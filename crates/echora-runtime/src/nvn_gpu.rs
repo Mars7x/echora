@@ -2788,6 +2788,10 @@ impl Nvn {
         // Bindings, through the inferred map.
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
+        let mut storage = HashMap::new();
+        // Driver constant entries of bound storage buffers: (stage index,
+        // c0 offset, GPU address, size).
+        let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
         let (mut uniform_time, mut texture_time) = Default::default();
         let mut uniform_bytes = 0u64;
         for (index, stage) in stages.iter().enumerate() {
@@ -2824,6 +2828,39 @@ impl Nvn {
                             descriptor.index, stage.stage, keys_for_note.get(index).copied().unwrap_or(0)
                         ));
                         uniforms.insert((index, descriptor.binding), vec![0; used as usize]);
+                    }
+                    // Storage buffer i of a graphics stage: its address and
+                    // size at c0+0x110+16*i (inferred: vertex shaders read
+                    // c0+0x170 where the application binds slot 6, beside
+                    // slot 12). The contents are read now; graphics stages'
+                    // writes are not returned.
+                    DescriptorKind::StorageBuffer
+                        if descriptor.cbuf_index == 0
+                            && descriptor.cbuf_offset >= 0x110
+                            && (descriptor.cbuf_offset - 0x110) % 16 == 0 =>
+                    {
+                        let slot = (descriptor.cbuf_offset - 0x110) / 16;
+                        let bind = self
+                            .render
+                            .state
+                            .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
+                            .ok_or_else(|| format!("storage buffer {nvn}/{slot} is not bound"))?;
+                        let (gpu, size) = (bind.x[3], bind.x[4]);
+                        let base = gpu & !15;
+                        let length = gpu - base + size;
+                        let guest = self.gpu_to_guest(base, length)?;
+                        self.resolve_storage(core, Some(guest..guest + length))?;
+                        if descriptor.flags & 1 != 0 {
+                            self.gpu
+                                .as_mut()
+                                .unwrap()
+                                .note("graphics-stage storage buffer writes are not returned");
+                        }
+                        storage_entries.push((index, descriptor.cbuf_offset, gpu, size));
+                        storage.insert(
+                            (index, descriptor.binding),
+                            self.gpu_bytes(core, base, length)?,
+                        );
                     }
                     // Texel buffers (buffer textures) bind like textures.
                     DescriptorKind::Texture | DescriptorKind::TextureBuffer
@@ -2884,15 +2921,47 @@ impl Nvn {
                         textures.insert((index, descriptor.binding), (source, sampler));
                     }
                     other => {
+                        // The stage and its bound storage buffers, from
+                        // which the driver constant layout can be inferred.
+                        let bound: Vec<String> = self
+                            .render
+                            .state
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.starts_with(&format!("BindStorageBuffer/{nvn}/"))
+                            })
+                            .map(|(key, bind)| format!("{key}={:#x}+{:#x}", bind.x[3], bind.x[4]))
+                            .collect();
                         return Err(format!(
-                            "{other:?} binding at c{}+{:#x}",
-                            descriptor.cbuf_index, descriptor.cbuf_offset
+                            "{other:?} binding at c{}+{:#x} in {:?} stage {:016x} (bound [{}])",
+                            descriptor.cbuf_index,
+                            descriptor.cbuf_offset,
+                            stage.stage,
+                            keys_for_note.get(index).copied().unwrap_or(0),
+                            bound.join(" ")
                         ));
                     }
                 }
             }
         }
 
+        // Each stage's c0 holds its storage buffers' addresses and sizes,
+        // which translated code reads to find offsets in the buffer.
+        for (index, offset, gpu, size) in storage_entries {
+            let Some(c0) = stages[index].descriptors.iter().find(|descriptor| {
+                descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0
+            }) else {
+                continue;
+            };
+            if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
+                let entry = offset as usize;
+                if bytes.len() < entry + 12 {
+                    bytes.resize((entry + 16).next_multiple_of(16), 0);
+                }
+                bytes[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
+                bytes[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
+            }
+        }
         phase(self, "stat: draw us bindings", &mut since);
         {
             let backend = self.gpu.as_mut().unwrap();
@@ -3576,6 +3645,7 @@ impl Nvn {
             first_instance,
             uniforms,
             textures,
+            storage,
             fixed,
         };
         let probe_target = draw.colors.first().copied();
