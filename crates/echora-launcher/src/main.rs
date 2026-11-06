@@ -5,6 +5,7 @@
 //! `--show` opens the window even when "Skip launcher" is on.
 
 mod app;
+mod backdrop;
 mod chrome;
 mod install;
 

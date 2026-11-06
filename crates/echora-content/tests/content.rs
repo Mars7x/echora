@@ -123,6 +123,42 @@ fn rejects_unrecognized_directory() {
     assert!(ContentSource::open(dir.path()).is_err());
 }
 
+#[test]
+fn reads_single_romfs_files_from_a_dump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("dump");
+    write(&root.join("exefs/main"), &fake_nso(1));
+    write(&root.join("romfs/Event/Movie/clip.webm"), b"video");
+    let src = ContentSource::open(&root).unwrap();
+    let read = |path: &str, limit| src.read_romfs_file(0, path, limit);
+    assert_eq!(
+        read("Event/Movie/clip.webm", 64).unwrap().unwrap(),
+        b"video"
+    );
+    assert!(read("Event/Movie/missing.webm", 64).unwrap().is_none());
+    assert!(read("Event/Movie", 64).unwrap().is_none());
+    assert!(read("../exefs/main", 1 << 20).unwrap().is_none());
+    assert!(read("Event/Movie/clip.webm", 2).is_err());
+}
+
+#[test]
+#[ignore = "needs a user-supplied NUP in ECHORA_TEST_NUP"]
+fn reads_single_romfs_files_from_a_nup() {
+    let nup = std::env::var("ECHORA_TEST_NUP").expect("ECHORA_TEST_NUP");
+    let src = ContentSource::open(&nup).unwrap();
+    let prog = src.inventory().unwrap().program_package.unwrap();
+    let movie = src
+        .read_romfs_file(prog, "Event/Movie/Dm_Title_0045.webm", 64 << 20)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&movie[..4], b"\x1a\x45\xdf\xa3", "WebM/Matroska header");
+    assert!(
+        src.read_romfs_file(prog, "Event/Movie/none.webm", 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// NUP and extracted-directory input must normalize to the same ExeFS key:
 /// `ECHORA_TEST_NUP=/path/game.nup cargo test -p echora-content -- --ignored`.
 #[test]

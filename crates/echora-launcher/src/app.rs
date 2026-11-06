@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
-use crate::install;
+use crate::{backdrop, install};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -58,7 +58,7 @@ mod palette {
     pub const WINDOW_BUTTON: u32 = 0xffffff1f;
     pub const WINDOW_BUTTON_HOVER: u32 = 0xffffff33;
     pub const WINDOW_BORDER: u32 = 0xffffff14;
-    pub const ART_SHADE: u32 = 0x0000004d;
+    pub const ART_SHADE: u32 = 0x00000033;
 }
 
 /// The panel shown over the launcher.
@@ -289,10 +289,39 @@ impl Launcher {
                         .and_then(|_| std::fs::write(&file, path.display().to_string()));
                 }
                 self.game = Some(game);
+                self.extract_backdrop(path, cx);
             }
             Err(message) => self.notify(message, cx),
         }
         cx.notify();
+    }
+
+    /// Takes the backdrop frame from the game the first time one is chosen,
+    /// then swaps it in for the icon.
+    fn extract_backdrop(&mut self, game: PathBuf, cx: &mut Context<Self>) {
+        if backdrop::path().is_none_or(|path| path.exists()) {
+            return;
+        }
+        let task = cx
+            .background_executor()
+            .spawn(async move { backdrop::extract(&game) });
+        cx.spawn(async move |this, cx| {
+            let path = match task.await {
+                Ok(path) => path,
+                Err(error) => return eprintln!("backdrop: {error}; using the icon"),
+            };
+            let art = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| decode_art(&bytes));
+            let _ = this.update(cx, |this, cx| {
+                if let (Some(game), Some(art)) = (this.game.as_mut(), art) {
+                    game.art = Some(art);
+                    this.backdrop = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn choose_game(&mut self, _: &ChooseGame, _: &mut Window, cx: &mut Context<Self>) {
@@ -462,17 +491,10 @@ fn read_game(path: &Path) -> Result<Game, String> {
         };
         Arc::new(Image::from_bytes(format, bytes.clone()))
     });
-    let art = package
-        .icon
-        .as_deref()
-        .and_then(|bytes| image::load_from_memory(bytes).ok())
-        .map(|decoded| {
-            let mut art = decoded.into_rgba8();
-            for pixel in art.as_chunks_mut::<4>().0 {
-                pixel.swap(0, 2);
-            }
-            art
-        });
+    let art = backdrop::path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| decode_art(&bytes))
+        .or_else(|| package.icon.as_deref().and_then(decode_art));
     Ok(Game {
         path: path.to_path_buf(),
         title: package
@@ -484,6 +506,15 @@ fn read_game(path: &Path) -> Result<Game, String> {
         icon,
         art,
     })
+}
+
+/// Decodes an image into the BGRA layout GPUI uploads.
+fn decode_art(bytes: &[u8]) -> Option<image::RgbaImage> {
+    let mut art = image::load_from_memory(bytes).ok()?.into_rgba8();
+    for pixel in art.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Some(art)
 }
 
 fn last_game_file() -> Option<PathBuf> {
@@ -704,7 +735,7 @@ fn scrim(
 /// up, which smooths it further.
 fn frost(art: &image::RgbaImage) -> image::RgbaImage {
     use image::imageops::{self, FilterType};
-    const WIDTH: u32 = 160;
+    const WIDTH: u32 = 320;
     const PAD: u32 = 24;
     let height = (art.height() * WIDTH / art.width().max(1)).max(1);
     let small = imageops::resize(art, WIDTH, height, FilterType::Triangle);
@@ -713,7 +744,7 @@ fn frost(art: &image::RgbaImage) -> image::RgbaImage {
         let y = y.saturating_sub(PAD).min(height - 1);
         *small.get_pixel(x, y)
     });
-    let blurred = imageops::fast_blur(&padded, 7.0);
+    let blurred = imageops::fast_blur(&padded, 6.0);
     imageops::crop_imm(&blurred, PAD, PAD, WIDTH, height).to_image()
 }
 
@@ -1133,19 +1164,9 @@ impl Launcher {
                                     .child(env!("CARGO_PKG_VERSION")),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(button("source", "Source code").h(px(32.0)).on_click(
-                                cx.listener(|_, _, _, cx| {
-                                    cx.open_url("https://github.com/Mars7x/echora")
-                                }),
-                            ))
-                            .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
-                                |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
-                            ))),
-                    ),
+                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
+                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
+                    ))),
             )
             .child(
                 div()
@@ -1160,9 +1181,19 @@ impl Launcher {
             .child(
                 div()
                     .pt(px(12.0))
-                    .text_xs()
-                    .text_color(color(palette::TEXT_MUTED))
-                    .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(color(palette::TEXT_MUTED))
+                            .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
+                    )
+                    .child(button("source", "Source code").h(px(32.0)).on_click(
+                        cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")),
+                    )),
             );
         scrim(sheet, self.corner, cx)
     }
