@@ -465,6 +465,45 @@ fn analyze_symbols(
     }))
 }
 
+/// ELF symbol type of a function.
+const STT_FUNC: u8 = 2;
+
+/// Module offsets of every defined function (`STT_FUNC`) in the dynamic
+/// symbol table. Other modules reach these through symbol-resolved GOT slots
+/// (`JUMP_SLOT`, `GLOB_DAT`), so no relative relocation points at them.
+pub fn defined_functions(module: &NsoModule) -> Result<Vec<u64>> {
+    let Some(table) = module
+        .mod0
+        .as_ref()
+        .and_then(|info| info.dynamic.as_ref())
+        .and_then(|dynamic| dynamic.symbol_table.as_ref())
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(count) = table.count else {
+        return Ok(Vec::new());
+    };
+    let symbols = view(
+        module,
+        table.memory_offset,
+        count * 24,
+        "dynamic symbol table",
+    )?;
+    let mut functions = Vec::new();
+    for index in 1..count as usize {
+        let symbol = &symbols[index * 24..index * 24 + 24];
+        let kind = symbol[4] & 0xf;
+        let section = u16::from_le_bytes([symbol[6], symbol[7]]);
+        let value = u64_at(symbol, 8, "symbol value")?;
+        if kind == STT_FUNC && section != 0 && value != 0 {
+            functions.push(value);
+        }
+    }
+    functions.sort_unstable();
+    functions.dedup();
+    Ok(functions)
+}
+
 /// Module offset of the defined dynamic symbol `name`, if the module exports
 /// one. Uses the bounded table already validated by [`analyze`].
 pub fn defined_symbol(module: &NsoModule, name: &str) -> Result<Option<u64>> {

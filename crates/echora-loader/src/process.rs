@@ -153,6 +153,18 @@ pub fn relative_text_targets(placed: &PlacedModule) -> Vec<u64> {
     targets
 }
 
+/// Exported functions in this module's text: entry points other modules
+/// call through symbol-resolved GOT slots.
+pub fn exported_function_targets(placed: &PlacedModule) -> Vec<u64> {
+    let text = placed.text_range();
+    crate::mod0::defined_functions(&placed.module)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|offset| placed.base + offset)
+        .filter(|address| text.contains(address))
+        .collect()
+}
+
 /// Static constructors: `DT_INIT_ARRAY` slots whose relative relocation
 /// targets this module's text, in array order.
 pub fn init_array_targets(placed: &PlacedModule) -> Vec<u64> {
