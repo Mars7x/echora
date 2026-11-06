@@ -381,6 +381,12 @@ enum ReadableEventKind {
     /// DisplaySession command 31's event (undocumented; u32 index 0, moved
     /// like command 11's, released by 32). Provisional and never signaled.
     DisplayEvent31,
+    /// NVIDIA driver device event (QueryEvent): never signaled, as nothing
+    /// produces GPU errors or semaphore notifications here.
+    NvdrvEvent {
+        device: &'static str,
+        id: u32,
+    },
     /// GpuSession notification event by index (CreateEvent, command 12).
     GpuNotification {
         index: u32,
@@ -889,6 +895,8 @@ pub struct Services {
     nvdrv_firmware_memory_margin: Option<bool>,
     /// Open NVIDIA driver file descriptors and their device paths.
     nvdrv_fds: BTreeMap<u32, String>,
+    /// QueryEvent backings by (device path, event ID); each is created once.
+    nvdrv_events: BTreeMap<(String, u32), ReadableEventId>,
     /// Live transfer-memory handles (CreateTransferMemory).
     transfer_memories: BTreeMap<u32, TransferMemory>,
     /// Transfer memories referenced by a server object after their handle
@@ -980,6 +988,7 @@ impl Default for Services {
             graphics_supervisor_phase: None,
             nvdrv_firmware_memory_margin: None,
             nvdrv_fds: BTreeMap::new(),
+            nvdrv_events: BTreeMap::new(),
             transfer_memories: BTreeMap::new(),
             retained_transfer_memories: Vec::new(),
             writable_event_handles: BTreeMap::new(),
@@ -1315,6 +1324,15 @@ impl Call<'_> {
         handle: u32,
         interface_id: u32,
     ) -> Result<ipc::Reply, Trap> {
+        self.prepare_copy_handle_reply_with_data(handle, interface_id, &[])
+    }
+
+    fn prepare_copy_handle_reply_with_data(
+        &self,
+        handle: u32,
+        interface_id: u32,
+        data: &[u8],
+    ) -> Result<ipc::Reply, Trap> {
         // A readable-event alias remains a kernel handle inside a domain. It
         // is never an output domain object or a moved service-session handle.
         let reply = if self.request.domain.is_some() {
@@ -1323,11 +1341,11 @@ impl Call<'_> {
                 0,
                 handle,
                 interface_id,
-                &[],
+                data,
                 &[],
             )
         } else {
-            ipc::build_copy_handle_reply_with_data(self.request, 0, handle, interface_id, &[])
+            ipc::build_copy_handle_reply_with_data(self.request, 0, handle, interface_id, data)
         };
         reply.map_err(|error| invalid(format!("build copied-event reply: {error:#}")))
     }
@@ -5751,6 +5769,62 @@ impl Services {
                 self.provisional_commands.insert("nvdrv:gsv:ioctl");
                 Ok(Outcome::success())
             }
+            // INvDrv2User QueryEvent (4): u32 Fd, u32 EvtId; copies the
+            // readable event and returns u32 Err (classic layout). Only the
+            // nvhost-ctrl-gpu events Switchbrew documents (1 ErrorEvent, 2
+            // SemaphoreEvent) exist; repeated queries alias one backing.
+            4 => {
+                call.shape(8, false, false)?;
+                let word = |at: usize| crate::bytes::le_u32(&call.request.arguments[at..at + 4]);
+                let (fd, event) = (word(0), word(4));
+                let Some(device) = self.nvdrv_fds.get(&fd).cloned() else {
+                    return Err(
+                        call.unsupported(SERVICE, format!("QueryEvent on unopened fd {fd}"))
+                    );
+                };
+                let device: &'static str = match (device.as_str(), event) {
+                    ("/dev/nvhost-ctrl-gpu", 1 | 2) => "/dev/nvhost-ctrl-gpu",
+                    _ => {
+                        return Err(call.unsupported(
+                            SERVICE,
+                            format!("QueryEvent {event} on {device} is not modeled"),
+                        ));
+                    }
+                };
+                let key = (device.to_string(), event);
+                let id = match self.nvdrv_events.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                            return Err(invalid("readable event backing capacity exhausted"));
+                        }
+                        ReadableEventId(
+                            self.readable_events
+                                .keys()
+                                .map(|id| id.0)
+                                .max()
+                                .unwrap_or(0)
+                                + 1,
+                        )
+                    }
+                };
+                let handle = self.next_available_handle()?;
+                let reply = call.prepare_copy_handle_reply_with_data(
+                    handle,
+                    NVDRV_INTERFACE_ID,
+                    &0u32.to_le_bytes(),
+                )?;
+                call.write_reply(&reply)?;
+                self.readable_events.entry(id).or_insert(ReadableEvent {
+                    owner: application.clone(),
+                    kind: ReadableEventKind::NvdrvEvent { device, id: event },
+                    signaled: false,
+                });
+                self.nvdrv_events.insert(key, id);
+                self.readable_event_handles.insert(handle, id);
+                self.next_handle = handle + 1;
+                Ok(Outcome::success())
+            }
             // INvDrv2User SetConfiguration (13): a u64 whose bit 0 is the old
             // GraphicsFirmwareMemoryMarginEnabled option (Switchbrew "NV
             // services", [S2]). Other bits are undocumented and stop. There is
@@ -5872,7 +5946,8 @@ impl Services {
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
             | ReadableEventKind::DisplayNotification
-            | ReadableEventKind::DisplayEvent31 => {
+            | ReadableEventKind::DisplayEvent31
+            | ReadableEventKind::NvdrvEvent { .. } => {
                 return Err(invalid(
                     "syncpoint-cache events are not application lifecycle events",
                 ));
