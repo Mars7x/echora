@@ -410,6 +410,8 @@ enum ReadableEventKind {
     AudioRendererFrame,
     /// Internal: a parked bsd:u Poll, signaled when it completes.
     SocketPoll,
+    /// nfp IUser AttachAvailabilityChangeEvent (23); never signaled.
+    NfpAvailability,
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -689,6 +691,12 @@ enum ServiceObject {
     SslContext,
     /// nsd:u, network service discovery (Eden-NS2 1a6d7d4 nsd.cpp).
     NsdUser,
+    /// nfp:user (amiibo) IUserManager and the IUser it creates; the host
+    /// has no NFC devices.
+    NfpUserManager,
+    NfpUser {
+        initialized: bool,
+    },
     /// nifm:u IStaticService, IGeneralService and IRequest with no network.
     NifmStatic,
     NifmGeneral,
@@ -784,6 +792,8 @@ impl ServiceObject {
             Self::SslContext => "ssl:context",
             Self::NifmStatic => "nifm:u",
             Self::NsdUser => "nsd:u",
+            Self::NfpUserManager => "nfp:user",
+            Self::NfpUser { .. } => "nfp:user:user",
             Self::NifmGeneral => "nifm:u:general",
             Self::NifmRequest { .. } => "nifm:u:request",
             Self::BcatCreator => "bcat:u",
@@ -1019,6 +1029,12 @@ pub struct Services {
     /// Set by a request that parks its thread on the internal event handle
     /// (taken by the runtime after SendSyncRequest).
     blocked_request: Option<u32>,
+    /// nfp availability-change event, created once.
+    nfp_availability_event: Option<ReadableEventId>,
+    /// Npad ids the application disconnected (hid DisconnectNpad).
+    pub(crate) hid_disconnected_npads: BTreeSet<u32>,
+    /// hid SetSupportedNpadStyleSet's style set.
+    hid_supported_style_set: u32,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1115,6 +1131,9 @@ impl Default for Services {
             socket_poll_timeouts: BTreeMap::new(),
             pending_polls: BTreeMap::new(),
             blocked_request: None,
+            nfp_availability_event: None,
+            hid_disconnected_npads: BTreeSet::new(),
+            hid_supported_style_set: 0,
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -1341,7 +1360,13 @@ impl Call<'_> {
     }
 
     fn output_buffer(&self) -> Result<(u64, u64), Trap> {
-        let (address, size, mode) = self.request.receive_buffers[0];
+        // A request with only a C (receive-list) buffer uses that.
+        let Some(&(address, size, mode)) = self.request.receive_buffers.first() else {
+            return match self.request.receive_list.first() {
+                Some(&(address, size)) => Ok((address, size)),
+                None => Err(invalid("missing output buffer descriptor")),
+            };
+        };
         // Modes 0 (normal), 1 (non-secure) and 3 (non-device) only differ in
         // which memory states the kernel may map; this server writes the
         // client's memory directly. Mode 2 is invalid.
@@ -2176,6 +2201,9 @@ impl Services {
             | ServiceObject::NifmGeneral
             | ServiceObject::NifmRequest { .. } => self.nifm(&object.clone(), call),
             ServiceObject::NsdUser => self.nsd(call),
+            ServiceObject::NfpUserManager | ServiceObject::NfpUser { .. } => {
+                self.nfp(&object.clone(), call)
+            }
             ServiceObject::BcatCreator
             | ServiceObject::BcatService
             | ServiceObject::BcatStorage
@@ -3465,6 +3493,95 @@ impl Services {
         }
     }
 
+    /// nfp:user (yuzu/Eden numbering) with no NFC devices.
+    fn nfp(&mut self, object: &ServiceObject, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        const SERVICE: &str = "nfp:user";
+        match (object, call.request.command_id) {
+            // IUserManager CreateUserInterface (0) -> IUser.
+            (ServiceObject::NfpUserManager, 0) => {
+                call.shape(0, false, false)?;
+                self.reply_new_object(
+                    call,
+                    ServiceObject::NfpUser { initialized: false },
+                    AOC_INTERFACE_ID,
+                )
+            }
+            // IUser Initialize (0): u64 applet resource user ID, u64 unused,
+            // the PID and an input buffer of MCU versions; Finalize (1).
+            (ServiceObject::NfpUser { .. }, 0 | 1) => {
+                let initialize = call.request.command_id == 0;
+                if initialize && (call.request.arguments.len() != 16 || call.request.pid.is_none())
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("Initialize shape ({})", call.request.describe()),
+                    ));
+                }
+                let mut updated = self.sessions[&call.handle].clone();
+                if let Some(ServiceObject::NfpUser { initialized }) =
+                    updated.object_mut(call.request.domain.as_ref().map(|domain| domain.object_id))
+                {
+                    *initialized = initialize;
+                }
+                self.sessions.insert(call.handle, updated);
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
+            }
+            // AttachAvailabilityChangeEvent (23): one copied event, never
+            // signaled (NFC availability does not change on the host).
+            (ServiceObject::NfpUser { .. }, 23) => {
+                call.shape(0, false, false)?;
+                let application = self
+                    .main_application
+                    .clone()
+                    .ok_or_else(|| invalid("nfp requires the bootstrap main application"))?;
+                let event = match self.nfp_availability_event {
+                    Some(event) => event,
+                    None => {
+                        if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                            return Err(invalid("readable event backing capacity exhausted"));
+                        }
+                        ReadableEventId(
+                            self.readable_events
+                                .keys()
+                                .map(|id| id.0)
+                                .max()
+                                .unwrap_or(0)
+                                + 1,
+                        )
+                    }
+                };
+                let handle = self.next_available_handle()?;
+                let reply = call.prepare_copy_handle_reply(handle, 0)?;
+                call.write_reply(&reply)?;
+                self.readable_events.entry(event).or_insert(ReadableEvent {
+                    owner: application,
+                    kind: ReadableEventKind::NfpAvailability,
+                    signaled: false,
+                });
+                self.nfp_availability_event = Some(event);
+                self.readable_event_handles.insert(handle, event);
+                self.next_handle = handle + 1;
+                Ok(Outcome {
+                    output_copy_handle_count: 1,
+                    ..Outcome::success()
+                })
+            }
+            // GetState (19) -> u32: 0 not initialized, 1 initialized.
+            (ServiceObject::NfpUser { initialized }, 19) => {
+                call.shape(0, false, false)?;
+                call.reply(
+                    0,
+                    None,
+                    AOC_INTERFACE_ID,
+                    &u32::from(*initialized).to_le_bytes(),
+                )?;
+                Ok(Outcome::success())
+            }
+            _ => Err(call.unsupported(SERVICE, "nfp command is not implemented")),
+        }
+    }
+
     /// The internal handle of a request that parked its thread, once.
     pub(crate) fn take_blocked_request(&mut self) -> Option<u32> {
         self.blocked_request.take()
@@ -3851,7 +3968,6 @@ impl Services {
             76,   // SetAccelerometerPlayMode
             79,   // SetGyroscopeZeroDriftMode
             91,   // ActivateGesture
-            100,  // SetSupportedNpadStyleSet
             102,  // SetSupportedNpadIdType
             103,  // ActivateNpad
             104,  // DeactivateNpad
@@ -3902,6 +4018,30 @@ impl Services {
                     &[],
                     AOC_INTERFACE_ID,
                 )
+            }
+            // SetSupportedNpadStyleSet (100): u32 style set, u64 applet
+            // resource user ID, PID; GetSupportedNpadStyleSet (101): u64
+            // applet resource user ID, PID -> u32 (0 until set).
+            (ServiceObject::HidServer, 100) => {
+                call.shape(16, true, false)?;
+                self.hid_supported_style_set = crate::bytes::le_u32(&call.request.arguments[..4]);
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
+            }
+            (ServiceObject::HidServer, 101) => {
+                call.shape(8, true, false)?;
+                let styles = self.hid_supported_style_set;
+                call.reply(0, None, AOC_INTERFACE_ID, &styles.to_le_bytes())?;
+                Ok(Outcome::success())
+            }
+            // DisconnectNpad (107): u32 npad id, u64 applet resource user
+            // ID and the PID. The disconnected ids are recorded (reported).
+            (ServiceObject::HidServer, 107) => {
+                call.shape(16, true, false)?;
+                let npad = crate::bytes::le_u32(&call.request.arguments[..4]);
+                self.hid_disconnected_npads.insert(npad);
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
             }
             // AcquireNpadStyleSetUpdateEventHandle(u32 npad id, u64 aruid,
             // u64 event cookie, PID) -> copied event.
@@ -4039,10 +4179,10 @@ impl Services {
     /// accepted and discarded; nothing is ever pending transmission.
     fn play_report(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
         match call.request.command_id {
-            // SaveReport* (10100..=10105) and SaveSystemReport* (20100,
-            // 20101): event name and MessagePack buffers, optionally a
-            // user and the PID. Discarded.
-            10100..=10105 | 20100 | 20101 => {
+            // SaveReport* (10100..=10107; OoT sends 10107, a newer variant)
+            // and SaveSystemReport* (20100, 20101): event name and
+            // MessagePack buffers, optionally a user and the PID. Discarded.
+            10100..=10107 | 20100 | 20101 => {
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
                 Ok(Outcome::success())
             }
@@ -4976,6 +5116,50 @@ impl Services {
                     output_copy_handle_count: 1,
                     ..Outcome::success()
                 })
+            }
+            // GetClockSnapshot (400): u8 type -> ClockSnapshot (0xD0 bytes,
+            // yuzu/Eden layout) in an output buffer: user and network
+            // SystemClockContexts, both POSIX times, CalendarTimes and their
+            // CalendarAdditionalInfos, the steady clock time point, the
+            // location name, automatic correction and the type. With no
+            // network the network clock equals the user clock.
+            (ServiceObject::TimeStatic, 400) => {
+                // The u8 arrives padded to a word; the buffer may be B or C.
+                if !(1..=4).contains(&call.request.arguments.len())
+                    || call.request.pid.is_some()
+                    || call.request.input_buffer.is_some()
+                {
+                    return Err(call.unsupported(
+                        "time:u",
+                        format!("GetClockSnapshot shape ({})", call.request.describe()),
+                    ));
+                }
+                let kind = call.request.arguments[0];
+                let (address, size) = call.output_buffer()?;
+                if size < 0xd0 {
+                    return Err(call.unsupported("time:u", "ClockSnapshot buffer under 0xd0 bytes"));
+                }
+                let mut context = Vec::with_capacity(0x20);
+                context.extend_from_slice(&(posix - steady).to_le_bytes());
+                context.extend_from_slice(&steady.to_le_bytes());
+                context.extend_from_slice(&self.steady_clock_source);
+                let calendar = local_calendar_time(posix);
+                let mut snapshot = vec![0u8; 0xd0];
+                snapshot[0..0x20].copy_from_slice(&context);
+                snapshot[0x20..0x40].copy_from_slice(&context);
+                snapshot[0x40..0x48].copy_from_slice(&posix.to_le_bytes());
+                snapshot[0x48..0x50].copy_from_slice(&posix.to_le_bytes());
+                snapshot[0x50..0x58].copy_from_slice(&calendar[..8]);
+                snapshot[0x58..0x60].copy_from_slice(&calendar[..8]);
+                snapshot[0x60..0x78].copy_from_slice(&calendar[8..]);
+                snapshot[0x78..0x90].copy_from_slice(&calendar[8..]);
+                snapshot[0x90..0x98].copy_from_slice(&steady.to_le_bytes());
+                snapshot[0x98..0xa8].copy_from_slice(&self.steady_clock_source);
+                snapshot[0xa8..0xab].copy_from_slice(b"UTC");
+                snapshot[0xcd] = kind;
+                call.memory.write(address, &snapshot)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
             }
             // ITimeZoneService. The device location is UTC (inference: no
             // rule data is loaded, so every conversion uses offset 0).
@@ -7012,6 +7196,7 @@ impl Services {
             | ReadableEventKind::AudioOutBuffer
             | ReadableEventKind::AudioRendererFrame
             | ReadableEventKind::SocketPoll
+            | ReadableEventKind::NfpAvailability
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
@@ -7241,6 +7426,7 @@ impl Services {
                     "ssl" => ServiceObject::SslService,
                     "nifm:u" => ServiceObject::NifmStatic,
                     "nsd:u" => ServiceObject::NsdUser,
+                    "nfp:user" => ServiceObject::NfpUserManager,
                     "bcat:u" => ServiceObject::BcatCreator,
                     "stpl:u" => ServiceObject::StreamplayUser,
                     "prepo:u" => ServiceObject::PlayReport,
@@ -7326,6 +7512,8 @@ impl Services {
             "audio_outs":self.audio_outs,
             "audio_device_list_requests":self.audio_device_list_requests,
             "socket_poll_timeouts":self.socket_poll_timeouts,
+            "hid_disconnected_npads":self.hid_disconnected_npads,
+            "hid_supported_style_set":self.hid_supported_style_set,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
                 "sample_count":renderer.parameters.sample_count,

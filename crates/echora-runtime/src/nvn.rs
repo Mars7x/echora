@@ -668,6 +668,18 @@ impl Nvn {
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
+            // nvnDeviceGetTimestampInNanoseconds(device, const
+            // NVNcounterData*) -> u64 (NVN1's signature): the report's GPU
+            // timestamp (offset 8, written by ReportCounter as the physical
+            // counter) in nanoseconds.
+            "nvnDeviceGetTimestampInNanoseconds" => {
+                self.object(this, "Device").map_err(invalid)?;
+                let ticks = core.memory.read_u64(x[1] + 8)?;
+                let nanoseconds = u128::from(ticks) * 1_000_000_000
+                    / u128::from(echora_guest::PHYSICAL_COUNTER_FREQUENCY_HZ);
+                core.cpu.regs[0] = nanoseconds as u64;
+                return Ok(true);
+            }
             // nvnQueueBuilderGetQueueMemorySize(builder) -> size: the
             // memory the application must allocate and pass back with
             // SetQueueMemory (main+0xf49150 allocates it 4 KiB aligned).

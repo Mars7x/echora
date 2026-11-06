@@ -2262,7 +2262,8 @@ impl Machine {
     /// or without a window, ECHORA_AUTO_PRESS=N holds a button for 6
     /// samples every N (for headless runs through menus): the next one of
     /// ECHORA_AUTO_KEYS (comma-separated names such as A,UP,A), then A,
-    /// from sample ECHORA_AUTO_START until ECHORA_AUTO_END.
+    /// from sample ECHORA_AUTO_START until ECHORA_AUTO_END; otherwise an
+    /// idle, connected controller.
     fn publish_controller(&mut self) -> Result<(), Trap> {
         let Some(base) = self.hid_mapping else {
             return Ok(());
@@ -2333,7 +2334,9 @@ impl Machine {
                 .unwrap_or(crate::window::button::A);
             u64::from(sample % every < 6) * key
         } else {
-            return Ok(());
+            // No window and no scripted presses: the controller is still
+            // connected, with nothing pressed.
+            0
         };
         self.hid_samples += 1;
         crate::hid::write_controller(
