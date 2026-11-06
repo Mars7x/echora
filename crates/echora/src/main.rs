@@ -601,15 +601,36 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         "[package]\nname = \"echora-translation\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
          [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
     );
+    // One shared library holds the guest crate, so the bundles and the
+    // runner share a single copy of its state (the window table above all).
+    // It lives here rather than as a dylib of echora-guest itself, which
+    // would collide with the guest's ordinary build in Echora's workspace.
+    write_if_changed(
+        &out.join("guest/Cargo.toml"),
+        &format!(
+            "[package]\nname = \"echora-guest-shared\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+             [lib]\ncrate-type = [\"dylib\"]\n\n\
+             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+        ),
+    )?;
+    write_if_changed(
+        &out.join("guest/src/lib.rs"),
+        "// Generated. Keep this file local.\npub use echora_guest::*;\n",
+    )?;
     let mut imports = String::new();
     let bundles: Vec<&[u64]> = regions.chunks(BUNDLE_REGIONS).collect();
     for (index, members) in bundles.iter().enumerate() {
         let mut manifest = format!(
             "[package]\nname = \"echora-bundle-{index}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
              [lib]\ncrate-type = [\"dylib\"]\n\n\
-             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n\
+             echora-guest-shared = {{ path = \"../../guest\" }}\n"
         );
-        let mut exports = String::from("// Generated. Keep this file local.\n");
+        // Linking the shared guest library keeps the guest crate out of
+        // each bundle.
+        let mut exports = String::from(
+            "// Generated. Keep this file local.\nextern crate echora_guest_shared;\n",
+        );
         for region in *members {
             manifest.push_str(&format!(
                 "gen-r-{region:x} = {{ path = \"../../regions/{region:x}\" }}\n"
@@ -671,7 +692,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     // `rpath` lets the runner find the bundles and the shared guest crate.
     write_if_changed(
         &out.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
+        "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
          [profile.release]\nopt-level = 1\nrpath = true\n\n[profile.release.package.echora-guest]\nopt-level = 3\n\n\
          [profile.release.package.echora-runtime]\nopt-level = 3\n",
     )?;

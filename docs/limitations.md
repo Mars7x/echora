@@ -40,3 +40,9 @@
   game-specific projection and UI changes before it can be offered.
 - CI covers Linux x86-64, Windows x86-64 and macOS ARM64 compilation and
   tests only.
+- The translation links as shared-library bundles (192 regions, about
+  500 MB of code each). On Windows a Rust dylib may export at most 65,535
+  symbols, which bundles of this size will exceed; building the
+  translation on Windows will need smaller bundles or exports limited to
+  each bundle's dispatch entry points. Only Linux builds of the translation
+  have been run.
