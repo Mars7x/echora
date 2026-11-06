@@ -35,8 +35,8 @@ desktop's native widgets. The cost is a young, fast-moving API with few
 ready-made controls, so the launcher draws its own (buttons, segmented
 choices). It draws client-side window controls on Linux compositors that
 require them, keeps the native title bar on Windows and the traffic lights
-on macOS. The in-game settings overlay will be drawn by Echora's own
-presenter into the game's swapchain rather than by a desktop toolkit.
+on macOS. Settings are changed only in the launcher; there is no
+in-game settings interface.
 
 GPUI 0.2.2 reaches `xattr` 0.2.3 through its HTTP client, and that `xattr`
 needs `libc::ENOATTR`, which `libc` 0.2.190 removed on Linux. `Cargo.lock`

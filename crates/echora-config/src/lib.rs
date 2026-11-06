@@ -1,5 +1,5 @@
-//! Echora's settings model, shared by the launcher, the runtime and the
-//! in-game settings layer.
+//! Echora's settings model, shared by the launcher and the runtime. Settings
+//! are changed in the launcher; there is no in-game settings interface.
 //!
 //! Settings are stored as versioned TOML. What the user *requested* is kept
 //! separate from what is *effective* on the current host: unsupported choices
@@ -13,7 +13,7 @@ use std::path::Path;
 use echora_resolution::{AspectPolicy, Extent, InternalResolution, Ratio};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -228,16 +228,11 @@ impl Default for AudioSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct InputSettings {
     pub vibration: bool,
-    /// Keyboard shortcut that opens the in-game settings.
-    pub settings_key: String,
 }
 
 impl Default for InputSettings {
     fn default() -> Self {
-        Self {
-            vibration: true,
-            settings_key: "F1".into(),
-        }
+        Self { vibration: true }
     }
 }
 
@@ -277,14 +272,13 @@ pub enum SettingKey {
     AudioDevice,
     Volume,
     Vibration,
-    SettingsKey,
 }
 
 impl SettingKey {
     pub fn apply_class(self) -> ApplyClass {
         use ApplyClass::*;
         match self {
-            Self::FrameLimit | Self::Volume | Self::Vibration | Self::SettingsKey => Immediate,
+            Self::FrameLimit | Self::Volume | Self::Vibration => Immediate,
             Self::WindowSize
             | Self::WindowMode
             | Self::Monitor
@@ -417,9 +411,6 @@ impl Settings {
         if self.audio.volume > 100 {
             return bad(format!("volume {} (0-100)", self.audio.volume));
         }
-        if self.input.settings_key.trim().is_empty() {
-            return bad("settings shortcut is empty".into());
-        }
         Ok(())
     }
 
@@ -462,10 +453,6 @@ impl Settings {
         diff(
             a.input.vibration != b.input.vibration,
             SettingKey::Vibration,
-        );
-        diff(
-            a.input.settings_key != b.input.settings_key,
-            SettingKey::SettingsKey,
         );
         out
     }
@@ -559,7 +546,13 @@ fn migrate(value: &mut toml::Table, from: u32) -> Result<(), ConfigError> {
             "schema 0 is not a valid settings version".into(),
         ));
     }
-    // Schema 1 is the first version; future migrations step from `from` up.
+    // Schema 2 dropped `input.settings_key`: there is no in-game settings
+    // interface to open.
+    if from < 2
+        && let Some(toml::Value::Table(input)) = value.get_mut("input")
+    {
+        input.remove("settings_key");
+    }
     value.insert(
         "schema".into(),
         toml::Value::Integer(i64::from(SCHEMA_VERSION)),
@@ -698,6 +691,14 @@ mod tests {
         let parsed: Settings = toml::from_str("[launcher]\nskip = true\n").unwrap();
         assert!(parsed.launcher.skip);
         assert!(Settings::default().changes(&parsed).is_empty());
+    }
+
+    #[test]
+    fn schema_1_files_drop_the_settings_shortcut() {
+        let old = "schema = 1\n[input]\nvibration = false\nsettings_key = \"F1\"\n";
+        let settings = Settings::from_toml(old).unwrap();
+        assert!(!settings.input.vibration);
+        assert_eq!(settings.schema, SCHEMA_VERSION);
     }
 
     #[test]
