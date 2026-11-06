@@ -3248,7 +3248,8 @@ impl Machine {
                 }
                 // The transport result is separate from the service result in
                 // the TLS reply. No reply or success is fabricated on a trap.
-                self.core.cpu.regs[0] = 0;
+                self.core.cpu.regs[0] =
+                    u64::from(self.services.take_transport_result().unwrap_or(0));
                 Ok(())
             }
             0x26 if args[0] as u32 & 0x80000000 != 0 => Ok(()),
