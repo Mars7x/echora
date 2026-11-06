@@ -426,14 +426,16 @@ fn discover_game(
         let exports = process::exported_function_targets(p);
         let lazy = process::lazy_binding_targets(p);
         let relocs = process::relative_text_targets(p);
+        let addresses = process::code_address_targets(p);
         let prologues = process::prologue_targets(p);
         println!(
-            "{:<8} seeds: {} constructors, {} exported functions, {} lazy-binding stubs, {} relocation targets, {} prologues",
+            "{:<8} seeds: {} constructors, {} exported functions, {} lazy-binding stubs, {} relocation targets, {} code addresses, {} prologues",
             p.module.name,
             ctors.len(),
             exports.len(),
             lazy.len(),
             relocs.len(),
+            addresses.len(),
             prologues.len()
         );
         roots.extend(ctors);
@@ -443,6 +445,7 @@ fn discover_game(
         // Unresolved imports jump through their GOT slot's lazy value.
         roots.extend(lazy);
         deferred.extend(relocs);
+        deferred.extend(addresses);
         deferred.extend(prologues);
     }
     roots.sort_unstable();
