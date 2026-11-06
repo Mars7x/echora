@@ -123,6 +123,20 @@ pub enum HostEntry {
 #[path = "nvn_gpu.rs"]
 mod gpu;
 
+/// Queued work of one queue (see `Nvn::pending`).
+#[derive(Debug)]
+enum QueueItem {
+    /// Commands of a list from `next` on.
+    List {
+        commands: std::sync::Arc<Vec<Command>>,
+        next: usize,
+    },
+    /// A FenceSync: the sync signals once earlier work has run.
+    Fence { sync: u64, args: Args },
+    /// A WaitSync: later work waits for the sync.
+    WaitSync { sync: u64 },
+}
+
 /// The ECHORA_* environment, read once: the draw path consulted debug
 /// switches several times per draw, and each lookup locks and scans the
 /// environment.
@@ -283,6 +297,15 @@ pub struct Nvn {
     /// Nesting of command lists running through CallCommands.
     #[serde(skip)]
     call_depth: u32,
+    /// Work each queue has been given but not run yet, in order: a queue
+    /// stops at a WaitEvent whose condition does not hold (or a WaitSync on
+    /// a sync not yet signaled) and resumes when another queue or the CPU
+    /// changes that (see `pump_queues`).
+    #[serde(skip)]
+    pending: BTreeMap<u64, std::collections::VecDeque<QueueItem>>,
+    /// Waits that never held when work had to run anyway (a present,
+    /// Finish or blocking CPU wait drained the queue), by kind.
+    pub forced_waits: BTreeMap<String, u64>,
     /// ECHORA_NVN_TEXTURE_LOG: each texture initialized (format, target,
     /// size, stride and guest storage address), the first 512; a hex
     /// `low-high` value keeps those with storage in that range.
@@ -642,8 +665,9 @@ impl Nvn {
         let invalid = |message: String| Trap::InvalidState {
             message: format!("{name}: {message}"),
         };
-        let stop = |message: String| Trap::UnsupportedService {
-            pc: core.cpu.pc,
+        let pc = core.cpu.pc;
+        let stop = move |message: String| Trap::UnsupportedService {
+            pc,
             service: "nvn".into(),
             command_id: None,
             message: format!("{name}: {message}"),
@@ -771,6 +795,12 @@ impl Nvn {
             // timeout, and an explicit stop for a blocking wait that would
             // never finish.
             "nvnSyncWait" => {
+                self.object(this, "Sync").map_err(invalid)?;
+                // A blocking wait on a sync a blocked queue will signal: the
+                // queues are drained (the CPU would wait forever otherwise).
+                if x[1] != 0 && self.sync_fence_pending(this) {
+                    self.drain_queues(core)?;
+                }
                 let sync = self.object(this, "Sync").map_err(invalid)?;
                 let signaled = sync.state.contains_key("Signaled");
                 core.cpu.regs[0] = if signaled {
@@ -1010,13 +1040,27 @@ impl Nvn {
                 }
                 self.object(x[1], "Sync").map_err(invalid)?;
                 let sync = self.objects.get_mut(&x[1]).unwrap();
-                sync.state.insert("Signaled".into(), args);
+                if self.pending.get(&this).is_some_and(|work| !work.is_empty()) {
+                    // Signaled when the queue's earlier work has run.
+                    sync.state.remove("Signaled");
+                    self.pending
+                        .get_mut(&this)
+                        .unwrap()
+                        .push_back(QueueItem::Fence { sync: x[1], args });
+                } else {
+                    sync.state.insert("Signaled".into(), args);
+                }
                 return Ok(true);
             }
-            // nvnQueueFlush / nvnQueueFinish: submitted host work is already
-            // complete, so nothing is pending.
+            // nvnQueueFlush / nvnQueueFinish: queued work runs as far as its
+            // waits allow; Finish waits for all of it, so a queue still
+            // blocked then is drained.
             "nvnQueueFlush" | "nvnQueueFinish" => {
                 self.object(this, "Queue").map_err(invalid)?;
+                self.pump_queues(core)?;
+                if name == "nvnQueueFinish" {
+                    self.drain_queues(core)?;
+                }
                 return Ok(true);
             }
             // nvnQueueWaitSync(NVNqueue*, const NVNsync*) -> NVNboolean: later
@@ -1028,10 +1072,12 @@ impl Nvn {
                     let note = format!("flow queue {this:x} waits sync {:x}", x[1]);
                     self.gpu_note(note);
                 }
-                let sync = self.object(x[1], "Sync").map_err(invalid)?;
-                if !sync.state.contains_key("Signaled") {
-                    return Err(stop("queue waits on a sync that is never signaled".into()));
-                }
+                self.object(x[1], "Sync").map_err(invalid)?;
+                self.pending
+                    .entry(this)
+                    .or_default()
+                    .push_back(QueueItem::WaitSync { sync: x[1] });
+                self.pump_queues(core)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1243,10 +1289,15 @@ impl Nvn {
                         );
                         self.gpu_note(note);
                     }
-                    for command in list.iter() {
-                        self.execute(command, core)?;
-                    }
+                    self.pending
+                        .entry(this)
+                        .or_default()
+                        .push_back(QueueItem::List {
+                            commands: list,
+                            next: 0,
+                        });
                 }
+                self.pump_queues(core)?;
                 return Ok(true);
             }
             // nvnTextureGetSwizzle(texture, int* r, int* g, int* b, int* a):
@@ -1342,6 +1393,7 @@ impl Nvn {
                     _ => return Err(stop(format!("event signal mode {mode} is not modeled"))),
                 };
                 core.memory.write_u32(address, new)?;
+                self.pump_queues(core)?;
                 return Ok(true);
             }
             // nvnEventInitialize(NVNevent*, const NVNeventBuilder*) ->
@@ -1691,6 +1743,9 @@ impl Nvn {
             // are sampled (ECHORA_FRAME_EVERY).
             "nvnQueuePresentTexture" => {
                 self.object(this, "Queue").map_err(invalid)?;
+                // The presented image needs the work queued before it.
+                self.pump_queues(core)?;
+                self.drain_queues(core)?;
                 let window = self.object(x[1], "Window").map_err(invalid)?;
                 let index = x[2] as u32;
                 let texture = window
@@ -2170,6 +2225,164 @@ impl Nvn {
             }
         }
         Ok(false)
+    }
+
+    /// Run queued work on every queue until none can advance: a queue stops
+    /// at a wait that does not hold, and work another queue runs (a
+    /// SignalEvent, a fence) may let it continue.
+    fn pump_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        loop {
+            let mut progressed = false;
+            let queues: Vec<u64> = self.pending.keys().copied().collect();
+            for queue in queues {
+                progressed |= self.run_queue(queue, core, false)?;
+            }
+            if !progressed {
+                self.pending.retain(|_, work| !work.is_empty());
+                return Ok(());
+            }
+        }
+    }
+
+    /// Run all queued work, waits that do not hold included (counted in
+    /// `forced_waits`): the CPU needs the results now.
+    fn drain_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        while let Some(&queue) = self
+            .pending
+            .iter()
+            .find(|(_, work)| !work.is_empty())
+            .map(|(queue, _)| queue)
+        {
+            // Queues that can run first, so the forced wait is the last
+            // resort.
+            self.pump_queues(core)?;
+            if self
+                .pending
+                .get(&queue)
+                .is_some_and(|work| !work.is_empty())
+            {
+                self.run_queue(queue, core, true)?;
+            }
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Whether `sync` has a fence queued behind blocked work.
+    fn sync_fence_pending(&self, sync: u64) -> bool {
+        self.pending
+            .values()
+            .flatten()
+            .any(|item| matches!(item, QueueItem::Fence { sync: fenced, .. } if *fenced == sync))
+    }
+
+    /// Whether a recorded WaitEvent's condition holds now.
+    fn event_wait_holds(&self, command: &Command, core: &Guest) -> Result<bool, Trap> {
+        let address = self
+            .event_address(command.x[1])
+            .map_err(|message| Trap::InvalidState {
+                message: format!("WaitEvent: {message}"),
+            })?;
+        let value = core.memory.read_u32(address)?;
+        let target = command.x[3] as u32;
+        Ok(match command.x[2] as u32 {
+            1 => value >= target,
+            _ => value == target,
+        })
+    }
+
+    /// Run `queue`'s work in order until it is done or blocked (`force`
+    /// runs through waits). Returns whether anything ran.
+    fn run_queue(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
+        let mut progressed = false;
+        loop {
+            let Some(item) = self
+                .pending
+                .get_mut(&queue)
+                .and_then(|work| work.front_mut())
+            else {
+                return Ok(progressed);
+            };
+            match item {
+                QueueItem::List { commands, next } => {
+                    let Some(command) = commands.get(*next) else {
+                        self.pending.get_mut(&queue).unwrap().pop_front();
+                        continue;
+                    };
+                    let commands = commands.clone();
+                    let index = *next;
+                    let command = &commands[index];
+                    let rest = command.name.trim_start_matches("nvnCommandBuffer");
+                    if rest == "WaitEvent" && !self.event_wait_holds(command, core)? {
+                        if !force {
+                            return Ok(progressed);
+                        }
+                        *self.forced_waits.entry("WaitEvent".into()).or_default() += 1;
+                        *self
+                            .skipped_work
+                            .entry("WaitEvent unsatisfied".into())
+                            .or_default() += 1;
+                    }
+                    if let QueueItem::List { next, .. } =
+                        self.pending.get_mut(&queue).unwrap().front_mut().unwrap()
+                    {
+                        *next += 1;
+                    }
+                    progressed = true;
+                    if rest == "WaitEvent" {
+                        continue;
+                    }
+                    if matches!(rest, "CallCommands" | "CopyCommands") {
+                        // The called lists run next, in order, ahead of
+                        // the rest of this one (their waits block too).
+                        let work = self.pending.get_mut(&queue).unwrap();
+                        for handle in command.captured.iter().rev() {
+                            match self.command_lists.get(handle) {
+                                Some((list, ..)) => work.push_front(QueueItem::List {
+                                    commands: list.clone(),
+                                    next: 0,
+                                }),
+                                None => self.stale_command_submissions += 1,
+                            }
+                        }
+                        continue;
+                    }
+                    self.execute(command, core)?;
+                }
+                QueueItem::Fence { sync, args } => {
+                    let (sync, args) = (*sync, *args);
+                    self.pending.get_mut(&queue).unwrap().pop_front();
+                    if let Some(object) = self.objects.get_mut(&sync) {
+                        object.state.insert("Signaled".into(), args);
+                    }
+                    progressed = true;
+                }
+                QueueItem::WaitSync { sync } => {
+                    let sync = *sync;
+                    let signaled = self
+                        .objects
+                        .get(&sync)
+                        .is_some_and(|object| object.state.contains_key("Signaled"));
+                    if !signaled && !self.sync_fence_pending(sync) {
+                        // No queue will signal it: waiting would never end.
+                        return Err(Trap::UnsupportedService {
+                            pc: core.cpu.pc,
+                            service: "nvn".into(),
+                            command_id: None,
+                            message: "queue waits on a sync that is never signaled".into(),
+                        });
+                    }
+                    if !signaled && !force {
+                        return Ok(progressed);
+                    }
+                    if !signaled {
+                        *self.forced_waits.entry("WaitSync".into()).or_default() += 1;
+                    }
+                    self.pending.get_mut(&queue).unwrap().pop_front();
+                    progressed = true;
+                }
+            }
+        }
     }
 
     /// Execute one recorded command on the host. Commands that are not
@@ -3256,6 +3469,7 @@ impl Nvn {
             "texture_log": self.texture_log,
             "stale_command_submissions": self.stale_command_submissions,
             "skipped_work": self.skipped_work,
+            "forced_waits": self.forced_waits,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
             "gpu_notes": self.gpu.as_ref().map(|backend| &backend.notes),
             "gpu_flushes": self.gpu.as_ref().map(|backend| {
