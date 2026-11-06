@@ -6,6 +6,7 @@
 
 mod app;
 mod chrome;
+mod install;
 
 fn main() -> std::process::ExitCode {
     app::run()
