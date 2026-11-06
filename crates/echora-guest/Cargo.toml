@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+# A dylib as well, so the translation's region bundles (shared libraries,
+# each under the 2 GiB code limit) and the runner share one copy of the
+# guest state such as the window table.
+crate-type = ["rlib", "dylib"]
+
 [dependencies]
 portable-atomic = "1"
 serde.workspace = true

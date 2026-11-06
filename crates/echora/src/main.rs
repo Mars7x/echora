@@ -587,17 +587,47 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         }
     }
 
+    // Regions are linked into a few shared libraries ("bundles"), each well
+    // under the 2 GiB that x86-64 code can span with 32-bit relative
+    // references (and that a Windows image may occupy). The dispatcher
+    // reaches each region through its bundle's re-export.
     let mut dispatch = format!(
         "[package]\nname = \"echora-translation\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
          [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
     );
-    for region in &regions {
+    let mut imports = String::new();
+    let bundles: Vec<&[u64]> = regions.chunks(BUNDLE_REGIONS).collect();
+    for (index, members) in bundles.iter().enumerate() {
+        let mut manifest = format!(
+            "[package]\nname = \"echora-bundle-{index}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+             [lib]\ncrate-type = [\"dylib\"]\n\n\
+             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+        );
+        let mut exports = String::from("// Generated. Keep this file local.\n");
+        for region in *members {
+            manifest.push_str(&format!(
+                "gen-r-{region:x} = {{ path = \"../../regions/{region:x}\" }}\n"
+            ));
+            exports.push_str(&format!("pub use gen_r_{region:x};\n"));
+            imports.push_str(&format!("use echora_bundle_{index}::gen_r_{region:x};\n"));
+        }
+        let dir = out.join("bundles").join(index.to_string());
+        write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
+        write_if_changed(&dir.join("src/lib.rs"), &exports)?;
         dispatch.push_str(&format!(
-            "gen-r-{region:x} = {{ path = \"../regions/{region:x}\" }}\n"
+            "echora-bundle-{index} = {{ path = \"../bundles/{index}\" }}\n"
         ));
     }
+    if let Ok(entries) = std::fs::read_dir(out.join("bundles")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.parse::<usize>().map_or(true, |i| i >= bundles.len()) {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+    }
     write_if_changed(&out.join("dispatch/Cargo.toml"), &dispatch)?;
-    write_if_changed(&out.join("dispatch/src/lib.rs"), &root)?;
+    write_if_changed(&out.join("dispatch/src/lib.rs"), &(imports + &root))?;
 
     // The runner: boots the process, checks it is the build this
     // translation was made from, and runs it.
@@ -632,11 +662,29 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     )?;
     // Generated code is compiled at a moderate level; the guest crate and
     // the runtime it calls into get full optimization.
+    // `rpath` lets the runner find the bundles and the shared guest crate.
     write_if_changed(
         &out.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"dispatch\", \"runner\", \"regions/*\"]\n\n\
-         [profile.release]\nopt-level = 1\n\n[profile.release.package.echora-guest]\nopt-level = 3\n\n\
+        "[workspace]\nresolver = \"3\"\nmembers = [\"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
+         [profile.release]\nopt-level = 1\nrpath = true\n\n[profile.release.package.echora-guest]\nopt-level = 3\n\n\
          [profile.release.package.echora-runtime]\nopt-level = 3\n",
+    )?;
+    // Linking the bundles as shared libraries needs the standard library
+    // linked dynamically too; on Unix the runner records where it lives.
+    let mut flags = vec!["-C".to_owned(), "prefer-dynamic".to_owned()];
+    if cfg!(unix) {
+        let libdir =
+            std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+                .args(["--print", "target-libdir"])
+                .output()
+                .context("run rustc --print target-libdir")?;
+        let libdir = String::from_utf8_lossy(&libdir.stdout).trim().to_owned();
+        flags.push("-C".into());
+        flags.push(format!("link-arg=-Wl,-rpath,{libdir}"));
+    }
+    write_if_changed(
+        &out.join(".cargo/config.toml"),
+        &format!("[build]\nrustflags = {flags:?}\n"),
     )?;
     std::fs::write(
         out.join("translation-report.json"),
@@ -651,6 +699,10 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     println!("translation: {}", out.display());
     Ok(())
 }
+
+/// Regions per shared library: about 500 MB of code each at the current
+/// code size, far from the 2 GiB limit.
+const BUNDLE_REGIONS: usize = 192;
 
 fn analyze(
     input: PathBuf,
