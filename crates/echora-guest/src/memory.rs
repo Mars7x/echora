@@ -145,12 +145,12 @@ impl Pages {
         self.resident.retain(|page| *page < start || *page >= end);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn contains_key(&self, page: &u64) -> bool {
         self.resident.contains(page)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn keys(&self) -> impl Iterator<Item = &u64> {
         self.resident.iter()
     }

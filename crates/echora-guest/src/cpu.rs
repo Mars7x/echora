@@ -334,6 +334,7 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::memory::{Memory, READ, STATE_STACK, WRITE};
 
     #[test]

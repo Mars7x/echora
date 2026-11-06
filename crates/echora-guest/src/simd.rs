@@ -3161,6 +3161,7 @@ pub fn load_replicate(
 #[cfg(test)]
 mod vector_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
     fn lanes32(values: [u32; 4]) -> u128 {
