@@ -10,15 +10,19 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+astc-decode = "0.3"
+echora-gpu.workspace = true
 echora-guest.workspace = true
 echora-loader.workspace = true
 echora-nup.workspace = true
 getrandom = { version = "0.4", features = ["std"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 miniz_oxide = "0.8"
+raw-window-handle = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+winit = "0.30"
 
 [dev-dependencies]
 echora-nup = { workspace = true, features = ["writer"] }

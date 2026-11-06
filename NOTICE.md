@@ -14,12 +14,16 @@ these separately; preserve their notices when redistributing builds.
 | Package | Version | License |
 |---|---|---|
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 |
+| `ash` | 0.38.0 | MIT OR Apache-2.0 |
+| `astc-decode` | 0.3.1 | MIT OR Apache-2.0 |
+| `cc` (build) | 1.11.0 | MIT OR Apache-2.0 |
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
 | `jiff` | 0.2.39 | Unlicense OR MIT |
 | `libc` | 0.2.191 | MIT OR Apache-2.0 |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `portable-atomic` | 1.15.0 | Apache-2.0 OR MIT |
+| `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | `lz4_flex` | 0.11.6 | MIT |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 |
@@ -28,6 +32,7 @@ these separately; preserve their notices when redistributing builds.
 | `toml` | 1.2.0 | MIT OR Apache-2.0 |
 | `tracing` | 0.1.44 | MIT |
 | `tracing-subscriber` | 0.3.23 | MIT |
+| `winit` | 0.30.13 | Apache-2.0 |
 | `yaxpeax-arch` | 0.3.3 | 0BSD |
 | `yaxpeax-arm` | 0.4.0 | 0BSD |
 | `zstd` | 0.13.4 | MIT (bundles zstd, BSD-3-Clause OR GPL-2.0) |
@@ -61,7 +66,9 @@ including its network-interaction clause.
   its `crates/guest`; `crates/echora-lift` from its `src/aarch64.rs`,
   `src/simd.rs` and `src/codegen.rs`; `crates/echora-runtime` from its
   runtime, threads, synchronization, IPC, services, logging, file system,
-  RomFS, HID, display, content, HLE, audio and bootstrap modules; and the
+  RomFS, HID, display, content, HLE, audio, bootstrap, NVN, SASS, format
+  and window modules; `crates/echora-gpu` from its `crates/gpu` and
+  `native/shader`; and the
   synthetic programs and
   atomics assertions in `crates/echora-aot-tests` from its
   `tests/aot_execution.rs`.

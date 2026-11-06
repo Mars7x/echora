@@ -14,8 +14,14 @@
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
-- The runtime's NVN layer implements no graphics call yet (the first NVN call
-  stops with its name), and there is no window, input or audio backend.
+- The NVN layer is Pokopia's: OoT's mesh/task pipelines, AV1 video and other
+  Switch 2 graphics features it needs are not implemented. NVN calls the
+  Vulkan backend directly; a backend trait (for Metal and Direct3D 12) is
+  still to be introduced. There is no input or audio backend, and the
+  window runs on its own thread, which macOS does not allow.
+- Shader translation needs the fetched recompiler sources
+  (`ECHORA_SHADER_SRC`); binaries built with them include AGPL-3.0 code
+  (sirit).
 - RomFS data from a NUP is read in place; raw files are not hash-checked on
   each read (`echora verify` checks every file), compressed files are
   verified when decoded.
