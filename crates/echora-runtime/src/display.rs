@@ -62,7 +62,7 @@ pub struct DisplaySessionState {
 pub type Handled = Result<Vec<u8>, String>;
 
 fn word(arguments: &[u8], index: usize) -> u32 {
-    u32::from_le_bytes(arguments[index * 4..index * 4 + 4].try_into().unwrap())
+    crate::bytes::le_u32(&arguments[index * 4..index * 4 + 4])
 }
 
 fn dword(arguments: &[u8], index: usize) -> u64 {
@@ -274,6 +274,7 @@ impl DisplaySessionState {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -722,12 +722,16 @@ impl ThreadCollection {
             let serde_json::Value::Object(fields) = part else {
                 unreachable!("thread report fragments are object literals");
             };
-            report.as_object_mut().unwrap().extend(fields);
+            report
+                .as_object_mut()
+                .expect("the report is built as a JSON object")
+                .extend(fields);
         }
         report
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;

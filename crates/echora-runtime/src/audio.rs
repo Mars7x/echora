@@ -52,6 +52,7 @@ pub fn apply_volume(pcm: &mut [u8], volume: f32) {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

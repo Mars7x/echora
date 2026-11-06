@@ -136,6 +136,7 @@ pub fn write_controller(
     memory.initialize(base + NPAD_CONDITION, &condition)
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;

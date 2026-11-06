@@ -108,6 +108,7 @@ pub fn program_length(code: &[u8]) -> Option<usize> {
     None
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

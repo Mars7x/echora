@@ -400,6 +400,7 @@ fn validate_controls(
     disjoint(&ranges, label)
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

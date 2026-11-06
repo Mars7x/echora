@@ -26,8 +26,8 @@
 - RomFS data from a NUP is read in place; raw files are not hash-checked on
   each read (`echora verify` checks every file), compressed files are
   verified when decoded.
-- The ported runtime still uses `unwrap()` in about 70 places, mostly
-  fixed-length slice conversions; they should become checked conversions.
+- The ported NVN modules still use `unwrap()` after presence checks; the
+  rest of the runtime states its invariants or recovers from poisoned locks.
 - Update RomFS is not overlaid on base RomFS. The checked OoT input is a
   standalone update whose RomFS is used whole; its completeness is not
   verified against a base.

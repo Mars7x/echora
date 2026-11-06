@@ -92,7 +92,7 @@ pub fn inflate_finish_sites(module: &NsoModule) -> Vec<u64> {
         let start = offset.checked_sub(u64::from(text.memory_offset))? as usize;
         text.bytes
             .get(start..start + 4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .map(|bytes| crate::bytes::le_u32(bytes))
     };
     let matching = INFLATE.iter().find(|build| {
         build
@@ -198,6 +198,7 @@ fn inflate_zlib(input: &[u8], capacity: usize) -> Option<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(input, capacity).ok()
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
@@ -243,7 +244,7 @@ mod tests {
         assert_eq!(memory.read_u32(0x10020).unwrap(), 64 - 23);
         assert_eq!(memory.read_u64(0x10028).unwrap(), 23);
         // Adler-32 of the output, as stored in the stream trailer.
-        let trailer = u32::from_be_bytes(HELLO[len as usize - 4..].try_into().unwrap());
+        let trailer = crate::bytes::be_u32(&HELLO[len as usize - 4..]);
         assert_eq!(memory.read_u64(0x10060).unwrap(), u64::from(trailer));
 
         // Too little output space, and corrupt data.

@@ -258,6 +258,7 @@ pub fn size(path: &Path) -> FsResult<u64> {
         .map_err(not_found)
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
