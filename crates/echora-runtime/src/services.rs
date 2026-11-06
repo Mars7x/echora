@@ -4615,9 +4615,10 @@ impl Services {
         match call.request.command_id {
             // Initialize: copied process handle, then the applet resource user
             // ID, bootstrap flags and four remote-memory parameters (Eden
-            // 1a6d7d4 graphics_supervisor_protocol.h). The flags value and the
-            // all-zero parameters are the only observed bootstrap; it requests
-            // no remote memory, so success only advances the session phase.
+            // 1a6d7d4 graphics_supervisor_protocol.h). The flags select
+            // bootstrap features that change nothing modeled here (titles send
+            // 0x8000000000000005 and ...07); all-zero parameters request no
+            // remote memory, so success only advances the session phase.
             4 => {
                 call.shape_with_copies(48, false, false, 1)?;
                 let word = |at: usize| crate::bytes::le_u64(&call.request.arguments[at..at + 8]);
@@ -4638,10 +4639,13 @@ impl Services {
                         "Initialize applet resource user ID is not the application's",
                     ));
                 }
-                if flags != 0x8000_0000_0000_0005 || parameters != [0; 4] {
+                if parameters != [0; 4] {
                     return Err(call.unsupported(
                         SERVICE,
-                        "Initialize bootstrap flags or remote-memory parameters are not the modeled values",
+                        format!(
+                            "Initialize remote-memory parameters {parameters:#x?} (flags \
+                             {flags:#x}) are not modeled"
+                        ),
                     ));
                 }
                 call.reply(0, None, 0, &[])?;
