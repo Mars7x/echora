@@ -980,8 +980,6 @@ impl Launcher {
             .flex_col()
             .rounded_l(u(radius::SHEET))
             .bg(color(palette::SIDEBAR))
-            .border_r_1()
-            .border_color(color(palette::BORDER))
             .child(title)
             .child(
                 div()
