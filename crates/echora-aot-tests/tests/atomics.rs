@@ -1,7 +1,7 @@
 //! Load/store-exclusive, compare-and-swap, atomic add, load-acquire and
 //! store-release semantics, executed natively. The body is transcribed from
 //! pokopia-recomp `tests/aot_execution.rs`.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 #![allow(
     clippy::unwrap_used,
     clippy::type_complexity,

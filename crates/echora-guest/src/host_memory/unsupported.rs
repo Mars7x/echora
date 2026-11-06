@@ -12,7 +12,7 @@ impl HostMemory {
     pub(crate) fn new(_size: u64) -> Self {
         panic!(
             "guest memory has no backend for this host yet: Echora's guest view needs \
-             4 KiB host pages and page-granular file views (implemented for Linux only)"
+             4 KiB host pages and page-granular file views (implemented for Linux and Windows only)"
         )
     }
 

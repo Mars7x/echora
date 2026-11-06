@@ -504,7 +504,7 @@ fn outside(address: u64) -> ! {
     panic!("guest memory access at {address:#x} lies outside the guest address space")
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::memory::{AtomicOp, Memory, READ, STATE_NORMAL, WRITE};

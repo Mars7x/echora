@@ -6266,7 +6266,7 @@ fn vibration_device(handle: &[u8]) -> u32 {
     u32::from(handle[1]) << 8 | u32::from(handle[2])
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 

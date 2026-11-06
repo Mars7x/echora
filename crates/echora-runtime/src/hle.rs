@@ -198,7 +198,7 @@ fn inflate_zlib(input: &[u8], capacity: usize) -> Option<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(input, capacity).ok()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 

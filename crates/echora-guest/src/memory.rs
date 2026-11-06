@@ -145,12 +145,12 @@ impl Pages {
         self.resident.retain(|page| *page < start || *page >= end);
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     fn contains_key(&self, page: &u64) -> bool {
         self.resident.contains(page)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     fn keys(&self) -> impl Iterator<Item = &u64> {
         self.resident.iter()
     }
@@ -1760,7 +1760,7 @@ impl Memory {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
