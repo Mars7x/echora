@@ -455,6 +455,50 @@ pub fn menu_item(id: impl Into<ElementId>, label: &'static str, selected: bool) 
         .child(label)
 }
 
+/// How long a menu takes to fold away.
+pub const MENU_OUT: Duration = Duration::from_millis(150);
+
+/// A [`menu`]'s height, in design pixels, with `rows` items.
+fn menu_height(rows: usize) -> f32 {
+    let rows = rows as f32;
+    space::XS * 2.0 + 32.0 * rows + 2.0 * (rows - 1.0).max(0.0) + 2.0
+}
+
+/// A [`menu`] of `rows` items springing open from its top edge, as a popover
+/// does: it unfolds from most of its height to all of it (overshooting a
+/// little) while fading in. Its items are clipped as it unfolds, its shadow
+/// isn't.
+pub fn menu_opening(menu: Div, rows: usize, id: impl Into<ElementId>, motion: bool) -> AnyElement {
+    if !motion {
+        return menu.into_any_element();
+    }
+    let height = menu_height(rows);
+    menu.overflow_hidden()
+        .with_animation(id, Animation::new(SPRING), move |menu, t| {
+            let unfold = spring(t);
+            menu.h(u(height * (0.6 + 0.4 * unfold)))
+                .opacity(ease_out(t / 0.4))
+                .relative()
+                .top(u(-6.0 * (1.0 - unfold)))
+        })
+        .into_any_element()
+}
+
+/// A [`menu`] of `rows` items folding back up and fading out over
+/// [`MENU_OUT`], after it closed.
+pub fn menu_closing(menu: Div, rows: usize, id: impl Into<ElementId>) -> AnyElement {
+    let height = menu_height(rows);
+    menu.overflow_hidden()
+        .with_animation(id, Animation::new(MENU_OUT), move |menu, t| {
+            let fold = t * t;
+            menu.h(u(height * (1.0 - 0.4 * fold)))
+                .opacity(1.0 - ease_out(t))
+                .relative()
+                .top(u(-6.0 * fold))
+        })
+        .into_any_element()
+}
+
 /// A boxed list: rows on a card, separated by thin lines, with an optional
 /// group title above.
 pub fn group(title: Option<&'static str>, rows: Vec<AnyElement>) -> Div {

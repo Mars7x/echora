@@ -131,6 +131,9 @@ struct Launcher {
     closing: Option<Sheet>,
     /// The settings pop-up menu that is open, by id.
     open_menu: Option<&'static str>,
+    /// A menu folding away after being closed, and which closing it is.
+    closing_menu: Option<(&'static str, u64)>,
+    menu_closes: u64,
     /// The menu closed by the current mouse press, so the release on its
     /// own button doesn't open it again.
     menu_dismissed: Option<&'static str>,
@@ -302,6 +305,8 @@ impl Launcher {
             sheet_focus: cx.focus_handle(),
             closing: None,
             open_menu: None,
+            closing_menu: None,
+            menu_closes: 0,
             menu_dismissed: None,
             toggled: None,
             buttons,
@@ -547,10 +552,32 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Closes the open menu, which folds away, and returns its id.
+    fn close_menu(&mut self, cx: &mut Context<Self>) -> Option<&'static str> {
+        let menu = self.open_menu.take()?;
+        if self.motion {
+            self.menu_closes += 1;
+            let close = (menu, self.menu_closes);
+            self.closing_menu = Some(close);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(ui::MENU_OUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.closing_menu == Some(close) {
+                        this.closing_menu = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+        Some(menu)
+    }
+
     /// Escape, B and the close buttons: closes an open menu first, then the
     /// sheet, which fades out. Focus goes back to what opened it.
     fn close_sheet(&mut self, _: &CloseSheet, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(menu) = self.open_menu.take() {
+        if let Some(menu) = self.close_menu(cx) {
             window.focus(&self.stops.handle((menu, 0usize), cx));
             cx.notify();
             return;
@@ -1456,7 +1483,7 @@ impl Launcher {
                     return;
                 }
                 if this.open_menu == Some(id) {
-                    this.open_menu = None;
+                    this.close_menu(cx);
                     window.focus(&this.stops.handle((id, 0usize), cx));
                 } else {
                     // Focus starts on the current choice.
@@ -1465,8 +1492,41 @@ impl Launcher {
                 }
                 cx.notify();
             }));
+        // Where the menu hangs, below the button's right edge, above
+        // everything else.
+        let hang = |menu: AnyElement| {
+            div().absolute().top(u(36.0)).right_0().child(
+                deferred(
+                    anchored()
+                        .anchor(gpui::Corner::TopRight)
+                        .snap_to_window_with_margin(px(space::S))
+                        .child(menu),
+                )
+                .with_priority(2),
+            )
+        };
         if !open {
-            return div().flex_none().child(button).into_any_element();
+            // A menu just closed folds away, no longer taking input.
+            let closing = self
+                .closing_menu
+                .filter(|&(menu, _)| live && menu == id)
+                .map(|(_, close)| {
+                    let menu =
+                        ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
+                            ui::menu_item((id, index + 1), label, value == current)
+                        }));
+                    hang(ui::menu_closing(
+                        menu,
+                        choices.len(),
+                        ElementId::Name(format!("{id}-close-{close}").into()),
+                    ))
+                });
+            return div()
+                .relative()
+                .flex_none()
+                .child(button)
+                .children(closing)
+                .into_any_element();
         }
         let menu = ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
             self.stop_rounded(
@@ -1476,7 +1536,7 @@ impl Launcher {
                 cx,
             )
             .on_press(cx.listener(move |this, _, window, cx| {
-                this.open_menu = None;
+                this.close_menu(cx);
                 window.focus(&this.stops.handle((id, 0usize), cx));
                 this.change(cx, |settings| apply(settings, value));
             }))
@@ -1497,7 +1557,7 @@ impl Launcher {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
-                                    this.open_menu = None;
+                                    this.close_menu(cx);
                                     this.menu_dismissed = Some(id);
                                     window.focus(&this.stops.handle((id, 0usize), cx));
                                     cx.notify();
@@ -1507,17 +1567,12 @@ impl Launcher {
                 )
                 .with_priority(1),
             )
-            .child(
-                div().absolute().top(u(36.0)).right_0().child(
-                    deferred(
-                        anchored()
-                            .anchor(gpui::Corner::TopRight)
-                            .snap_to_window_with_margin(px(space::S))
-                            .child(ui::appear(menu, (id, 101usize), -6.0, self.motion)),
-                    )
-                    .with_priority(2),
-                ),
-            )
+            .child(hang(ui::menu_opening(
+                menu,
+                choices.len(),
+                (id, 101usize),
+                self.motion,
+            )))
             .into_any_element()
     }
 
