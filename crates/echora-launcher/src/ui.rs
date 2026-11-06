@@ -184,24 +184,40 @@ pub fn button(
         .child(label.into())
 }
 
-/// A window control (close, minimize, maximize): 24 px at every UI scale,
-/// as the desktop's own are, dimmed while the window is in the background.
-pub fn window_button(
-    id: impl Into<gpui::ElementId>,
-    icon: &'static str,
-    active: bool,
-) -> Stateful<Div> {
+/// A round 24 px button holding a 16 px symbolic icon: the window controls
+/// (close, minimize, maximize) and a sheet's close button. It stays 24 px at
+/// every UI scale, as the desktop's own controls do, and its icon dims while
+/// the window is in the background.
+///
+/// The circle is an SVG like the icon. GPUI snaps each SVG to whole pixels
+/// from its centre, so two SVGs sharing a centre land on the same pixels; a
+/// circle drawn as a rounded box would sit at the exact position instead,
+/// which on a sheet centred to half a pixel puts the glyph off-centre.
+pub fn round_button(id: impl Into<ElementId>, icon: &'static str, active: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .group(ROUND_BUTTON)
+        .relative()
         .flex_none()
         .size(px(24.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(color(palette::FILL))
-        .hover(|style| style.bg(color(palette::FILL_HOVER)))
-        .active(|style| style.bg(color(palette::FILL_PRESSED)))
+        .child(
+            gpui::svg()
+                .path(CIRCLE)
+                .id("circle")
+                .absolute()
+                .inset_0()
+                .text_color(color(palette::FILL))
+                .group_hover(ROUND_BUTTON, |style| {
+                    style.text_color(color(palette::FILL_HOVER))
+                })
+                .group_active(ROUND_BUTTON, |style| {
+                    style.text_color(color(palette::FILL_PRESSED))
+                }),
+        )
         .child(
             gpui::svg()
                 .path(icon)
@@ -214,26 +230,8 @@ pub fn window_button(
         )
 }
 
-/// A round 24 px icon button, like the window's own buttons.
-pub fn icon_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .size(u(24.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(color(palette::FILL))
-        .hover(|style| style.bg(color(palette::FILL_HOVER)))
-        .active(|style| style.bg(color(palette::FILL_PRESSED)))
-        .child(
-            gpui::svg()
-                .path(icon)
-                .size(u(16.0))
-                .text_color(color(palette::LABEL)),
-        )
-}
+const ROUND_BUTTON: &str = "round-button";
+const CIRCLE: &str = "icons/circle.svg";
 
 /// An on/off switch, 40 by 24 px: the same dark knob in both states, on a
 /// white track when on and a gray one when off. `animate` slides the knob,
