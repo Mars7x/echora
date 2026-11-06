@@ -697,6 +697,20 @@ impl Machine {
             if completion.is_none() && record.deadline.is_some_and(|deadline| now >= deadline) {
                 // A finished SleepThread returns no result (W0 is written 0).
                 completion = Some(if record.sleep { (0, -1) } else { (0xea01, -1) });
+                if !record.sleep && self.debug_messages.len() < 256 {
+                    let objects: Vec<String> = record
+                        .handles
+                        .iter()
+                        .map(|&handle| match self.services.readable_event_kind(handle) {
+                            Some(kind) => format!("{handle:#x} {kind}"),
+                            None => format!("{handle:#x}"),
+                        })
+                        .collect();
+                    self.debug_messages.push(format!(
+                        "wait timed out: thread {id}, objects [{}]",
+                        objects.join(", ")
+                    ));
+                }
             }
             let Some((result, index)) = completion else {
                 continue;
@@ -3190,6 +3204,25 @@ impl Machine {
                         self.debug_messages.push(format!("break payload: {hex}"));
                     }
                 }
+                // Frame-record chain (x29 -> [fp, lr]) so the report shows
+                // who called the abort.
+                let mut frames = vec![format!("{:#x}", self.core.cpu.regs[30])];
+                let mut fp = self.core.cpu.regs[29];
+                while frames.len() < 24 && fp != 0 && fp % 16 == 0 {
+                    let mut record = [0u8; 16];
+                    if self.memory.read(fp, &mut record).is_err() {
+                        break;
+                    }
+                    let next = crate::bytes::le_u64(&record[..8]);
+                    let lr = crate::bytes::le_u64(&record[8..]);
+                    frames.push(format!("{lr:#x}"));
+                    if next <= fp {
+                        break;
+                    }
+                    fp = next;
+                }
+                self.debug_messages
+                    .push(format!("break backtrace: {}", frames.join(" ")));
                 Err(Trap::GuestBreak {
                     pc: self.core.cpu.pc,
                     reason: args[0],

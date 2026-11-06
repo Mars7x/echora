@@ -35,6 +35,8 @@ const AS_INITIALIZE_EX: u32 = 0x4028_4109;
 const AS_GET_SYNC_RO_MAP: u32 = 0x8010_410b;
 /// NVGPU_AS_IOCTL_GET_VA_REGIONS (in/out, 0x40 bytes).
 const AS_GET_VA_REGIONS: u32 = 0xc040_4108;
+/// NVGPU_AS_IOCTL_BIND_CHANNEL (in, u32 channel fd).
+const AS_BIND_CHANNEL: u32 = 0x4004_4101;
 const SMALL_PAGE_SIZE: u32 = 0x1000;
 /// Read-only syncpoint map: base GPU VA, bytes per syncpoint, count.
 const SYNC_RO_MAP_BASE: u64 = 0xff_0000_0000;
@@ -66,8 +68,11 @@ fn native_gpu_characteristics() -> Vec<u8> {
     put32(0x30, 0x1b); // pde_coverage_bit_count
     put32(0x34, 0x10000 | 0x1000); // available page sizes
     put32(0x38, 0x1); // gpc_mask
-    put32(0x3c, 0x807); // SM version
-    put32(0x40, 0x807); // SPA version
+    // SM and SPA version 8.8: Eden has 8.7 (Orin), but this SDK's NVN only
+    // has built-in GPU data for 0x808 (sdk+0x674560 returns none for any
+    // other value, and nvnDeviceInitialize then fails).
+    put32(0x3c, 0x808); // SM version
+    put32(0x40, 0x808); // SPA version
     put32(0x44, 0x80); // sm_arch_warp_count
     put32(0x48, 0x28); // gpu_va_bit_count
     put32(0x58, 0x902d); // twod_class
@@ -104,12 +109,16 @@ struct AddressSpace {
 #[derive(Clone, Debug, Default)]
 pub struct Devices {
     address_spaces: std::collections::BTreeMap<u32, AddressSpace>,
+    /// Channel fd -> the address-space fd it is bound to.
+    channel_spaces: std::collections::BTreeMap<u32, u32>,
 }
 
 impl Devices {
     /// Forgets the state of a closed descriptor.
     pub fn close(&mut self, fd: u32) {
         self.address_spaces.remove(&fd);
+        self.channel_spaces.remove(&fd);
+        self.channel_spaces.retain(|_, space| *space != fd);
     }
 }
 
@@ -281,6 +290,19 @@ pub fn ioctl(
                 ..IoctlOutput::default()
             })
         }
+        // NVGPU_AS_IOCTL_BIND_CHANNEL: binds a channel fd to this
+        // initialized address space (Eden 1a6d7d4 accepts it without
+        // effect). The binding is recorded; a channel binds once.
+        ("/dev/nvhost-as-gpu", AS_BIND_CHANNEL) if input.len() >= 4 => {
+            if !devices.address_spaces.contains_key(&fd) {
+                return Err(format!("BIND_CHANNEL before INITIALIZE_EX on fd {fd}"));
+            }
+            let channel = u32_at(input, 0);
+            if devices.channel_spaces.insert(channel, fd).is_some() {
+                return Err(format!("channel fd {channel} is already bound"));
+            }
+            Ok(IoctlOutput::default())
+        }
         // Eden 1a6d7d4 stubs Ioctl3 0x13 on this device as NotImplemented
         // and writes no output; the SDK continues past that result.
         ("/dev/nvhost-ctrl-gpu", GPU_IOCTL_13) => Ok(IoctlOutput {
@@ -358,6 +380,23 @@ mod tests {
     }
 
     #[test]
+    fn channels_bind_once_to_an_initialized_address_space() {
+        let mut devices = Devices::default();
+        let as_gpu = "/dev/nvhost-as-gpu";
+        let channel = 4u32.to_le_bytes();
+        assert!(ioctl(&mut devices, 2, as_gpu, 0x4004_4101, &channel, 0, 0).is_err());
+        let mut init = vec![0u8; 0x28];
+        init[8..12].copy_from_slice(&0x10000u32.to_le_bytes());
+        init[0x18..0x20].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        ioctl(&mut devices, 2, as_gpu, 0x4028_4109, &init, 0, 0).unwrap();
+        ioctl(&mut devices, 2, as_gpu, 0x4004_4101, &channel, 0, 0).unwrap();
+        assert!(ioctl(&mut devices, 2, as_gpu, 0x4004_4101, &channel, 0, 0).is_err());
+        // Closing the channel forgets its binding.
+        devices.close(4);
+        ioctl(&mut devices, 2, as_gpu, 0x4004_4101, &channel, 0, 0).unwrap();
+    }
+
+    #[test]
     fn native_characteristics_report_ampere_with_the_input_address_echoed() {
         let mut input = vec![0u8; 0xe8];
         input[..8].copy_from_slice(&0xe8u64.to_le_bytes());
@@ -369,7 +408,7 @@ mod tests {
         assert_eq!(out.output[0x10..], out.inline_output[..]);
         let word =
             |at: usize| u32::from_le_bytes(out.inline_output[at..at + 4].try_into().unwrap());
-        assert_eq!((word(0), word(4), word(0x3c)), (0x170, 0xe, 0x807));
+        assert_eq!((word(0), word(4), word(0x3c)), (0x170, 0xe, 0x808));
         assert_eq!(word(0x5c), 0xb197);
         assert!(call("/dev/nvhost-ctrl-gpu", 0xc0e8_4705, &input, 0xe8, 0xd0).is_err());
         assert!(call("/dev/nvmap", 0xc0e8_4705, &input, 0xe8, 0xd8).is_err());

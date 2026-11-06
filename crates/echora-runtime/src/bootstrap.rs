@@ -65,6 +65,21 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
 
 /// Loads the ExeFS in `exefs` into a new process with an instruction budget
 /// of `max_steps`.
+/// Addresses of the exports the runtime replaces with host functions
+/// (`nvn::HOOKED_EXPORTS`). A hook only runs where no translated block
+/// exists, so translation must leave these addresses out.
+pub fn hooked_export_addresses(placed: &[PlacedModule]) -> Result<Vec<u64>> {
+    let mut addresses = Vec::new();
+    for name in crate::nvn::HOOKED_EXPORTS {
+        for p in placed {
+            if let Some(offset) = echora_loader::defined_symbol(&p.module, name)? {
+                addresses.push(p.base + offset);
+            }
+        }
+    }
+    Ok(addresses)
+}
+
 pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     let modules = echora_loader::load_exefs(exefs)?;
     let npdm = crate::npdm::load_npdm(&exefs.join("main.npdm"))?;
@@ -194,14 +209,10 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
 
     // Replace the NVN driver's bootstrap export with a host entry; the thunk
     // range stays unmapped.
-    for name in crate::nvn::HOOKED_EXPORTS {
-        for p in &placed {
-            if let Some(offset) = echora_loader::defined_symbol(&p.module, name)? {
-                machine
-                    .nvn
-                    .add_hook(p.base + offset, crate::nvn::HostEntry::BootstrapLoader);
-            }
-        }
+    for address in hooked_export_addresses(&placed)? {
+        machine
+            .nvn
+            .add_hook(address, crate::nvn::HostEntry::BootstrapLoader);
     }
     // Host replacements for known library functions, matched by exact code.
     if std::env::var_os("ECHORA_NO_HLE").is_none() {
