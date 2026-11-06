@@ -360,11 +360,10 @@ impl Machine {
     }
 
     /// Horizon exposes four stable process entropy words. Draw them once from
-    /// the Linux OS source; never substitute fixed words on an I/O failure.
+    /// the host OS source; never substitute fixed words on an I/O failure.
     pub fn initialize_entropy_from_os(&mut self) -> std::io::Result<()> {
-        use std::io::Read;
         let mut bytes = [0u8; 32];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        getrandom::fill(&mut bytes)?;
         self.random_entropy = Some(std::array::from_fn(|index| {
             u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
         }));
@@ -2383,13 +2382,10 @@ impl Machine {
                 message: "configured main handle collides with the dynamic handle namespace".into(),
             });
         }
-        use std::io::Read;
         let mut random = [0u8; 8];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut random))
-            .map_err(|error| Trap::InvalidState {
-                message: format!("initialize thread X18 entropy from Linux: {error}"),
-            })?;
+        getrandom::fill(&mut random).map_err(|error| Trap::InvalidState {
+            message: format!("initialize thread X18 entropy from the host: {error}"),
+        })?;
         self.threads.create(
             &mut self.memory,
             self.layout.tls_base,
