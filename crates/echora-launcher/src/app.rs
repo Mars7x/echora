@@ -9,11 +9,14 @@ use std::time::Duration;
 use echora_config::{InternalResolutionSetting, Settings, WindowMode};
 use echora_content::ContentSource;
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Decorations, FocusHandle, FontWeight, Hsla,
-    Image, ImageFormat, KeyBinding, MouseButton, ObjectFit, PathPromptOptions, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions, actions, div, img,
-    point, prelude::*, px, rgba, size,
+    AnyElement, App, Application, Bounds, BoxShadow, Context, CursorStyle, Decorations,
+    FocusHandle, FontWeight, HitboxBehavior, Hsla, Image, ImageFormat, KeyBinding, MouseButton,
+    MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels, RenderImage, ResizeEdge, SharedString,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgba, size, svg,
 };
+
+use crate::chrome::{self, ButtonLayout, WindowButton};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -23,7 +26,7 @@ const RESOLUTIONS: [(&str, InternalResolutionSetting); 5] = [
     ("720p", InternalResolutionSetting::Height { height: 720 }),
     ("1080p", InternalResolutionSetting::Height { height: 1080 }),
     ("1440p", InternalResolutionSetting::Height { height: 1440 }),
-    ("4K", InternalResolutionSetting::Height { height: 2160 }),
+    ("2160p", InternalResolutionSetting::Height { height: 2160 }),
 ];
 
 const WINDOW_MODES: [(&str, WindowMode); 3] = [
@@ -50,7 +53,10 @@ mod palette {
     pub const PLAY: u32 = 0xffffffff;
     pub const PLAY_HOVER: u32 = 0xe0e0e0ff;
     pub const PLAY_TEXT: u32 = 0x0d0d0dff;
-    pub const SCRIM: u32 = 0x000000a6;
+    pub const SCRIM: u32 = 0x00000080;
+    pub const WINDOW_BUTTON: u32 = 0xffffff1f;
+    pub const WINDOW_BUTTON_HOVER: u32 = 0xffffff33;
+    pub const WINDOW_BORDER: u32 = 0xffffff14;
     pub const ART_SHADE: u32 = 0x0000004d;
 }
 
@@ -88,6 +94,15 @@ struct Game {
     title: SharedString,
     version: SharedString,
     icon: Option<Arc<Image>>,
+    /// The icon decoded once (BGRA, as GPUI uploads it), for the backdrop.
+    art: Option<image::RgbaImage>,
+}
+
+/// The backdrop cropped to the window's shape, so it can be drawn at exactly
+/// the window's size and its corners rounded with the window's.
+struct Backdrop {
+    crop: (u32, u32, u32, u32),
+    image: Arc<RenderImage>,
 }
 
 struct Launcher {
@@ -96,6 +111,13 @@ struct Launcher {
     settings: Settings,
     settings_path: Option<PathBuf>,
     sheet: Option<Sheet>,
+    /// Window buttons the desktop asks for, when decorations are ours.
+    buttons: ButtonLayout,
+    /// Corner radius of the window this frame (zero when maximized or tiled).
+    corner: Pixels,
+    /// A title bar press that turns into a window move once the mouse drags.
+    moving: bool,
+    backdrop: Option<Backdrop>,
     settings_tab: SettingsTab,
     notice: Option<SharedString>,
     notice_generation: u64,
@@ -108,44 +130,50 @@ pub fn run() -> ExitCode {
     if !show && let Some(code) = skip_to_game() {
         return code;
     }
-    Application::new().run(|cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("enter", Play, Some("Launcher")),
-            KeyBinding::new("ctrl-,", ToggleSettings, Some("Launcher")),
-            KeyBinding::new("cmd-,", ToggleSettings, Some("Launcher")),
-            KeyBinding::new("escape", CloseSheet, Some("Launcher")),
-            KeyBinding::new("ctrl-o", ChooseGame, Some("Launcher")),
-            KeyBinding::new("cmd-o", ChooseGame, Some("Launcher")),
-            KeyBinding::new("ctrl-q", Quit, None),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Echora".into()),
-                appears_transparent: cfg!(target_os = "macos"),
-                traffic_light_position: Some(point(px(14.0), px(14.0))),
-            }),
-            app_id: Some(APP_ID.into()),
-            window_min_size: Some(size(px(720.0), px(460.0))),
-            window_decorations: Some(WindowDecorations::Client),
-            ..Default::default()
-        };
-        let opened = cx.open_window(options, |window, cx| {
-            cx.new(|cx| {
-                let launcher = Launcher::new(cx);
-                window.focus(&launcher.focus);
-                launcher
-            })
+    let buttons = ButtonLayout::from_desktop();
+    Application::new()
+        .with_assets(chrome::Icons)
+        .run(move |cx: &mut App| {
+            cx.bind_keys([
+                KeyBinding::new("enter", Play, Some("Launcher")),
+                KeyBinding::new("ctrl-,", ToggleSettings, Some("Launcher")),
+                KeyBinding::new("cmd-,", ToggleSettings, Some("Launcher")),
+                KeyBinding::new("escape", CloseSheet, Some("Launcher")),
+                KeyBinding::new("ctrl-o", ChooseGame, Some("Launcher")),
+                KeyBinding::new("cmd-o", ChooseGame, Some("Launcher")),
+                KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("cmd-q", Quit, None),
+            ]);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Echora".into()),
+                    appears_transparent: cfg!(target_os = "macos"),
+                    traffic_light_position: Some(point(px(14.0), px(14.0))),
+                }),
+                app_id: Some(APP_ID.into()),
+                window_min_size: Some(size(px(720.0), px(460.0))),
+                window_decorations: Some(WindowDecorations::Client),
+                // Transparent so client-side decorations can round the corners
+                // and draw the shadow.
+                window_background: WindowBackgroundAppearance::Transparent,
+                ..Default::default()
+            };
+            let opened = cx.open_window(options, |window, cx| {
+                cx.new(|cx| {
+                    let launcher = Launcher::new(buttons, cx);
+                    window.focus(&launcher.focus);
+                    launcher
+                })
+            });
+            if let Err(error) = opened {
+                eprintln!("echora-launcher: could not open a window: {error}");
+                cx.quit();
+            }
+            cx.activate(true);
         });
-        if let Err(error) = opened {
-            eprintln!("echora-launcher: could not open a window: {error}");
-            cx.quit();
-        }
-        cx.activate(true);
-    });
     ExitCode::SUCCESS
 }
 
@@ -205,7 +233,7 @@ fn game_command(game: &Path, settings: Option<&Path>) -> Option<Command> {
 }
 
 impl Launcher {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(buttons: ButtonLayout, cx: &mut Context<Self>) -> Self {
         let (settings_path, settings) = load_settings();
         let mut launcher = Self {
             focus: cx.focus_handle(),
@@ -213,6 +241,10 @@ impl Launcher {
             settings,
             settings_path,
             sheet: None,
+            buttons,
+            corner: px(0.0),
+            moving: false,
+            backdrop: None,
             settings_tab: SettingsTab::Game,
             notice: None,
             notice_generation: 0,
@@ -380,6 +412,17 @@ fn read_game(path: &Path) -> Result<Game, String> {
         };
         Arc::new(Image::from_bytes(format, bytes.clone()))
     });
+    let art = package
+        .icon
+        .as_deref()
+        .and_then(|bytes| image::load_from_memory(bytes).ok())
+        .map(|decoded| {
+            let mut art = decoded.into_rgba8();
+            for pixel in art.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            art
+        });
     Ok(Game {
         path: path.to_path_buf(),
         title: package
@@ -389,6 +432,7 @@ fn read_game(path: &Path) -> Result<Game, String> {
             .into(),
         version: version.into(),
         icon,
+        art,
     })
 }
 
@@ -442,20 +486,23 @@ fn play_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Di
         .child(label)
 }
 
-fn window_control(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+/// A round title bar button in the style GNOME uses.
+fn window_button(button: WindowButton, maximized: bool) -> gpui::Stateful<gpui::Div> {
     div()
-        .id(id)
-        .size(px(26.0))
+        .id(button.id())
+        .size(px(24.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(color(palette::DOCK))
-        .hover(|style| style.bg(color(palette::CONTROL_HOVER)))
-        .cursor_pointer()
-        .text_sm()
-        .text_color(color(palette::TEXT))
-        .child(glyph)
+        .bg(color(palette::WINDOW_BUTTON))
+        .hover(|style| style.bg(color(palette::WINDOW_BUTTON_HOVER)))
+        .child(
+            svg()
+                .path(button.icon(maximized))
+                .size(px(16.0))
+                .text_color(color(palette::TEXT)),
+        )
 }
 
 /// A row of mutually exclusive choices.
@@ -599,11 +646,16 @@ fn about_page(cx: &mut Context<Launcher>) -> Vec<AnyElement> {
 }
 
 /// Dims the launcher behind a sheet; clicking outside the sheet closes it.
-fn scrim(sheet: gpui::Stateful<gpui::Div>, cx: &mut Context<Launcher>) -> impl IntoElement {
+fn scrim(
+    sheet: gpui::Stateful<gpui::Div>,
+    corner: Pixels,
+    cx: &mut Context<Launcher>,
+) -> impl IntoElement {
     div()
         .id("scrim")
         .absolute()
         .inset_0()
+        .rounded(corner)
         .flex()
         .items_center()
         .justify_center()
@@ -619,46 +671,117 @@ fn divider() -> impl IntoElement {
 }
 
 impl Launcher {
-    fn render_art(&self, window: &Window) -> AnyElement {
-        let Some(icon) = self.game.as_ref().and_then(|game| game.icon.clone()) else {
+    fn render_art(&mut self, window: &mut Window) -> AnyElement {
+        let Some(art) = self.game.as_ref().and_then(|game| game.art.as_ref()) else {
             return div()
                 .size_full()
                 .bg(color(palette::BACKDROP))
                 .into_any_element();
         };
+        // Keep the top of the square art, where the title artwork sits, and
+        // as much width as the window's shape allows.
+        let inset = window.client_inset().unwrap_or(px(0.0)) * 2.0;
+        let viewport = window.viewport_size();
+        let aspect =
+            f32::from(viewport.width - inset) / f32::from(viewport.height - inset).max(1.0);
+        let (width, height) = art.dimensions();
+        let crop = if aspect >= width as f32 / height as f32 {
+            (
+                0,
+                0,
+                width,
+                ((width as f32 / aspect) as u32).clamp(1, height),
+            )
+        } else {
+            let crop_width = ((height as f32 * aspect) as u32).clamp(1, width);
+            ((width - crop_width) / 2, 0, crop_width, height)
+        };
+        if self
+            .backdrop
+            .as_ref()
+            .is_none_or(|backdrop| backdrop.crop != crop)
+        {
+            let (x, y, w, h) = crop;
+            let pixels = image::imageops::crop_imm(art, x, y, w, h).to_image();
+            let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));
+            if let Some(old) = self.backdrop.replace(Backdrop { crop, image }) {
+                let _ = window.drop_image(old.image);
+            }
+        }
+        let Some(backdrop) = &self.backdrop else {
+            return div().into_any_element();
+        };
         div()
             .size_full()
             .relative()
-            // The icon is square: scale it to the window's width and keep its
-            // top, where the title artwork sits, in view.
             .child(
-                img(icon)
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w_full()
-                    .h(window.viewport_size().width)
-                    .object_fit(ObjectFit::Cover),
+                img(backdrop.image.clone())
+                    .size_full()
+                    .rounded(self.corner)
+                    .object_fit(ObjectFit::Fill),
             )
-            .child(div().absolute().inset_0().bg(color(palette::ART_SHADE)))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(self.corner)
+                    .bg(color(palette::ART_SHADE)),
+            )
             .into_any_element()
     }
 
-    fn render_top_bar(&self, window: &Window) -> impl IntoElement {
+    fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let client_side = matches!(window.window_decorations(), Decorations::Client { .. });
+        let maximized = window.is_maximized();
+        let buttons = |side: &[WindowButton]| {
+            div()
+                .flex()
+                .gap(px(10.0))
+                .children(side.iter().map(|&button| {
+                    window_button(button, maximized).on_click(move |_, window, _| match button {
+                        WindowButton::Minimize => window.minimize_window(),
+                        WindowButton::Maximize => window.zoom_window(),
+                        WindowButton::Close => window.remove_window(),
+                    })
+                }))
+        };
         div()
+            .id("title-bar")
             .absolute()
             .top_0()
             .left_0()
             .right_0()
             .h(px(52.0))
-            .px(px(22.0))
+            .px(px(14.0))
             .flex()
             .items_center()
-            .justify_between()
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+            .gap(px(12.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.moving = true),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.moving = false),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
+                if this.moving && event.dragging() {
+                    this.moving = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_click(|event, window, _| {
+                if event.is_right_click() {
+                    window.show_window_menu(event.position());
+                } else if event.click_count() == 2 {
+                    window.zoom_window();
+                }
+            })
+            .when(client_side, |el| el.child(buttons(&self.buttons.left)))
             .child(
                 div()
+                    .flex_1()
+                    .px(px(8.0))
                     .when(cfg!(target_os = "macos"), |el| el.pl(px(64.0)))
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -666,21 +789,7 @@ impl Launcher {
                     // The empty screen already shows the name in large type.
                     .when(self.game.is_some(), |el| el.child("ECHORA")),
             )
-            .when(client_side && !cfg!(target_os = "macos"), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .gap(px(8.0))
-                        .child(
-                            window_control("minimize", "–")
-                                .on_click(|_, window, _| window.minimize_window()),
-                        )
-                        .child(
-                            window_control("close", "×")
-                                .on_click(|_, window, _| window.remove_window()),
-                        ),
-                )
-            })
+            .when(client_side, |el| el.child(buttons(&self.buttons.right)))
     }
 
     fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -888,7 +997,7 @@ impl Launcher {
             .bg(color(palette::SHEET))
             .child(tabs)
             .child(content);
-        scrim(sheet, cx)
+        scrim(sheet, self.corner, cx)
     }
 
     fn render_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -933,7 +1042,7 @@ impl Launcher {
                     ))),
             )
             .children(about_page(cx));
-        scrim(sheet, cx)
+        scrim(sheet, self.corner, cx)
     }
 
     /// The chosen game and the way to change it.
@@ -1000,8 +1109,84 @@ impl Launcher {
     }
 }
 
+/// Space around the window for the shadow and the resize handles.
+const WINDOW_INSET: f32 = 12.0;
+const WINDOW_RADIUS: f32 = 14.0;
+
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Decorations::Client { tiling } = window.window_decorations() else {
+            self.corner = px(0.0);
+            return self.render_content(window, cx).into_any_element();
+        };
+        let floating = !tiling.is_tiled() && !window.is_maximized();
+        let inset = px(WINDOW_INSET);
+        window.set_client_inset(if floating { inset } else { px(0.0) });
+        self.corner = if floating { px(WINDOW_RADIUS) } else { px(0.0) };
+        let content = self
+            .render_content(window, cx)
+            .rounded(self.corner)
+            .when(floating, |el| {
+                el.border_1()
+                    .border_color(color(palette::WINDOW_BORDER))
+                    .shadow(vec![BoxShadow {
+                        color: Hsla::black().opacity(0.45),
+                        blur_radius: inset * 0.75,
+                        spread_radius: px(0.0),
+                        offset: point(px(0.0), px(2.0)),
+                    }])
+            });
+        div()
+            .id("window")
+            .size_full()
+            .when(floating, |el| {
+                el.p(inset)
+                    .child(resize_cursor(inset))
+                    .on_mouse_move(|_, window, _| window.refresh())
+                    .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                        let size = window.window_bounds().get_bounds().size;
+                        if let Some(edge) = chrome::resize_edge(event.position, inset, size) {
+                            window.start_window_resize(edge);
+                        }
+                    })
+            })
+            .child(content)
+            .into_any_element()
+    }
+}
+
+/// Shows the resize cursor over the window's edges.
+fn resize_cursor(inset: Pixels) -> impl IntoElement {
+    canvas(
+        |_, window, _| {
+            window.insert_hitbox(
+                Bounds::new(
+                    point(px(0.0), px(0.0)),
+                    window.window_bounds().get_bounds().size,
+                ),
+                HitboxBehavior::Normal,
+            )
+        },
+        move |_, hitbox, window, _| {
+            let size = window.window_bounds().get_bounds().size;
+            let Some(edge) = chrome::resize_edge(window.mouse_position(), inset, size) else {
+                return;
+            };
+            let cursor = match edge {
+                ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+                ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+                ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+                ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+            };
+            window.set_cursor_style(cursor, &hitbox);
+        },
+    )
+    .size_full()
+    .absolute()
+}
+
+impl Launcher {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .key_context("Launcher")
             .track_focus(&self.focus)
@@ -1039,7 +1224,7 @@ impl Render for Launcher {
                         ),
                 )
             })
-            .child(self.render_top_bar(window))
+            .child(self.render_top_bar(window, cx))
             .child(
                 div()
                     .absolute()
