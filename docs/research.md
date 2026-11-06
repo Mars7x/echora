@@ -162,6 +162,24 @@ Extrapolated, a full build is about 4.5 CPU-hours of region compilation;
 at six parallel jobs it needs roughly 7 GB of memory. Generated output
 belongs on disk: `/tmp` is a RAM-backed tmpfs on the development machine.
 
+## Mesh and task shaders
+
+The game's NVN table includes the whole `DrawMeshTasks` family, and the OoT
+bring-up notes say the opening uses `DrawMeshTasksIndirect`. The pinned
+PokeDinner recompiler has no task or mesh stages. Eglantine (GPL-3.0,
+branch `nx2`) added them in `310dd59` ("translate Switch 2 task and mesh
+programs", for VK_EXT_mesh_shader): task programs write a payload, mesh
+programs write vertex and primitive groups, and the two mesh instructions
+sirit lacks are patched in after assembly. The RX 9070 XT (RADV) exposes
+task and mesh stages with subgroup size control 32-64.
+
+Against Eglantine `nx2` at `0ca2032`, four of Echora's eight recompiler
+patches are already upstream in more general forms (TXQ second
+destination, TLDS x/z pairs, FSETP with a uniform source, undefined
+registers as zero) and the other four apply cleanly; the shim compiles
+against it. Moving the pin from PokeDinner to Eglantine is the planned
+route to mesh support; it has not been validated by tests yet.
+
 ## Licensing decision
 
 Echora is GPL-3.0-or-later, matching Pokopia so its code can be carried over,
