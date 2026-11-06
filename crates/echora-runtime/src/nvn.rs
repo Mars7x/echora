@@ -1766,6 +1766,34 @@ impl Nvn {
                     // limit ended with a whole-GPU reset.
                     self.gpu_submit().map_err(stop)?;
                 }
+                // ECHORA_CAPTURE_EVERY=N with ECHORA_CAPTURE_DIR (echora run
+                // sets it beside the report): the first and every N-th
+                // presented image as frame-<present>.png, unchanged frames
+                // included, so a run shows what was on screen.
+                if let (Ok(every), Some(directory)) = (
+                    debug_var("ECHORA_CAPTURE_EVERY"),
+                    debug_var_os("ECHORA_CAPTURE_DIR"),
+                ) {
+                    let every = every.parse::<u64>().unwrap_or(0).max(1);
+                    if self.presented_frames == 1 || self.presented_frames.is_multiple_of(every) {
+                        let image = if self.gpu().is_some() {
+                            self.gpu_read_back(texture).map_err(stop)?
+                        } else {
+                            self.images.get(&texture).cloned()
+                        };
+                        if let Some(image) = image {
+                            let directory = std::path::Path::new(&directory);
+                            std::fs::create_dir_all(directory).map_err(|error| {
+                                invalid(format!("create {}: {error}", directory.display()))
+                            })?;
+                            let path =
+                                directory.join(format!("frame-{:05}.png", self.presented_frames));
+                            std::fs::write(&path, image.png()).map_err(|error| {
+                                invalid(format!("write {}: {error}", path.display()))
+                            })?;
+                        }
+                    }
+                }
                 if let Some(directory) = debug_var_os("ECHORA_FRAME_DIR") {
                     if self.gpu().is_some() {
                         self.gpu_dump_targets().map_err(stop)?;
@@ -2305,10 +2333,10 @@ impl Nvn {
             };
             match item {
                 QueueItem::List { commands, next } => {
-                    let Some(command) = commands.get(*next) else {
+                    if commands.get(*next).is_none() {
                         self.pending.get_mut(&queue).unwrap().pop_front();
                         continue;
-                    };
+                    }
                     let commands = commands.clone();
                     let index = *next;
                     let command = &commands[index];
@@ -3741,6 +3769,53 @@ impl Image {
         }
         bytes
     }
+
+    /// PNG of 8-bit RGB (channels clamped to [0, 1]), for frame captures.
+    pub fn png(&self) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(self.texels.len() * 3 + self.height as usize);
+        for row in self.texels.chunks(self.width.max(1) as usize) {
+            raw.push(0); // filter: none
+            for texel in row {
+                for channel in &texel[..3] {
+                    raw.push((channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        let mut header = Vec::with_capacity(13);
+        header.extend_from_slice(&self.width.to_be_bytes());
+        header.extend_from_slice(&self.height.to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, data) in [
+            (b"IHDR", header),
+            (b"IDAT", miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6)),
+            (b"IEND", Vec::new()),
+        ] {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let start = png.len();
+            png.extend_from_slice(kind);
+            png.extend_from_slice(&data);
+            let crc = crc32(&png[start..]);
+            png.extend_from_slice(&crc.to_be_bytes());
+        }
+        png
+    }
+}
+
+/// CRC-32 (IEEE, as PNG chunks use).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 /// Modeled nvnDeviceGetInteger properties. NVN is undocumented, so each value
