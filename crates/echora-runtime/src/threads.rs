@@ -55,6 +55,8 @@ impl ThreadState {
 struct InitializedThread {
     // Preserve creation provenance independently of mutable scheduling metadata.
     request: ThreadCreate,
+    /// SetThreadPriority changes this; creation priority stays in `request`.
+    base_priority: u8,
     effective_priority: u8,
     ideal_core: i32,
     affinity_mask: u64,
@@ -216,7 +218,22 @@ impl ThreadCollection {
     }
 
     pub(crate) fn base_priority(&self, id: u64) -> Option<u8> {
-        self.threads.get(&id).map(|thread| thread.request.priority)
+        self.threads.get(&id).map(|thread| thread.base_priority)
+    }
+
+    /// The caller recomputes and applies effective priorities afterwards.
+    pub(crate) fn set_base_priority(&mut self, id: u64, priority: u8) -> Result<(), Trap> {
+        let thread = self
+            .threads
+            .get_mut(&id)
+            .ok_or_else(|| invalid("owned child thread ID does not exist"))?;
+        if priority >= 64 {
+            return Err(invalid(
+                "base priority must be a validated virtual priority",
+            ));
+        }
+        thread.base_priority = priority;
+        Ok(())
     }
 
     /// Runtime owns mutex donation and queue ordering. The collection stores
@@ -226,7 +243,7 @@ impl ThreadCollection {
             .threads
             .get_mut(&id)
             .ok_or_else(|| invalid("owned child thread ID does not exist"))?;
-        if priority > thread.request.priority {
+        if priority > thread.base_priority {
             return Err(invalid(
                 "effective priority cannot be lower than the base priority",
             ));
@@ -455,6 +472,7 @@ impl ThreadCollection {
         cpu.regs[18] = request.x18 | 1;
         let record = InitializedThread {
             request,
+            base_priority: request.priority,
             effective_priority: request.priority,
             ideal_core: i32::from(request.core),
             affinity_mask: 1u64 << request.core,
@@ -660,7 +678,7 @@ impl ThreadCollection {
                     "stack_top":thread.request.stack_top,
                     "priority":thread.effective_priority, "core":thread.request.core,
                     "creation_priority":thread.request.priority,
-                    "base_priority":thread.request.priority,
+                    "base_priority":thread.base_priority,
                     "effective_priority":thread.effective_priority,
                     "creation_core":thread.request.core,
                     "creation_affinity_mask":1u64 << thread.request.core,
