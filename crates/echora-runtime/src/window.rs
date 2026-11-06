@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use echora_config::WindowMode;
 use echora_gpu::present::WindowHandle;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
@@ -181,7 +182,7 @@ struct App {
 }
 
 /// The window's initial size: ECHORA_WINDOW_SIZE=WIDTHxHEIGHT, else the
-/// render resolution ECHORA_RESOLUTION, else 1280x720.
+/// render resolution ECHORA_RESOLUTION, else the settings' window size.
 fn window_size() -> (u32, u32) {
     let size = |name| {
         let value = std::env::var(name).ok()?;
@@ -191,7 +192,10 @@ fn window_size() -> (u32, u32) {
     };
     size("ECHORA_WINDOW_SIZE")
         .or_else(|| size("ECHORA_RESOLUTION"))
-        .unwrap_or((1280, 720))
+        .unwrap_or_else(|| {
+            let display = &crate::settings::get().display;
+            (display.window_width, display.window_height)
+        })
 }
 
 impl App {
@@ -237,8 +241,27 @@ impl ApplicationHandler for App {
         let mut attributes = Window::default_attributes()
             .with_title("Echora")
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
-        if std::env::var_os("ECHORA_FULLSCREEN").is_some_and(|value| value != "0") {
-            attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        // ECHORA_FULLSCREEN=1 overrides the settings' window mode. Exclusive
+        // fullscreen uses the monitor's current mode.
+        let mode = match std::env::var_os("ECHORA_FULLSCREEN") {
+            Some(value) if value != "0" => WindowMode::BorderlessFullscreen,
+            Some(_) => WindowMode::Windowed,
+            None => crate::settings::get().display.window_mode,
+        };
+        match mode {
+            WindowMode::Windowed => {}
+            WindowMode::BorderlessFullscreen => {
+                attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
+            }
+            WindowMode::ExclusiveFullscreen => {
+                let video = event_loop
+                    .primary_monitor()
+                    .and_then(|monitor| monitor.video_modes().next());
+                attributes = attributes.with_fullscreen(Some(match video {
+                    Some(video) => Fullscreen::Exclusive(video),
+                    None => Fullscreen::Borderless(None),
+                }));
+            }
         }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,

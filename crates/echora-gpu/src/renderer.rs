@@ -80,6 +80,11 @@ impl Scale {
     /// the console's 1080 rows: 2560x1440 is 4/3) or ECHORA_RESOLUTION_SCALE
     /// (an integer, or N/D); none by default or when out of range.
     pub fn from_env() -> Self {
+        Self::env_override().unwrap_or(Self::ONE)
+    }
+
+    /// The scale the environment asks for, if it asks.
+    pub fn env_override() -> Option<Self> {
         let resolution = std::env::var("ECHORA_RESOLUTION").ok().and_then(|value| {
             let (_, height) = value.trim().split_once(['x', 'X'])?;
             Self::new(height.trim().parse().ok()?, 1080)
@@ -94,7 +99,7 @@ impl Scale {
                 None => Self::new(value.parse().ok()?, 1),
             }
         };
-        resolution.or_else(factor).unwrap_or(Self::ONE)
+        resolution.or_else(factor)
     }
 
     pub fn is_one(self) -> bool {
@@ -1629,6 +1634,11 @@ impl Renderer {
     }
 
     /// The renderer's resolution scale (shaders are translated for it).
+    /// Chooses the render target scale. Call before any target exists.
+    pub fn set_resolution_scale(&mut self, scale: Scale) {
+        self.scale = scale;
+    }
+
     pub fn resolution_scale(&self) -> Scale {
         self.scale
     }

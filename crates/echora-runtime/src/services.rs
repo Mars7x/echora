@@ -3339,7 +3339,7 @@ impl Services {
                 let arguments = &call.request.arguments;
                 if arguments.len() >= 20 {
                     let float = |at: usize| crate::bytes::le_f32(&arguments[at..at + 4]);
-                    crate::input::rumble(vibration_device(&arguments[..4]), float(4), float(12));
+                    crate::settings::rumble(vibration_device(&arguments[..4]), float(4), float(12));
                 }
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
                 Ok(Outcome::success())
@@ -3359,7 +3359,7 @@ impl Services {
                     for index in 0..count {
                         let value = &value_bytes[index * 16..];
                         let float = |at: usize| crate::bytes::le_f32(&value[at..at + 4]);
-                        crate::input::rumble(
+                        crate::settings::rumble(
                             vibration_device(&handle_bytes[index * 4..index * 4 + 4]),
                             float(0),
                             float(8),
@@ -3375,7 +3375,7 @@ impl Services {
                 let arguments = &call.request.arguments;
                 if arguments.len() >= 5 {
                     let on = f32::from(u8::from(arguments[4] != 0));
-                    crate::input::rumble(vibration_device(&arguments[..4]), on, 0.0);
+                    crate::settings::rumble(vibration_device(&arguments[..4]), on, 0.0);
                 }
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
                 Ok(Outcome::success())
@@ -3966,7 +3966,10 @@ impl Services {
                         .read(samples.wrapping_add(offset), &mut pcm)
                         .is_ok()
                     {
-                        crate::audio::apply_volume(&mut pcm, self.audio_outs[id].volume);
+                        crate::audio::apply_volume(
+                            &mut pcm,
+                            self.audio_outs[id].volume * crate::settings::master_volume(),
+                        );
                         let _ = host.send(pcm);
                     }
                 }

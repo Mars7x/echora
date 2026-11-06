@@ -760,6 +760,7 @@ dependencies = [
  "anyhow",
  "astc-decode",
  "echora-audio",
+ "echora-config",
  "echora-gpu",
  "echora-guest",
  "echora-input",
