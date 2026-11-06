@@ -88,8 +88,8 @@ pub mod palette {
     pub const SELECTED: u32 = 0x333333ff;
     /// The thin edge around the window.
     pub const WINDOW_EDGE: u32 = 0xffffff0f;
-    /// Play, and the main action of the empty screen. 4.9:1 under its
-    /// label.
+    /// Play, the main action of the empty screen, and switches that are
+    /// on. 4.9:1 under its label.
     pub const ACCENT: u32 = 0x2f7a34ff;
     pub const ACCENT_HOVER: u32 = 0x36853bff;
     pub const ACCENT_PRESSED: u32 = 0x29692dff;
@@ -292,8 +292,8 @@ pub fn round_button(id: impl Into<ElementId>, icon: &'static str, active: bool) 
 const ROUND_BUTTON: &str = "round-button";
 const CIRCLE: &str = "icons/circle.svg";
 
-/// An on/off switch, 40 by 24 px: the same dark knob in both states, on a
-/// white track when on and a gray one when off. `animate` slides the knob,
+/// An on/off switch, 40 by 24 px, as libadwaita draws one: the same light
+/// knob in both states, on the accent when on and a gray track when off. `animate` slides the knob,
 /// for the switch that was just flipped.
 pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
     // Knob travel: from 2 px in to 18 px in.
@@ -303,7 +303,7 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .top(u(2.0))
         .size(u(20.0))
         .rounded_full()
-        .bg(color(palette::BACKDROP));
+        .bg(color(palette::ON_ACCENT));
     let knob = if animate {
         knob.with_animation(
             ElementId::Name(format!("{id}-{on}").into()),
@@ -322,7 +322,7 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .h(u(24.0))
         .rounded_full()
         .bg(color(if on {
-            palette::LABEL
+            palette::ACCENT
         } else {
             palette::SWITCH_OFF
         }))
