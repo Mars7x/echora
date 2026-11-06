@@ -293,6 +293,51 @@ impl ContentSource {
         })
     }
 
+    /// Reads one file from package `package`'s RomFS by its `/`-separated
+    /// path inside the RomFS (e.g. `Event/Movie/Dm_Title_0045.webm`).
+    /// `Ok(None)` when the package has no RomFS or no such file; files over
+    /// `limit` bytes are an error.
+    pub fn read_romfs_file(
+        &self,
+        package: usize,
+        path: &str,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Nup(archive) => {
+                let Some(romfs) = archive.packages().get(package).and_then(|p| p.romfs) else {
+                    return Ok(None);
+                };
+                match archive.resolve(romfs, path) {
+                    Some(Node::File(id)) => Ok(Some(archive.read_file(id, limit)?)),
+                    _ => Ok(None),
+                }
+            }
+            Self::Directory { packages, .. } => {
+                let Some(romfs) = packages.get(package).and_then(|p| p.romfs.as_ref()) else {
+                    return Ok(None);
+                };
+                if path.split('/').any(|part| part == "..") {
+                    return Ok(None);
+                }
+                let file = romfs.join(path);
+                let size = match fs::metadata(&file) {
+                    Ok(meta) if meta.is_file() => meta.len(),
+                    Ok(_) => return Ok(None),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(io_at(&file)(error)),
+                };
+                if size > limit {
+                    return Err(ContentError::Layout(format!(
+                        "{}: {size} bytes exceeds the {limit}-byte read limit",
+                        file.display()
+                    )));
+                }
+                fs::read(&file).map(Some).map_err(io_at(&file))
+            }
+        }
+    }
+
     /// Ensures the ExeFS of `package` exists as plain files under
     /// `cache_root/exefs/<exefs_key>/`, extracting and verifying it only if
     /// that entry is absent or incomplete. Returns the directory.
