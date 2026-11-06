@@ -711,6 +711,7 @@ impl Launcher {
         let Some(art) = self.game.as_ref().and(self.art.as_ref()) else {
             return div()
                 .size_full()
+                .rounded(self.corner)
                 .bg(color(palette::BACKDROP))
                 .into_any_element();
         };
@@ -1256,25 +1257,33 @@ impl Render for Launcher {
         let content = self
             .render_content(window, cx)
             .rounded(self.corner)
+            // The edge highlight sits on top of the art rather than as a
+            // border, which would inset the art and show a dark frame.
             .when(floating, |el| {
-                el.border_1()
-                    .border_color(color(palette::WINDOW_BORDER))
-                    // Faint, like the desktop's own window shadows: a soft
-                    // drop and a hairline that separates the edge.
-                    .shadow(vec![
-                        BoxShadow {
-                            color: Hsla::black().opacity(0.18),
-                            blur_radius: px(10.0),
-                            spread_radius: px(0.0),
-                            offset: point(px(0.0), px(2.0)),
-                        },
-                        BoxShadow {
-                            color: Hsla::black().opacity(0.12),
-                            blur_radius: px(1.0),
-                            spread_radius: px(0.0),
-                            offset: point(px(0.0), px(0.0)),
-                        },
-                    ])
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded(self.corner)
+                        .border_1()
+                        .border_color(color(palette::WINDOW_BORDER)),
+                )
+                // Faint, like the desktop's own window shadows: a soft
+                // drop and a hairline that separates the edge.
+                .shadow(vec![
+                    BoxShadow {
+                        color: Hsla::black().opacity(0.18),
+                        blur_radius: px(10.0),
+                        spread_radius: px(0.0),
+                        offset: point(px(0.0), px(2.0)),
+                    },
+                    BoxShadow {
+                        color: Hsla::black().opacity(0.12),
+                        blur_radius: px(1.0),
+                        spread_radius: px(0.0),
+                        offset: point(px(0.0), px(0.0)),
+                    },
+                ])
             });
         div()
             .id("window")
@@ -1337,7 +1346,9 @@ impl Launcher {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(color(palette::BACKDROP))
+            // No background of its own: the art layer paints the whole window,
+            // and a second layer under its rounded corners would show at the
+            // antialiased edge.
             .child(self.render_art(window))
             .when(self.game.is_none(), |el| {
                 el.child(
