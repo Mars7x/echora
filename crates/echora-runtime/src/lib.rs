@@ -2,9 +2,8 @@
 //! the system services the game reaches.
 //!
 //! Adapted from pokopia-recomp (same author, GPL-3.0-or-later). Host
-//! integrations that are not ported yet are explicit: `nvn` keeps only the
-//! entry-point table and implements no NVN function, `window` and `input`
-//! report no window and no gamepads, and `audio` opens no host device.
+//! integrations that are not ported yet are explicit: `input` reports no
+//! gamepads and `audio` opens no host device.
 
 // Ported code keeps its original structure; these lints flag style only.
 // Most unwraps convert fixed-length slices to arrays; replacing them is
@@ -25,8 +24,10 @@ pub mod loader;
 pub mod logging;
 pub mod npdm;
 pub mod nvn;
+pub mod nvn_format;
 pub mod romfs;
 pub mod runtime;
+pub mod sass;
 pub mod services;
 mod synchronization;
 mod threads;
