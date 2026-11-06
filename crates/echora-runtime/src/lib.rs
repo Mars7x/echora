@@ -23,6 +23,7 @@ pub mod ipc;
 pub mod loader;
 pub mod logging;
 pub mod npdm;
+pub mod nvdrv;
 #[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod nvn;
 #[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
