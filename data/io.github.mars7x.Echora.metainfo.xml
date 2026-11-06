@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mars7x.Echora</id>
+  <name>Echora</name>
+  <summary>Native recompilation of Ocarina of Time for Nintendo Switch 2</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      Echora is an experimental native recompilation of The Legend of Zelda:
+      Ocarina of Time for Nintendo Switch 2. It translates the game's code
+      ahead of time into native code and runs it on a reimplementation of the
+      console's services. It requires your own legally obtained copy of the
+      game and contains no game files.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.mars7x.Echora.desktop</launchable>
+  <url type="homepage">https://github.com/Mars7x/echora</url>
+  <developer id="io.github.mars7x">
+    <name>Echora contributors</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+</component>
