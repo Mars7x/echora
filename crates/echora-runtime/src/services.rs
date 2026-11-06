@@ -350,6 +350,9 @@ enum ReadableEventKind {
     /// DisplaySession notification event (GetNotificationEvent, 11). No
     /// producer exists yet, so it is never signaled.
     DisplayNotification,
+    /// DisplaySession command 31's event (undocumented; u32 index 0, moved
+    /// like command 11's, released by 32). Provisional and never signaled.
+    DisplayEvent31,
     /// GpuSession notification event by index (CreateEvent, command 12).
     GpuNotification {
         index: u32,
@@ -4544,11 +4547,14 @@ impl Services {
         // GetNotificationEvent (11) / ReleaseNotificationEvent (13): u32 index
         // 0 (Eden 1a6d7d4). 11 moves a readable event, created once per
         // session and signaled only while notification bits are pending.
-        if matches!(call.request.command_id, 11 | 13) {
+        // 31/32 are an undocumented pair of the same shape (the SDK stores
+        // 31's moved handle and closes it on failure); provisional.
+        if matches!(call.request.command_id, 11 | 13 | 31 | 32) {
             if call.request.arguments.len() != 4 || call.request.arguments != [0; 4] {
-                return Err(call.unsupported(SERVICE, "notification event index is not 0"));
+                return Err(call.unsupported(SERVICE, "display event index is not 0"));
             }
-            if call.request.command_id == 13 {
+            let notification = matches!(call.request.command_id, 11 | 13);
+            if matches!(call.request.command_id, 13 | 32) {
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands.insert("appletOE:display_session");
                 return Ok(Outcome::success());
@@ -4557,7 +4563,12 @@ impl Services {
                 .main_application
                 .clone()
                 .ok_or_else(|| invalid("display session requires the main application"))?;
-            let id = match state.notification_event {
+            let slot = if notification {
+                state.notification_event
+            } else {
+                state.event_31
+            };
+            let id = match slot {
                 Some(id) => ReadableEventId(id),
                 None => {
                     if self.readable_events.len() >= MAX_READABLE_EVENTS {
@@ -4573,13 +4584,21 @@ impl Services {
                     )
                 }
             };
-            let pending = state.notifications.iter().any(|bits| *bits != 0);
-            state.notification_event = Some(id.0);
+            let pending = notification && state.notifications.iter().any(|bits| *bits != 0);
+            if notification {
+                state.notification_event = Some(id.0);
+            } else {
+                state.event_31 = Some(id.0);
+            }
             let handle = self.next_available_handle()?;
             call.reply(0, Some(handle), 0, &[])?;
             let event = self.readable_events.entry(id).or_insert(ReadableEvent {
                 owner: application,
-                kind: ReadableEventKind::DisplayNotification,
+                kind: if notification {
+                    ReadableEventKind::DisplayNotification
+                } else {
+                    ReadableEventKind::DisplayEvent31
+                },
                 signaled: false,
             });
             event.signaled |= pending;
@@ -4888,12 +4907,14 @@ impl Services {
             }
             // InitializeDisplayContext (Switchbrew "Switch 2: GSV services"):
             // u64 Version, moves a DisplaySession; 19.0.0 requires 0x300010000.
-            // 0x300020000 is what newer SDKs send (Eden 1a6d7d4, provisional).
+            // 0x300020000 is what newer SDKs send (Eden 1a6d7d4) and OoT sends
+            // 0x300040000; both are provisional, as each display-session
+            // command is still checked on its own.
             // Requires CreateDisplayContext (301).
             305 => {
                 call.shape(8, false, false)?;
                 let version = crate::bytes::le_u64(&call.request.arguments[..8]);
-                if !matches!(version, 0x3_0001_0000 | 0x3_0002_0000) {
+                if !matches!(version, 0x3_0001_0000 | 0x3_0002_0000 | 0x3_0004_0000) {
                     return Err(call.unsupported(
                         SERVICE,
                         format!("display session version {version:#x} is not known"),
@@ -4969,7 +4990,26 @@ impl Services {
                 );
                 Ok(Outcome::success())
             }
-            _ => Err(call.unsupported(SERVICE, "graphics supervisor command is not implemented")),
+            // Undocumented query with no input and a u32 output. The SDK
+            // (OoT, sdk+0x491660) issues command 120 next only when the
+            // value is 1; 0 skips that undocumented follow-up. Provisional.
+            126 => {
+                call.shape(0, false, false)?;
+                if self.graphics_supervisor_phase != Some(GraphicsSupervisorPhase::Ready) {
+                    return Err(call.unsupported(SERVICE, "command 126 before bootstrap completes"));
+                }
+                call.reply(0, None, 0, &0u32.to_le_bytes())?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:126");
+                Ok(Outcome::success())
+            }
+            _ => Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "graphics supervisor command is not implemented ({})",
+                    call.request.describe()
+                ),
+            )),
         }
     }
 
@@ -5643,7 +5683,8 @@ impl Services {
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
-            | ReadableEventKind::DisplayNotification => {
+            | ReadableEventKind::DisplayNotification
+            | ReadableEventKind::DisplayEvent31 => {
                 return Err(invalid(
                     "syncpoint-cache events are not application lifecycle events",
                 ));

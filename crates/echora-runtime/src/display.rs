@@ -43,6 +43,8 @@ pub struct DisplaySessionState {
     pub default_endpoint: Option<u64>,
     /// Local backing ID of the session's notification event, once created.
     pub notification_event: Option<u32>,
+    /// Readable event moved by command 31 (index 0), created once.
+    pub event_31: Option<u32>,
     /// Pending notification bits (32 x u32), read by GetNotifications.
     pub notifications: Vec<u32>,
     /// Other displays opened by name (for example "player1", a GameShare
@@ -268,7 +270,9 @@ impl DisplaySessionState {
                 Ok(Vec::new())
             }
             _ => Err(format!(
-                "display session command {command} is not implemented"
+                "display session command {command} is not implemented (arguments {} bytes {:02x?})",
+                arguments.len(),
+                arguments
             )),
         }
     }
