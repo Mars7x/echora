@@ -899,6 +899,11 @@ pub struct Services {
     nvdrv_firmware_memory_margin: Option<bool>,
     /// Open NVIDIA driver file descriptors and their device paths.
     nvdrv_fds: BTreeMap<u32, String>,
+    /// Page ranges SetGpuMemoryAttribute marked GpuSharable (0x20), kept
+    /// here rather than in the guest mappings, as (start, end).
+    pub(crate) gpu_sharable: BTreeMap<u64, u64>,
+    /// KUserWorkerSession GPU memory by handle: (start, end, two u8 flags).
+    gpu_memory: BTreeMap<u32, (u64, u64, [u8; 2])>,
     /// Per-descriptor NVIDIA device state.
     nvdrv_devices: crate::nvdrv::Devices,
     /// QueryEvent backings by (device path, event ID); each is created once.
@@ -998,6 +1003,8 @@ impl Default for Services {
             graphics_supervisor_phase: None,
             nvdrv_firmware_memory_margin: None,
             nvdrv_fds: BTreeMap::new(),
+            gpu_sharable: BTreeMap::new(),
+            gpu_memory: BTreeMap::new(),
             nvdrv_devices: Default::default(),
             nvdrv_events: BTreeMap::new(),
             transfer_memories: BTreeMap::new(),
@@ -2085,10 +2092,7 @@ impl Services {
                 self.streamplay(&object.clone(), call)
             }
             ServiceObject::PlayReport => self.play_report(call),
-            ServiceObject::GpuWorker => Err(call.unsupported(
-                "appletOE:gpu_worker",
-                "GPU worker command is not implemented",
-            )),
+            ServiceObject::GpuWorker => self.gpu_worker(call),
             ServiceObject::NvidiaDriver { application }
                 if call.request.protocol == Protocol::Cmif =>
             {
@@ -5773,6 +5777,72 @@ impl Services {
             }
             _ => Err(call.unsupported(SERVICE, "syncpoint supervisor command is not implemented")),
         }
+    }
+
+    /// KUserWorkerSession (Switchbrew "Switch 2: GSV services",
+    /// nn::gpuk::impl::kuser::KUserWorkerSession), TIPC.
+    fn gpu_worker(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        const SERVICE: &str = "appletOE:gpu_worker";
+        match call.request.command_id {
+            // CreateGpuMemory: u64 MemoryAddressStart, u64 MemoryAddressEnd
+            // and two u8s; returns a u32 GpuMemoryHandle. The range must
+            // carry GpuSharable (SetGpuMemoryAttribute 0x20). Handles count
+            // from 1. Provisional beyond the documented layout.
+            101 => {
+                let arguments = &call.request.arguments;
+                if !(18..=24).contains(&arguments.len()) {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("CreateGpuMemory shape ({})", call.request.describe()),
+                    ));
+                }
+                let start = crate::bytes::le_u64(&arguments[..8]);
+                let end = crate::bytes::le_u64(&arguments[8..16]);
+                let flags = [arguments[16], arguments[17]];
+                if start >= end
+                    || start % 0x1000 != 0
+                    || end % 0x1000 != 0
+                    || !self.is_gpu_sharable(start, end - start)
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("CreateGpuMemory range {start:#x}..{end:#x} is not GpuSharable"),
+                    ));
+                }
+                if self.gpu_memory.len() >= 4096 {
+                    return Err(call.unsupported(SERVICE, "too many GPU memory handles"));
+                }
+                let handle = self
+                    .gpu_memory
+                    .keys()
+                    .next_back()
+                    .map_or(1, |last| last + 1);
+                call.reply(0, None, 0, &handle.to_le_bytes())?;
+                self.gpu_memory.insert(handle, (start, end, flags));
+                self.provisional_commands.insert("appletOE:gpu_worker:101");
+                Ok(Outcome::success())
+            }
+            _ => Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "GPU worker command is not implemented ({})",
+                    call.request.describe()
+                ),
+            )),
+        }
+    }
+
+    /// Whether every page of `[address, address + size)` is GpuSharable.
+    pub(crate) fn is_gpu_sharable(&self, address: u64, size: u64) -> bool {
+        let end = address.saturating_add(size);
+        let mut cursor = address;
+        while cursor < end {
+            match self.gpu_sharable.range(..=cursor).next_back() {
+                Some((_, &run_end)) if run_end > cursor => cursor = run_end,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// The process-bound NVIDIA driver session. Commands are added as the
