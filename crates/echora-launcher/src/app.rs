@@ -9,7 +9,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use echora_config::{InternalResolutionSetting, Settings, WindowMode};
 use echora_content::ContentSource;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -31,14 +31,104 @@ const WINDOW_MODES: [(&str, WindowMode); 3] = [
 /// A menu action.
 type Action = fn(&Rc<State>);
 
+/// The launcher's look: flat surfaces, the game's icon, clear type and one
+/// accent colour for the primary action.
+const STYLE: &str = r#"
+window.echora {
+    background: #121417;
+    color: #e6e8eb;
+}
+window.echora headerbar {
+    background: transparent;
+    box-shadow: none;
+}
+.echora-wordmark {
+    font-size: 36pt;
+    font-weight: 800;
+    letter-spacing: 6px;
+}
+.echora-tagline {
+    font-size: 11pt;
+    color: alpha(#e6e8eb, 0.6);
+}
+.echora-hint {
+    font-size: 9pt;
+    color: alpha(#e6e8eb, 0.4);
+}
+.echora-icon {
+    border-radius: 20px;
+}
+.echora-icon-placeholder {
+    background: #1b1e22;
+    border-radius: 20px;
+}
+.echora-tag {
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #4cc9a0;
+}
+.echora-title {
+    font-size: 24pt;
+    font-weight: 800;
+}
+.echora-subtitle {
+    font-size: 11pt;
+    color: alpha(#e6e8eb, 0.6);
+}
+button.echora-play {
+    background: #4cc9a0;
+    color: #0b1a14;
+    font-size: 12pt;
+    font-weight: 700;
+    border-radius: 10px;
+    padding: 8px 32px;
+}
+button.echora-play:hover {
+    background: #5fd4ad;
+}
+button.echora-play:disabled {
+    background: #24282d;
+    color: alpha(#e6e8eb, 0.45);
+}
+button.echora-round {
+    background: #1f2328;
+    border-radius: 10px;
+    min-width: 40px;
+    min-height: 40px;
+}
+button.echora-round:hover {
+    background: #292e34;
+}
+.echora-card {
+    background: #1a1d21;
+    border-radius: 14px;
+    padding: 16px 20px;
+}
+.echora-key {
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: alpha(#e6e8eb, 0.45);
+}
+.echora-value {
+    font-family: monospace;
+    font-size: 10pt;
+}
+"#;
+
 struct State {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     stack: gtk::Stack,
-    title: adw::ActionRow,
-    version: adw::ActionRow,
-    build: adw::ActionRow,
-    path: adw::ActionRow,
+    icon: gtk::Picture,
+    icon_placeholder: gtk::Box,
+    tag: gtk::Label,
+    title: gtk::Label,
+    subtitle: gtk::Label,
+    build: gtk::Label,
+    version: gtk::Label,
+    path: gtk::Label,
     launch: gtk::Button,
     game: RefCell<Option<PathBuf>>,
     settings_path: Option<PathBuf>,
@@ -48,6 +138,18 @@ struct State {
 
 pub fn run() -> ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| {
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        let css = gtk::CssProvider::new();
+        css.load_from_string(STYLE);
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
     app.connect_activate(build_window);
     if app.run() == glib::ExitCode::SUCCESS {
         ExitCode::SUCCESS
@@ -56,11 +158,33 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn info_row(title: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(title).build();
-    row.add_css_class("property");
-    row.set_subtitle_selectable(true);
-    row
+fn label(text: &str, class: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class(class);
+    label.set_xalign(0.0);
+    label
+}
+
+fn round_button(icon: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.add_css_class("echora-round");
+    button.set_tooltip_text(Some(tooltip));
+    button.set_valign(gtk::Align::Center);
+    button
+}
+
+/// One labelled value in the details card.
+fn detail(grid: &gtk::Grid, row: i32, key: &str) -> gtk::Label {
+    let name = label(key, "echora-key");
+    name.set_valign(gtk::Align::Start);
+    let value = label("", "echora-value");
+    value.set_selectable(true);
+    value.set_wrap(true);
+    value.set_wrap_mode(gtk::pango::WrapMode::Char);
+    value.set_hexpand(true);
+    grid.attach(&name, 0, row, 1, 1);
+    grid.attach(&value, 1, row, 1, 1);
+    value
 }
 
 fn build_window(app: &adw::Application) {
@@ -75,50 +199,100 @@ fn build_window(app: &adw::Application) {
         })
         .unwrap_or_default();
 
-    let choose = gtk::Button::with_label("Choose Game…");
-    choose.add_css_class("pill");
-    choose.add_css_class("suggested-action");
+    // Empty state: the wordmark and one action.
+    let choose = gtk::Button::with_label("Choose Game");
+    choose.add_css_class("echora-play");
     choose.set_halign(gtk::Align::Center);
-    let empty = adw::StatusPage::builder()
-        .icon_name("applications-games-symbolic")
-        .title("No Game Selected")
-        .description("Choose your Ocarina of Time NUP package or dump folder.")
-        .child(&choose)
-        .build();
+    choose.set_margin_top(28);
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    empty.set_valign(gtk::Align::Center);
+    empty.set_halign(gtk::Align::Center);
+    let wordmark = gtk::Label::new(Some("ECHORA"));
+    wordmark.add_css_class("echora-wordmark");
+    let tagline = gtk::Label::new(Some("Ocarina of Time, recompiled to run natively"));
+    tagline.add_css_class("echora-tagline");
+    let hint = gtk::Label::new(Some("Select your NUP package or dump folder to begin"));
+    hint.add_css_class("echora-hint");
+    hint.set_margin_top(10);
+    empty.append(&wordmark);
+    empty.append(&tagline);
+    empty.append(&choose);
+    empty.append(&hint);
 
-    let (title, version, build, path) = (
-        info_row("Title"),
-        info_row("Version"),
-        info_row("Build ID"),
-        info_row("Location"),
-    );
-    let details = adw::PreferencesGroup::builder().title("Game").build();
-    for row in [&title, &version, &build, &path] {
-        details.add(row);
-    }
-    let launch = gtk::Button::with_label("Launch");
-    launch.add_css_class("pill");
-    launch.add_css_class("suggested-action");
-    let change = gtk::Button::with_label("Change Game…");
-    change.add_css_class("pill");
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    buttons.set_halign(gtk::Align::Center);
-    buttons.set_margin_top(12);
-    buttons.append(&change);
-    buttons.append(&launch);
-    let actions = adw::PreferencesGroup::new();
-    actions.add(&buttons);
-    let game_page = adw::PreferencesPage::new();
-    game_page.add(&details);
-    game_page.add(&actions);
+    // Game page: icon, title and actions, then the details card.
+    let icon = gtk::Picture::new();
+    icon.set_size_request(184, 184);
+    icon.set_can_shrink(true);
+    icon.set_content_fit(gtk::ContentFit::Cover);
+    icon.add_css_class("echora-icon");
+    icon.set_overflow(gtk::Overflow::Hidden);
+    let icon_placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    icon_placeholder.set_size_request(184, 184);
+    icon_placeholder.add_css_class("echora-icon-placeholder");
+    let placeholder_image = gtk::Image::from_icon_name("applications-games-symbolic");
+    placeholder_image.set_pixel_size(72);
+    placeholder_image.set_vexpand(true);
+    placeholder_image.set_opacity(0.4);
+    icon_placeholder.append(&placeholder_image);
+    let icon_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    icon_slot.set_valign(gtk::Align::Center);
+    icon_slot.append(&icon);
+    icon_slot.append(&icon_placeholder);
+
+    let tag = label("", "echora-tag");
+    tag.set_halign(gtk::Align::Start);
+    let title = label("", "echora-title");
+    title.set_wrap(true);
+    let subtitle = label("", "echora-subtitle");
+    let launch = gtk::Button::with_label("Play");
+    launch.add_css_class("echora-play");
+    let settings_button = round_button("emblem-system-symbolic", "Settings");
+    let change = round_button("folder-open-symbolic", "Choose Another Game");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    actions.set_margin_top(18);
+    actions.append(&launch);
+    actions.append(&settings_button);
+    actions.append(&change);
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    heading.set_valign(gtk::Align::Center);
+    heading.set_hexpand(true);
+    heading.append(&tag);
+    heading.append(&title);
+    heading.append(&subtitle);
+    heading.append(&actions);
+    let hero = gtk::Box::new(gtk::Orientation::Horizontal, 32);
+    hero.append(&icon_slot);
+    hero.append(&heading);
+
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(10);
+    grid.set_column_spacing(24);
+    let build = detail(&grid, 0, "BUILD ID");
+    let version = detail(&grid, 1, "CONTENT VERSION");
+    let path = detail(&grid, 2, "LOCATION");
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("echora-card");
+    card.append(&grid);
+
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 32);
+    page.set_margin_top(12);
+    page.set_margin_bottom(36);
+    page.set_margin_start(40);
+    page.set_margin_end(40);
+    page.set_valign(gtk::Align::Center);
+    page.append(&hero);
+    page.append(&card);
+    let game_page = adw::Clamp::builder().maximum_size(760).child(&page).build();
 
     let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&game_page, Some("game"));
 
     let menu = gio::Menu::new();
+    menu.append(Some("Choose Game…"), Some("app.choose"));
     menu.append(Some("Choose Dump Folder…"), Some("app.folder"));
-    menu.append(Some("Preferences"), Some("app.preferences"));
+    menu.append(Some("Settings"), Some("app.preferences"));
     menu.append(Some("About Echora"), Some("app.about"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -127,6 +301,7 @@ fn build_window(app: &adw::Application) {
         .tooltip_text("Main Menu")
         .build();
     let header = adw::HeaderBar::new();
+    header.set_show_title(false);
     header.pack_end(&menu_button);
 
     let toasts = adw::ToastOverlay::new();
@@ -137,18 +312,23 @@ fn build_window(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Echora")
-        .default_width(640)
+        .default_width(860)
         .default_height(560)
         .content(&toolbar)
         .build();
+    window.add_css_class("echora");
 
     let state = Rc::new(State {
         window: window.clone(),
         toasts,
         stack,
+        icon,
+        icon_placeholder,
+        tag,
         title,
-        version,
+        subtitle,
         build,
+        version,
         path,
         launch: launch.clone(),
         game: RefCell::new(None),
@@ -157,15 +337,24 @@ fn build_window(app: &adw::Application) {
         child: RefCell::new(None),
     });
 
-    for button in [&choose, &change] {
+    {
         let state = state.clone();
-        button.connect_clicked(move |_| choose_package(&state));
+        choose.connect_clicked(move |_| choose_package(&state));
+    }
+    {
+        let state = state.clone();
+        change.connect_clicked(move |_| choose_package(&state));
+    }
+    {
+        let state = state.clone();
+        settings_button.connect_clicked(move |_| show_preferences(&state));
     }
     {
         let state = state.clone();
         launch.connect_clicked(move |_| launch_game(&state));
     }
-    let actions: [(&str, Action); 3] = [
+    let actions: [(&str, Action); 4] = [
+        ("choose", choose_package),
         ("folder", choose_folder),
         ("preferences", show_preferences),
         ("about", show_about),
@@ -177,6 +366,7 @@ fn build_window(app: &adw::Application) {
         app.add_action(&entry);
     }
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
+    app.set_accels_for_action("app.choose", &["<Control>o"]);
 
     if let Some(last) = last_game_file()
         .and_then(|file| std::fs::read_to_string(file).ok())
@@ -240,21 +430,35 @@ fn select_game(state: &Rc<State>, path: PathBuf) {
     };
     state
         .title
-        .set_subtitle(package.title_name.as_deref().unwrap_or("Unknown title"));
+        .set_label(package.title_name.as_deref().unwrap_or("Unknown title"));
     let numeric = format!(
         "{}.{}.{}",
         package.version >> 16,
         (package.version >> 8) & 0xff,
         package.version & 0xff
     );
-    state.version.set_subtitle(&match &package.display_version {
-        Some(display) => format!("{display} (content version {numeric})"),
-        None => numeric,
+    state.tag.set_label(&match &package.display_version {
+        Some(display) => format!("VERSION {display}"),
+        None => format!("VERSION {numeric}"),
+    });
+    state.subtitle.set_label(match inventory.source {
+        "nup" => "NUP package, read in place",
+        _ => "Extracted dump folder",
     });
     state
         .build
-        .set_subtitle(package.main_build_id().as_deref().unwrap_or("Unknown"));
-    state.path.set_subtitle(&path.display().to_string());
+        .set_label(package.main_build_id().as_deref().unwrap_or("Unknown"));
+    state
+        .version
+        .set_label(&format!("{numeric} ({})", package.version));
+    state.path.set_label(&path.display().to_string());
+    let texture = package
+        .icon
+        .as_deref()
+        .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok());
+    state.icon.set_paintable(texture.as_ref());
+    state.icon.set_visible(texture.is_some());
+    state.icon_placeholder.set_visible(texture.is_none());
     if let Some(file) = last_game_file() {
         let _ = file
             .parent()

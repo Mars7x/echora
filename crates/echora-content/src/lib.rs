@@ -118,6 +118,10 @@ pub struct PackageInventory {
     pub standalone_update: bool,
     pub display_version: Option<String>,
     pub title_name: Option<String>,
+    /// The package's icon image (JPEG or PNG as distributed), when the input
+    /// carries one. Not included in serialized reports.
+    #[serde(skip)]
+    pub icon: Option<Vec<u8>>,
     pub exefs: Vec<ModuleInventory>,
     /// Content key of the ExeFS module set: SHA-256 over the sorted module
     /// names and their SHA-256 values.
@@ -205,6 +209,7 @@ impl ContentSource {
                         standalone_update: p.standalone_update,
                         display_version: meta.display_version,
                         title_name: meta.title_name,
+                        icon: meta.icon,
                         exefs_key: exefs_key(&exefs),
                         exefs,
                         romfs,
@@ -230,6 +235,7 @@ impl ContentSource {
                         standalone_update: false,
                         display_version: None,
                         title_name: None,
+                        icon: None,
                         exefs_key: exefs_key(&exefs),
                         exefs,
                         romfs,
