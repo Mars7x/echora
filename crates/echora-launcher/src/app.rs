@@ -20,7 +20,7 @@ use gpui::{
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
-use crate::ui::{self, Kind, Size, color, palette, radius, space, text};
+use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -599,6 +599,9 @@ const WINDOW_INSET: f32 = 16.0;
 /// Margin between a sheet and the window's edges.
 const SHEET_MARGIN: f32 = 24.0;
 
+/// The size a sheet grows from as it opens, relative to its full size.
+const SHEET_FROM: f32 = 0.9;
+
 /// How long a closing sheet takes to fade out.
 const SHEET_OUT: Duration = Duration::from_millis(180);
 
@@ -627,10 +630,23 @@ fn scrim(
             )
         })
         // Clicks inside the sheet must not reach the scrim behind it.
-        .child(if closing {
+        .child(if !motion {
             sheet.into_any_element()
+        } else if closing {
+            // Leaving: shrink slightly while the whole sheet fades.
+            ui::scaled(sheet, 1.0)
+                .with_animation("sheet-out", Animation::new(SHEET_OUT), |el, t| {
+                    el.scale(1.0 - 0.05 * ui::ease_out(t))
+                })
+                .into_any_element()
         } else {
-            ui::appear(sheet, "sheet-in", space::L, motion)
+            // Opening: grow from its centre on a spring, as GNOME's
+            // dialogs do.
+            ui::scaled(sheet, SHEET_FROM)
+                .with_animation("sheet-in", Animation::new(ui::SPRING), |el, t| {
+                    el.scale(SHEET_FROM + (1.0 - SHEET_FROM) * ui::spring(t))
+                })
+                .into_any_element()
         });
     if !motion {
         return backdrop.into_any_element();
@@ -654,15 +670,21 @@ fn scrim(
         .into_any_element()
 }
 
+/// Window pixels as rems, so a sheet sized from the window scales with the
+/// rest of its contents.
+fn to_rems(pixels: Pixels) -> gpui::Rems {
+    gpui::rems(f32::from(pixels) / 16.0)
+}
+
 /// A sheet's surface: the window's own background, at a fixed size so
 /// wrapped text is measured at its real width.
 fn sheet(id: &'static str, width: Pixels, height: Option<Pixels>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .w(width)
-        .when_some(height, |el, height| el.h(height))
+        .w(to_rems(width))
+        .when_some(height, |el, height| el.h(to_rems(height)))
         .flex()
-        .rounded(px(radius::SHEET))
+        .rounded(u(radius::SHEET))
         .border_1()
         .border_color(color(palette::BORDER))
         .bg(color(palette::SURFACE))
@@ -922,11 +944,11 @@ impl Launcher {
         let title = self.drag_window(
             div()
                 .flex_none()
-                .h(px(48.0))
-                .px(px(space::L + space::XS))
+                .h(u(48.0))
+                .px(u(space::L + space::XS))
                 .flex()
                 .items_center()
-                .text_size(px(text::HEADLINE))
+                .text_size(u(text::HEADLINE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(color(palette::LABEL))
                 .child("Settings"),
@@ -936,31 +958,31 @@ impl Launcher {
         // children are not clipped to the sheet's rounding.
         let tabs = div()
             .flex_none()
-            .w(px(180.0))
+            .w(u(180.0))
             .flex()
             .flex_col()
-            .rounded_l(px(radius::SHEET))
+            .rounded_l(u(radius::SHEET))
             .bg(color(palette::SIDEBAR))
             .border_r_1()
             .border_color(color(palette::BORDER))
             .child(title)
             .child(
                 div()
-                    .px(px(space::S))
+                    .px(u(space::S))
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(u(2.0))
                     .children(SettingsTab::ALL.into_iter().map(|tab| {
                         let selected = tab == self.settings_tab;
                         ui::focusable(
                             div()
                                 .id(tab.label())
-                                .h(px(36.0))
-                                .px(px(space::M))
+                                .h(u(36.0))
+                                .px(u(space::M))
                                 .flex()
                                 .items_center()
-                                .rounded(px(radius::CONTROL))
-                                .text_size(px(text::BODY))
+                                .rounded(u(radius::CONTROL))
+                                .text_size(u(text::BODY))
                                 .cursor_pointer()
                                 .when(selected, |el| {
                                     el.bg(color(palette::SELECTED))
@@ -990,15 +1012,15 @@ impl Launcher {
             .drag_window(
                 div()
                     .flex_none()
-                    .h(px(48.0))
-                    .pl(px(space::XL))
-                    .pr(px(space::M))
+                    .h(u(48.0))
+                    .pl(u(space::XL))
+                    .pr(u(space::M))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(text::HEADLINE))
+                            .text_size(u(text::HEADLINE))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(palette::LABEL))
                             .child(self.settings_tab.label()),
@@ -1009,7 +1031,7 @@ impl Launcher {
         let page = div()
             .flex()
             .flex_col()
-            .gap(px(space::XL))
+            .gap(u(space::XL))
             .children(self.settings_page(window, !closing, cx));
         let content = div()
             .flex_1()
@@ -1023,9 +1045,9 @@ impl Launcher {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(space::XL))
-                    .pt(px(space::XS))
-                    .pb(px(space::XL))
+                    .px(u(space::XL))
+                    .pt(u(space::XS))
+                    .pb(u(space::XL))
                     .child(page),
             );
         let sheet = sheet("settings", width, Some(height))
@@ -1212,7 +1234,7 @@ impl Launcher {
                 .with_priority(1),
             )
             .child(
-                div().absolute().top(px(36.0)).right_0().child(
+                div().absolute().top(u(36.0)).right_0().child(
                     deferred(
                         anchored()
                             .anchor(gpui::Corner::TopRight)
@@ -1259,14 +1281,14 @@ impl Launcher {
         let icon = match &game.icon {
             Some(icon) => img(icon.clone())
                 .flex_none()
-                .size(px(40.0))
-                .rounded(px(radius::CONTROL))
+                .size(u(40.0))
+                .rounded(u(radius::CONTROL))
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
             None => div()
                 .flex_none()
-                .size(px(40.0))
-                .rounded(px(radius::CONTROL))
+                .size(u(40.0))
+                .rounded(u(radius::CONTROL))
                 .bg(color(palette::FILL))
                 .into_any_element(),
         };
@@ -1342,39 +1364,39 @@ impl Launcher {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(u(2.0))
                 .child(
                     div()
-                        .text_size(px(text::BODY))
+                        .text_size(u(text::BODY))
                         .text_color(color(palette::LABEL))
                         .truncate()
                         .child(name),
                 )
                 .child(
                     div()
-                        .text_size(px(text::CAPTION))
+                        .text_size(u(text::CAPTION))
                         .text_color(color(palette::SECONDARY_LABEL))
                         .child(role),
                 )
         };
         let credits = div()
-            .p(px(space::L))
+            .p(u(space::L))
             .flex()
             .flex_col()
-            .gap(px(space::M))
-            .rounded(px(radius::CARD))
+            .gap(u(space::M))
+            .rounded(u(radius::CARD))
             .bg(color(palette::CARD))
             .children(CREDITS.chunks(2).map(|pair| {
                 div()
                     .flex()
-                    .gap(px(space::L))
+                    .gap(u(space::L))
                     .children(pair.iter().map(credit))
             }));
         let top = self
             .drag_window(
                 div()
-                    .h(px(44.0))
-                    .px(px(space::M))
+                    .h(u(44.0))
+                    .px(u(space::M))
                     .flex()
                     .items_center()
                     .justify_end(),
@@ -1387,36 +1409,36 @@ impl Launcher {
             .child(top)
             .child(
                 div()
-                    .px(px(space::XL + space::XS))
+                    .px(u(space::XL + space::XS))
                     .flex()
                     .flex_col()
-                    .gap(px(space::XS + 2.0))
+                    .gap(u(space::XS + 2.0))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(space::S + 2.0))
+                            .gap(u(space::S + 2.0))
                             .child(
                                 div()
-                                    .text_size(px(text::LARGE_TITLE))
+                                    .text_size(u(text::LARGE_TITLE))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(color(palette::LABEL))
                                     .child("Echora"),
                             )
                             .child(
                                 div()
-                                    .px(px(space::S))
-                                    .py(px(2.0))
+                                    .px(u(space::S))
+                                    .py(u(2.0))
                                     .rounded_full()
                                     .bg(color(palette::FILL))
-                                    .text_size(px(text::CAPTION))
+                                    .text_size(u(text::CAPTION))
                                     .text_color(color(palette::LABEL))
                                     .child(env!("CARGO_PKG_VERSION")),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(text::BODY))
+                            .text_size(u(text::BODY))
                             .text_color(color(palette::SECONDARY_LABEL))
                             .child(
                                 "A native recompilation of The Legend of Zelda: Ocarina of \
@@ -1426,15 +1448,15 @@ impl Launcher {
             )
             .child(
                 div()
-                    .px(px(space::XL))
-                    .pt(px(space::L + space::XS))
+                    .px(u(space::XL))
+                    .pt(u(space::L + space::XS))
                     .flex()
                     .flex_col()
-                    .gap(px(space::S))
+                    .gap(u(space::S))
                     .child(
                         div()
-                            .px(px(space::XS))
-                            .text_size(px(text::CALLOUT))
+                            .px(u(space::XS))
+                            .text_size(u(text::CALLOUT))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(palette::SECONDARY_LABEL))
                             .child("Credits"),
@@ -1443,15 +1465,15 @@ impl Launcher {
             )
             .child(
                 div()
-                    .px(px(space::XL + space::XS))
-                    .py(px(space::L))
+                    .px(u(space::XL + space::XS))
+                    .py(u(space::L))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(space::L))
+                    .gap(u(space::L))
                     .child(
                         div()
-                            .text_size(px(text::CAPTION))
+                            .text_size(u(text::CAPTION))
                             .text_color(color(palette::SECONDARY_LABEL))
                             .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
                     )
