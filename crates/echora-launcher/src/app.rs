@@ -515,6 +515,12 @@ fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gp
         .child(label.into())
 }
 
+/// Closes the open sheet: the same round × as the window's close button.
+fn close_button(cx: &mut Context<Launcher>) -> gpui::Stateful<gpui::Div> {
+    window_button(WindowButton::Close, false)
+        .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
+}
+
 fn about_button(cx: &mut Context<Launcher>) -> gpui::Stateful<gpui::Div> {
     button("about", "About").on_click(cx.listener(|this, _, _, cx| {
         this.sheet = Some(Sheet::About);
@@ -1056,9 +1062,7 @@ impl Launcher {
                             .text_color(color(palette::TEXT))
                             .child(self.settings_tab.label()),
                     )
-                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
-                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
-                    ))),
+                    .child(close_button(cx)),
             )
             .children(page);
         let sheet = div()
@@ -1118,9 +1122,7 @@ impl Launcher {
                                     .child(env!("CARGO_PKG_VERSION")),
                             ),
                     )
-                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
-                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
-                    ))),
+                    .child(close_button(cx)),
             )
             .child(
                 div()
