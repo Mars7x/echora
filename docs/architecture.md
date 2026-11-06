@@ -8,7 +8,7 @@ crates selected per host.
 
 | Crate | Layer | Responsibility | State |
 |---|---|---|---|
-| `echora-launcher` | front end | GTK4/libadwaita launcher (Linux): choose the game (NUP or dump folder) and see its title, version and build ID; preferences for the settings the runtime applies (window mode and size, internal resolution, volume, vibration), saved to the shared settings file; launch through `echora run`. | Implemented; checked under Xvfb. Other platforms print a pointer to the CLI. |
+| `echora-launcher` | front end | GPUI launcher (Linux, Windows, macOS): the game's artwork fills the window, with a dock holding the title, version, Play, Settings and Change game; a tabbed settings sheet (Display: window mode and internal resolution; Controls: vibration; Launcher: skip the launcher and start the last game directly, with `--show` to reopen it), saved to the shared settings file; launch through `echora run`. | Implemented; screenshots checked on Linux under headless sway with lavapipe. Not yet run on Windows or macOS. |
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
 | `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget, process layout and discovery roots (prologues, RELA/RELR relative targets, `init_array`). ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
@@ -29,14 +29,18 @@ launcher depends on `echora-config` and `echora-content`, never the reverse.
 
 ## Front ends
 
-The Linux launcher uses GTK4 and libadwaita so it behaves like a native
-GNOME application (system styling, dialogs, accessibility, keyboard
-navigation). Windows and macOS need their own front end on the same
-settings model; GPUI (a pure-Rust, GPU-rendered toolkit) is a candidate
-for sharing one codebase between them, at the cost of non-native widgets
-and a fast-moving API. The in-game settings overlay will be drawn by
-Echora's own presenter into the game's swapchain rather than by a desktop
-toolkit.
+The launcher uses GPUI, the pure-Rust, GPU-rendered toolkit from Zed, so one
+codebase serves Linux, Windows and macOS with its own look rather than a
+desktop's native widgets. The cost is a young, fast-moving API with few
+ready-made controls, so the launcher draws its own (buttons, segmented
+choices). It draws client-side window controls on Linux compositors that
+require them, keeps the native title bar on Windows and the traffic lights
+on macOS. The in-game settings overlay will be drawn by Echora's own
+presenter into the game's swapchain rather than by a desktop toolkit.
+
+GPUI 0.2.2 reaches `xattr` 0.2.3 through its HTTP client, and that `xattr`
+needs `libc::ENOATTR`, which `libc` 0.2.190 removed on Linux. `Cargo.lock`
+therefore pins `libc` 0.2.189 until GPUI moves to a fixed `xattr`.
 
 ## Boundaries
 

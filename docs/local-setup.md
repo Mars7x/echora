@@ -5,8 +5,10 @@
 - Rust 1.88 or newer (`rustup` stable).
 - A C compiler: the `zstd` crate builds the reference zstd library.
 - Your own NUP file or extracted dump of the game.
-- On Linux: the ALSA, udev, GTK 4 and libadwaita development packages
-  (Ubuntu: `libasound2-dev libudev-dev libgtk-4-dev libadwaita-1-dev`).
+- On Linux: the ALSA, udev, xkbcommon, Wayland, fontconfig, X11-xcb and
+  Vulkan development packages (Ubuntu: `libasound2-dev libudev-dev
+  libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev
+  libvulkan-dev`).
 
 Development is done on Fedora (Linux x86-64, AMD RADV). The current tools
 also build on Windows and macOS.

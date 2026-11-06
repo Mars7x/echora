@@ -76,7 +76,8 @@ display version 1.1.1):
    Direct3D 12. Render targets are sized by `echora-resolution`, so the scene
    renders at the selected internal resolution instead of being stretched.
 5. **Host integration** (planned). Native windowing, input, audio and a
-   GTK4/libadwaita launcher on Linux, with settings available in game.
+   GPUI launcher on Linux, Windows and macOS, with settings available in
+   game.
 
 See [architecture](docs/architecture.md) for the crate boundaries.
 
@@ -102,9 +103,10 @@ echora run game.nup              # run the built translation (see docs/local-set
 echora extract game.nup out --subtree romfs
 ```
 
-On Linux, `echora-launcher` (GTK4/libadwaita) chooses the game, edits the
-settings the runtime applies and starts it; it needs the GTK 4 and
-libadwaita development packages to build.
+`echora-launcher` (GPUI) chooses the game, edits the settings the runtime
+applies and starts it. It runs on Linux, Windows and macOS; place it next to
+the `echora` binary. With "Skip launcher" on it starts the game directly;
+`echora-launcher --show` opens the window again.
 
 See [local setup](docs/local-setup.md) and [content input](docs/content.md).
 

@@ -9,3 +9,8 @@ Terminal=false
 Categories=Game;
 Keywords=Zelda;Ocarina;Switch;
 StartupNotify=true
+Actions=Launcher;
+
+[Desktop Action Launcher]
+Name=Open Launcher
+Exec=echora-launcher --show

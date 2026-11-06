@@ -13,7 +13,7 @@ Each phase completes only on the evidence named here, not when code exists.
 | 6. First real game frame | A correct game-generated frame. | — |
 | 7. Input, audio, interactive gameplay | Interactive scene with graphics, input and audio. | — |
 | 8. Native resolution support | Internal render size verified at several arbitrary resolutions. | — |
-| 9. Launcher (GTK4/libadwaita) | Launcher configures and starts Echora; exposed settings work. | Settings model exists. |
+| 9. Launcher (GPUI) | Launcher configures and starts Echora; exposed settings work. | Settings model exists. |
 | 10. In-game settings | Supported settings change during play without corrupting state. | Apply classes defined. |
 | 11. Full-game compatibility | The game can be completed without known major failures. | — |
 | 12. High frame rates | No timing, physics or animation regressions. | — |

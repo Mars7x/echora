@@ -20,11 +20,10 @@ these separately; preserve their notices when redistributing builds.
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `cpal` | 0.15.3 | Apache-2.0 |
 | `gilrs` | 0.11.2 | Apache-2.0 OR MIT |
-| `gtk4` | 0.11 | MIT |
+| `gpui` | 0.2.2 | Apache-2.0 |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
 | `jiff` | 0.2.39 | Unlicense OR MIT |
-| `libadwaita` | 0.9 | MIT |
-| `libc` | 0.2.191 | MIT OR Apache-2.0 |
+| `libc` | 0.2.189 | MIT OR Apache-2.0 |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `portable-atomic` | 1.15.0 | Apache-2.0 OR MIT |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib |

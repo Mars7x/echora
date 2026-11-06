@@ -1,6 +1,6 @@
 [package]
 name = "echora-launcher"
-description = "Echora launcher (GTK4/libadwaita on Linux)"
+description = "Echora launcher (GPUI)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,11 +12,10 @@ publish.workspace = true
 name = "echora-launcher"
 path = "src/main.rs"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+[dependencies]
 echora-config.workspace = true
 echora-content.workspace = true
-gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+gpui = "0.2.2"
 
 [lints]
 workspace = true
