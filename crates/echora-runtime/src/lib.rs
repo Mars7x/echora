@@ -1,9 +1,9 @@
 //! The guest runtime: process state, the scheduler, kernel SVCs, IPC and
 //! the system services the game reaches.
 //!
-//! Adapted from pokopia-recomp (same author, GPL-3.0-or-later). Host
-//! integrations that are not ported yet are explicit: `input` reports no
-//! gamepads and `audio` opens no host device.
+//! Adapted from pokopia-recomp (same author, GPL-3.0-or-later). Gamepads
+//! come from `echora-input`; `audio` plays through PipeWire's `pw-cat` when
+//! `ECHORA_AUDIO` is set and opens no device otherwise.
 
 // Ported code keeps its original structure; these lints flag style only.
 // Most unwraps convert fixed-length slices to arrays; replacing them is

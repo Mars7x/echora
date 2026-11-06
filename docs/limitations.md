@@ -17,8 +17,9 @@
 - The NVN layer is Pokopia's: OoT's mesh/task pipelines, AV1 video and other
   Switch 2 graphics features it needs are not implemented. NVN calls the
   Vulkan backend directly; a backend trait (for Metal and Direct3D 12) is
-  still to be introduced. There is no input or audio backend, and the
-  window runs on its own thread, which macOS does not allow.
+  still to be introduced. Gamepads work on Linux only (evdev),
+  audio only through PipeWire's `pw-cat`, and the window runs on its own
+  thread, which macOS does not allow.
 - Shader translation needs the fetched recompiler sources
   (`ECHORA_SHADER_SRC`); binaries built with them include AGPL-3.0 code
   (sirit).
