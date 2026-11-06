@@ -518,6 +518,28 @@ impl Settings {
     }
 }
 
+/// The settings file: `ECHORA_SETTINGS`, else `settings.toml` in the
+/// platform's per-user configuration directory (`$XDG_CONFIG_HOME/echora`
+/// or `~/.config/echora`, `%APPDATA%\\Echora`, or
+/// `~/Library/Application Support/Echora`). `None` when neither is known.
+pub fn default_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(path) = std::env::var_os("ECHORA_SETTINGS") {
+        return Some(PathBuf::from(path));
+    }
+    let env = |k| std::env::var_os(k).map(PathBuf::from);
+    let dir = if cfg!(target_os = "windows") {
+        env("APPDATA").map(|d| d.join("Echora"))
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support/Echora"))
+    } else {
+        env("XDG_CONFIG_HOME")
+            .or_else(|| env("HOME").map(|h| h.join(".config")))
+            .map(|d| d.join("echora"))
+    };
+    dir.map(|d| d.join("settings.toml"))
+}
+
 /// Upgrades an older settings table in place to [`SCHEMA_VERSION`].
 fn migrate(value: &mut toml::Table, from: u32) -> Result<(), ConfigError> {
     if from == 0 {

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+echora-config.workspace = true
 echora-content.workspace = true
 echora-lift.workspace = true
 echora-loader.workspace = true
