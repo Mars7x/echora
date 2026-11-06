@@ -413,8 +413,9 @@ fn discover_game(
         })
         .collect();
 
-    // The process starts in rtld's text; static constructors are primary
-    // roots, prologues and relocation targets are deferred candidates.
+    // The process starts in rtld's text; static constructors and exported
+    // functions are primary roots, prologues and relocation targets are
+    // deferred candidates.
     let mut roots = vec![placed[0].text_range().start];
     let mut deferred = Vec::new();
     for p in &placed {
@@ -422,16 +423,21 @@ fn discover_game(
             continue;
         }
         let ctors = process::init_array_targets(p);
+        let exports = process::exported_function_targets(p);
         let relocs = process::relative_text_targets(p);
         let prologues = process::prologue_targets(p);
         println!(
-            "{:<8} seeds: {} constructors, {} relocation targets, {} prologues",
+            "{:<8} seeds: {} constructors, {} exported functions, {} relocation targets, {} prologues",
             p.module.name,
             ctors.len(),
+            exports.len(),
             relocs.len(),
             prologues.len()
         );
         roots.extend(ctors);
+        // Exported functions are certain entry points, reached from other
+        // modules by symbol rather than by relocation.
+        roots.extend(exports);
         deferred.extend(relocs);
         deferred.extend(prologues);
     }
