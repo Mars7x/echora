@@ -1723,6 +1723,14 @@ impl Nvn {
             | "nvnQueueFinalize"
             | "nvnMemoryPoolFinalize" => {
                 let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
+                // Destructors finalize embedded objects that may never have
+                // been initialized (main+0x3b61ab4 finalizes two buffers of
+                // every instance); the driver tolerates that, so it is a
+                // counted no-op.
+                if !self.objects.contains_key(&this) {
+                    *self.skipped_work.entry(format!("{kind} finalized uninitialized")).or_default() += 1;
+                    return Ok(true);
+                }
                 self.object(this, kind).map_err(invalid)?;
                 if kind == "MemoryPool"
                     && self.objects.values().any(|object| {

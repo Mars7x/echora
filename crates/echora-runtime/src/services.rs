@@ -1065,6 +1065,8 @@ pub struct Services {
     /// Set by a request that parks its thread on the internal event handle
     /// (taken by the runtime after SendSyncRequest).
     blocked_request: Option<u32>,
+    /// SendSyncRequest's own result for the last request, when not success.
+    transport_result: Option<u32>,
     /// nfp availability-change event, created once.
     nfp_availability_event: Option<ReadableEventId>,
     /// Npad ids the application disconnected (hid DisconnectNpad).
@@ -1083,12 +1085,15 @@ pub struct Services {
     native_memory_addresses: BTreeMap<u32, u64>,
     /// Decoder image pools (911) and their native memory handle.
     decoder_image_pools: BTreeMap<u32, u32>,
-    /// Decoder frames bound with BindFrame (311) and their image pool.
-    decoder_frames: BTreeMap<u32, u32>,
     /// Whether the video decoder was started (6) and not stopped (207).
     video_decoder_running: bool,
-    /// Frames handed back to the decoder (command 314).
+    /// Frames handed back to the decoder (command 314), output slots
+    /// waiting for a frame (311/314), and frames reported decoded (213).
     returned_frames: u64,
+    decoder_slots: std::collections::VecDeque<u32>,
+    decoded_frames: u64,
+    /// GetFrame calls answered "no output" (213).
+    empty_frame_requests: u64,
     /// Video decoder submissions so far and the queued input (id,
     /// timestamp argument, bitstream).
     video_submissions: u64,
@@ -1194,6 +1199,7 @@ impl Default for Services {
             socket_poll_timeouts: BTreeMap::new(),
             pending_polls: BTreeMap::new(),
             blocked_request: None,
+            transport_result: None,
             nfp_availability_event: None,
             hid_disconnected_npads: BTreeSet::new(),
             hid_supported_style_set: 0,
@@ -1203,9 +1209,11 @@ impl Default for Services {
             native_memories: BTreeMap::new(),
             native_memory_addresses: BTreeMap::new(),
             decoder_image_pools: BTreeMap::new(),
-            decoder_frames: BTreeMap::new(),
             video_decoder_running: false,
             returned_frames: 0,
+            decoder_slots: Default::default(),
+            decoded_frames: 0,
+            empty_frame_requests: 0,
             video_submissions: 0,
             video_input: Vec::new(),
             library_applets: Vec::new(),
@@ -2047,9 +2055,17 @@ impl Services {
         // non-domain session announces that the client is about to close its
         // handle (libnx serviceClose: send, ignore the result, CloseHandle).
         // The session itself is released by that CloseHandle; the request
-        // succeeds without a reply.
-        if !session.is_domain() && bytes[..8] == [2, 0, 0, 0, 0, 0, 0, 0] {
+        // succeeds without a reply. A TIPC Close (type 15, also bare) does
+        // the same for TIPC sessions.
+        // For TIPC the server closes its side, so the request itself fails
+        // with ResultSessionClosed (0xf601), which the SDK requires before
+        // closing its handle (sdk+0x1a5794).
+        let tipc_close = bytes[..8] == [15, 0, 0, 0, 0, 0, 0, 0];
+        if !session.is_domain() && (bytes[..8] == [2, 0, 0, 0, 0, 0, 0, 0] || tipc_close) {
             self.session_close_requests += 1;
+            if tipc_close {
+                self.transport_result = Some(0xf601);
+            }
             return Ok(());
         }
         let request = match ipc::parse_request_with_domain(&bytes, session.is_domain()) {
@@ -2347,29 +2363,70 @@ impl Services {
                 Ok(Outcome::success())
             }
             // VideoDecoderSession 311 (BindFrame; the SDK's
-            // RegisterAv1DecoderBuffer, client sdk+0x330854): u32 image pool,
-            // then 12 bytes OoT leaves zero -> 16 bytes the SDK keeps per
-            // frame slot. Answered with a frame id (from 1) and a zero word;
-            // the frame and its pool are recorded. Provisional.
-            ServiceObject::VideoDecoder if call.request.command_id == 311 => {
-                call.shape(16, false, false)?;
-                let pool = crate::bytes::le_u32(&call.request.arguments[..4]);
-                if !self.decoder_image_pools.contains_key(&pool) {
-                    return Err(
-                        call.unsupported(object.service(), format!("frame in image pool {pool}"))
-                    );
+            // RegisterAv1DecoderBuffer, client sdk+0x330854) and 314
+            // (Switchbrew's DestroyFrame; the SDK's
+            // ReleaseAv1DecoderOutputBuffer, client sdk+0x331730): u32 slot
+            // handle the SDK keeps per output slot, then 12 (311) or 28 (314:
+            // u32 0, the slot's previous sync handle, u64 0) bytes -> the
+            // slot's 16-byte NativeSyncHandle, which the SDK stores before
+            // putting the slot on its ready ring (sdk+0x331810). The slot is
+            // queued for the next decoded frame; the handle is the slot and
+            // a zero value (syncpoint waits always pass, see the syncpoint
+            // supervisor's 103). Provisional.
+            ServiceObject::VideoDecoder if matches!(call.request.command_id, 311 | 314) => {
+                let register = call.request.command_id == 311;
+                call.shape(if register { 16 } else { 32 }, false, false)?;
+                let slot = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if self.decoder_slots.len() >= 64 {
+                    return Err(invalid("decoder output slot queue overflow"));
                 }
-                let frame = self
-                    .decoder_frames
-                    .keys()
-                    .next_back()
-                    .map_or(1, |frame| frame + 1);
-                self.decoder_frames.insert(frame, pool);
-                let mut reply = u64::from(frame).to_le_bytes().to_vec();
+                self.decoder_slots.push_back(slot);
+                let mut reply = u64::from(slot).to_le_bytes().to_vec();
                 reply.extend_from_slice(&0u64.to_le_bytes());
                 call.reply(0, None, 0, &reply)?;
+                if !register {
+                    self.returned_frames += 1;
+                }
                 self.provisional_commands
-                    .insert("appletOE:video_decoder:311");
+                    .insert("appletOE:video_decoder:311/314");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 213 (Switchbrew's GetFrame; read by the
+            // SDK's GetAv1DecoderOutputBufferProperties, sdk+0x331a24): the
+            // next decoded frame: u32 slot handle, four u32 sizes the SDK
+            // keeps as u16 (width, height, then two more; answered as the
+            // configured size twice), a u32, the u64 timestamp and a flag
+            // byte. Frames fill slots in the order they were handed to the
+            // decoder, each taking the oldest submission's timestamp. No
+            // pixels are written (no host decoder yet). With no slot or no
+            // submission waiting there is no frame: the result is
+            // 0x1c286f, which the SDK's AcquireAv1DecoderOutputBuffer itself
+            // returns when no output is ready (sdk+0x330c80). Provisional.
+            ServiceObject::VideoDecoder if call.request.command_id == 213 => {
+                call.shape(0, false, false)?;
+                if self.decoder_slots.is_empty() || self.video_input.is_empty() {
+                    const NO_OUTPUT: u32 = 0x1c_286f;
+                    call.reply(NO_OUTPUT, None, 0, &[])?;
+                    self.empty_frame_requests += 1;
+                    return Ok(Outcome::result(NO_OUTPUT));
+                }
+                let slot = self.decoder_slots.pop_front().unwrap_or_default();
+                let (_, timestamp, _) = self.video_input.remove(0);
+                let (width, height) = self
+                    .video_decoders
+                    .last()
+                    .and_then(|(_, parameters)| Some((*parameters.get(4)?, *parameters.get(5)?)))
+                    .unwrap_or((1920, 1080));
+                let mut data = Vec::with_capacity(0x24);
+                for value in [slot, width, height, width, height, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                data.extend_from_slice(&timestamp.to_le_bytes());
+                data.extend_from_slice(&0u32.to_le_bytes());
+                call.reply(0, None, 0, &data)?;
+                self.decoded_frames += 1;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:213");
                 Ok(Outcome::success())
             }
             // VideoDecoderSession 109 (Decode; the SDK's
@@ -2399,13 +2456,27 @@ impl Services {
                 let timestamp = crate::bytes::le_u64(&call.request.arguments[4..12]);
                 self.video_submissions += 1;
                 let id = self.video_submissions;
-                // Keep a bounded backlog until a decoder consumes it.
-                if self.video_input.len() < 64 {
-                    self.video_input.push((id, timestamp, bytes));
+                // GetFrame (213) consumes submissions in order.
+                if self.video_input.len() >= 4096 {
+                    return Err(invalid("video submission backlog overflow"));
                 }
+                self.video_input.push((id, timestamp, bytes));
                 call.reply(0, None, 0, &id.to_le_bytes())?;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:109");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 115 (FinalizeVideoDecoder; Switchbrew
+            // name): no input or reply data (inferred). Queued slots and
+            // submissions are dropped.
+            ServiceObject::VideoDecoder if call.request.command_id == 115 => {
+                call.shape(0, false, false)?;
+                self.decoder_slots.clear();
+                self.video_input.clear();
+                self.video_decoder_running = false;
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:115");
                 Ok(Outcome::success())
             }
             // VideoDecoderSession Start (6), Flush (8) and Stop (207)
@@ -2421,25 +2492,6 @@ impl Services {
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:start_stop");
-                Ok(Outcome::success())
-            }
-            // VideoDecoderSession 314 (named DestroyFrame on Switchbrew; the
-            // SDK's client at sdk+0x331730 is 311's counterpart): u32 frame
-            // slot handle, u32 0, the slot's previous 16-byte value and u64
-            // 0 -> 16 bytes the SDK stores back into the slot before putting
-            // it on its free ring (sdk+0x331810), so it hands a frame back to
-            // the decoder. Answered like 311. With no host decoder no frame
-            // ever comes out, and OoT calls it continuously; the calls are
-            // counted. Provisional.
-            ServiceObject::VideoDecoder if call.request.command_id == 314 => {
-                call.shape(32, false, false)?;
-                let slot = crate::bytes::le_u32(&call.request.arguments[..4]);
-                let mut reply = u64::from(slot).to_le_bytes().to_vec();
-                reply.extend_from_slice(&0u64.to_le_bytes());
-                call.reply(0, None, 0, &reply)?;
-                self.returned_frames += 1;
-                self.provisional_commands
-                    .insert("appletOE:video_decoder:314");
                 Ok(Outcome::success())
             }
             // VideoDecoderSession 101 (Configure): u32 width, u32 height,
@@ -4210,6 +4262,11 @@ impl Services {
             }
             _ => Err(call.unsupported(SERVICE, "nfp command is not implemented")),
         }
+    }
+
+    /// A transport result for the last request (instead of success), once.
+    pub(crate) fn take_transport_result(&mut self) -> Option<u32> {
+        self.transport_result.take()
     }
 
     /// The internal handle of a request that parked its thread, once.
@@ -6414,6 +6471,23 @@ impl Services {
                     .insert("appletOE:graphics_supervisor:111");
                 Ok(Outcome::success())
             }
+            // 112: u32 native memory handle from 111; no reply data. It
+            // follows the decoder's teardown, the counterpart of 111
+            // (inferred): the handle and its bound address are forgotten.
+            112 => {
+                call.shape(4, false, false)?;
+                let handle = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if self.native_memories.remove(&handle).is_none() {
+                    return Err(
+                        call.unsupported(SERVICE, format!("destroy of native memory {handle}"))
+                    );
+                }
+                self.native_memory_addresses.remove(&handle);
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:112");
+                Ok(Outcome::success())
+            }
             // 114 (CreateNativeMemory, client sdk+0x48ec88): u32 handle from
             // 111, u64 address and u64 size of the application's memory, and
             // 16 bytes OoT leaves zero; no reply data. The address is
@@ -8412,6 +8486,8 @@ impl Services {
             "video_decoding_implemented":false,
             "video_submissions":self.video_submissions,
             "returned_frames":self.returned_frames,
+            "decoded_frames":self.decoded_frames,
+            "empty_frame_requests":self.empty_frame_requests,
             "library_applets":self.library_applets,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
