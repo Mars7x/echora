@@ -319,6 +319,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             println!("report: {}", report.display());
             let mut command = std::process::Command::new(&runner);
+            // ECHORA_CAPTURE_EVERY=N: presented frames are saved as PNGs in
+            // run-<stamp>-frames beside the report.
+            if std::env::var_os("ECHORA_CAPTURE_EVERY").is_some()
+                && std::env::var_os("ECHORA_CAPTURE_DIR").is_none()
+            {
+                let frames = translation.join(format!("run-{stamp}-frames"));
+                println!("frames: {}", frames.display());
+                command.env("ECHORA_CAPTURE_DIR", frames);
+            }
             command
                 .arg(&exefs)
                 .arg(budget.to_string())
