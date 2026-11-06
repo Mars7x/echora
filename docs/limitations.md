@@ -2,9 +2,9 @@
 
 - Game code is loaded and verified but not yet translated or executed.
   Synthetic AArch64 programs are lifted and executed natively.
-- Guest memory works on Linux and Windows (10 1803 or later) with 4 KiB
-  pages only. macOS builds and runs the non-memory tests but cannot create
-  guest memory yet.
+- Guest memory reaches host memory directly on Linux and Windows (10 1803 or
+  later), which need 4 KiB host pages. macOS uses a checked backend that
+  looks every guest access up in a table, which is slower.
 - On Windows, releasing part of a 2 MiB memory chunk zeroes it but keeps its
   storage committed until the whole chunk is released.
 - A guest access to unmapped or protected memory ends the process (with the

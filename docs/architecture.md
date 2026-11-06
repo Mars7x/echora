@@ -11,10 +11,10 @@ crates selected per host.
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
 | `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget, process layout and discovery roots (prologues, RELA/RELR relative targets, `init_array`). ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
-| `echora-guest` | core + host backend | Guest CPU state, guest memory (mappings, permissions, TLB, exclusive monitor), SIMD/FP semantics, traps, and the `Core` that generated code runs against. Guest memory has a per-host backend (`host_memory/`): Linux maps one memfd twice, Windows maps pagefile-backed sections into placeholder reservations, so generated code accesses guest memory directly. | Ported from Pokopia. Linux and Windows backends. |
+| `echora-guest` | core + host backend | Guest CPU state, guest memory (mappings, permissions, TLB, exclusive monitor), SIMD/FP semantics, traps, and the `Core` that generated code runs against. Guest memory has a per-host backend (`host_memory/`): Linux maps one memfd twice, Windows maps pagefile-backed sections into placeholder reservations, so generated code accesses guest memory directly; macOS translates each access through a per-guest-page table. | Ported from Pokopia. Linux, Windows and macOS backends. |
 | `echora-lift` | core | AArch64 decoding (scalar and SIMD/FP), code discovery from entries, prologues, relocation targets and jump tables, basic blocks, and Rust emission. Generated code depends only on `echora-guest` and exposes `dispatch(&mut Core)`. | Ported from Pokopia; 53 tests. |
-| `echora-aot-tests` | test | Synthetic AArch64 programs lifted by `build.rs` and run natively on a minimal host loop (integer, flags, calls, PAuth hints, budgets, window dispatch, missing blocks, CAS/LDADD/exclusives, acquire/release). | Execution tests (Linux and Windows). |
-| `echora-runtime` | core (+ host stand-ins) | Process bootstrap (module mapping, stack, TLS, entry registers, NPDM capabilities including the private kernel resource pool), scheduler and threads, synchronization, kernel SVCs, IPC framing and the system services, file systems and RomFS images, HID shared memory. NVN keeps only its entry-point table; window, input and audio are stand-ins with no host device. | Ported from Pokopia; tests on Linux and Windows. Boots the real game's process; not yet run. |
+| `echora-aot-tests` | test | Synthetic AArch64 programs lifted by `build.rs` and run natively on a minimal host loop (integer, flags, calls, PAuth hints, budgets, window dispatch, missing blocks, CAS/LDADD/exclusives, acquire/release). | Execution tests (Linux, Windows and macOS). |
+| `echora-runtime` | core (+ host stand-ins) | Process bootstrap (module mapping, stack, TLS, entry registers, NPDM capabilities including the private kernel resource pool), scheduler and threads, synchronization, kernel SVCs, IPC framing and the system services, file systems and RomFS images, HID shared memory. NVN keeps only its entry-point table; window, input and audio are stand-ins with no host device. | Ported from Pokopia; tests on Linux, Windows and macOS. Boots the real game's process; not yet run. |
 | `echora-resolution` | core | Resolution planning: guest logical size, guest view, internal scene size, presentation rectangle, output size; target/viewport mapping; change impact. | Implemented, tested. Not yet used by a renderer. |
 | `echora-config` | core | Versioned TOML settings, validation, migration, requested vs effective settings, apply classes for live changes. | Implemented, tested. Not yet used by a runtime or launcher. |
 | `echora` | front end | Command-line tool; owns host paths (cache location). | `inspect`, `verify`, `import`, `load`, `analyze`, `lift`, `extract`. |
@@ -73,9 +73,15 @@ untouched remainders. Section pages cannot be decommitted, so releasing a
 whole chunk drops its section while partial releases are zeroed in place. A
 vectored exception handler reports forbidden guest accesses as on Linux.
 
-16 KiB-page hosts such as Apple silicon need a different strategy and
-currently have no backend; `echora-guest` compiles there and fails clearly
-if guest memory is created.
+Apple silicon's 16 KiB pages cannot give each 4 KiB guest page its own
+backing and permissions, so macOS uses the checked backend: a translation
+table holds, per guest page, the host address of its backing page plus
+READ/WRITE bits. Each access looks its page up and checks the permission;
+a forbidden access prints the same report and aborts. Accesses that cross a
+guest page are split, since neighbouring guest pages need not have
+neighbouring backing. Linux and Windows reach memory directly; on macOS every
+access pays the lookup. `--cfg echora_checked_memory` selects this backend on
+Linux for testing.
 
 ## Resolution model
 
