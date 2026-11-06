@@ -185,7 +185,8 @@ pub fn run() -> ExitCode {
 }
 
 /// With "Skip launcher" on, starts the last game and waits for it. `None`
-/// means the window should open instead.
+/// means the window should open instead: also when the game fails, so the
+/// player isn't left with nothing on screen.
 fn skip_to_game() -> Option<ExitCode> {
     let (settings_path, settings) = load_settings();
     if !settings.launcher.skip {
@@ -194,7 +195,10 @@ fn skip_to_game() -> Option<ExitCode> {
     let mut command = game_command(&last_game()?, settings_path.as_deref())?;
     match command.status() {
         Ok(status) if status.success() => Some(ExitCode::SUCCESS),
-        Ok(_) => Some(ExitCode::FAILURE),
+        Ok(status) => {
+            eprintln!("echora-launcher: the game stopped ({status}); opening the launcher");
+            None
+        }
         Err(error) => {
             eprintln!("echora-launcher: couldn't start the game: {error}");
             None
