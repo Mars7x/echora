@@ -15,8 +15,6 @@ pub struct IoctlOutput {
 
 /// NvResult::NotImplemented.
 const NOT_IMPLEMENTED: u32 = 1;
-/// NvResult::NotSupported.
-const NOT_SUPPORTED: u32 = 2;
 
 /// NVGPU_GPU_IOCTL_GET_CHARACTERISTICS with the 0xD8-byte native structure
 /// (`0xC0E84705`: group 'G', number 5, in/out, 0xE8 bytes).
@@ -35,6 +33,13 @@ const GET_ACTIVE_SLOT_MASK: u32 = 0x8008_4714;
 const AS_INITIALIZE_EX: u32 = 0x4028_4109;
 /// NVGPU_AS_IOCTL_GET_SYNC_RO_MAP (out, 0x10 bytes).
 const AS_GET_SYNC_RO_MAP: u32 = 0x8010_410b;
+/// NVGPU_AS_IOCTL_GET_VA_REGIONS (in/out, 0x40 bytes).
+const AS_GET_VA_REGIONS: u32 = 0xc040_4108;
+const SMALL_PAGE_SIZE: u32 = 0x1000;
+/// Read-only syncpoint map: base GPU VA, bytes per syncpoint, count.
+const SYNC_RO_MAP_BASE: u64 = 0xff_0000_0000;
+const SYNC_RO_MAP_SYNCPOINT_SIZE: u32 = 0x1000;
+const SYNC_RO_MAP_SYNCPOINTS: u32 = 1024;
 /// Group 'G' number 0x13, in/out, 8 bytes.
 const GPU_IOCTL_13: u32 = 0xc008_4713;
 /// TPC mask of the single GPC: bits for its two TPCs.
@@ -86,9 +91,41 @@ fn native_gpu_characteristics() -> Vec<u8> {
     bytes
 }
 
-/// Ioctl (inline size 0) and Ioctl3: one input buffer, a main and an
-/// optional inline output buffer.
+/// GPU address space set up by INITIALIZE_EX on one nvhost-as-gpu fd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AddressSpace {
+    big_page_size: u32,
+    start: u64,
+    split: u64,
+    end: u64,
+}
+
+/// Per-descriptor device state.
+#[derive(Clone, Debug, Default)]
+pub struct Devices {
+    address_spaces: std::collections::BTreeMap<u32, AddressSpace>,
+}
+
+impl Devices {
+    /// Forgets the state of a closed descriptor.
+    pub fn close(&mut self, fd: u32) {
+        self.address_spaces.remove(&fd);
+    }
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u32_at(bytes, at)) | u64::from(u32_at(bytes, at + 4)) << 32
+}
+
+/// Ioctl (inline size 0) and Ioctl3 on descriptor `fd` of `device`: one
+/// input buffer, a main and an optional inline output buffer.
 pub fn ioctl(
+    devices: &mut Devices,
+    fd: u32,
     device: &str,
     code: u32,
     input: &[u8],
@@ -172,21 +209,78 @@ pub fn ioctl(
         // FLUSH_L2 (in, u32 flags, u32 reserved): nothing is cached on the
         // host side, so there is nothing to flush.
         ("/dev/nvhost-ctrl-gpu", FLUSH_L2) if input.len() >= 8 => Ok(IoctlOutput::default()),
-        // NVGPU_AS_IOCTL_INITIALIZE_EX (in, 0x28 bytes: u32 big page size,
-        // s32 as fd, u32 flags, u32 reserved, u64 VA start/end/split). The
-        // host renders through NVN, so the guest's GPU VA layout is only
-        // accepted here.
+        // NVGPU_AS_IOCTL_INITIALIZE_EX (in, 0x28 bytes: u32 flags, s32 as
+        // fd, u32 big page size, u32 reserved, u64 VA start, end, split; a
+        // zero split is one unified range). The layout is recorded for
+        // GET_VA_REGIONS; the host renders through NVN, so nothing maps
+        // into it.
         ("/dev/nvhost-as-gpu", AS_INITIALIZE_EX) if input.len() >= 0x28 => {
+            let end = u64_at(input, 0x18);
+            let split = match u64_at(input, 0x20) {
+                0 => end,
+                split => split,
+            };
+            let space = AddressSpace {
+                big_page_size: u32_at(input, 8),
+                start: u64_at(input, 0x10),
+                end,
+                split,
+            };
+            if devices.address_spaces.contains_key(&fd) {
+                return Err(format!("address space fd {fd} is already initialized"));
+            }
+            if !space.big_page_size.is_power_of_two()
+                || space.big_page_size < 0x1000
+                || !(space.start <= space.split && space.split <= space.end)
+            {
+                return Err(format!("INITIALIZE_EX layout {space:x?} is not modeled"));
+            }
+            devices.address_spaces.insert(fd, space);
             Ok(IoctlOutput::default())
         }
         // NVGPU_AS_IOCTL_GET_SYNC_RO_MAP (out, u64 base GPU VA, u32 sync
-        // size, u32 syncpoint count; Linux nvgpu number 11). No read-only
-        // syncpoint map is modeled, so it is NotSupported, as nvgpu answers
-        // without one. Provisional.
-        ("/dev/nvhost-as-gpu", AS_GET_SYNC_RO_MAP) => Ok(IoctlOutput {
-            result: NOT_SUPPORTED,
-            ..IoctlOutput::default()
-        }),
+        // size, u32 syncpoint count; Linux nvgpu number 11). Answering
+        // NotSupported sends the SDK down a path that later dereferences an
+        // uncreated singleton, so a map is reported: one page per syncpoint
+        // at the top of the supervisor partition. Nothing reads it on the
+        // host. Values provisional.
+        ("/dev/nvhost-as-gpu", AS_GET_SYNC_RO_MAP) if output_size >= 0x10 => {
+            let mut output = SYNC_RO_MAP_BASE.to_le_bytes().to_vec();
+            output.extend_from_slice(&SYNC_RO_MAP_SYNCPOINT_SIZE.to_le_bytes());
+            output.extend_from_slice(&SYNC_RO_MAP_SYNCPOINTS.to_le_bytes());
+            Ok(IoctlOutput {
+                output,
+                ..IoctlOutput::default()
+            })
+        }
+        // NVGPU_AS_IOCTL_GET_VA_REGIONS (in/out, 0x40 bytes: u64 buffer
+        // address, u32 buffer size, u32 reserved, two 24-byte regions of u64
+        // offset, u32 page size, u32 reserved, u64 pages). As yuzu-family
+        // emulators answer: the small-page region [start, split) and the
+        // big-page region [split, end) from INITIALIZE_EX. A unified range
+        // reports no big pages (provisional).
+        ("/dev/nvhost-as-gpu", AS_GET_VA_REGIONS) if input.len() >= 0x40 && output_size >= 0x40 => {
+            let space = devices
+                .address_spaces
+                .get(&fd)
+                .ok_or_else(|| format!("GET_VA_REGIONS before INITIALIZE_EX on fd {fd}"))?;
+            let mut output = input[..8].to_vec();
+            output.extend_from_slice(&0x30u32.to_le_bytes());
+            output.extend_from_slice(&0u32.to_le_bytes());
+            for (offset, end, page_size) in [
+                (space.start, space.split, SMALL_PAGE_SIZE),
+                (space.split, space.end, space.big_page_size),
+            ] {
+                output.extend_from_slice(&offset.to_le_bytes());
+                output.extend_from_slice(&page_size.to_le_bytes());
+                output.extend_from_slice(&0u32.to_le_bytes());
+                output.extend_from_slice(&((end - offset) / u64::from(page_size)).to_le_bytes());
+            }
+            Ok(IoctlOutput {
+                output,
+                ..IoctlOutput::default()
+            })
+        }
         // Eden 1a6d7d4 stubs Ioctl3 0x13 on this device as NotImplemented
         // and writes no output; the SDK continues past that result.
         ("/dev/nvhost-ctrl-gpu", GPU_IOCTL_13) => Ok(IoctlOutput {
@@ -204,12 +298,71 @@ pub fn ioctl(
 mod tests {
     use super::*;
 
+    fn call(
+        device: &str,
+        code: u32,
+        input: &[u8],
+        output: usize,
+        inline: usize,
+    ) -> Result<IoctlOutput, String> {
+        ioctl(
+            &mut Devices::default(),
+            1,
+            device,
+            code,
+            input,
+            output,
+            inline,
+        )
+    }
+
+    #[test]
+    fn address_space_regions_follow_its_initialized_layout() {
+        let mut devices = Devices::default();
+        let mut init = vec![0u8; 0x28];
+        init[8..12].copy_from_slice(&0x10000u32.to_le_bytes());
+        init[0x10..0x18].copy_from_slice(&0x800_0000u64.to_le_bytes());
+        init[0x18..0x20].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        init[0x20..0x28].copy_from_slice(&(3u64 << 38).to_le_bytes());
+        let mut query = vec![0u8; 0x40];
+        query[..8].copy_from_slice(&0xabcdu64.to_le_bytes());
+        let as_gpu = "/dev/nvhost-as-gpu";
+        assert!(ioctl(&mut devices, 2, as_gpu, 0xc040_4108, &query, 0x40, 0).is_err());
+        ioctl(&mut devices, 2, as_gpu, 0x4028_4109, &init, 0, 0).unwrap();
+        assert!(ioctl(&mut devices, 2, as_gpu, 0x4028_4109, &init, 0, 0).is_err());
+        let out = ioctl(&mut devices, 2, as_gpu, 0xc040_4108, &query, 0x40, 0)
+            .unwrap()
+            .output;
+        let u64_at = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+        assert_eq!((out.len(), u64_at(0), out[8]), (0x40, 0xabcd, 0x30));
+        assert_eq!(
+            (u64_at(0x10), u64_at(0x20)),
+            (0x800_0000, ((3 << 38) - 0x800_0000) / 0x1000)
+        );
+        assert_eq!((u64_at(0x28), u64_at(0x38)), (3 << 38, (1 << 38) / 0x10000));
+        devices.close(2);
+        assert!(ioctl(&mut devices, 2, as_gpu, 0xc040_4108, &query, 0x40, 0).is_err());
+        // A zero split is one small-page range.
+        init[0x20..0x28].fill(0);
+        ioctl(&mut devices, 2, as_gpu, 0x4028_4109, &init, 0, 0).unwrap();
+        let out = ioctl(&mut devices, 2, as_gpu, 0xc040_4108, &query, 0x40, 0)
+            .unwrap()
+            .output;
+        let u64_at = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+        assert_eq!(
+            (u64_at(0x20), u64_at(0x28), u64_at(0x38)),
+            (((1 << 40) - 0x800_0000) / 0x1000, 1 << 40, 0)
+        );
+        let map = call(as_gpu, 0x8010_410b, &[], 0x10, 0).unwrap();
+        assert_eq!((map.output.len(), map.result), (0x10, 0));
+    }
+
     #[test]
     fn native_characteristics_report_ampere_with_the_input_address_echoed() {
         let mut input = vec![0u8; 0xe8];
         input[..8].copy_from_slice(&0xe8u64.to_le_bytes());
         input[8..16].copy_from_slice(&0x1234_5678u64.to_le_bytes());
-        let out = ioctl("/dev/nvhost-ctrl-gpu", 0xc0e8_4705, &input, 0xe8, 0xd8).unwrap();
+        let out = call("/dev/nvhost-ctrl-gpu", 0xc0e8_4705, &input, 0xe8, 0xd8).unwrap();
         assert_eq!(out.output.len(), 0xe8);
         assert_eq!(out.output[..8], 0xd8u64.to_le_bytes());
         assert_eq!(out.output[8..16], 0x1234_5678u64.to_le_bytes());
@@ -218,32 +371,32 @@ mod tests {
             |at: usize| u32::from_le_bytes(out.inline_output[at..at + 4].try_into().unwrap());
         assert_eq!((word(0), word(4), word(0x3c)), (0x170, 0xe, 0x807));
         assert_eq!(word(0x5c), 0xb197);
-        assert!(ioctl("/dev/nvhost-ctrl-gpu", 0xc0e8_4705, &input, 0xe8, 0xd0).is_err());
-        assert!(ioctl("/dev/nvmap", 0xc0e8_4705, &input, 0xe8, 0xd8).is_err());
+        assert!(call("/dev/nvhost-ctrl-gpu", 0xc0e8_4705, &input, 0xe8, 0xd0).is_err());
+        assert!(call("/dev/nvmap", 0xc0e8_4705, &input, 0xe8, 0xd8).is_err());
     }
 
     #[test]
     fn tpc_masks_are_written_only_for_a_nonzero_buffer_size() {
         let mut input = vec![0u8; 0x18];
         input[8..16].copy_from_slice(&0xdead_0000u64.to_le_bytes());
-        let empty = ioctl("/dev/nvhost-ctrl-gpu", 0xc018_4706, &input, 0x18, 4).unwrap();
+        let empty = call("/dev/nvhost-ctrl-gpu", 0xc018_4706, &input, 0x18, 4).unwrap();
         assert_eq!(empty.output, input);
         assert!(empty.inline_output.is_empty());
         input[..4].copy_from_slice(&4u32.to_le_bytes());
-        let out = ioctl("/dev/nvhost-ctrl-gpu", 0xc018_4706, &input, 0x18, 4).unwrap();
+        let out = call("/dev/nvhost-ctrl-gpu", 0xc018_4706, &input, 0x18, 4).unwrap();
         assert_eq!(out.output[0x10..0x14], 3u32.to_le_bytes());
         assert_eq!(out.output[8..16], input[8..16]);
         assert_eq!(out.inline_output, 3u32.to_le_bytes());
         assert_eq!(out.result, 0);
-        let stub = ioctl("/dev/nvhost-ctrl-gpu", 0xc008_4713, &[0; 8], 8, 8).unwrap();
+        let stub = call("/dev/nvhost-ctrl-gpu", 0xc008_4713, &[0; 8], 8, 8).unwrap();
         assert_eq!((stub.result, stub.output.len()), (1, 0));
-        let size = ioctl("/dev/nvhost-ctrl-gpu", 0x8004_4701, &[], 4, 0).unwrap();
+        let size = call("/dev/nvhost-ctrl-gpu", 0x8004_4701, &[], 4, 0).unwrap();
         assert_eq!((size.output, size.result), (1u32.to_le_bytes().to_vec(), 0));
-        let info = ioctl("/dev/nvhost-ctrl-gpu", 0x8028_4702, &[], 0x28, 0).unwrap();
+        let info = call("/dev/nvhost-ctrl-gpu", 0x8028_4702, &[], 0x28, 0).unwrap();
         assert_eq!((info.output.len(), info.output[8]), (0x28, 0x00));
         assert_eq!(info.output[4 * 9], 0x10);
-        let slots = ioctl("/dev/nvhost-ctrl-gpu", 0x8008_4714, &[], 8, 0).unwrap();
+        let slots = call("/dev/nvhost-ctrl-gpu", 0x8008_4714, &[], 8, 0).unwrap();
         assert_eq!(slots.output, [7, 0, 0, 0, 1, 0, 0, 0]);
-        assert!(ioctl("/dev/nvhost-ctrl-gpu", 0x8028_4702, &[], 0x20, 0).is_err());
+        assert!(call("/dev/nvhost-ctrl-gpu", 0x8028_4702, &[], 0x20, 0).is_err());
     }
 }
