@@ -311,6 +311,8 @@ fn low_mask_cases(word: u32) -> Option<u64> {
 const MAX_JUMP_TABLE_ENTRIES: u64 = 65536;
 /// Entries read from an unsigned byte table whose bound is not found.
 const UNBOUNDED_BYTE_TABLE_ENTRIES: u64 = 64;
+/// Entries read from an unsigned halfword table whose bound is not found.
+const UNBOUNDED_HALFWORD_TABLE_ENTRIES: u64 = 128;
 /// How far back from the BR the table setup is searched, in instructions.
 const JUMP_TABLE_WINDOW: u64 = 160;
 
@@ -563,16 +565,17 @@ fn jump_table(
     } else {
         base?
     };
-    // Unsigned byte entries scaled to instructions can only reach the 256
-    // instructions after the base, nearby code of the same function. With no
-    // bound in the window (a loop counter whose exit test is elsewhere, as at
-    // main 0x71009c93f0), a fixed number of entries is read instead; extra
-    // targets only add block entries.
-    let unbounded = entry_size == 1 && !entry_signed && shift == 2 && !sign_extend32;
-    let (count, exact) = match bound(&compares, &index_copies) {
-        Some(count) => (count, true),
-        None if unbounded => (UNBOUNDED_BYTE_TABLE_ENTRIES, false),
-        None => return None,
+    // Unsigned byte or halfword entries scaled to instructions only reach
+    // forward from the base, into code after the dispatch. With no bound in
+    // the window (a loop counter whose exit test is elsewhere, as at main
+    // 0x71009c93f0 and 0x7100b4cbac), a fixed number of entries is read
+    // instead; extra targets only add block entries.
+    let unbounded = !entry_signed && shift == 2 && !sign_extend32;
+    let (count, exact) = match (bound(&compares, &index_copies), entry_size) {
+        (Some(count), _) => (count, true),
+        (None, 1) if unbounded => (UNBOUNDED_BYTE_TABLE_ENTRIES, false),
+        (None, 2) if unbounded => (UNBOUNDED_HALFWORD_TABLE_ENTRIES, false),
+        _ => return None,
     };
     if count == 0 || count > MAX_JUMP_TABLE_ENTRIES {
         return None;
@@ -2821,6 +2824,38 @@ mod tests {
             name: "rodata".into(),
             base: 0x2000,
             bytes: vec![0, 2, 1],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
+        assert!(translation.instructions.contains_key(&0x1020));
+    }
+
+    #[test]
+    fn unbounded_halfword_tables_read_a_fixed_number_of_entries() {
+        // As above with halfword entries: ldrh w11, [x9, x8, lsl #1].
+        let words = [
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_0129, // add x9, x9, #0
+            0x1000_008a, // adr x10, 0x1018
+            0x7868_792b, // ldrh w11, [x9, x8, lsl #1]
+            0x8b0b_094a, // add x10, x10, x11, lsl #2
+            0xd61f_0140, // br x10
+            0xd65f_03c0, // 0x1018: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 2, 0, 1, 0],
         };
         let translation = discover_with_tables(
             &[region(&words)],
