@@ -603,9 +603,6 @@ const WINDOW_INSET: f32 = 16.0;
 /// Margin between a sheet and the window's edges.
 const SHEET_MARGIN: f32 = 24.0;
 
-/// The size a sheet grows from as it opens, relative to its full size.
-const SHEET_FROM: f32 = 0.94;
-
 /// How long a closing sheet takes to fade out.
 const SHEET_OUT: Duration = Duration::from_millis(180);
 
@@ -613,7 +610,6 @@ const SHEET_OUT: Duration = Duration::from_millis(180);
 /// A closing sheet fades out instead of in and takes no input.
 fn scrim(
     sheet: gpui::Stateful<gpui::Div>,
-    surface: u32,
     corner: Pixels,
     motion: bool,
     closing: bool,
@@ -636,7 +632,7 @@ fn scrim(
         })
         // Clicks inside the sheet must not reach the scrim behind it.
         .child(if motion {
-            grow(sheet, surface, closing)
+            fade(sheet, closing)
         } else {
             sheet.into_any_element()
         });
@@ -662,49 +658,27 @@ fn scrim(
         .into_any_element()
 }
 
-/// GNOME-style growth without scaling text or images (which would snap to
-/// the pixel grid differently every frame): the sheet's contents, always at
-/// full size, fade in at once while a card of the sheet's colour springs
-/// open from the centre beneath them. Closing shrinks the card as the
-/// contents fade first.
-fn grow(sheet: gpui::Stateful<gpui::Div>, surface: u32, closing: bool) -> AnyElement {
-    let duration = if closing { SHEET_OUT } else { ui::SPRING };
-    let card = div()
-        .absolute()
-        .rounded(u(radius::SHEET))
-        .border_1()
-        .border_color(color(palette::BORDER))
-        .bg(color(surface))
+/// Opening fades the sheet in with the dim behind it; closing fades it out
+/// a little faster. Neither scales: GPUI can't scale an element without its
+/// text and images snapping to the pixel grid frame by frame.
+fn fade(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
+    let duration = if closing {
+        SHEET_OUT
+    } else {
+        Duration::from_millis(200)
+    };
+    sheet
         .with_animation(
-            if closing { "card-out" } else { "card-in" },
+            if closing { "sheet-out" } else { "sheet-in" },
             Animation::new(duration),
-            move |card, t| {
-                let scale = if closing {
-                    1.0 - 0.05 * ui::ease_out(t)
+            move |sheet, t| {
+                sheet.opacity(if closing {
+                    1.0 - ui::ease_out(t)
                 } else {
-                    SHEET_FROM + (1.0 - SHEET_FROM) * ui::spring(t)
-                };
-                // Each edge moves in by half the size the card is missing.
-                let inset = gpui::relative((1.0 - scale) / 2.0);
-                card.top(inset).bottom(inset).left(inset).right(inset)
+                    ui::ease_out(t)
+                })
             },
-        );
-    let content = sheet.with_animation(
-        if closing { "content-out" } else { "content-in" },
-        Animation::new(duration),
-        move |sheet, t| {
-            sheet.opacity(if closing {
-                1.0 - ui::ease_out(t * 2.0)
-            } else {
-                // Together with the card, opaque within the first third.
-                ui::ease_out(t / 0.3)
-            })
-        },
-    );
-    div()
-        .relative()
-        .child(card)
-        .child(content)
+        )
         .into_any_element()
 }
 
@@ -729,7 +703,7 @@ fn sheet(
         .flex()
         .rounded(u(radius::SHEET))
         .border_1()
-        .border_color(color(palette::BORDER))
+        .border_color(color(palette::WINDOW_EDGE))
         .bg(color(surface))
 }
 
@@ -1098,7 +1072,7 @@ impl Launcher {
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(tabs)
             .child(content);
-        scrim(sheet, surface, self.corner, self.motion, closing, cx)
+        scrim(sheet, self.corner, self.motion, closing, cx)
     }
 
     fn settings_page(
@@ -1528,7 +1502,7 @@ impl Launcher {
                     )
                     .child(source),
             );
-        scrim(sheet, surface, self.corner, self.motion, closing, cx)
+        scrim(sheet, self.corner, self.motion, closing, cx)
     }
 }
 
