@@ -251,16 +251,12 @@ pub fn button(
 /// circle drawn as a rounded box would sit at the exact position instead,
 /// which on a sheet centred to half a pixel puts the glyph off-centre.
 pub fn round_button(id: impl Into<ElementId>, icon: &'static str, active: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .group(ROUND_BUTTON)
+    let button = div()
         .relative()
-        .flex_none()
         .size(px(24.0))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
         .child(
             gpui::svg()
                 .path(CIRCLE)
@@ -284,8 +280,22 @@ pub fn round_button(id: impl Into<ElementId>, icon: &'static str, active: bool) 
                 } else {
                     palette::SECONDARY_LABEL
                 })),
-        )
+        );
+    // Takes clicks up to ROUND_BUTTON_REACH beyond the circle, as the
+    // desktop's own window buttons do, so a press just off it doesn't
+    // land on the header and drag the window.
+    div()
+        .id(id)
+        .group(ROUND_BUTTON)
+        .flex_none()
+        .p(px(ROUND_BUTTON_REACH))
+        .child(button)
 }
+
+/// How far a round button takes clicks beyond its circle: half the gap
+/// window buttons keep, so neighbours' click areas meet. Layouts leave this
+/// much less space around the button.
+pub const ROUND_BUTTON_REACH: f32 = 6.0;
 
 const ROUND_BUTTON: &str = "round-button";
 const CIRCLE: &str = "icons/circle.svg";
