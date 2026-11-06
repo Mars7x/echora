@@ -13,7 +13,7 @@ use echora_input::button;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
     CursorStyle, Decorations, Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
-    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseMoveEvent, ObjectFit,
+    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, actions, anchored,
     canvas, deferred, div, img, point, prelude::*, px, size,
@@ -974,40 +974,38 @@ impl Launcher {
                         })
                 }))
         };
-        div()
-            .id("title-bar")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(48.0))
-            .px(px(space::M))
-            .flex()
-            .items_center()
-            .justify_between()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.moving = true),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.moving = false),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
-                if this.moving && event.dragging() {
-                    this.moving = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_click(|event, window, _| {
-                if event.is_right_click() {
-                    window.show_window_menu(event.position());
-                } else if event.click_count() == 2 {
-                    window.zoom_window();
-                }
-            })
-            .child(div().when(client_side, |el| el.child(buttons(&self.buttons.left))))
-            .child(div().when(client_side, |el| el.child(buttons(&self.buttons.right))))
+        self.drag_window(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(48.0))
+                .px(px(space::M))
+                .flex()
+                .items_center()
+                .justify_between()
+                // The app's name, centred as a header bar's title is, where the
+                // launcher draws its own header bar.
+                .when(client_side, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .font_family(ui::TITLE_FONT)
+                            .text_size(u(text::HEADLINE))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color(palette::LABEL))
+                            .child("Echora"),
+                    )
+                })
+                .child(div().when(client_side, |el| el.child(buttons(&self.buttons.left))))
+                .child(div().when(client_side, |el| el.child(buttons(&self.buttons.right)))),
+            cx,
+        )
     }
 
     /// No game yet: a status page with the one thing to do.
@@ -1159,12 +1157,23 @@ impl Launcher {
             .into_any_element()
     }
 
-    /// Lets `el` drag the window, like the title bar.
+    /// Makes `el` behave as a header bar does: dragging it moves the
+    /// window, a double-click maximizes or restores it, and a right-click
+    /// opens the window menu.
     fn drag_window(&self, el: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
         el.on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _, _, _| this.moving = true),
+            cx.listener(|this, event: &MouseDownEvent, window, _| {
+                if event.click_count == 2 {
+                    window.zoom_window();
+                } else {
+                    this.moving = true;
+                }
+            }),
         )
+        .on_mouse_down(MouseButton::Right, |event, window, _| {
+            window.show_window_menu(event.position);
+        })
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|this, _, _, _| this.moving = false),
