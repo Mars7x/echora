@@ -74,6 +74,33 @@ pub enum Direction {
     Down,
 }
 
+impl Direction {
+    fn reverse(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Up => Self::Down,
+            Self::Right => Self::Left,
+            Self::Down => Self::Up,
+        }
+    }
+}
+
+/// A move of focus, remembered so that moving straight back returns to the
+/// control it left, even where another control is nearer that way (from a
+/// sidebar tab to the button level with a lower tab, and back).
+struct Move<T> {
+    from: T,
+    direction: Direction,
+    to: T,
+}
+
+impl<T: PartialEq> Move<T> {
+    /// The control to return to when moving `direction` from `at`.
+    fn back(&self, at: &T, direction: Direction) -> Option<&T> {
+        (self.to == *at && direction == self.direction.reverse()).then_some(&self.from)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Stops(Rc<RefCell<Inner>>);
 
@@ -92,6 +119,7 @@ struct Inner {
     frame: Vec<Stop>,
     /// The focus ring, while one shows.
     ring: Option<Glide>,
+    last_move: Option<Move<FocusHandle>>,
 }
 
 /// How long the ring takes to spring to a newly focused control.
@@ -204,7 +232,8 @@ impl Stops {
         }
     }
 
-    /// The control to focus when moving `direction` from `focused`: the
+    /// The control to focus when moving `direction` from `focused`: back to
+    /// the control the last move left when this undoes it, otherwise the
     /// nearest one that way, or the first control when focus is on none of
     /// them. `None` leaves focus where it is.
     pub fn toward(
@@ -212,29 +241,39 @@ impl Stops {
         focused: Option<&FocusHandle>,
         direction: Direction,
     ) -> Option<FocusHandle> {
-        let inner = self.0.borrow();
-        let from = focused.and_then(|focused| {
-            inner
-                .frame
-                .iter()
-                .find(|stop| stop.handle == *focused)
-                .map(|stop| stop.bounds)
-        });
+        let mut inner = self.0.borrow_mut();
+        let Inner {
+            frame, last_move, ..
+        } = &mut *inner;
+        let from = focused.and_then(|focused| frame.iter().find(|stop| stop.handle == *focused));
         let Some(from) = from else {
-            return inner.frame.first().map(|stop| stop.handle.clone());
+            return frame.first().map(|stop| stop.handle.clone());
         };
-        let from = Rect::from(from);
-        inner
-            .frame
-            .iter()
-            .filter_map(|stop| {
-                Some((
-                    from.distance(&Rect::from(stop.bounds), direction)?,
-                    &stop.handle,
-                ))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, handle)| handle.clone())
+        let drawn = |handle: &FocusHandle| frame.iter().any(|stop| stop.handle == *handle);
+        let back = last_move
+            .as_ref()
+            .and_then(|last| last.back(&from.handle, direction))
+            .filter(|handle| drawn(handle))
+            .cloned();
+        let rect = Rect::from(from.bounds);
+        let to = back.or_else(|| {
+            frame
+                .iter()
+                .filter_map(|stop| {
+                    Some((
+                        rect.distance(&Rect::from(stop.bounds), direction)?,
+                        &stop.handle,
+                    ))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, handle)| handle.clone())
+        })?;
+        *last_move = Some(Move {
+            from: from.handle.clone(),
+            direction,
+            to: to.clone(),
+        });
+        Some(to)
     }
 }
 
@@ -291,7 +330,7 @@ impl Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{Direction, Rect};
+    use super::{Direction, Move, Rect};
 
     fn rect(left: f32, top: f32, width: f32, height: f32) -> Rect {
         Rect {
@@ -322,5 +361,17 @@ mod tests {
         let to_level = tab.distance(&level, Direction::Right).unwrap();
         let to_below = tab.distance(&below, Direction::Right).unwrap();
         assert!(to_level < to_below);
+    }
+
+    #[test]
+    fn moving_straight_back_returns_where_focus_came_from() {
+        let last = Move {
+            from: "game",
+            direction: Direction::Right,
+            to: "reinstall",
+        };
+        assert_eq!(last.back(&"reinstall", Direction::Left), Some(&"game"));
+        assert_eq!(last.back(&"reinstall", Direction::Up), None);
+        assert_eq!(last.back(&"display", Direction::Left), None);
     }
 }
