@@ -16,6 +16,7 @@ path = "src/main.rs"
 echora-config.workspace = true
 echora-content.workspace = true
 gpui = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [lints]
 workspace = true
