@@ -15,6 +15,8 @@ pub struct IoctlOutput {
 
 /// NvResult::NotImplemented.
 const NOT_IMPLEMENTED: u32 = 1;
+/// NvResult::NotSupported.
+const NOT_SUPPORTED: u32 = 2;
 
 /// NVGPU_GPU_IOCTL_GET_CHARACTERISTICS with the 0xD8-byte native structure
 /// (`0xC0E84705`: group 'G', number 5, in/out, 0xE8 bytes).
@@ -29,6 +31,10 @@ const ZCULL_GET_INFO: u32 = 0x8028_4702;
 const FLUSH_L2: u32 = 0x4008_4707;
 /// NVGPU_GPU_IOCTL_GET_ACTIVE_SLOT_MASK (out, 8 bytes).
 const GET_ACTIVE_SLOT_MASK: u32 = 0x8008_4714;
+/// NVGPU_AS_IOCTL_INITIALIZE_EX (in, 0x28 bytes).
+const AS_INITIALIZE_EX: u32 = 0x4028_4109;
+/// NVGPU_AS_IOCTL_GET_SYNC_RO_MAP (out, 0x10 bytes).
+const AS_GET_SYNC_RO_MAP: u32 = 0x8010_410b;
 /// Group 'G' number 0x13, in/out, 8 bytes.
 const GPU_IOCTL_13: u32 = 0xc008_4713;
 /// TPC mask of the single GPC: bits for its two TPCs.
@@ -166,6 +172,21 @@ pub fn ioctl(
         // FLUSH_L2 (in, u32 flags, u32 reserved): nothing is cached on the
         // host side, so there is nothing to flush.
         ("/dev/nvhost-ctrl-gpu", FLUSH_L2) if input.len() >= 8 => Ok(IoctlOutput::default()),
+        // NVGPU_AS_IOCTL_INITIALIZE_EX (in, 0x28 bytes: u32 big page size,
+        // s32 as fd, u32 flags, u32 reserved, u64 VA start/end/split). The
+        // host renders through NVN, so the guest's GPU VA layout is only
+        // accepted here.
+        ("/dev/nvhost-as-gpu", AS_INITIALIZE_EX) if input.len() >= 0x28 => {
+            Ok(IoctlOutput::default())
+        }
+        // NVGPU_AS_IOCTL_GET_SYNC_RO_MAP (out, u64 base GPU VA, u32 sync
+        // size, u32 syncpoint count; Linux nvgpu number 11). No read-only
+        // syncpoint map is modeled, so it is NotSupported, as nvgpu answers
+        // without one. Provisional.
+        ("/dev/nvhost-as-gpu", AS_GET_SYNC_RO_MAP) => Ok(IoctlOutput {
+            result: NOT_SUPPORTED,
+            ..IoctlOutput::default()
+        }),
         // Eden 1a6d7d4 stubs Ioctl3 0x13 on this device as NotImplemented
         // and writes no output; the SDK continues past that result.
         ("/dev/nvhost-ctrl-gpu", GPU_IOCTL_13) => Ok(IoctlOutput {

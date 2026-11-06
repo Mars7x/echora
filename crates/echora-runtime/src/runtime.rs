@@ -1932,6 +1932,7 @@ impl Machine {
         if self.layout.workers > 1 {
             return self.run_parallel(&dispatch);
         }
+        crate::fault::watch(&self.core);
         loop {
             let result = dispatch(&mut self.core);
             if result.is_ok() {
