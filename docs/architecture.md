@@ -27,6 +27,17 @@ Planned crates, in roadmap order: the NVN layer in the runtime on top of
 `echora-gpu`, and host crates for windowing, input and audio. The
 launcher depends on `echora-config` and `echora-content`, never the reverse.
 
+## Front ends
+
+The Linux launcher uses GTK4 and libadwaita so it behaves like a native
+GNOME application (system styling, dialogs, accessibility, keyboard
+navigation). Windows and macOS need their own front end on the same
+settings model; GPUI (a pure-Rust, GPU-rendered toolkit) is a candidate
+for sharing one codebase between them, at the cost of non-native widgets
+and a fast-moving API. The in-game settings overlay will be drawn by
+Echora's own presenter into the game's swapchain rather than by a desktop
+toolkit.
+
 ## Boundaries
 
 - **Portable core:** content, loader, lifter, IR, guest semantics, runtime
