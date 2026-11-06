@@ -1034,7 +1034,7 @@ impl Launcher {
         let active = self.sheet.is_none();
         let settings = self
             .stop(
-                ui::button("settings", "Settings", Kind::Secondary, Size::Large),
+                ui::button("settings", "Settings", Kind::Secondary, Size::Large).w(u(DOCK_BUTTON)),
                 active,
                 cx,
             )
@@ -1045,7 +1045,7 @@ impl Launcher {
             );
         let about = self
             .stop(
-                ui::button("about", "About", Kind::Secondary, Size::Large),
+                ui::button("about", "About", Kind::Secondary, Size::Large).w(u(DOCK_BUTTON)),
                 active,
                 cx,
             )
@@ -1098,7 +1098,7 @@ impl Launcher {
                         Kind::Primary,
                         Size::Large,
                     )
-                    .px(u(36.0)),
+                    .w(u(DOCK_BUTTON)),
                     active,
                     cx,
                 )
@@ -1728,6 +1728,9 @@ impl Launcher {
         scrim(sheet, self.corner, self.motion, closing, cx)
     }
 }
+
+/// The width Play, Settings and About share, so the row reads as one set.
+const DOCK_BUTTON: f32 = 112.0;
 
 /// The artwork tile beside the title, and the narrowest window (in design
 /// pixels) that shows it.
