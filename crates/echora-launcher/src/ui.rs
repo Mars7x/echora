@@ -4,12 +4,13 @@
 //!
 //! - A 4 px spacing grid; nested corner radii shrink by the padding between
 //!   them (window 12, sheet 14, card 10, control 8, inner 6).
-//! - One type scale (44/26/15/14/13/12) in Inter, bundled so every
+//! - One type scale (44/26/15/14/13/12) in Inter (the game title in
+//!   Cinzel), bundled so every
 //!   platform shows the same type with real weights; sentence case for
 //!   every label.
 //! - Semantic dark colours from the author's GTK theme (label, secondary
-//!   label, separator, fills, selection) with text contrast of at least
-//!   4.5:1, and the light foreground as the single accent.
+//!   label, separator, fills), a lighter neutral for selection, text
+//!   contrast of at least 4.5:1, and the light foreground as the accent.
 //! - Controls at least 32 px tall (40 px in the dock), each with hover,
 //!   pressed and keyboard-focus states. The focus ring shows only while the
 //!   keyboard is being used, as both guidelines ask.
@@ -75,8 +76,10 @@ pub mod palette {
     pub const FILL: u32 = 0x242424ff;
     pub const FILL_HOVER: u32 = 0x2b2b2bff;
     pub const FILL_PRESSED: u32 = 0x303030ff;
-    /// The theme's selection colour.
-    pub const SELECTED: u32 = 0x2e3a46ff;
+    /// Selected items: a lighter neutral, no colour.
+    pub const SELECTED: u32 = 0x333333ff;
+    /// The thin edge around the window.
+    pub const WINDOW_EDGE: u32 = 0xffffff0f;
     pub const ACCENT: u32 = 0xf0f0f0ff;
     pub const ACCENT_HOVER: u32 = 0xddddddff;
     pub const ACCENT_PRESSED: u32 = 0xc8c8c8ff;
@@ -443,12 +446,18 @@ pub fn toast(message: SharedString) -> Div {
         .child(message)
 }
 
-/// Inter (SIL Open Font License; see `assets/fonts/OFL.txt`) in the three
-/// weights the launcher uses.
-const FONTS: [&[u8]; 3] = [
+/// The game title's typeface: engraved Roman capitals in the spirit of the
+/// series' logo.
+pub const TITLE_FONT: &str = "Cinzel";
+
+/// Inter for everything, in the three weights the launcher uses, and Cinzel
+/// for the game title; both SIL Open Font License (see `assets/fonts`).
+const FONTS: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/Inter-Regular.ttf"),
     include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
     include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-Regular.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-Bold.ttf"),
 ];
 
 /// Registers the bundled font and returns its family, or the platform's UI

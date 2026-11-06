@@ -1850,7 +1850,6 @@ dependencies = [
  "echora-config",
  "echora-content",
  "gpui",
- "image",
 ]
 
 [[package]]

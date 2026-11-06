@@ -57,11 +57,12 @@ GPL-3.0 section 13 permits combining with AGPL-3.0 code. A binary built
 with the shader library carries the AGPL terms for the sirit part,
 including its network-interaction clause.
 
-## Bundled font
+## Bundled fonts
 
 `crates/echora-launcher/assets/fonts` holds Inter 4.1 (Regular, SemiBold,
-Bold) by The Inter Project Authors, under the SIL Open Font License 1.1
-(`OFL.txt` alongside). It is embedded in the launcher binary.
+Bold) by The Inter Project Authors and Cinzel (Regular, Bold) by The Cinzel
+Project Authors, both under the SIL Open Font License 1.1 (`Inter-OFL.txt`
+and `Cinzel-OFL.txt` alongside). They are embedded in the launcher binary.
 
 ## References
 

@@ -863,6 +863,7 @@ impl Launcher {
             .when_some(series, |el, series| {
                 el.child(
                     div()
+                        .font_family(ui::TITLE_FONT)
                         .text_size(px(text::HEADLINE))
                         .text_color(color(palette::SECONDARY_LABEL))
                         .child(series),
@@ -870,6 +871,7 @@ impl Launcher {
             })
             .child(
                 div()
+                    .font_family(ui::TITLE_FONT)
                     .text_size(px(text::HERO))
                     .line_height(gpui::relative(1.1))
                     .font_weight(FontWeight::BOLD)
@@ -961,7 +963,6 @@ impl Launcher {
                                 .cursor_pointer()
                                 .when(selected, |el| {
                                     el.bg(color(palette::SELECTED))
-                                        .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(color(palette::LABEL))
                                 })
                                 .when(!selected, |el| {
@@ -1491,7 +1492,7 @@ impl Render for Launcher {
                         .inset_0()
                         .rounded(self.corner)
                         .border_1()
-                        .border_color(color(palette::BORDER)),
+                        .border_color(color(palette::WINDOW_EDGE)),
                 )
                 // Faint, like the desktop's own window shadows: a soft
                 // drop and a hairline that separates the edge.
