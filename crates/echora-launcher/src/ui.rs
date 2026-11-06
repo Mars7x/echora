@@ -14,8 +14,9 @@
 //! - Controls at least 32 px tall (40 px in the dock), each with hover,
 //!   pressed and keyboard-focus states. The focus ring shows only while the
 //!   keyboard is being used, as both guidelines ask.
-//! - Short motion (120-200 ms, easing out) for things that appear or
-//!   change, skipped when the desktop asks for reduced motion.
+//! - Spring motion, as libadwaita uses (a slight overshoot that settles),
+//!   for things that appear or change; skipped when the desktop asks for
+//!   reduced motion.
 //! - Switches for on/off settings, pop-up menus for choices, boxed lists
 //!   for settings rows.
 
@@ -23,7 +24,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, FontWeight, Hsla,
-    SharedString, Stateful, div, ease_out_quint, prelude::*, px, rgba,
+    SharedString, Stateful, div, prelude::*, px, rgba,
 };
 
 /// Spacing on a 4 px grid.
@@ -211,8 +212,8 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
     let knob = if animate {
         knob.with_animation(
             ElementId::Name(format!("{id}-{on}").into()),
-            Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
-            move |knob, t| knob.left(at(t)),
+            Animation::new(Duration::from_millis(320)),
+            move |knob, t| knob.left(at(spring(t))),
         )
         .into_any_element()
     } else {
@@ -234,7 +235,30 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .child(knob)
 }
 
-/// Fades `el` in while it rises `rise` px into place, once per `id`.
+/// A slightly underdamped spring, as libadwaita animates: position over
+/// normalized time, overshooting by about 5% and settling by `t = 1`.
+pub fn spring(t: f32) -> f32 {
+    // Damping ratio 0.7 and a natural frequency that settles within the
+    // animation's duration.
+    const DAMPING: f32 = 0.7;
+    const FREQUENCY: f32 = 10.0;
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let damped = FREQUENCY * (1.0 - DAMPING * DAMPING).sqrt();
+    let decay = (-DAMPING * FREQUENCY * t).exp();
+    1.0 - decay * ((damped * t).cos() + DAMPING * FREQUENCY / damped * (damped * t).sin())
+}
+
+/// Ease-out for opacity, which must not overshoot.
+pub fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// How long an element takes to spring into place.
+pub const SPRING: Duration = Duration::from_millis(380);
+
+/// Fades `el` in while it springs `rise` px into place, once per `id`.
 pub fn appear<E>(el: E, id: impl Into<ElementId>, rise: f32, motion: bool) -> AnyElement
 where
     E: Styled + IntoElement + 'static,
@@ -242,11 +266,12 @@ where
     if !motion {
         return el.into_any_element();
     }
-    el.with_animation(
-        id,
-        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
-        move |el, t| el.opacity(t).relative().top(px(rise * (1.0 - t))),
-    )
+    el.with_animation(id, Animation::new(SPRING), move |el, t| {
+        // Fully opaque by 40% of the way, while the spring still settles.
+        el.opacity(ease_out(t / 0.4))
+            .relative()
+            .top(px(rise * (1.0 - spring(t))))
+    })
     .into_any_element()
 }
 
@@ -473,5 +498,22 @@ pub fn load_font(cx: &gpui::App) -> SharedString {
             eprintln!("echora-launcher: bundled font not loaded: {error}");
             ".SystemUIFont".into()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ease_out, spring};
+
+    #[test]
+    fn the_spring_overshoots_a_little_and_settles() {
+        assert!(spring(0.0).abs() < 1e-6);
+        assert_eq!(spring(1.0), 1.0);
+        let peak = (0..=100)
+            .map(|i| spring(i as f32 / 100.0))
+            .fold(0.0, f32::max);
+        assert!(peak > 1.02 && peak < 1.1, "overshoot {peak}");
+        assert!((spring(0.95) - 1.0).abs() < 0.01, "not settled");
+        assert_eq!(ease_out(2.0), 1.0);
     }
 }
