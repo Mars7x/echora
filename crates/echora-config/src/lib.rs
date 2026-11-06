@@ -40,6 +40,7 @@ pub struct Settings {
     pub frame: FrameSettings,
     pub audio: AudioSettings,
     pub input: InputSettings,
+    pub launcher: LauncherSettings,
 }
 
 impl Default for Settings {
@@ -51,6 +52,7 @@ impl Default for Settings {
             frame: FrameSettings::default(),
             audio: AudioSettings::default(),
             input: InputSettings::default(),
+            launcher: LauncherSettings::default(),
         }
     }
 }
@@ -237,6 +239,16 @@ impl Default for InputSettings {
             settings_key: "F1".into(),
         }
     }
+}
+
+/// Launcher behaviour. These never affect a running game, so they have no
+/// [`SettingKey`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LauncherSettings {
+    /// Start the last chosen game straight away instead of showing the
+    /// launcher window.
+    pub skip: bool,
 }
 
 /// What applying a changed setting to a running game requires.
@@ -677,6 +689,15 @@ mod tests {
         );
         // The requested settings are untouched.
         assert_eq!(s.graphics.backend, BackendPreference::Metal);
+    }
+
+    #[test]
+    fn launcher_section_round_trips_and_defaults_off() {
+        let settings = Settings::default();
+        assert!(!settings.launcher.skip);
+        let parsed: Settings = toml::from_str("[launcher]\nskip = true\n").unwrap();
+        assert!(parsed.launcher.skip);
+        assert!(Settings::default().changes(&parsed).is_empty());
     }
 
     #[test]
