@@ -22,7 +22,7 @@ use gpui::{
 use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
 use crate::nav::{Activate, Direction, Press as _, Stops};
-use crate::ui::{self, Kind, Ring, Size, color, palette, radius, space, text, u};
+use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -354,18 +354,18 @@ impl Launcher {
     }
 
     /// Makes `el`, a button, a control the keyboard and controllers reach
-    /// while `live`, with a focus ring. Controls behind a sheet or an open
-    /// menu aren't live.
+    /// while `live`. Controls behind a sheet or an open menu aren't live.
     fn stop(&self, el: Stateful<Div>, live: bool, cx: &App) -> Stateful<Div> {
-        self.stop_shaped(el, Ring::Around(radius::CONTROL), live, cx)
+        self.stop_rounded(el, radius::CONTROL, live, cx)
     }
 
-    /// [`Self::stop`] for a control whose focus ring is shaped `ring`.
-    fn stop_shaped(&self, el: Stateful<Div>, ring: Ring, live: bool, cx: &App) -> Stateful<Div> {
+    /// [`Self::stop`] for a control rounded other than a button is, which
+    /// the focus ring follows.
+    fn stop_rounded(&self, el: Stateful<Div>, corner: f32, live: bool, cx: &App) -> Stateful<Div> {
         if !live {
             return el;
         }
-        self.stops.add(el, ring, self.keyboard, cx)
+        self.stops.add(el, corner, cx)
     }
 
     /// Shows a short message above the dock for a few seconds.
@@ -1205,7 +1205,7 @@ impl Launcher {
                     .gap(u(2.0))
                     .children(SettingsTab::ALL.into_iter().map(|tab| {
                         let selected = tab == self.settings_tab;
-                        self.stop_shaped(
+                        self.stop(
                             div()
                                 .id(tab.label())
                                 .h(u(36.0))
@@ -1227,7 +1227,6 @@ impl Launcher {
                                         })
                                 })
                                 .child(tab.label()),
-                            Ring::Within(radius::CONTROL),
                             live,
                             cx,
                         )
@@ -1300,9 +1299,9 @@ impl Launcher {
         let toggled = self.toggled;
         let switch =
             |id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<Self>| {
-                self.stop_shaped(
+                self.stop_rounded(
                     ui::switch(id, on, motion && toggled == Some(id)),
-                    Ring::Around(Ring::PILL),
+                    radius::FULL,
                     live,
                     cx,
                 )
@@ -1441,9 +1440,9 @@ impl Launcher {
             return div().flex_none().child(button).into_any_element();
         }
         let menu = ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
-            self.stop_shaped(
+            self.stop_rounded(
                 ui::menu_item((id, index + 1), label, value == current),
-                Ring::Within(radius::INNER),
+                radius::INNER,
                 true,
                 cx,
             )
@@ -2003,6 +2002,7 @@ impl Launcher {
                     Sheet::About => self.render_about(window, false, cx),
                 })
             })
+            .child(self.stops.ring(self.keyboard, self.motion))
     }
 }
 
