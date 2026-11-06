@@ -76,8 +76,8 @@ display version 1.1.1):
    Direct3D 12. Render targets are sized by `echora-resolution`, so the scene
    renders at the selected internal resolution instead of being stretched.
 5. **Host integration** (planned). Native windowing, input, audio and a
-   GPUI launcher on Linux, Windows and macOS, with settings available in
-   game.
+   GPUI launcher on Linux, Windows and macOS, where all settings are
+   changed.
 
 See [architecture](docs/architecture.md) for the crate boundaries.
 
