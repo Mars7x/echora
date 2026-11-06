@@ -269,6 +269,9 @@ pub struct Draw<'a> {
     pub uniforms: HashMap<(usize, u32), Vec<u8>>,
     /// Texture bindings by (stage index, binding).
     pub textures: HashMap<(usize, u32), (TextureSource, Sampler)>,
+    /// Storage buffer contents by (stage index, binding). Graphics stages
+    /// read them; writes are not returned.
+    pub storage: HashMap<(usize, u32), Vec<u8>>,
     pub fixed: Fixed,
     pub blends: Vec<Blend>,
 }
@@ -424,6 +427,11 @@ impl Renderer {
                         }
                         descriptors[1] += 1;
                     }
+                    DescriptorKind::StorageBuffer => {
+                        let length = draw.storage.get(&key).map_or(16, Vec::len) as u64;
+                        bytes += length.max(16) + 256;
+                        descriptors[2] += 1;
+                    }
                     _ => {
                         let length = draw.uniforms.get(&key).map_or(16, Vec::len) as u64;
                         bytes += length.max(16) + 256;
@@ -466,6 +474,25 @@ impl Renderer {
                         writes.push((
                             descriptor.binding,
                             vk::DescriptorType::UNIFORM_BUFFER,
+                            Some(vk::DescriptorBufferInfo {
+                                buffer,
+                                offset,
+                                range,
+                            }),
+                            None,
+                        ));
+                    }
+                    DescriptorKind::StorageBuffer => {
+                        let bytes = draw
+                            .storage
+                            .get(&key)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[0; 16]);
+                        let (buffer, offset) = self.ring_upload(bytes, 256)?;
+                        let range = (bytes.len() as u64).max(16).next_multiple_of(16);
+                        writes.push((
+                            descriptor.binding,
+                            vk::DescriptorType::STORAGE_BUFFER,
                             Some(vk::DescriptorBufferInfo {
                                 buffer,
                                 offset,
@@ -909,6 +936,7 @@ pub(crate) mod tests {
                 color.iter().flat_map(|value| value.to_le_bytes()).collect(),
             )]),
             textures: HashMap::new(),
+            storage: HashMap::new(),
             fixed: Fixed {
                 topology: vk::PrimitiveTopology::TRIANGLE_STRIP,
                 primitive_restart: false,
