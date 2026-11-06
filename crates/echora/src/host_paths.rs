@@ -26,6 +26,28 @@ pub fn cache_dir() -> Result<PathBuf> {
     }
 }
 
+/// `ECHORA_DATA_DIR`, else the platform's per-user data directory: where
+/// game saves live.
+pub fn data_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("ECHORA_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let env = |k| std::env::var_os(k).map(PathBuf::from);
+    let dir = if cfg!(target_os = "windows") {
+        env("APPDATA").map(|d| d.join("Echora"))
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support/Echora"))
+    } else {
+        env("XDG_DATA_HOME")
+            .or_else(|| env("HOME").map(|h| h.join(".local/share")))
+            .map(|d| d.join("echora"))
+    };
+    match dir {
+        Some(d) => Ok(d),
+        None => bail!("no data directory could be determined; set ECHORA_DATA_DIR"),
+    }
+}
+
 /// The settings file (see `echora_config::default_path`).
 pub fn settings_file() -> Result<PathBuf> {
     match echora_config::default_path() {

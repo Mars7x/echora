@@ -303,6 +303,9 @@ const GPU_VA_USER_START: u64 = 0x800_0000;
 const GPU_VA_SPLIT: u64 = 3 << 38;
 const GPU_VA_END: u64 = 1 << 40;
 /// Device paths listed on Switchbrew "NV services".
+/// Work buffer size answered by IAudioRendererManager GetWorkBufferSize.
+const AUDIO_RENDERER_WORK_BUFFER_SIZE: u64 = 0x1000;
+
 const NVDRV_DEVICES: &[&str] = &[
     "/dev/nvhost-ctrl",
     "/dev/nvmap",
@@ -403,6 +406,8 @@ enum ReadableEventKind {
     AudioDeviceOutput,
     /// IAudioOut RegisterBufferEvent (4): signaled when a buffer is released.
     AudioOutBuffer,
+    /// IAudioRenderer QuerySystemEvent (7): signaled as each frame renders.
+    AudioRendererFrame,
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -708,6 +713,11 @@ enum ServiceObject {
         sample_rate: u32,
         channels: u32,
     },
+    /// IAudioRenderer from OpenAudioRenderer; its state is
+    /// `Services::audio_renderers[id]`.
+    AudioRenderer {
+        id: usize,
+    },
     /// IAudioOut from OpenAudioOut; its state is `Services::audio_outs[id]`.
     AudioOut {
         id: usize,
@@ -757,6 +767,7 @@ impl ServiceObject {
             Self::AudioRendererManager => "aud:u:audren",
             Self::AudioDevice { .. } => "aud:u:audio_device",
             Self::AudioOut { .. } => "aud:u:audio_out",
+            Self::AudioRenderer { .. } => "aud:u:audio_renderer",
             Self::OpusDecoderManager => "hwopus",
             Self::SocketClient => "bsd:u",
             Self::SslService => "ssl",
@@ -980,6 +991,12 @@ pub struct Services {
     main_application: Option<MainApplicationIdentity>,
     audio_device_output_event: Option<ReadableEventId>,
     audio_outs: Vec<AudioOutState>,
+    /// Renderer sessions and their system events.
+    audio_renderers: Vec<(crate::audio_renderer::Renderer, Option<ReadableEventId>)>,
+    /// IAudioDevice output volume auto-tune setting (commands 19/20).
+    audio_volume_auto_tune: bool,
+    /// IAudioDevice output volumes by device name (f32 bits).
+    audio_device_volumes: BTreeMap<String, u32>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1068,6 +1085,9 @@ impl Default for Services {
             main_application: None,
             audio_device_output_event: None,
             audio_outs: Vec::new(),
+            audio_renderers: Vec::new(),
+            audio_volume_auto_tune: false,
+            audio_device_volumes: BTreeMap::new(),
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -2085,6 +2105,7 @@ impl Services {
             | ServiceObject::AudioRendererManager
             | ServiceObject::AudioDevice { .. }
             | ServiceObject::AudioOut { .. }
+            | ServiceObject::AudioRenderer { .. }
             | ServiceObject::OpusDecoderManager
             | ServiceObject::OpusDecoder { .. } => self.audio(&object.clone(), call),
             ServiceObject::SocketClient => self.socket_client(call),
@@ -3036,6 +3057,32 @@ impl Services {
                 };
                 self.reply_new_object(call, manager, AOC_INTERFACE_ID)
             }
+            // IAudioRendererManager GetWorkBufferSize (1): the 0x34-byte
+            // AudioRendererParameterInternal (Eden-NS2 1a6d7d4
+            // audio_renderer_parameter.h; revision tag at 0x30) -> u64.
+            // Tags are "REV" plus '0' + version; OoT sends "REv@", version
+            // 16 with a lowercase 'v' (observed), so either case is taken.
+            // The size is the transfer memory OpenAudioRenderer receives.
+            // The host renderer keeps its state in host memory, so one page
+            // is enough (Eden sizes Nintendo's internal structures instead).
+            (ServiceObject::AudioRendererManager, 1) => {
+                call.shape(0x34, false, false)?;
+                let revision = crate::bytes::le_u32(&call.request.arguments[0x30..0x34]);
+                let [r, e, v, version] = revision.to_le_bytes();
+                if (r, e) != (b'R', b'E') || !matches!(v, b'V' | b'v') || version < b'0' {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!("renderer revision {revision:#x} is not a REV tag"),
+                    ));
+                }
+                call.reply(
+                    0,
+                    None,
+                    AOC_INTERFACE_ID,
+                    &AUDIO_RENDERER_WORK_BUFFER_SIZE.to_le_bytes(),
+                )?;
+                Ok(Outcome::success())
+            }
             // IAudioRendererManager GetAudioDeviceServiceWithRevisionInfo (4):
             // u32 revision magic ("REV" plus a version byte, padded) and the
             // u64 applet resource user ID, without a PID descriptor (observed
@@ -3049,11 +3096,99 @@ impl Services {
                     AOC_INTERFACE_ID,
                 )
             }
+            // IAudioDevice ListAudioOutputDeviceName (14), as Eden-NS2
+            // 1a6d7d4 audio_device.cpp: the three output devices' 0x100-byte
+            // names into a mapped output buffer, and the s32 count.
+            (ServiceObject::AudioDevice { .. }, 14) => {
+                call.shape_output(0, false)?;
+                let (address, size) = call.output_buffer()?;
+                let names = [
+                    "AudioBuiltInSpeakerOutput",
+                    "AudioTvOutput",
+                    "AudioExternalOutput",
+                ];
+                let count = names.len().min((size / 0x100) as usize);
+                for (index, name) in names[..count].iter().enumerate() {
+                    let mut entry = [0u8; 0x100];
+                    entry[..name.len()].copy_from_slice(name.as_bytes());
+                    call.memory.write(address + index as u64 * 0x100, &entry)?;
+                }
+                call.reply(0, None, AOC_INTERFACE_ID, &(count as u32).to_le_bytes())?;
+                Ok(Outcome::success())
+            }
+            // Set/GetAudioDeviceOutputVolume (1/2, mapped buffer; 7/8
+            // AutoSelect): the device name in the input buffer, with an f32
+            // volume for Set. Volumes are kept per name (1.0 until set);
+            // the host output does not apply them.
+            (ServiceObject::AudioDevice { .. }, 1 | 2 | 7 | 8) => {
+                let set = matches!(command, 1 | 7);
+                call.shape(if set { 4 } else { 0 }, false, true)?;
+                let (address, size) = call
+                    .request
+                    .input_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.address, buffer.size))
+                    .ok_or_else(|| invalid("device volume without a name"))?;
+                let mut name = vec![0u8; size.min(0x100) as usize];
+                call.memory.read(address, &mut name)?;
+                let name = String::from_utf8_lossy(
+                    &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())],
+                )
+                .into_owned();
+                if set {
+                    let volume = crate::bytes::le_u32(&call.request.arguments[..4]);
+                    self.audio_device_volumes.insert(name, volume);
+                    call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                } else {
+                    let volume = self
+                        .audio_device_volumes
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(1.0f32.to_bits());
+                    call.reply(0, None, AOC_INTERFACE_ID, &volume.to_le_bytes())?;
+                }
+                Ok(Outcome::success())
+            }
+            // GetActiveChannelCount (5) -> u32: the host output's channels
+            // (Eden-NS2 reports its sink's), stereo.
+            (ServiceObject::AudioDevice { .. }, 5) => {
+                call.shape(0, false, false)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &2u32.to_le_bytes())?;
+                Ok(Outcome::success())
+            }
+            // ReleaseAudioOutputDeviceNotification (18, [17.0.0+]): the u64
+            // from Acquire; nothing to release.
+            (ServiceObject::AudioDevice { .. }, 18) => {
+                call.shape(8, false, false)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
+            }
+            // IAudioDevice SetAudioDeviceOutputVolumeAutoTuneEnabled (19,
+            // bool) and IsAudioDeviceOutputVolumeAutoTuneEnabled (20): the
+            // setting is kept and reported (Eden-NS2 reports false). The
+            // host applies no automatic volume tuning either way.
+            (ServiceObject::AudioDevice { .. }, 19) => {
+                // The bool arrives padded to a word (observed).
+                call.shape(4, false, false)?;
+                self.audio_volume_auto_tune = call.request.arguments[0] != 0;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
+            }
+            (ServiceObject::AudioDevice { .. }, 20) => {
+                call.shape(0, false, false)?;
+                let enabled = u32::from(self.audio_volume_auto_tune);
+                call.reply(0, None, AOC_INTERFACE_ID, &enabled.to_le_bytes())?;
+                Ok(Outcome::success())
+            }
             // IAudioDevice QueryAudioDeviceOutputEvent (12): copies the
             // readable side of one application-owned event; repeated calls
             // alias it.
-            (ServiceObject::AudioDevice { .. }, 12) => {
-                call.shape(0, false, false)?;
+            // AcquireAudioOutputDeviceNotification (17, [17.0.0+]): takes a
+            // u64 and returns a handle (Switchbrew Audio_services). The
+            // output device never changes here, so it is the same
+            // never-signaled event.
+            (ServiceObject::AudioDevice { .. }, 12 | 17) => {
+                call.shape(if command == 17 { 8 } else { 0 }, false, false)?;
                 let application = self
                     .main_application
                     .clone()
@@ -3161,6 +3296,41 @@ impl Services {
                 )
             }
             (ServiceObject::AudioOut { id }, _) => self.audio_out(*id, call),
+            // IAudioRendererManager OpenAudioRenderer (0), as Eden-NS2
+            // 1a6d7d4 audio_renderer_manager.cpp: the 0x34-byte parameters
+            // (padded to 0x38), u64 transfer memory size and the applet
+            // resource user ID, with the PID and two copied handles
+            // (transfer memory, process).
+            (ServiceObject::AudioRendererManager, 0) => {
+                let request = &call.request;
+                if request.arguments.len() < 0x48
+                    || request.pid.is_none()
+                    || request.copy_handles.len() != 2
+                {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!("OpenAudioRenderer shape ({})", request.describe()),
+                    ));
+                }
+                let parameters =
+                    crate::audio_renderer::Parameters::parse(&request.arguments[..0x34])
+                        .map_err(|message| call.unsupported(object.service(), message))?;
+                let work_size = crate::bytes::le_u64(&request.arguments[0x38..0x40]);
+                if work_size < AUDIO_RENDERER_WORK_BUFFER_SIZE {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!("renderer work buffer of {work_size:#x} bytes"),
+                    ));
+                }
+                if self.audio_renderers.len() >= 2 {
+                    return Err(invalid("audio renderer capacity exhausted"));
+                }
+                let id = self.audio_renderers.len();
+                self.audio_renderers
+                    .push((crate::audio_renderer::Renderer::new(parameters), None));
+                self.reply_new_object(call, ServiceObject::AudioRenderer { id }, AOC_INTERFACE_ID)
+            }
+            (ServiceObject::AudioRenderer { id }, _) => self.audio_renderer(*id, call),
             (ServiceObject::OpusDecoderManager, 0..=8) => self.opus_manager(call),
             (
                 ServiceObject::OpusDecoder {
@@ -3991,6 +4161,14 @@ impl Services {
     /// whether any event was signaled.
     pub(crate) fn advance_audio(&mut self, now: std::time::Instant) -> bool {
         let mut signaled = false;
+        for (renderer, event) in &mut self.audio_renderers {
+            if renderer.advance(now) {
+                if let Some(event) = event.and_then(|id| self.readable_events.get_mut(&id)) {
+                    event.signaled = true;
+                    signaled = true;
+                }
+            }
+        }
         for out in &mut self.audio_outs {
             if out.advance(now) {
                 if let Some(event) = out.event.and_then(|id| self.readable_events.get_mut(&id)) {
@@ -4008,7 +4186,129 @@ impl Services {
             .iter()
             .filter(|out| out.started)
             .filter_map(|out| out.front_end)
+            .chain(
+                self.audio_renderers
+                    .iter()
+                    .filter_map(|(renderer, _)| renderer.next_deadline()),
+            )
             .min()
+    }
+
+    /// IAudioRenderer (Eden-NS2 1a6d7d4 audio_renderer.cpp numbering). The
+    /// renderer state is `audio_renderer::Renderer`; nothing is mixed.
+    fn audio_renderer(&mut self, id: usize, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        const SERVICE: &str = "aud:u:audio_renderer";
+        let now = std::time::Instant::now();
+        let command = call.request.command_id;
+        let renderer = &mut self.audio_renderers[id].0;
+        renderer.advance(now);
+        let parameters = renderer.parameters;
+        let word = |value: u32| value.to_le_bytes();
+        match command {
+            // GetSampleRate, GetSampleCount, GetMixBufferCount, GetState (0
+            // started, 1 stopped), GetRenderingTimeLimit.
+            0..=3 | 9 => {
+                call.shape(0, false, false)?;
+                let value = match command {
+                    0 => parameters.sample_rate,
+                    1 => parameters.sample_count,
+                    2 => parameters.mixes,
+                    3 => u32::from(!renderer.started),
+                    _ => renderer.rendering_time_limit,
+                };
+                call.reply(0, None, AOC_INTERFACE_ID, &word(value))?;
+            }
+            // RequestUpdate (4): input in an A buffer, output and
+            // performance in B buffers; RequestUpdateAuto (10) sends the
+            // same three as AutoSelect buffers.
+            4 | 10 => {
+                let request = &call.request;
+                let input = request
+                    .input_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.address, buffer.size));
+                let output = request
+                    .receive_buffers
+                    .first()
+                    .map(|&(address, size, _)| (address, size));
+                let output = output.or_else(|| request.receive_list.first().copied());
+                let (Some((input_address, input_size)), Some((output_address, output_size))) =
+                    (input, output)
+                else {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("RequestUpdate buffers ({})", request.describe()),
+                    ));
+                };
+                if input_size > 0x10_0000 || output_size > 0x10_0000 {
+                    return Err(invalid("renderer update buffers exceed 1 MiB"));
+                }
+                let mut bytes = vec![0u8; input_size as usize];
+                call.memory.read(input_address, &mut bytes)?;
+                let output = self.audio_renderers[id]
+                    .0
+                    .update(&bytes, output_size as usize)
+                    .map_err(|message| call.unsupported(SERVICE, message))?;
+                call.memory.write(output_address, &output)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+            }
+            // Start (5) / Stop (6).
+            5 | 6 => {
+                call.shape(0, false, false)?;
+                self.audio_renderers[id].0.set_started(command == 5, now);
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+            }
+            // QuerySystemEvent (7): one copied event, signaled per frame.
+            7 => {
+                call.shape(0, false, false)?;
+                let application = self
+                    .main_application
+                    .clone()
+                    .ok_or_else(|| invalid("aud:u requires the bootstrap main application"))?;
+                let event = match self.audio_renderers[id].1 {
+                    Some(event) => event,
+                    None => {
+                        if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                            return Err(invalid("readable event backing capacity exhausted"));
+                        }
+                        ReadableEventId(
+                            self.readable_events
+                                .keys()
+                                .map(|id| id.0)
+                                .max()
+                                .unwrap_or(0)
+                                + 1,
+                        )
+                    }
+                };
+                let handle = self.next_available_handle()?;
+                let reply = call.prepare_copy_handle_reply(handle, 0)?;
+                call.write_reply(&reply)?;
+                self.readable_events.entry(event).or_insert(ReadableEvent {
+                    owner: application,
+                    kind: ReadableEventKind::AudioRendererFrame,
+                    signaled: false,
+                });
+                self.audio_renderers[id].1 = Some(event);
+                self.readable_event_handles.insert(handle, event);
+                self.next_handle = handle + 1;
+                return Ok(Outcome {
+                    output_copy_handle_count: 1,
+                    ..Outcome::success()
+                });
+            }
+            // SetRenderingTimeLimit (8): u32 percent.
+            8 => {
+                call.shape(4, false, false)?;
+                let limit = crate::bytes::le_u32(&call.request.arguments[..4]);
+                self.audio_renderers[id].0.rendering_time_limit = limit;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+            }
+            _ => {
+                return Err(call.unsupported(SERVICE, "audio renderer command is not implemented"));
+            }
+        }
+        Ok(Outcome::success())
     }
 
     /// IAudioOut (yuzu audio_out.cpp command numbering).
@@ -6313,6 +6613,7 @@ impl Services {
             | ReadableEventKind::GpuNotification { .. }
             | ReadableEventKind::AudioDeviceOutput
             | ReadableEventKind::AudioOutBuffer
+            | ReadableEventKind::AudioRendererFrame
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
@@ -6623,6 +6924,15 @@ impl Services {
             "service_backends":["lm","appletOE"], "filesystem_services_implemented":false,
             "session_close_requests":self.session_close_requests,
             "audio_outs":self.audio_outs,
+            "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
+                "sample_rate":renderer.parameters.sample_rate,
+                "sample_count":renderer.parameters.sample_count,
+                "voices":renderer.parameters.voices,
+                "started":renderer.started,
+                "frames_rendered":renderer.frames,
+                "updates":renderer.updates,
+                "mixing_implemented":false,
+            })).collect::<Vec<_>>(),
             "terminate_result":self.terminate_result,
             "data_storage_reads":self.data_storage_reads,
             "data_storage_bytes_read":self.data_storage_bytes_read,
