@@ -3301,8 +3301,17 @@ impl Image {
 ///   Host command buffers record into host memory and need none of it, so
 ///   each is 4096, valid as a size and as a power-of-two alignment.
 ///   Provisional.
+/// - 39, 78, 103: cached with 15..18, 25, 36, 37 in the application's
+///   device-info structure (main+0x20e8540). With 103 at 0 a buffer offset
+///   computed from it becomes -1 (rounding up to a multiple of 0), and with
+///   39 at 0 a flushed range falls outside its buffer, so both act as
+///   alignments: 256, like the other alignments. 78 showed no effect: 0.
+///   Provisional.
 fn device_integer(property: u32) -> Option<i32> {
     match property {
+        39 => Some(256),
+        78 => Some(0),
+        103 => Some(256),
         81 | 85 | 91 => Some(4096),
         24..=26 => Some(4096),
         0 => Some(231),
