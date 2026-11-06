@@ -26,24 +26,10 @@ pub fn cache_dir() -> Result<PathBuf> {
     }
 }
 
-/// `ECHORA_SETTINGS`, else `settings.toml` in the platform's per-user
-/// configuration directory.
+/// The settings file (see `echora_config::default_path`).
 pub fn settings_file() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ECHORA_SETTINGS") {
-        return Ok(PathBuf::from(path));
-    }
-    let env = |k| std::env::var_os(k).map(PathBuf::from);
-    let dir = if cfg!(target_os = "windows") {
-        env("APPDATA").map(|d| d.join("Echora"))
-    } else if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Application Support/Echora"))
-    } else {
-        env("XDG_CONFIG_HOME")
-            .or_else(|| env("HOME").map(|h| h.join(".config")))
-            .map(|d| d.join("echora"))
-    };
-    match dir {
-        Some(d) => Ok(d.join("settings.toml")),
+    match echora_config::default_path() {
+        Some(path) => Ok(path),
         None => bail!("no configuration directory could be determined; set ECHORA_SETTINGS"),
     }
 }

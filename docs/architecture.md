@@ -8,6 +8,7 @@ crates selected per host.
 
 | Crate | Layer | Responsibility | State |
 |---|---|---|---|
+| `echora-launcher` | front end | GTK4/libadwaita launcher (Linux): choose the game (NUP or dump folder) and see its title, version and build ID; preferences for the settings the runtime applies (window mode and size, internal resolution, volume, vibration), saved to the shared settings file; launch through `echora run`. | Implemented; checked under Xvfb. Other platforms print a pointer to the CLI. |
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
 | `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget, process layout and discovery roots (prologues, RELA/RELR relative targets, `init_array`). ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
@@ -24,8 +25,7 @@ crates selected per host.
 
 Planned crates, in roadmap order: the NVN layer in the runtime on top of
 `echora-gpu`, and host crates for windowing, input and audio. The
-GTK4/libadwaita launcher will be a separate binary crate that depends on
-`echora-config` only, never the reverse.
+launcher depends on `echora-config` and `echora-content`, never the reverse.
 
 ## Boundaries
 

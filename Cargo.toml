@@ -9,6 +9,7 @@ members = [
     "crates/echora-gpu",
     "crates/echora-guest",
     "crates/echora-input",
+    "crates/echora-launcher",
     "crates/echora-lift",
     "crates/echora-loader",
     "crates/echora-nup",

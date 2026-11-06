@@ -102,6 +102,10 @@ echora run game.nup              # run the built translation (see docs/local-set
 echora extract game.nup out --subtree romfs
 ```
 
+On Linux, `echora-launcher` (GTK4/libadwaita) chooses the game, edits the
+settings the runtime applies and starts it; it needs the GTK 4 and
+libadwaita development packages to build.
+
 See [local setup](docs/local-setup.md) and [content input](docs/content.md).
 
 ## Documentation
