@@ -13,10 +13,10 @@ use echora_input::button;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
     CursorStyle, Decorations, Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
-    ImageFormat, KeyBinding, MouseButton, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
-    ResizeEdge, SharedString, Stateful, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, img,
-    point, prelude::*, px, size,
+    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseMoveEvent, ObjectFit,
+    PathPromptOptions, Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, actions, anchored,
+    canvas, deferred, div, img, point, prelude::*, px, size,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
@@ -124,7 +124,8 @@ struct Launcher {
     settings: Settings,
     settings_path: Option<PathBuf>,
     sheet: Option<Sheet>,
-    /// Holds focus while a sheet is open, so Escape always reaches it.
+    /// Holds focus while a sheet is open and none of its controls does, so
+    /// Escape always reaches it.
     sheet_focus: FocusHandle,
     /// A sheet fading out after being closed.
     closing: Option<Sheet>,
@@ -525,8 +526,13 @@ impl Launcher {
         self.closing = None;
         self.open_menu = None;
         self.toggled = None;
-        // Moving focus starts at the sheet's first control.
-        window.focus(&self.sheet_focus);
+        // Focus goes straight to the sheet's first control: the open
+        // settings tab, or About's one button.
+        let first = match sheet {
+            Sheet::Settings => self.stops.handle(self.settings_tab.label(), cx),
+            Sheet::About => self.stops.handle("source", cx),
+        };
+        window.focus(&first);
         cx.notify();
     }
 
@@ -719,6 +725,16 @@ fn watch_controllers(window: &mut Window, cx: &mut Context<Launcher>) {
             }
             if actions.is_empty() {
                 continue;
+            }
+            // A controller in use shows the focus ring, as keys do.
+            let shown = this.update(cx, |this, cx| {
+                if !this.keyboard {
+                    this.keyboard = true;
+                    cx.notify();
+                }
+            });
+            if shown.is_err() {
+                break;
             }
             // Dispatched outside the launcher's own update, as key presses
             // are, so the controls' handlers can update it.
@@ -1883,7 +1899,14 @@ impl Launcher {
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.step_tab(1, window, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.step_tab(-1, window, cx)))
-            // Any mouse press ends keyboard navigation, hiding focus rings.
+            // Any key press starts keyboard navigation, showing the focus
+            // ring, and any mouse press ends it.
+            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, cx| {
+                if !this.keyboard {
+                    this.keyboard = true;
+                    cx.notify();
+                }
+            }))
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.menu_dismissed = None;
                 if this.keyboard {
