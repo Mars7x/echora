@@ -200,6 +200,35 @@ pub struct Request {
     pub domain: Option<DomainRequest>,
 }
 
+impl Request {
+    /// One-line shape of the request for reports on unmodeled commands: raw
+    /// argument bytes, copied handles and buffer sizes.
+    pub fn describe(&self) -> String {
+        let arguments: String = self
+            .arguments
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut text = format!("arguments {} bytes [{arguments}]", self.arguments.len());
+        if !self.copy_handles.is_empty() {
+            text += &format!(", copied handles {:#x?}", self.copy_handles);
+        }
+        if let Some(buffer) = &self.input_buffer {
+            text += &format!(", input buffer {:#x} bytes", buffer.size);
+        }
+        for buffer in &self.extra_pointers {
+            text += &format!(", input buffer {:#x} bytes", buffer.size);
+        }
+        for (_, size, _) in &self.receive_buffers {
+            text += &format!(", output buffer {size:#x} bytes");
+        }
+        for (_, size) in &self.receive_list {
+            text += &format!(", receive list {size:#x} bytes");
+        }
+        text
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reply {
     /// A complete TLS message buffer. Constructed replies are zero-initialized;
