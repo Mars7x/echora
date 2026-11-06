@@ -1334,20 +1334,24 @@ impl Launcher {
         let settings = &self.settings;
         let motion = self.motion;
         let toggled = self.toggled;
-        let switch =
-            |id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<Self>| {
-                self.stop_rounded(
-                    ui::switch(id, on, motion && toggled == Some(id)),
-                    radius::FULL,
-                    live,
-                    cx,
-                )
-                .on_press(cx.listener(move |this, _, _, cx| {
-                    this.toggled = Some(id);
-                    this.change(cx, flip);
-                }))
-                .into_any_element()
-            };
+        // A setting that is on or off: the whole row flips it.
+        let switch = |id: &'static str,
+                      titles: gpui::Div,
+                      on: bool,
+                      flip: fn(&mut Settings),
+                      cx: &mut Context<Self>| {
+            self.stop_rounded(
+                ui::switch_row(id, titles, on, motion && toggled == Some(id)),
+                radius::CARD,
+                live,
+                cx,
+            )
+            .on_press(cx.listener(move |this, _, _, cx| {
+                this.toggled = Some(id);
+                this.change(cx, flip);
+            }))
+            .into_any_element()
+        };
         match self.settings_tab {
             SettingsTab::Game => self.game_page(live, cx),
             SettingsTab::Display => vec![
@@ -1389,45 +1393,33 @@ impl Launcher {
             SettingsTab::Controls => vec![
                 ui::group(
                     None,
-                    vec![
-                        ui::row(
-                            None,
-                            ui::titles("Vibration", None),
-                            Some(switch(
-                                "vibration",
-                                settings.input.vibration,
-                                |s| s.input.vibration = !s.input.vibration,
-                                cx,
-                            )),
-                        )
-                        .into_any_element(),
-                    ],
+                    vec![switch(
+                        "vibration",
+                        ui::titles("Vibration", None),
+                        settings.input.vibration,
+                        |s| s.input.vibration = !s.input.vibration,
+                        cx,
+                    )],
                 )
                 .into_any_element(),
             ],
             SettingsTab::Launcher => vec![
                 ui::group(
                     None,
-                    vec![
-                        ui::row(
-                            None,
-                            ui::titles(
-                                "Skip launcher",
-                                Some(
-                                    "Start the game directly. Choose Open launcher from \
+                    vec![switch(
+                        "skip",
+                        ui::titles(
+                            "Skip launcher",
+                            Some(
+                                "Start the game directly. Choose Open launcher from \
                                      Echora's app menu to come back."
-                                        .into(),
-                                ),
+                                    .into(),
                             ),
-                            Some(switch(
-                                "skip",
-                                settings.launcher.skip,
-                                |s| s.launcher.skip = !s.launcher.skip,
-                                cx,
-                            )),
-                        )
-                        .into_any_element(),
-                    ],
+                        ),
+                        settings.launcher.skip,
+                        |s| s.launcher.skip = !s.launcher.skip,
+                        cx,
+                    )],
                 )
                 .into_any_element(),
             ],
