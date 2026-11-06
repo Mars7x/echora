@@ -245,10 +245,11 @@ pub struct Nvn {
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
-    /// Memory pools as (object, GPU address, size, guest address), rebuilt
-    /// when a lookup misses (see `pool_for`).
+    /// GPU ranges as (pool object, pool GPU address, range GPU address,
+    /// size, guest address): a pool's storage, or one mapping of a virtual
+    /// pool. Rebuilt when a lookup misses (see `pool_for`).
     #[serde(skip)]
-    pool_ranges: std::cell::RefCell<Vec<[u64; 4]>>,
+    pool_ranges: std::cell::RefCell<Vec<[u64; 5]>>,
     /// Commands recorded by each command buffer that is recording.
     #[serde(skip)]
     recording: BTreeMap<u64, Vec<Command>>,
@@ -658,6 +659,36 @@ impl Nvn {
                 core.memory.write_u32(x[2], value as u32)?;
                 return Ok(true);
             }
+            // nvnDeviceRegisterFastClearColor(device, const float* rgba,
+            // NVNformat): registers a clear color for compressed fast
+            // clears; the application ignores the result (main+0xb44c4c).
+            // The host renderer has no fast-clear path, so nothing changes.
+            "nvnDeviceRegisterFastClearColor" => {
+                self.object(this, "Device").map_err(invalid)?;
+                core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
+            // nvnQueueBuilderGetQueueMemorySize(builder) -> size: the
+            // memory the application must allocate and pass back with
+            // SetQueueMemory (main+0xf49150 allocates it 4 KiB aligned).
+            // The host queue keeps nothing there; the answer is the sum of
+            // the command, compute and control sizes the builder set.
+            "nvnQueueBuilderGetQueueMemorySize" => {
+                let bag = self
+                    .bags
+                    .get(&this)
+                    .filter(|bag| bag.kind == "QueueBuilder")
+                    .ok_or_else(|| invalid(format!("no QueueBuilder at {this:#x}")))?;
+                let mut size = 0u64;
+                for property in ["CommandMemorySize", "ComputeMemorySize", "ControlMemorySize"] {
+                    let Some(value) = bag.props.get(property) else {
+                        return Err(stop(format!("{property} was never set")));
+                    };
+                    size += value.x[0] & 0xffff_ffff;
+                }
+                core.cpu.regs[0] = size;
+                return Ok(true);
+            }
             // nvnDeviceSetWindowOriginMode / nvnDeviceSetDepthMode (device,
             // enum). The application passes 1 for both; recorded on the
             // device. The renderer draws with an upper-left window origin
@@ -759,6 +790,84 @@ impl Nvn {
             "nvnMemoryPoolGetBufferAddress" => {
                 let pool = self.object(this, "MemoryPool").map_err(invalid)?;
                 core.cpu.regs[0] = pool.state["GpuAddress"].x[0];
+                return Ok(true);
+            }
+            // nvnMemoryPoolMapVirtual(NVNmemoryPool* virtual, int count,
+            // const NVNmappingRequest*) -> NVNboolean. A request (0x28
+            // bytes, from the application's call at main+0x11a9d40): u64
+            // physical pool, s64 physical offset, s64 virtual offset, u64
+            // size, u16 storage class. A null physical pool unmaps. The
+            // virtual pool (no storage) keeps each mapping; its GPU range
+            // resolves through it to the physical pool's storage.
+            "nvnMemoryPoolMapVirtual" => {
+                let pool = self.object(this, "MemoryPool").map_err(invalid)?;
+                let storage = pool.builder["Storage"];
+                if storage.x[0] != 0 {
+                    return Err(stop("MapVirtual on a pool with storage".into()));
+                }
+                let pool_size = storage.x[1];
+                let count = x[1] as i32;
+                if !(0..=4096).contains(&count) {
+                    return Err(invalid(format!("{count} mapping requests")));
+                }
+                let mut mappings = Vec::new();
+                for index in 0..count as u64 {
+                    let at = x[2] + index * 0x28;
+                    let word = |offset: u64| core.memory.read_u64(at + offset);
+                    let request = [word(0)?, word(8)?, word(0x10)?, word(0x18)?];
+                    mappings.push(request);
+                }
+                for [physical, physical_offset, offset, size] in mappings {
+                    if size == 0 || offset.checked_add(size).is_none_or(|end| end > pool_size) {
+                        return Err(invalid(format!(
+                            "virtual mapping {offset:#x}+{size:#x} outside the pool"
+                        )));
+                    }
+                    if physical != 0 {
+                        let target = self.object(physical, "MemoryPool").map_err(invalid)?;
+                        let target = target.builder["Storage"];
+                        if target.x[0] == 0
+                            || physical_offset
+                                .checked_add(size)
+                                .is_none_or(|end| end > target.x[1])
+                        {
+                            return Err(invalid(format!(
+                                "physical range {physical_offset:#x}+{size:#x} of pool {physical:#x}"
+                            )));
+                        }
+                    }
+                    let pool = self.objects.get_mut(&this).unwrap();
+                    let overlapping: Vec<(String, u64, u64)> = pool
+                        .state
+                        .iter()
+                        .filter_map(|(name, mapping)| {
+                            let start = u64::from_str_radix(name.strip_prefix(VIRTUAL_MAPPING)?, 16)
+                                .ok()?;
+                            let end = start + mapping.x[2];
+                            (start < offset + size && offset < end)
+                                .then(|| (name.clone(), start, end))
+                        })
+                        .collect();
+                    for (name, start, end) in overlapping {
+                        if start < offset || end > offset + size {
+                            return Err(stop(format!(
+                                "virtual mapping {offset:#x}+{size:#x} splits {start:#x}..{end:#x}"
+                            )));
+                        }
+                        pool.state.remove(&name);
+                    }
+                    if physical != 0 {
+                        pool.state.insert(
+                            format!("{VIRTUAL_MAPPING}{offset:016x}"),
+                            Args {
+                                x: [physical, physical_offset, size, 0],
+                                v: [0; 2],
+                            },
+                        );
+                    }
+                }
+                self.pool_ranges.borrow_mut().clear();
+                core.cpu.regs[0] = 1;
                 return Ok(true);
             }
             // nvnMemoryPoolMap(const NVNmemoryPool*) -> void*: the storage.
@@ -1049,6 +1158,19 @@ impl Nvn {
                 }
                 return Ok(true);
             }
+            // nvnTextureBuilderGetStorageClass / nvnTextureGetStorageClass:
+            // the application stores the class as a u16 in its texture info
+            // (main+0xc2ce4c) and nothing nearby interprets it. Host textures
+            // have one storage class, answered as 1. Provisional.
+            "nvnTextureBuilderGetStorageClass" | "nvnTextureGetStorageClass" => {
+                if name.starts_with("nvnTextureBuilder") {
+                    self.bag(this, "TextureBuilder").map_err(invalid)?;
+                } else {
+                    self.object(this, "Texture").map_err(invalid)?;
+                }
+                core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
             // nvnTextureBuilderGetStorageSize / GetStorageAlignment (builder)
             // and nvnTextureGetStorageSize (texture): the block-linear size of
             // the described texture (see nvn_format).
@@ -1073,6 +1195,15 @@ impl Nvn {
             }
             // nvnSamplerInitialize(NVNsampler*, const NVNsamplerBuilder*) ->
             // NVNboolean.
+            // nvnEventInitialize(NVNevent*, const NVNeventBuilder*) ->
+            // NVNboolean. The builder's storage (memory pool, offset) is
+            // recorded; signal and wait calls are modeled as they appear.
+            "nvnEventInitialize" => {
+                let builder = self.bag(x[1], "EventBuilder").map_err(invalid)?;
+                self.initialize(this, "Event", builder).map_err(invalid)?;
+                core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
             "nvnSamplerInitialize" => {
                 let builder = self.bag(x[1], "SamplerBuilder").map_err(invalid)?;
                 self.require_device(&builder).map_err(invalid)?;
@@ -2188,7 +2319,7 @@ impl Nvn {
         let info = crate::nvn_format::info(format)
             .ok_or_else(|| TexelError::Stop(format!("texture format {format} is not modeled")))?;
         let target = get("Target").unwrap_or(1);
-        let (width, height) = (get("Width").unwrap_or(1), get("Height").unwrap_or(1));
+        let (width, mut height) = (get("Width").unwrap_or(1), get("Height").unwrap_or(1));
         let depth = if target == 2 {
             get("Depth").unwrap_or(1)
         } else {
@@ -2196,9 +2327,18 @@ impl Nvn {
         };
         // Array and cube targets keep their layers (faces) in Depth; the
         // region's z selects them. Each layer is a whole mip chain at a fixed
-        // stride (the per-layer size block_linear_size uses).
+        // stride (the per-layer size block_linear_size uses). A 1D array
+        // (target 3) keeps its layers in Height and selects them with the
+        // region's y: each layer is one row, the region's y/height become
+        // its z/depth.
+        let mut region = region;
         let layers = match target {
             4 | 6 | 8 | 9 => get("Depth").unwrap_or(1),
+            3 => {
+                let [rx, ry, _, rw, rh, _] = region;
+                region = [rx, 0, ry, rw, 1, rh];
+                std::mem::replace(&mut height, 1)
+            }
             _ => 1,
         };
         let layer_stride = if layers > 1 {
@@ -2209,7 +2349,7 @@ impl Nvn {
         };
         let [rx, ry, rz, rw, rh, rd] = region;
         let stride = texture.builder.get("Stride").map_or(0, |value| value.x[0]);
-        if !matches!(target, 0 | 1 | 2 | 4 | 7 | 8 | 9 | 10)
+        if !matches!(target, 0..=4 | 7..=10)
             || rz.checked_add(rd).is_none_or(|end| end > depth.max(layers))
         {
             return Err(TexelError::Stop(format!(
@@ -2478,29 +2618,54 @@ impl Nvn {
     /// memory pool. Pool ranges are cached; a range whose pool object is
     /// gone, or a miss, rebuilds the cache from the live pools.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let find = |ranges: &[[u64; 4]]| {
-            ranges.iter().find_map(|&[key, gpu, size, memory]| {
-                let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
-                let live = self.objects.get(&key).is_some_and(|pool| {
-                    pool.kind == "MemoryPool"
-                        && pool.state.get("GpuAddress").map(|args| args.x[0]) == Some(gpu)
-                });
-                live.then_some((memory + offset, size - offset))
-            })
+        let find = |ranges: &[[u64; 5]]| {
+            ranges
+                .iter()
+                .find_map(|&[key, pool_gpu, gpu, size, memory]| {
+                    let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
+                    let live = self.objects.get(&key).is_some_and(|pool| {
+                        pool.kind == "MemoryPool"
+                            && pool.state.get("GpuAddress").map(|args| args.x[0]) == Some(pool_gpu)
+                    });
+                    live.then_some((memory + offset, size - offset))
+                })
         };
         if let Some(found) = find(&self.pool_ranges.borrow()) {
             return Some(found);
         }
-        let ranges: Vec<[u64; 4]> = self
-            .objects
-            .iter()
-            .filter(|(_, object)| object.kind == "MemoryPool")
-            .filter_map(|(key, pool)| {
-                let gpu = pool.state.get("GpuAddress")?.x[0];
-                let storage = &pool.builder["Storage"];
-                Some([*key, gpu, storage.x[1], storage.x[0]])
-            })
-            .collect();
+        let mut ranges: Vec<[u64; 5]> = Vec::new();
+        for (key, pool) in &self.objects {
+            if pool.kind != "MemoryPool" {
+                continue;
+            }
+            let Some(gpu) = pool.state.get("GpuAddress").map(|args| args.x[0]) else {
+                continue;
+            };
+            let storage = &pool.builder["Storage"];
+            if storage.x[0] != 0 {
+                ranges.push([*key, gpu, gpu, storage.x[1], storage.x[0]]);
+                continue;
+            }
+            // A virtual pool: each mapping reaches into a physical pool.
+            for (name, mapping) in &pool.state {
+                let Some(offset) = name
+                    .strip_prefix(VIRTUAL_MAPPING)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                else {
+                    continue;
+                };
+                let [physical, physical_offset, size, _] = mapping.x;
+                let Some(storage) = self
+                    .objects
+                    .get(&physical)
+                    .filter(|object| object.kind == "MemoryPool")
+                    .map(|object| object.builder["Storage"].x[0])
+                else {
+                    continue;
+                };
+                ranges.push([*key, gpu, gpu + offset, size, storage + physical_offset]);
+            }
+        }
         let found = find(&ranges);
         *self.pool_ranges.borrow_mut() = ranges;
         found
@@ -2827,8 +2992,25 @@ impl Image {
 /// - 36, 37: queried next to 17 and 18 when nn::gfx initializes a texture or
 ///   sampler descriptor pool (main+0x105cb1c); the answer is stored to a
 ///   stack slot that is never read. 0.
+/// - 0, 1: the API major and minor version. The application requires major
+///   231 and minor 40 or later (main+0x346c10c) before it creates its
+///   graphics system; the sdk's own NVN reports 231.40 (sdk+0x69f000).
+/// - 24, 25, 26: the application multiplies 24 by a count of its own and
+///   requires the product to be a multiple of 25, of 26 and of 4 KiB before
+///   allocating it (main+0xf4962c), the shape of shader scratch memory
+///   (factor, alignment, granularity). The host needs no scratch memory, so
+///   each is 4096, the smallest answer every check accepts.
+/// - 81, 85, 91: copied into the size fields of a default configuration
+///   structure next to fixed 4 MiB and 1 MiB sizes (main+0xf26c70).
+///   Host command buffers record into host memory and need none of it, so
+///   each is 4096, valid as a size and as a power-of-two alignment.
+///   Provisional.
 fn device_integer(property: u32) -> Option<i32> {
     match property {
+        81 | 85 | 91 => Some(4096),
+        24..=26 => Some(4096),
+        0 => Some(231),
+        1 => Some(40),
         36 | 37 => Some(0),
         56 | 57 => Some(256),
         42 | 90 => Some(0),
@@ -2838,6 +3020,10 @@ fn device_integer(property: u32) -> Option<i32> {
         _ => None,
     }
 }
+
+/// State-key prefix of a virtual pool's mapping (followed by the virtual
+/// offset in hex): physical pool, physical offset, size.
+const VIRTUAL_MAPPING: &str = "VirtualMapping/";
 
 /// Whether `name` is a plausible NVN entry-point name (ASCII identifier with
 /// the `nvn` prefix). Lookups of anything else stop explicitly.
@@ -2860,6 +3046,110 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn virtual_pool_mappings_resolve_to_physical_storage() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: 0,
+        };
+        let mut nvn = Nvn::default();
+        let (device_builder, device) = (0x10_0000, 0x10_1000);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnDeviceBuilderSetDefaults",
+            &[device_builder],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnDeviceInitialize",
+            &[device, device_builder],
+        );
+        let pool = |nvn: &mut Nvn, core: &mut Guest, builder, object, storage, size| {
+            call(nvn, core, "nvnMemoryPoolBuilderSetDefaults", &[builder]);
+            call(
+                nvn,
+                core,
+                "nvnMemoryPoolBuilderSetDevice",
+                &[builder, device],
+            );
+            call(
+                nvn,
+                core,
+                "nvnMemoryPoolBuilderSetStorage",
+                &[builder, storage, size],
+            );
+            assert_eq!(
+                call(nvn, core, "nvnMemoryPoolInitialize", &[object, builder]),
+                1
+            );
+            call(nvn, core, "nvnMemoryPoolGetBufferAddress", &[object])
+        };
+        pool(&mut nvn, &mut core, 0x10_2000, 0x10_3000, 0x10_8000, 0x4000);
+        let virtual_gpu = pool(&mut nvn, &mut core, 0x10_2000, 0x10_3100, 0, 0x8000);
+        // Physical offset 0x1000 of the first pool at virtual offset 0x2000.
+        let request = 0x10_5000;
+        for (index, word) in [0x10_3000u64, 0x1000, 0x2000, 0x2000].iter().enumerate() {
+            core.memory
+                .write(request + index as u64 * 8, &word.to_le_bytes())
+                .unwrap();
+        }
+        let map = [0x10_3100, 1, request];
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnMemoryPoolMapVirtual", &map),
+            1
+        );
+        assert_eq!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10), Ok(0x10_9010));
+        assert!(nvn.gpu_to_guest(virtual_gpu + 0x3ff0, 0x20).is_err());
+        assert!(nvn.gpu_to_guest(virtual_gpu, 4).is_err());
+        // A null physical pool unmaps the range.
+        core.memory.write(request, &0u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnMemoryPoolMapVirtual", &map),
+            1
+        );
+        assert!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10).is_err());
+    }
+
+    #[test]
+    fn queue_memory_size_sums_the_builder_sizes() {
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: 0,
+        };
+        let mut nvn = Nvn::default();
+        let builder = 0x10_0000;
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnQueueBuilderSetDefaults",
+            &[builder],
+        );
+        for (name, size) in [("Command", 0x1_0000), ("Compute", 0x4000)] {
+            let setter = format!("nvnQueueBuilderSet{name}MemorySize");
+            call(&mut nvn, &mut core, &setter, &[builder, size]);
+        }
+        let getter = "nvnQueueBuilderGetQueueMemorySize";
+        assert!(nvn.call(getter, &mut core).is_err());
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnQueueBuilderSetControlMemorySize",
+            &[builder, 0x1000],
+        );
+        assert_eq!(call(&mut nvn, &mut core, getter, &[builder]), 0x1_5000);
     }
 
     #[test]
