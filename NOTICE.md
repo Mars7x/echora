@@ -57,6 +57,13 @@ GPL-3.0 section 13 permits combining with AGPL-3.0 code. A binary built
 with the shader library carries the AGPL terms for the sirit part,
 including its network-interaction clause.
 
+## Launcher backdrop
+
+`crates/echora-launcher/assets/backdrop.jpg` is a 320×180, heavily blurred
+frame from the game's `Dm_Title_0045` title video (© Nintendo). It carries
+no detail of the original and is included at the project author's
+discretion; it is the only game-derived file in the repository.
+
 ## References
 
 - NUP format specification and reference implementation:

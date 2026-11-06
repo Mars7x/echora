@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
-use crate::{backdrop, install};
+use crate::install;
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -95,8 +95,6 @@ struct Game {
     title: SharedString,
     version: SharedString,
     icon: Option<Arc<Image>>,
-    /// The icon decoded once (BGRA, as GPUI uploads it), for the backdrop.
-    art: Option<image::RgbaImage>,
 }
 
 /// The backdrop cropped to the window's shape, so it can be drawn at exactly
@@ -118,6 +116,8 @@ struct Launcher {
     corner: Pixels,
     /// A title bar press that turns into a window move once the mouse drags.
     moving: bool,
+    /// The frosted backdrop, decoded once (BGRA, as GPUI uploads it).
+    art: Option<image::RgbaImage>,
     backdrop: Option<Backdrop>,
     settings_tab: SettingsTab,
     notice: Option<SharedString>,
@@ -247,6 +247,7 @@ impl Launcher {
             buttons,
             corner: px(0.0),
             moving: false,
+            art: decode_art(BACKDROP),
             backdrop: None,
             settings_tab: SettingsTab::Game,
             notice: None,
@@ -289,39 +290,10 @@ impl Launcher {
                         .and_then(|_| std::fs::write(&file, path.display().to_string()));
                 }
                 self.game = Some(game);
-                self.extract_backdrop(path, cx);
             }
             Err(message) => self.notify(message, cx),
         }
         cx.notify();
-    }
-
-    /// Takes the backdrop frame from the game the first time one is chosen,
-    /// then swaps it in for the icon.
-    fn extract_backdrop(&mut self, game: PathBuf, cx: &mut Context<Self>) {
-        if backdrop::path().is_none_or(|path| path.exists()) {
-            return;
-        }
-        let task = cx
-            .background_executor()
-            .spawn(async move { backdrop::extract(&game) });
-        cx.spawn(async move |this, cx| {
-            let path = match task.await {
-                Ok(path) => path,
-                Err(error) => return eprintln!("backdrop: {error}; using the icon"),
-            };
-            let art = std::fs::read(path)
-                .ok()
-                .and_then(|bytes| decode_art(&bytes));
-            let _ = this.update(cx, |this, cx| {
-                if let (Some(game), Some(art)) = (this.game.as_mut(), art) {
-                    game.art = Some(art);
-                    this.backdrop = None;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
     }
 
     fn choose_game(&mut self, _: &ChooseGame, _: &mut Window, cx: &mut Context<Self>) {
@@ -491,10 +463,6 @@ fn read_game(path: &Path) -> Result<Game, String> {
         };
         Arc::new(Image::from_bytes(format, bytes.clone()))
     });
-    let art = backdrop::path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| decode_art(&bytes))
-        .or_else(|| package.icon.as_deref().and_then(decode_art));
     Ok(Game {
         path: path.to_path_buf(),
         title: package
@@ -504,9 +472,12 @@ fn read_game(path: &Path) -> Result<Game, String> {
             .into(),
         version: version.into(),
         icon,
-        art,
     })
 }
+
+/// The launcher backdrop: a heavily blurred frame from the game's
+/// `Dm_Title_0045` title video (see NOTICE.md).
+const BACKDROP: &[u8] = include_bytes!("../assets/backdrop.jpg");
 
 /// Decodes an image into the BGRA layout GPUI uploads.
 fn decode_art(bytes: &[u8]) -> Option<image::RgbaImage> {
@@ -730,24 +701,6 @@ fn scrim(
         .child(sheet.on_click(|_, _, cx| cx.stop_propagation()))
 }
 
-/// A frosted-glass version of the backdrop: shrunk, then blurred with its
-/// edge pixels repeated so the borders don't darken. The GPU scales it back
-/// up, which smooths it further.
-fn frost(art: &image::RgbaImage) -> image::RgbaImage {
-    use image::imageops::{self, FilterType};
-    const WIDTH: u32 = 320;
-    const PAD: u32 = 24;
-    let height = (art.height() * WIDTH / art.width().max(1)).max(1);
-    let small = imageops::resize(art, WIDTH, height, FilterType::Triangle);
-    let padded = image::RgbaImage::from_fn(WIDTH + 2 * PAD, height + 2 * PAD, |x, y| {
-        let x = x.saturating_sub(PAD).min(WIDTH - 1);
-        let y = y.saturating_sub(PAD).min(height - 1);
-        *small.get_pixel(x, y)
-    });
-    let blurred = imageops::fast_blur(&padded, 6.0);
-    imageops::crop_imm(&blurred, PAD, PAD, WIDTH, height).to_image()
-}
-
 /// A thin line between settings rows.
 fn divider() -> impl IntoElement {
     div().h(px(1.0)).bg(color(palette::DIVIDER))
@@ -755,14 +708,14 @@ fn divider() -> impl IntoElement {
 
 impl Launcher {
     fn render_art(&mut self, window: &mut Window) -> AnyElement {
-        let Some(art) = self.game.as_ref().and_then(|game| game.art.as_ref()) else {
+        let Some(art) = self.game.as_ref().and(self.art.as_ref()) else {
             return div()
                 .size_full()
                 .bg(color(palette::BACKDROP))
                 .into_any_element();
         };
-        // Keep the top of the square art, where the title artwork sits, and
-        // as much width as the window's shape allows.
+        // Fill the window's shape: trim the sides of the wide art when the
+        // window is narrower, or its bottom when the window is wider.
         let inset = window.client_inset().unwrap_or(px(0.0)) * 2.0;
         let viewport = window.viewport_size();
         let aspect =
@@ -785,7 +738,7 @@ impl Launcher {
             .is_none_or(|backdrop| backdrop.crop != crop)
         {
             let (x, y, w, h) = crop;
-            let pixels = frost(&image::imageops::crop_imm(art, x, y, w, h).to_image());
+            let pixels = image::imageops::crop_imm(art, x, y, w, h).to_image();
             let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));
             if let Some(old) = self.backdrop.replace(Backdrop { crop, image }) {
                 let _ = window.drop_image(old.image);
