@@ -1077,6 +1077,8 @@ pub struct Services {
     idle_time_detection_extension: u32,
     /// Syncpoint supervisor command 22 events by index.
     syncpoint_events: BTreeMap<u32, ReadableEventId>,
+    /// Syncpoint event indices armed by 201 and not yet disarmed by 202.
+    armed_syncpoint_events: BTreeSet<u32>,
     /// Initialized video decoders: transfer memory size and parameters.
     video_decoders: Vec<(u64, Vec<u32>)>,
     /// Graphics supervisor native memories (111) by handle: kind, size.
@@ -1092,6 +1094,12 @@ pub struct Services {
     returned_frames: u64,
     decoder_slots: std::collections::VecDeque<u32>,
     decoded_frames: u64,
+    /// Submissions refused while the decoder's input was full.
+    refused_video_submissions: u64,
+    /// Decoded frames waiting for GetFrame: (slot, timestamp).
+    decoded_video_frames: std::collections::VecDeque<(u32, u64)>,
+    /// The decoder's input event (GetInputEvent), for back-pressure.
+    video_input_event: Option<ReadableEventId>,
     /// GetFrame calls answered "no output" (213).
     empty_frame_requests: u64,
     /// Video decoder submissions so far and the queued input (id,
@@ -1205,6 +1213,7 @@ impl Default for Services {
             hid_supported_style_set: 0,
             idle_time_detection_extension: 0,
             syncpoint_events: BTreeMap::new(),
+            armed_syncpoint_events: BTreeSet::new(),
             video_decoders: Vec::new(),
             native_memories: BTreeMap::new(),
             native_memory_addresses: BTreeMap::new(),
@@ -1213,6 +1222,9 @@ impl Default for Services {
             returned_frames: 0,
             decoder_slots: Default::default(),
             decoded_frames: 0,
+            refused_video_submissions: 0,
+            decoded_video_frames: Default::default(),
+            video_input_event: None,
             empty_frame_requests: 0,
             video_submissions: 0,
             video_input: Vec::new(),
@@ -1586,6 +1598,9 @@ fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
     ready
 }
 
+/// Submissions the host video decoder holds before its input event clears.
+const VIDEO_INPUT_DEPTH: usize = 8;
+
 /// AppletId of the controller applet (yuzu applet AppletId::Controller).
 const LIBRARY_APPLET_CONTROLLER: u32 = 0x0c;
 
@@ -1871,9 +1886,16 @@ impl Services {
         let Some(id) = self.readable_event_handles.get(&handle) else {
             return Ok(None);
         };
+        // An armed syncpoint event stays signaled until disarmed: its
+        // target value counts as reached (host GPU work completes at
+        // submission), even after the client clears the event.
         self.readable_events
             .get(id)
-            .map(|event| Some(event.signaled))
+            .map(|event| {
+                let armed = matches!(event.kind, ReadableEventKind::SyncpointEvent { index }
+                    if self.armed_syncpoint_events.contains(&index));
+                Some(event.signaled || armed)
+            })
             .ok_or_else(|| invalid("readable-event alias has no backing event"))
     }
 
@@ -2357,6 +2379,7 @@ impl Services {
                         signaled: true,
                     },
                 );
+                self.video_input_event = Some(event);
                 self.readable_event_handles.insert(handle, event);
                 self.next_handle = handle + 1;
                 self.provisional_commands.insert("appletOE:video_decoder:3");
@@ -2381,6 +2404,7 @@ impl Services {
                     return Err(invalid("decoder output slot queue overflow"));
                 }
                 self.decoder_slots.push_back(slot);
+                self.decode_video_frames();
                 let mut reply = u64::from(slot).to_le_bytes().to_vec();
                 reply.extend_from_slice(&0u64.to_le_bytes());
                 call.reply(0, None, 0, &reply)?;
@@ -2404,14 +2428,13 @@ impl Services {
             // returns when no output is ready (sdk+0x330c80). Provisional.
             ServiceObject::VideoDecoder if call.request.command_id == 213 => {
                 call.shape(0, false, false)?;
-                if self.decoder_slots.is_empty() || self.video_input.is_empty() {
+                self.decode_video_frames();
+                let Some((slot, timestamp)) = self.decoded_video_frames.pop_front() else {
                     const NO_OUTPUT: u32 = 0x1c_286f;
                     call.reply(NO_OUTPUT, None, 0, &[])?;
                     self.empty_frame_requests += 1;
                     return Ok(Outcome::result(NO_OUTPUT));
-                }
-                let slot = self.decoder_slots.pop_front().unwrap_or_default();
-                let (_, timestamp, _) = self.video_input.remove(0);
+                };
                 let (width, height) = self
                     .video_decoders
                     .last()
@@ -2424,7 +2447,6 @@ impl Services {
                 data.extend_from_slice(&timestamp.to_le_bytes());
                 data.extend_from_slice(&0u32.to_le_bytes());
                 call.reply(0, None, 0, &data)?;
-                self.decoded_frames += 1;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:213");
                 Ok(Outcome::success())
@@ -2451,6 +2473,15 @@ impl Services {
                         format!("Decode shape ({})", call.request.describe()),
                     ));
                 }
+                // A full decoder refuses the submission with 0x1c266f, which
+                // OoT's player treats as "try again" (subsdk0+0xfd80 maps it
+                // to 122).
+                if self.video_input.len() >= VIDEO_INPUT_DEPTH {
+                    const QUEUE_FULL: u32 = 0x1c_266f;
+                    call.reply(QUEUE_FULL, None, 0, &[])?;
+                    self.refused_video_submissions += 1;
+                    return Ok(Outcome::result(QUEUE_FULL));
+                }
                 let mut bytes = vec![0u8; input.1 as usize];
                 call.memory.read(input.0, &mut bytes)?;
                 let timestamp = crate::bytes::le_u64(&call.request.arguments[4..12]);
@@ -2461,6 +2492,7 @@ impl Services {
                     return Err(invalid("video submission backlog overflow"));
                 }
                 self.video_input.push((id, timestamp, bytes));
+                self.decode_video_frames();
                 call.reply(0, None, 0, &id.to_le_bytes())?;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:109");
@@ -2473,6 +2505,8 @@ impl Services {
                 call.shape(0, false, false)?;
                 self.decoder_slots.clear();
                 self.video_input.clear();
+                self.decoded_video_frames.clear();
+                self.video_input_event = None;
                 self.video_decoder_running = false;
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands
@@ -4267,6 +4301,27 @@ impl Services {
     /// A transport result for the last request (instead of success), once.
     pub(crate) fn take_transport_result(&mut self) -> Option<u32> {
         self.transport_result.take()
+    }
+
+    /// Pair output slots handed to the decoder with the oldest waiting
+    /// submissions: each pair is a decoded frame (slot, timestamp) for
+    /// GetFrame. No pixels are produced yet. The input event is signaled
+    /// while fewer than VIDEO_INPUT_DEPTH submissions wait, the decoder's
+    /// back-pressure on SubmitAv1DecoderInputBuffer.
+    fn decode_video_frames(&mut self) {
+        while !self.decoder_slots.is_empty() && !self.video_input.is_empty() {
+            let slot = self.decoder_slots.pop_front().unwrap_or_default();
+            let (_, timestamp, _) = self.video_input.remove(0);
+            self.decoded_video_frames.push_back((slot, timestamp));
+            self.decoded_frames += 1;
+        }
+        let accepting = self.video_input.len() < VIDEO_INPUT_DEPTH;
+        if let Some(event) = self
+            .video_input_event
+            .and_then(|id| self.readable_events.get_mut(&id))
+        {
+            event.signaled = accepting;
+        }
     }
 
     /// The internal handle of a request that parked its thread, once.
@@ -7561,14 +7616,17 @@ impl Services {
                 if let Some(event) = self.readable_events.get_mut(&event) {
                     event.signaled = true;
                 }
+                self.armed_syncpoint_events.insert(index);
                 self.provisional_commands
                     .insert("appletOE:syncpoint_supervisor:201");
                 Ok(Outcome::success())
             }
-            // Command 202: u32 event index; no reply data. The SDK sends it
-            // once a requested syncpoint wait succeeded (client
-            // sdk+0x5d5138), so it disarms 201's request: the event is
-            // unsignaled. Provisional.
+            // Command 202: u32 event index; no reply data. The SDK's
+            // syncpoint-event wait sends it when the event is not yet
+            // signaled and then waits on the event (sdk+0x5d4b48); it also
+            // follows successful waits (sdk+0x5d5138). It asks for the event
+            // once the armed target is reached, which on the host it always
+            // is: the event is signaled. Provisional.
             202 => {
                 call.shape(4, false, false)?;
                 let index = crate::bytes::le_u32(&call.request.arguments[..4]);
@@ -7580,7 +7638,7 @@ impl Services {
                 };
                 call.reply(0, None, 0, &[])?;
                 if let Some(event) = self.readable_events.get_mut(&event) {
-                    event.signaled = false;
+                    event.signaled = true;
                 }
                 self.provisional_commands
                     .insert("appletOE:syncpoint_supervisor:202");
@@ -8487,6 +8545,7 @@ impl Services {
             "video_submissions":self.video_submissions,
             "returned_frames":self.returned_frames,
             "decoded_frames":self.decoded_frames,
+            "refused_video_submissions":self.refused_video_submissions,
             "empty_frame_requests":self.empty_frame_requests,
             "library_applets":self.library_applets,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({

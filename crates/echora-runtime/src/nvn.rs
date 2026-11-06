@@ -1185,6 +1185,28 @@ impl Nvn {
                 }
                 return Ok(true);
             }
+            // nvnTextureGetSwizzle(texture, int* r, int* g, int* b, int* a):
+            // the builder's SetSwizzle, or the identity (R, G, B, A: 2, 3, 4,
+            // 5 in the numbering nvn_gpu decodes) when never set.
+            "nvnTextureGetSwizzle" => {
+                let texture = self.object(this, "Texture").map_err(invalid)?;
+                let swizzle = texture.builder.get("Swizzle").map_or([2, 3, 4, 5], |value| value.x);
+                for (index, component) in swizzle.iter().enumerate() {
+                    let out = x[1 + index];
+                    if out == 0 {
+                        return Err(invalid("null swizzle output".into()));
+                    }
+                    core.memory.write_u32(out, *component as u32)?;
+                }
+                return Ok(true);
+            }
+            // nvnTextureGetSamples(texture) -> int: the builder's SetSamples,
+            // 0 (single-sampled) when never set, as SetDefaults leaves it.
+            "nvnTextureGetSamples" => {
+                let texture = self.object(this, "Texture").map_err(invalid)?;
+                core.cpu.regs[0] = texture.builder.get("Samples").map_or(0, |value| value.x[0]);
+                return Ok(true);
+            }
             // nvnTextureBuilderGetStorageClass / nvnTextureGetStorageClass:
             // the application stores the class as a u16 in its texture info
             // (main+0xc2ce4c) and nothing nearby interprets it. Host textures
@@ -1999,9 +2021,11 @@ impl Nvn {
         if let (Some(property), Some(object)) = (rest.strip_prefix("Get"), self.objects.get(&this))
         {
             if object.kind == kind {
-                let default = (kind == "Sampler")
-                    .then(|| sampler_default(property))
-                    .flatten();
+                let default = match kind {
+                    "Sampler" => sampler_default(property),
+                    "Texture" => texture_default(property),
+                    _ => None,
+                };
                 if let Some(value) = object
                     .state
                     .get(property)
@@ -3354,6 +3378,21 @@ fn sampler_default(property: &str) -> Option<Args> {
         _ => return None,
     };
     Some(Args { x, v })
+}
+
+/// A texture property SetDefaults sets, for getters on textures whose
+/// builder never set it: no stride (block-linear), single-sampled, depth
+/// read mode 0, no flags, one level, depth 1.
+fn texture_default(property: &str) -> Option<Args> {
+    let value = match property {
+        "Stride" | "Samples" | "DepthStencilMode" | "Flags" => 0,
+        "Levels" | "Depth" => 1,
+        _ => return None,
+    };
+    Some(Args {
+        x: [value, 0, 0, 0],
+        v: [0; 2],
+    })
 }
 
 /// State-key prefix of a virtual pool's mapping (followed by the virtual
