@@ -114,7 +114,8 @@ pub fn resize_edge(
     })
 }
 
-/// The launcher's built-in icons, drawn as 16-pixel symbolic glyphs.
+/// The launcher's built-in icons, drawn as 16-pixel symbolic glyphs with
+/// 2 px strokes on whole pixels, so straight edges render crisp.
 pub struct Icons;
 
 const ICONS: [(&str, &str); 6] = [
@@ -128,19 +129,19 @@ const ICONS: [(&str, &str); 6] = [
     ),
     (
         "icons/close.svg",
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="#000" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="#000" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>"##,
     ),
     (
         "icons/minimize.svg",
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4.5 10.5h7" stroke="#000" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4 11h8" stroke="#000" stroke-width="2" fill="none"/></svg>"##,
     ),
     (
         "icons/maximize.svg",
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="4.5" y="4.5" width="7" height="7" rx="1" stroke="#000" stroke-width="1.5" fill="none"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="4" y="4" width="8" height="8" rx="1" stroke="#000" stroke-width="2" fill="none"/></svg>"##,
     ),
     (
         "icons/restore.svg",
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="4" y="6" width="6" height="6" rx="1" stroke="#000" stroke-width="1.4" fill="none"/><path d="M6.5 4h4.5a1 1 0 0 1 1 1v4.5" stroke="#000" stroke-width="1.4" fill="none"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="4" y="6" width="6" height="6" rx="1" stroke="#000" stroke-width="2" fill="none"/><path d="M7 3h5a1 1 0 0 1 1 1v5" stroke="#000" stroke-width="2" fill="none"/></svg>"##,
     ),
 ];
 

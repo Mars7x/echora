@@ -178,11 +178,40 @@ pub fn button(
         .bg(color(fill))
         .hover(|style| style.bg(color(hover)))
         .active(|style| style.bg(color(pressed)))
-        .cursor_pointer()
         .text_size(u(font))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color(label_color))
         .child(label.into())
+}
+
+/// A window control (close, minimize, maximize): 24 px at every UI scale,
+/// as the desktop's own are, dimmed while the window is in the background.
+pub fn window_button(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    active: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(color(palette::FILL))
+        .hover(|style| style.bg(color(palette::FILL_HOVER)))
+        .active(|style| style.bg(color(palette::FILL_PRESSED)))
+        .child(
+            gpui::svg()
+                .path(icon)
+                .size(px(16.0))
+                .text_color(color(if active {
+                    palette::LABEL
+                } else {
+                    palette::SECONDARY_LABEL
+                })),
+        )
 }
 
 /// A round 24 px icon button, like the window's own buttons.
@@ -235,7 +264,6 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .w(u(40.0))
         .h(u(24.0))
         .rounded_full()
-        .cursor_pointer()
         .bg(color(if on {
             palette::LABEL
         } else {
@@ -315,7 +343,6 @@ pub fn popup_button(id: impl Into<ElementId>, label: &'static str) -> Stateful<D
         .bg(color(palette::FILL))
         .hover(|style| style.bg(color(palette::FILL_HOVER)))
         .active(|style| style.bg(color(palette::FILL_PRESSED)))
-        .cursor_pointer()
         .text_size(u(text::BODY))
         .text_color(color(palette::LABEL))
         .child(label)
@@ -358,7 +385,6 @@ pub fn menu_item(id: impl Into<ElementId>, label: &'static str, selected: bool) 
         .items_center()
         .gap(u(space::S))
         .rounded(u(radius::INNER))
-        .cursor_pointer()
         .hover(|style| style.bg(color(palette::FILL)))
         .active(|style| style.bg(color(palette::FILL_HOVER)))
         .text_size(u(text::BODY))
