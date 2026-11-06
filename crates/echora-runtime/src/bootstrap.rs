@@ -241,13 +241,13 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     machine
         .services
         .set_service_access(npdm.service_access.clone());
-    // ECHORA_ROMFS: an extracted RomFS directory for the application's data.
-    if let Some(root) = std::env::var_os("ECHORA_ROMFS") {
-        let root = PathBuf::from(root);
-        let listing = crate::romfs::list_directory(&root)?;
-        let romfs = crate::romfs::VirtualRomfs::build(&root, &listing)
-            .context("build the application RomFS image")?;
-        machine.services.set_data_romfs(romfs);
+    // ECHORA_ROMFS: the application's data, as an extracted RomFS directory
+    // or a NUP read in place (ECHORA_ROMFS_PACKAGE selects the package when
+    // more than one has a RomFS).
+    if let Some(path) = std::env::var_os("ECHORA_ROMFS") {
+        machine
+            .services
+            .set_data_romfs(open_romfs(Path::new(&path))?);
     }
     Ok(LoadedProgram {
         exefs_directory: exefs
@@ -257,6 +257,33 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
         npdm,
         machine,
     })
+}
+
+fn open_romfs(path: &Path) -> Result<crate::romfs::VirtualRomfs> {
+    use crate::romfs::{FileSource, NupFiles, VirtualRomfs};
+    if path.is_dir() {
+        let listing = crate::romfs::list_directory(path)?;
+        return VirtualRomfs::build(path, &listing).context("build the RomFS image");
+    }
+    let archive = std::sync::Arc::new(echora_nup::NupArchive::open(path)?);
+    let with_romfs: Vec<usize> = archive
+        .packages()
+        .iter()
+        .filter(|p| p.romfs.is_some())
+        .map(|p| p.index)
+        .collect();
+    let package = match env_number::<usize>("ECHORA_ROMFS_PACKAGE") {
+        Some(index) => index,
+        None => match with_romfs.as_slice() {
+            [only] => *only,
+            _ => bail!(
+                "the NUP has {} packages with a RomFS; set ECHORA_ROMFS_PACKAGE",
+                with_romfs.len()
+            ),
+        },
+    };
+    let (files, listing) = NupFiles::open(archive, package)?;
+    VirtualRomfs::build_from(FileSource::Nup(files), &listing).context("build the RomFS image")
 }
 
 impl LoadedProgram {

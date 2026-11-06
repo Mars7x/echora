@@ -126,6 +126,27 @@ fn verify_detects_corrupted_extent() {
 }
 
 #[test]
+fn raw_files_read_at_any_offset_within_bounds() {
+    let tmp = write_temp(&sample(false));
+    let a = NupArchive::open(tmp.path()).unwrap();
+    let romfs = a.packages()[0].romfs.unwrap();
+    let Some(Node::File(big)) = a.resolve(romfs, "System/big.bin") else {
+        panic!()
+    };
+    let mut out = [0u8; 4];
+    a.read_raw_at(big, 251 * 3 + 1, &mut out).unwrap();
+    assert_eq!(out, [1, 2, 3, 4]);
+    assert!(a.read_raw_at(big, 199_998, &mut out).is_err());
+    // Compressed files cannot be read at an offset.
+    let tmp = write_temp(&sample(true));
+    let a = NupArchive::open(tmp.path()).unwrap();
+    let Some(Node::File(big)) = a.resolve(a.packages()[0].romfs.unwrap(), "System/big.bin") else {
+        panic!()
+    };
+    assert!(a.read_raw_at(big, 0, &mut out).is_err());
+}
+
+#[test]
 fn unverified_stream_still_bounds_length() {
     let tmp = write_temp(&sample(true));
     let a = NupArchive::open(tmp.path()).unwrap();

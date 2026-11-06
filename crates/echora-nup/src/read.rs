@@ -161,6 +161,31 @@ impl NupArchive {
         })
     }
 
+    /// Reads `out.len()` bytes at `offset` within a raw (uncompressed) file,
+    /// directly from its extent. The content hash is not checked; use
+    /// [`Self::verify_contents`] for that.
+    pub fn read_raw_at(&self, id: FileId, offset: u64, out: &mut [u8]) -> Result<()> {
+        let entry = self.file(id);
+        if entry.codec != Codec::Raw {
+            return Err(NupError::Format(format!("file {} is compressed", id.0)));
+        }
+        let end = offset.checked_add(out.len() as u64);
+        if end.is_none_or(|e| e > entry.size) {
+            return Err(NupError::Format(format!(
+                "read of {} bytes at {offset} is outside file {} ({} bytes)",
+                out.len(),
+                id.0,
+                entry.size
+            )));
+        }
+        read_exact_at(&self.file, out, entry.extent_offset + offset).map_err(|source| {
+            NupError::Io {
+                path: self.path().to_path_buf(),
+                source,
+            }
+        })
+    }
+
     /// Reads a whole file into memory, verifying its hash. `limit` bounds the
     /// allocation; larger files must be streamed with [`Self::open_file`].
     pub fn read_file(&self, id: FileId, limit: u64) -> Result<Vec<u8>> {

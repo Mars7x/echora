@@ -12,6 +12,7 @@ publish.workspace = true
 anyhow.workspace = true
 echora-guest.workspace = true
 echora-loader.workspace = true
+echora-nup.workspace = true
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 miniz_oxide = "0.8"
 serde.workspace = true
@@ -19,6 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+echora-nup = { workspace = true, features = ["writer"] }
 tempfile.workspace = true
 
 [lints]

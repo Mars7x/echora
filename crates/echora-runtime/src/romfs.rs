@@ -5,7 +5,8 @@
 //! to 0x10, then the directory hash table, directory entries, file hash table
 //! and file entries. Entry offsets are byte offsets into their tables, and an
 //! empty link is 0xFFFFFFFF. The image is never materialized: reads are served
-//! from the in-memory metadata and, for file data, from the host files.
+//! from the in-memory metadata and, for file data, from a `FileSource`: host
+//! files under a directory, or a NUP package's RomFS read in place.
 
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeMap;
@@ -33,9 +34,145 @@ struct ImageFile {
     size: u64,
 }
 
+/// Upper bound on decoded compressed files kept in memory.
+const DECODED_CACHE_BYTES: u64 = 512 << 20;
+
+/// Where file data comes from.
+#[derive(Debug)]
+pub enum FileSource {
+    /// Host files: the root joined with each listed path.
+    Directory(PathBuf),
+    /// Files of a NUP package's RomFS, read in place.
+    Nup(NupFiles),
+}
+
+/// A NUP RomFS read in place. Raw files are read at any offset directly;
+/// zstd-compressed files are decoded whole (their SHA-256 is verified) into
+/// a bounded cache of recently used files.
+#[derive(Debug)]
+pub struct NupFiles {
+    archive: std::sync::Arc<echora_nup::NupArchive>,
+    ids: std::collections::HashMap<String, echora_nup::FileId>,
+    cache: std::sync::Mutex<DecodedCache>,
+}
+
+#[derive(Debug, Default)]
+struct DecodedCache {
+    /// Least recently used first.
+    entries: std::collections::VecDeque<(echora_nup::FileId, std::sync::Arc<Vec<u8>>)>,
+    bytes: u64,
+}
+
+impl NupFiles {
+    /// The RomFS of `archive`'s package `package` and its file listing.
+    pub fn open(
+        archive: std::sync::Arc<echora_nup::NupArchive>,
+        package: usize,
+    ) -> Result<(Self, Vec<ListedFile>)> {
+        let pkg = archive
+            .packages()
+            .get(package)
+            .with_context(|| format!("NUP has no package {package}"))?;
+        let romfs = pkg
+            .romfs
+            .with_context(|| format!("NUP package {package} has no RomFS"))?;
+        let files = archive.walk_files(romfs);
+        let listing = files
+            .iter()
+            .map(|(path, id)| ListedFile {
+                path: path.clone(),
+                size: archive.file(*id).size,
+            })
+            .collect();
+        let ids = files.into_iter().collect();
+        let source = Self {
+            archive,
+            ids,
+            cache: std::sync::Mutex::new(DecodedCache::default()),
+        };
+        Ok((source, listing))
+    }
+
+    fn read(&self, path: &str, offset: u64, out: &mut [u8]) -> Result<()> {
+        let id = *self
+            .ids
+            .get(path)
+            .with_context(|| format!("RomFS file {path:?} is not in the NUP"))?;
+        let entry = self.archive.file(id);
+        match entry.codec {
+            echora_nup::Codec::Raw => self
+                .archive
+                .read_raw_at(id, offset, out)
+                .with_context(|| format!("read RomFS file {path:?}")),
+            echora_nup::Codec::Zstd => {
+                let data = self.decoded(id, path)?;
+                let start = offset as usize;
+                let bytes = data
+                    .get(start..start + out.len())
+                    .with_context(|| format!("read past the end of RomFS file {path:?}"))?;
+                out.copy_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
+
+    fn decoded(&self, id: echora_nup::FileId, path: &str) -> Result<std::sync::Arc<Vec<u8>>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RomFS cache poisoned"))?;
+        if let Some(index) = cache.entries.iter().position(|(cached, _)| *cached == id) {
+            let entry = cache.entries.remove(index).expect("index found above");
+            let data = entry.1.clone();
+            cache.entries.push_back(entry);
+            return Ok(data);
+        }
+        let size = self.archive.file(id).size;
+        ensure!(
+            size <= DECODED_CACHE_BYTES,
+            "compressed RomFS file {path:?} ({size} bytes) exceeds the decode cache"
+        );
+        let data = std::sync::Arc::new(
+            self.archive
+                .read_file(id, size)
+                .with_context(|| format!("decode RomFS file {path:?}"))?,
+        );
+        while cache.bytes + size > DECODED_CACHE_BYTES {
+            let Some((_, old)) = cache.entries.pop_front() else {
+                break;
+            };
+            cache.bytes -= old.len() as u64;
+        }
+        cache.bytes += size;
+        cache.entries.push_back((id, data.clone()));
+        Ok(data)
+    }
+}
+
+impl FileSource {
+    fn read(&self, path: &str, size: u64, offset: u64, out: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Directory(root) => {
+                let full = root.join(path);
+                let mut handle = File::open(&full)
+                    .with_context(|| format!("RomFS file {path:?} is not staged locally"))?;
+                let actual = handle.metadata()?.len();
+                if actual != size {
+                    bail!("RomFS file {path:?} is {actual} bytes locally, listed as {size}");
+                }
+                handle.seek(SeekFrom::Start(offset))?;
+                handle
+                    .read_exact(out)
+                    .with_context(|| format!("read RomFS file {path:?}"))
+            }
+            Self::Nup(nup) => nup.read(path, offset, out),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VirtualRomfs {
-    root: PathBuf,
+    source: FileSource,
     /// Header bytes (0..0x50).
     header: Vec<u8>,
     /// Hash tables and entries, starting at `tables_offset`.
@@ -120,6 +257,11 @@ impl VirtualRomfs {
     /// Build the image metadata for `listing`. File data is read from `root`
     /// joined with each listed path when a read reaches it.
     pub fn build(root: &Path, listing: &[ListedFile]) -> Result<Self> {
+        Self::build_from(FileSource::Directory(root.to_path_buf()), listing)
+    }
+
+    /// Build the image metadata for `listing`, with file data from `source`.
+    pub fn build_from(source: FileSource, listing: &[ListedFile]) -> Result<Self> {
         let mut dirs = vec![DirNode::default()];
         let mut by_path: BTreeMap<String, usize> = BTreeMap::new();
         let mut sorted = listing.to_vec();
@@ -280,7 +422,7 @@ impl VirtualRomfs {
             .collect();
         files.sort_by_key(|file| file.offset);
         Ok(Self {
-            root: root.to_path_buf(),
+            source,
             header,
             tables,
             tables_offset,
@@ -325,21 +467,12 @@ impl VirtualRomfs {
             if from >= to {
                 continue;
             }
-            let path = self.root.join(&file.path);
-            let mut handle = File::open(&path)
-                .with_context(|| format!("RomFS file {:?} is not staged locally", file.path))?;
-            let actual = handle.metadata()?.len();
-            if actual != file.size {
-                bail!(
-                    "RomFS file {:?} is {actual} bytes locally, listed as {}",
-                    file.path,
-                    file.size
-                );
-            }
-            handle.seek(SeekFrom::Start(from - file.offset))?;
-            handle
-                .read_exact(&mut output[(from - offset) as usize..(to - offset) as usize])
-                .with_context(|| format!("read RomFS file {:?}", file.path))?;
+            self.source.read(
+                &file.path,
+                file.size,
+                from - file.offset,
+                &mut output[(from - offset) as usize..(to - offset) as usize],
+            )?;
         }
         Ok(output)
     }
@@ -387,6 +520,53 @@ pub fn list_directory(root: &Path) -> Result<Vec<ListedFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use echora_nup::writer as nup_writer;
+
+    /// The same files served from a directory and from a NUP (raw and
+    /// zstd-compressed) give byte-identical images.
+    #[test]
+    fn nup_source_matches_directory_source() {
+        let big: Vec<u8> = (0..300_000u32).map(|i| (i % 7) as u8).collect();
+        let files: Vec<(&'static str, Vec<u8>)> = vec![
+            ("romfs/Pack/big.pack", big),
+            ("romfs/System/a.txt", b"alpha".to_vec()),
+            ("romfs/System/b.bin", (0..=255u8).collect()),
+            ("romfs/top", b"top-level file".to_vec()),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (path, data) in &files {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, data).unwrap();
+        }
+        let root = dir.path().join("romfs");
+        let from_dir = VirtualRomfs::build(&root, &list_directory(&root).unwrap()).unwrap();
+
+        let nup = nup_writer::write_temp(&nup_writer::build(
+            &[nup_writer::PackageSpec::base(files)],
+            true,
+        ));
+        let archive = std::sync::Arc::new(echora_nup::NupArchive::open(nup.path()).unwrap());
+        let (source, listing) = NupFiles::open(archive, 0).unwrap();
+        let from_nup = VirtualRomfs::build_from(FileSource::Nup(source), &listing).unwrap();
+
+        assert_eq!(from_dir.size(), from_nup.size());
+        let size = from_dir.size() as usize;
+        assert_eq!(
+            from_dir.read(0, size).unwrap(),
+            from_nup.read(0, size).unwrap()
+        );
+        // Unaligned partial reads, twice (the second hits the decode cache).
+        for _ in 0..2 {
+            for (offset, length) in [(0x1f3, 0x40), (0x200, 0x10007), (size as u64 - 9, 9)] {
+                assert_eq!(
+                    from_dir.read(offset, length).unwrap(),
+                    from_nup.read(offset, length).unwrap()
+                );
+            }
+        }
+    }
 
     fn read_u32(bytes: &[u8], at: u64) -> u32 {
         u32::from_le_bytes(bytes[at as usize..at as usize + 4].try_into().unwrap())

@@ -13,6 +13,11 @@ sha2.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
+tempfile = { workspace = true, optional = true }
+
+[features]
+writer = ["dep:tempfile"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

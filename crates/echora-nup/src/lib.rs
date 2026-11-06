@@ -12,6 +12,10 @@ pub mod format;
 mod meta;
 mod read;
 mod verify;
+/// A minimal NUP writer for tests (the `writer` feature).
+#[cfg(feature = "writer")]
+#[allow(clippy::unwrap_used, missing_debug_implementations)]
+pub mod writer;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

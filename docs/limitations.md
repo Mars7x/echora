@@ -13,8 +13,9 @@
   with the real modules.
 - The runtime's NVN layer implements no graphics call yet (the first NVN call
   stops with its name), and there is no window, input or audio backend.
-- RomFS is served only from an extracted directory (`ECHORA_ROMFS`), not yet
-  from the NUP in place.
+- RomFS data from a NUP is read in place; raw files are not hash-checked on
+  each read (`echora verify` checks every file), compressed files are
+  verified when decoded.
 - Process entropy is read from `/dev/urandom` (Unix only).
 - The ported runtime still uses `unwrap()` in about 70 places, mostly
   fixed-length slice conversions; they should become checked conversions.
