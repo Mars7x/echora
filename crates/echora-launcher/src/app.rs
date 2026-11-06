@@ -535,9 +535,8 @@ fn setting_row(
 }
 
 /// The people and projects Echora builds on, with what each contributed.
-const CREDITS: [(&str, &str); 7] = [
+const CREDITS: [(&str, &str); 6] = [
     ("Mars7x", "Creator of Echora"),
-    ("pokopia-recomp", "Recompiler and runtime basis"),
     ("PokeDinner, an Eglantine fork", "Shader recompiler"),
     ("sirit", "SPIR-V generation"),
     ("GPUI by Zed Industries", "Launcher interface"),
