@@ -325,6 +325,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .arg(&report)
                 .env("ECHORA_ROMFS", romfs_path)
                 .env("ECHORA_SETTINGS", host_paths::settings_file()?);
+            // Draws run on the host GPU (Vulkan) unless the environment
+            // chooses otherwise; every configurable backend is a GPU one.
+            if std::env::var_os("ECHORA_GPU").is_none() {
+                command.env("ECHORA_GPU", "1");
+            }
             // Saves go under the per-user data directory unless the
             // environment chooses a save or work directory.
             if std::env::var_os("ECHORA_SAVE_DIR").is_none()
@@ -725,10 +730,23 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         flags.push("-C".into());
         flags.push(format!("link-arg=-Wl,-rpath,{libdir}"));
     }
-    write_if_changed(
-        &out.join(".cargo/config.toml"),
-        &format!("[build]\nrustflags = {flags:?}\n"),
-    )?;
+    // The shader recompiler is built into the runtime when its fetched
+    // sources are present (scripts/fetch-shader-sources.sh): the workspace
+    // passes them on, so a plain `cargo build` of the runner can draw.
+    let shader_sources = std::env::var_os("ECHORA_SHADER_SRC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let fetched = d.cache.join("shader-src");
+            fetched.is_dir().then_some(fetched)
+        });
+    let mut config = format!("[build]\nrustflags = {flags:?}\n");
+    if let Some(sources) = shader_sources {
+        config.push_str(&format!(
+            "\n[env]\nECHORA_SHADER_SRC = {:?}\n",
+            sources.to_string_lossy()
+        ));
+    }
+    write_if_changed(&out.join(".cargo/config.toml"), &config)?;
     std::fs::write(
         out.join("translation-report.json"),
         serde_json::to_vec_pretty(&report)?,
