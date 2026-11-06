@@ -1,195 +1,170 @@
-//! The GTK4/libadwaita launcher window.
+//! The launcher window: the game's art fills the window and a single dock at
+//! the bottom holds what the player needs, with settings in a sheet above it.
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use adw::prelude::*;
 use echora_config::{InternalResolutionSetting, Settings, WindowMode};
 use echora_content::ContentSource;
-use gtk::{gdk, gio, glib};
+use gpui::{
+    AnyElement, App, Application, Bounds, Context, Decorations, FocusHandle, FontWeight, Hsla,
+    Image, ImageFormat, KeyBinding, MouseButton, ObjectFit, PathPromptOptions, SharedString,
+    TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions, actions, div, img,
+    point, prelude::*, px, rgba, size,
+};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
-/// Internal resolution choices offered in preferences.
+/// Internal resolution choices offered in settings.
 const RESOLUTIONS: [(&str, InternalResolutionSetting); 5] = [
-    ("Match Window", InternalResolutionSetting::MatchOutput),
+    ("Window", InternalResolutionSetting::MatchOutput),
     ("720p", InternalResolutionSetting::Height { height: 720 }),
     ("1080p", InternalResolutionSetting::Height { height: 1080 }),
     ("1440p", InternalResolutionSetting::Height { height: 1440 }),
-    ("2160p", InternalResolutionSetting::Height { height: 2160 }),
+    ("4K", InternalResolutionSetting::Height { height: 2160 }),
 ];
 
 const WINDOW_MODES: [(&str, WindowMode); 3] = [
     ("Windowed", WindowMode::Windowed),
-    ("Borderless Fullscreen", WindowMode::BorderlessFullscreen),
-    ("Exclusive Fullscreen", WindowMode::ExclusiveFullscreen),
+    ("Borderless", WindowMode::BorderlessFullscreen),
+    ("Fullscreen", WindowMode::ExclusiveFullscreen),
 ];
 
-/// A menu action.
-type Action = fn(&Rc<State>);
+actions!(
+    echora,
+    [Play, ToggleSettings, CloseSettings, ChooseGame, Quit]
+);
 
-/// The launcher's look: flat surfaces, the game's icon, clear type and one
-/// accent colour for the primary action.
-const STYLE: &str = r#"
-window.echora {
-    background: #121417;
-    color: #e6e8eb;
-}
-window.echora headerbar {
-    background: transparent;
-    box-shadow: none;
-}
-.echora-wordmark {
-    font-size: 36pt;
-    font-weight: 800;
-    letter-spacing: 6px;
-}
-.echora-tagline {
-    font-size: 11pt;
-    color: alpha(#e6e8eb, 0.6);
-}
-.echora-hint {
-    font-size: 9pt;
-    color: alpha(#e6e8eb, 0.4);
-}
-.echora-icon {
-    border-radius: 20px;
-}
-.echora-icon-placeholder {
-    background: #1b1e22;
-    border-radius: 20px;
-}
-.echora-tag {
-    font-size: 9pt;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    color: #4cc9a0;
-}
-.echora-title {
-    font-size: 24pt;
-    font-weight: 800;
-}
-.echora-subtitle {
-    font-size: 11pt;
-    color: alpha(#e6e8eb, 0.6);
-}
-button.echora-play {
-    background: #4cc9a0;
-    color: #0b1a14;
-    font-size: 12pt;
-    font-weight: 700;
-    border-radius: 10px;
-    padding: 8px 32px;
-}
-button.echora-play:hover {
-    background: #5fd4ad;
-}
-button.echora-play:disabled {
-    background: #24282d;
-    color: alpha(#e6e8eb, 0.45);
-}
-button.echora-round {
-    background: #1f2328;
-    border-radius: 10px;
-    min-width: 40px;
-    min-height: 40px;
-}
-button.echora-round:hover {
-    background: #292e34;
-}
-.echora-card {
-    background: #1a1d21;
-    border-radius: 14px;
-    padding: 16px 20px;
-}
-.echora-key {
-    font-size: 9pt;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    color: alpha(#e6e8eb, 0.45);
-}
-.echora-value {
-    font-family: monospace;
-    font-size: 10pt;
-}
-"#;
-
-struct State {
-    window: adw::ApplicationWindow,
-    toasts: adw::ToastOverlay,
-    stack: gtk::Stack,
-    icon: gtk::Picture,
-    icon_placeholder: gtk::Box,
-    tag: gtk::Label,
-    title: gtk::Label,
-    subtitle: gtk::Label,
-    build: gtk::Label,
-    version: gtk::Label,
-    path: gtk::Label,
-    launch: gtk::Button,
-    game: RefCell<Option<PathBuf>>,
-    settings_path: Option<PathBuf>,
-    settings: RefCell<Settings>,
-    child: RefCell<Option<Child>>,
+/// Colours as `0xRRGGBBAA`: near-black grays with white for text and the
+/// primary action.
+mod palette {
+    pub const BACKDROP: u32 = 0x0d0d0dff;
+    pub const DOCK: u32 = 0x121212e6;
+    pub const SHEET: u32 = 0x141414ff;
+    pub const DIVIDER: u32 = 0x262626ff;
+    pub const CONTROL: u32 = 0x242424ff;
+    pub const CONTROL_HOVER: u32 = 0x2e2e2eff;
+    pub const SELECTED: u32 = 0xf5f5f5ff;
+    pub const SELECTED_TEXT: u32 = 0x0d0d0dff;
+    pub const TEXT: u32 = 0xf5f5f5ff;
+    pub const TEXT_MUTED: u32 = 0x8f8f8fff;
+    pub const PLAY: u32 = 0xffffffff;
+    pub const PLAY_HOVER: u32 = 0xe0e0e0ff;
+    pub const PLAY_TEXT: u32 = 0x0d0d0dff;
+    pub const SCRIM: u32 = 0x000000a6;
+    pub const ART_SHADE: u32 = 0x0000004d;
 }
 
-pub fn run() -> ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| {
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
-        let css = gtk::CssProvider::new();
-        css.load_from_string(STYLE);
-        if let Some(display) = gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &css,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Display,
+    Controls,
+    Launcher,
+}
+
+impl SettingsTab {
+    const ALL: [Self; 3] = [Self::Display, Self::Controls, Self::Launcher];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Display => "Display",
+            Self::Controls => "Controls",
+            Self::Launcher => "Launcher",
         }
-    });
-    app.connect_activate(build_window);
-    if app.run() == glib::ExitCode::SUCCESS {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
-fn label(text: &str, class: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.add_css_class(class);
-    label.set_xalign(0.0);
-    label
+/// The game the launcher will start.
+struct Game {
+    path: PathBuf,
+    title: SharedString,
+    version: SharedString,
+    icon: Option<Arc<Image>>,
 }
 
-fn round_button(icon: &str, tooltip: &str) -> gtk::Button {
-    let button = gtk::Button::from_icon_name(icon);
-    button.add_css_class("echora-round");
-    button.set_tooltip_text(Some(tooltip));
-    button.set_valign(gtk::Align::Center);
-    button
+struct Launcher {
+    focus: FocusHandle,
+    game: Option<Game>,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    notice: Option<SharedString>,
+    notice_generation: u64,
+    running: bool,
 }
 
-/// One labelled value in the details card.
-fn detail(grid: &gtk::Grid, row: i32, key: &str) -> gtk::Label {
-    let name = label(key, "echora-key");
-    name.set_valign(gtk::Align::Start);
-    let value = label("", "echora-value");
-    value.set_selectable(true);
-    value.set_wrap(true);
-    value.set_wrap_mode(gtk::pango::WrapMode::Char);
-    value.set_hexpand(true);
-    grid.attach(&name, 0, row, 1, 1);
-    grid.attach(&value, 1, row, 1, 1);
-    value
+pub fn run() -> ExitCode {
+    // `--show` opens the window even when the player chose to skip it.
+    let show = std::env::args().skip(1).any(|arg| arg == "--show");
+    if !show && let Some(code) = skip_to_game() {
+        return code;
+    }
+    Application::new().run(|cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("enter", Play, Some("Launcher")),
+            KeyBinding::new("ctrl-,", ToggleSettings, Some("Launcher")),
+            KeyBinding::new("cmd-,", ToggleSettings, Some("Launcher")),
+            KeyBinding::new("escape", CloseSettings, Some("Launcher")),
+            KeyBinding::new("ctrl-o", ChooseGame, Some("Launcher")),
+            KeyBinding::new("cmd-o", ChooseGame, Some("Launcher")),
+            KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Echora".into()),
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: Some(point(px(14.0), px(14.0))),
+            }),
+            app_id: Some(APP_ID.into()),
+            window_min_size: Some(size(px(720.0), px(460.0))),
+            window_decorations: Some(WindowDecorations::Client),
+            ..Default::default()
+        };
+        let opened = cx.open_window(options, |window, cx| {
+            cx.new(|cx| {
+                let launcher = Launcher::new(cx);
+                window.focus(&launcher.focus);
+                launcher
+            })
+        });
+        if let Err(error) = opened {
+            eprintln!("echora-launcher: could not open a window: {error}");
+            cx.quit();
+        }
+        cx.activate(true);
+    });
+    ExitCode::SUCCESS
 }
 
-fn build_window(app: &adw::Application) {
-    let settings_path = echora_config::default_path();
-    let settings = settings_path
+/// With "Skip launcher" on, starts the last game and waits for it. `None`
+/// means the window should open instead.
+fn skip_to_game() -> Option<ExitCode> {
+    let (settings_path, settings) = load_settings();
+    if !settings.launcher.skip {
+        return None;
+    }
+    let mut command = game_command(&last_game()?, settings_path.as_deref())?;
+    match command.status() {
+        Ok(status) if status.success() => Some(ExitCode::SUCCESS),
+        Ok(_) => Some(ExitCode::FAILURE),
+        Err(error) => {
+            eprintln!("echora-launcher: couldn't start the game: {error}");
+            None
+        }
+    }
+}
+
+/// The settings file's location and its contents, or defaults.
+fn load_settings() -> (Option<PathBuf>, Settings) {
+    let path = echora_config::default_path();
+    let settings = path
         .as_deref()
         .map(Settings::load)
         .transpose()
@@ -198,475 +173,720 @@ fn build_window(app: &adw::Application) {
             None
         })
         .unwrap_or_default();
+    (path, settings)
+}
 
-    // Empty state: the wordmark and one action.
-    let choose = gtk::Button::with_label("Choose Game");
-    choose.add_css_class("echora-play");
-    choose.set_halign(gtk::Align::Center);
-    choose.set_margin_top(28);
-    let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    empty.set_valign(gtk::Align::Center);
-    empty.set_halign(gtk::Align::Center);
-    let wordmark = gtk::Label::new(Some("ECHORA"));
-    wordmark.add_css_class("echora-wordmark");
-    let tagline = gtk::Label::new(Some("Ocarina of Time, recompiled to run natively"));
-    tagline.add_css_class("echora-tagline");
-    let hint = gtk::Label::new(Some("Select your NUP package or dump folder to begin"));
-    hint.add_css_class("echora-hint");
-    hint.set_margin_top(10);
-    empty.append(&wordmark);
-    empty.append(&tagline);
-    empty.append(&choose);
-    empty.append(&hint);
-
-    // Game page: icon, title and actions, then the details card.
-    let icon = gtk::Picture::new();
-    icon.set_size_request(184, 184);
-    icon.set_can_shrink(true);
-    icon.set_content_fit(gtk::ContentFit::Cover);
-    icon.add_css_class("echora-icon");
-    icon.set_overflow(gtk::Overflow::Hidden);
-    let icon_placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    icon_placeholder.set_size_request(184, 184);
-    icon_placeholder.add_css_class("echora-icon-placeholder");
-    let placeholder_image = gtk::Image::from_icon_name("applications-games-symbolic");
-    placeholder_image.set_pixel_size(72);
-    placeholder_image.set_vexpand(true);
-    placeholder_image.set_opacity(0.4);
-    icon_placeholder.append(&placeholder_image);
-    let icon_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    icon_slot.set_valign(gtk::Align::Center);
-    icon_slot.append(&icon);
-    icon_slot.append(&icon_placeholder);
-
-    let tag = label("", "echora-tag");
-    tag.set_halign(gtk::Align::Start);
-    let title = label("", "echora-title");
-    title.set_wrap(true);
-    let subtitle = label("", "echora-subtitle");
-    let launch = gtk::Button::with_label("Play");
-    launch.add_css_class("echora-play");
-    let settings_button = round_button("emblem-system-symbolic", "Settings");
-    let change = round_button("folder-open-symbolic", "Choose Another Game");
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    actions.set_margin_top(18);
-    actions.append(&launch);
-    actions.append(&settings_button);
-    actions.append(&change);
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    heading.set_valign(gtk::Align::Center);
-    heading.set_hexpand(true);
-    heading.append(&tag);
-    heading.append(&title);
-    heading.append(&subtitle);
-    heading.append(&actions);
-    let hero = gtk::Box::new(gtk::Orientation::Horizontal, 32);
-    hero.append(&icon_slot);
-    hero.append(&heading);
-
-    let grid = gtk::Grid::new();
-    grid.set_row_spacing(10);
-    grid.set_column_spacing(24);
-    let build = detail(&grid, 0, "BUILD ID");
-    let version = detail(&grid, 1, "CONTENT VERSION");
-    let path = detail(&grid, 2, "LOCATION");
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    card.add_css_class("echora-card");
-    card.append(&grid);
-
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 32);
-    page.set_margin_top(12);
-    page.set_margin_bottom(36);
-    page.set_margin_start(40);
-    page.set_margin_end(40);
-    page.set_valign(gtk::Align::Center);
-    page.append(&hero);
-    page.append(&card);
-    let game_page = adw::Clamp::builder().maximum_size(760).child(&page).build();
-
-    let stack = gtk::Stack::new();
-    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    stack.add_named(&empty, Some("empty"));
-    stack.add_named(&game_page, Some("game"));
-
-    let menu = gio::Menu::new();
-    menu.append(Some("Choose Game…"), Some("app.choose"));
-    menu.append(Some("Choose Dump Folder…"), Some("app.folder"));
-    menu.append(Some("Settings"), Some("app.preferences"));
-    menu.append(Some("About Echora"), Some("app.about"));
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .menu_model(&menu)
-        .primary(true)
-        .tooltip_text("Main Menu")
-        .build();
-    let header = adw::HeaderBar::new();
-    header.set_show_title(false);
-    header.pack_end(&menu_button);
-
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&stack));
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&toasts));
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Echora")
-        .default_width(860)
-        .default_height(560)
-        .content(&toolbar)
-        .build();
-    window.add_css_class("echora");
-
-    let state = Rc::new(State {
-        window: window.clone(),
-        toasts,
-        stack,
-        icon,
-        icon_placeholder,
-        tag,
-        title,
-        subtitle,
-        build,
-        version,
-        path,
-        launch: launch.clone(),
-        game: RefCell::new(None),
-        settings_path,
-        settings: RefCell::new(settings),
-        child: RefCell::new(None),
-    });
-
-    {
-        let state = state.clone();
-        choose.connect_clicked(move |_| choose_package(&state));
-    }
-    {
-        let state = state.clone();
-        change.connect_clicked(move |_| choose_package(&state));
-    }
-    {
-        let state = state.clone();
-        settings_button.connect_clicked(move |_| show_preferences(&state));
-    }
-    {
-        let state = state.clone();
-        launch.connect_clicked(move |_| launch_game(&state));
-    }
-    let actions: [(&str, Action); 4] = [
-        ("choose", choose_package),
-        ("folder", choose_folder),
-        ("preferences", show_preferences),
-        ("about", show_about),
-    ];
-    for (name, run) in actions {
-        let entry = gio::SimpleAction::new(name, None);
-        let state = state.clone();
-        entry.connect_activate(move |_, _| run(&state));
-        app.add_action(&entry);
-    }
-    app.set_accels_for_action("app.preferences", &["<Control>comma"]);
-    app.set_accels_for_action("app.choose", &["<Control>o"]);
-
-    if let Some(last) = last_game_file()
+/// The game chosen last time, if it is still there.
+fn last_game() -> Option<PathBuf> {
+    last_game_file()
         .and_then(|file| std::fs::read_to_string(file).ok())
         .map(|text| PathBuf::from(text.trim()))
         .filter(|path| path.exists())
-    {
-        select_game(&state, last);
-    }
-    window.present();
 }
 
-fn toast(state: &State, message: impl AsRef<str>) {
-    state.toasts.add_toast(adw::Toast::new(message.as_ref()));
+/// `echora run GAME` using the `echora` binary next to the launcher.
+fn game_command(game: &Path, settings: Option<&Path>) -> Option<Command> {
+    let echora = std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name(format!("echora{}", std::env::consts::EXE_SUFFIX)))
+        .filter(|path| path.is_file())?;
+    let mut command = Command::new(echora);
+    command.arg("run").arg(game);
+    if let Some(settings) = settings {
+        command.env("ECHORA_SETTINGS", settings);
+    }
+    Some(command)
+}
+
+impl Launcher {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let (settings_path, settings) = load_settings();
+        let mut launcher = Self {
+            focus: cx.focus_handle(),
+            game: None,
+            settings,
+            settings_path,
+            settings_open: false,
+            settings_tab: SettingsTab::Display,
+            notice: None,
+            notice_generation: 0,
+            running: false,
+        };
+        if let Some(last) = last_game() {
+            launcher.select_game(last, cx);
+        }
+        launcher
+    }
+
+    /// Shows a short message above the dock for a few seconds.
+    fn notify(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.notice = Some(message.into());
+        self.notice_generation += 1;
+        let generation = self.notice_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.notice_generation == generation {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_game(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match read_game(&path) {
+            Ok(game) => {
+                if let Some(file) = last_game_file() {
+                    let _ = file
+                        .parent()
+                        .map(std::fs::create_dir_all)
+                        .transpose()
+                        .and_then(|_| std::fs::write(&file, path.display().to_string()));
+                }
+                self.game = Some(game);
+            }
+            Err(message) => self.notify(message, cx),
+        }
+        cx.notify();
+    }
+
+    fn choose_game(&mut self, _: &ChooseGame, _: &mut Window, cx: &mut Context<Self>) {
+        // A NUP package is a file and a dump is a folder; the platform picker
+        // offers both.
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.select_game(path, cx));
+        })
+        .detach();
+    }
+
+    fn play(&mut self, _: &Play, _: &mut Window, cx: &mut Context<Self>) {
+        if self.running || self.settings_open {
+            return;
+        }
+        let Some(game) = &self.game else {
+            return;
+        };
+        let Some(mut command) = game_command(&game.path, self.settings_path.as_deref()) else {
+            self.notify("The echora command wasn't found next to the launcher", cx);
+            return;
+        };
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.notify(format!("Couldn't start the game: {error}"), cx);
+                return;
+            }
+        };
+        self.running = true;
+        self.notify("Starting…", cx);
+        cx.spawn(async move |this, cx| {
+            let succeeded = wait_for(child, cx).await;
+            let _ = this.update(cx, |this, cx| {
+                this.running = false;
+                if !succeeded {
+                    this.notify("The game stopped. The run report has the details.", cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_settings(&mut self, _: &ToggleSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, _: &CloseSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    fn change(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Settings)) {
+        edit(&mut self.settings);
+        match &self.settings_path {
+            Some(path) => {
+                if let Err(error) = self.settings.save(path) {
+                    self.notify(format!("Settings not saved: {error}"), cx);
+                }
+            }
+            None => self.notify("No configuration folder, so settings aren't saved", cx),
+        }
+        cx.notify();
+    }
+}
+
+/// Polls the game process without blocking the window.
+async fn wait_for(mut child: Child, cx: &mut gpui::AsyncApp) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn read_game(path: &Path) -> Result<Game, String> {
+    let inventory = ContentSource::open(path)
+        .and_then(|source| source.inventory())
+        .map_err(|error| format!("That isn't a usable game: {error}"))?;
+    let package = inventory
+        .program_package
+        .map(|index| &inventory.packages[index])
+        .ok_or("That selection has no game program in it")?;
+    let version = match &package.display_version {
+        Some(display) => format!("Version {display}"),
+        None => format!(
+            "Version {}.{}.{}",
+            package.version >> 16,
+            (package.version >> 8) & 0xff,
+            package.version & 0xff
+        ),
+    };
+    let icon = package.icon.as_ref().map(|bytes| {
+        let format = if bytes.starts_with(b"\x89PNG") {
+            ImageFormat::Png
+        } else {
+            ImageFormat::Jpeg
+        };
+        Arc::new(Image::from_bytes(format, bytes.clone()))
+    });
+    Ok(Game {
+        path: path.to_path_buf(),
+        title: package
+            .title_name
+            .clone()
+            .unwrap_or_else(|| "Unknown game".into())
+            .into(),
+        version: version.into(),
+        icon,
+    })
 }
 
 fn last_game_file() -> Option<PathBuf> {
     echora_config::default_path().map(|settings| settings.with_file_name("last-game"))
 }
 
-fn choose_package(state: &Rc<State>) {
-    let filter = gtk::FileFilter::new();
-    filter.set_name(Some("NUP Packages"));
-    filter.add_pattern("*.nup");
-    let filters = gio::ListStore::new::<gtk::FileFilter>();
-    filters.append(&filter);
-    let dialog = gtk::FileDialog::builder()
-        .title("Choose Game")
-        .filters(&filters)
-        .build();
-    let chosen = state.clone();
-    dialog.open(Some(&state.window), gio::Cancellable::NONE, move |result| {
-        if let Some(path) = result.ok().and_then(|file| file.path()) {
-            select_game(&chosen, path);
-        }
-    });
+/// `0xRRGGBBAA`.
+fn color(hex: u32) -> Hsla {
+    rgba(hex).into()
 }
 
-fn choose_folder(state: &Rc<State>) {
-    let dialog = gtk::FileDialog::builder()
-        .title("Choose Dump Folder")
-        .build();
-    let chosen = state.clone();
-    dialog.select_folder(Some(&state.window), gio::Cancellable::NONE, move |result| {
-        if let Some(path) = result.ok().and_then(|file| file.path()) {
-            select_game(&chosen, path);
-        }
-    });
+/// A secondary button in the dock or the settings sheet.
+fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(44.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(10.0))
+        .bg(color(palette::CONTROL))
+        .hover(|style| style.bg(color(palette::CONTROL_HOVER)))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(color(palette::TEXT))
+        .child(label.into())
 }
 
-fn select_game(state: &Rc<State>, path: PathBuf) {
-    let inventory = match ContentSource::open(&path).and_then(|source| source.inventory()) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            toast(state, format!("Not a usable game: {error}"));
-            return;
-        }
-    };
-    let Some(package) = inventory.program_package.map(|i| &inventory.packages[i]) else {
-        toast(state, "The selection contains no game program");
-        return;
-    };
-    state
-        .title
-        .set_label(package.title_name.as_deref().unwrap_or("Unknown title"));
-    let numeric = format!(
-        "{}.{}.{}",
-        package.version >> 16,
-        (package.version >> 8) & 0xff,
-        package.version & 0xff
-    );
-    state.tag.set_label(&match &package.display_version {
-        Some(display) => format!("VERSION {display}"),
-        None => format!("VERSION {numeric}"),
-    });
-    state.subtitle.set_label(match inventory.source {
-        "nup" => "NUP package, read in place",
-        _ => "Extracted dump folder",
-    });
-    state
-        .build
-        .set_label(package.main_build_id().as_deref().unwrap_or("Unknown"));
-    state
-        .version
-        .set_label(&format!("{numeric} ({})", package.version));
-    state.path.set_label(&path.display().to_string());
-    let texture = package
-        .icon
-        .as_deref()
-        .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok());
-    state.icon.set_paintable(texture.as_ref());
-    state.icon.set_visible(texture.is_some());
-    state.icon_placeholder.set_visible(texture.is_none());
-    if let Some(file) = last_game_file() {
-        let _ = file
-            .parent()
-            .map(std::fs::create_dir_all)
-            .transpose()
-            .and_then(|_| std::fs::write(&file, path.display().to_string()));
-    }
-    *state.game.borrow_mut() = Some(path);
-    state.stack.set_visible_child_name("game");
+fn play_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(44.0))
+        .px(px(26.0))
+        .flex()
+        .items_center()
+        .rounded(px(10.0))
+        .bg(color(palette::PLAY))
+        .hover(|style| style.bg(color(palette::PLAY_HOVER)))
+        .cursor_pointer()
+        .text_color(color(palette::PLAY_TEXT))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label)
 }
 
-fn launch_game(state: &Rc<State>) {
-    let Some(game) = state.game.borrow().clone() else {
-        return;
-    };
-    let echora = std::env::current_exe()
-        .ok()
-        .map(|exe| exe.with_file_name("echora"))
-        .filter(|path| path.is_file());
-    let Some(echora) = echora else {
-        toast(
-            state,
-            "The echora command was not found next to the launcher",
-        );
-        return;
-    };
-    let mut command = Command::new(echora);
-    command.arg("run").arg(&game);
-    if let Some(settings) = &state.settings_path {
-        command.env("ECHORA_SETTINGS", settings);
-    }
-    match command.spawn() {
-        Ok(child) => {
-            *state.child.borrow_mut() = Some(child);
-            state.launch.set_sensitive(false);
-            toast(state, "Starting Ocarina of Time…");
-            let watched = state.clone();
-            glib::timeout_add_local(Duration::from_millis(500), move || {
-                let status = watched
-                    .child
-                    .borrow_mut()
-                    .as_mut()
-                    .and_then(|child| child.try_wait().ok().flatten());
-                let Some(status) = status else {
-                    return glib::ControlFlow::Continue;
-                };
-                *watched.child.borrow_mut() = None;
-                watched.launch.set_sensitive(true);
-                if !status.success() {
-                    toast(&watched, "The game stopped; see the run report for details");
-                }
-                glib::ControlFlow::Break
-            });
-        }
-        Err(error) => toast(state, format!("Could not start echora: {error}")),
-    }
+fn window_control(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(color(palette::DOCK))
+        .hover(|style| style.bg(color(palette::CONTROL_HOVER)))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(color(palette::TEXT))
+        .child(glyph)
 }
 
-fn save(state: &State) {
-    let Some(path) = &state.settings_path else {
-        toast(state, "No configuration directory; settings are not saved");
-        return;
-    };
-    if let Err(error) = state.settings.borrow().save(path) {
-        toast(state, format!("Settings not saved: {error}"));
-    }
+/// A row of mutually exclusive choices.
+fn segmented<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    choices: &[(&'static str, T)],
+    current: T,
+    cx: &mut Context<Launcher>,
+    apply: fn(&mut Settings, T),
+) -> impl IntoElement {
+    div()
+        .flex()
+        .p(px(3.0))
+        .gap(px(2.0))
+        .rounded(px(9.0))
+        .bg(color(palette::CONTROL))
+        .children(choices.iter().enumerate().map(|(index, &(label, value))| {
+            let selected = value == current;
+            div()
+                .id((id, index))
+                .px(px(12.0))
+                .py(px(5.0))
+                .rounded(px(7.0))
+                .text_sm()
+                .cursor_pointer()
+                .when(selected, |el| {
+                    el.bg(color(palette::SELECTED))
+                        .text_color(color(palette::SELECTED_TEXT))
+                })
+                .when(!selected, |el| {
+                    el.text_color(color(palette::TEXT_MUTED))
+                        .hover(|style| style.text_color(color(palette::TEXT)))
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(cx, |settings| apply(settings, value));
+                }))
+        }))
 }
 
-fn combo(title: &str, labels: &[&str], selected: usize) -> adw::ComboRow {
-    let row = adw::ComboRow::builder()
-        .title(title)
-        .model(&gtk::StringList::new(labels))
-        .build();
-    row.set_selected(selected as u32);
-    row
-}
-
-fn spin(title: &str, lower: f64, upper: f64, value: u32) -> adw::SpinRow {
-    let row = adw::SpinRow::with_range(lower, upper, 1.0);
-    row.set_title(title);
-    row.set_value(f64::from(value));
-    row
-}
-
-fn show_preferences(state: &Rc<State>) {
-    let current = state.settings.borrow().clone();
-    let dialog = adw::PreferencesDialog::new();
-
-    let display = adw::PreferencesPage::builder()
-        .title("Display")
-        .icon_name("video-display-symbolic")
-        .build();
-    let window_group = adw::PreferencesGroup::builder()
-        .title("Window")
-        .description("Applied when the game starts.")
-        .build();
-    let mode_index = WINDOW_MODES
-        .iter()
-        .position(|(_, mode)| *mode == current.display.window_mode)
-        .unwrap_or(0);
-    let mode = combo("Mode", &WINDOW_MODES.map(|(label, _)| label), mode_index);
-    let width = spin("Width", 320.0, 7680.0, current.display.window_width);
-    let height = spin("Height", 240.0, 4320.0, current.display.window_height);
-    window_group.add(&mode);
-    window_group.add(&width);
-    window_group.add(&height);
-    let render_group = adw::PreferencesGroup::builder().title("Rendering").build();
-    let resolution_index = RESOLUTIONS
-        .iter()
-        .position(|(_, setting)| *setting == current.display.internal_resolution)
-        .unwrap_or(0);
-    let resolution = combo(
-        "Internal Resolution",
-        &RESOLUTIONS.map(|(label, _)| label),
-        resolution_index,
-    );
-    resolution.set_subtitle("The resolution the game's scenes are drawn at");
-    render_group.add(&resolution);
-    display.add(&window_group);
-    display.add(&render_group);
-
-    let audio = adw::PreferencesPage::builder()
-        .title("Audio")
-        .icon_name("audio-speakers-symbolic")
-        .build();
-    let audio_group = adw::PreferencesGroup::new();
-    let volume = spin("Volume", 0.0, 100.0, current.audio.volume);
-    audio_group.add(&volume);
-    audio.add(&audio_group);
-
-    let input = adw::PreferencesPage::builder()
-        .title("Controls")
-        .icon_name("input-gaming-symbolic")
-        .build();
-    let input_group = adw::PreferencesGroup::new();
-    let vibration = adw::SwitchRow::builder()
-        .title("Vibration")
-        .active(current.input.vibration)
-        .build();
-    input_group.add(&vibration);
-    input.add(&input_group);
-
-    for page in [&display, &audio, &input] {
-        dialog.add(page);
-    }
-
-    let update = {
-        let state = state.clone();
-        move |change: &dyn Fn(&mut Settings)| {
-            change(&mut state.settings.borrow_mut());
-            save(&state);
-        }
-    };
-    let on = Rc::new(update);
-    {
-        let on = on.clone();
-        mode.connect_selected_notify(move |row| {
-            let mode = WINDOW_MODES[row.selected() as usize].1;
-            on(&|s| s.display.window_mode = mode);
-        });
-    }
-    {
-        let on = on.clone();
-        width.connect_value_notify(move |row| {
-            let value = row.value() as u32;
-            on(&|s| s.display.window_width = value);
-        });
-    }
-    {
-        let on = on.clone();
-        height.connect_value_notify(move |row| {
-            let value = row.value() as u32;
-            on(&|s| s.display.window_height = value);
-        });
-    }
-    {
-        let on = on.clone();
-        resolution.connect_selected_notify(move |row| {
-            let setting = RESOLUTIONS[row.selected() as usize].1;
-            on(&|s| s.display.internal_resolution = setting);
-        });
-    }
-    {
-        let on = on.clone();
-        volume.connect_value_notify(move |row| {
-            let value = row.value() as u32;
-            on(&|s| s.audio.volume = value);
-        });
-    }
-    vibration.connect_active_notify(move |row| {
-        let active = row.is_active();
-        on(&|s| s.input.vibration = active);
-    });
-    dialog.present(Some(&state.window));
-}
-
-fn show_about(state: &Rc<State>) {
-    let about = adw::AboutDialog::builder()
-        .application_name("Echora")
-        .application_icon("applications-games")
-        .version(env!("CARGO_PKG_VERSION"))
-        .developer_name("Echora contributors")
-        .license_type(gtk::License::Gpl30)
-        .website("https://github.com/Mars7x/echora")
-        .comments(
-            "An experimental native recompilation of The Legend of Zelda: Ocarina of \
-             Time for Nintendo Switch 2. Requires your own legally obtained copy of the game.",
+/// One setting: its name and what it does on the left, the control on the
+/// right.
+fn setting_row(
+    title: &'static str,
+    description: &'static str,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(24.0))
+        .py(px(14.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(color(palette::TEXT))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(color(palette::TEXT_MUTED))
+                        .child(description),
+                ),
         )
-        .build();
-    about.present(Some(&state.window));
+        .child(div().flex_none().child(control))
+}
+
+/// A thin line between settings rows.
+fn divider() -> impl IntoElement {
+    div().h(px(1.0)).bg(color(palette::DIVIDER))
+}
+
+impl Launcher {
+    fn render_art(&self, window: &Window) -> AnyElement {
+        let Some(icon) = self.game.as_ref().and_then(|game| game.icon.clone()) else {
+            return div()
+                .size_full()
+                .bg(color(palette::BACKDROP))
+                .into_any_element();
+        };
+        div()
+            .size_full()
+            .relative()
+            // The icon is square: scale it to the window's width and keep its
+            // top, where the title artwork sits, in view.
+            .child(
+                img(icon)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(window.viewport_size().width)
+                    .object_fit(ObjectFit::Cover),
+            )
+            .child(div().absolute().inset_0().bg(color(palette::ART_SHADE)))
+            .into_any_element()
+    }
+
+    fn render_top_bar(&self, window: &Window) -> impl IntoElement {
+        let client_side = matches!(window.window_decorations(), Decorations::Client { .. });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(52.0))
+            .px(px(22.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+            .child(
+                div()
+                    .when(cfg!(target_os = "macos"), |el| el.pl(px(64.0)))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color(palette::TEXT_MUTED))
+                    .child("ECHORA"),
+            )
+            .when(client_side && !cfg!(target_os = "macos"), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(
+                            window_control("minimize", "–")
+                                .on_click(|_, window, _| window.minimize_window()),
+                        )
+                        .child(
+                            window_control("close", "×")
+                                .on_click(|_, window, _| window.remove_window()),
+                        ),
+                )
+            })
+    }
+
+    fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dock = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .p(px(8.0))
+            .rounded(px(16.0))
+            .bg(color(palette::DOCK));
+        let Some(game) = &self.game else {
+            return dock
+                .child(play_button("choose", "Choose game").on_click(
+                    cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
+                ))
+                .child(button("settings", "Settings").on_click(cx.listener(
+                    |this, _, window, cx| this.toggle_settings(&ToggleSettings, window, cx),
+                )));
+        };
+        let thumbnail = match &game.icon {
+            Some(icon) => img(icon.clone())
+                .size(px(44.0))
+                .rounded(px(10.0))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => div()
+                .size(px(44.0))
+                .rounded(px(10.0))
+                .bg(color(palette::CONTROL))
+                .into_any_element(),
+        };
+        dock.child(thumbnail)
+            .child(
+                div()
+                    .pl(px(6.0))
+                    .pr(px(18.0))
+                    .max_w(px(320.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_color(color(palette::TEXT))
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(game.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(color(palette::TEXT_MUTED))
+                            .child(game.version.clone()),
+                    ),
+            )
+            .child(
+                play_button("play", if self.running { "Running" } else { "Play" })
+                    .when(self.running, |el| el.opacity(0.6).cursor_default())
+                    .on_click(cx.listener(|this, _, window, cx| this.play(&Play, window, cx))),
+            )
+            .child(button("settings", "Settings").on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.toggle_settings(&ToggleSettings, window, cx)
+                }),
+            ))
+            .child(button("change", "Change game").on_click(
+                cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
+            ))
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = &self.settings;
+        let page: Vec<AnyElement> = match self.settings_tab {
+            SettingsTab::Display => vec![
+                setting_row(
+                    "Window mode",
+                    "How the game's window is shown",
+                    segmented(
+                        "mode",
+                        &WINDOW_MODES,
+                        settings.display.window_mode,
+                        cx,
+                        |s, mode| s.display.window_mode = mode,
+                    ),
+                )
+                .into_any_element(),
+                divider().into_any_element(),
+                setting_row(
+                    "Internal resolution",
+                    "The resolution scenes are drawn at",
+                    segmented(
+                        "resolution",
+                        &RESOLUTIONS,
+                        settings.display.internal_resolution,
+                        cx,
+                        |s, resolution| s.display.internal_resolution = resolution,
+                    ),
+                )
+                .into_any_element(),
+            ],
+            SettingsTab::Controls => vec![
+                setting_row(
+                    "Vibration",
+                    "Rumble on controllers that support it",
+                    segmented(
+                        "vibration",
+                        &[("Off", false), ("On", true)],
+                        settings.input.vibration,
+                        cx,
+                        |s, on| s.input.vibration = on,
+                    ),
+                )
+                .into_any_element(),
+            ],
+            SettingsTab::Launcher => vec![
+                setting_row(
+                    "Skip launcher",
+                    "Start the game straight away. Run echora-launcher --show to come back here.",
+                    segmented(
+                        "skip",
+                        &[("Off", false), ("On", true)],
+                        settings.launcher.skip,
+                        cx,
+                        |s, on| s.launcher.skip = on,
+                    ),
+                )
+                .into_any_element(),
+            ],
+        };
+        let tabs = div()
+            .w(px(150.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .p(px(12.0))
+            .border_r_1()
+            .border_color(color(palette::DIVIDER))
+            .child(
+                div()
+                    .px(px(10.0))
+                    .pt(px(4.0))
+                    .pb(px(14.0))
+                    .text_lg()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(color(palette::TEXT))
+                    .child("Settings"),
+            )
+            .children(SettingsTab::ALL.into_iter().map(|tab| {
+                let selected = tab == self.settings_tab;
+                div()
+                    .id(tab.label())
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |el| {
+                        el.bg(color(palette::CONTROL))
+                            .text_color(color(palette::TEXT))
+                    })
+                    .when(!selected, |el| {
+                        el.text_color(color(palette::TEXT_MUTED))
+                            .hover(|style| style.text_color(color(palette::TEXT)))
+                    })
+                    .child(tab.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_tab = tab;
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px(px(10.0))
+                    .text_xs()
+                    .text_color(color(palette::TEXT_MUTED))
+                    .child(format!("Echora {}", env!("CARGO_PKG_VERSION"))),
+            );
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .px(px(24.0))
+            .py(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pb(px(6.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(color(palette::TEXT_MUTED))
+                            .child(self.settings_tab.label().to_uppercase()),
+                    )
+                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
+                        |this, _, window, cx| this.close_settings(&CloseSettings, window, cx),
+                    ))),
+            )
+            .children(page)
+            .child(div().flex_1())
+            .when(self.settings_tab != SettingsTab::Launcher, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(color(palette::TEXT_MUTED))
+                        .child("Changes apply the next time the game starts."),
+                )
+            });
+        let sheet = div()
+            .id("sheet")
+            .w_full()
+            .max_w(px(760.0))
+            .mx(px(24.0))
+            .h(px(380.0))
+            .flex()
+            .rounded(px(16.0))
+            .border_1()
+            .border_color(color(palette::DIVIDER))
+            .bg(color(palette::SHEET))
+            // Clicks inside the sheet must not reach the scrim behind it.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(tabs)
+            .child(content);
+        div()
+            .id("scrim")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(color(palette::SCRIM))
+            .on_click(
+                cx.listener(|this, _, window, cx| this.close_settings(&CloseSettings, window, cx)),
+            )
+            .child(sheet)
+    }
+}
+
+impl Render for Launcher {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("Launcher")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::play))
+            .on_action(cx.listener(Self::toggle_settings))
+            .on_action(cx.listener(Self::close_settings))
+            .on_action(cx.listener(Self::choose_game))
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(color(palette::BACKDROP))
+            .child(self.render_art(window))
+            .when(self.game.is_none(), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .pb(px(80.0))
+                        .child(
+                            div()
+                                .text_3xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(color(palette::TEXT))
+                                .child("Echora"),
+                        )
+                        .child(
+                            div()
+                                .pt(px(6.0))
+                                .text_color(color(palette::TEXT_MUTED))
+                                .child("Choose your NUP package or dump folder to begin"),
+                        ),
+                )
+            })
+            .child(self.render_top_bar(window))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(24.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .when_some(self.notice.clone(), |el, notice| {
+                        el.child(
+                            div()
+                                .px(px(14.0))
+                                .py(px(7.0))
+                                .rounded(px(10.0))
+                                .bg(color(palette::DOCK))
+                                .text_sm()
+                                .text_color(color(palette::TEXT))
+                                .child(notice),
+                        )
+                    })
+                    .child(self.render_dock(cx)),
+            )
+            .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+    }
 }
