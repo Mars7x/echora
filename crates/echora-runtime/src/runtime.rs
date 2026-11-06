@@ -778,6 +778,23 @@ impl Machine {
                 return Ok(false);
             }
             let now = std::time::Instant::now();
+            // ECHORA_WALL_SECONDS=N: an idle guest (every thread waiting,
+            // only timers left) ends the run as a budget stop after N host
+            // seconds, so the report shows what it waits on.
+            static WALL_LIMIT: std::sync::OnceLock<Option<std::time::Instant>> =
+                std::sync::OnceLock::new();
+            let limit = WALL_LIMIT.get_or_init(|| {
+                std::env::var("ECHORA_WALL_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|seconds| now + std::time::Duration::from_secs(seconds))
+            });
+            if limit.is_some_and(|limit| now >= limit) {
+                return Err(Trap::Budget {
+                    pc: self.core.cpu.pc,
+                    steps: self.core.steps,
+                });
+            }
             if deadline > now {
                 std::thread::sleep(deadline - now);
             }
