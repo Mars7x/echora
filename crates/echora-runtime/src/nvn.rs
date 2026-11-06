@@ -787,9 +787,17 @@ impl Nvn {
                 return Ok(true);
             }
             // nvnMemoryPoolGetBufferAddress(const NVNmemoryPool*) -> u64.
+            // A pool not yet initialized answers 0: the application tests
+            // for it before initializing a pool lazily (main+0xb45f44), where
+            // the driver reads its still-zeroed structure.
             "nvnMemoryPoolGetBufferAddress" => {
-                let pool = self.object(this, "MemoryPool").map_err(invalid)?;
-                core.cpu.regs[0] = pool.state["GpuAddress"].x[0];
+                core.cpu.regs[0] = match self.objects.get(&this) {
+                    None => 0,
+                    Some(_) => {
+                        let pool = self.object(this, "MemoryPool").map_err(invalid)?;
+                        pool.state["GpuAddress"].x[0]
+                    }
+                };
                 return Ok(true);
             }
             // nvnMemoryPoolMapVirtual(NVNmemoryPool* virtual, int count,
@@ -868,6 +876,13 @@ impl Nvn {
                 }
                 self.pool_ranges.borrow_mut().clear();
                 core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
+            // nvnMemoryPoolGetSize(const NVNmemoryPool*) -> size_t: the
+            // size the builder's SetStorage gave.
+            "nvnMemoryPoolGetSize" => {
+                let pool = self.object(this, "MemoryPool").map_err(invalid)?;
+                core.cpu.regs[0] = pool.builder["Storage"].x[1];
                 return Ok(true);
             }
             // nvnMemoryPoolMap(const NVNmemoryPool*) -> void*: the storage.
@@ -1637,27 +1652,23 @@ impl Nvn {
             // compiled yet, so the program always links.
             "nvnProgramSetShaders" => {
                 self.object(this, "Program").map_err(invalid)?;
-                let count = x[1] as u32;
-                if count == 0 || count > 6 {
-                    return Err(invalid(format!("{count} shader stages")));
-                }
-                let mut stages = Vec::new();
-                for index in 0..u64::from(count) {
-                    let entry = x[2] + index * 16;
-                    stages.push(Args {
-                        x: [core.memory.read_u64(entry)?, core.memory.read_u64(entry + 8)?, 0, 0],
-                        v: [0; 2],
-                    });
-                }
-                if let Some(directory) = debug_var_os("ECHORA_SHADER_DIR") {
-                    self.dump_shader_stages(core, &stages, std::path::Path::new(&directory))
-                        .map_err(|error| invalid(format!("shader dump: {error}")))?;
-                }
-                let program = self.objects.get_mut(&this).unwrap();
-                program.state.retain(|key, _| !key.starts_with("Stage"));
-                for (index, stage) in stages.into_iter().enumerate() {
-                    program.state.insert(format!("Stage{index}"), stage);
-                }
+                self.set_program_shaders(core, this, x[1], x[2])?;
+                core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
+            // nvnProgramInitializeFromBuilder(NVNprogram*, const
+            // NVNprogramBuilder*) -> NVNboolean: Initialize with the
+            // builder's device, then its SetShaders(count, data), read now
+            // (the application calls it right after setting them).
+            "nvnProgramInitializeFromBuilder" => {
+                let builder = self.bag(x[1], "ProgramBuilder").map_err(invalid)?;
+                self.require_device(&builder).map_err(invalid)?;
+                let shaders = builder
+                    .get("Shaders")
+                    .copied()
+                    .ok_or_else(|| stop("program builder has no shaders".into()))?;
+                self.initialize(this, "Program", builder).map_err(invalid)?;
+                self.set_program_shaders(core, this, shaders.x[0], shaders.x[1])?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1762,6 +1773,92 @@ impl Nvn {
         let Some((kind, rest)) = split_name(name) else {
             return Ok(false);
         };
+        // Sampler getters that write through output pointers (X1.. in
+        // order): nvnSampler[Builder]GetLodClamp(s, float* min, float* max),
+        // GetMinMagFilter(s, int* min, int* mag), GetWrapMode(s, int* s,
+        // int* t, int* r) and GetCompare(s, int* mode, int* function). They
+        // return what the matching setter stored (floats in V0/V1).
+        if matches!(kind, "Sampler" | "SamplerBuilder") {
+            // SetBorderColor[i|ui](builder, const T rgba[4]): the four words
+            // are captured, since the application may reuse the array.
+            // Get* writes them to the array at X1 (default transparent
+            // black, OpenGL's).
+            if let Some(suffix) = rest
+                .strip_prefix("SetBorderColor")
+                .filter(|_| kind == "SamplerBuilder")
+            {
+                let mut words = [0u64; 4];
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
+                }
+                let bag = self.bags.entry(this).or_insert_with(|| Bag {
+                    kind: kind.into(),
+                    props: BTreeMap::new(),
+                });
+                if bag.kind != kind {
+                    return Err(invalid(format!("no SamplerBuilder at {this:#x}")));
+                }
+                bag.props.insert(
+                    format!("BorderColor{suffix}"),
+                    Args {
+                        x: words,
+                        v: [0; 2],
+                    },
+                );
+                return Ok(true);
+            }
+            if let Some(suffix) = rest.strip_prefix("GetBorderColor") {
+                let props = if kind == "Sampler" {
+                    self.object(this, "Sampler")
+                        .map_err(invalid)?
+                        .builder
+                        .clone()
+                } else {
+                    self.bag(this, "SamplerBuilder").map_err(invalid)?
+                };
+                let words = props
+                    .get(&format!("BorderColor{suffix}"))
+                    .map_or([0; 4], |value| value.x);
+                for (index, word) in words.iter().enumerate() {
+                    core.memory
+                        .write_u32(x[1] + index as u64 * 4, *word as u32)?;
+                }
+                return Ok(true);
+            }
+            let outputs = match rest {
+                "GetLodClamp" => Some((2, true)),
+                "GetMinMagFilter" | "GetCompare" => Some((2, false)),
+                "GetWrapMode" => Some((3, false)),
+                _ => None,
+            };
+            if let Some((count, floats)) = outputs {
+                let property = &rest[3..];
+                let props = if kind == "Sampler" {
+                    self.object(this, "Sampler")
+                        .map_err(invalid)?
+                        .builder
+                        .clone()
+                } else {
+                    self.bag(this, "SamplerBuilder").map_err(invalid)?
+                };
+                let Some(value) = props.get(property).copied().or(sampler_default(property)) else {
+                    return Err(stop(format!("{property} was never set")));
+                };
+                for index in 0..count {
+                    let out = x[1 + index];
+                    if out == 0 {
+                        return Err(invalid("null output".into()));
+                    }
+                    let word = if floats {
+                        value.v[index] as u32
+                    } else {
+                        value.x[index] as u32
+                    };
+                    core.memory.write_u32(out, word)?;
+                }
+                return Ok(true);
+            }
+        }
         // Fixed-function state objects (nvn<Kind>State) are plain structures
         // the application configures with SetDefaults/Set and binds by
         // pointer, like builders.
@@ -1858,7 +1955,15 @@ impl Nvn {
         if let (Some(property), Some(object)) = (rest.strip_prefix("Get"), self.objects.get(&this))
         {
             if object.kind == kind {
-                if let Some(value) = object.state.get(property).or(object.builder.get(property)) {
+                let default = (kind == "Sampler")
+                    .then(|| sampler_default(property))
+                    .flatten();
+                if let Some(value) = object
+                    .state
+                    .get(property)
+                    .or(object.builder.get(property))
+                    .or(default.as_ref())
+                {
                     core.cpu.regs[0] = value.x[0];
                     core.cpu.vectors[0] = u128::from(value.v[0]);
                     return Ok(true);
@@ -2707,6 +2812,54 @@ impl Nvn {
         self.object(device.x[0], "Device").map(|_| ())
     }
 
+    /// SetShaders(count, const NVNshaderData*) on an initialized program.
+    /// Each 16-byte entry is the GPU address of a compiled stage and a
+    /// pointer to its control section (inferred from the 16-byte stride at
+    /// the call sites). The stages are kept for shader translation; nothing
+    /// is compiled yet, so the program always links.
+    fn set_program_shaders(
+        &mut self,
+        core: &mut Guest,
+        program: u64,
+        count: u64,
+        data: u64,
+    ) -> Result<(), Trap> {
+        let invalid = |message: String| Trap::InvalidState {
+            message: format!("nvnProgram shaders: {message}"),
+        };
+        let count = count as u32;
+        if count == 0 || count > 6 {
+            return Err(invalid(format!("{count} shader stages")));
+        }
+        let mut stages = Vec::new();
+        for index in 0..u64::from(count) {
+            let entry = data + index * 16;
+            stages.push(Args {
+                x: [
+                    core.memory.read_u64(entry)?,
+                    core.memory.read_u64(entry + 8)?,
+                    0,
+                    0,
+                ],
+                v: [0; 2],
+            });
+        }
+        if let Some(directory) = debug_var_os("ECHORA_SHADER_DIR") {
+            self.dump_shader_stages(core, &stages, std::path::Path::new(&directory))
+                .map_err(|error| invalid(format!("shader dump: {error}")))?;
+        }
+        let program = self
+            .objects
+            .get_mut(&program)
+            .filter(|object| object.kind == "Program")
+            .ok_or_else(|| invalid("program is not initialized".into()))?;
+        program.state.retain(|key, _| !key.starts_with("Stage"));
+        for (index, stage) in stages.into_iter().enumerate() {
+            program.state.insert(format!("Stage{index}"), stage);
+        }
+        Ok(())
+    }
+
     fn initialize(
         &mut self,
         address: u64,
@@ -2973,7 +3126,7 @@ impl Image {
 /// this host implementation, not NVIDIA's driver:
 /// - 42, 90: folded as `value != 0` into two optional-feature bits, and both
 ///   states are handled. The host device offers neither optional feature.
-/// - 4, 10, 11, 12, 13, 111, 124: used only as alignment requirements (the
+/// - 4, 10, 11, 12, 13, 53, 111, 124: used only as alignment requirements (the
 ///   application takes the maximum with its own power-of-two alignment) for
 ///   buffers selected by usage flags. Host memory pools are plain guest memory,
 ///   so one 256-byte alignment (Vulkan's largest common offset requirement)
@@ -3014,11 +3167,33 @@ fn device_integer(property: u32) -> Option<i32> {
         36 | 37 => Some(0),
         56 | 57 => Some(256),
         42 | 90 => Some(0),
-        4 | 10 | 11 | 12 | 13 | 111 | 124 | 17 | 18 => Some(256),
+        4 | 10 | 11 | 12 | 13 | 53 | 111 | 124 | 17 | 18 => Some(256),
         15 | 16 => Some(32),
         19 | 20 => Some(0),
         _ => None,
     }
+}
+
+/// A sampler property SetDefaults sets, for getters on samplers whose
+/// builder never set it: OpenGL's defaults, which NVN sampler state mirrors
+/// (LOD clamp -1000..1000, LOD bias 0, no depth compare with function
+/// LEQUAL, anisotropy 1, min filter nearest-mipmap-linear and mag linear,
+/// repeat wrapping, average reduction 0, LOD snap 0), in the enum numbering `nvn_gpu` decodes: compare
+/// LEQUAL 4, filters 4 and 1, wrap 1. Floats are in `v`. Provisional.
+fn sampler_default(property: &str) -> Option<Args> {
+    let float = |value: f32| u64::from(value.to_bits());
+    let (x, v) = match property {
+        "LodClamp" => ([0; 4], [float(-1000.0), float(1000.0)]),
+        "LodBias" => ([0; 4], [float(0.0), 0]),
+        "Compare" => ([0, 4, 0, 0], [0; 2]),
+        "MaxAnisotropy" => ([0; 4], [float(1.0), 0]),
+        "MinMagFilter" => ([4, 1, 0, 0], [0; 2]),
+        "WrapMode" => ([1, 1, 1, 0], [0; 2]),
+        "ReductionFilter" => ([0; 4], [0; 2]),
+        "LodSnap" => ([0; 4], [float(0.0), 0]),
+        _ => return None,
+    };
+    Some(Args { x, v })
 }
 
 /// State-key prefix of a virtual pool's mapping (followed by the virtual
