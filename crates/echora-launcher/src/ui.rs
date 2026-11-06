@@ -290,8 +290,8 @@ pub fn round_button(id: impl Into<ElementId>, icon: &'static str, active: bool) 
 const ROUND_BUTTON: &str = "round-button";
 const CIRCLE: &str = "icons/circle.svg";
 
-/// An on/off switch, 40 by 24 px, as libadwaita draws one: the same light
-/// knob in both states, on the accent when on and a gray track when off. `animate` slides the knob,
+/// An on/off switch, 40 by 24 px: the same dark knob in both states, on the
+/// accent when on and a gray track when off. `animate` slides the knob,
 /// for the switch that was just flipped.
 pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
     // Knob travel: from 2 px in to 18 px in.
@@ -301,7 +301,7 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .top(u(2.0))
         .size(u(20.0))
         .rounded_full()
-        .bg(color(palette::ON_ACCENT));
+        .bg(color(palette::BACKDROP));
     let knob = if animate {
         knob.with_animation(
             ElementId::Name(format!("{id}-{on}").into()),
