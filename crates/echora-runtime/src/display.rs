@@ -58,6 +58,8 @@ pub struct DisplaySessionState {
     pub secondary_endpoints: Vec<(u64, u64, u64)>,
     /// Command 301's two values for the default display (unnamed).
     pub display_values: Option<(u64, u64)>,
+    /// Command 261's u32 for the default display (undocumented setter).
+    pub value_261: Option<u32>,
 }
 
 /// A successful reply's raw data, or an explicit stop.
@@ -253,6 +255,19 @@ impl DisplaySessionState {
                 }
                 Ok(client.available.to_le_bytes().to_vec())
             }
+            // 261(u64 display name, u32) -> (): unnamed, one of the 26x setter
+            // family. The SDK's wrapper (sdk+0x5e4740) reads no reply data.
+            // OoT sends the default display and 0. Recorded with no further
+            // effect (provisional).
+            261 => {
+                expect(3)?;
+                let name = dword(arguments, 0);
+                if name != DEFAULT_DISPLAY_NAME {
+                    return Err(format!("command 261 for display {name:#x}"));
+                }
+                self.value_261 = Some(word(arguments, 2));
+                Ok(Vec::new())
+            }
             // 301(u64 display name, u64, u64) -> (): unnamed and absent from
             // Eden 1a6d7d4. The SDK's wrapper (sdk+0x5623dc) sends the
             // default display and 0x8000000000000000 for both values, reads
@@ -321,6 +336,22 @@ mod tests {
         assert!(state.handle(111, &args(&endpoint)).is_err());
         assert_eq!(state.secondary_endpoints, [(player1, player1, 9)]);
         assert_eq!(state.default_endpoint, None);
+    }
+
+    #[test]
+    fn command_261_records_a_value_for_the_default_display_only() {
+        let mut state = DisplaySessionState::default();
+        let [low, high] = name();
+        assert!(state.handle(261, &args(&[low, high])).is_err());
+        assert!(state.handle(261, &args(&[low + 1, high, 0])).is_err());
+        assert_eq!(state.value_261, None);
+        assert!(
+            state
+                .handle(261, &args(&[low, high, 3]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.value_261, Some(3));
     }
 
     #[test]

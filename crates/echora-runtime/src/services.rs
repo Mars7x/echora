@@ -4536,25 +4536,58 @@ impl Services {
             self.provisional_commands.insert("appletOE:display_session");
             return Ok(Outcome::success());
         }
+        // 32: u32 index 0 and a copy of command 31's event; moves another
+        // handle to that same event. Undocumented, inferred from the SDK
+        // wrapper (sdk+0x5e3af0) that replaces its stored handle with the
+        // reply's. Provisional.
+        if call.request.command_id == 32 {
+            call.shape_with_copies(4, false, false, 1)?;
+            if call.request.arguments != [0; 4] {
+                return Err(call.unsupported(SERVICE, "command 32 index is not 0"));
+            }
+            let copied = self
+                .readable_event_handles
+                .get(&call.request.copy_handles[0])
+                .copied();
+            let Some(id) = copied.filter(|id| Some(id.0) == state.event_31) else {
+                return Err(call.unsupported(
+                    SERVICE,
+                    "command 32 handle is not this session's command 31 event",
+                ));
+            };
+            let handle = self.next_available_handle()?;
+            call.reply(0, Some(handle), 0, &[])?;
+            self.readable_event_handles.insert(handle, id);
+            self.next_handle = handle + 1;
+            self.sessions.insert(call.handle, updated);
+            self.provisional_commands.insert("appletOE:display_session");
+            return Ok(Outcome::success());
+        }
         if call.request.pid.is_some()
             || !call.request.copy_handles.is_empty()
             || call.request.input_buffer.is_some()
             || !call.request.receive_buffers.is_empty()
             || !call.request.receive_list.is_empty()
         {
-            return Err(call.unsupported(SERVICE, "display session command carries buffers"));
+            return Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "display session command carries buffers ({})",
+                    call.request.describe()
+                ),
+            ));
         }
         // GetNotificationEvent (11) / ReleaseNotificationEvent (13): u32 index
         // 0 (Eden 1a6d7d4). 11 moves a readable event, created once per
         // session and signaled only while notification bits are pending.
-        // 31/32 are an undocumented pair of the same shape (the SDK stores
-        // 31's moved handle and closes it on failure); provisional.
-        if matches!(call.request.command_id, 11 | 13 | 31 | 32) {
+        // 31 is undocumented with 11's shape (the SDK stores its moved
+        // handle and closes it on failure); provisional.
+        if matches!(call.request.command_id, 11 | 13 | 31) {
             if call.request.arguments.len() != 4 || call.request.arguments != [0; 4] {
                 return Err(call.unsupported(SERVICE, "display event index is not 0"));
             }
             let notification = matches!(call.request.command_id, 11 | 13);
-            if matches!(call.request.command_id, 13 | 32) {
+            if call.request.command_id == 13 {
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands.insert("appletOE:display_session");
                 return Ok(Outcome::success());
