@@ -7,15 +7,19 @@
 //! so a control can be focused before it is drawn (the chosen item of a menu
 //! that is just opening) and focus can return to it later. Each frame the
 //! controls record where they were laid out, and a move picks among those.
+//!
+//! One focus ring serves every control, drawn above everything (menus
+//! included), and springs from the control focus left to the one it went to.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Div, Element, ElementId, FocusHandle, KeyDownEvent, Pixels, Stateful, Window,
-    actions, canvas,
+    actions, canvas, deferred,
 };
 
 use crate::ui;
@@ -73,11 +77,39 @@ pub enum Direction {
 #[derive(Clone, Default)]
 pub struct Stops(Rc<RefCell<Inner>>);
 
+/// A control drawn this frame.
+struct Stop {
+    bounds: Bounds<Pixels>,
+    /// Its corner radius in design pixels, which the ring follows.
+    corner: f32,
+    handle: FocusHandle,
+}
+
 #[derive(Default)]
 struct Inner {
     handles: HashMap<ElementId, FocusHandle>,
-    /// The controls drawn this frame, in paint order, with their bounds.
-    frame: Vec<(Bounds<Pixels>, FocusHandle)>,
+    /// The controls drawn this frame, in paint order.
+    frame: Vec<Stop>,
+    /// The focus ring, while one shows.
+    ring: Option<Glide>,
+}
+
+/// How long the ring takes to spring to a newly focused control.
+const GLIDE: Duration = Duration::from_millis(300);
+
+/// The focus ring springing from one shape to the control it now marks.
+struct Glide {
+    handle: FocusHandle,
+    from: ui::RingShape,
+    to: ui::RingShape,
+    start: Instant,
+}
+
+impl Glide {
+    fn at(&self, now: Instant) -> ui::RingShape {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / GLIDE.as_secs_f32();
+        self.from.lerp(&self.to, ui::spring(t))
+    }
 }
 
 impl Stops {
@@ -96,34 +128,80 @@ impl Stops {
             .clone()
     }
 
-    /// Makes `el` a stop, drawing `ring` while it has focus and `show_ring`
-    /// (the keyboard or a controller is in use). `el` must have an id.
-    pub fn add(
-        &self,
-        el: Stateful<Div>,
-        ring: ui::Ring,
-        show_ring: bool,
-        cx: &App,
-    ) -> Stateful<Div> {
+    /// Makes `el`, whose corners are rounded `corner` design pixels, a
+    /// stop. `el` must have an id.
+    pub fn add(&self, el: Stateful<Div>, corner: f32, cx: &App) -> Stateful<Div> {
         let id = Element::id(&el).expect("a focus stop needs an element id");
         let handle = self.handle(id, cx);
         let stops = self.clone();
-        let tracked = handle.clone();
-        el.track_focus(&tracked).child(
+        el.track_focus(&handle.clone()).child(
             canvas(
                 move |bounds, _, _| {
-                    stops.0.borrow_mut().frame.push((bounds, handle.clone()));
-                    handle
+                    stops.0.borrow_mut().frame.push(Stop {
+                        bounds,
+                        corner,
+                        handle: handle.clone(),
+                    })
                 },
-                move |bounds, handle, window, _| {
-                    if show_ring && handle.is_focused(window) {
-                        ui::paint_focus_ring(bounds, ring, window);
-                    }
-                },
+                |_, _, _, _| {},
             )
             .absolute()
             .inset_0(),
         )
+    }
+
+    /// The focus ring, above everything else on screen: around the focused
+    /// control while `show` (the keyboard or a controller is in use),
+    /// springing there from the last control it marked when `motion`
+    /// allows.
+    pub fn ring(&self, show: bool, motion: bool) -> impl IntoElement {
+        let stops = self.clone();
+        deferred(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| stops.paint_ring(show, motion, window),
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .with_priority(3)
+    }
+
+    fn paint_ring(&self, show: bool, motion: bool, window: &mut Window) {
+        let mut inner = self.0.borrow_mut();
+        let Inner { frame, ring, .. } = &mut *inner;
+        let focused = frame.iter().find(|stop| stop.handle.is_focused(window));
+        let (Some(stop), true) = (focused, show) else {
+            *ring = None;
+            return;
+        };
+        let target = ui::RingShape::around(stop.bounds, stop.corner, window);
+        let now = Instant::now();
+        match ring {
+            // The same control: follow it as it moves (a sheet springing in).
+            Some(glide) if glide.handle == stop.handle => glide.to = target,
+            Some(glide) if motion => {
+                *glide = Glide {
+                    handle: stop.handle.clone(),
+                    from: glide.at(now),
+                    to: target,
+                    start: now,
+                }
+            }
+            _ => {
+                *ring = Some(Glide {
+                    handle: stop.handle.clone(),
+                    from: target,
+                    to: target,
+                    start: now,
+                })
+            }
+        }
+        let glide = ring.as_ref().expect("the ring was just set");
+        glide.at(now).paint(window);
+        if now < glide.start + GLIDE {
+            window.request_animation_frame();
+        }
     }
 
     /// The control to focus when moving `direction` from `focused`: the
@@ -139,18 +217,21 @@ impl Stops {
             inner
                 .frame
                 .iter()
-                .find(|(_, handle)| handle == focused)
-                .map(|(bounds, _)| *bounds)
+                .find(|stop| stop.handle == *focused)
+                .map(|stop| stop.bounds)
         });
         let Some(from) = from else {
-            return inner.frame.first().map(|(_, handle)| handle.clone());
+            return inner.frame.first().map(|stop| stop.handle.clone());
         };
         let from = Rect::from(from);
         inner
             .frame
             .iter()
-            .filter_map(|(bounds, handle)| {
-                Some((from.distance(&Rect::from(*bounds), direction)?, handle))
+            .filter_map(|stop| {
+                Some((
+                    from.distance(&Rect::from(stop.bounds), direction)?,
+                    &stop.handle,
+                ))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, handle)| handle.clone())

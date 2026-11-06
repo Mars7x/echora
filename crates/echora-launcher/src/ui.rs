@@ -45,6 +45,8 @@ pub mod radius {
     pub const CARD: f32 = 10.0;
     pub const CONTROL: f32 = 8.0;
     pub const INNER: f32 = 6.0;
+    /// Fully round: pills and circles.
+    pub const FULL: f32 = f32::INFINITY;
 }
 
 /// The type scale, in pixels.
@@ -90,7 +92,7 @@ pub mod palette {
     pub const ACCENT_HOVER: u32 = 0xddddddff;
     pub const ACCENT_PRESSED: u32 = 0xc8c8c8ff;
     pub const ON_ACCENT: u32 = 0x101010ff;
-    pub const FOCUS: u32 = 0xf0f0f0a6;
+    pub const FOCUS: u32 = 0xf0f0f0d9;
     pub const SCRIM: u32 = 0x00000099;
     /// Pop-up menus, as the theme's popovers.
     pub const MENU: u32 = 0x191919ff;
@@ -107,47 +109,60 @@ pub fn color(hex: u32) -> Hsla {
     rgba(hex).into()
 }
 
-/// Where a control's focus ring goes, with the control's corner radius in
-/// design pixels ([`Ring::PILL`] for pills and circles).
+/// The focus ring: the same for every control, 2 px wide and 2 px clear
+/// of the control's edge, following its rounding. The gap keeps it apart
+/// from light and dark controls alike. Painted rather than a box shadow,
+/// which GPUI draws nothing for without blur.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Ring {
-    /// Around the control, clear of its edge: buttons and switches.
-    Around(f32),
-    /// Just inside the control's edge: rows of a list or sidebar, which sit
-    /// close together, as libadwaita draws them.
-    Within(f32),
+pub struct RingShape {
+    bounds: Bounds<Pixels>,
+    radius: Pixels,
 }
 
-impl Ring {
-    pub const PILL: f32 = f32::INFINITY;
-}
-
-/// Paints the focus ring of the focused control (laid out in `bounds`)
-/// during keyboard or controller navigation: 2 px wide and following the
-/// control's rounding, 2 px clear of it when drawn around it, so it shows on
-/// light and dark controls alike. Painted rather than a box shadow, which
-/// GPUI draws nothing for without blur.
-pub fn paint_focus_ring(bounds: Bounds<Pixels>, ring: Ring, window: &mut Window) {
+impl RingShape {
     const GAP: f32 = 2.0;
     const WIDTH: f32 = 2.0;
-    let scale = window.rem_size() / px(16.0);
-    let corner =
-        |radius: f32| (px(radius) * scale).min(bounds.size.height.min(bounds.size.width) / 2.0);
-    let (bounds, radius) = match ring {
-        Ring::Around(radius) => {
-            let outset = px(GAP + WIDTH);
-            (bounds.dilate(outset), corner(radius) + outset)
+
+    /// The ring around a control laid out in `bounds` with corners rounded
+    /// `corner` design pixels ([`radius::FULL`] for pills and circles).
+    pub fn around(bounds: Bounds<Pixels>, corner: f32, window: &Window) -> Self {
+        let scale = window.rem_size() / px(16.0);
+        let corner = (px(corner) * scale).min(bounds.size.height.min(bounds.size.width) / 2.0);
+        let outset = px(Self::GAP + Self::WIDTH);
+        Self {
+            bounds: bounds.dilate(outset),
+            radius: corner + outset,
         }
-        Ring::Within(radius) => (bounds, corner(radius)),
-    };
-    window.paint_quad(gpui::quad(
-        bounds,
-        radius,
-        gpui::transparent_black(),
-        px(WIDTH),
-        color(palette::FOCUS),
-        BorderStyle::Solid,
-    ));
+    }
+
+    /// The shape `t` of the way from `self` to `to` (beyond 1 overshoots).
+    pub fn lerp(&self, to: &Self, t: f32) -> Self {
+        let mix = |a: Pixels, b: Pixels| a + (b - a) * t;
+        Self {
+            bounds: Bounds {
+                origin: gpui::point(
+                    mix(self.bounds.origin.x, to.bounds.origin.x),
+                    mix(self.bounds.origin.y, to.bounds.origin.y),
+                ),
+                size: gpui::size(
+                    mix(self.bounds.size.width, to.bounds.size.width),
+                    mix(self.bounds.size.height, to.bounds.size.height),
+                ),
+            },
+            radius: mix(self.radius, to.radius),
+        }
+    }
+
+    pub fn paint(&self, window: &mut Window) {
+        window.paint_quad(gpui::quad(
+            self.bounds,
+            self.radius,
+            gpui::transparent_black(),
+            px(Self::WIDTH),
+            color(palette::FOCUS),
+            BorderStyle::Solid,
+        ));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
