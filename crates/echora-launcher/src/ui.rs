@@ -112,8 +112,10 @@ pub fn color(hex: u32) -> Hsla {
 }
 
 /// The focus ring: the same for every control, 2 px wide around its edge
-/// and following its rounding. Painted rather than a box shadow, which
-/// GPUI draws nothing for without blur.
+/// and following its rounding. It reaches 1 px over the edge too, since two
+/// smoothed edges meeting on the same pixels leave a faint dark seam.
+/// Painted rather than a box shadow, which GPUI draws nothing for without
+/// blur.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RingShape {
     bounds: Bounds<Pixels>,
@@ -123,6 +125,8 @@ pub struct RingShape {
 
 impl RingShape {
     const WIDTH: f32 = 2.0;
+    /// How far the ring reaches over the control's edge.
+    const OVERLAP: f32 = 1.0;
     /// How much larger the ring starts when it appears, as it springs in.
     const APPEAR_GROWTH: f32 = 6.0;
 
@@ -174,7 +178,7 @@ impl RingShape {
             self.bounds,
             self.radius,
             gpui::transparent_black(),
-            px(Self::WIDTH),
+            px(Self::WIDTH + Self::OVERLAP),
             color(palette::FOCUS).opacity(self.opacity),
             BorderStyle::Solid,
         ));
