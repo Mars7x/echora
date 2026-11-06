@@ -424,13 +424,15 @@ fn discover_game(
         }
         let ctors = process::init_array_targets(p);
         let exports = process::exported_function_targets(p);
+        let lazy = process::lazy_binding_targets(p);
         let relocs = process::relative_text_targets(p);
         let prologues = process::prologue_targets(p);
         println!(
-            "{:<8} seeds: {} constructors, {} exported functions, {} relocation targets, {} prologues",
+            "{:<8} seeds: {} constructors, {} exported functions, {} lazy-binding stubs, {} relocation targets, {} prologues",
             p.module.name,
             ctors.len(),
             exports.len(),
+            lazy.len(),
             relocs.len(),
             prologues.len()
         );
@@ -438,6 +440,8 @@ fn discover_game(
         // Exported functions are certain entry points, reached from other
         // modules by symbol rather than by relocation.
         roots.extend(exports);
+        // Unresolved imports jump through their GOT slot's lazy value.
+        roots.extend(lazy);
         deferred.extend(relocs);
         deferred.extend(prologues);
     }
