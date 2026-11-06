@@ -1,0 +1,23 @@
+[package]
+name = "echora-loader"
+description = "Bounded loader for Switch executable modules (NSO with LZ4 or ZBIC segments)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+lz4_flex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

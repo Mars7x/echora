@@ -1,8 +1,12 @@
 # Known limitations
 
-- No game code is loaded, translated or executed yet.
-- The NSO loader does not exist yet; `main` uses ZBIC segments that need a
-  new decoder (the only public implementation is GPLv2-only).
+- Game code is loaded and verified but not yet translated or executed.
+- MOD0 and dynamic-section metadata are not parsed yet.
+- NSO flag bit 6 (`0x40`) is set in `main` alongside the ZBIC bit; its meaning
+  is unknown. It is accepted only together with ZBIC, and segment hashes
+  confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
+  fit their size fields is rejected rather than decoded; this has not occurred
+  with the real modules.
 - Update RomFS is not overlaid on base RomFS. The checked OoT input is a
   standalone update whose RomFS is used whole; its completeness is not
   verified against a base.

@@ -46,6 +46,16 @@ enum Command {
         #[arg(long)]
         cache: Option<PathBuf>,
     },
+    /// Import the input, then load and verify every executable module.
+    Load {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Print the module report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
         input: PathBuf,
@@ -122,6 +132,49 @@ fn run(cli: Cli) -> Result<ExitCode> {
             tracing::info!(elapsed = ?start.elapsed(), "ExeFS ready");
             println!("exefs: {}", dir.display());
         }
+        Command::Load { input, cache, json } => {
+            let cache = match cache {
+                Some(c) => c,
+                None => host_paths::cache_dir()?,
+            };
+            let source = ContentSource::open(&input)?;
+            let inv = source.inventory()?;
+            let Some(pkg) = inv.program_package else {
+                bail!("the input contains no package with an ExeFS");
+            };
+            let dir = source.materialize_exefs(&inv, pkg, &cache)?;
+            let start = Instant::now();
+            let modules = echora_loader::load_exefs(&dir)?;
+            let elapsed = start.elapsed();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&modules)?);
+            } else {
+                for m in &modules {
+                    println!(
+                        "{:<8} build {} flags {:#04x} image {:#x} bss {:#x}",
+                        m.name,
+                        hex_prefix(&m.build_id),
+                        m.flags,
+                        m.image_size,
+                        m.bss_size
+                    );
+                    for (label, s) in ["text", "rodata", "data"].iter().zip(m.segments()) {
+                        println!(
+                            "  {label:<6} {:>10} bytes at {:#09x}  {:?}  sha256 {}",
+                            s.bytes.len(),
+                            s.memory_offset,
+                            s.compression,
+                            if s.hash_verified {
+                                "verified"
+                            } else {
+                                "not stored"
+                            }
+                        );
+                    }
+                }
+            }
+            tracing::info!(?elapsed, modules = modules.len(), "ExeFS loaded");
+        }
         Command::Extract {
             input,
             dest,
@@ -152,6 +205,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn hex_prefix(id: &[u8; 32]) -> String {
+    id[..20].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn print_inventory(inv: &ContentInventory) {

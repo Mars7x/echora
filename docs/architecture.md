@@ -10,12 +10,12 @@ crates selected per host.
 |---|---|---|---|
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
+| `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget. ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. | Implemented, verified on the real modules. MOD0/dynamic metadata not yet ported. |
 | `echora-resolution` | core | Resolution planning: guest logical size, guest view, internal scene size, presentation rectangle, output size; target/viewport mapping; change impact. | Implemented, tested. Not yet used by a renderer. |
 | `echora-config` | core | Versioned TOML settings, validation, migration, requested vs effective settings, apply classes for live changes. | Implemented, tested. Not yet used by a runtime or launcher. |
-| `echora` | front end | Command-line tool; owns host paths (cache location). | `inspect`, `verify`, `import`, `extract`. |
+| `echora` | front end | Command-line tool; owns host paths (cache location). | `inspect`, `verify`, `import`, `load`, `extract`. |
 
-Planned crates, in roadmap order: `echora-loader` (NSO segments including
-ZBIC, MOD0, relocation metadata), `echora-lift` (AArch64 decoding, discovery,
+Planned crates, in roadmap order: `echora-lift` (AArch64 decoding, discovery,
 IR, code generation), `echora-guest` (guest CPU state, memory, SIMD/FP
 semantics shared with generated code), `echora-runtime` (scheduler, SVCs,
 IPC, services), `echora-gpu` (portable graphics translation) with

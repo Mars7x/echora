@@ -257,8 +257,8 @@ impl ContentSource {
                 .find(|n| n.unknown_flags != 0)
             {
                 notes.push(format!(
-                    "ExeFS contains NSO flags {:#x} beyond the classic compression/hash bits; \
-                     newer SDK segment encodings (ZBIC) must be supported by the loader",
+                    "ExeFS contains NSO flags {:#x} beyond the classic compression/hash bits \
+                     (0x80 marks ZBIC-compressed segments)",
                     nso.unknown_flags
                 ));
             }

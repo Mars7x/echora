@@ -4,6 +4,7 @@ members = [
     "crates/echora",
     "crates/echora-config",
     "crates/echora-content",
+    "crates/echora-loader",
     "crates/echora-nup",
     "crates/echora-resolution",
 ]
@@ -20,12 +21,14 @@ publish = false
 [workspace.dependencies]
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
+echora-loader = { path = "crates/echora-loader" }
 echora-nup = { path = "crates/echora-nup" }
 echora-resolution = { path = "crates/echora-resolution" }
 
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
+lz4_flex = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -35,7 +35,7 @@ NUP reference tool (`a55uka/nup` `d40d9cf`).
 | [seedds/nxnative](https://github.com/seedds/nxnative) | MIT | NSO rewriter, Horizon HLE host, NVN→Metal, AV1 backend; PRs #599 (clock_gettime ifunc), #1283 (socket event counters). | Reference for SDK 22 behavior and the Metal backend. |
 | [LNPANDY/NX2Apple](https://github.com/LNPANDY/NX2Apple) | MIT | Packaging front end for nxnative-style builds. | Not needed now. |
 | [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine), [zortos293/Lichii](https://github.com/zortos293/Lichii) | GPL-3.0 | Switch 2 emulators; OoT issues Lichii #87, #112, Eglantine #567 cover WaitForAddress type 3, mesh/task pipelines, Ampere shader forms (`TLD4.SCR`). | License-compatible; consult for shader and SVC semantics when reached. |
-| [kinnay/zbic](https://github.com/kinnay/zbic) | GPLv2-only | ZBIC compression (zstd variant introduced with Switch firmware 22.0.0), bundling Atmosphère's zstd sources. | GPLv2-only cannot be combined with GPL-3.0-or-later code. Echora needs its own decoder, validated against the real `main` segments. |
+| [kinnay/zbic](https://github.com/kinnay/zbic) `11b08f2` | GPLv2-only | ZBIC compression (zstd variant introduced with Switch firmware 22.0.0), bundling Atmosphère's zstd sources. | Used only to learn the format; no code taken. Echora's decoder is an independent transcoder (see below). |
 | zeldaret/oot, Shipwright, Zelda64Recomp | various | N64 decompilation and ports. | Gameplay knowledge only; no code or execution design transfers. |
 
 ## OoT requirements reported by other projects
@@ -54,6 +54,31 @@ confirmed against Echora's own runs rather than assumed:
 - SVC 0x34/0x35 WaitForAddress/SignalToAddress arbitration type 3 (64-bit).
 - NVN2 mesh/task pipelines (`DrawMeshTasksIndirect` in the opening), AV1 and
   NDVE movie decoding, resolution-dependent `TLD4.SCR` gathers.
+
+## ZBIC format
+
+Studied from `kinnay/zbic` (`src/zstd.c`, the code under
+`ZSTD_ZBIC_SUPPORT`). ZBIC differs from Zstandard in two places only:
+
+- The frame magic is `ZBIC` (`0x4349425A`).
+- FSE table descriptions (Huffman weight tables and the literal-length,
+  offset and match-length tables) use binary interpolative coding. Byte 0
+  holds the description length minus one (low 7 bits) and a
+  low-probability flag (bit 7). The remaining bytes, read from the end
+  toward the start into a state kept at 40 bits or more, encode mixed-radix
+  digits: max symbol minus one (radix 52), table log minus 5 (radix 8), the
+  final cumulative value, then one digit per step of an interpolative walk
+  over cumulative counts. The walk order is a right-first preorder traversal
+  of [0, 256] plus a terminal step; Echora generates it instead of storing
+  the reference's table.
+
+Echora decodes each description, re-encodes it in standard form, adjusts the
+enclosing Huffman header, literals size and block size, and decompresses the
+result with libzstd. With standard coding on both sides the same transcoder
+reproduces libzstd's own frames byte for byte. On the checked input all three
+`main` segments match their header SHA-256 values.
+
+`main` has NSO flags `0xff`: bits 0-5 as usual, bit 7 ZBIC, bit 6 unknown.
 
 ## Licensing decision
 

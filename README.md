@@ -28,9 +28,14 @@ display version 1.1.1):
   separate (arbitrary sizes, non-integer ratios, ultrawide), and a versioned
   settings model with requested-versus-effective resolution and live-change
   classes. Neither is connected to a renderer yet.
+- **Executable loading works.** `echora load` decompresses all four modules
+  (`rtld`, `main`, `subsdk0`, `sdk`; `main` alone is 81 MB of text, rodata and
+  data)
+  and every segment matches the SHA-256 stored in its NSO header. `main` uses
+  ZBIC, a Zstandard variant from Switch firmware 22, which Echora decodes by
+  transcoding to standard Zstandard. Loading takes about 0.2 s.
 - **No game code runs yet.** The recompiler and runtime are next; see the
-  [roadmap](docs/roadmap.md). The first loader blocker is known: the game's
-  `main` module uses ZBIC-compressed segments (NSO flags `0xff`).
+  [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
   x86-64, Windows x86-64 and macOS ARM64. Nothing beyond content tooling runs
   on any platform.
@@ -43,6 +48,8 @@ display version 1.1.1):
    checks. `echora-content` turns a NUP or an extracted `exefs/`+`romfs/`
    dump into one inventory (packages, versions, build IDs, module hashes) and
    materializes the program's ExeFS in a cache keyed by its content.
+   `echora-loader` decompresses NSO modules (LZ4 or ZBIC) and verifies each
+   segment hash.
 2. **Translation** (planned). Executable modules are decoded and translated
    ahead of time into native code through an architecture-neutral
    representation, following the approach proven in
@@ -74,6 +81,7 @@ The current commands work on your NUP file or extracted dump directory:
 echora inspect game.nup          # packages, versions, build ID, module hashes
 echora verify game.nup           # decode and hash-check every file
 echora import game.nup           # validate and cache the program's ExeFS
+echora load game.nup             # decompress and verify every module
 echora extract game.nup out --subtree romfs
 ```
 

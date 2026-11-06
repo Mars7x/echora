@@ -16,6 +16,7 @@ these separately; preserve their notices when redistributing builds.
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 |
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
+| `lz4_flex` | 0.11.6 | MIT |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 |
 | `sha2` | 0.10.9 | MIT OR Apache-2.0 |
@@ -32,6 +33,10 @@ these separately; preserve their notices when redistributing builds.
   independent Rust implementation of that specification.
 - [pokopia-recomp](https://github.com/Mars7x/pokopia-recomp) (GPL-3.0-or-later),
   the design basis for Echora's recompiler and runtime.
+  `crates/echora-loader/src/nso.rs` is adapted from its `src/loader/nso.rs`.
+- [kinnay/zbic](https://github.com/kinnay/zbic) (GPLv2) was studied to learn
+  the ZBIC format; Echora's decoder contains no code from it.
+- Zstandard format: RFC 8878.
 - Switchbrew, libnx and Atmosphère documentation for executable formats.
 - Projects consulted for game-specific behavior are listed in
   [docs/research.md](docs/research.md).
