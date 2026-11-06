@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use crate::pad::{PRESS, Pad, button, directions, stick};
 #[cfg(test)]
 use crate::pad::STICK_MAX;
+use crate::pad::{PRESS, Pad, button, directions, stick};
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;

@@ -108,7 +108,17 @@ impl Backend {
             return Err("ECHORA_GPU needs the shader recompiler (ECHORA_SHADER_LIB)".into());
         }
         let gpu = echora_gpu::vulkan::Gpu::new()?;
-        let renderer = Renderer::new(gpu)?;
+        let mut renderer = Renderer::new(gpu)?;
+        if echora_gpu::renderer::Scale::env_override().is_none()
+            && let Some((numerator, denominator)) = crate::settings::render_scale()
+        {
+            match echora_gpu::renderer::Scale::new(numerator, denominator) {
+                Some(scale) => renderer.set_resolution_scale(scale),
+                None => eprintln!(
+                    "settings: render scale {numerator}/{denominator} is outside 1/2..4; using 1"
+                ),
+            }
+        }
         Ok(Some(Self {
             max_extent: renderer.max_image_extent(),
             renderer,

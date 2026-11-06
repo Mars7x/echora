@@ -323,6 +323,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .arg(budget.to_string())
                 .arg(&report)
                 .env("ECHORA_ROMFS", romfs_path)
+                .env("ECHORA_SETTINGS", host_paths::settings_file()?)
                 .status()
                 .with_context(|| format!("start {}", runner.display()))?;
             if !status.success() {

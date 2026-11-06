@@ -48,6 +48,11 @@ only changed regions, but any change to `echora-guest` recompiles them all.
 Keep the cache on disk: on systems where `/tmp` is a RAM-backed tmpfs, do
 not point `ECHORA_CACHE_DIR` there.
 
+Settings are read from `~/.config/echora/settings.toml` (the platform's
+configuration directory; `ECHORA_SETTINGS` overrides the path). The runtime
+applies the window size and mode, internal resolution, volume and
+vibration so far.
+
 `run` stops at the first operation that is not implemented and writes a
 JSON report (`run-<time>.json`) next to the translation. Useful switches:
 `ECHORA_WORKERS` (host threads for guest threads), `ECHORA_SCHEDULER_SLICE`,
