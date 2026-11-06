@@ -453,15 +453,15 @@ fn discover_game(
     deferred.sort_unstable();
     deferred.dedup();
 
+    // Hooked exports (the NVN bootstrap) run as host code, which only
+    // happens where no translated block exists; exported-function roots
+    // would otherwise translate them.
+    let host_entries = echora_runtime::bootstrap::hooked_export_addresses(&placed)?
+        .into_iter()
+        .collect();
     let start = Instant::now();
-    let translation = discover_with_tables(
-        &regions,
-        &rodata,
-        &roots,
-        &deferred,
-        &Default::default(),
-        limit,
-    )?;
+    let translation =
+        discover_with_tables(&regions, &rodata, &roots, &deferred, &host_entries, limit)?;
     Ok(Discovered {
         cache,
         exefs_key,

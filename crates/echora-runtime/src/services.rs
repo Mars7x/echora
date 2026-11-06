@@ -1668,6 +1668,14 @@ impl Services {
             .ok_or_else(|| invalid("readable-event alias has no backing event"))
     }
 
+    /// The readable-event kind behind a handle, for diagnostics.
+    pub(crate) fn readable_event_kind(&self, handle: u32) -> Option<String> {
+        let id = self.readable_event_handles.get(&handle)?;
+        self.readable_events
+            .get(id)
+            .map(|event| format!("{:?}", event.kind))
+    }
+
     pub(crate) fn thread_id(&self, handle: u32) -> Option<u64> {
         self.thread_handles.get(&handle).copied()
     }
@@ -5921,7 +5929,8 @@ impl Services {
             // NormalUnmapGpuMemory4K ([20.0.0+] 213). Layout from the SDK
             // (sdk+0x469558): u32 address space, u64 GPU address, u64 last
             // GPU address, u8 sync flag, u32 event ID the SDK then waits on.
-            // Returns a u64 (answered 0). Removes the mappings inside the
+            // Returns the u64 byte count unmapped (sdk+0x4696d8 subtracts it
+            // from the space's mapped total). Removes the mappings inside the
             // range and signals the event. Provisional.
             213 => {
                 let arguments = &call.request.arguments;
@@ -5941,17 +5950,21 @@ impl Services {
                         format!("unmap {address:#x}..={last:#x} in space {space} is not modeled"),
                     ));
                 }
-                let inside: Vec<u64> = self
+                let inside: Vec<(u64, u64)> = self
                     .gpu_mappings
                     .range(address..=last)
                     .filter(|&(_, &(other, other_last, ..))| other == space && other_last <= last)
-                    .map(|(&start, _)| start)
+                    .map(|(&start, &(_, other_last, ..))| (start, other_last))
                     .collect();
+                // The reply is the byte count unmapped; the SDK subtracts it
+                // from the address space's mapped total, which must reach
+                // zero before DestroyGpuAddressSpace.
+                let unmapped: u64 = inside.iter().map(|&(start, end)| end - start + 1).sum();
                 let Some(&event) = self.gpu_events.get(&event_index) else {
                     return Err(call.unsupported(SERVICE, "unmap completion event was not created"));
                 };
-                call.reply(0, None, 0, &0u64.to_le_bytes())?;
-                for start in inside {
+                call.reply(0, None, 0, &unmapped.to_le_bytes())?;
+                for (start, _) in inside {
                     self.gpu_mappings.remove(&start);
                 }
                 if let Some(event) = self.readable_events.get_mut(&event) {
