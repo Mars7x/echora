@@ -1,0 +1,12 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -2086,7 +2086,7 @@
+                  (u64{insn.Bits(74, 2)} << 47) | (u64{insn.Bits(71, 1)} << 49));
+             break;
+         }
+-        case 0x20b: case 0x80b: case 0xa0b: // FSETP
++        case 0x20b: case 0x80b: case 0xa0b: case 0xc0b: // FSETP (0xc0b: uniform second source; Pokopia)
+         case 0x20c: case 0x80c: case 0xa0c: case 0xc0c: { // ISETP
+             const bool floating = (opcode & 0x1ff) == 0xb;
+             if (!floating && insn.Bits(72, 1)) return fail(index, "native extended integer comparison");

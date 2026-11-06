@@ -15,12 +15,13 @@ crates selected per host.
 | `echora-lift` | core | AArch64 decoding (scalar and SIMD/FP), code discovery from entries, prologues, relocation targets and jump tables, basic blocks, and Rust emission. Generated code depends only on `echora-guest` and exposes `dispatch(&mut Core)`. | Ported from Pokopia; 53 tests. |
 | `echora-aot-tests` | test | Synthetic AArch64 programs lifted by `build.rs` and run natively on a minimal host loop (integer, flags, calls, PAuth hints, budgets, window dispatch, missing blocks, CAS/LDADD/exclusives, acquire/release). | Execution tests (Linux, Windows and macOS). |
 | `echora-runtime` | core (+ host stand-ins) | Process bootstrap (module mapping, stack, TLS, entry registers, NPDM capabilities including the private kernel resource pool), scheduler and threads, synchronization, kernel SVCs, IPC framing and the system services, file systems and RomFS images, HID shared memory. NVN keeps only its entry-point table; window, input and audio are stand-ins with no host device. | Ported from Pokopia; tests on Linux, Windows and macOS. Boots the real game's process; not yet run. |
+| `echora-gpu` | host backend | Vulkan device, renderer, draws, compute, presentation, and shader translation through the PokeDinner recompiler (C ABI shim built by `build.rs` when `ECHORA_SHADER_SRC` is set). | Ported from Pokopia; 9 tests. Not yet connected to the runtime's NVN layer. |
 | `echora-resolution` | core | Resolution planning: guest logical size, guest view, internal scene size, presentation rectangle, output size; target/viewport mapping; change impact. | Implemented, tested. Not yet used by a renderer. |
 | `echora-config` | core | Versioned TOML settings, validation, migration, requested vs effective settings, apply classes for live changes. | Implemented, tested. Not yet used by a runtime or launcher. |
 | `echora` | front end | Command-line tool; owns host paths (cache location). | `inspect`, `verify`, `import`, `load`, `analyze`, `lift`, `extract`. |
 
-Planned crates, in roadmap order: `echora-gpu` (portable graphics translation) with
-`echora-gpu-vulkan`, and host crates for windowing, input and audio. The
+Planned crates, in roadmap order: the NVN layer in the runtime on top of
+`echora-gpu`, and host crates for windowing, input and audio. The
 GTK4/libadwaita launcher will be a separate binary crate that depends on
 `echora-config` only, never the reverse.
 
