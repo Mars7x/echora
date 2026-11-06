@@ -68,7 +68,7 @@ including its network-interaction clause.
   runtime, threads, synchronization, IPC, services, logging, file system,
   RomFS, HID, display, content, HLE, audio, bootstrap, NVN, SASS, format
   and window modules; `crates/echora-gpu` from its `crates/gpu` and
-  `native/shader`; and the
+  `native/shader`; `crates/echora-input` from its `crates/input`; and the
   synthetic programs and
   atomics assertions in `crates/echora-aot-tests` from its
   `tests/aot_execution.rs`.

@@ -586,6 +586,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "echora-input"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "echora-lift"
 version = "0.1.0"
 dependencies = [
@@ -631,6 +638,7 @@ dependencies = [
  "astc-decode",
  "echora-gpu",
  "echora-guest",
+ "echora-input",
  "echora-loader",
  "echora-nup",
  "getrandom 0.4.3",

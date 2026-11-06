@@ -7,6 +7,7 @@ members = [
     "crates/echora-content",
     "crates/echora-gpu",
     "crates/echora-guest",
+    "crates/echora-input",
     "crates/echora-lift",
     "crates/echora-loader",
     "crates/echora-nup",
@@ -28,6 +29,7 @@ echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
 echora-gpu = { path = "crates/echora-gpu" }
 echora-guest = { path = "crates/echora-guest" }
+echora-input = { path = "crates/echora-input" }
 echora-lift = { path = "crates/echora-lift" }
 echora-loader = { path = "crates/echora-loader" }
 echora-nup = { path = "crates/echora-nup" }
