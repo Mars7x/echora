@@ -1,6 +1,6 @@
-//! The launcher window: the game's art fills the window and a single dock at
-//! the bottom holds what the player needs, with settings and about in sheets
-//! above it. Everything visual comes from the design system in [`crate::ui`].
+//! The launcher window: the game's title large in the bottom left with Play,
+//! Settings and About under it, and settings and about in sheets above.
+//! Everything visual comes from the design system in [`crate::ui`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
@@ -13,9 +13,9 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
     CursorStyle, Decorations, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
     ImageFormat, KeyBinding, MouseButton, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
-    RenderImage, ResizeEdge, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowOptions, actions, canvas, div, ease_out_quint, img,
-    point, prelude::*, px, size,
+    ResizeEdge, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, actions, canvas, div, ease_out_quint, img, point, prelude::*,
+    px, size,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
@@ -88,13 +88,6 @@ struct Game {
     icon: Option<Arc<Image>>,
 }
 
-/// The backdrop cropped to the window's shape, so it can be drawn at exactly
-/// the window's size and its corners rounded with the window's.
-struct Backdrop {
-    crop: (u32, u32, u32, u32),
-    image: Arc<RenderImage>,
-}
-
 struct Launcher {
     focus: FocusHandle,
     /// Play is the default button: it holds focus, so Enter or Space starts
@@ -115,9 +108,6 @@ struct Launcher {
     corner: Pixels,
     /// A title bar press that turns into a window move once the mouse drags.
     moving: bool,
-    /// The frosted backdrop, decoded once (BGRA, as GPUI uploads it).
-    art: Option<image::RgbaImage>,
-    backdrop: Option<Backdrop>,
     /// The resize edge under the pointer, if any.
     resize_edge: Option<ResizeEdge>,
     /// The remembered game is still being read.
@@ -169,7 +159,7 @@ pub fn run() -> ExitCode {
                 window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             };
-            let font: SharedString = ".SystemUIFont".into();
+            let font = ui::load_font(cx);
             let opened = cx.open_window(options, |window, cx| {
                 cx.new(|cx| {
                     let launcher = Launcher::new(buttons, motion, font, window, cx);
@@ -263,8 +253,6 @@ impl Launcher {
             buttons,
             corner: px(0.0),
             moving: false,
-            art: decode_art(BACKDROP),
-            backdrop: None,
             resize_edge: None,
             loading: false,
             settings_tab: SettingsTab::Game,
@@ -274,7 +262,7 @@ impl Launcher {
             installing: None,
         };
         // Read the remembered game off the UI thread so the window opens at
-        // once; the backdrop shows while the dock waits for it.
+        // once; the title fills in when the game has been read.
         if let Some(last) = last_game() {
             launcher.loading = true;
             let task = cx
@@ -528,17 +516,20 @@ fn read_game(path: &Path) -> Result<Game, String> {
     })
 }
 
-/// The launcher backdrop: a heavily blurred frame from the game's
-/// `Dm_Title_0045` title video (see NOTICE.md).
-const BACKDROP: &[u8] = include_bytes!("../assets/backdrop.jpg");
-
-/// Decodes an image into the BGRA layout GPUI uploads.
-fn decode_art(bytes: &[u8]) -> Option<image::RgbaImage> {
-    let mut art = image::load_from_memory(bytes).ok()?.into_rgba8();
-    for pixel in art.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
+/// Splits a title into its series and the game's own name, for titles such
+/// as "The Legend of Zelda Ocarina of Time" or "Series: Name".
+fn split_title(title: &str) -> (Option<SharedString>, SharedString) {
+    const SERIES: &str = "The Legend of Zelda";
+    if let Some(rest) = title.strip_prefix(SERIES) {
+        let rest = rest.trim_start_matches([':', ' ']);
+        if !rest.is_empty() {
+            return (Some(SERIES.into()), rest.to_owned().into());
+        }
     }
-    Some(art)
+    match title.split_once(": ") {
+        Some((series, name)) => (Some(series.to_owned().into()), name.to_owned().into()),
+        None => (None, title.to_owned().into()),
+    }
 }
 
 fn last_game_file() -> Option<PathBuf> {
@@ -628,65 +619,12 @@ impl Launcher {
         .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
     }
 
-    fn render_art(&mut self, window: &mut Window) -> AnyElement {
-        let shown = self.game.is_some() || self.loading;
-        let Some(art) = self.art.as_ref().filter(|_| shown) else {
-            return div()
-                .size_full()
-                .rounded(self.corner)
-                .bg(color(palette::BACKDROP))
-                .into_any_element();
-        };
-        // Fill the window's shape: trim the sides of the wide art when the
-        // window is narrower, or its bottom when the window is wider.
-        let inset = window.client_inset().unwrap_or(px(0.0)) * 2.0;
-        let viewport = window.viewport_size();
-        let aspect =
-            f32::from(viewport.width - inset) / f32::from(viewport.height - inset).max(1.0);
-        let (width, height) = art.dimensions();
-        let crop = if aspect >= width as f32 / height as f32 {
-            (
-                0,
-                0,
-                width,
-                ((width as f32 / aspect) as u32).clamp(1, height),
-            )
-        } else {
-            let crop_width = ((height as f32 * aspect) as u32).clamp(1, width);
-            ((width - crop_width) / 2, 0, crop_width, height)
-        };
-        if self
-            .backdrop
-            .as_ref()
-            .is_none_or(|backdrop| backdrop.crop != crop)
-        {
-            let (x, y, w, h) = crop;
-            let pixels = image::imageops::crop_imm(art, x, y, w, h).to_image();
-            let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));
-            if let Some(old) = self.backdrop.replace(Backdrop { crop, image }) {
-                let _ = window.drop_image(old.image);
-            }
-        }
-        let Some(backdrop) = &self.backdrop else {
-            return div().into_any_element();
-        };
+    /// The window's plain background, rounded with the window.
+    fn render_background(&self) -> impl IntoElement {
         div()
             .size_full()
-            .relative()
-            .child(
-                img(backdrop.image.clone())
-                    .size_full()
-                    .rounded(self.corner)
-                    .object_fit(ObjectFit::Fill),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(self.corner)
-                    .bg(color(palette::ART_SHADE)),
-            )
-            .into_any_element()
+            .rounded(self.corner)
+            .bg(color(palette::BACKDROP))
     }
 
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -775,51 +713,10 @@ impl Launcher {
             .child(div().pt(px(space::L)).child(choose))
     }
 
-    fn render_dock(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Settings and About; the whole bottom bar on the empty screen, and
+    /// beside Play on the game screen.
+    fn secondary_actions(&self, cx: &mut Context<Self>) -> [gpui::Stateful<gpui::Div>; 2] {
         let active = self.sheet.is_none();
-        let dock = div()
-            .flex()
-            .items_center()
-            .gap(px(space::S))
-            .p(px(space::S))
-            .rounded(px(radius::DOCK))
-            .border_1()
-            .border_color(color(palette::BORDER))
-            .bg(color(palette::MATERIAL));
-        if let Some((title, progress)) = &self.installing {
-            let fraction = progress.fraction().clamp(0.0, 1.0);
-            return dock
-                .px(px(space::L))
-                .py(px(space::M + 2.0))
-                .child(
-                    div()
-                        .w(px(360.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(space::S + 2.0))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap(px(space::M))
-                                .child(
-                                    div()
-                                        .text_size(px(text::BODY))
-                                        .text_color(color(palette::LABEL))
-                                        .truncate()
-                                        .child(format!("Installing {title}")),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(text::CALLOUT))
-                                        .text_color(color(palette::SECONDARY_LABEL))
-                                        .child(format!("{}%", (fraction * 100.0) as u32)),
-                                ),
-                        )
-                        .child(ui::progress(fraction)),
-                )
-                .into_any_element();
-        }
         let settings = ui::focusable(
             ui::button("settings", "Settings", Kind::Secondary, Size::Large),
             active,
@@ -837,63 +734,94 @@ impl Launcher {
             this.sheet = Some(Sheet::About);
             cx.notify();
         }));
-        let Some(game) = &self.game else {
-            return dock.child(settings).child(about).into_any_element();
+        [settings, about]
+    }
+
+    /// The empty screen's bar: Settings and About.
+    fn render_dock(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(space::S))
+            .p(px(space::S))
+            .rounded(px(radius::DOCK))
+            .border_1()
+            .border_color(color(palette::BORDER))
+            .bg(color(palette::MATERIAL))
+            .children(self.secondary_actions(cx))
+            .into_any_element()
+    }
+
+    /// The game screen: the title large in the bottom left, with Play,
+    /// Settings and About under it (or the install's progress).
+    fn render_hero(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, detail) = match (&self.installing, &self.game) {
+            (Some((title, progress)), _) => (
+                title.clone(),
+                format!(
+                    "Installing, {}%",
+                    (progress.fraction().clamp(0.0, 1.0) * 100.0) as u32
+                ),
+            ),
+            (None, Some(game)) => (game.title.clone(), game.version.to_string()),
+            (None, None) => return div().into_any_element(),
         };
-        let thumbnail = match &game.icon {
-            Some(icon) => img(icon.clone())
-                .flex_none()
-                .size(px(40.0))
-                .rounded(px(radius::CONTROL))
-                .object_fit(ObjectFit::Cover)
-                .into_any_element(),
-            None => div()
-                .flex_none()
-                .size(px(40.0))
-                .rounded(px(radius::CONTROL))
-                .bg(color(palette::FILL))
-                .into_any_element(),
-        };
-        let play = ui::focusable(
-            ui::button(
-                "play",
-                if self.running { "Running" } else { "Play" },
-                Kind::Primary,
-                Size::Large,
+        let (series, name) = split_title(&title);
+        let actions = if let Some((_, progress)) = &self.installing {
+            div()
+                .w(px(320.0))
+                .child(ui::progress(progress.fraction()))
+                .into_any_element()
+        } else {
+            let active = self.sheet.is_none();
+            let play = ui::focusable(
+                ui::button(
+                    "play",
+                    if self.running { "Running" } else { "Play" },
+                    Kind::Primary,
+                    Size::Large,
+                )
+                .px(px(36.0)),
+                active,
+                self.keyboard,
             )
-            .px(px(28.0)),
-            active,
-            self.keyboard,
-        )
-        .when(active, |el| el.track_focus(&self.play_focus))
-        .when(self.running, |el| el.opacity(0.6).cursor_default())
-        .on_click(cx.listener(|this, _, window, cx| this.play(&Play, window, cx)));
-        dock.child(thumbnail)
+            .when(active, |el| el.track_focus(&self.play_focus))
+            .when(self.running, |el| el.opacity(0.6).cursor_default())
+            .on_click(cx.listener(|this, _, window, cx| this.play(&Play, window, cx)));
+            div()
+                .flex()
+                .gap(px(space::S))
+                .child(play)
+                .children(self.secondary_actions(cx))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .when_some(series, |el, series| {
+                el.child(
+                    div()
+                        .text_size(px(text::HEADLINE))
+                        .text_color(color(palette::SECONDARY_LABEL))
+                        .child(series),
+                )
+            })
             .child(
                 div()
-                    .pl(px(space::XS))
-                    .pr(px(space::L))
-                    .max_w(px(320.0))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(text::HEADLINE))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(color(palette::LABEL))
-                            .truncate()
-                            .child(game.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(text::CALLOUT))
-                            .text_color(color(palette::SECONDARY_LABEL))
-                            .child(game.version.clone()),
-                    ),
+                    .text_size(px(text::HERO))
+                    .line_height(gpui::relative(1.1))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color(palette::LABEL))
+                    .child(name),
             )
-            .child(play)
-            .child(settings)
-            .child(about)
+            .child(
+                div()
+                    .pt(px(space::XS + 2.0))
+                    .text_size(px(text::CALLOUT))
+                    .text_color(color(palette::SECONDARY_LABEL))
+                    .child(detail),
+            )
+            .child(div().pt(px(space::XL)).child(actions))
             .into_any_element()
     }
 
@@ -1449,44 +1377,92 @@ impl Launcher {
             .overflow_hidden()
             .font_family(self.font.clone())
             .text_size(px(text::BODY))
-            // No background of its own: the art layer paints the whole window,
-            // and a second layer under its rounded corners would show at the
-            // antialiased edge.
-            .child(self.render_art(window))
+            .child(self.render_background())
             .when(welcome, |el| el.child(self.render_welcome(cx)))
             .child(self.render_title_bar(window, cx))
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom(px(space::XL))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(space::M))
-                    .when_some(self.notice.clone(), |el, notice| {
-                        el.child(ui::appear(
-                            ui::toast(notice.clone()),
-                            ElementId::Name(format!("toast-{}", self.notice_generation).into()),
-                            space::S,
-                            self.motion,
-                        ))
-                    })
-                    .when(!self.loading, |el| {
-                        el.child(ui::appear(
-                            div().child(self.render_dock(cx)),
-                            "dock-in",
-                            space::L,
-                            self.motion,
-                        ))
-                    }),
-            )
+            .map(|el| {
+                let toast = self.notice.clone().map(|notice| {
+                    ui::appear(
+                        ui::toast(notice),
+                        ElementId::Name(format!("toast-{}", self.notice_generation).into()),
+                        space::S,
+                        self.motion,
+                    )
+                });
+                if self.loading {
+                    return el;
+                }
+                if self.game.is_some() || self.installing.is_some() {
+                    // The title hero sits in the bottom left; messages
+                    // appear above it.
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(px(space::XL + space::L))
+                            .right(px(space::XL + space::L))
+                            .bottom(px(space::XL + space::L))
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(px(space::L))
+                            .children(toast)
+                            .child(ui::appear(
+                                div().child(self.render_hero(cx)),
+                                "hero-in",
+                                space::L,
+                                self.motion,
+                            )),
+                    )
+                } else {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom(px(space::XL))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(space::M))
+                            .children(toast)
+                            .child(ui::appear(
+                                div().child(self.render_dock(cx)),
+                                "dock-in",
+                                space::L,
+                                self.motion,
+                            )),
+                    )
+                }
+            })
             .when_some(self.sheet, |el, sheet| {
                 el.child(match sheet {
                     Sheet::Settings => self.render_settings(window, cx),
                     Sheet::About => self.render_about(window, cx),
                 })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_title;
+
+    #[test]
+    fn splits_series_from_the_title() {
+        let (series, name) = split_title("The Legend of Zelda Ocarina of Time");
+        assert_eq!(
+            series.map(|s| s.to_string()).as_deref(),
+            Some("The Legend of Zelda")
+        );
+        assert_eq!(name.to_string(), "Ocarina of Time");
+        let (series, name) = split_title("The Legend of Zelda: Ocarina of Time");
+        assert_eq!(
+            series.map(|s| s.to_string()).as_deref(),
+            Some("The Legend of Zelda")
+        );
+        assert_eq!(name.to_string(), "Ocarina of Time");
+        let (series, name) = split_title("Some Game");
+        assert_eq!(series, None);
+        assert_eq!(name.to_string(), "Some Game");
     }
 }

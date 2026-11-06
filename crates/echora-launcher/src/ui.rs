@@ -4,8 +4,9 @@
 //!
 //! - A 4 px spacing grid; nested corner radii shrink by the padding between
 //!   them (window 12, sheet 14, card 10, control 8, inner 6).
-//! - One type scale in the platform's UI font, and sentence case for every
-//!   label.
+//! - One type scale (44/26/15/14/13/12) in Inter, bundled so every
+//!   platform shows the same type with real weights; sentence case for
+//!   every label.
 //! - Semantic dark colours (label, secondary label, separator, fills) with
 //!   text contrast of at least 4.5:1, and white as the single accent.
 //! - Controls at least 32 px tall (40 px in the dock), each with hover,
@@ -44,6 +45,7 @@ pub mod radius {
 
 /// The type scale, in pixels.
 pub mod text {
+    pub const HERO: f32 = 44.0;
     pub const LARGE_TITLE: f32 = 26.0;
     pub const HEADLINE: f32 = 15.0;
     pub const BODY: f32 = 14.0;
@@ -54,11 +56,11 @@ pub mod text {
 /// Colours as `0xRRGGBBAA`: near-black grays, white labels and white as
 /// the accent.
 pub mod palette {
-    pub const BACKDROP: u32 = 0x0d0d0dff;
+    pub const BACKDROP: u32 = 0x121214ff;
     /// Sheets and the sidebar.
     pub const SURFACE: u32 = 0x1c1c1eff;
     pub const SIDEBAR: u32 = 0x161618ff;
-    /// The dock and toasts float over the art.
+    /// The bar and toasts float over the background.
     pub const MATERIAL: u32 = 0x18181ae0;
     /// Boxed lists on a surface.
     pub const CARD: u32 = 0xffffff0d;
@@ -77,7 +79,6 @@ pub mod palette {
     pub const ON_ACCENT: u32 = 0x0d0d0dff;
     pub const FOCUS: u32 = 0xffffffa6;
     pub const SCRIM: u32 = 0x00000080;
-    pub const ART_SHADE: u32 = 0x00000033;
 }
 
 /// `0xRRGGBBAA`.
@@ -440,4 +441,28 @@ pub fn toast(message: SharedString) -> Div {
         .text_size(px(text::BODY))
         .text_color(color(palette::LABEL))
         .child(message)
+}
+
+/// Inter (SIL Open Font License; see `assets/fonts/OFL.txt`) in the three
+/// weights the launcher uses.
+const FONTS: [&[u8]; 3] = [
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+];
+
+/// Registers the bundled font and returns its family, or the platform's UI
+/// font if registering fails.
+pub fn load_font(cx: &gpui::App) -> SharedString {
+    let fonts = FONTS
+        .iter()
+        .map(|font| std::borrow::Cow::Borrowed(*font))
+        .collect();
+    match cx.text_system().add_fonts(fonts) {
+        Ok(()) => "Inter".into(),
+        Err(error) => {
+            eprintln!("echora-launcher: bundled font not loaded: {error}");
+            ".SystemUIFont".into()
+        }
+    }
 }
