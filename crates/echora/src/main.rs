@@ -74,6 +74,20 @@ enum Command {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Discover code and write the translation (a Cargo workspace of
+    /// generated Rust) to the cache, rewriting only changed files.
+    Lift {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Maximum instructions to discover.
+        #[arg(long, default_value_t = 20_000_000)]
+        limit: usize,
+        /// Guest bytes per generated crate, as a power of two.
+        #[arg(long, default_value_t = 16)]
+        region_bits: u32,
+    },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
         input: PathBuf,
@@ -201,6 +215,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit,
             report,
         } => analyze(input, cache, &seed, limit, report.as_deref())?,
+        Command::Lift {
+            input,
+            cache,
+            limit,
+            region_bits,
+        } => lift(input, cache, limit, region_bits)?,
         Command::Extract {
             input,
             dest,
@@ -233,13 +253,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn analyze(
+struct Discovered {
+    cache: PathBuf,
+    exefs_key: String,
+    placed: Vec<echora_loader::process::PlacedModule>,
+    translation: echora_lift::codegen::Translation,
+    elapsed: std::time::Duration,
+}
+
+/// Loads the program's modules, places them, seeds discovery and runs it.
+fn discover_game(
     input: PathBuf,
     cache: Option<PathBuf>,
     seed: &[String],
     limit: usize,
-    report_path: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<Discovered> {
     use echora_lift::codegen::{CodeRegion, discover_with_tables};
     use echora_loader::process;
 
@@ -253,6 +281,10 @@ fn analyze(
         bail!("the input contains no package with an ExeFS");
     };
     let dir = source.materialize_exefs(&inv, pkg, &cache)?;
+    let exefs_key = inv.packages[pkg]
+        .exefs_key
+        .clone()
+        .context("program package has no ExeFS key")?;
     let placed = process::place_modules(echora_loader::load_exefs(&dir)?);
 
     let regions: Vec<CodeRegion> = placed
@@ -308,7 +340,126 @@ fn analyze(
         &Default::default(),
         limit,
     )?;
-    let elapsed = start.elapsed();
+    Ok(Discovered {
+        cache,
+        exefs_key,
+        placed,
+        translation,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// Writes `contents` unless the file already holds exactly that; returns
+/// whether it wrote.
+fn write_if_changed(path: &std::path::Path, contents: &str) -> std::io::Result<bool> {
+    if std::fs::read(path).is_ok_and(|old| old == contents.as_bytes()) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<()> {
+    use echora_lift::codegen::emit_rust_split_to;
+
+    if !(10..=24).contains(&region_bits) {
+        bail!("region-bits must be between 10 and 24");
+    }
+    let d = discover_game(input, cache, &[], limit)?;
+    let report = d.translation.report();
+    println!(
+        "discovered {} instructions in {} blocks ({:.1} s){}",
+        report.translated_instructions,
+        report.block_count,
+        d.elapsed.as_secs_f64(),
+        if report.truncated {
+            ", truncated at the limit"
+        } else {
+            ""
+        }
+    );
+    let out = d.cache.join("translations").join(&d.exefs_key);
+    let guest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../echora-guest")
+        .canonicalize()
+        .context("locate the echora-guest crate")?;
+    let guest = guest.to_string_lossy().into_owned();
+
+    let start = Instant::now();
+    let mut regions = Vec::new();
+    let (mut written, mut source_bytes) = (0usize, 0u64);
+    let root = emit_rust_split_to(&d.translation, region_bits, &mut |region, source| {
+        let dir = out.join("regions").join(format!("{region:x}"));
+        let manifest = format!(
+            "[package]\nname = \"gen-r-{region:x}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+        );
+        write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
+        source_bytes += source.len() as u64;
+        written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
+        regions.push(region);
+        Ok::<(), std::io::Error>(())
+    })?;
+    let emit_time = start.elapsed();
+
+    // Remove regions that no longer exist.
+    if let Ok(entries) = std::fs::read_dir(out.join("regions")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if u64::from_str_radix(&name, 16).map_or(true, |r| !regions.contains(&r)) {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+    }
+
+    let mut dispatch = format!(
+        "[package]\nname = \"echora-translation\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+    );
+    for region in &regions {
+        dispatch.push_str(&format!(
+            "gen-r-{region:x} = {{ path = \"../regions/{region:x}\" }}\n"
+        ));
+    }
+    write_if_changed(&out.join("dispatch/Cargo.toml"), &dispatch)?;
+    write_if_changed(&out.join("dispatch/src/lib.rs"), &root)?;
+    // Generated code is compiled at a moderate level; the guest crate it
+    // calls into gets full optimization.
+    write_if_changed(
+        &out.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"dispatch\", \"regions/*\"]\n\n\
+         [profile.release]\nopt-level = 1\n\n[profile.release.package.echora-guest]\nopt-level = 3\n",
+    )?;
+    std::fs::write(
+        out.join("translation-report.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    println!(
+        "wrote {} region crates ({:.1} MiB of Rust, {written} changed) in {:.1} s",
+        regions.len(),
+        source_bytes as f64 / f64::from(1 << 20),
+        emit_time.as_secs_f64()
+    );
+    println!("translation: {}", out.display());
+    Ok(())
+}
+
+fn analyze(
+    input: PathBuf,
+    cache: Option<PathBuf>,
+    seed: &[String],
+    limit: usize,
+    report_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let Discovered {
+        placed,
+        translation,
+        elapsed,
+        ..
+    } = discover_game(input, cache, seed, limit)?;
     let report = translation.report();
     println!(
         "discovered {} instructions in {} blocks ({:.1} s){}",

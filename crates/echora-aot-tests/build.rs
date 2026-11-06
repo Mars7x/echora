@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use echora_lift::codegen::{CodeRegion, discover, emit_rust};
+use echora_lift::codegen::{CodeRegion, discover, emit_rust, emit_rust_split};
 
 include!("src/programs.rs");
 
@@ -42,6 +42,19 @@ fn main() {
     let entries: Vec<u64> = (0..words.len()).map(|i| CODE_BASE + i as u64 * 4).collect();
     let translation = discover(&[region(&words)], &entries, 400).expect("sharded_call_return");
     module(&mut out, "sharded_call_return", &emit_rust(&translation));
+
+    // The same program through split emission (the layout real builds use):
+    // region sources become child modules named as the root expects.
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod split_call_return {{").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(
+        out,
+        "{root}\npub fn run(m: &mut crate::Machine) -> Result<(), Trap> {{ install(); m.run(dispatch) }}\n}}"
+    )
+    .expect("write");
 
     // A hole inside a window must trap, not fall through.
     let words = vec![0x14000000; 300];

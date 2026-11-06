@@ -2019,6 +2019,25 @@ pub fn emit_rust_split(
     translation: &Translation,
     region_bits: u32,
 ) -> (String, Vec<(u64, String)>) {
+    let mut regions = Vec::new();
+    let root = emit_rust_split_to(translation, region_bits, &mut |region, source| {
+        regions.push((region, source));
+        Ok::<(), std::convert::Infallible>(())
+    });
+    match root {
+        Ok(root) => (root, regions),
+        Err(never) => match never {},
+    }
+}
+
+/// [`emit_rust_split`], handing each region's source to `sink` as soon as it
+/// is complete (in ascending region order) so that at most one region is
+/// held in memory. Returns the root dispatcher source.
+pub fn emit_rust_split_to<E>(
+    translation: &Translation,
+    region_bits: u32,
+    sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
+) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let mut windows: Vec<(u64, &[BasicBlock])> = Vec::new();
     let mut first = 0;
@@ -2040,7 +2059,8 @@ pub fn emit_rust_split(
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
          pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
     );
-    let mut regions: Vec<(u64, String)> = Vec::new();
+    let header = "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{Core as Machine, Trap};\n";
+    let mut current: Option<(u64, String)> = None;
     for (window, blocks) in &windows {
         let region = window >> shift;
         writeln!(
@@ -2048,10 +2068,13 @@ pub fn emit_rust_split(
             "        {window:#x} => gen_r_{region:x}::run_window_{window:x}(m),"
         )
         .unwrap();
-        if regions.last().map(|(index, _)| *index) != Some(region) {
-            regions.push((region, String::from("// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{Core as Machine, Trap};\n")));
+        if current.as_ref().map(|(index, _)| *index) != Some(region) {
+            if let Some((index, source)) = current.take() {
+                sink(index, source)?;
+            }
+            current = Some((region, String::from(header)));
         }
-        let output = &mut regions.last_mut().expect("region pushed above").1;
+        let output = &mut current.as_mut().expect("region set above").1;
         // A window lies within one page, and page permissions change only in
         // SVCs, which leave the window: one execute check on entry covers
         // every block run before it returns.
@@ -2076,6 +2099,9 @@ pub fn emit_rust_split(
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }
+    if let Some((index, source)) = current.take() {
+        sink(index, source)?;
+    }
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
@@ -2088,7 +2114,7 @@ pub fn emit_rust_split(
         .unwrap();
     }
     root.push_str("];\n");
-    (root, regions)
+    Ok(root)
 }
 
 pub fn emit_rust(translation: &Translation) -> String {
