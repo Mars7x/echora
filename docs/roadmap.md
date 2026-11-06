@@ -7,7 +7,7 @@ Each phase completes only on the evidence named here, not when code exists.
 | 0. Reuse audit | Reuse matrix and architecture decision ([research](research.md)). | Done 2026-11-06. |
 | 1. Repository and portable foundation | Workspace builds; tests pass on Linux, Windows and macOS CI. | Done 2026-11-06. |
 | 2. Content processing | The supplied NUP is validated, inventoried and its ExeFS cached without manual extraction; NUP and directory input normalize identically. | Done for the checked input. RomFS base/update overlay not yet needed. |
-| 3. Compiler foundation | Synthetic guest functions translated and executed natively with verified semantics; missing-block reports. | In progress. NSO loader with ZBIC and MOD0/dynamic analysis done and verified on all modules; the lifter is next. |
+| 3. Compiler foundation | Synthetic guest functions translated and executed natively with verified semantics; missing-block reports. | In progress. Loader (ZBIC, MOD0) verified on all modules. Guest crate and lifter ported; synthetic programs (integer, flags, calls, atomics, exclusives, acquire/release, window dispatch, missing blocks) run natively on Linux. Lifting the real modules is next. |
 | 4. Guest runtime | Translated startup reaches a recorded runtime milestone. | — |
 | 5. Graphics and resolution foundations | Synthetic workloads at arbitrary sizes; safe resizes. | Resolution planner exists. |
 | 6. First real game frame | A correct game-generated frame. | — |
@@ -23,8 +23,5 @@ Each phase completes only on the evidence named here, not when code exists.
 
 ## Next steps
 
-1. Port Pokopia's AArch64 decoder, lifter and guest crate into Echora with
-   their synthetic tests, splitting Linux-specific host memory behind a
-   backend trait.
-2. Measure translation and build cost for OoT's 63 MB `main` text before
+1. Measure translation and build cost for OoT's 63 MB `main` text before
    committing to the generated-crate layout.

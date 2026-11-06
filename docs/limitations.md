@@ -1,6 +1,11 @@
 # Known limitations
 
 - Game code is loaded and verified but not yet translated or executed.
+  Synthetic AArch64 programs are lifted and executed natively.
+- Guest memory works on Linux with 4 KiB pages only. Windows and macOS build
+  and run the non-memory tests but cannot create guest memory yet.
+- A guest access to unmapped or protected memory ends the process (with the
+  guest address reported) instead of returning a recoverable trap.
 - NSO flag bit 6 (`0x40`) is set in `main` alongside the ZBIC bit; its meaning
   is unknown. It is accepted only together with ZBIC, and segment hashes
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer

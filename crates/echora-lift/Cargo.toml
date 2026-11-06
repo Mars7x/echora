@@ -1,0 +1,19 @@
+[package]
+name = "echora-lift"
+description = "AArch64 decoding, code discovery and native code emission for Echora"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+echora-guest.workspace = true
+serde.workspace = true
+yaxpeax-arch = "0.3"
+yaxpeax-arm = "0.4"
+
+[lints]
+workspace = true

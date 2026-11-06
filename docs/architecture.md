@@ -10,14 +10,15 @@ crates selected per host.
 |---|---|---|---|
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
-| `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget. ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. | MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
+| `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget. ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
+| `echora-guest` | core + host backend | Guest CPU state, guest memory (mappings, permissions, TLB, exclusive monitor), SIMD/FP semantics, traps, and the `Core` that generated code runs against. Guest memory has a per-host backend (`host_memory/`): Linux maps one memfd twice so generated code accesses guest memory directly. | Ported from Pokopia; 57 tests. Linux backend only. |
+| `echora-lift` | core | AArch64 decoding (scalar and SIMD/FP), code discovery from entries, prologues, relocation targets and jump tables, basic blocks, and Rust emission. Generated code depends only on `echora-guest` and exposes `dispatch(&mut Core)`. | Ported from Pokopia; 53 tests. |
+| `echora-aot-tests` | test | Synthetic AArch64 programs lifted by `build.rs` and run natively on a minimal host loop (integer, flags, calls, PAuth hints, budgets, window dispatch, missing blocks, CAS/LDADD/exclusives, acquire/release). | 11 execution tests (Linux). |
 | `echora-resolution` | core | Resolution planning: guest logical size, guest view, internal scene size, presentation rectangle, output size; target/viewport mapping; change impact. | Implemented, tested. Not yet used by a renderer. |
 | `echora-config` | core | Versioned TOML settings, validation, migration, requested vs effective settings, apply classes for live changes. | Implemented, tested. Not yet used by a runtime or launcher. |
 | `echora` | front end | Command-line tool; owns host paths (cache location). | `inspect`, `verify`, `import`, `load`, `extract`. |
 
-Planned crates, in roadmap order: `echora-lift` (AArch64 decoding, discovery,
-IR, code generation), `echora-guest` (guest CPU state, memory, SIMD/FP
-semantics shared with generated code), `echora-runtime` (scheduler, SVCs,
+Planned crates, in roadmap order: `echora-runtime` (scheduler, SVCs,
 IPC, services), `echora-gpu` (portable graphics translation) with
 `echora-gpu-vulkan`, and host crates for windowing, input and audio. The
 GTK4/libadwaita launcher will be a separate binary crate that depends on
@@ -52,6 +53,19 @@ through gameplay on Linux:
    machine-code backend can be added if measurements justify it.
 4. Each unimplemented instruction, SVC or service stops the run with a
    precise report rather than returning invented success.
+
+## Guest memory backends
+
+Generated code loads and stores through a host view of guest memory, so the
+backend decides both speed and portability. The Linux backend maps one sparse
+memfd twice (a host-side physical view and a guest view with per-page guest
+permissions); a forbidden guest access faults in the host and ends the
+process with the guest address reported. It needs 4 KiB host pages. Both
+views are excluded from core dumps: dumping a shared mapping of the
+address-space-sized file would fault in every page. Windows (64 KiB view
+granularity) and 16 KiB-page hosts such as Apple silicon need a different
+strategy and currently have no backend; `echora-guest` compiles there and
+fails clearly if guest memory is created.
 
 ## Resolution model
 

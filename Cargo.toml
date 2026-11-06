@@ -2,8 +2,11 @@
 resolver = "3"
 members = [
     "crates/echora",
+    "crates/echora-aot-tests",
     "crates/echora-config",
     "crates/echora-content",
+    "crates/echora-guest",
+    "crates/echora-lift",
     "crates/echora-loader",
     "crates/echora-nup",
     "crates/echora-resolution",
@@ -21,6 +24,8 @@ publish = false
 [workspace.dependencies]
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
+echora-guest = { path = "crates/echora-guest" }
+echora-lift = { path = "crates/echora-lift" }
 echora-loader = { path = "crates/echora-loader" }
 echora-nup = { path = "crates/echora-nup" }
 echora-resolution = { path = "crates/echora-resolution" }

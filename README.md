@@ -36,8 +36,13 @@ display version 1.1.1):
   transcoding to standard Zstandard. MOD0 and dynamic-section metadata
   (GNU-hash symbol tables, RELA/RELR/PLT relocations, init arrays) are
   validated for every module. Loading takes about 0.2 s.
-- **No game code runs yet.** The recompiler and runtime are next; see the
-  [roadmap](docs/roadmap.md).
+- **Native execution of synthetic code works.** The AArch64 lifter and guest
+  CPU/memory model (ported from pokopia-recomp) translate test programs to
+  Rust at build time; they run natively and pass integer, call, atomic,
+  exclusive and acquire/release semantics checks. Guest memory currently
+  needs Linux.
+- **No game code runs yet.** Lifting the real modules and the runtime are
+  next; see the [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
   x86-64, Windows x86-64 and macOS ARM64. Nothing beyond content tooling runs
   on any platform.

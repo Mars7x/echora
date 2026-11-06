@@ -1,0 +1,18 @@
+[package]
+name = "echora-guest"
+description = "Guest CPU state, memory and SIMD/FP semantics shared by the runtime and generated code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
