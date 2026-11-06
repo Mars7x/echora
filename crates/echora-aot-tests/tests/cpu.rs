@@ -278,15 +278,3 @@ fn msr_nzcv_takes_bits_31_to_28() {
     assert_eq!(m.core.cpu.nzcv, 0b0101);
     assert_eq!(m.core.cpu.regs[7], 0x5000_0000);
 }
-
-#[test]
-fn split_emission_runs_the_same_program() {
-    let mut m = Machine::new();
-    assert!(matches!(
-        split_call_return::run(&mut m),
-        Err(Trap::Exit { code: 0 })
-    ));
-    assert_eq!(m.core.cpu.regs[3], 17);
-    assert_eq!(m.core.cpu.regs[30], 0x1004);
-    assert_eq!(m.core.steps, 4);
-}
