@@ -136,7 +136,7 @@ pub fn write_controller(
     memory.initialize(base + NPAD_CONDITION, &condition)
 }
 
-#[cfg(all(test, any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::memory::{READ, STATE_SHARED};

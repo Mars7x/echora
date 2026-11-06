@@ -49,6 +49,7 @@ zstd = "0.13"
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(echora_checked_memory)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

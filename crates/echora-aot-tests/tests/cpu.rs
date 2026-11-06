@@ -1,7 +1,7 @@
 //! Integer, flag, call/return, PAuth-hint, budget and SIMD stack programs,
 //! executed natively. Expected values follow pokopia-recomp
 //! `tests/aot_execution.rs`.
-#![cfg(any(target_os = "linux", windows))]
+#![cfg(any(target_os = "linux", windows, target_os = "macos"))]
 #![allow(clippy::unwrap_used, unsafe_code)]
 
 use echora_aot_tests::*;
@@ -135,7 +135,7 @@ fn calls_across_dispatch_windows() {
 fn unmapped_store_ends_the_process_naming_the_guest_address() {
     if std::env::var_os("ECHORA_FAULT_CHILD").is_some() {
         // No core dump for this intentional crash.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let none = libc::rlimit {
                 rlim_cur: 0,

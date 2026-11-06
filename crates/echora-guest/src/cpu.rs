@@ -365,7 +365,7 @@ mod tests {
         }
     }
     use super::*;
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     use crate::memory::{Memory, READ, STATE_STACK, WRITE};
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(cpu, original);
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     #[test]
     fn q_pair_stack_roundtrip_preserves_all128_bits_and_register31() {
         let mut memory = Memory::new(0x10000);
