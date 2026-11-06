@@ -604,7 +604,7 @@ const WINDOW_INSET: f32 = 16.0;
 const SHEET_MARGIN: f32 = 24.0;
 
 /// The size a sheet grows from as it opens, relative to its full size.
-const SHEET_FROM: f32 = 0.9;
+const SHEET_FROM: f32 = 0.94;
 
 /// How long a closing sheet takes to fade out.
 const SHEET_OUT: Duration = Duration::from_millis(180);
@@ -613,6 +613,7 @@ const SHEET_OUT: Duration = Duration::from_millis(180);
 /// A closing sheet fades out instead of in and takes no input.
 fn scrim(
     sheet: gpui::Stateful<gpui::Div>,
+    surface: u32,
     corner: Pixels,
     motion: bool,
     closing: bool,
@@ -635,7 +636,7 @@ fn scrim(
         })
         // Clicks inside the sheet must not reach the scrim behind it.
         .child(if motion {
-            grow(sheet, closing)
+            grow(sheet, surface, closing)
         } else {
             sheet.into_any_element()
         });
@@ -662,17 +663,18 @@ fn scrim(
 }
 
 /// GNOME-style growth without scaling text or images (which would snap to
-/// the pixel grid differently every frame): a plain card springs open from
-/// the centre, and the sheet's contents, always at full size, fade in over
-/// it as it settles. Closing shrinks the card as the contents fade first.
-fn grow(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
+/// the pixel grid differently every frame): the sheet's contents, always at
+/// full size, fade in at once while a card of the sheet's colour springs
+/// open from the centre beneath them. Closing shrinks the card as the
+/// contents fade first.
+fn grow(sheet: gpui::Stateful<gpui::Div>, surface: u32, closing: bool) -> AnyElement {
     let duration = if closing { SHEET_OUT } else { ui::SPRING };
     let card = div()
         .absolute()
         .rounded(u(radius::SHEET))
         .border_1()
         .border_color(color(palette::BORDER))
-        .bg(color(palette::SURFACE))
+        .bg(color(surface))
         .with_animation(
             if closing { "card-out" } else { "card-in" },
             Animation::new(duration),
@@ -694,7 +696,8 @@ fn grow(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
             sheet.opacity(if closing {
                 1.0 - ui::ease_out(t * 2.0)
             } else {
-                ui::ease_out((t - 0.2) / 0.35)
+                // Together with the card, opaque within the first third.
+                ui::ease_out(t / 0.3)
             })
         },
     );
@@ -713,7 +716,12 @@ fn to_rems(pixels: Pixels) -> gpui::Rems {
 
 /// A sheet's surface: the window's own background, at a fixed size so
 /// wrapped text is measured at its real width.
-fn sheet(id: &'static str, width: Pixels, height: Option<Pixels>) -> gpui::Stateful<gpui::Div> {
+fn sheet(
+    id: &'static str,
+    width: Pixels,
+    height: Option<Pixels>,
+    surface: u32,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w(to_rems(width))
@@ -722,7 +730,7 @@ fn sheet(id: &'static str, width: Pixels, height: Option<Pixels>) -> gpui::State
         .rounded(u(radius::SHEET))
         .border_1()
         .border_color(color(palette::BORDER))
-        .bg(color(palette::SURFACE))
+        .bg(color(surface))
 }
 
 impl Launcher {
@@ -1085,11 +1093,12 @@ impl Launcher {
                     .pb(u(space::XL))
                     .child(page),
             );
-        let sheet = sheet("settings", width, Some(height))
+        let surface = palette::VIEW;
+        let sheet = sheet("settings", width, Some(height), surface)
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(tabs)
             .child(content);
-        scrim(sheet, self.corner, self.motion, closing, cx)
+        scrim(sheet, surface, self.corner, self.motion, closing, cx)
     }
 
     fn settings_page(
@@ -1442,7 +1451,8 @@ impl Launcher {
                 cx,
             )
             .child(self.close_button(!closing, cx));
-        let sheet = sheet("about", width, None)
+        let surface = palette::SURFACE;
+        let sheet = sheet("about", width, None, surface)
             .flex_col()
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(top)
@@ -1518,7 +1528,7 @@ impl Launcher {
                     )
                     .child(source),
             );
-        scrim(sheet, self.corner, self.motion, closing, cx)
+        scrim(sheet, surface, self.corner, self.motion, closing, cx)
     }
 }
 
