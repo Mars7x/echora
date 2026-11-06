@@ -145,6 +145,33 @@ impl MutexWaits {
         Ok(())
     }
 
+    /// SetBasePriority then RestorePriority from `thread` up its owner chain.
+    /// Returns the staged queue (waiter orders may change) and every
+    /// resulting effective priority.
+    pub(crate) fn prepare_base_priority(
+        &self,
+        thread: u64,
+        base: u8,
+        priorities: &BTreeMap<u64, ThreadPriority>,
+    ) -> Result<WaitPlan, Trap> {
+        self.validate_priorities(priorities)?;
+        Self::require_thread(priorities, thread)?;
+        if base > 63 {
+            return Err(invalid("base priority is outside the modeled 0..63 range"));
+        }
+        let mut state = self.clone();
+        let mut staged_priorities = priorities.clone();
+        staged_priorities
+            .get_mut(&thread)
+            .expect("require_thread checked the entry")
+            .base = base;
+        state.restore_priority(thread, &mut staged_priorities)?;
+        Ok(WaitPlan {
+            state,
+            priorities: effective_priorities(&staged_priorities),
+        })
+    }
+
     pub(crate) fn prepare_wait(
         &self,
         waiter: u64,

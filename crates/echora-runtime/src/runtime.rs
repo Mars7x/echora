@@ -221,6 +221,8 @@ pub struct Machine {
     main_thread_affinity: (i32, u64),
     main_thread_handle_open: bool,
     main_thread_state: ThreadState,
+    /// SetThreadPriority changes this; the layout keeps the creation value.
+    main_thread_base_priority: u8,
     main_thread_effective_priority: u8,
     main_mutex_owner_references: u32,
     main_wait_cancelled: bool,
@@ -321,6 +323,7 @@ impl Machine {
             main_thread_affinity,
             main_thread_handle_open: true,
             main_thread_state: ThreadState::Runnable,
+            main_thread_base_priority: main_thread_effective_priority,
             main_thread_effective_priority,
             main_mutex_owner_references: 0,
             main_wait_cancelled: false,
@@ -830,13 +833,53 @@ impl Machine {
         Ok(0)
     }
 
+    /// SetThreadPriority (Atmosphere 6b0c077 kern_svc_thread.cpp): range,
+    /// then process grant (InvalidPriority), then handle (InvalidHandle).
+    /// SetBasePriority then restores effective priorities up the mutex
+    /// owner chain; the serialized scheduler sees them at its next pick.
+    fn set_thread_priority(&mut self, handle: u32, priority: i32) -> Result<u32, Trap> {
+        let Ok(priority) = u8::try_from(priority) else {
+            return Ok(0xe001);
+        };
+        if priority >= 64 {
+            return Ok(0xe001);
+        }
+        let priority_mask = self
+            .layout
+            .process_priority_mask
+            .filter(|mask| *mask != 0)
+            .ok_or_else(|| Trap::InvalidState {
+                message:
+                    "SetThreadPriority requires validated nonzero process priority permissions"
+                        .into(),
+            })?;
+        if priority_mask & (1u64 << priority) == 0 {
+            return Ok(0xe001);
+        }
+        let Some(id) = self.thread_id_for_handle(handle) else {
+            return Ok(0xe401);
+        };
+        let plan =
+            self.mutex_waits
+                .prepare_base_priority(id, priority, &self.thread_priorities()?)?;
+        if id == self.layout.main_thread_id {
+            self.main_thread_base_priority = priority;
+        } else {
+            self.threads.set_base_priority(id, priority)?;
+        }
+        self.validate_thread_priorities(&plan.priorities)?;
+        self.apply_thread_priorities(&plan.priorities)?;
+        self.mutex_waits = plan.state;
+        Ok(0)
+    }
+
     fn thread_priorities(&self) -> Result<BTreeMap<u64, ThreadPriority>, Trap> {
         let mut priorities = BTreeMap::new();
         if self.main_thread_alive() {
             priorities.insert(
                 self.layout.main_thread_id,
                 ThreadPriority {
-                    base: self.layout.main_thread_priority,
+                    base: self.main_thread_base_priority,
                     effective: self.main_thread_effective_priority,
                 },
             );
@@ -862,7 +905,7 @@ impl Machine {
         for (&id, &priority) in priorities {
             let base = if id == self.layout.main_thread_id {
                 self.main_thread_alive()
-                    .then_some(self.layout.main_thread_priority)
+                    .then_some(self.main_thread_base_priority)
             } else {
                 self.threads.base_priority(id)
             };
@@ -2824,6 +2867,12 @@ impl Machine {
                 }
                 Ok(())
             }
+            0x0d => {
+                // Raw ABI: W0 handle, signed W1 priority; only W0 is an output.
+                let result = self.set_thread_priority(args[0] as u32, args[1] as u32 as i32)?;
+                self.core.cpu.regs[0] = u64::from(result);
+                Ok(())
+            }
             0x0f => {
                 // Raw ABI: W0 handle, signed W1 selector, full-width X2 mask;
                 // only W0 is an output. X3 and every other register survive.
@@ -3402,7 +3451,7 @@ impl Machine {
             "mutex_owner_references":self.main_mutex_owner_references,
             "wait_cancelled":self.main_wait_cancelled,
             "creation_priority":self.layout.main_thread_priority,
-            "base_priority":self.layout.main_thread_priority,
+            "base_priority":self.main_thread_base_priority,
             "effective_priority":self.main_thread_effective_priority,
             "signaled":self.main_thread_state == ThreadState::Terminated,
             "tls_allocation_owned":self.main_thread_tls_owned,
@@ -4398,6 +4447,65 @@ mod tests {
         assert!(!m.thread_wait_cancelled(2).unwrap());
         assert_eq!(m.synchronization_waits_started, 0);
         assert_eq!(m.synchronization_waits_cancelled, 0);
+    }
+
+    fn set_priority(m: &mut Machine, handle: u64, priority: u64) -> u64 {
+        m.core.cpu.regs[..2].copy_from_slice(&[handle, priority]);
+        m.svc(0x0d).unwrap();
+        m.core.cpu.regs[0]
+    }
+
+    #[test]
+    fn set_thread_priority_checks_range_grant_then_handle() {
+        let mut m = thread_machine();
+        let base = m.main_thread_base_priority;
+        // Range and grant come before the handle lookup.
+        for priority in [64, u64::from(u32::MAX), 5] {
+            assert_eq!(set_priority(&mut m, 0x1234, priority), 0xe001);
+        }
+        assert_eq!(set_priority(&mut m, 0x1234, 40), 0xe401);
+        assert_eq!(m.main_thread_base_priority, base);
+        m.core.cpu.regs[1] = 0x9999;
+        assert_eq!(set_priority(&mut m, 0xffff8000, 40), 0);
+        assert_eq!(m.core.cpu.regs[1], 40); // W1 is input only.
+        assert_eq!(m.main_thread_base_priority, 40);
+        assert_eq!(m.main_thread_effective_priority, 40);
+        m.core.cpu.regs[1] = 0xffff8000;
+        m.svc(0x0c).unwrap();
+        assert_eq!(m.core.cpu.regs[..2], [0, 40]);
+        let report = m.report(&Trap::MissingBlock { pc: 0 });
+        assert_eq!(
+            report["thread_model"]["main_thread_record"]["base_priority"],
+            40
+        );
+        assert_eq!(
+            report["thread_model"]["main_thread_record"]["creation_priority"],
+            base
+        );
+    }
+
+    #[test]
+    fn set_thread_priority_keeps_donation_and_restores_the_owner_chain() {
+        let mut m = mutex_test_machine();
+        let child = mutex_test_child(&mut m, 30, true);
+        m.memory.write_u32(0xa000, 0x40000100).unwrap();
+        m.finish_block().unwrap();
+        mutex_test_lock(&mut m, 0x100, 0xa000, child);
+        assert_eq!(m.main_thread_effective_priority, 30);
+        // A lower base on the owner keeps the waiter's donation.
+        assert_eq!(set_priority(&mut m, 0x100, 50), 0);
+        assert_eq!(m.main_thread_base_priority, 50);
+        assert_eq!(m.main_thread_effective_priority, 30);
+        // Raising the waiter propagates to its owner.
+        assert_eq!(set_priority(&mut m, u64::from(child), 29), 0);
+        assert_eq!(m.threads.base_priority(2), Some(29));
+        assert_eq!(m.threads.priority(2), Some(29));
+        assert_eq!(m.main_thread_effective_priority, 29);
+        // Lowering it again restores the owner to the waiter's new priority.
+        assert_eq!(set_priority(&mut m, u64::from(child), 45), 0);
+        assert_eq!(m.main_thread_effective_priority, 45);
+        assert_eq!(set_priority(&mut m, u64::from(child), 55), 0);
+        assert_eq!(m.main_thread_effective_priority, 50);
     }
 
     #[test]
