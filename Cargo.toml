@@ -10,6 +10,7 @@ members = [
     "crates/echora-loader",
     "crates/echora-nup",
     "crates/echora-resolution",
+    "crates/echora-runtime",
 ]
 default-members = ["crates/*"]
 
@@ -29,6 +30,7 @@ echora-lift = { path = "crates/echora-lift" }
 echora-loader = { path = "crates/echora-loader" }
 echora-nup = { path = "crates/echora-nup" }
 echora-resolution = { path = "crates/echora-resolution" }
+echora-runtime = { path = "crates/echora-runtime" }
 
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

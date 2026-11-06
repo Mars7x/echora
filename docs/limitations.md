@@ -11,6 +11,13 @@
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
+- The runtime's NVN layer implements no graphics call yet (the first NVN call
+  stops with its name), and there is no window, input or audio backend.
+- RomFS is served only from an extracted directory (`ECHORA_ROMFS`), not yet
+  from the NUP in place.
+- Process entropy is read from `/dev/urandom` (Unix only).
+- The ported runtime still uses `unwrap()` in about 70 places, mostly
+  fixed-length slice conversions; they should become checked conversions.
 - Update RomFS is not overlaid on base RomFS. The checked OoT input is a
   standalone update whose RomFS is used whole; its completeness is not
   verified against a base.

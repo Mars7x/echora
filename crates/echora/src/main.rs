@@ -74,6 +74,14 @@ enum Command {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Create the game process (modules, stack, TLS, entry registers)
+    /// without executing guest code, and describe it.
+    Boot {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
     /// Discover code and write the translation (a Cargo workspace of
     /// generated Rust) to the cache, rewriting only changed files.
     Lift {
@@ -215,6 +223,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit,
             report,
         } => analyze(input, cache, &seed, limit, report.as_deref())?,
+        Command::Boot { input, cache } => {
+            let cache = match cache {
+                Some(c) => c,
+                None => host_paths::cache_dir()?,
+            };
+            let source = ContentSource::open(&input)?;
+            let inv = source.inventory()?;
+            let Some(pkg) = inv.program_package else {
+                bail!("the input contains no package with an ExeFS");
+            };
+            let dir = source.materialize_exefs(&inv, pkg, &cache)?;
+            let program = echora_runtime::bootstrap::load_program(&dir, 0)?;
+            let n = &program.npdm;
+            println!(
+                "program {:016X}, main thread priority {} core {}, stack {:#x}, ACID layout {}",
+                n.program_id,
+                n.main_thread_priority,
+                n.main_thread_core,
+                n.main_thread_stack_size,
+                n.acid_layout
+            );
+            println!("service access: {} entries", n.service_access.len());
+            for m in &program.modules {
+                println!(
+                    "  {:<8} at {:#x} ({:#x} bytes)",
+                    m.module.name, m.base, m.module.image_size
+                );
+            }
+            let m = &program.machine;
+            println!(
+                "entry {:#x}, sp {:#x}, tls {:#x}, {} mappings",
+                m.core.cpu.pc,
+                m.core.cpu.sp,
+                m.core.cpu.tpidrro_el0,
+                m.memory.mappings().count()
+            );
+            println!("hooked host entries: {}", m.nvn.hook_addresses().count());
+        }
         Command::Lift {
             input,
             cache,

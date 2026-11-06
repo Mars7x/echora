@@ -16,7 +16,9 @@ these separately; preserve their notices when redistributing builds.
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 |
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
+| `jiff` | 0.2.39 | Unlicense OR MIT |
 | `libc` | 0.2.191 | MIT OR Apache-2.0 |
+| `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `portable-atomic` | 1.15.0 | Apache-2.0 OR MIT |
 | `lz4_flex` | 0.11.6 | MIT |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 |
@@ -40,7 +42,10 @@ these separately; preserve their notices when redistributing builds.
   `crates/echora-loader/src/nso.rs` and `mod0.rs` are adapted from its
   `src/loader/nso.rs` and `src/loader/mod0.rs`; `crates/echora-guest` from
   its `crates/guest`; `crates/echora-lift` from its `src/aarch64.rs`,
-  `src/simd.rs` and `src/codegen.rs`; and the synthetic programs and
+  `src/simd.rs` and `src/codegen.rs`; `crates/echora-runtime` from its
+  runtime, threads, synchronization, IPC, services, logging, file system,
+  RomFS, HID, display, content, HLE, audio and bootstrap modules; and the
+  synthetic programs and
   atomics assertions in `crates/echora-aot-tests` from its
   `tests/aot_execution.rs`.
 - [kinnay/zbic](https://github.com/kinnay/zbic) (GPLv2) was studied to learn
