@@ -98,6 +98,7 @@ echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
 echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
 echora lift game.nup             # write the translation (4.2 GiB of Rust) to the cache
+echora run game.nup              # run the built translation (see docs/local-setup.md)
 echora extract game.nup out --subtree romfs
 ```
 
