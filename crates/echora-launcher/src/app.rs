@@ -32,10 +32,7 @@ const WINDOW_MODES: [(&str, WindowMode); 3] = [
     ("Fullscreen", WindowMode::ExclusiveFullscreen),
 ];
 
-actions!(
-    echora,
-    [Play, ToggleSettings, CloseSettings, ChooseGame, Quit]
-);
+actions!(echora, [Play, ToggleSettings, CloseSheet, ChooseGame, Quit]);
 
 /// Colours as `0xRRGGBBAA`: near-black grays with white for text and the
 /// primary action.
@@ -57,20 +54,29 @@ mod palette {
     pub const ART_SHADE: u32 = 0x0000004d;
 }
 
+/// The panel shown over the launcher.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sheet {
+    Settings,
+    About,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
+    Game,
     Display,
     Controls,
     Launcher,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 3] = [Self::Display, Self::Controls, Self::Launcher];
+    const ALL: [Self; 4] = [Self::Game, Self::Display, Self::Controls, Self::Launcher];
 
     fn label(self) -> &'static str {
         match self {
             Self::Display => "Display",
             Self::Controls => "Controls",
+            Self::Game => "Game",
             Self::Launcher => "Launcher",
         }
     }
@@ -89,7 +95,7 @@ struct Launcher {
     game: Option<Game>,
     settings: Settings,
     settings_path: Option<PathBuf>,
-    settings_open: bool,
+    sheet: Option<Sheet>,
     settings_tab: SettingsTab,
     notice: Option<SharedString>,
     notice_generation: u64,
@@ -107,7 +113,7 @@ pub fn run() -> ExitCode {
             KeyBinding::new("enter", Play, Some("Launcher")),
             KeyBinding::new("ctrl-,", ToggleSettings, Some("Launcher")),
             KeyBinding::new("cmd-,", ToggleSettings, Some("Launcher")),
-            KeyBinding::new("escape", CloseSettings, Some("Launcher")),
+            KeyBinding::new("escape", CloseSheet, Some("Launcher")),
             KeyBinding::new("ctrl-o", ChooseGame, Some("Launcher")),
             KeyBinding::new("cmd-o", ChooseGame, Some("Launcher")),
             KeyBinding::new("ctrl-q", Quit, None),
@@ -206,8 +212,8 @@ impl Launcher {
             game: None,
             settings,
             settings_path,
-            settings_open: false,
-            settings_tab: SettingsTab::Display,
+            sheet: None,
+            settings_tab: SettingsTab::Game,
             notice: None,
             notice_generation: 0,
             running: false,
@@ -275,7 +281,7 @@ impl Launcher {
     }
 
     fn play(&mut self, _: &Play, _: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.settings_open {
+        if self.running || self.sheet.is_some() {
             return;
         }
         let Some(game) = &self.game else {
@@ -308,12 +314,15 @@ impl Launcher {
     }
 
     fn toggle_settings(&mut self, _: &ToggleSettings, _: &mut Window, cx: &mut Context<Self>) {
-        self.settings_open = !self.settings_open;
+        self.sheet = match self.sheet {
+            Some(Sheet::Settings) => None,
+            _ => Some(Sheet::Settings),
+        };
         cx.notify();
     }
 
-    fn close_settings(&mut self, _: &CloseSettings, _: &mut Window, cx: &mut Context<Self>) {
-        self.settings_open = false;
+    fn close_sheet(&mut self, _: &CloseSheet, _: &mut Window, cx: &mut Context<Self>) {
+        self.sheet = None;
         cx.notify();
     }
 
@@ -410,6 +419,13 @@ fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gp
         .child(label.into())
 }
 
+fn about_button(cx: &mut Context<Launcher>) -> gpui::Stateful<gpui::Div> {
+    button("about", "About").on_click(cx.listener(|this, _, _, cx| {
+        this.sheet = Some(Sheet::About);
+        cx.notify();
+    }))
+}
+
 fn play_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -484,7 +500,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
 /// right.
 fn setting_row(
     title: &'static str,
-    description: &'static str,
+    description: Option<&'static str>,
     control: impl IntoElement,
 ) -> impl IntoElement {
     div()
@@ -506,14 +522,96 @@ fn setting_row(
                         .text_color(color(palette::TEXT))
                         .child(title),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(color(palette::TEXT_MUTED))
-                        .child(description),
-                ),
+                .when_some(description, |el, description| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(color(palette::TEXT_MUTED))
+                            .child(description),
+                    )
+                }),
         )
         .child(div().flex_none().child(control))
+}
+
+/// The people and projects Echora builds on, with what each contributed.
+const CREDITS: [(&str, &str); 7] = [
+    ("Mars7x", "Creator of Echora"),
+    ("pokopia-recomp", "Recompiler and runtime basis"),
+    ("PokeDinner, an Eglantine fork", "Shader recompiler"),
+    ("sirit", "SPIR-V generation"),
+    ("GPUI by Zed Industries", "Launcher interface"),
+    ("a55uka/nup", "NUP format specification"),
+    ("Switchbrew, libnx, Atmosphère", "Format documentation"),
+];
+
+fn about_page(cx: &mut Context<Launcher>) -> Vec<AnyElement> {
+    let mut page = vec![
+        div()
+            .pt(px(8.0))
+            .pb(px(12.0))
+            .text_sm()
+            .text_color(color(palette::TEXT_MUTED))
+            .child(
+                "A native recompilation of The Legend of Zelda: Ocarina of Time for \
+                 Nintendo Switch 2. You need your own copy of the game.",
+            )
+            .into_any_element(),
+        divider().into_any_element(),
+        div()
+            .pt(px(12.0))
+            .pb(px(2.0))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color(palette::TEXT_MUTED))
+            .child("CREDITS")
+            .into_any_element(),
+    ];
+    page.extend(CREDITS.iter().map(|&(name, role)| {
+        div()
+            .flex()
+            .justify_between()
+            .gap(px(16.0))
+            .py(px(3.0))
+            .text_sm()
+            .child(div().text_color(color(palette::TEXT)).child(name))
+            .child(div().text_color(color(palette::TEXT_MUTED)).child(role))
+            .into_any_element()
+    }));
+    page.push(
+        div()
+            .pt(px(12.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(color(palette::TEXT_MUTED))
+                    .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
+            )
+            .child(button("source", "Source code").h(px(32.0)).on_click(
+                cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")),
+            ))
+            .into_any_element(),
+    );
+    page
+}
+
+/// Dims the launcher behind a sheet; clicking outside the sheet closes it.
+fn scrim(sheet: gpui::Stateful<gpui::Div>, cx: &mut Context<Launcher>) -> impl IntoElement {
+    div()
+        .id("scrim")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(color(palette::SCRIM))
+        .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
+        // Clicks inside the sheet must not reach the scrim behind it.
+        .child(sheet.on_click(|_, _, cx| cx.stop_propagation()))
 }
 
 /// A thin line between settings rows.
@@ -566,7 +664,8 @@ impl Launcher {
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(color(palette::TEXT_MUTED))
-                    .child("ECHORA"),
+                    // The empty screen already shows the name in large type.
+                    .when(self.game.is_some(), |el| el.child("ECHORA")),
             )
             .when(client_side && !cfg!(target_os = "macos"), |el| {
                 el.child(
@@ -600,7 +699,8 @@ impl Launcher {
                 ))
                 .child(button("settings", "Settings").on_click(cx.listener(
                     |this, _, window, cx| this.toggle_settings(&ToggleSettings, window, cx),
-                )));
+                )))
+                .child(about_button(cx));
         };
         let thumbnail = match &game.icon {
             Some(icon) => img(icon.clone())
@@ -646,18 +746,17 @@ impl Launcher {
                     this.toggle_settings(&ToggleSettings, window, cx)
                 }),
             ))
-            .child(button("change", "Change game").on_click(
-                cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
-            ))
+            .child(about_button(cx))
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = &self.settings;
         let page: Vec<AnyElement> = match self.settings_tab {
+            SettingsTab::Game => self.game_page(cx),
             SettingsTab::Display => vec![
                 setting_row(
                     "Window mode",
-                    "How the game's window is shown",
+                    None,
                     segmented(
                         "mode",
                         &WINDOW_MODES,
@@ -670,7 +769,7 @@ impl Launcher {
                 divider().into_any_element(),
                 setting_row(
                     "Internal resolution",
-                    "The resolution scenes are drawn at",
+                    None,
                     segmented(
                         "resolution",
                         &RESOLUTIONS,
@@ -684,7 +783,7 @@ impl Launcher {
             SettingsTab::Controls => vec![
                 setting_row(
                     "Vibration",
-                    "Rumble on controllers that support it",
+                    None,
                     segmented(
                         "vibration",
                         &[("Off", false), ("On", true)],
@@ -698,7 +797,7 @@ impl Launcher {
             SettingsTab::Launcher => vec![
                 setting_row(
                     "Skip launcher",
-                    "Start the game straight away. Run echora-launcher --show to come back here.",
+                    Some("Run echora-launcher --show to come back here"),
                     segmented(
                         "skip",
                         &[("Off", false), ("On", true)],
@@ -750,16 +849,10 @@ impl Launcher {
                         this.settings_tab = tab;
                         cx.notify();
                     }))
-            }))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .px(px(10.0))
-                    .text_xs()
-                    .text_color(color(palette::TEXT_MUTED))
-                    .child(format!("Echora {}", env!("CARGO_PKG_VERSION"))),
-            );
+            }));
         let content = div()
+            .id("settings-page")
+            .overflow_y_scroll()
             .flex_1()
             .min_w_0()
             .flex()
@@ -774,52 +867,137 @@ impl Launcher {
                     .pb(px(6.0))
                     .child(
                         div()
-                            .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(color(palette::TEXT_MUTED))
-                            .child(self.settings_tab.label().to_uppercase()),
+                            .text_color(color(palette::TEXT))
+                            .child(self.settings_tab.label()),
                     )
                     .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
-                        |this, _, window, cx| this.close_settings(&CloseSettings, window, cx),
+                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
                     ))),
             )
-            .children(page)
-            .child(div().flex_1())
-            .when(self.settings_tab != SettingsTab::Launcher, |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(color(palette::TEXT_MUTED))
-                        .child("Changes apply the next time the game starts."),
-                )
-            });
+            .children(page);
         let sheet = div()
             .id("sheet")
             .w_full()
             .max_w(px(760.0))
             .mx(px(24.0))
-            .h(px(380.0))
+            .h(px(420.0))
             .flex()
             .rounded(px(16.0))
             .border_1()
             .border_color(color(palette::DIVIDER))
             .bg(color(palette::SHEET))
-            // Clicks inside the sheet must not reach the scrim behind it.
-            .on_click(|_, _, cx| cx.stop_propagation())
             .child(tabs)
             .child(content);
-        div()
-            .id("scrim")
-            .absolute()
-            .inset_0()
+        scrim(sheet, cx)
+    }
+
+    fn render_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sheet = div()
+            .id("about")
+            .w_full()
+            .max_w(px(560.0))
+            .mx(px(24.0))
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(color(palette::SCRIM))
-            .on_click(
-                cx.listener(|this, _, window, cx| this.close_settings(&CloseSettings, window, cx)),
+            .flex_col()
+            .px(px(24.0))
+            .py(px(16.0))
+            .rounded(px(16.0))
+            .border_1()
+            .border_color(color(palette::DIVIDER))
+            .bg(color(palette::SHEET))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(color(palette::TEXT))
+                                    .child("Echora"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(color(palette::TEXT_MUTED))
+                                    .child(env!("CARGO_PKG_VERSION")),
+                            ),
+                    )
+                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
+                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
+                    ))),
             )
-            .child(sheet)
+            .children(about_page(cx));
+        scrim(sheet, cx)
+    }
+
+    /// The chosen game and the way to change it.
+    fn game_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let summary = match &self.game {
+            Some(game) => div()
+                .flex()
+                .items_center()
+                .gap(px(14.0))
+                .child(match &game.icon {
+                    Some(icon) => img(icon.clone())
+                        .size(px(56.0))
+                        .rounded(px(12.0))
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element(),
+                    None => div()
+                        .size(px(56.0))
+                        .rounded(px(12.0))
+                        .bg(color(palette::CONTROL))
+                        .into_any_element(),
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(color(palette::TEXT))
+                                .child(game.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(color(palette::TEXT_MUTED))
+                                .child(game.version.clone()),
+                        ),
+                ),
+            None => div()
+                .text_sm()
+                .text_color(color(palette::TEXT_MUTED))
+                .child("No game chosen yet"),
+        };
+        let label = if self.game.is_some() {
+            "Change game"
+        } else {
+            "Choose game"
+        };
+        vec![
+            div()
+                .pt(px(10.0))
+                .pb(px(16.0))
+                .child(summary)
+                .into_any_element(),
+            div()
+                .flex()
+                .child(button("change", label).h(px(36.0)).on_click(
+                    cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
+                ))
+                .into_any_element(),
+        ]
     }
 }
 
@@ -830,7 +1008,7 @@ impl Render for Launcher {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::play))
             .on_action(cx.listener(Self::toggle_settings))
-            .on_action(cx.listener(Self::close_settings))
+            .on_action(cx.listener(Self::close_sheet))
             .on_action(cx.listener(Self::choose_game))
             .size_full()
             .relative()
@@ -887,6 +1065,11 @@ impl Render for Launcher {
                     })
                     .child(self.render_dock(cx)),
             )
-            .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when_some(self.sheet, |el, sheet| {
+                el.child(match sheet {
+                    Sheet::Settings => self.render_settings(cx).into_any_element(),
+                    Sheet::About => self.render_about(cx).into_any_element(),
+                })
+            })
     }
 }
