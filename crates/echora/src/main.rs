@@ -96,6 +96,16 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         region_bits: u32,
     },
+    /// Run the built translation of the input's program (see `lift`).
+    Run {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Guest instruction budget.
+        #[arg(long, default_value_t = 1_000_000_000)]
+        budget: u64,
+    },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
         input: PathBuf,
@@ -267,6 +277,58 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit,
             region_bits,
         } => lift(input, cache, limit, region_bits)?,
+        Command::Run {
+            input,
+            cache,
+            budget,
+        } => {
+            let cache = match cache {
+                Some(c) => c,
+                None => host_paths::cache_dir()?,
+            };
+            let source = ContentSource::open(&input)?;
+            let inv = source.inventory()?;
+            let Some(pkg) = inv.program_package else {
+                bail!("the input contains no package with an ExeFS");
+            };
+            let exefs = source.materialize_exefs(&inv, pkg, &cache)?;
+            let key = inv.packages[pkg]
+                .exefs_key
+                .as_ref()
+                .context("program package has no ExeFS key")?;
+            let translation = cache.join("translations").join(key);
+            let runner = translation
+                .join("target/release/echora-run")
+                .with_extension(std::env::consts::EXE_EXTENSION);
+            if !runner.is_file() {
+                bail!(
+                    "no built translation at {}; run `echora lift` and `cargo build --release -p echora-run` there",
+                    translation.display()
+                );
+            }
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let report = translation.join(format!("run-{stamp}.json"));
+            // A NUP is read in place; a dump directory keeps its data in romfs/.
+            let input = input.canonicalize()?;
+            let romfs_path = if input.is_dir() {
+                input.join("romfs")
+            } else {
+                input
+            };
+            println!("report: {}", report.display());
+            let status = std::process::Command::new(&runner)
+                .arg(&exefs)
+                .arg(budget.to_string())
+                .arg(&report)
+                .env("ECHORA_ROMFS", romfs_path)
+                .status()
+                .with_context(|| format!("start {}", runner.display()))?;
+            if !status.success() {
+                return Ok(ExitCode::from(2));
+            }
+        }
         Command::Extract {
             input,
             dest,
