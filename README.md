@@ -103,8 +103,10 @@ echora run game.nup              # run the built translation (see docs/local-set
 echora extract game.nup out --subtree romfs
 ```
 
-`echora-launcher` (GPUI) chooses the game, edits the settings the runtime
-applies and starts it. It runs on Linux, Windows and macOS; place it next to
+`echora-launcher` (GPUI) installs the game from your NUP or dump into
+Echora's data folder (`~/.local/share/echora/game` on Linux), after which
+the original is no longer needed, edits the settings the runtime applies
+and starts it. It runs on Linux, Windows and macOS; place it next to
 the `echora` binary. With "Skip launcher" on it starts the game directly;
 `echora-launcher --show` opens the window again.
 

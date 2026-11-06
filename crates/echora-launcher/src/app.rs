@@ -13,10 +13,11 @@ use gpui::{
     FocusHandle, FontWeight, HitboxBehavior, Hsla, Image, ImageFormat, KeyBinding, MouseButton,
     MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels, RenderImage, ResizeEdge, SharedString,
     TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, actions, canvas, div, img, point, prelude::*, px, rgba, size, svg,
+    WindowOptions, actions, canvas, div, img, point, prelude::*, px, relative, rgba, size, svg,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
+use crate::install;
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -122,6 +123,8 @@ struct Launcher {
     notice: Option<SharedString>,
     notice_generation: u64,
     running: bool,
+    /// The game being installed and how far the copy has got.
+    installing: Option<(SharedString, Arc<install::Progress>)>,
 }
 
 pub fn run() -> ExitCode {
@@ -249,6 +252,7 @@ impl Launcher {
             notice: None,
             notice_generation: 0,
             running: false,
+            installing: None,
         };
         if let Some(last) = last_game() {
             launcher.select_game(last, cx);
@@ -307,7 +311,53 @@ impl Launcher {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| this.select_game(path, cx));
+            let _ = this.update(cx, |this, cx| this.install_game(path, cx));
+        })
+        .detach();
+    }
+
+    /// Copies the chosen NUP or dump into Echora's data folder on another
+    /// thread, then switches to the installed copy.
+    fn install_game(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        if self.running || self.installing.is_some() {
+            return;
+        }
+        let title = match read_game(&source) {
+            Ok(game) => game.title,
+            Err(message) => return self.notify(message, cx),
+        };
+        let Some(games) = install::data_dir().map(|dir| dir.join("game")) else {
+            return self.notify("There's no data folder to install the game into", cx);
+        };
+        let progress = Arc::new(install::Progress::default());
+        let worker = progress.clone();
+        std::thread::spawn(move || install::install(&source, &games, &worker));
+        self.installing = Some((title, progress.clone()));
+        self.sheet = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let result = progress.take_result();
+                let done = result.is_some();
+                let updated = this.update(cx, |this, cx| {
+                    if let Some(result) = result {
+                        this.installing = None;
+                        match result {
+                            Ok(installed) => this.select_game(installed, cx),
+                            Err(error) => {
+                                this.notify(format!("Couldn't install the game: {error}"), cx)
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if done || updated.is_err() {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -800,9 +850,49 @@ impl Launcher {
             .p(px(8.0))
             .rounded(px(16.0))
             .bg(color(palette::DOCK));
+        if let Some((title, progress)) = &self.installing {
+            let fraction = progress.fraction().clamp(0.0, 1.0);
+            return dock.px(px(18.0)).py(px(14.0)).child(
+                div()
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .text_color(color(palette::TEXT))
+                                    .truncate()
+                                    .child(format!("Installing {title}")),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(palette::TEXT_MUTED))
+                                    .child(format!("{}%", (fraction * 100.0) as u32)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(color(palette::CONTROL))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(color(palette::TEXT))
+                                    .w(relative(fraction)),
+                            ),
+                    ),
+            );
+        }
         let Some(game) = &self.game else {
             return dock
-                .child(play_button("choose", "Choose game").on_click(
+                .child(play_button("choose", "Install game").on_click(
                     cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
                 ))
                 .child(button("settings", "Settings").on_click(cx.listener(
@@ -1088,23 +1178,47 @@ impl Launcher {
                 .text_color(color(palette::TEXT_MUTED))
                 .child("No game chosen yet"),
         };
-        let label = if self.game.is_some() {
-            "Change game"
-        } else {
-            "Choose game"
+        let installed_in = install::data_dir().map(|dir| dir.join("game"));
+        let original = self
+            .game
+            .as_ref()
+            .filter(|game| {
+                installed_in
+                    .as_ref()
+                    .is_none_or(|dir| !game.path.starts_with(dir))
+            })
+            .map(|game| game.path.clone());
+        let choose = cx.listener(|this: &mut Self, _: &gpui::ClickEvent, window, cx| {
+            this.choose_game(&ChooseGame, window, cx)
+        });
+        let (note, action) = match (&self.game, original) {
+            (None, _) => (None, button("install", "Install game").on_click(choose)),
+            (Some(_), None) => (
+                Some("Installed. Your original NUP or dump is no longer needed."),
+                button("install", "Reinstall").on_click(choose),
+            ),
+            (Some(_), Some(path)) => (
+                Some("Played from its original location. Install it to keep a copy in Echora."),
+                button("install", "Install into Echora").on_click(
+                    cx.listener(move |this, _, _, cx| this.install_game(path.clone(), cx)),
+                ),
+            ),
         };
         vec![
             div()
                 .pt(px(10.0))
-                .pb(px(16.0))
+                .pb(px(12.0))
                 .child(summary)
                 .into_any_element(),
             div()
-                .flex()
-                .child(button("change", label).h(px(36.0)).on_click(
-                    cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
-                ))
+                .when_some(note, |el, note| {
+                    el.pb(px(14.0))
+                        .text_xs()
+                        .text_color(color(palette::TEXT_MUTED))
+                        .child(note)
+                })
                 .into_any_element(),
+            div().flex().child(action.h(px(36.0))).into_any_element(),
         ]
     }
 }
@@ -1220,7 +1334,9 @@ impl Launcher {
                             div()
                                 .pt(px(6.0))
                                 .text_color(color(palette::TEXT_MUTED))
-                                .child("Choose your NUP package or dump folder to begin"),
+                                .child(
+                                    "Choose your NUP package or dump folder to install the game",
+                                ),
                         ),
                 )
             })
