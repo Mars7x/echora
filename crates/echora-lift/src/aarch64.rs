@@ -384,6 +384,15 @@ pub enum Instruction {
     StripPac {
         rd: u8,
     },
+    /// PACGA Xd, Xn, Xm|SP: a generic authentication code in Xd's upper
+    /// 32 bits (lower 32 zero). Only equality between computations matters
+    /// (setjmp signs registers that longjmp signs again and compares), so
+    /// any deterministic function of the operands serves as the key.
+    PacGeneric {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
     /// PAC*/AUT* register forms with every key disabled: the register is
     /// unchanged (authentication neither adds nor checks a code).
     PAuthDisabledData,
@@ -899,6 +908,9 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
             };
         }
         _ => {}
+    }
+    if word & 0xffe0_fc00 == 0x9ac0_3000 {
+        return PacGeneric { rd, rn, rm };
     }
     // CRC32/CRC32C: sz selects the data width; only the X form uses sf=1.
     if word & 0x7fe0_e000 == 0x1ac0_4000 {
@@ -2171,6 +2183,14 @@ mod tests {
 
     #[test]
     fn pointer_strip_cache_and_event_hints() {
+        assert_eq!(
+            decode(0x9ad1_3262, 0),
+            Instruction::PacGeneric {
+                rd: 2,
+                rn: 19,
+                rm: 17
+            }
+        );
         assert_eq!(decode(0xdac1_43e3, 0), Instruction::StripPac { rd: 3 });
         assert_eq!(decode(0xdac1_47e0, 0), Instruction::StripPac { rd: 0 });
         // PACIA X0, X1; AUTDB X2, SP; PACIZA X5.
