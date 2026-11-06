@@ -1,0 +1,12 @@
+/target
+*.nup
+*.nsp
+*.xci
+*.nso
+*.npdm
+/exefs/
+/romfs/
+/work/
+/cache/
+.claude/
+*.swp
