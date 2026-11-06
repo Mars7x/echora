@@ -107,19 +107,41 @@ pub fn color(hex: u32) -> Hsla {
     rgba(hex).into()
 }
 
-/// Paints the ring around the focused control (laid out in `bounds`)
-/// during keyboard or controller navigation: 2 px wide, 2 px clear of the
-/// control and following its rounding, so it shows on light and dark
-/// controls alike. Painted rather than a box shadow, which GPUI draws
-/// nothing for without blur.
-pub fn paint_focus_ring(bounds: Bounds<Pixels>, window: &mut Window) {
+/// Where a control's focus ring goes, with the control's corner radius in
+/// design pixels ([`Ring::PILL`] for pills and circles).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Ring {
+    /// Around the control, clear of its edge: buttons and switches.
+    Around(f32),
+    /// Just inside the control's edge: rows of a list or sidebar, which sit
+    /// close together, as libadwaita draws them.
+    Within(f32),
+}
+
+impl Ring {
+    pub const PILL: f32 = f32::INFINITY;
+}
+
+/// Paints the focus ring of the focused control (laid out in `bounds`)
+/// during keyboard or controller navigation: 2 px wide and following the
+/// control's rounding, 2 px clear of it when drawn around it, so it shows on
+/// light and dark controls alike. Painted rather than a box shadow, which
+/// GPUI draws nothing for without blur.
+pub fn paint_focus_ring(bounds: Bounds<Pixels>, ring: Ring, window: &mut Window) {
     const GAP: f32 = 2.0;
     const WIDTH: f32 = 2.0;
     let scale = window.rem_size() / px(16.0);
-    let outset = px(GAP + WIDTH);
-    let radius = (px(radius::CONTROL) * scale).min(bounds.size.height / 2.0) + outset;
+    let corner =
+        |radius: f32| (px(radius) * scale).min(bounds.size.height.min(bounds.size.width) / 2.0);
+    let (bounds, radius) = match ring {
+        Ring::Around(radius) => {
+            let outset = px(GAP + WIDTH);
+            (bounds.dilate(outset), corner(radius) + outset)
+        }
+        Ring::Within(radius) => (bounds, corner(radius)),
+    };
     window.paint_quad(gpui::quad(
-        bounds.dilate(outset),
+        bounds,
         radius,
         gpui::transparent_black(),
         px(WIDTH),

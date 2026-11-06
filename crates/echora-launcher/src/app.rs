@@ -22,7 +22,7 @@ use gpui::{
 use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
 use crate::nav::{Activate, Direction, Press as _, Stops};
-use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
+use crate::ui::{self, Kind, Ring, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
 
@@ -353,14 +353,19 @@ impl Launcher {
         }
     }
 
-    /// Makes `el` a control the keyboard and controllers reach while
-    /// `live`, with a focus ring. Controls behind a sheet or an open menu
-    /// aren't live.
+    /// Makes `el`, a button, a control the keyboard and controllers reach
+    /// while `live`, with a focus ring. Controls behind a sheet or an open
+    /// menu aren't live.
     fn stop(&self, el: Stateful<Div>, live: bool, cx: &App) -> Stateful<Div> {
+        self.stop_shaped(el, Ring::Around(radius::CONTROL), live, cx)
+    }
+
+    /// [`Self::stop`] for a control whose focus ring is shaped `ring`.
+    fn stop_shaped(&self, el: Stateful<Div>, ring: Ring, live: bool, cx: &App) -> Stateful<Div> {
         if !live {
             return el;
         }
-        self.stops.add(el, self.keyboard, cx)
+        self.stops.add(el, ring, self.keyboard, cx)
     }
 
     /// Shows a short message above the dock for a few seconds.
@@ -1200,7 +1205,7 @@ impl Launcher {
                     .gap(u(2.0))
                     .children(SettingsTab::ALL.into_iter().map(|tab| {
                         let selected = tab == self.settings_tab;
-                        self.stop(
+                        self.stop_shaped(
                             div()
                                 .id(tab.label())
                                 .h(u(36.0))
@@ -1222,6 +1227,7 @@ impl Launcher {
                                         })
                                 })
                                 .child(tab.label()),
+                            Ring::Within(radius::CONTROL),
                             live,
                             cx,
                         )
@@ -1294,12 +1300,17 @@ impl Launcher {
         let toggled = self.toggled;
         let switch =
             |id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<Self>| {
-                self.stop(ui::switch(id, on, motion && toggled == Some(id)), live, cx)
-                    .on_press(cx.listener(move |this, _, _, cx| {
-                        this.toggled = Some(id);
-                        this.change(cx, flip);
-                    }))
-                    .into_any_element()
+                self.stop_shaped(
+                    ui::switch(id, on, motion && toggled == Some(id)),
+                    Ring::Around(Ring::PILL),
+                    live,
+                    cx,
+                )
+                .on_press(cx.listener(move |this, _, _, cx| {
+                    this.toggled = Some(id);
+                    this.change(cx, flip);
+                }))
+                .into_any_element()
             };
         match self.settings_tab {
             SettingsTab::Game => self.game_page(live, cx),
@@ -1430,8 +1441,9 @@ impl Launcher {
             return div().flex_none().child(button).into_any_element();
         }
         let menu = ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
-            self.stop(
+            self.stop_shaped(
                 ui::menu_item((id, index + 1), label, value == current),
+                Ring::Within(radius::INNER),
                 true,
                 cx,
             )

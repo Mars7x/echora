@@ -14,7 +14,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Div, Element, ElementId, FocusHandle, Pixels, Stateful, Window, actions, canvas,
+    App, Bounds, Div, Element, ElementId, FocusHandle, KeyDownEvent, Pixels, Stateful, Window,
+    actions, canvas,
 };
 
 use crate::ui;
@@ -23,12 +24,12 @@ actions!(
     nav,
     [
         /// Presses the focused control, as a controller's A button does.
-        /// (Enter and Space press it through GPUI's own keyboard clicks.)
         Activate
     ]
 );
 
-/// Controls that a click or [`Activate`] presses.
+/// Controls that a click, [`Activate`], or Enter or Space while focused
+/// presses.
 pub trait Press {
     fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self;
 }
@@ -37,10 +38,27 @@ impl Press for Stateful<Div> {
     fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self {
         let listener = Rc::new(listener);
         let activate = listener.clone();
+        let key = listener.clone();
+        // GPUI clicks a focused control when Enter or Space is released;
+        // pressing on the key going down instead feels immediate. Held keys
+        // don't repeat the press.
+        self.on_click(move |event, window, cx| {
+            if !event.is_keyboard() {
+                listener(&(), window, cx);
+            }
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            let stroke = &event.keystroke;
+            if matches!(stroke.key.as_str(), "enter" | "space") && !stroke.modifiers.modified() {
+                cx.stop_propagation();
+                if !event.is_held {
+                    key(&(), window, cx);
+                }
+            }
+        })
         // Actions go to the focused element first, so only the focused
         // control answers Activate.
-        self.on_click(move |_, window, cx| listener(&(), window, cx))
-            .on_action(move |_: &Activate, window, cx| activate(&(), window, cx))
+        .on_action(move |_: &Activate, window, cx| activate(&(), window, cx))
     }
 }
 
@@ -78,9 +96,15 @@ impl Stops {
             .clone()
     }
 
-    /// Makes `el` a stop, with a focus ring while `ring` (the keyboard or
-    /// a controller is in use). `el` must have an id.
-    pub fn add(&self, el: Stateful<Div>, ring: bool, cx: &App) -> Stateful<Div> {
+    /// Makes `el` a stop, drawing `ring` while it has focus and `show_ring`
+    /// (the keyboard or a controller is in use). `el` must have an id.
+    pub fn add(
+        &self,
+        el: Stateful<Div>,
+        ring: ui::Ring,
+        show_ring: bool,
+        cx: &App,
+    ) -> Stateful<Div> {
         let id = Element::id(&el).expect("a focus stop needs an element id");
         let handle = self.handle(id, cx);
         let stops = self.clone();
@@ -92,8 +116,8 @@ impl Stops {
                     handle
                 },
                 move |bounds, handle, window, _| {
-                    if ring && handle.is_focused(window) {
-                        ui::paint_focus_ring(bounds, window);
+                    if show_ring && handle.is_focused(window) {
+                        ui::paint_focus_ring(bounds, ring, window);
                     }
                 },
             )
