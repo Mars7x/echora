@@ -1,15 +1,23 @@
 //! Host gamepads as a Switch controller state.
 //!
 //! The interface ([`Pad`], [`gamepads`], [`rumble`]) names nothing
-//! platform-specific. Linux reads evdev devices directly; other platforms
-//! have no gamepad backend yet and report no pads.
+//! platform-specific. Linux reads evdev devices directly; Windows and macOS
+//! use gilrs; other platforms report no pads.
+
+mod pad;
+pub use pad::{Pad, STICK_MAX, button};
 
 #[cfg(target_os = "linux")]
 mod evdev;
 #[cfg(target_os = "linux")]
-pub use evdev::*;
+pub use evdev::{Gamepads, gamepads, rumble};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod gilrs_pads;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub use gilrs_pads::{Gamepads, gamepads, rumble};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod none;
-#[cfg(not(target_os = "linux"))]
-pub use none::*;
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub use none::{Gamepads, gamepads, rumble};

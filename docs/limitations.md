@@ -17,7 +17,7 @@
 - The NVN layer is Pokopia's: OoT's mesh/task pipelines, AV1 video and other
   Switch 2 graphics features it needs are not implemented. NVN calls the
   Vulkan backend directly; a backend trait (for Metal and Direct3D 12) is
-  still to be introduced. Gamepads work on Linux only (evdev), audio
+  still to be introduced. Gamepads on Windows and macOS (gilrs) are untested on hardware, audio
   output does not resample (the device must accept the guest's rate and
   channel count), and the window runs on its own thread, which macOS does
   not allow.

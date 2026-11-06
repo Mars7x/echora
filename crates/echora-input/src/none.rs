@@ -1,13 +1,7 @@
 //! Platforms without a gamepad backend: there are no pads, and rumble
 //! requests have no effect.
 
-/// One controller's state: held buttons and both sticks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Pad {
-    pub buttons: u64,
-    pub left: (i32, i32),
-    pub right: (i32, i32),
-}
+use crate::pad::Pad;
 
 #[derive(Debug, Default)]
 pub struct Gamepads;

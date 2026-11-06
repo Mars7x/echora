@@ -19,6 +19,7 @@ these separately; preserve their notices when redistributing builds.
 | `cc` (build) | 1.11.0 | MIT OR Apache-2.0 |
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `cpal` | 0.15.3 | Apache-2.0 |
+| `gilrs` | 0.11.2 | Apache-2.0 OR MIT |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
 | `jiff` | 0.2.39 | Unlicense OR MIT |
 | `libc` | 0.2.191 | MIT OR Apache-2.0 |
