@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/echora",
     "crates/echora-aot-tests",
+    "crates/echora-audio",
     "crates/echora-config",
     "crates/echora-content",
     "crates/echora-gpu",
@@ -25,6 +26,7 @@ repository = "https://github.com/Mars7x/echora"
 publish = false
 
 [workspace.dependencies]
+echora-audio = { path = "crates/echora-audio" }
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
 echora-gpu = { path = "crates/echora-gpu" }

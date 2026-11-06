@@ -2,8 +2,7 @@
 //! the system services the game reaches.
 //!
 //! Adapted from pokopia-recomp (same author, GPL-3.0-or-later). Gamepads
-//! come from `echora-input`; `audio` plays through PipeWire's `pw-cat` when
-//! `ECHORA_AUDIO` is set and opens no device otherwise.
+//! come from `echora-input`; audio from `echora-audio` (with `ECHORA_AUDIO`).
 
 // Ported code keeps its original structure; these lints flag style only.
 // Most unwraps convert fixed-length slices to arrays; replacing them is
