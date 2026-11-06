@@ -1764,6 +1764,15 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             "                m.cpu.strip_pac({rd}, m.memory.address_space_end())?;"
         )
         .unwrap(),
+        PacGeneric { rd, rn, rm } => {
+            let value = format!(
+                "{{ let h = ({} ^ ({}).rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15); \
+                 (h ^ (h >> 29)) & 0xffff_ffff_0000_0000 }}",
+                reg(*rn, 64, false),
+                reg(*rm, 64, true)
+            );
+            put(output, *rd, 64, false, &value);
+        }
         PAuthDisabledData | CacheMaintenance => {}
         ReadNzcv { rt } => put(output, *rt, 64, false, "(u64::from(m.cpu.nzcv) << 28)"),
         WriteNzcv { rt } => writeln!(
@@ -2657,6 +2666,16 @@ mod tests {
         assert!(output.contains(&resolved("m.cpu.write_reg(30, 64, false, 0x1004)")));
         assert!(!output.contains("aarch64::decode"));
         assert_eq!(charged(&output), 4);
+    }
+
+    #[test]
+    fn generic_authentication_codes_are_deterministic_upper_halves() {
+        // pacga x2, x19, x17; ret
+        let translation = discover(&[region(&[0x9ad1_3262, 0xd65f_03c0])], &[0x1000], 8).unwrap();
+        assert_eq!(translation.report().unsupported_instructions, 0);
+        let output = emit_rust(&translation);
+        assert!(output.contains("rotate_left(29)"));
+        assert!(output.contains("& 0xffff_ffff_0000_0000"));
     }
 
     #[test]
