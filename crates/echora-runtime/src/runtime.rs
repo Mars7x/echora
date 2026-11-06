@@ -8,7 +8,7 @@ use crate::threads::{ThreadCollection, ThreadCreate, ThreadState};
 pub use echora_guest::Core;
 use serde::Serialize;
 use std::collections::BTreeMap;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 use std::time::Duration;
 
 pub use echora_guest::Trap;
@@ -3752,7 +3752,7 @@ impl Worker {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
     use crate::memory::{

@@ -1,7 +1,7 @@
 //! Integer, flag, call/return, PAuth-hint, budget and SIMD stack programs,
 //! executed natively. Expected values follow pokopia-recomp
 //! `tests/aot_execution.rs`.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used, unsafe_code)]
 
 use echora_aot_tests::*;
@@ -135,12 +135,24 @@ fn calls_across_dispatch_windows() {
 fn unmapped_store_ends_the_process_naming_the_guest_address() {
     if std::env::var_os("ECHORA_FAULT_CHILD").is_some() {
         // No core dump for this intentional crash.
-        let none = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: setrlimit with a valid struct; affects only this process.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) }, 0);
+        #[cfg(target_os = "linux")]
+        {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: setrlimit with a valid struct; affects only this process.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) }, 0);
+        }
+        // No Windows Error Reporting dialog for this intentional crash.
+        #[cfg(windows)]
+        // SAFETY: changes only this process's error mode.
+        unsafe {
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                SEM_NOGPFAULTERRORBOX, SetErrorMode,
+            };
+            SetErrorMode(SEM_NOGPFAULTERRORBOX);
+        }
         let mut m = Machine::new();
         m.memory.unmap_exact(0x8000, 0x2000).unwrap();
         let _ = memory_and_flags::run(&mut m);
