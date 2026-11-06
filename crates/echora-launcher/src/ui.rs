@@ -10,7 +10,7 @@
 //!   every label.
 //! - Semantic dark colours from the author's GTK theme (label, secondary
 //!   label, separator, fills), a lighter neutral for selection, text
-//!   contrast of at least 4.5:1, and the light foreground as the accent.
+//!   contrast of at least 4.5:1, and an ocarina indigo as the one accent.
 //! - Controls at least 32 px tall (40 px in the dock), each with hover,
 //!   pressed and keyboard-focus states. The focus ring shows only while the
 //!   keyboard is being used, as both guidelines ask.
@@ -62,7 +62,7 @@ pub mod text {
 /// Colours as `0xRRGGBBAA`, fixed to the author's GTK theme on every system
 /// (github.com/Mars7x/mygtktheme): its window, view, sidebar, dialog,
 /// popover, card and border colours. Selection is a lighter neutral and the
-/// accent is the theme's light foreground, not its teal.
+/// accent is the indigo of the Ocarina of Time, not the theme's teal.
 pub mod palette {
     /// The window, headers and sheets' content.
     pub const BACKDROP: u32 = 0x101010ff;
@@ -88,10 +88,12 @@ pub mod palette {
     pub const SELECTED: u32 = 0x333333ff;
     /// The thin edge around the window.
     pub const WINDOW_EDGE: u32 = 0xffffff0f;
-    pub const ACCENT: u32 = 0xf0f0f0ff;
-    pub const ACCENT_HOVER: u32 = 0xddddddff;
-    pub const ACCENT_PRESSED: u32 = 0xc8c8c8ff;
-    pub const ON_ACCENT: u32 = 0x101010ff;
+    /// Play, and the main action of the empty screen. 5.5:1 under its
+    /// label.
+    pub const ACCENT: u32 = 0x4458c8ff;
+    pub const ACCENT_HOVER: u32 = 0x4f63d2ff;
+    pub const ACCENT_PRESSED: u32 = 0x3a4cb3ff;
+    pub const ON_ACCENT: u32 = 0xf5f5f5ff;
     pub const FOCUS: u32 = 0xf0f0f0d9;
     pub const SCRIM: u32 = 0x00000099;
     /// Pop-up menus, as the theme's popovers.
