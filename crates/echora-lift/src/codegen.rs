@@ -525,6 +525,18 @@ fn jump_table(
                     }
                     continue;
                 }
+                // `ccmp wN, #imm, #nzcv, cond` before the b.hi / b.hs: when
+                // its condition fails the flags are `nzcv`, and with C set
+                // and Z clear the branch to the default case is taken
+                // either way, so the immediate still bounds the index (main
+                // 0x71008f7e14: cmn w0, #1; ccmp w21, #9, #2, ne; b.hi).
+                if entry_size != 0 && word & 0x7fe0_0c10 == 0x7a40_0800 && word & 0b0110 == 0b0010 {
+                    let limit = u64::from((word >> 16) & 31);
+                    if let Some(cases) = conditional_bound(read_word, cursor, limit) {
+                        compares.push((rn, cases));
+                    }
+                    continue;
+                }
                 if entry_size != 0
                     && written.is_some_and(|register| index_copies.contains(&register))
                 {
@@ -2751,6 +2763,43 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x1020), Some(&3));
         assert!(translation.instructions.contains_key(&0x1028));
+    }
+
+    #[test]
+    fn conditional_compares_bound_jump_tables() {
+        // adrp x8, 0x2000; add x8, x8, #0; ccmp w1, #2, #2, ne; b.hi 0x1024;
+        // adr x9, 0x101c; ldrh w10, [x8, x1, lsl #1]; add x9, x9, x10, lsl
+        // #2; br x9 (at 0x101c), then three RET cases.
+        let words = [
+            0xb000_0008, // adrp x8, 0x2000
+            0x9100_0108, // add x8, x8, #0
+            0x7a42_1822, // ccmp w1, #2, #2, ne
+            0x5400_00a8, // b.hi 0x1020
+            0x1000_00a9, // adr x9, 0x1024
+            0x7861_790a, // ldrh w10, [x8, x1, lsl #1]
+            0x8b0a_0929, // add x9, x9, x10, lsl #2
+            0xd61f_0120, // br x9
+            0xd65f_03c0, // 0x1020: default
+            0xd65f_03c0, // 0x1024: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 1, 0, 2, 0],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
+        assert!(translation.instructions.contains_key(&0x102c));
     }
 
     #[test]

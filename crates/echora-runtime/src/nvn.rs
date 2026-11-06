@@ -1650,9 +1650,13 @@ impl Nvn {
             // section (inferred from the 16-byte stride at the call sites).
             // The stages are kept for shader translation; nothing is
             // compiled yet, so the program always links.
-            "nvnProgramSetShaders" => {
+            // nvnProgramSetShadersExt: the same with 24-byte entries, whose
+            // first two fields are SetShaders' and the third a further u64
+            // the application copies from its shader record (main+0x12a4798).
+            "nvnProgramSetShaders" | "nvnProgramSetShadersExt" => {
                 self.object(this, "Program").map_err(invalid)?;
-                self.set_program_shaders(core, this, x[1], x[2])?;
+                let stride = if name.ends_with("Ext") { 24 } else { 16 };
+                self.set_program_shaders(core, this, x[1], x[2], stride)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1668,7 +1672,7 @@ impl Nvn {
                     .copied()
                     .ok_or_else(|| stop("program builder has no shaders".into()))?;
                 self.initialize(this, "Program", builder).map_err(invalid)?;
-                self.set_program_shaders(core, this, shaders.x[0], shaders.x[1])?;
+                self.set_program_shaders(core, this, shaders.x[0], shaders.x[1], 16)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -2813,7 +2817,8 @@ impl Nvn {
     }
 
     /// SetShaders(count, const NVNshaderData*) on an initialized program.
-    /// Each 16-byte entry is the GPU address of a compiled stage and a
+    /// Each entry (`stride` bytes) starts with the GPU address of a compiled
+    /// stage and a
     /// pointer to its control section (inferred from the 16-byte stride at
     /// the call sites). The stages are kept for shader translation; nothing
     /// is compiled yet, so the program always links.
@@ -2823,6 +2828,7 @@ impl Nvn {
         program: u64,
         count: u64,
         data: u64,
+        stride: u64,
     ) -> Result<(), Trap> {
         let invalid = |message: String| Trap::InvalidState {
             message: format!("nvnProgram shaders: {message}"),
@@ -2833,7 +2839,7 @@ impl Nvn {
         }
         let mut stages = Vec::new();
         for index in 0..u64::from(count) {
-            let entry = data + index * 16;
+            let entry = data + index * stride;
             stages.push(Args {
                 x: [
                     core.memory.read_u64(entry)?,

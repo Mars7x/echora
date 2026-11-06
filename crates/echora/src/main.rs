@@ -318,12 +318,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 input
             };
             println!("report: {}", report.display());
-            let status = std::process::Command::new(&runner)
+            let mut command = std::process::Command::new(&runner);
+            command
                 .arg(&exefs)
                 .arg(budget.to_string())
                 .arg(&report)
                 .env("ECHORA_ROMFS", romfs_path)
-                .env("ECHORA_SETTINGS", host_paths::settings_file()?)
+                .env("ECHORA_SETTINGS", host_paths::settings_file()?);
+            // Saves go under the per-user data directory unless the
+            // environment chooses a save or work directory.
+            if std::env::var_os("ECHORA_SAVE_DIR").is_none()
+                && std::env::var_os("ECHORA_WORK").is_none()
+            {
+                command.env("ECHORA_SAVE_DIR", host_paths::data_dir()?.join("save"));
+            }
+            let status = command
                 .status()
                 .with_context(|| format!("start {}", runner.display()))?;
             if !status.success() {
