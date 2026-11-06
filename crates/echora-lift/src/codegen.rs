@@ -309,6 +309,8 @@ fn low_mask_cases(word: u32) -> Option<u64> {
 
 /// Most cases a recovered jump table may have.
 const MAX_JUMP_TABLE_ENTRIES: u64 = 65536;
+/// Entries read from an unsigned byte table whose bound is not found.
+const UNBOUNDED_BYTE_TABLE_ENTRIES: u64 = 64;
 /// How far back from the BR the table setup is searched, in instructions.
 const JUMP_TABLE_WINDOW: u64 = 160;
 
@@ -549,7 +551,17 @@ fn jump_table(
     } else {
         base?
     };
-    let count = bound(&compares, &index_copies)?;
+    // Unsigned byte entries scaled to instructions can only reach the 256
+    // instructions after the base, nearby code of the same function. With no
+    // bound in the window (a loop counter whose exit test is elsewhere, as at
+    // main 0x71009c93f0), a fixed number of entries is read instead; extra
+    // targets only add block entries.
+    let unbounded = entry_size == 1 && !entry_signed && shift == 2 && !sign_extend32;
+    let (count, exact) = match bound(&compares, &index_copies) {
+        Some(count) => (count, true),
+        None if unbounded => (UNBOUNDED_BYTE_TABLE_ENTRIES, false),
+        None => return None,
+    };
     if count == 0 || count > MAX_JUMP_TABLE_ENTRIES {
         return None;
     }
@@ -566,7 +578,12 @@ fn jump_table(
     };
     let mut targets = Vec::new();
     for index in 0..count {
-        let raw = read_data(table.checked_add(index * entry_size)?, entry_size)?;
+        let Some(raw) = read_data(table.checked_add(index * entry_size)?, entry_size) else {
+            if exact {
+                return None;
+            }
+            break;
+        };
         let bits = entry_size * 8;
         let mut value = if entry_signed && bits < 64 {
             (((raw << (64 - bits)) as i64) >> (64 - bits)) as u64
@@ -579,7 +596,7 @@ fn jump_table(
         let target = base.wrapping_add(value << shift);
         if read_word(target).is_some() {
             targets.push(target);
-        } else {
+        } else if exact {
             return None;
         }
     }
@@ -2715,6 +2732,39 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x1020), Some(&3));
         assert!(translation.instructions.contains_key(&0x1028));
+    }
+
+    #[test]
+    fn unbounded_byte_tables_read_a_fixed_number_of_entries() {
+        // As the low-mask case, but the index (x8) has no bound in the
+        // window: a loop counter tested elsewhere. Entries are read anyway.
+        let words = [
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_0129, // add x9, x9, #0
+            0x1000_008a, // adr x10, 0x1018
+            0x3868_692b, // ldrb w11, [x9, x8]
+            0x8b0b_094a, // add x10, x10, x11, lsl #2
+            0xd61f_0140, // br x10
+            0xd65f_03c0, // 0x1018: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 2, 1],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
+        assert!(translation.instructions.contains_key(&0x1020));
     }
 
     #[test]

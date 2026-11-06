@@ -3457,7 +3457,8 @@ impl Machine {
     }
 
     /// SVC 0x2D UnmapPhysicalMemory: releases physical memory mapped in an
-    /// alias-region range. Mappings must lie wholly inside the range.
+    /// alias-region range, including the covered part of a mapping that
+    /// extends past it.
     fn unmap_physical_memory(&mut self, address: u64, size: u64) -> Result<u64, Trap> {
         if let Some(error) = self.physical_range_error(address, size) {
             return Ok(error);
@@ -3468,17 +3469,52 @@ impl Machine {
             let mapping = self.memory.query(cursor);
             let next = mapping.base.saturating_add(mapping.size);
             if mapping.state != STATE_FREE {
-                if mapping.label != PHYSICAL_LABEL || mapping.base < address || next > end {
+                if mapping.label != PHYSICAL_LABEL
+                    || ((mapping.base < address || next > end)
+                        && (mapping.permissions != READ | WRITE || mapping.attributes != 0))
+                {
                     return Err(Trap::InvalidState {
                         message: format!(
                             "UnmapPhysicalMemory of {address:#x}+{size:#x} covers part of \
-                             {:?} at {:#x}+{:#x}; partial unmaps are not modeled",
-                            mapping.label, mapping.base, mapping.size
+                             {:?} at {:#x}+{:#x} (permissions {:#x}, attributes {:#x}); \
+                             this partial unmap is not modeled",
+                            mapping.label,
+                            mapping.base,
+                            mapping.size,
+                            mapping.permissions,
+                            mapping.attributes
                         ),
                     });
                 }
+                // The memory model unmaps whole mappings: the parts outside
+                // the range are copied out, the mapping is unmapped, and those
+                // parts are mapped again with their contents.
+                let kept: Vec<(u64, u64)> = [
+                    (mapping.base, address.saturating_sub(mapping.base)),
+                    (end, next.saturating_sub(end)),
+                ]
+                .into_iter()
+                .filter(|&(base, size)| size != 0 && base >= mapping.base)
+                .collect();
+                let mut saved = Vec::new();
+                for &(base, size) in &kept {
+                    let mut bytes = vec![0u8; size as usize];
+                    self.memory.read(base, &mut bytes)?;
+                    saved.push(bytes);
+                }
                 self.memory.unmap_exact(mapping.base, mapping.size)?;
                 self.physical_size -= mapping.size;
+                for (&(base, size), bytes) in kept.iter().zip(&saved) {
+                    self.memory
+                        .map(base, size, READ | WRITE, STATE_NORMAL, PHYSICAL_LABEL)?;
+                    self.physical_size += size;
+                    // All-zero pages stay untouched (and non-resident).
+                    for (index, page) in bytes.chunks(PAGE_SIZE as usize).enumerate() {
+                        if page.iter().any(|&byte| byte != 0) {
+                            self.memory.write(base + index as u64 * PAGE_SIZE, page)?;
+                        }
+                    }
+                }
             }
             cursor = next.min(end);
         }
@@ -6570,6 +6606,16 @@ mod tests {
         assert_eq!(used(&mut m), before + 3 * PAGE_SIZE);
         assert_eq!(call(&mut m, 0x2c, alias + 1, PAGE_SIZE), 0xcc01);
         assert_eq!(call(&mut m, 0x2c, alias, 0), 0xca01);
+        // Unmapping the middle page keeps both neighbours and their data.
+        m.memory.write(alias + 2 * PAGE_SIZE, &[9; 8]).unwrap();
+        assert_eq!(call(&mut m, 0x2d, alias + PAGE_SIZE, PAGE_SIZE), 0);
+        assert!(m.memory.read_u64(alias + PAGE_SIZE).is_err());
+        assert_eq!(m.memory.read_u64(alias).unwrap(), 0x0707070707070707);
+        assert_eq!(
+            m.memory.read_u64(alias + 2 * PAGE_SIZE).unwrap(),
+            0x0909090909090909
+        );
+        assert_eq!(used(&mut m), before + 2 * PAGE_SIZE);
         assert_eq!(call(&mut m, 0x2d, alias, 3 * PAGE_SIZE), 0);
         assert!(m.memory.read_u64(alias).is_err());
         assert_eq!(used(&mut m), before);
