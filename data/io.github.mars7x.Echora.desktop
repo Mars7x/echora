@@ -12,5 +12,5 @@ StartupNotify=true
 Actions=Launcher;
 
 [Desktop Action Launcher]
-Name=Open Launcher
+Name=Open launcher
 Exec=echora-launcher --show
