@@ -56,13 +56,17 @@ pub mod text {
     pub const CAPTION: f32 = 12.0;
 }
 
-/// Colours as `0xRRGGBBAA`, from the author's GTK theme
-/// (github.com/Mars7x/mygtktheme), keeping its neutrals and selection
-/// colour; the accent is its light foreground rather than the teal.
+/// Colours as `0xRRGGBBAA`, fixed to the author's GTK theme on every system
+/// (github.com/Mars7x/mygtktheme): its window, view, sidebar, dialog,
+/// popover, card and border colours. Selection is a lighter neutral and the
+/// accent is the theme's light foreground, not its teal.
 pub mod palette {
     /// The window, headers and sheets' content.
     pub const BACKDROP: u32 = 0x101010ff;
-    /// Sheets, as the theme's dialogs.
+    /// The main view inside a sheet with a sidebar (Settings), as the
+    /// theme's views.
+    pub const VIEW: u32 = 0x101010ff;
+    /// Plain sheets (About), as the theme's dialogs.
     pub const SURFACE: u32 = 0x191919ff;
     pub const SIDEBAR: u32 = 0x171717ff;
     /// Floating bars and toasts.
