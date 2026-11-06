@@ -313,6 +313,7 @@ pub fn block_linear_offset_in(
     block * block_size + gob_in_block * GOB_SIZE + within
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

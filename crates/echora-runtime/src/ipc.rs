@@ -224,12 +224,12 @@ fn extent(bytes: &[u8], offset: usize, size: usize, field: &str) -> Result<std::
 
 fn read_u32(bytes: &[u8], offset: usize, field: &str) -> Result<u32> {
     let range = extent(bytes, offset, 4, field)?;
-    Ok(u32::from_le_bytes(bytes[range].try_into().unwrap()))
+    Ok(crate::bytes::le_u32(&bytes[range]))
 }
 
 fn read_u64(bytes: &[u8], offset: usize, field: &str) -> Result<u64> {
     let range = extent(bytes, offset, 8, field)?;
-    Ok(u64::from_le_bytes(bytes[range].try_into().unwrap()))
+    Ok(crate::bytes::le_u64(&bytes[range]))
 }
 
 fn align_16(offset: usize) -> Result<usize> {
@@ -608,7 +608,7 @@ pub fn parse_request_with_domain(bytes: &[u8], is_domain: bool) -> Result<Reques
                     object_count <= MAX_DOMAIN_OBJECTS,
                     "CMIF domain input object count exceeds the supported capacity"
                 );
-                let data_size = u16::from_le_bytes(header[2..4].try_into().unwrap());
+                let data_size = crate::bytes::le_u16(&header[2..4]);
                 let message_offset = frame_offset + CMIF_DOMAIN_HEADER_SIZE;
                 let object_table_offset = message_offset
                     .checked_add(usize::from(data_size))
@@ -632,10 +632,8 @@ pub fn parse_request_with_domain(bytes: &[u8], is_domain: bool) -> Result<Reques
                 );
                 if trailing >= 4 {
                     for index in 0..list_count.min(trailing / 2) {
-                        out_pointer_sizes.push(u16::from_le_bytes(
-                            bytes[object_table_end + index * 2..object_table_end + index * 2 + 2]
-                                .try_into()
-                                .unwrap(),
+                        out_pointer_sizes.push(crate::bytes::le_u16(
+                            &bytes[object_table_end + index * 2..object_table_end + index * 2 + 2],
                         ));
                     }
                 }
@@ -1171,6 +1169,7 @@ pub fn build_domain_close_reply(request: &Request, original_bytes: &[u8]) -> Res
     })
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,7 +1179,7 @@ mod tests {
     }
 
     fn get_u32(bytes: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        crate::bytes::le_u32(&bytes[offset..offset + 4])
     }
 
     fn tipc(command: u16, arguments: &[u8], pid: Option<u64>) -> Vec<u8> {
@@ -1873,44 +1872,20 @@ mod tests {
     fn copy_handle_pair_replies_carry_both_handles() {
         let ordinary = parse_request(&cmif(4, 91, &[], None)).unwrap();
         let reply = build_copy_handle_pair_reply(&ordinary, [0x345, 0x346], 0x1234).unwrap();
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[4..8].try_into().unwrap()),
-            0x8000_0008
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[8..12].try_into().unwrap()),
-            2 << 1
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[12..16].try_into().unwrap()),
-            0x345
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[16..20].try_into().unwrap()),
-            0x346
-        );
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[4..8]), 0x8000_0008);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[8..12]), 2 << 1);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[12..16]), 0x345);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[16..20]), 0x346);
         assert_eq!(&reply.bytes[32..36], b"SFCO");
         assert_eq!(reply.result_offset, Some(40));
 
         let domain =
             parse_request_with_domain(&domain_send(6, 91, &[], None, 7, &[]), true).unwrap();
         let reply = build_copy_handle_pair_reply(&domain, [0x345, 0x346], 0x1234).unwrap();
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[4..8].try_into().unwrap()),
-            0x8000_000c
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[8..12].try_into().unwrap()),
-            2 << 1
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[16..20].try_into().unwrap()),
-            0x346
-        );
-        assert_eq!(
-            u32::from_le_bytes(reply.bytes[32..36].try_into().unwrap()),
-            0
-        );
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[4..8]), 0x8000_000c);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[8..12]), 2 << 1);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[16..20]), 0x346);
+        assert_eq!(crate::bytes::le_u32(&reply.bytes[32..36]), 0);
         assert_eq!(&reply.bytes[48..52], b"SFCO");
         assert_eq!(reply.result_offset, Some(56));
     }

@@ -189,7 +189,7 @@ impl LocalLogSink {
         }
 
         // The fixed header has been checked before any of these reads.
-        let payload_size = u32::from_le_bytes(packet[20..24].try_into().unwrap());
+        let payload_size = crate::bytes::le_u32(&packet[20..24]);
         let expected_length = usize::try_from(payload_size)
             .ok()
             .and_then(|size| LOG_PACKET_HEADER_SIZE.checked_add(size));
@@ -243,8 +243,8 @@ impl LocalLogSink {
             .context("cannot allocate local log record")?;
         let record = LogRecord {
             process_id: logger.process_id,
-            untrusted_packet_process_id: u64::from_le_bytes(packet[0..8].try_into().unwrap()),
-            thread_id: u64::from_le_bytes(packet[8..16].try_into().unwrap()),
+            untrusted_packet_process_id: crate::bytes::le_u64(&packet[0..8]),
+            thread_id: crate::bytes::le_u64(&packet[8..16]),
             flags: packet[16],
             reserved: packet[17],
             severity: packet[18],
@@ -299,6 +299,7 @@ impl LocalLogSink {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

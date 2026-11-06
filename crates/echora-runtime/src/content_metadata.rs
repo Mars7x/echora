@@ -536,6 +536,7 @@ pub fn parse_cnmt(bytes: &[u8]) -> Result<ContentMeta> {
     })
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

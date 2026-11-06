@@ -316,7 +316,11 @@ impl VirtualRomfs {
             for &file in &dir.files {
                 file_offsets[file] = cursor;
                 file_order.push(file);
-                let name = sorted[file].path.rsplit('/').next().unwrap();
+                let name = sorted[file]
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .expect("rsplit yields at least one part");
                 cursor += 0x20 + align(name.len() as u64, 4) as u32;
             }
         }
@@ -346,7 +350,10 @@ impl VirtualRomfs {
                 EMPTY
             } else {
                 let siblings = &dirs[dir.parent].children;
-                let position = siblings.iter().position(|&child| child == id).unwrap();
+                let position = siblings
+                    .iter()
+                    .position(|&child| child == id)
+                    .expect("an entry is among its parent's children");
                 siblings
                     .get(position + 1)
                     .map_or(EMPTY, |&next| dir_offsets[next])
@@ -367,7 +374,11 @@ impl VirtualRomfs {
             for (position, &file) in dir.files.iter().enumerate() {
                 let at = file_offsets[file] as usize;
                 let parent = dir_offsets[dir_id];
-                let name = sorted[file].path.rsplit('/').next().unwrap();
+                let name = sorted[file]
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .expect("rsplit yields at least one part");
                 let next = dir
                     .files
                     .get(position + 1)
@@ -517,6 +528,7 @@ pub fn list_directory(root: &Path) -> Result<Vec<ListedFile>> {
     Ok(files)
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

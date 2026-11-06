@@ -132,9 +132,15 @@ impl MutexWaits {
             current = self.waiting.get(&id).map(|waiter| waiter.owner);
             if current.is_some() {
                 let order = self.take_order()?;
-                self.waiting.get_mut(&id).unwrap().order = order;
+                self.waiting
+                    .get_mut(&id)
+                    .expect("id is a current waiter")
+                    .order = order;
             }
-            priorities.get_mut(&id).unwrap().effective = next_priority;
+            priorities
+                .get_mut(&id)
+                .expect("every waiter has a priority entry")
+                .effective = next_priority;
         }
         Ok(())
     }
@@ -224,7 +230,10 @@ impl MutexWaits {
         }
 
         let mut state = self.clone();
-        let selected_waiter = state.waiting.remove(&selected).unwrap();
+        let selected_waiter = state
+            .waiting
+            .remove(&selected)
+            .expect("the selected thread is waiting");
         state.returns.insert(
             selected,
             MutexReturn {
@@ -586,7 +595,10 @@ impl ZeroHandleWaits {
         deadline: std::time::Instant,
     ) -> Result<(), Trap> {
         self.begin_objects(id, timeout_ns.max(1), Vec::new(), Some(deadline))?;
-        self.waiting.get_mut(&id).unwrap().sleep = true;
+        self.waiting
+            .get_mut(&id)
+            .expect("id is a current waiter")
+            .sleep = true;
         Ok(())
     }
 
@@ -725,6 +737,7 @@ impl ZeroHandleWaits {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
@@ -1015,6 +1028,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod zero_handle_tests {
     use super::*;

@@ -365,7 +365,7 @@ impl Machine {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)?;
         self.random_entropy = Some(std::array::from_fn(|index| {
-            u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
+            crate::bytes::le_u64(&bytes[index * 8..index * 8 + 8])
         }));
         Ok(())
     }
@@ -1914,7 +1914,7 @@ impl Machine {
                 // A branch to a host function: run it with the AArch64
                 // calling convention, then return to the link register.
                 self.flush_core_counts()?;
-                let entry = self.nvn.entry(pc).unwrap();
+                let entry = self.nvn.entry(pc).expect("has_entry(pc) was checked above");
                 self.call_nvn(entry)?;
                 return self.finish_host_call();
             }
@@ -3553,7 +3553,10 @@ impl Worker {
                 };
                 let thread = self.core.current_thread_id;
                 let waited = std::time::Instant::now();
-                let mut machine = shared.machine.lock().unwrap();
+                let mut machine = shared
+                    .machine
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let held = std::time::Instant::now();
                 if shared.stop.load(Ordering::Relaxed) {
                     return (self.core, None);
@@ -3574,7 +3577,7 @@ impl Worker {
                     machine = shared
                         .nvn_back
                         .wait_while(machine, |machine| machine.nvn_away)
-                        .unwrap();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 let submit =
                     host_call.is_some_and(|pc| machine.nvn.entry_is(pc, "nvnQueueSubmitCommands"));
@@ -3614,7 +3617,10 @@ impl Worker {
                 }
             }
             // Parked: wait for a runnable thread no other worker runs.
-            let mut machine = shared.machine.lock().unwrap();
+            let mut machine = shared
+                .machine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             machine.parked_workers += 1;
             loop {
                 if shared.stop.load(Ordering::Relaxed) {
@@ -3651,7 +3657,11 @@ impl Worker {
                             .map(|at| at.saturating_duration_since(std::time::Instant::now()))
                             .unwrap_or(PARKED_RECHECK)
                             .min(PARKED_RECHECK);
-                        machine = shared.wake.wait_timeout(machine, wait).unwrap().0;
+                        machine = shared
+                            .wake
+                            .wait_timeout(machine, wait)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
                     }
                     Err(trap) => {
                         machine.parked_workers -= 1;
@@ -3703,7 +3713,10 @@ impl Worker {
             *nvn.call_microseconds.entry(NAME.into()).or_default() +=
                 started.elapsed().as_micros() as u64;
         }
-        let mut machine = shared.machine.lock().unwrap();
+        let mut machine = shared
+            .machine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         machine.nvn = nvn;
         machine.nvn_away = false;
         shared.nvn_back.notify_all();
@@ -3759,6 +3772,7 @@ impl Worker {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
@@ -5948,7 +5962,7 @@ mod tests {
             reply
         }
         fn word(bytes: &[u8], offset: usize) -> u32 {
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            crate::bytes::le_u32(&bytes[offset..offset + 4])
         }
         fn command(id: u32) -> [u8; TLS_MESSAGE_BUFFER_SIZE] {
             packet(&[(0, 4), (4, 8), (16, u32::from_le_bytes(*b"SFCI")), (24, id)])

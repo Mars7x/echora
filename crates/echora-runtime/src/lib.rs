@@ -8,10 +8,11 @@
 // Ported code keeps its original structure; these lints flag style only.
 // Most unwraps convert fixed-length slices to arrays; replacing them is
 // tracked as cleanup in docs/limitations.md.
-#![allow(missing_debug_implementations, clippy::all, clippy::unwrap_used)]
+#![allow(missing_debug_implementations, clippy::all)]
 
 pub mod audio;
 pub mod bootstrap;
+mod bytes;
 pub mod content;
 pub mod content_metadata;
 pub mod display;
@@ -23,14 +24,18 @@ pub mod ipc;
 pub mod loader;
 pub mod logging;
 pub mod npdm;
+#[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod nvn;
+#[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod nvn_format;
 pub mod romfs;
 pub mod runtime;
+#[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod sass;
 pub mod services;
 mod synchronization;
 mod threads;
+#[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod window;
 
 pub use echora_guest::{cpu, memory};

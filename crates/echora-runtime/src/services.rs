@@ -1125,7 +1125,7 @@ fn service_name(arguments: &[u8]) -> Result<String, Trap> {
             "SM service name is not a nonempty zero-padded ASCII name",
         ));
     }
-    Ok(String::from_utf8(arguments[..length].to_vec()).unwrap())
+    Ok(String::from_utf8(arguments[..length].to_vec()).expect("checked to be ASCII above"))
 }
 
 struct Call<'a> {
@@ -1466,7 +1466,7 @@ impl Services {
         use std::fmt::Write;
         let mut tls_snapshot_hex = String::with_capacity(TLS_MESSAGE_BUFFER_SIZE * 2);
         for byte in bytes {
-            write!(tls_snapshot_hex, "{byte:02x}").unwrap();
+            write!(tls_snapshot_hex, "{byte:02x}").expect("writing to a String cannot fail");
         }
         self.private_parse_failures.push(PrivateIpcParseFailure {
             pc,
@@ -2145,7 +2145,7 @@ impl Services {
                         "lifecycle endpoint owner must match the trusted bootstrap main application",
                     ));
                 }
-                let mode = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let mode = crate::bytes::le_u32(&call.request.arguments[..4]);
                 if mode > 2 {
                     return Err(call.unsupported(
                         "appletOE:common_state_getter",
@@ -2265,7 +2265,7 @@ impl Services {
                         "application-functions owner must match the trusted main application",
                     ));
                 }
-                let kind = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let kind = crate::bytes::le_u32(&call.request.arguments[..4]);
                 match kind {
                     2 if !self.preselected_user_popped => {
                         let mut data = vec![0u8; 0x88];
@@ -2478,7 +2478,7 @@ impl Services {
             // is recorded for the report; termination itself is not modeled.
             ServiceObject::ApplicationFunctions { .. } if call.request.command_id == 22 => {
                 call.shape(4, false, false)?;
-                let result = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let result = crate::bytes::le_u32(&call.request.arguments[..4]);
                 self.terminate_result = Some(result);
                 call.reply(0, None, APPLICATION_FUNCTIONS_INTERFACE_ID, &[])?;
                 Ok(Outcome::success())
@@ -2631,7 +2631,7 @@ impl Services {
             }
             (ServiceObject::AppletStorageAccessor { data }, 11) => {
                 call.shape_output(8, false)?;
-                let offset = i64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let offset = crate::bytes::le_i64(&call.request.arguments[..8]);
                 let (address, size) = call.output_buffer()?;
                 let in_range = u64::try_from(offset)
                     .ok()
@@ -2938,7 +2938,7 @@ impl Services {
             // from the guest; yuzu audio_renderer_manager.cpp names the fields).
             (ServiceObject::AudioRendererManager, 4) => {
                 call.shape(16, false, false)?;
-                let revision = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let revision = crate::bytes::le_u32(&call.request.arguments[..4]);
                 self.reply_new_object(
                     call,
                     ServiceObject::AudioDevice { revision },
@@ -3006,18 +3006,21 @@ impl Services {
                     return Err(call.unsupported(object.service(), "unexpected OpenAudioOut shape"));
                 }
                 let arguments = &request.arguments;
-                let sample_rate = match u32::from_le_bytes(arguments[..4].try_into().unwrap()) {
+                let sample_rate = match crate::bytes::le_u32(&arguments[..4]) {
                     0 => 48_000,
                     rate => rate,
                 };
-                let channels = match u16::from_le_bytes(arguments[4..6].try_into().unwrap()) {
+                let channels = match crate::bytes::le_u16(&arguments[4..6]) {
                     0 => 2,
                     count => u32::from(count),
                 };
                 if sample_rate != 48_000 || !matches!(channels, 1 | 2 | 6) {
                     return Err(call.unsupported(object.service(), "unsupported audio-out format"));
                 }
-                let input = request.input_buffer.clone().unwrap();
+                let input = request
+                    .input_buffer
+                    .clone()
+                    .expect("input buffer presence checked by the request shape");
                 let (out_address, out_size, _) = request.receive_buffers[0];
                 let mut name = vec![0u8; input.size.min(0x100) as usize];
                 call.memory.read(input.address, &mut name)?;
@@ -3070,13 +3073,17 @@ impl Services {
             // so the size is a local value: 64 KiB per stream plus 4 KiB.
             (ServiceObject::OpusDecoderManager, 9) => {
                 call.shape(0, false, true)?;
-                let input = call.request.input_buffer.clone().unwrap();
+                let input = call
+                    .request
+                    .input_buffer
+                    .clone()
+                    .expect("input buffer presence checked by the request shape");
                 if input.size < 16 {
                     return Err(call.unsupported(object.service(), "short Opus parameters"));
                 }
                 let mut parameters = [0u8; 16];
                 call.memory.read(input.address, &mut parameters)?;
-                let streams = u32::from_le_bytes(parameters[8..12].try_into().unwrap());
+                let streams = crate::bytes::le_u32(&parameters[8..12]);
                 if streams == 0 || streams > 255 {
                     return Err(call.unsupported(object.service(), "invalid Opus stream count"));
                 }
@@ -3331,8 +3338,7 @@ impl Services {
             (ServiceObject::HidServer, 201) => {
                 let arguments = &call.request.arguments;
                 if arguments.len() >= 20 {
-                    let float =
-                        |at: usize| f32::from_le_bytes(arguments[at..at + 4].try_into().unwrap());
+                    let float = |at: usize| crate::bytes::le_f32(&arguments[at..at + 4]);
                     crate::input::rumble(vibration_device(&arguments[..4]), float(4), float(12));
                 }
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
@@ -3352,8 +3358,7 @@ impl Services {
                     call.memory.read(values.address, &mut value_bytes)?;
                     for index in 0..count {
                         let value = &value_bytes[index * 16..];
-                        let float =
-                            |at: usize| f32::from_le_bytes(value[at..at + 4].try_into().unwrap());
+                        let float = |at: usize| crate::bytes::le_f32(&value[at..at + 4]);
                         crate::input::rumble(
                             vibration_device(&handle_bytes[index * 4..index * 4 + 4]),
                             float(0),
@@ -3768,7 +3773,7 @@ impl Services {
         let word = |index: usize| -> Option<u32> {
             arguments
                 .get(index * 4..index * 4 + 4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .map(|bytes| crate::bytes::le_u32(bytes))
         };
         // (sample_rate, channels) from inline OpusParameters(Ex) or the X
         // buffer's OpusMultiStreamParameters(Ex) (which start the same way).
@@ -3782,8 +3787,8 @@ impl Services {
                 let mut bytes = [0u8; 8];
                 call.memory.read(input.address, &mut bytes)?;
                 Ok((
-                    u32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                    u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+                    crate::bytes::le_u32(&bytes[..4]),
+                    crate::bytes::le_u32(&bytes[4..]),
                 ))
             } else {
                 match (word(0), word(1)) {
@@ -3854,7 +3859,7 @@ impl Services {
             return Err(call.unsupported(SERVICE, "short Opus packet header"));
         }
         call.memory.read(input.address, &mut header)?;
-        let size = u64::from(u32::from_be_bytes(header[..4].try_into().unwrap()));
+        let size = u64::from(crate::bytes::be_u32(&header[..4]));
         if size == 0 || 8 + size > input.size {
             return Err(call.unsupported(SERVICE, "Opus packet exceeds its input buffer"));
         }
@@ -3939,18 +3944,22 @@ impl Services {
             // u64 offset}; `size` bytes of PCM16 interleaved frames.
             3 | 7 => {
                 call.shape(8, false, true)?;
-                let tag = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
-                let input = call.request.input_buffer.clone().unwrap();
+                let tag = crate::bytes::le_u64(&call.request.arguments[..8]);
+                let input = call
+                    .request
+                    .input_buffer
+                    .clone()
+                    .expect("input buffer presence checked by the request shape");
                 if input.size < 0x28 {
                     return Err(call.unsupported(SERVICE, "short AudioOutBuffer"));
                 }
                 let mut record = [0u8; 0x28];
                 call.memory.read(input.address, &mut record)?;
-                let size = u64::from_le_bytes(record[0x18..0x20].try_into().unwrap());
+                let size = crate::bytes::le_u64(&record[0x18..0x20]);
                 if let Some(host) = &self.audio_outs[id].host {
                     // PCM at samples + offset; a bounded copy per buffer.
-                    let samples = u64::from_le_bytes(record[0x08..0x10].try_into().unwrap());
-                    let offset = u64::from_le_bytes(record[0x20..0x28].try_into().unwrap());
+                    let samples = crate::bytes::le_u64(&record[0x08..0x10]);
+                    let offset = crate::bytes::le_u64(&record[0x20..0x28]);
                     let mut pcm = vec![0u8; size.min(1 << 20) as usize];
                     if call
                         .memory
@@ -4052,7 +4061,7 @@ impl Services {
             // ContainsAudioOutBuffer(u64 tag) -> bool.
             6 => {
                 call.shape(8, false, false)?;
-                let tag = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let tag = crate::bytes::le_u64(&call.request.arguments[..8]);
                 let out = &self.audio_outs[id];
                 let present = out.queue.iter().any(|(queued, _)| *queued == tag)
                     || out.released.contains(&tag);
@@ -4094,7 +4103,7 @@ impl Services {
             // SetAudioOutVolume(f32) / GetAudioOutVolume -> f32.
             12 => {
                 call.shape(4, false, false)?;
-                let volume = f32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let volume = crate::bytes::le_f32(&call.request.arguments[..4]);
                 self.audio_outs[id].volume = volume;
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
             }
@@ -4183,7 +4192,7 @@ impl Services {
             }
             (ServiceObject::TimeZone, 100 | 101) => {
                 call.shape(8, false, command == 100)?;
-                let time = i64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let time = crate::bytes::le_i64(&call.request.arguments[..8]);
                 call.reply(0, None, AOC_INTERFACE_ID, &local_calendar_time(time))?;
                 Ok(Outcome::success())
             }
@@ -4608,9 +4617,7 @@ impl Services {
             // no remote memory, so success only advances the session phase.
             4 => {
                 call.shape_with_copies(48, false, false, 1)?;
-                let word = |at: usize| {
-                    u64::from_le_bytes(call.request.arguments[at..at + 8].try_into().unwrap())
-                };
+                let word = |at: usize| crate::bytes::le_u64(&call.request.arguments[at..at + 8]);
                 let (aruid, flags) = (word(0), word(8));
                 let parameters = [word(16), word(24), word(32), word(40)];
                 if call.request.copy_handles[0] != CURRENT_PROCESS_PSEUDO_HANDLE {
@@ -4768,10 +4775,8 @@ impl Services {
             204 => {
                 call.shape_with_copies(24, false, false, 2)?;
                 let arguments = &call.request.arguments;
-                let word =
-                    |at: usize| u32::from_le_bytes(arguments[at..at + 4].try_into().unwrap());
-                let quad =
-                    |at: usize| u64::from_le_bytes(arguments[at..at + 8].try_into().unwrap());
+                let word = |at: usize| crate::bytes::le_u32(&arguments[at..at + 4]);
+                let quad = |at: usize| crate::bytes::le_u64(&arguments[at..at + 8]);
                 if (word(0), word(4), quad(8), quad(16)) != (1, 0x1ff, 0x1000, 0x2000) {
                     return Err(call.unsupported(
                         SERVICE,
@@ -4880,7 +4885,7 @@ impl Services {
             // Requires CreateDisplayContext (301).
             305 => {
                 call.shape(8, false, false)?;
-                let version = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let version = crate::bytes::le_u64(&call.request.arguments[..8]);
                 if !matches!(version, 0x3_0001_0000 | 0x3_0002_0000) {
                     return Err(call.unsupported(
                         SERVICE,
@@ -4912,7 +4917,7 @@ impl Services {
             // documented 401/402 GPU-context pair.
             497 => {
                 call.shape(8, false, false)?;
-                let version = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let version = crate::bytes::le_u64(&call.request.arguments[..8]);
                 if !matches!(version, 2 | 4) {
                     return Err(call.unsupported(SERVICE, "GPU session version is not 2 or 4"));
                 }
@@ -4939,7 +4944,7 @@ impl Services {
             // Same policy as Eden 1a6d7d4; reported as provisional.
             115 => {
                 call.shape(8, false, false)?;
-                let requested = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
+                let requested = crate::bytes::le_u64(&call.request.arguments[..8]);
                 if !matches!(requested, 0 | 2)
                     || self.graphics_supervisor_phase != Some(GraphicsSupervisorPhase::Ready)
                 {
@@ -4974,7 +4979,7 @@ impl Services {
             .ok_or_else(|| invalid("GPU session requires the main application"))?;
         let event_id_argument = |call: &Call<'_>| -> Result<u32, Trap> {
             call.shape(4, false, false)?;
-            let id = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+            let id = crate::bytes::le_u32(&call.request.arguments[..4]);
             if id > GPU_NOTIFICATION_MAX_ID {
                 return Err(call.unsupported(SERVICE, "event ID outside GetEventIdRange"));
             }
@@ -5104,8 +5109,8 @@ impl Services {
                 call.shape(72, false, false)?;
                 let arguments = &call.request.arguments;
                 let attribute = &arguments[8..];
-                let program = u64::from_le_bytes(attribute[0..8].try_into().unwrap());
-                let user = u128::from_le_bytes(attribute[8..24].try_into().unwrap());
+                let program = crate::bytes::le_u64(&attribute[0..8]);
+                let user = crate::bytes::le_u128(&attribute[8..24]);
                 let (kind, index) = (
                     attribute[32],
                     u16::from_le_bytes([attribute[34], attribute[35]]),
@@ -5145,7 +5150,7 @@ impl Services {
             // default. No access log is produced here; the mode is stored.
             1004 => {
                 call.shape(4, false, false)?;
-                let mode = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let mode = crate::bytes::le_u32(&call.request.arguments[..4]);
                 call.reply(0, None, FSP_INTERFACE_ID, &[])?;
                 self.fs_access_log_mode = mode;
                 Ok(Outcome::success())
@@ -5188,18 +5193,10 @@ impl Services {
             Ok(fs::guest_path(&bytes))
         };
         let word = |call: &Call<'_>, offset: usize| {
-            u32::from_le_bytes(
-                call.request.arguments[offset..offset + 4]
-                    .try_into()
-                    .unwrap(),
-            )
+            crate::bytes::le_u32(&call.request.arguments[offset..offset + 4])
         };
         let dword = |call: &Call<'_>, offset: usize| {
-            u64::from_le_bytes(
-                call.request.arguments[offset..offset + 8]
-                    .try_into()
-                    .unwrap(),
-            )
+            crate::bytes::le_u64(&call.request.arguments[offset..offset + 8])
         };
         match (object, command) {
             (ServiceObject::FileSystem { id }, _) => {
@@ -5323,7 +5320,11 @@ impl Services {
                     1 => {
                         call.shape(24, false, true)?;
                         let (offset, size) = (dword(call, 8), dword(call, 16));
-                        let input = call.request.input_buffer.clone().unwrap();
+                        let input = call
+                            .request
+                            .input_buffer
+                            .clone()
+                            .expect("input buffer presence checked by the request shape");
                         let mut bytes = vec![0u8; size.min(input.size) as usize];
                         call.memory.read(input.address, &mut bytes)?;
                         match fs::write_at(&host, offset, &bytes) {
@@ -5410,8 +5411,8 @@ impl Services {
             // Read(u64 offset, u64 size) into one output buffer.
             0 => {
                 call.shape_output(16, false)?;
-                let offset = u64::from_le_bytes(call.request.arguments[..8].try_into().unwrap());
-                let size = u64::from_le_bytes(call.request.arguments[8..16].try_into().unwrap());
+                let offset = crate::bytes::le_u64(&call.request.arguments[..8]);
+                let size = crate::bytes::le_u64(&call.request.arguments[8..16]);
                 let (address, capacity) = call.output_buffer()?;
                 if size > capacity {
                     return Err(call.unsupported(SERVICE, "read larger than its output buffer"));
@@ -5495,7 +5496,7 @@ impl Services {
             // most the value from command 1).
             21 => {
                 call.shape(4, false, false)?;
-                let count = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let count = crate::bytes::le_u32(&call.request.arguments[..4]);
                 if count > SYNCPOINT_MAX_EVENT_INDEX {
                     return Err(call.unsupported(SERVICE, "event count above the maximum"));
                 }
@@ -5537,7 +5538,7 @@ impl Services {
                     ));
                 }
                 if arguments.len() == 16 {
-                    let aruid = u64::from_le_bytes(arguments[8..16].try_into().unwrap());
+                    let aruid = crate::bytes::le_u64(&arguments[8..16]);
                     if aruid != application.process_id {
                         return Err(
                             call.unsupported(SERVICE, "margin aruid is not the application's")
@@ -5726,7 +5727,7 @@ impl Services {
 
     fn open_application_proxy(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
         call.shape_with_copies(16, true, false, 1)?;
-        let flags = u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+        let flags = crate::bytes::le_u32(&call.request.arguments[..4]);
         if flags != 0 {
             return Err(call.unsupported(
                 "appletOE",
@@ -5878,7 +5879,11 @@ impl Services {
         match call.request.command_id {
             0 => {
                 call.shape(0, false, true)?;
-                let buffer = call.request.input_buffer.as_ref().unwrap();
+                let buffer = call
+                    .request
+                    .input_buffer
+                    .as_ref()
+                    .expect("input buffer presence checked by the request shape");
                 if buffer.kind != InputBufferKind::MapAlias {
                     return Err(call.unsupported(
                         "lm:logger",
@@ -5916,8 +5921,7 @@ impl Services {
             }
             1 => {
                 call.shape(4, false, false)?;
-                let destination =
-                    u32::from_le_bytes(call.request.arguments[..4].try_into().unwrap());
+                let destination = crate::bytes::le_u32(&call.request.arguments[..4]);
                 call.reply(0, None, LOGGER_INTERFACE_ID, &[])?;
                 self.log_sink.set_destination(destination);
                 Ok(Outcome::success())
@@ -6139,7 +6143,9 @@ impl Services {
                 "snapshot_scope":"full_already_read_tls_message_buffer_including_potentially_stale_tail",
             },
         });
-        let target = report.as_object_mut().unwrap();
+        let target = report
+            .as_object_mut()
+            .expect("the report is built as a JSON object");
         for part in [
             application_report,
             graphics_report,
@@ -6265,6 +6271,7 @@ fn vibration_device(handle: &[u8]) -> u32 {
     u32::from(handle[1]) << 8 | u32::from(handle[2])
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
@@ -7067,8 +7074,8 @@ mod tests {
     fn utc_calendar_time_converts_posix_seconds() {
         let out = super::utc_calendar_time(1_709_210_096); // 2024-02-29 12:34:56 Thu
         assert_eq!(&out[..7], &[0xe8, 0x07, 2, 29, 12, 34, 56]);
-        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
-        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 59);
+        assert_eq!(crate::bytes::le_u32(&out[8..12]), 4);
+        assert_eq!(crate::bytes::le_u32(&out[12..16]), 59);
         for time in [0, 951_782_400, 1_709_210_096, 4_102_444_799] {
             let calendar = super::utc_calendar_time(time);
             assert_eq!(
@@ -7078,7 +7085,7 @@ mod tests {
         }
         let epoch = super::utc_calendar_time(0);
         assert_eq!(&epoch[..7], &[0xb2, 0x07, 1, 1, 0, 0, 0]);
-        assert_eq!(u32::from_le_bytes(epoch[8..12].try_into().unwrap()), 4);
+        assert_eq!(crate::bytes::le_u32(&epoch[8..12]), 4);
     }
 
     #[test]
@@ -7091,7 +7098,7 @@ mod tests {
             (object.size, object.permission, bytes.len()),
             (0x1000, 1, 0x1000)
         );
-        let i64_at = |at: usize| i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let i64_at = |at: usize| crate::bytes::le_i64(&bytes[at..at + 8]);
         // Counters are zero, so slot 0 of every field is the live value.
         for counter in [0x00usize, 0x38, 0x80, 0xc8, 0xd0] {
             assert_eq!(&bytes[counter..counter + 4], &[0; 4]);

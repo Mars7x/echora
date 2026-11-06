@@ -29,19 +29,19 @@ pub(crate) fn checked_range(
 
 pub(crate) fn u32_at(bytes: &[u8], offset: usize, what: &str) -> Result<u32> {
     let range = checked_range(offset as u64, 4, bytes.len() as u64, what)?;
-    Ok(u32::from_le_bytes(bytes[range].try_into().unwrap()))
+    Ok(crate::bytes::le_u32(&bytes[range]))
 }
 
 pub(crate) fn u64_at(bytes: &[u8], offset: usize, what: &str) -> Result<u64> {
     let range = checked_range(offset as u64, 8, bytes.len() as u64, what)?;
-    Ok(u64::from_le_bytes(bytes[range].try_into().unwrap()))
+    Ok(crate::bytes::le_u64(&bytes[range]))
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        write!(&mut output, "{byte:02x}").unwrap();
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
     }
     output
 }
