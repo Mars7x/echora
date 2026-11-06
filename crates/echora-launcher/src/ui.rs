@@ -45,8 +45,6 @@ pub mod radius {
     pub const CARD: f32 = 10.0;
     pub const CONTROL: f32 = 8.0;
     pub const INNER: f32 = 6.0;
-    /// Fully round: pills and circles.
-    pub const FULL: f32 = f32::INFINITY;
 }
 
 /// The type scale, in pixels.
@@ -131,7 +129,7 @@ impl RingShape {
     const APPEAR_GROWTH: f32 = 6.0;
 
     /// The ring around a control laid out in `bounds` with corners rounded
-    /// `corner` design pixels ([`radius::FULL`] for pills and circles).
+    /// `corner` design pixels (at most half its height).
     pub fn around(bounds: Bounds<Pixels>, corner: f32, window: &Window) -> Self {
         let scale = window.rem_size() / px(16.0);
         let corner = (px(corner) * scale).min(bounds.size.height.min(bounds.size.width) / 2.0);
@@ -531,6 +529,22 @@ pub fn row(leading: Option<AnyElement>, titles: Div, trailing: Option<AnyElement
         .children(leading)
         .child(titles)
         .children(trailing)
+}
+
+/// A list row that is one switch, as libadwaita's switch rows: the whole
+/// row is the control, hovered, pressed and focused as one, with the switch
+/// at its end showing the state. In a group of its own, the row fills the
+/// group's rounded card.
+pub fn switch_row(id: &'static str, titles: Div, on: bool, animate: bool) -> Stateful<Div> {
+    row(
+        None,
+        titles,
+        Some(switch(id, on, animate).into_any_element()),
+    )
+    .id((id, 0usize))
+    .rounded(u(radius::CARD))
+    .hover(|style| style.bg(color(palette::FILL)))
+    .active(|style| style.bg(color(palette::FILL_HOVER)))
 }
 
 /// A thin progress bar; `fraction` runs from 0 to 1.
