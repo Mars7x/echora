@@ -1210,6 +1210,26 @@ impl Nvn {
             }
             // nvnSamplerInitialize(NVNsampler*, const NVNsamplerBuilder*) ->
             // NVNboolean.
+            // nvnEventSignal(NVNevent*, mode, u32 value) from the CPU and
+            // nvnEventGetValue(const NVNevent*) -> u32: the event is the u32
+            // at its storage (memory pool, offset). Mode 0 writes the value
+            // and 1 adds it (inferred; the application signals mode 0 with
+            // value 0 at main+0x2cb41c).
+            "nvnEventSignal" | "nvnEventGetValue" => {
+                let address = self.event_address(this).map_err(invalid)?;
+                if name == "nvnEventGetValue" {
+                    core.cpu.regs[0] = u64::from(core.memory.read_u32(address)?);
+                    return Ok(true);
+                }
+                let (mode, value) = (x[1] as u32, x[2] as u32);
+                let new = match mode {
+                    0 => value,
+                    1 => core.memory.read_u32(address)?.wrapping_add(value),
+                    _ => return Err(stop(format!("event signal mode {mode} is not modeled"))),
+                };
+                core.memory.write_u32(address, new)?;
+                return Ok(true);
+            }
             // nvnEventInitialize(NVNevent*, const NVNeventBuilder*) ->
             // NVNboolean. The builder's storage (memory pool, offset) is
             // recorded; signal and wait calls are modeled as they appear.
@@ -2386,11 +2406,71 @@ impl Nvn {
                     }
                     return Ok(());
                 }
+                // WaitEvent(event, mode, u32 value): the GPU waits until the
+                // event satisfies the comparison (the application waits mode
+                // 0 for 1 on an event it set to 0, frame pacing). Queues run
+                // at submission and cannot stall, so the wait is evaluated
+                // (mode 0 as equal, 1 as at least, inferred) and execution
+                // continues; unsatisfied waits are counted in the report.
+                // SignalEvent(event, mode, location, flags, u32 value): the
+                // GPU writes (mode 0) or adds (1) the value when it reaches
+                // the command; location (which pipeline stage) has no host
+                // meaning since earlier commands have already run.
+                // UpdateUniformBuffer: the data captured at record time is
+                // written into the buffer when the command runs.
+                if rest == "UpdateUniformBuffer" {
+                    let (offset, size) = (command.x[3], command.x[4]);
+                    let guest = self
+                        .gpu_to_guest(command.x[1] + offset, size)
+                        .map_err(stop)?;
+                    let bytes: Vec<u8> = command
+                        .captured
+                        .iter()
+                        .flat_map(|word| word.to_le_bytes())
+                        .take(size as usize)
+                        .collect();
+                    core.memory.write(guest, &bytes)?;
+                    self.gpu_invalidate(guest..guest + size, None);
+                    return Ok(());
+                }
+                if rest == "SignalEvent" {
+                    let address = self.event_address(command.x[1]).map_err(stop)?;
+                    let value = command.x[5] as u32;
+                    let new = match command.x[2] as u32 {
+                        0 => value,
+                        1 => core.memory.read_u32(address)?.wrapping_add(value),
+                        mode => {
+                            return Err(stop(format!("event signal mode {mode} is not modeled")));
+                        }
+                    };
+                    core.memory.write_u32(address, new)?;
+                    return Ok(());
+                }
+                if rest == "WaitEvent" {
+                    let address = self.event_address(command.x[1]).map_err(stop)?;
+                    let (mode, target) = (command.x[2] as u32, command.x[3] as u32);
+                    let value = core.memory.read_u32(address)?;
+                    let satisfied = match mode {
+                        0 => value == target,
+                        1 => value >= target,
+                        _ => return Err(stop(format!("event wait mode {mode} is not modeled"))),
+                    };
+                    if !satisfied {
+                        *self
+                            .skipped_work
+                            .entry("WaitEvent unsatisfied".into())
+                            .or_default() += 1;
+                    }
+                    return Ok(());
+                }
                 if is_work_command(rest) && debug_var_os("ECHORA_NVN_SKIP_WORK").is_some() {
                     *self.skipped_work.entry(rest.into()).or_default() += 1;
                     return Ok(());
                 }
-                Err(stop("command is not modeled".into()))
+                Err(stop(format!(
+                    "command is not modeled (x {:x?})",
+                    &command.x[..5]
+                )))
             }
         }
     }
@@ -2816,6 +2896,26 @@ impl Nvn {
         self.object(device.x[0], "Device").map(|_| ())
     }
 
+    /// Guest address of an initialized event's u32: its builder's storage
+    /// (memory pool, offset) inside the pool's storage.
+    fn event_address(&self, event: u64) -> Result<u64, String> {
+        let event = self.object(event, "Event")?;
+        let storage = event
+            .builder
+            .get("Storage")
+            .copied()
+            .ok_or("event has no storage")?;
+        let pool = self.object(storage.x[0], "MemoryPool")?;
+        let pool_storage = pool.builder["Storage"];
+        if pool_storage.x[0] == 0 || storage.x[1].saturating_add(4) > pool_storage.x[1] {
+            return Err(format!(
+                "event storage {:#x}+{:#x} outside its pool",
+                storage.x[0], storage.x[1]
+            ));
+        }
+        Ok(pool_storage.x[0] + storage.x[1])
+    }
+
     /// SetShaders(count, const NVNshaderData*) on an initialized program.
     /// Each entry (`stride` bytes) starts with the GPU address of a compiled
     /// stage and a
@@ -3098,6 +3198,31 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
                     .map(|word| core.memory.read_u32(command.x[3] + word * 4).map(u64::from))
                     .collect::<Result<_, _>>()?;
             }
+        }
+        // UpdateUniformBuffer(cmd, buffer address, buffer size, offset,
+        // size, const void* data): the data, in u64 words (the last one
+        // zero-padded).
+        "nvnCommandBufferUpdateUniformBuffer" => {
+            let size = command.x[4];
+            if size > 0x1_0000
+                || command.x[3]
+                    .checked_add(size)
+                    .is_none_or(|end| end > command.x[2])
+            {
+                return Err(Trap::InvalidState {
+                    message: format!(
+                        "uniform update {:#x}+{size:#x} of a {:#x}-byte buffer",
+                        command.x[3], command.x[2]
+                    ),
+                });
+            }
+            let mut bytes = vec![0u8; size.next_multiple_of(8) as usize];
+            core.memory
+                .read(command.x[5], &mut bytes[..size as usize])?;
+            command.captured = bytes
+                .chunks(8)
+                .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
+                .collect();
         }
         "nvnCommandBufferClearColor" => {
             command.captured = (0..4)

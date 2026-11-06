@@ -408,6 +408,8 @@ enum ReadableEventKind {
     AudioOutBuffer,
     /// IAudioRenderer QuerySystemEvent (7): signaled as each frame renders.
     AudioRendererFrame,
+    /// Internal: a parked bsd:u Poll, signaled when it completes.
+    SocketPoll,
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -685,6 +687,8 @@ enum ServiceObject {
     /// PKI imports; with no network no connection is ever established.
     SslService,
     SslContext,
+    /// nsd:u, network service discovery (Eden-NS2 1a6d7d4 nsd.cpp).
+    NsdUser,
     /// nifm:u IStaticService, IGeneralService and IRequest with no network.
     NifmStatic,
     NifmGeneral,
@@ -779,6 +783,7 @@ impl ServiceObject {
             Self::SslService => "ssl",
             Self::SslContext => "ssl:context",
             Self::NifmStatic => "nifm:u",
+            Self::NsdUser => "nsd:u",
             Self::NifmGeneral => "nifm:u:general",
             Self::NifmRequest { .. } => "nifm:u:request",
             Self::BcatCreator => "bcat:u",
@@ -1005,6 +1010,15 @@ pub struct Services {
     audio_device_volumes: BTreeMap<String, u32>,
     /// Device functionalities the application listed virtual devices for.
     audio_device_list_requests: BTreeSet<u32>,
+    /// bsd:u EventFd descriptors and their counter values.
+    socket_event_fds: BTreeMap<i32, u64>,
+    /// bsd:u Poll calls by requested timeout (the service never blocks).
+    socket_poll_timeouts: BTreeMap<i32, u64>,
+    /// Polls parked with nothing ready, by their internal event handle.
+    pending_polls: BTreeMap<u32, PendingPoll>,
+    /// Set by a request that parks its thread on the internal event handle
+    /// (taken by the runtime after SendSyncRequest).
+    blocked_request: Option<u32>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1097,6 +1111,10 @@ impl Default for Services {
             audio_volume_auto_tune: false,
             audio_device_volumes: BTreeMap::new(),
             audio_device_list_requests: BTreeSet::new(),
+            socket_event_fds: BTreeMap::new(),
+            socket_poll_timeouts: BTreeMap::new(),
+            pending_polls: BTreeMap::new(),
+            blocked_request: None,
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -1425,6 +1443,37 @@ impl Call<'_> {
             message.into(),
         )
     }
+}
+
+/// A bsd:u Poll parked until a descriptor is ready: the calling thread's
+/// message buffer, its prepared reply (the ready count goes at
+/// `data_offset`), the pollfds and their output buffer.
+#[derive(Clone, Debug)]
+struct PendingPoll {
+    tls: u64,
+    reply: Vec<u8>,
+    data_offset: usize,
+    entries: Vec<u8>,
+    output: Option<(u64, u64)>,
+    event: ReadableEventId,
+}
+
+/// Fill each pollfd's revents for the EventFds: writable (POLLOUT 4) always,
+/// readable (POLLIN 1) with a nonzero counter, POLLNVAL (0x20) for unknown
+/// descriptors. Returns the number with any revents.
+fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
+    let mut ready = 0;
+    for entry in entries.chunks_mut(8) {
+        let fd = crate::bytes::le_u32(&entry[..4]) as i32;
+        let events = crate::bytes::le_u16(&entry[4..6]);
+        let revents = match event_fds.get(&fd) {
+            Some(&counter) => events & (u16::from(counter != 0) | 4),
+            None => 0x20,
+        };
+        entry[6..8].copy_from_slice(&revents.to_le_bytes());
+        ready += i32::from(revents != 0);
+    }
+    ready
 }
 
 struct Outcome {
@@ -2126,6 +2175,7 @@ impl Services {
             ServiceObject::NifmStatic
             | ServiceObject::NifmGeneral
             | ServiceObject::NifmRequest { .. } => self.nifm(&object.clone(), call),
+            ServiceObject::NsdUser => self.nsd(call),
             ServiceObject::BcatCreator
             | ServiceObject::BcatService
             | ServiceObject::BcatStorage
@@ -3415,6 +3465,89 @@ impl Services {
         }
     }
 
+    /// The internal handle of a request that parked its thread, once.
+    pub(crate) fn take_blocked_request(&mut self) -> Option<u32> {
+        self.blocked_request.take()
+    }
+
+    /// Finish parked polls that now have a ready descriptor: write their
+    /// pollfds and reply, then signal their internal event.
+    fn complete_ready_polls(&mut self, memory: &mut Memory) -> Result<(), Trap> {
+        let handles: Vec<u32> = self.pending_polls.keys().copied().collect();
+        for handle in handles {
+            let mut poll = self.pending_polls[&handle].clone();
+            let ready = poll_event_fds(&self.socket_event_fds, &mut poll.entries);
+            if ready == 0 {
+                continue;
+            }
+            if let Some((address, size)) = poll.output {
+                let length = poll.entries.len().min(size as usize);
+                memory.write(address, &poll.entries[..length])?;
+            }
+            poll.reply[poll.data_offset..poll.data_offset + 4]
+                .copy_from_slice(&ready.to_le_bytes());
+            memory.write(poll.tls, &poll.reply)?;
+            if let Some(event) = self.readable_events.get_mut(&poll.event) {
+                event.signaled = true;
+            }
+            self.pending_polls.remove(&handle);
+        }
+        Ok(())
+    }
+
+    /// nsd:u as Eden-NS2 1a6d7d4 nsd.cpp answers it: environment "lp1",
+    /// FQDNs resolved to themselves (nothing is contacted offline) and
+    /// application server environment Lp (1).
+    fn nsd(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        const SERVICE: &str = "nsd:u";
+        match call.request.command_id {
+            // GetEnvironmentIdentifier: 8 bytes into the output buffer.
+            11 => {
+                call.shape_output(0, false)?;
+                let (address, size) = call.output_buffer()?;
+                if size < 8 {
+                    return Err(call.unsupported(SERVICE, "environment buffer under 8 bytes"));
+                }
+                call.memory.write(address, b"lp1\0\0\0\0\0")?;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+            }
+            // Resolve / ResolveEx: FQDN in, the same FQDN (0x100 bytes) out;
+            // ResolveEx adds a success result word.
+            20 | 21 => {
+                let request = &call.request;
+                let input = request.input_buffer.as_ref().map(|b| (b.address, b.size));
+                let Some((input_address, input_size)) = input else {
+                    return Err(call.unsupported(SERVICE, "Resolve without an FQDN"));
+                };
+                let (address, size) = call.output_buffer()?;
+                let mut fqdn = vec![0u8; input_size.min(0x100) as usize];
+                call.memory.read(input_address, &mut fqdn)?;
+                let length = fqdn.iter().position(|&b| b == 0).unwrap_or(fqdn.len());
+                if length >= 0x100 || size < 0x100 {
+                    // ResultOverflow (module NSD 141, description 6).
+                    call.reply(0x0c8d, None, AOC_INTERFACE_ID, &[])?;
+                    return Ok(Outcome::result(0x0c8d));
+                }
+                let mut out = [0u8; 0x100];
+                out[..length].copy_from_slice(&fqdn[..length]);
+                call.memory.write(address, &out)?;
+                let reply = if call.request.command_id == 21 {
+                    0u32.to_le_bytes().to_vec()
+                } else {
+                    Vec::new()
+                };
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+            }
+            // GetApplicationServerEnvironmentType -> u32 (Lp).
+            100 => {
+                call.shape(0, false, false)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &1u32.to_le_bytes())?;
+            }
+            _ => return Err(call.unsupported(SERVICE, "nsd command is not implemented")),
+        }
+        Ok(Outcome::success())
+    }
+
     /// bsd:u ISocketClient (Switchbrew numbering). The host offers no
     /// network: RegisterClient (0) and StartMonitoring (1) succeed, and
     /// Socket (2) returns -1 with errno ENETDOWN (100; nn::socket errno
@@ -3453,6 +3586,200 @@ impl Services {
                 let mut reply = Vec::with_capacity(8);
                 reply.extend_from_slice(&(-1i32).to_le_bytes());
                 reply.extend_from_slice(&ENETDOWN.to_le_bytes());
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+                Ok(Outcome::success())
+            }
+            // Poll (6): s32 nfds, s32 timeout (ms), pollfd {s32 fd, s16
+            // events, s16 revents} array in and out (Eden-NS2 bsd.cpp) ->
+            // {s32 ready, u32 errno}. EventFds are writable (POLLOUT 4) and
+            // readable (POLLIN 1) while their counter is nonzero; other
+            // descriptors report POLLNVAL (0x20). The service does not
+            // block: with nothing ready it returns 0 at once, whatever the
+            // timeout (each timeout is recorded for the report).
+            6 => {
+                let request = &call.request;
+                if request.arguments.len() != 8
+                    || request.pid.is_some()
+                    || !request.copy_handles.is_empty()
+                {
+                    return Err(
+                        call.unsupported(SERVICE, format!("Poll shape ({})", request.describe()))
+                    );
+                }
+                let count = crate::bytes::le_u32(&request.arguments[..4]) as i32;
+                let timeout = crate::bytes::le_u32(&request.arguments[4..8]) as i32;
+                let input = request
+                    .input_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.address, buffer.size))
+                    .ok_or_else(|| invalid("Poll without pollfds"))?;
+                if !(0..=64).contains(&count) || (count as u64) * 8 > input.1 {
+                    return Err(call.unsupported(SERVICE, format!("Poll of {count} descriptors")));
+                }
+                let mut entries = vec![0u8; count as usize * 8];
+                call.memory.read(input.0, &mut entries)?;
+                let output = if count != 0 {
+                    Some(call.output_buffer()?)
+                } else {
+                    None
+                };
+                *self.socket_poll_timeouts.entry(timeout).or_default() += 1;
+                let ready = poll_event_fds(&self.socket_event_fds, &mut entries);
+                if ready == 0 && timeout < 0 {
+                    // Nothing ready and no timeout: the calling thread parks
+                    // on an internal event (no handle reaches the guest)
+                    // until an EventFd write makes a descriptor ready.
+                    let mut first = 1i32.to_le_bytes().to_vec();
+                    first.extend_from_slice(&0u32.to_le_bytes());
+                    let mut second = 2i32.to_le_bytes().to_vec();
+                    second.extend_from_slice(&0u32.to_le_bytes());
+                    let reply = call.prepare_reply(0, None, AOC_INTERFACE_ID, &first, &[])?;
+                    let other = call.prepare_reply(0, None, AOC_INTERFACE_ID, &second, &[])?;
+                    let data_offset = reply
+                        .bytes
+                        .iter()
+                        .zip(&other.bytes)
+                        .position(|(a, b)| a != b)
+                        .ok_or_else(|| invalid("Poll reply has no data field"))?;
+                    let application = self
+                        .main_application
+                        .clone()
+                        .ok_or_else(|| invalid("bsd:u requires the bootstrap main application"))?;
+                    if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                        return Err(invalid("readable event backing capacity exhausted"));
+                    }
+                    let event = ReadableEventId(
+                        self.readable_events
+                            .keys()
+                            .map(|id| id.0)
+                            .max()
+                            .unwrap_or(0)
+                            + 1,
+                    );
+                    self.readable_events.insert(
+                        event,
+                        ReadableEvent {
+                            owner: application,
+                            kind: ReadableEventKind::SocketPoll,
+                            signaled: false,
+                        },
+                    );
+                    let handle = self.next_available_handle()?;
+                    self.readable_event_handles.insert(handle, event);
+                    self.next_handle = handle + 1;
+                    self.pending_polls.insert(
+                        handle,
+                        PendingPoll {
+                            tls: call.buffer_address,
+                            reply: reply.bytes,
+                            data_offset,
+                            entries,
+                            output,
+                            event,
+                        },
+                    );
+                    self.blocked_request = Some(handle);
+                    return Ok(Outcome::success());
+                }
+                if let Some((address, size)) = output {
+                    let length = entries.len().min(size as usize);
+                    call.memory.write(address, &entries[..length])?;
+                }
+                let mut reply = ready.to_le_bytes().to_vec();
+                reply.extend_from_slice(&0u32.to_le_bytes());
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+                Ok(Outcome::success())
+            }
+            // Read (25): s32 fd, the data into an output buffer -> {s32
+            // ret, u32 errno}. An EventFd yields its 8-byte counter and
+            // resets it; at zero it fails with EAGAIN (11) instead of
+            // blocking.
+            25 => {
+                if call.request.arguments.len() != 4 || call.request.pid.is_some() {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("Read shape ({})", call.request.describe()),
+                    ));
+                }
+                let fd = crate::bytes::le_u32(&call.request.arguments[..4]) as i32;
+                let (address, size) = call.output_buffer()?;
+                let (ret, errno) = match self.socket_event_fds.get_mut(&fd) {
+                    Some(_) if size < 8 => (-1i32, 22u32),
+                    Some(0) => (-1, 11),
+                    Some(counter) => {
+                        call.memory.write(address, &counter.to_le_bytes())?;
+                        *counter = 0;
+                        (8, 0)
+                    }
+                    None => (-1, 9),
+                };
+                let mut reply = ret.to_le_bytes().to_vec();
+                reply.extend_from_slice(&errno.to_le_bytes());
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+                Ok(Outcome::success())
+            }
+            // Write (24): s32 fd, the data in an input buffer -> {s32 ret,
+            // u32 errno}. For an EventFd the 8-byte value adds to its
+            // counter (Linux eventfd semantics), completing parked polls.
+            24 => {
+                if call.request.arguments.len() != 4 || call.request.pid.is_some() {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("Write shape ({})", call.request.describe()),
+                    ));
+                }
+                let fd = crate::bytes::le_u32(&call.request.arguments[..4]) as i32;
+                let input = call
+                    .request
+                    .input_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.address, buffer.size))
+                    .ok_or_else(|| invalid("Write without data"))?;
+                let (ret, errno) = match self.socket_event_fds.get_mut(&fd) {
+                    Some(counter) if input.1 >= 8 => {
+                        let value = call.memory.read_u64(input.0)?;
+                        *counter = counter.saturating_add(value);
+                        (8i32, 0u32)
+                    }
+                    // EINVAL (22) for a short eventfd write.
+                    Some(_) => (-1, 22),
+                    None => (-1, 9),
+                };
+                let mut reply = ret.to_le_bytes().to_vec();
+                reply.extend_from_slice(&errno.to_le_bytes());
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+                self.complete_ready_polls(call.memory)?;
+                Ok(Outcome::success())
+            }
+            // Close (26): s32 fd -> {s32 ret, u32 errno}. Only EventFd
+            // descriptors exist; others fail with EBADF (9).
+            26 => {
+                call.shape(4, false, false)?;
+                let fd = crate::bytes::le_u32(&call.request.arguments[..4]) as i32;
+                let (ret, errno) = match self.socket_event_fds.remove(&fd) {
+                    Some(_) => (0i32, 0u32),
+                    None => (-1, 9),
+                };
+                let mut reply = ret.to_le_bytes().to_vec();
+                reply.extend_from_slice(&errno.to_le_bytes());
+                call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
+                Ok(Outcome::success())
+            }
+            // EventFd (31, [7.0.0+]: u64 initial value, u32 flags (Eden-NS2
+            // bsd.cpp) -> {s32 fd, u32 errno}. A local counter, not a
+            // socket: it gets a descriptor holding its value. Descriptors
+            // start at 3, after the standard streams.
+            31 => {
+                call.shape(16, false, false)?;
+                let initial = crate::bytes::le_u64(&call.request.arguments[..8]);
+                let fd = self
+                    .socket_event_fds
+                    .keys()
+                    .next_back()
+                    .map_or(3, |fd| fd + 1);
+                self.socket_event_fds.insert(fd, initial);
+                let mut reply = fd.to_le_bytes().to_vec();
+                reply.extend_from_slice(&0u32.to_le_bytes());
                 call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
                 Ok(Outcome::success())
             }
@@ -3928,6 +4255,23 @@ impl Services {
             // GetCurrentIpAddress / GetInternetConnectionStatus: not connected.
             (ServiceObject::NifmGeneral, 12 | 18) => {
                 call.shape(0, false, false)?;
+                call.reply(NETWORK_DISABLED, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::result(NETWORK_DISABLED))
+            }
+            // GetCurrentNetworkProfile (5, and 101 with NetworkProfileDataV2:
+            // the SDK's nn::nifm::GetCurrentNetworkProfile sends 101): the
+            // profile goes to an output buffer; there is no current network.
+            (ServiceObject::NifmGeneral, 5 | 101) => {
+                // The buffer is a B or C descriptor; nothing is written.
+                if !call.request.arguments.is_empty() || call.request.input_buffer.is_some() {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!(
+                            "GetCurrentNetworkProfile shape ({})",
+                            call.request.describe()
+                        ),
+                    ));
+                }
                 call.reply(NETWORK_DISABLED, None, AOC_INTERFACE_ID, &[])?;
                 Ok(Outcome::result(NETWORK_DISABLED))
             }
@@ -6667,6 +7011,7 @@ impl Services {
             | ReadableEventKind::AudioDeviceOutput
             | ReadableEventKind::AudioOutBuffer
             | ReadableEventKind::AudioRendererFrame
+            | ReadableEventKind::SocketPoll
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
@@ -6895,6 +7240,7 @@ impl Services {
                     "bsd:u" => ServiceObject::SocketClient,
                     "ssl" => ServiceObject::SslService,
                     "nifm:u" => ServiceObject::NifmStatic,
+                    "nsd:u" => ServiceObject::NsdUser,
                     "bcat:u" => ServiceObject::BcatCreator,
                     "stpl:u" => ServiceObject::StreamplayUser,
                     "prepo:u" => ServiceObject::PlayReport,
@@ -6979,6 +7325,7 @@ impl Services {
             "session_close_requests":self.session_close_requests,
             "audio_outs":self.audio_outs,
             "audio_device_list_requests":self.audio_device_list_requests,
+            "socket_poll_timeouts":self.socket_poll_timeouts,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
                 "sample_count":renderer.parameters.sample_count,
@@ -7325,6 +7672,29 @@ fn vibration_device(handle: &[u8]) -> u32 {
 #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_fds_poll_readable_only_with_a_nonzero_counter() {
+        let mut fds = BTreeMap::new();
+        fds.insert(3, 0u64);
+        let pollfd = |fd: i32, events: u16| {
+            let mut entry = fd.to_le_bytes().to_vec();
+            entry.extend_from_slice(&events.to_le_bytes());
+            entry.extend_from_slice(&0u16.to_le_bytes());
+            entry
+        };
+        let revents = |entries: &[u8], index: usize| {
+            crate::bytes::le_u16(&entries[index * 8 + 6..index * 8 + 8])
+        };
+        // POLLIN on an empty eventfd is not ready; an unknown fd is invalid.
+        let mut entries = [pollfd(3, 1), pollfd(9, 1)].concat();
+        assert_eq!(poll_event_fds(&fds, &mut entries), 1);
+        assert_eq!((revents(&entries, 0), revents(&entries, 1)), (0, 0x20));
+        fds.insert(3, 2);
+        let mut entries = pollfd(3, 1 | 4);
+        assert_eq!(poll_event_fds(&fds, &mut entries), 1);
+        assert_eq!(revents(&entries, 0), 1 | 4);
+    }
 
     #[test]
     fn opus_packet_durations_follow_the_toc_byte() {

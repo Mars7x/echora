@@ -3221,6 +3221,28 @@ impl Machine {
                         .push(format!("unsupported request backtrace: {frames}"));
                 }
                 sent?;
+                if let Some(handle) = self.services.take_blocked_request() {
+                    // The request parked its thread (a bsd:u Poll with
+                    // nothing ready): wait without timeout on its internal
+                    // event; the service writes the reply before signaling.
+                    if self.thread_state(self.core.current_thread_id) != Some(ThreadState::Runnable)
+                        || self.pending_mutex_wait.is_some()
+                        || self.pending_synchronization_wait.is_some()
+                    {
+                        return Err(Trap::InvalidState {
+                            message: "a blocking request requires the active runnable context"
+                                .into(),
+                        });
+                    }
+                    self.synchronization_waits.begin_objects(
+                        self.core.current_thread_id,
+                        -1,
+                        vec![handle],
+                        None,
+                    )?;
+                    self.pending_synchronization_wait = Some(self.core.current_thread_id);
+                    return Ok(());
+                }
                 // The transport result is separate from the service result in
                 // the TLS reply. No reply or success is fabricated on a trap.
                 self.core.cpu.regs[0] = 0;
