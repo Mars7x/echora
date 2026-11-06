@@ -43,8 +43,12 @@ pub struct DisplaySessionState {
     pub default_endpoint: Option<u64>,
     /// Local backing ID of the session's notification event, once created.
     pub notification_event: Option<u32>,
-    /// Readable event moved by command 31 (index 0), created once.
-    pub event_31: Option<u32>,
+    /// Readable events moved by command 31, by event index, each created
+    /// once.
+    pub events_31: std::collections::BTreeMap<u32, u32>,
+    /// Command 31 event indices bound by the odd commands 261..=271, with
+    /// the command.
+    pub event_bindings: std::collections::BTreeMap<u32, u32>,
     /// Pending notification bits (32 x u32), read by GetNotifications.
     pub notifications: Vec<u32>,
     /// Other displays opened by name (for example "player1", a GameShare
@@ -58,8 +62,6 @@ pub struct DisplaySessionState {
     pub secondary_endpoints: Vec<(u64, u64, u64)>,
     /// Command 301's two values for the default display (unnamed).
     pub display_values: Option<(u64, u64)>,
-    /// Command 261's u32 for the default display (undocumented setter).
-    pub value_261: Option<u32>,
 }
 
 /// A successful reply's raw data, or an explicit stop.
@@ -255,17 +257,24 @@ impl DisplaySessionState {
                 }
                 Ok(client.available.to_le_bytes().to_vec())
             }
-            // 261(u64 display name, u32) -> (): unnamed, one of the 26x setter
-            // family. The SDK's wrapper (sdk+0x5e4740) reads no reply data.
-            // OoT sends the default display and 0. Recorded with no further
-            // effect (provisional).
-            261 => {
+            // 261..=271 odd (u64 display name, u32 event index) -> ():
+            // undocumented. The SDK allocates the index for command 31's
+            // event first and releases it if these fail (sdk+0x5eb338,
+            // sdk+0x5ebb68, sdk+0x5ebdf8, sdk+0x5ec428), so each binds that
+            // event to one property's change notification: 263 from
+            // QueryRefreshRate, 265 QueryHdrStatus, 267 QueryHdrPaperWhite,
+            // 271 QueryVrrSupported. None of them changes here, so bound
+            // events are never signaled (provisional).
+            261 | 263 | 265 | 267 | 269 | 271 => {
                 expect(3)?;
                 let name = dword(arguments, 0);
-                if name != DEFAULT_DISPLAY_NAME {
-                    return Err(format!("command 261 for display {name:#x}"));
+                let index = word(arguments, 2);
+                if name != DEFAULT_DISPLAY_NAME || index >= 8 {
+                    return Err(format!(
+                        "command {command} for display {name:#x} index {index}"
+                    ));
                 }
-                self.value_261 = Some(word(arguments, 2));
+                self.event_bindings.insert(index, command);
                 Ok(Vec::new())
             }
             // 301(u64 display name, u64, u64) -> (): unnamed and absent from
@@ -339,19 +348,21 @@ mod tests {
     }
 
     #[test]
-    fn command_261_records_a_value_for_the_default_display_only() {
+    fn notification_commands_bind_event_indices_of_the_default_display() {
         let mut state = DisplaySessionState::default();
         let [low, high] = name();
         assert!(state.handle(261, &args(&[low, high])).is_err());
-        assert!(state.handle(261, &args(&[low + 1, high, 0])).is_err());
-        assert_eq!(state.value_261, None);
-        assert!(
-            state
-                .handle(261, &args(&[low, high, 3]))
-                .unwrap()
-                .is_empty()
+        assert!(state.handle(263, &args(&[low + 1, high, 0])).is_err());
+        assert!(state.handle(265, &args(&[low, high, 8])).is_err());
+        assert!(state.event_bindings.is_empty());
+        for (command, index) in [(261, 0), (263, 1), (271, 2)] {
+            let reply = state.handle(command, &args(&[low, high, index]));
+            assert!(reply.unwrap().is_empty());
+        }
+        assert_eq!(
+            state.event_bindings.iter().collect::<Vec<_>>(),
+            [(&0, &261), (&1, &263), (&2, &271)]
         );
-        assert_eq!(state.value_261, Some(3));
     }
 
     #[test]

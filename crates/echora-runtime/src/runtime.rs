@@ -2955,6 +2955,35 @@ impl Machine {
                 self.core.cpu.regs[0] = u64::from(result);
                 Ok(())
             }
+            0x0e => {
+                // GetThreadCoreMask raw ABI: W2 handle in; W0 result, W1 ideal
+                // core and X2 affinity mask out (Horizon; the outputs keep
+                // their old values on InvalidHandle).
+                let handle = args[2] as u32;
+                let affinity = match self.thread_id_for_handle(handle) {
+                    Some(id) if id == self.layout.main_thread_id => Some(self.main_thread_affinity),
+                    Some(id) => {
+                        Some(
+                            self.threads
+                                .affinity(id)
+                                .ok_or_else(|| Trap::InvalidState {
+                                    message: "thread handle has no initialized affinity backing"
+                                        .into(),
+                                })?,
+                        )
+                    }
+                    None => None,
+                };
+                match affinity {
+                    Some((core, mask)) => {
+                        self.core.cpu.regs[0] = 0;
+                        self.core.cpu.regs[1] = u64::from(core as u32);
+                        self.core.cpu.regs[2] = mask;
+                    }
+                    None => self.core.cpu.regs[0] = 0xe401,
+                }
+                Ok(())
+            }
             0x0f => {
                 // Raw ABI: W0 handle, signed W1 selector, full-width X2 mask;
                 // only W0 is an output. X3 and every other register survive.
@@ -3179,13 +3208,19 @@ impl Machine {
                     self.core.cpu.regs[0] = 0xe401;
                     return Ok(());
                 }
-                self.services.send_sync_request(
+                let sent = self.services.send_sync_request(
                     &mut self.memory,
                     self.core.cpu.tpidrro_el0,
                     handle,
                     self.layout.process_id,
                     self.core.cpu.pc,
-                )?;
+                );
+                if let Err(Trap::UnsupportedService { .. }) = &sent {
+                    let frames = self.frame_backtrace();
+                    self.debug_messages
+                        .push(format!("unsupported request backtrace: {frames}"));
+                }
+                sent?;
                 // The transport result is separate from the service result in
                 // the TLS reply. No reply or success is fabricated on a trap.
                 self.core.cpu.regs[0] = 0;
@@ -3204,25 +3239,9 @@ impl Machine {
                         self.debug_messages.push(format!("break payload: {hex}"));
                     }
                 }
-                // Frame-record chain (x29 -> [fp, lr]) so the report shows
-                // who called the abort.
-                let mut frames = vec![format!("{:#x}", self.core.cpu.regs[30])];
-                let mut fp = self.core.cpu.regs[29];
-                while frames.len() < 24 && fp != 0 && fp % 16 == 0 {
-                    let mut record = [0u8; 16];
-                    if self.memory.read(fp, &mut record).is_err() {
-                        break;
-                    }
-                    let next = crate::bytes::le_u64(&record[..8]);
-                    let lr = crate::bytes::le_u64(&record[8..]);
-                    frames.push(format!("{lr:#x}"));
-                    if next <= fp {
-                        break;
-                    }
-                    fp = next;
-                }
+                let frames = self.frame_backtrace();
                 self.debug_messages
-                    .push(format!("break backtrace: {}", frames.join(" ")));
+                    .push(format!("break backtrace: {frames}"));
                 Err(Trap::GuestBreak {
                     pc: self.core.cpu.pc,
                     reason: args[0],
@@ -3459,6 +3478,26 @@ impl Machine {
     /// SVC 0x2D UnmapPhysicalMemory: releases physical memory mapped in an
     /// alias-region range, including the covered part of a mapping that
     /// extends past it.
+    /// The current thread's return addresses: X30, then the frame-record
+    /// chain (x29 -> [previous fp, lr]), as hex, for stop diagnostics.
+    fn frame_backtrace(&self) -> String {
+        let mut frames = vec![format!("{:#x}", self.core.cpu.regs[30])];
+        let mut fp = self.core.cpu.regs[29];
+        while frames.len() < 24 && fp != 0 && fp % 16 == 0 {
+            let mut record = [0u8; 16];
+            if self.memory.read(fp, &mut record).is_err() {
+                break;
+            }
+            let next = crate::bytes::le_u64(&record[..8]);
+            frames.push(format!("{:#x}", crate::bytes::le_u64(&record[8..])));
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        frames.join(" ")
+    }
+
     fn unmap_physical_memory(&mut self, address: u64, size: u64) -> Result<u64, Trap> {
         if let Some(error) = self.physical_range_error(address, size) {
             return Ok(error);
@@ -4603,6 +4642,24 @@ mod tests {
         m.core.cpu.regs[..2].copy_from_slice(&[handle, priority]);
         m.svc(0x0d).unwrap();
         m.core.cpu.regs[0]
+    }
+
+    #[test]
+    fn get_thread_core_mask_reports_the_set_affinity() {
+        let mut m = thread_machine();
+        let get = |m: &mut Machine, handle: u64| {
+            m.core.cpu.regs[2] = handle;
+            m.svc(0x0e).unwrap();
+            (m.core.cpu.regs[0], m.core.cpu.regs[1], m.core.cpu.regs[2])
+        };
+        assert_eq!(get(&mut m, 0x1234).0, 0xe401);
+        let (result, _, mask) = get(&mut m, 0xffff8000);
+        assert_eq!(result, 0);
+        assert_ne!(mask, 0);
+        m.core.cpu.regs[..3].copy_from_slice(&[0xffff8000, 0, 1]);
+        m.svc(0x0f).unwrap();
+        assert_eq!(m.core.cpu.regs[0], 0);
+        assert_eq!(get(&mut m, 0xffff8000), (0, 0, 1));
     }
 
     #[test]

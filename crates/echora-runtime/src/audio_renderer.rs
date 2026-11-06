@@ -209,6 +209,9 @@ pub struct Renderer {
     /// Usage of each effect slot: (type, new, enabled).
     effects: BTreeMap<usize, (u8, bool, bool)>,
     pub rendering_time_limit: u32,
+    /// SetVoiceDropParameter's f32 bits (Eden-NS2's default 1.0). Voices
+    /// are never dropped here, so it is only reported back.
+    pub voice_drop_parameter: u32,
 }
 
 impl Renderer {
@@ -222,6 +225,7 @@ impl Renderer {
             voices: BTreeMap::new(),
             effects: BTreeMap::new(),
             rendering_time_limit: 100,
+            voice_drop_parameter: 1.0f32.to_bits(),
         }
     }
 
