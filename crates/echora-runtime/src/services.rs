@@ -295,6 +295,9 @@ struct SyncpointCache {
 /// Interface tag written into this prototype's nvdrv CMIF replies.
 const NVDRV_INTERFACE_ID: u32 = 0x6e76_6472;
 const NVDRV_MAX_FDS: usize = 64;
+/// NvResult codes for Open of an unavailable device.
+const NV_NOT_SUPPORTED: u32 = 0x2;
+const NV_FILE_OPERATION_FAILED: u32 = 0x3_0003;
 /// Eden 1a6d7d4 extended GPU address-space layout (40-bit VA).
 const GPU_VA_USER_START: u64 = 0x800_0000;
 const GPU_VA_SPLIT: u64 = 3 << 38;
@@ -904,6 +907,9 @@ pub struct Services {
     pub(crate) gpu_sharable: BTreeMap<u64, u64>,
     /// KUserWorkerSession GPU memory by handle: (start, end, two u8 flags).
     gpu_memory: BTreeMap<u32, (u64, u64, [u8; 2])>,
+    /// NormalMapGpuMemory4K mappings by GPU address: (address space, last
+    /// GPU address, memory handle, memory offset).
+    gpu_mappings: BTreeMap<u64, (u32, u64, u32, u64)>,
     /// Per-descriptor NVIDIA device state.
     nvdrv_devices: crate::nvdrv::Devices,
     /// QueryEvent backings by (device path, event ID); each is created once.
@@ -1005,6 +1011,7 @@ impl Default for Services {
             nvdrv_fds: BTreeMap::new(),
             gpu_sharable: BTreeMap::new(),
             gpu_memory: BTreeMap::new(),
+            gpu_mappings: BTreeMap::new(),
             nvdrv_devices: Default::default(),
             nvdrv_events: BTreeMap::new(),
             transfer_memories: BTreeMap::new(),
@@ -5785,7 +5792,8 @@ impl Services {
         const SERVICE: &str = "appletOE:gpu_worker";
         match call.request.command_id {
             // CreateGpuMemory: u64 MemoryAddressStart, u64 MemoryAddressEnd
-            // and two u8s; returns a u32 GpuMemoryHandle. The range must
+            // (its last byte: the SDK sends start + size - 1) and two u8s;
+            // returns a u32 GpuMemoryHandle. The range must
             // carry GpuSharable (SetGpuMemoryAttribute 0x20). Handles count
             // from 1. Provisional beyond the documented layout.
             101 => {
@@ -5797,9 +5805,11 @@ impl Services {
                     ));
                 }
                 let start = crate::bytes::le_u64(&arguments[..8]);
-                let end = crate::bytes::le_u64(&arguments[8..16]);
+                let last = crate::bytes::le_u64(&arguments[8..16]);
+                let end = last.wrapping_add(1);
                 let flags = [arguments[16], arguments[17]];
-                if start >= end
+                if last < start
+                    || end == 0
                     || start % 0x1000 != 0
                     || end % 0x1000 != 0
                     || !self.is_gpu_sharable(start, end - start)
@@ -5820,6 +5830,134 @@ impl Services {
                 call.reply(0, None, 0, &handle.to_le_bytes())?;
                 self.gpu_memory.insert(handle, (start, end, flags));
                 self.provisional_commands.insert("appletOE:gpu_worker:101");
+                Ok(Outcome::success())
+            }
+            // DestroyGpuMemory: u32 GpuMemoryHandle and u32 EventId, no
+            // output; the event is signaled when the memory is released
+            // (Switchbrew). Memory still mapped is refused.
+            102 => {
+                call.shape(8, false, false)?;
+                let memory = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let event_index = crate::bytes::le_u32(&call.request.arguments[4..8]);
+                if !self.gpu_memory.contains_key(&memory) {
+                    return Err(call
+                        .unsupported(SERVICE, format!("destroy of unknown GPU memory {memory}")));
+                }
+                if self
+                    .gpu_mappings
+                    .values()
+                    .any(|&(_, _, mapped, _)| mapped == memory)
+                {
+                    return Err(
+                        call.unsupported(SERVICE, "destroy of GPU memory that is still mapped")
+                    );
+                }
+                let Some(&event) = self.gpu_events.get(&event_index) else {
+                    return Err(call.unsupported(SERVICE, "release event was not created"));
+                };
+                call.reply(0, None, 0, &[])?;
+                self.gpu_memory.remove(&memory);
+                if let Some(event) = self.readable_events.get_mut(&event) {
+                    event.signaled = true;
+                }
+                Ok(Outcome::success())
+            }
+            // NormalMapGpuMemory4K ([20.0.0+] 211). Layout from the SDK
+            // (sdk+0x4691c0): u32 address space, u64 GPU address, u64 last
+            // GPU address, u32 GpuMemoryHandle, u64 memory offset, seven u8
+            // settings each in its own word, and the u32 ID of a GpuSession
+            // event the SDK then waits on. Returns a u8 the SDK overwrites.
+            // The map completes at once and signals that event. The host
+            // renders through NVN, so nothing is mapped. Provisional.
+            211 => {
+                let arguments = &call.request.arguments;
+                if arguments.len() != 0x40 {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("NormalMapGpuMemory4K shape ({})", call.request.describe()),
+                    ));
+                }
+                let word = |at: usize| crate::bytes::le_u32(&arguments[at..at + 4]);
+                let dword = |at: usize| crate::bytes::le_u64(&arguments[at..at + 8]);
+                let (space, address, last) = (word(0), dword(4), dword(0xc));
+                let (memory, offset, event_index) = (word(0x14), dword(0x18), word(0x3c));
+                let Some(&(start, end, _)) = self.gpu_memory.get(&memory) else {
+                    return Err(
+                        call.unsupported(SERVICE, format!("map of unknown GPU memory {memory}"))
+                    );
+                };
+                if !self.gpu_address_spaces.contains_key(&space)
+                    || last < address
+                    || address % 0x1000 != 0
+                    || (last + 1) % 0x1000 != 0
+                    || offset
+                        .checked_add(last - address)
+                        .is_none_or(|top| top >= end - start)
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!(
+                            "map {address:#x}..={last:#x} of memory {memory} offset {offset:#x} in space {space} is not modeled"
+                        ),
+                    ));
+                }
+                if self.gpu_mappings.range(..=last).next_back().is_some_and(
+                    |(_, &(other, other_last, ..))| other == space && other_last >= address,
+                ) {
+                    return Err(call.unsupported(SERVICE, "overlapping GPU mapping"));
+                }
+                let Some(&event) = self.gpu_events.get(&event_index) else {
+                    return Err(call.unsupported(SERVICE, "map completion event was not created"));
+                };
+                call.reply(0, None, 0, &0u32.to_le_bytes())?;
+                self.gpu_mappings
+                    .insert(address, (space, last, memory, offset));
+                if let Some(event) = self.readable_events.get_mut(&event) {
+                    event.signaled = true;
+                }
+                self.provisional_commands.insert("appletOE:gpu_worker:211");
+                Ok(Outcome::success())
+            }
+            // NormalUnmapGpuMemory4K ([20.0.0+] 213). Layout from the SDK
+            // (sdk+0x469558): u32 address space, u64 GPU address, u64 last
+            // GPU address, u8 sync flag, u32 event ID the SDK then waits on.
+            // Returns a u64 (answered 0). Removes the mappings inside the
+            // range and signals the event. Provisional.
+            213 => {
+                let arguments = &call.request.arguments;
+                if arguments.len() != 0x1c {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("NormalUnmapGpuMemory4K shape ({})", call.request.describe()),
+                    ));
+                }
+                let word = |at: usize| crate::bytes::le_u32(&arguments[at..at + 4]);
+                let dword = |at: usize| crate::bytes::le_u64(&arguments[at..at + 8]);
+                let (space, address, last, event_index) =
+                    (word(0), dword(4), dword(0xc), word(0x18));
+                if !self.gpu_address_spaces.contains_key(&space) || last < address {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("unmap {address:#x}..={last:#x} in space {space} is not modeled"),
+                    ));
+                }
+                let inside: Vec<u64> = self
+                    .gpu_mappings
+                    .range(address..=last)
+                    .filter(|&(_, &(other, other_last, ..))| other == space && other_last <= last)
+                    .map(|(&start, _)| start)
+                    .collect();
+                let Some(&event) = self.gpu_events.get(&event_index) else {
+                    return Err(call.unsupported(SERVICE, "unmap completion event was not created"));
+                };
+                call.reply(0, None, 0, &0u64.to_le_bytes())?;
+                for start in inside {
+                    self.gpu_mappings.remove(&start);
+                }
+                if let Some(event) = self.readable_events.get_mut(&event) {
+                    event.signaled = true;
+                }
+                self.provisional_commands.insert("appletOE:gpu_worker:213");
                 Ok(Outcome::success())
             }
             _ => Err(call.unsupported(
@@ -5884,6 +6022,24 @@ impl Services {
                     return Err(
                         call.unsupported(SERVICE, format!("Open of undocumented device {path:?}"))
                     );
+                }
+                // No GPU debugger or profiler exists (the characteristics
+                // report the debugger unavailable). As Eden 1a6d7d4: the
+                // profiler answers NotSupported and an absent device
+                // FileOperationFailed, both with fd 0; the driver then takes
+                // its no-debugger path.
+                let unavailable = match path.as_str() {
+                    "/dev/nvhost-prof-gpu" => Some(NV_NOT_SUPPORTED),
+                    "/dev/nvhost-dbg-gpu" | "/dev/nvhost-prof-dev-gpu" => {
+                        Some(NV_FILE_OPERATION_FAILED)
+                    }
+                    _ => None,
+                };
+                if let Some(error) = unavailable {
+                    let mut reply = 0u32.to_le_bytes().to_vec();
+                    reply.extend_from_slice(&error.to_le_bytes());
+                    call.reply(0, None, NVDRV_INTERFACE_ID, &reply)?;
+                    return Ok(Outcome::success());
                 }
                 if self.nvdrv_fds.len() >= NVDRV_MAX_FDS {
                     return Err(call.unsupported(SERVICE, "too many open NVIDIA driver devices"));
