@@ -15,6 +15,7 @@ mod bytes;
 pub mod content;
 pub mod content_metadata;
 pub mod display;
+mod fault;
 pub mod fs;
 pub mod hid;
 pub mod hle;

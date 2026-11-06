@@ -295,6 +295,10 @@ struct SyncpointCache {
 /// Interface tag written into this prototype's nvdrv CMIF replies.
 const NVDRV_INTERFACE_ID: u32 = 0x6e76_6472;
 const NVDRV_MAX_FDS: usize = 64;
+/// Eden 1a6d7d4 extended GPU address-space layout (40-bit VA).
+const GPU_VA_USER_START: u64 = 0x800_0000;
+const GPU_VA_SPLIT: u64 = 3 << 38;
+const GPU_VA_END: u64 = 1 << 40;
 /// Device paths listed on Switchbrew "NV services".
 const NVDRV_DEVICES: &[&str] = &[
     "/dev/nvhost-ctrl",
@@ -910,6 +914,10 @@ pub struct Services {
     graphics_contexts: BTreeSet<u32>,
     gpu_session_version: Option<u64>,
     gpu_events: BTreeMap<u32, ReadableEventId>,
+    /// GpuSession graphics devices by ID: (packed name, parameter, label).
+    graphics_devices: BTreeMap<u8, [u64; 3]>,
+    /// GpuSession address spaces by handle, with their creation flags.
+    gpu_address_spaces: BTreeMap<u32, u32>,
     gpu_worker_ready: bool,
     graphics_scale_changed_notification: Option<bool>,
     exit_locked: bool,
@@ -997,6 +1005,8 @@ impl Default for Services {
             graphics_contexts: BTreeSet::new(),
             gpu_session_version: None,
             gpu_events: BTreeMap::new(),
+            graphics_devices: BTreeMap::new(),
+            gpu_address_spaces: BTreeMap::new(),
             gpu_worker_ready: false,
             graphics_scale_changed_notification: None,
             exit_locked: false,
@@ -5092,6 +5102,21 @@ impl Services {
                 );
                 Ok(Outcome::success())
             }
+            // ExistsAddressSpace (434, Switchbrew "Switch 2: GSV services"):
+            // a u32 GpuSession address-space handle; the SDK (sdk+0x46c428)
+            // reads only the result. Success for a created address space.
+            434 => {
+                call.shape(4, false, false)?;
+                let handle = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if !self.gpu_address_spaces.contains_key(&handle) {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("ExistsAddressSpace for unknown handle {handle}"),
+                    ));
+                }
+                call.reply(0, None, 0, &[])?;
+                Ok(Outcome::success())
+            }
             // Undocumented query with no input and a u32 output. The SDK
             // (OoT, sdk+0x491660) issues command 120 next only when the
             // value is 1; 0 skips that undocumented follow-up. Provisional.
@@ -5211,7 +5236,97 @@ impl Services {
                 self.next_handle = handle + 1;
                 Ok(Outcome::success())
             }
-            _ => Err(call.unsupported(SERVICE, "GPU session command is not implemented")),
+            // CreateGpuAddressSpace (33; reached from
+            // nn::gpu::sdk::CreateGpuAddressSpace, IPC at sdk+0x46c360): a u32
+            // (0 here, read as creation flags) in, a u32 address-space handle
+            // out. Handles count from 1. Provisional.
+            33 => {
+                call.shape(4, false, false)?;
+                let flags = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if flags != 0 {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("address space creation flags {flags:#x} are not modeled"),
+                    ));
+                }
+                if self.gpu_address_spaces.len() >= 64 {
+                    return Err(call.unsupported(SERVICE, "too many GPU address spaces"));
+                }
+                let handle = self
+                    .gpu_address_spaces
+                    .keys()
+                    .next_back()
+                    .map_or(1, |last| last + 1);
+                call.reply(0, None, 0, &handle.to_le_bytes())?;
+                self.gpu_address_spaces.insert(handle, flags);
+                self.provisional_commands.insert("appletOE:gpu_session:33");
+                Ok(Outcome::success())
+            }
+            // GetGsvPartitionGpuAddress (202) and 203 (the SDK reads it as
+            // the user partition's range list, sdk+0x46c4d0): a u32 address-
+            // space handle in. 202 returns one (start, end) u64 pair; 203 a
+            // u64 count (under 5) and four pairs, of which the SDK uses the
+            // first. Ranges follow Eden 1a6d7d4's extended GPU address-space
+            // layout (gpu_address_space_layout.h): user [0x8000000, split),
+            // supervisor [split, 1 << 40). Provisional.
+            202 | 203 => {
+                call.shape(4, false, false)?;
+                let handle = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if !self.gpu_address_spaces.contains_key(&handle) {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("GPU address space {handle} does not exist"),
+                    ));
+                }
+                let mut data = Vec::new();
+                if call.request.command_id == 202 {
+                    data.extend_from_slice(&GPU_VA_SPLIT.to_le_bytes());
+                    data.extend_from_slice(&GPU_VA_END.to_le_bytes());
+                } else {
+                    data.extend_from_slice(&1u64.to_le_bytes());
+                    data.extend_from_slice(&GPU_VA_USER_START.to_le_bytes());
+                    data.extend_from_slice(&GPU_VA_SPLIT.to_le_bytes());
+                    data.resize(8 + 4 * 16, 0);
+                }
+                call.reply(0, None, 0, &data)?;
+                self.provisional_commands
+                    .insert(if call.request.command_id == 202 {
+                        "appletOE:gpu_session:202"
+                    } else {
+                        "appletOE:gpu_session:203"
+                    });
+                Ok(Outcome::success())
+            }
+            // CreateGraphicsDevice (41; nn::gpu::sdk::CreateGraphicsDevice,
+            // sdk+0x467ff0): the device name packed into a u64 ("NvRmGpu"),
+            // a u64 parameter and a u64 debug label; returns a u8 device ID
+            // that the SDK stores in its GraphicsDeviceType. IDs count from 1.
+            // Undocumented beyond the name; provisional.
+            41 => {
+                call.shape(24, false, false)?;
+                let word = |at: usize| crate::bytes::le_u64(&call.request.arguments[at..at + 8]);
+                let device = [word(0), word(8), word(16)];
+                if device[0] != u64::from_le_bytes(*b"NvRmGpu\0") {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("graphics device name {:#x} is not NvRmGpu", device[0]),
+                    ));
+                }
+                let id = (1..=u8::MAX)
+                    .find(|id| !self.graphics_devices.contains_key(id))
+                    .ok_or_else(|| call.unsupported(SERVICE, "graphics device IDs exhausted"))?;
+                call.reply(0, None, 0, &u32::from(id).to_le_bytes())?;
+                self.graphics_devices.insert(id, device);
+                self.provisional_commands.insert("appletOE:gpu_session:41");
+                Ok(Outcome::success())
+            }
+            _ => Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "GPU session command is not implemented ({})",
+                    call.request.describe()
+                ),
+            )),
         }
     }
 
@@ -5767,6 +5882,17 @@ impl Services {
                 call.memory.write(inline.0, &result.inline_output)?;
                 call.reply(0, None, NVDRV_INTERFACE_ID, &result.result.to_le_bytes())?;
                 self.provisional_commands.insert("nvdrv:gsv:ioctl");
+                Ok(Outcome::success())
+            }
+            // INvDrv2User Close (2): u32 Fd; returns u32 Err (classic layout).
+            2 => {
+                call.shape(4, false, false)?;
+                let fd = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if !self.nvdrv_fds.contains_key(&fd) {
+                    return Err(call.unsupported(SERVICE, format!("Close of unopened fd {fd}")));
+                }
+                call.reply(0, None, NVDRV_INTERFACE_ID, &0u32.to_le_bytes())?;
+                self.nvdrv_fds.remove(&fd);
                 Ok(Outcome::success())
             }
             // INvDrv2User QueryEvent (4): u32 Fd, u32 EvtId; copies the
@@ -6390,6 +6516,8 @@ impl Services {
             "window_controller_aruid_source":"addressed_application_process_id",
             "graphics_supervisor_phase":self.graphics_supervisor_phase,
             "nvdrv_open_devices":self.nvdrv_fds,
+            "graphics_devices":self.graphics_devices.keys().collect::<Vec<_>>(),
+            "gpu_address_spaces":self.gpu_address_spaces.keys().collect::<Vec<_>>(),
             "hid_registration_implemented":false,
             "window_system_backend_implemented":false,
         });
