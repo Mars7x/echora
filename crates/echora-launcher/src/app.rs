@@ -108,6 +108,9 @@ struct Launcher {
     closing: Option<Sheet>,
     /// The settings pop-up menu that is open, by id.
     open_menu: Option<&'static str>,
+    /// The menu closed by the current mouse press, so the release on its
+    /// own button doesn't open it again.
+    menu_dismissed: Option<&'static str>,
     /// The switch just flipped; only it animates.
     toggled: Option<&'static str>,
     /// Window buttons the desktop asks for, when decorations are ours.
@@ -265,6 +268,7 @@ impl Launcher {
             sheet_focus: cx.focus_handle(),
             closing: None,
             open_menu: None,
+            menu_dismissed: None,
             toggled: None,
             buttons,
             corner: px(0.0),
@@ -630,23 +634,10 @@ fn scrim(
             )
         })
         // Clicks inside the sheet must not reach the scrim behind it.
-        .child(if !motion {
-            sheet.into_any_element()
-        } else if closing {
-            // Leaving: shrink slightly while the whole sheet fades.
-            ui::scaled(sheet, 1.0)
-                .with_animation("sheet-out", Animation::new(SHEET_OUT), |el, t| {
-                    el.scale(1.0 - 0.05 * ui::ease_out(t))
-                })
-                .into_any_element()
+        .child(if motion {
+            grow(sheet, closing)
         } else {
-            // Opening: grow from its centre on a spring, as GNOME's
-            // dialogs do.
-            ui::scaled(sheet, SHEET_FROM)
-                .with_animation("sheet-in", Animation::new(ui::SPRING), |el, t| {
-                    el.scale(SHEET_FROM + (1.0 - SHEET_FROM) * ui::spring(t))
-                })
-                .into_any_element()
+            sheet.into_any_element()
         });
     if !motion {
         return backdrop.into_any_element();
@@ -667,6 +658,50 @@ fn scrim(
             Animation::new(Duration::from_millis(220)),
             |el, t| el.opacity(ui::ease_out(t)),
         )
+        .into_any_element()
+}
+
+/// GNOME-style growth without scaling text or images (which would snap to
+/// the pixel grid differently every frame): a plain card springs open from
+/// the centre, and the sheet's contents, always at full size, fade in over
+/// it as it settles. Closing shrinks the card as the contents fade first.
+fn grow(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
+    let duration = if closing { SHEET_OUT } else { ui::SPRING };
+    let card = div()
+        .absolute()
+        .rounded(u(radius::SHEET))
+        .border_1()
+        .border_color(color(palette::BORDER))
+        .bg(color(palette::SURFACE))
+        .with_animation(
+            if closing { "card-out" } else { "card-in" },
+            Animation::new(duration),
+            move |card, t| {
+                let scale = if closing {
+                    1.0 - 0.05 * ui::ease_out(t)
+                } else {
+                    SHEET_FROM + (1.0 - SHEET_FROM) * ui::spring(t)
+                };
+                // Each edge moves in by half the size the card is missing.
+                let inset = gpui::relative((1.0 - scale) / 2.0);
+                card.top(inset).bottom(inset).left(inset).right(inset)
+            },
+        );
+    let content = sheet.with_animation(
+        if closing { "content-out" } else { "content-in" },
+        Animation::new(duration),
+        move |sheet, t| {
+            sheet.opacity(if closing {
+                1.0 - ui::ease_out(t * 2.0)
+            } else {
+                ui::ease_out((t - 0.2) / 0.35)
+            })
+        },
+    );
+    div()
+        .relative()
+        .child(card)
+        .child(content)
         .into_any_element()
 }
 
@@ -1187,6 +1222,9 @@ impl Launcher {
             .map_or(choices[0].0, |(label, _)| label);
         let button = ui::focusable(ui::popup_button((id, 0usize), label), live, keyboard).on_click(
             cx.listener(move |this, _, _, cx| {
+                if this.menu_dismissed.take() == Some(id) {
+                    return;
+                }
                 this.open_menu = if this.open_menu == Some(id) {
                     None
                 } else {
@@ -1224,8 +1262,9 @@ impl Launcher {
                             .h(viewport.height)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                                cx.listener(move |this, _, _, cx| {
                                     this.open_menu = None;
+                                    this.menu_dismissed = Some(id);
                                     cx.notify();
                                 }),
                             ),
@@ -1600,6 +1639,7 @@ impl Launcher {
             .on_action(cx.listener(Self::focus_prev))
             // Any mouse press ends keyboard navigation, hiding focus rings.
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.menu_dismissed = None;
                 if this.keyboard {
                     this.keyboard = false;
                     cx.notify();

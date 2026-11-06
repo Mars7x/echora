@@ -23,9 +23,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, Div, Element, ElementId,
-    FontWeight, GlobalElementId, Hsla, InspectorElementId, LayoutId, Pixels, Rems, SharedString,
-    Stateful, Window, div, prelude::*, px, rems, rgba,
+    Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, FontWeight, Hsla, Rems,
+    SharedString, Stateful, div, prelude::*, px, rems, rgba,
 };
 
 /// Spacing on a 4 px grid.
@@ -93,99 +92,9 @@ pub mod palette {
     pub const SWITCH_OFF: u32 = 0x3a3a3aff;
 }
 
-/// A length in the design system's pixels, as rems (1 rem = 16 px at rest),
-/// so a subtree drawn at a different rem size scales as a whole; see
-/// [`Scaled`].
+/// A length in the design system's pixels, as rems (1 rem = 16 px).
 pub fn u(pixels: f32) -> Rems {
     rems(pixels / 16.0)
-}
-
-/// Draws its child at `scale` times the size: every rem-based length and
-/// font size in the subtree follows the rem size it is laid out with. Used
-/// to grow sheets from their centre as they open.
-pub struct Scaled {
-    child: AnyElement,
-    scale: f32,
-    rem: Pixels,
-}
-
-pub fn scaled(child: impl IntoElement, scale: f32) -> Scaled {
-    Scaled {
-        child: child.into_any_element(),
-        scale,
-        rem: px(16.0),
-    }
-}
-
-impl Scaled {
-    pub fn scale(mut self, scale: f32) -> Self {
-        self.scale = scale;
-        self
-    }
-}
-
-impl IntoElement for Scaled {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for Scaled {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        self.rem = window.rem_size() * self.scale;
-        let rem = self.rem;
-        let layout =
-            window.with_rem_size(Some(rem), |window| self.child.request_layout(window, cx));
-        (layout, ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let rem = self.rem;
-        window.with_rem_size(Some(rem), |window| {
-            self.child.prepaint(window, cx);
-        });
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let rem = self.rem;
-        window.with_rem_size(Some(rem), |window| self.child.paint(window, cx));
-    }
 }
 
 /// `0xRRGGBBAA`.
