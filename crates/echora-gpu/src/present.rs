@@ -1,5 +1,5 @@
-//! Presentation to a host window: a Vulkan swapchain on a Wayland or Xlib
-//! surface, filled by blitting the presented render target (scaled to the
+//! Presentation to a host window: a Vulkan swapchain on a Wayland, Xlib or
+//! Win32 surface, filled by blitting the presented render target (scaled to the
 //! window) and presented synchronously.
 
 use std::ffi::c_void;
@@ -18,7 +18,12 @@ pub enum WindowHandle {
     },
     Xlib {
         display: *mut c_void,
-        window: u64,
+        /// An Xlib `Window` (C `unsigned long`).
+        window: vk::Window,
+    },
+    Win32 {
+        hinstance: vk::HINSTANCE,
+        hwnd: vk::HWND,
     },
 }
 
@@ -72,6 +77,14 @@ impl Presenter {
                     ash::khr::xlib_surface::Instance::new(&gpu.entry, &gpu.instance)
                         .create_xlib_surface(&info, None)
                         .map_err(vk_error("vkCreateXlibSurfaceKHR"))?
+                }
+                WindowHandle::Win32 { hinstance, hwnd } => {
+                    let info = vk::Win32SurfaceCreateInfoKHR::default()
+                        .hinstance(hinstance)
+                        .hwnd(hwnd);
+                    ash::khr::win32_surface::Instance::new(&gpu.entry, &gpu.instance)
+                        .create_win32_surface(&info, None)
+                        .map_err(vk_error("vkCreateWin32SurfaceKHR"))?
                 }
             }
         };

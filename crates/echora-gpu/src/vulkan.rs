@@ -52,6 +52,7 @@ impl Gpu {
             ash::khr::surface::NAME,
             ash::khr::wayland_surface::NAME,
             ash::khr::xlib_surface::NAME,
+            ash::khr::win32_surface::NAME,
         ]
         .into_iter()
         .filter(|wanted| {
