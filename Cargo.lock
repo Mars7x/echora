@@ -259,6 +259,7 @@ dependencies = [
  "echora-guest",
  "echora-lift",
  "libc",
+ "windows-sys",
 ]
 
 [[package]]
@@ -292,6 +293,7 @@ dependencies = [
  "libc",
  "portable-atomic",
  "serde",
+ "windows-sys",
 ]
 
 [[package]]
