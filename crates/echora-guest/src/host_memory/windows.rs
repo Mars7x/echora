@@ -443,9 +443,9 @@ impl HostMemory {
         }
     }
 
-    /// Host address of the guest view's first byte.
-    pub(crate) fn guest_base(&self) -> usize {
-        self.guest.base.as_ptr() as usize
+    /// Generated code's path into the guest view.
+    pub(crate) fn guest_access(&self) -> super::GuestAccess {
+        super::GuestAccess::new(self.guest.base.as_ptr() as usize, self.size)
     }
 
     /// The page at file offset `page` in the physical view.

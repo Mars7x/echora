@@ -145,12 +145,12 @@ impl Pages {
         self.resident.retain(|page| *page < start || *page >= end);
     }
 
-    #[cfg(all(test, any(target_os = "linux", windows)))]
+    #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
     fn contains_key(&self, page: &u64) -> bool {
         self.resident.contains(page)
     }
 
-    #[cfg(all(test, any(target_os = "linux", windows)))]
+    #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
     fn keys(&self) -> impl Iterator<Item = &u64> {
         self.resident.iter()
     }
@@ -542,7 +542,7 @@ impl Memory {
     /// A handle on the guest view for generated code (one per guest
     /// thread). It stays valid while this `Memory` lives.
     pub fn view(&self) -> crate::view::GuestView {
-        crate::view::GuestView::new(self.pages.host.guest_base(), self.address_space_end)
+        crate::view::GuestView::new(self.pages.host.guest_access(), self.address_space_end)
     }
 
     pub fn mappings(&self) -> impl Iterator<Item = &Mapping> {
@@ -1760,7 +1760,7 @@ impl Memory {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
