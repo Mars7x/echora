@@ -143,8 +143,9 @@ struct Launcher {
     buttons: ButtonLayout,
     /// Corner radius of the window this frame (zero when maximized or tiled).
     corner: Pixels,
-    /// A title bar press that turns into a window move once the mouse drags.
-    moving: bool,
+    /// Where a header press began, which turns into a window move once the
+    /// pointer drags past [`DRAG_THRESHOLD`].
+    press: Option<gpui::Point<Pixels>>,
     /// The desktop is moving the window. It may report the window inactive
     /// meanwhile, which mustn't dim the window buttons.
     dragging: bool,
@@ -311,7 +312,7 @@ impl Launcher {
             toggled: None,
             buttons,
             corner: px(0.0),
-            moving: false,
+            press: None,
             dragging: false,
             resize_edge: None,
             loading: false,
@@ -978,6 +979,8 @@ impl Launcher {
     /// Escape and B close the sheet from anywhere in it.
     fn close_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         ui::round_button("close-sheet", WindowButton::Close.icon(false), true)
+            // Its click area reaches into the header's padding.
+            .mr(px(-ui::ROUND_BUTTON_REACH))
             .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
     }
 
@@ -996,7 +999,8 @@ impl Launcher {
         let buttons = |side: &[WindowButton]| {
             div()
                 .flex()
-                .gap(px(space::M))
+                // The buttons' click areas fill the gap between them.
+                .gap(px(space::M - 2.0 * ui::ROUND_BUTTON_REACH))
                 .children(side.iter().map(|&button| {
                     ui::round_button(button.id(), button.icon(maximized), active)
                         // A press on a button must not start a window drag,
@@ -1019,7 +1023,7 @@ impl Launcher {
                 .left_0()
                 .right_0()
                 .h(px(48.0))
-                .px(px(space::M))
+                .px(px(space::M - ui::ROUND_BUTTON_REACH))
                 .flex()
                 .items_center()
                 .justify_between()
@@ -1205,7 +1209,7 @@ impl Launcher {
                 if event.click_count == 2 {
                     window.zoom_window();
                 } else {
-                    this.moving = true;
+                    this.press = Some(event.position);
                 }
             }),
         )
@@ -1214,11 +1218,16 @@ impl Launcher {
         })
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, _, _, _| this.moving = false),
+            cx.listener(|this, _, _, _| this.press = None),
         )
         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
-            if this.moving && event.dragging() {
-                this.moving = false;
+            let Some(press) = this.press else {
+                return;
+            };
+            if !event.dragging() {
+                this.press = None;
+            } else if (event.position - press).magnitude() >= f64::from(DRAG_THRESHOLD) {
+                this.press = None;
                 this.dragging = true;
                 window.start_window_move();
             }
@@ -1812,6 +1821,10 @@ impl Launcher {
         scrim(sheet, self.corner, self.motion, closing, cx)
     }
 }
+
+/// How far, in pixels, a header press must travel before it moves the
+/// window, as GTK waits, so a click that wobbles stays a click.
+const DRAG_THRESHOLD: f32 = 4.0;
 
 /// The width Play, Settings and About share, so the row reads as one set.
 const DOCK_BUTTON: f32 = 112.0;
