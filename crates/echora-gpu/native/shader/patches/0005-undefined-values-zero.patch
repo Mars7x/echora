@@ -1,0 +1,25 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
+index 0649290..7ed21b6 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
+@@ -6,8 +6,10 @@
+ 
+ namespace Shader::Backend::SPIRV {
+ 
++// Pokopia: registers never written read as zero, as on the hardware;
++// OpUndef let drivers pick any value (RADV produced black materials).
+ Id EmitUndefU1(EmitContext& ctx) {
+-    return ctx.OpUndef(ctx.U1);
++    return ctx.false_value;
+ }
+ 
+ Id EmitUndefU8(EmitContext&) {
+@@ -19,7 +21,7 @@ Id EmitUndefU16(EmitContext&) {
+ }
+ 
+ Id EmitUndefU32(EmitContext& ctx) {
+-    return ctx.OpUndef(ctx.U32[1]);
++    return ctx.u32_zero_value;
+ }
+ 
+ Id EmitUndefU64(EmitContext&) {

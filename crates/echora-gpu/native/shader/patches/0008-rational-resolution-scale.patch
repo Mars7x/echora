@@ -1,0 +1,41 @@
+diff --git a/src/shader_recompiler/ir_opt/rescaling_pass.cpp b/src/shader_recompiler/ir_opt/rescaling_pass.cpp
+index cae8110..7c94c29 100644
+--- a/src/shader_recompiler/ir_opt/rescaling_pass.cpp
++++ b/src/shader_recompiler/ir_opt/rescaling_pass.cpp
+@@ -97,6 +97,16 @@ void PatchPointSize(IR::Block& block, IR::Inst& inst) {
+     inst.SetArg(1, upscaled_point_value);
+ }
+ 
++// Pokopia: scales are rational, up_scale / ScaleDenominator() (a 4/3
++// scale renders 1920x1080 targets at 2560x1440). The denominator is
++// up_scale * down_factor (with down_shift 0 it is 1, as before).
++[[nodiscard]] u32 ScaleDenominator() {
++    const auto& info = Settings::values.resolution_info;
++    const u32 denominator = static_cast<u32>(
++        static_cast<f32>(info.up_scale) * info.down_factor + 0.5f);
++    return denominator == 0 ? 1 : denominator;
++}
++
+ [[nodiscard]] IR::U32 Scale(IR::IREmitter& ir, const IR::U1& is_scaled, const IR::U32& value) {
+     IR::U32 scaled_value{value};
+     if (const u32 up_scale = Settings::values.resolution_info.up_scale; up_scale != 1) {
+@@ -105,6 +115,9 @@ void PatchPointSize(IR::Block& block, IR::Inst& inst) {
+     if (const u32 down_shift = Settings::values.resolution_info.down_shift; down_shift != 0) {
+         scaled_value = ir.ShiftRightArithmetic(scaled_value, ir.Imm32(down_shift));
+     }
++    if (const u32 denominator = ScaleDenominator(); denominator != 1) {
++        scaled_value = ir.IDiv(scaled_value, ir.Imm32(denominator), true);
++    }
+     return IR::U32{ir.Select(is_scaled, scaled_value, value)};
+ }
+ 
+@@ -124,6 +137,9 @@ void PatchPointSize(IR::Block& block, IR::Inst& inst) {
+     if (const u32 down_shift = Settings::values.resolution_info.down_shift; down_shift != 0) {
+         scaled_value = ir.ShiftLeftLogical(scaled_value, ir.Imm32(down_shift));
+     }
++    if (const u32 denominator = ScaleDenominator(); denominator != 1) {
++        scaled_value = ir.IMul(scaled_value, ir.Imm32(denominator));
++    }
+     if (const u32 up_scale = Settings::values.resolution_info.up_scale; up_scale != 1) {
+         scaled_value = ir.IDiv(scaled_value, ir.Imm32(up_scale));
+     }
