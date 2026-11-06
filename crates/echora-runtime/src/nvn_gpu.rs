@@ -2829,22 +2829,37 @@ impl Nvn {
                         ));
                         uniforms.insert((index, descriptor.binding), vec![0; used as usize]);
                     }
-                    // Storage buffer i of a graphics stage: its address and
-                    // size at c0+0x110+16*i (inferred: vertex shaders read
-                    // c0+0x170 where the application binds slot 6, beside
-                    // slot 12). The contents are read now; graphics stages'
-                    // writes are not returned.
+                    // Storage buffer i of graphics stage s (NVN numbering):
+                    // its address and size at c0+0x110+0x400*s+16*i
+                    // (inferred: vertex shaders read c0+0x170 and fragment
+                    // shaders c0+0x570 where the application binds slot 6).
+                    // The contents are read now; graphics stages' writes are
+                    // not returned.
                     DescriptorKind::StorageBuffer
                         if descriptor.cbuf_index == 0
-                            && descriptor.cbuf_offset >= 0x110
-                            && (descriptor.cbuf_offset - 0x110) % 16 == 0 =>
+                            && descriptor.cbuf_offset >= 0x110 + 0x400 * nvn
+                            && descriptor.cbuf_offset < 0x110 + 0x400 * nvn + 0x200
+                            && descriptor.cbuf_offset % 16 == 0 =>
                     {
-                        let slot = (descriptor.cbuf_offset - 0x110) / 16;
+                        let slot = (descriptor.cbuf_offset - 0x110 - 0x400 * nvn) / 16;
                         let bind = self
                             .render
                             .state
                             .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
-                            .ok_or_else(|| format!("storage buffer {nvn}/{slot} is not bound"))?;
+                            .ok_or_else(|| {
+                                let bound: Vec<&str> = self
+                                    .render
+                                    .state
+                                    .keys()
+                                    .filter(|key| key.starts_with(&format!("BindStorageBuffer/{nvn}/")))
+                                    .map(String::as_str)
+                                    .collect();
+                                format!(
+                                    "storage buffer {nvn}/{slot} (c0+{:#x}) is not bound (bound [{}])",
+                                    descriptor.cbuf_offset,
+                                    bound.join(" ")
+                                )
+                            })?;
                         let (gpu, size) = (bind.x[3], bind.x[4]);
                         let base = gpu & !15;
                         let length = gpu - base + size;
