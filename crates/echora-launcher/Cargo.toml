@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 echora-config.workspace = true
 echora-content.workspace = true
+echora-input.workspace = true
 gpui = "0.2.2"
 
 [lints]

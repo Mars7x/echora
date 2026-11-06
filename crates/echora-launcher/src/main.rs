@@ -2,11 +2,13 @@
 //! applies (`echora-config`), and start it.
 //!
 //! Built with GPUI, so the same front end runs on Linux, Windows and macOS.
-//! `--show` opens the window even when "Skip launcher" is on.
+//! `--show` opens the window even when "Skip launcher" is on. The keyboard
+//! and controllers reach every control.
 
 mod app;
 mod chrome;
 mod install;
+mod nav;
 mod ui;
 
 fn main() -> std::process::ExitCode {

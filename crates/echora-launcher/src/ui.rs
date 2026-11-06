@@ -23,8 +23,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, FontWeight, Hsla, Rems,
-    SharedString, Stateful, div, prelude::*, px, rems, rgba,
+    Animation, AnimationExt as _, AnyElement, BorderStyle, Bounds, BoxShadow, Div, ElementId,
+    FontWeight, Hsla, Pixels, Rems, SharedString, Stateful, Window, div, prelude::*, px, rems,
+    rgba,
 };
 
 /// Spacing on a 4 px grid.
@@ -106,24 +107,25 @@ pub fn color(hex: u32) -> Hsla {
     rgba(hex).into()
 }
 
-/// The ring drawn around the focused control during keyboard navigation.
-fn focus_ring() -> Vec<BoxShadow> {
-    vec![BoxShadow {
-        color: color(palette::FOCUS),
-        blur_radius: px(0.0),
-        spread_radius: px(2.0),
-        offset: gpui::point(px(0.0), px(0.0)),
-    }]
-}
-
-/// Makes `el` a keyboard stop, with a focus ring while `keyboard` is on.
-/// Elements behind an open sheet pass `focusable: false`.
-pub fn focusable(el: Stateful<Div>, focusable: bool, keyboard: bool) -> Stateful<Div> {
-    if !focusable {
-        return el;
-    }
-    el.tab_index(0)
-        .when(keyboard, |el| el.focus(|style| style.shadow(focus_ring())))
+/// Paints the ring around the focused control (laid out in `bounds`)
+/// during keyboard or controller navigation: 2 px wide, 2 px clear of the
+/// control and following its rounding, so it shows on light and dark
+/// controls alike. Painted rather than a box shadow, which GPUI draws
+/// nothing for without blur.
+pub fn paint_focus_ring(bounds: Bounds<Pixels>, window: &mut Window) {
+    const GAP: f32 = 2.0;
+    const WIDTH: f32 = 2.0;
+    let scale = window.rem_size() / px(16.0);
+    let outset = px(GAP + WIDTH);
+    let radius = (px(radius::CONTROL) * scale).min(bounds.size.height / 2.0) + outset;
+    window.paint_quad(gpui::quad(
+        bounds.dilate(outset),
+        radius,
+        gpui::transparent_black(),
+        px(WIDTH),
+        color(palette::FOCUS),
+        BorderStyle::Solid,
+    ));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

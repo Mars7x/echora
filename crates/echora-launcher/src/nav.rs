@@ -1,0 +1,221 @@
+//! Focus by direction: arrow keys and a controller's D-pad move to the
+//! nearest control that way, as on a console, while Tab keeps the reading
+//! order.
+//!
+//! Every control the keyboard can reach is a [`Stops`] entry: it gets a
+//! focus handle that lasts as long as the launcher, keyed by its element id,
+//! so a control can be focused before it is drawn (the chosen item of a menu
+//! that is just opening) and focus can return to it later. Each frame the
+//! controls record where they were laid out, and a move picks among those.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use gpui::prelude::*;
+use gpui::{
+    App, Bounds, Div, Element, ElementId, FocusHandle, Pixels, Stateful, Window, actions, canvas,
+};
+
+use crate::ui;
+
+actions!(
+    nav,
+    [
+        /// Presses the focused control, as a controller's A button does.
+        /// (Enter and Space press it through GPUI's own keyboard clicks.)
+        Activate
+    ]
+);
+
+/// Controls that a click or [`Activate`] presses.
+pub trait Press {
+    fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self;
+}
+
+impl Press for Stateful<Div> {
+    fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self {
+        let listener = Rc::new(listener);
+        let activate = listener.clone();
+        // Actions go to the focused element first, so only the focused
+        // control answers Activate.
+        self.on_click(move |_, window, cx| listener(&(), window, cx))
+            .on_action(move |_: &Activate, window, cx| activate(&(), window, cx))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    Left,
+    Up,
+    Right,
+    Down,
+}
+
+#[derive(Clone, Default)]
+pub struct Stops(Rc<RefCell<Inner>>);
+
+#[derive(Default)]
+struct Inner {
+    handles: HashMap<ElementId, FocusHandle>,
+    /// The controls drawn this frame, in paint order, with their bounds.
+    frame: Vec<(Bounds<Pixels>, FocusHandle)>,
+}
+
+impl Stops {
+    /// Forgets last frame's layout; the controls drawn next record theirs.
+    pub fn begin_frame(&self) {
+        self.0.borrow_mut().frame.clear();
+    }
+
+    /// The focus handle of the control `id`.
+    pub fn handle(&self, id: impl Into<ElementId>, cx: &App) -> FocusHandle {
+        self.0
+            .borrow_mut()
+            .handles
+            .entry(id.into())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone()
+    }
+
+    /// Makes `el` a stop, with a focus ring while `ring` (the keyboard or
+    /// a controller is in use). `el` must have an id.
+    pub fn add(&self, el: Stateful<Div>, ring: bool, cx: &App) -> Stateful<Div> {
+        let id = Element::id(&el).expect("a focus stop needs an element id");
+        let handle = self.handle(id, cx);
+        let stops = self.clone();
+        let tracked = handle.clone();
+        el.track_focus(&tracked).child(
+            canvas(
+                move |bounds, _, _| {
+                    stops.0.borrow_mut().frame.push((bounds, handle.clone()));
+                    handle
+                },
+                move |bounds, handle, window, _| {
+                    if ring && handle.is_focused(window) {
+                        ui::paint_focus_ring(bounds, window);
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+    }
+
+    /// The control to focus when moving `direction` from `focused`: the
+    /// nearest one that way, or the first control when focus is on none of
+    /// them. `None` leaves focus where it is.
+    pub fn toward(
+        &self,
+        focused: Option<&FocusHandle>,
+        direction: Direction,
+    ) -> Option<FocusHandle> {
+        let inner = self.0.borrow();
+        let from = focused.and_then(|focused| {
+            inner
+                .frame
+                .iter()
+                .find(|(_, handle)| handle == focused)
+                .map(|(bounds, _)| *bounds)
+        });
+        let Some(from) = from else {
+            return inner.frame.first().map(|(_, handle)| handle.clone());
+        };
+        let from = Rect::from(from);
+        inner
+            .frame
+            .iter()
+            .filter_map(|(bounds, handle)| {
+                Some((from.distance(&Rect::from(*bounds), direction)?, handle))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, handle)| handle.clone())
+    }
+}
+
+/// Bounds as plain numbers.
+#[derive(Clone, Copy, Debug)]
+struct Rect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl From<Bounds<Pixels>> for Rect {
+    fn from(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            left: bounds.left().into(),
+            top: bounds.top().into(),
+            right: bounds.right().into(),
+            bottom: bounds.bottom().into(),
+        }
+    }
+}
+
+/// How far a control may overlap the one focused and still count as being
+/// beside it, for controls whose rings or rounding touch.
+const OVERLAP: f32 = 2.0;
+
+/// Sideways distance counts this many times the distance ahead, so a move
+/// prefers the control in line over a nearer one off to the side.
+const SIDEWAYS: f32 = 3.0;
+
+impl Rect {
+    /// How far `to` is from `self` going `direction`, or `None` when it
+    /// isn't that way.
+    fn distance(&self, to: &Rect, direction: Direction) -> Option<f32> {
+        let ahead = match direction {
+            Direction::Left => self.left - to.right,
+            Direction::Right => to.left - self.right,
+            Direction::Up => self.top - to.bottom,
+            Direction::Down => to.top - self.bottom,
+        };
+        if ahead < -OVERLAP {
+            return None;
+        }
+        // The gap between the two across the move, zero where they overlap.
+        let gap = |a0: f32, a1: f32, b0: f32, b1: f32| (b0 - a1).max(a0 - b1).max(0.0);
+        let sideways = match direction {
+            Direction::Left | Direction::Right => gap(self.top, self.bottom, to.top, to.bottom),
+            Direction::Up | Direction::Down => gap(self.left, self.right, to.left, to.right),
+        };
+        Some(ahead.max(0.0) + sideways * SIDEWAYS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Direction, Rect};
+
+    fn rect(left: f32, top: f32, width: f32, height: f32) -> Rect {
+        Rect {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        }
+    }
+
+    #[test]
+    fn moves_only_toward_controls_that_way() {
+        let play = rect(40.0, 500.0, 120.0, 40.0);
+        let settings = rect(168.0, 500.0, 100.0, 40.0);
+        assert!(play.distance(&settings, Direction::Right).is_some());
+        assert!(play.distance(&settings, Direction::Left).is_none());
+        assert!(play.distance(&settings, Direction::Up).is_none());
+        assert!(settings.distance(&play, Direction::Left).is_some());
+    }
+
+    #[test]
+    fn prefers_the_control_in_line() {
+        // A sidebar tab, the control level with it further right, and a
+        // nearer one well below.
+        let tab = rect(10.0, 100.0, 160.0, 36.0);
+        let level = rect(600.0, 96.0, 120.0, 32.0);
+        let below = rect(220.0, 300.0, 120.0, 32.0);
+        let to_level = tab.distance(&level, Direction::Right).unwrap();
+        let to_below = tab.distance(&below, Direction::Right).unwrap();
+        assert!(to_level < to_below);
+    }
+}

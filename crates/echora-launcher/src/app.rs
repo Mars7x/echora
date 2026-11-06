@@ -5,21 +5,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use echora_config::{InternalResolutionSetting, Settings, WindowMode};
 use echora_content::ContentSource;
+use echora_input::button;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
-    CursorStyle, Decorations, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
+    Action, Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
+    CursorStyle, Decorations, Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
     ImageFormat, KeyBinding, MouseButton, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
-    ResizeEdge, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, img, point,
-    prelude::*, px, size,
+    ResizeEdge, SharedString, Stateful, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, img,
+    point, prelude::*, px, size,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
+use crate::nav::{Activate, Direction, Press as _, Stops};
 use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
@@ -48,6 +50,12 @@ actions!(
         ChooseGame,
         FocusNext,
         FocusPrev,
+        FocusLeft,
+        FocusUp,
+        FocusRight,
+        FocusDown,
+        NextTab,
+        PrevTab,
         Quit
     ]
 );
@@ -70,6 +78,12 @@ enum SettingsTab {
 impl SettingsTab {
     const ALL: [Self; 4] = [Self::Game, Self::Display, Self::Controls, Self::Launcher];
 
+    /// The tab `step` places after this one, wrapping around.
+    fn step(self, step: isize) -> Self {
+        let index = Self::ALL.iter().position(|&tab| tab == self).unwrap_or(0) as isize;
+        Self::ALL[(index + step).rem_euclid(Self::ALL.len() as isize) as usize]
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Display => "Display",
@@ -89,11 +103,19 @@ struct Game {
 }
 
 struct Launcher {
+    /// The launcher as a whole, holding focus when no control does, so its
+    /// shortcuts keep working.
     focus: FocusHandle,
-    /// Play is the default button: it holds focus, so Enter or Space starts
-    /// the game.
-    play_focus: FocusHandle,
-    /// The keyboard is being used to move focus, so focus rings show.
+    /// The controls the keyboard and controllers reach.
+    stops: Stops,
+    /// Focus moves to the default control on the next frame, after the one
+    /// that held it went away.
+    refocus: bool,
+    /// The control focused when a sheet opened, which gets focus back when
+    /// it closes.
+    return_focus: Option<FocusHandle>,
+    /// The keyboard or a controller is being used to move focus, so focus
+    /// rings show.
     keyboard: bool,
     /// The desktop allows animations.
     motion: bool,
@@ -145,6 +167,12 @@ pub fn run() -> ExitCode {
             cx.bind_keys([
                 KeyBinding::new("tab", FocusNext, Some("Launcher")),
                 KeyBinding::new("shift-tab", FocusPrev, Some("Launcher")),
+                KeyBinding::new("left", FocusLeft, Some("Launcher")),
+                KeyBinding::new("up", FocusUp, Some("Launcher")),
+                KeyBinding::new("right", FocusRight, Some("Launcher")),
+                KeyBinding::new("down", FocusDown, Some("Launcher")),
+                KeyBinding::new("ctrl-tab", NextTab, Some("Launcher")),
+                KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Launcher")),
                 KeyBinding::new("ctrl-,", ToggleSettings, Some("Launcher")),
                 KeyBinding::new("cmd-,", ToggleSettings, Some("Launcher")),
                 KeyBinding::new("escape", CloseSheet, Some("Launcher")),
@@ -174,7 +202,7 @@ pub fn run() -> ExitCode {
             let opened = cx.open_window(options, |window, cx| {
                 cx.new(|cx| {
                     let launcher = Launcher::new(buttons, motion, font, window, cx);
-                    window.focus(&launcher.focus);
+                    window.focus(&launcher.default_focus(cx));
                     launcher
                 })
             });
@@ -257,7 +285,9 @@ impl Launcher {
         let (settings_path, settings) = load_settings();
         let mut launcher = Self {
             focus: cx.focus_handle(),
-            play_focus: cx.focus_handle(),
+            stops: Stops::default(),
+            refocus: false,
+            return_focus: None,
             keyboard: false,
             motion,
             font,
@@ -293,18 +323,44 @@ impl Launcher {
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.loading = false;
                     match game {
-                        Ok(game) => {
-                            this.game = Some(game);
-                            window.focus(&this.play_focus);
-                        }
+                        Ok(game) => this.game = Some(game),
                         Err(message) => this.notify(message, cx),
+                    }
+                    if this.sheet.is_none() {
+                        window.focus(&this.default_focus(cx));
                     }
                     cx.notify();
                 });
             })
             .detach();
         }
+        watch_controllers(window, cx);
         launcher
+    }
+
+    /// The control focus rests on: Play, or Choose game on the empty
+    /// screen, so Enter (or A) does the main thing at once. While a sheet is
+    /// open, the sheet; otherwise the launcher itself.
+    fn default_focus(&self, cx: &App) -> FocusHandle {
+        if self.sheet.is_some() {
+            self.sheet_focus.clone()
+        } else if self.installing.is_some() || self.loading {
+            self.focus.clone()
+        } else if self.game.is_some() {
+            self.stops.handle("play", cx)
+        } else {
+            self.stops.handle("choose", cx)
+        }
+    }
+
+    /// Makes `el` a control the keyboard and controllers reach while
+    /// `live`, with a focus ring. Controls behind a sheet or an open menu
+    /// aren't live.
+    fn stop(&self, el: Stateful<Div>, live: bool, cx: &App) -> Stateful<Div> {
+        if !live {
+            return el;
+        }
+        self.stops.add(el, self.keyboard, cx)
     }
 
     /// Shows a short message above the dock for a few seconds.
@@ -336,6 +392,7 @@ impl Launcher {
                         .and_then(|_| std::fs::write(&file, path.display().to_string()));
                 }
                 self.game = Some(game);
+                self.refocus = self.sheet.is_none();
             }
             Err(message) => self.notify(message, cx),
         }
@@ -380,7 +437,11 @@ impl Launcher {
         let worker = progress.clone();
         std::thread::spawn(move || install::install(&source, &games, &worker));
         self.installing = Some((title, progress.clone()));
+        // The sheet's controls go with it, so focus moves to the launcher.
         self.sheet = None;
+        self.open_menu = None;
+        self.return_focus = None;
+        self.refocus = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             loop {
@@ -392,6 +453,7 @@ impl Launcher {
                 let updated = this.update(cx, |this, cx| {
                     if let Some(result) = result {
                         this.installing = None;
+                        this.refocus = this.sheet.is_none();
                         match result {
                             Ok(installed) => this.select_game(installed, cx),
                             Err(error) => {
@@ -451,18 +513,23 @@ impl Launcher {
     }
 
     fn open_sheet(&mut self, sheet: Sheet, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet.is_none() {
+            self.return_focus = window.focused(cx);
+        }
         self.sheet = Some(sheet);
         self.closing = None;
         self.open_menu = None;
         self.toggled = None;
+        // Moving focus starts at the sheet's first control.
         window.focus(&self.sheet_focus);
         cx.notify();
     }
 
-    /// Escape and the close buttons: closes an open menu first, then the
-    /// sheet, which fades out.
+    /// Escape, B and the close buttons: closes an open menu first, then the
+    /// sheet, which fades out. Focus goes back to what opened it.
     fn close_sheet(&mut self, _: &CloseSheet, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open_menu.take().is_some() {
+        if let Some(menu) = self.open_menu.take() {
+            window.focus(&self.stops.handle((menu, 0usize), cx));
             cx.notify();
             return;
         }
@@ -482,11 +549,11 @@ impl Launcher {
             })
             .detach();
         }
-        if self.game.is_some() {
-            window.focus(&self.play_focus);
-        } else {
-            window.focus(&self.focus);
-        }
+        let target = self
+            .return_focus
+            .take()
+            .unwrap_or_else(|| self.default_focus(cx));
+        window.focus(&target);
         cx.notify();
     }
 
@@ -499,6 +566,30 @@ impl Launcher {
     fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<Self>) {
         self.keyboard = true;
         window.focus_prev();
+        cx.notify();
+    }
+
+    /// The arrow keys and a controller's D-pad and stick: focus moves to
+    /// the nearest control that way.
+    fn move_focus(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        self.keyboard = true;
+        if let Some(target) = self.stops.toward(window.focused(cx).as_ref(), direction) {
+            window.focus(&target);
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Tab and the shoulder buttons: the next or previous settings
+    /// tab, while Settings is open.
+    fn step_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet != Some(Sheet::Settings) {
+            return;
+        }
+        self.settings_tab = self.settings_tab.step(step);
+        self.open_menu = None;
+        self.toggled = None;
+        // The focused control may have been on the old page.
+        window.focus(&self.stops.handle(self.settings_tab.label(), cx));
         cx.notify();
     }
 
@@ -529,6 +620,114 @@ async fn wait_for(mut child: Child, cx: &mut gpui::AsyncApp) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// How often the controllers are read.
+const PAD_POLL: Duration = Duration::from_millis(16);
+/// A held direction repeats after this long, then every [`PAD_REPEAT`].
+const PAD_REPEAT_DELAY: Duration = Duration::from_millis(400);
+const PAD_REPEAT: Duration = Duration::from_millis(110);
+
+/// The D-pad and the left stick, as directions.
+const PAD_DIRECTIONS: [(u64, Direction); 8] = [
+    (button::LEFT, Direction::Left),
+    (button::UP, Direction::Up),
+    (button::RIGHT, Direction::Right),
+    (button::DOWN, Direction::Down),
+    (button::STICK_L_LEFT, Direction::Left),
+    (button::STICK_L_LEFT << 1, Direction::Up),
+    (button::STICK_L_LEFT << 2, Direction::Right),
+    (button::STICK_L_LEFT << 3, Direction::Down),
+];
+
+/// Drives the launcher from any connected controller, as the keyboard
+/// does, with the Switch's layout the game uses: the D-pad or left stick
+/// moves focus, A presses the focused control (as Enter), B goes back (as
+/// Escape), + opens Settings, and L and R (or ZL and ZR) change settings
+/// tab. Controllers are ignored while the game runs or another window is
+/// active.
+fn watch_controllers(window: &mut Window, cx: &mut Context<Launcher>) {
+    let pads = echora_input::gamepads();
+    cx.spawn_in(window, async move |this, cx| {
+        let mut held = 0u64;
+        // The direction being held, and when it next repeats.
+        let mut repeat: Option<(Direction, Instant)> = None;
+        loop {
+            cx.background_executor().timer(PAD_POLL).await;
+            let Ok(listening) = this.update_in(cx, |this, window, _| {
+                !this.running && window.is_window_active()
+            }) else {
+                break;
+            };
+            // Only presses count, so a button still held from the game
+            // does nothing when the launcher comes back.
+            let buttons = pads.state().buttons;
+            let pressed = if listening { buttons & !held } else { 0 };
+            held = buttons;
+            if !listening {
+                repeat = None;
+                continue;
+            }
+
+            let now = Instant::now();
+            let mut moves = Vec::new();
+            if let Some(&(_, direction)) = PAD_DIRECTIONS.iter().find(|(bit, _)| pressed & bit != 0)
+            {
+                moves.push(direction);
+                repeat = Some((direction, now + PAD_REPEAT_DELAY));
+            } else if let Some((direction, at)) = repeat {
+                let still_held = PAD_DIRECTIONS
+                    .iter()
+                    .any(|&(bit, d)| d == direction && held & bit != 0);
+                if !still_held {
+                    repeat = None;
+                } else if now >= at {
+                    moves.push(direction);
+                    repeat = Some((direction, now + PAD_REPEAT));
+                }
+            }
+            let mut actions: Vec<Box<dyn Action>> = moves
+                .into_iter()
+                .map(|direction| -> Box<dyn Action> {
+                    match direction {
+                        Direction::Left => Box::new(FocusLeft),
+                        Direction::Up => Box::new(FocusUp),
+                        Direction::Right => Box::new(FocusRight),
+                        Direction::Down => Box::new(FocusDown),
+                    }
+                })
+                .collect();
+            if pressed & button::B != 0 {
+                actions.push(Box::new(CloseSheet));
+            }
+            if pressed & button::PLUS != 0 {
+                actions.push(Box::new(ToggleSettings));
+            }
+            if pressed & (button::L | button::ZL) != 0 {
+                actions.push(Box::new(PrevTab));
+            }
+            if pressed & (button::R | button::ZR) != 0 {
+                actions.push(Box::new(NextTab));
+            }
+            if pressed & button::A != 0 {
+                actions.push(Box::new(Activate));
+            }
+            if actions.is_empty() {
+                continue;
+            }
+            // Dispatched outside the launcher's own update, as key presses
+            // are, so the controls' handlers can update it.
+            let dispatched = cx.update(|window, cx| {
+                for action in actions {
+                    window.dispatch_action(action, cx);
+                }
+            });
+            if dispatched.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 fn read_game(path: &Path) -> Result<Game, String> {
@@ -716,13 +915,11 @@ impl Launcher {
         (viewport.width - frame, viewport.height - frame)
     }
 
-    fn close_button(&self, live: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        ui::focusable(
-            ui::round_button("close-sheet", WindowButton::Close.icon(false), true),
-            live,
-            self.keyboard,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
+    /// A sheet's close button. The mouse's way out: it takes no focus, as
+    /// Escape and B close the sheet from anywhere in it.
+    fn close_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        ui::round_button("close-sheet", WindowButton::Close.icon(false), true)
+            .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
     }
 
     /// The window's plain background, rounded with the window.
@@ -794,12 +991,13 @@ impl Launcher {
 
     /// No game yet: a status page with the one thing to do.
     fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choose = ui::focusable(
-            ui::button("choose", "Choose game…", Kind::Primary, Size::Large),
-            self.sheet.is_none(),
-            self.keyboard,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)));
+        let choose = self
+            .stop(
+                ui::button("choose", "Choose game…", Kind::Primary, Size::Large),
+                self.sheet.is_none(),
+                cx,
+            )
+            .on_press(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)));
         div()
             .absolute()
             .inset_0()
@@ -829,20 +1027,24 @@ impl Launcher {
     /// beside Play on the game screen.
     fn secondary_actions(&self, cx: &mut Context<Self>) -> [gpui::Stateful<gpui::Div>; 2] {
         let active = self.sheet.is_none();
-        let settings = ui::focusable(
-            ui::button("settings", "Settings", Kind::Secondary, Size::Large),
-            active,
-            self.keyboard,
-        )
-        .on_click(
-            cx.listener(|this, _, window, cx| this.toggle_settings(&ToggleSettings, window, cx)),
-        );
-        let about = ui::focusable(
-            ui::button("about", "About", Kind::Secondary, Size::Large),
-            active,
-            self.keyboard,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.open_sheet(Sheet::About, window, cx)));
+        let settings = self
+            .stop(
+                ui::button("settings", "Settings", Kind::Secondary, Size::Large),
+                active,
+                cx,
+            )
+            .on_press(
+                cx.listener(|this, _, window, cx| {
+                    this.toggle_settings(&ToggleSettings, window, cx)
+                }),
+            );
+        let about = self
+            .stop(
+                ui::button("about", "About", Kind::Secondary, Size::Large),
+                active,
+                cx,
+            )
+            .on_press(cx.listener(|this, _, window, cx| this.open_sheet(Sheet::About, window, cx)));
         [settings, about]
     }
 
@@ -883,20 +1085,20 @@ impl Launcher {
                 .into_any_element()
         } else {
             let active = self.sheet.is_none();
-            let play = ui::focusable(
-                ui::button(
-                    "play",
-                    if self.running { "Running" } else { "Play" },
-                    Kind::Primary,
-                    Size::Large,
+            let play = self
+                .stop(
+                    ui::button(
+                        "play",
+                        if self.running { "Running" } else { "Play" },
+                        Kind::Primary,
+                        Size::Large,
+                    )
+                    .px(u(36.0)),
+                    active,
+                    cx,
                 )
-                .px(u(36.0)),
-                active,
-                self.keyboard,
-            )
-            .when(active, |el| el.track_focus(&self.play_focus))
-            .when(self.running, |el| el.opacity(0.6))
-            .on_click(cx.listener(|this, _, window, cx| this.play(&Play, window, cx)));
+                .when(self.running, |el| el.opacity(0.6))
+                .on_press(cx.listener(|this, _, window, cx| this.play(&Play, window, cx)));
             div()
                 .flex()
                 .gap(u(space::S))
@@ -965,7 +1167,8 @@ impl Launcher {
         let scale = window.rem_size() / px(16.0);
         let width = room_w.min(px(760.0) * scale);
         let height = room_h.min(px(460.0) * scale);
-        let keyboard = self.keyboard;
+        // An open menu keeps focus to itself.
+        let live = !closing && self.open_menu.is_none();
         let title = self.drag_window(
             div()
                 .flex_none()
@@ -997,7 +1200,7 @@ impl Launcher {
                     .gap(u(2.0))
                     .children(SettingsTab::ALL.into_iter().map(|tab| {
                         let selected = tab == self.settings_tab;
-                        ui::focusable(
+                        self.stop(
                             div()
                                 .id(tab.label())
                                 .h(u(36.0))
@@ -1019,10 +1222,10 @@ impl Launcher {
                                         })
                                 })
                                 .child(tab.label()),
-                            !closing,
-                            keyboard,
+                            live,
+                            cx,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_press(cx.listener(move |this, _, _, cx| {
                             this.settings_tab = tab;
                             this.open_menu = None;
                             this.toggled = None;
@@ -1049,7 +1252,7 @@ impl Launcher {
                     ),
                 cx,
             )
-            .child(self.close_button(!closing, cx));
+            .child(self.close_button(cx));
         let page = div()
             .flex()
             .flex_col()
@@ -1087,21 +1290,16 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let settings = &self.settings;
-        let keyboard = self.keyboard;
         let motion = self.motion;
         let toggled = self.toggled;
         let switch =
             |id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<Self>| {
-                ui::focusable(
-                    ui::switch(id, on, motion && toggled == Some(id)),
-                    live,
-                    keyboard,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggled = Some(id);
-                    this.change(cx, flip);
-                }))
-                .into_any_element()
+                self.stop(ui::switch(id, on, motion && toggled == Some(id)), live, cx)
+                    .on_press(cx.listener(move |this, _, _, cx| {
+                        this.toggled = Some(id);
+                        this.change(cx, flip);
+                    }))
+                    .into_any_element()
             };
         match self.settings_tab {
             SettingsTab::Game => self.game_page(live, cx),
@@ -1202,36 +1400,44 @@ impl Launcher {
         cx: &mut Context<Self>,
         apply: fn(&mut Settings, T),
     ) -> AnyElement {
-        let keyboard = self.keyboard;
         let open = live && self.open_menu == Some(id);
-        let label = choices
+        let selected = choices
             .iter()
-            .find(|(_, value)| *value == current)
-            .map_or(choices[0].0, |(label, _)| label);
-        let button = ui::focusable(ui::popup_button((id, 0usize), label), live, keyboard).on_click(
-            cx.listener(move |this, _, _, cx| {
+            .position(|(_, value)| *value == current)
+            .unwrap_or(0);
+        let label = choices[selected].0;
+        let button = self
+            .stop(
+                ui::popup_button((id, 0usize), label),
+                live && self.open_menu.is_none(),
+                cx,
+            )
+            .on_press(cx.listener(move |this, _, window, cx| {
                 if this.menu_dismissed.take() == Some(id) {
                     return;
                 }
-                this.open_menu = if this.open_menu == Some(id) {
-                    None
+                if this.open_menu == Some(id) {
+                    this.open_menu = None;
+                    window.focus(&this.stops.handle((id, 0usize), cx));
                 } else {
-                    Some(id)
-                };
+                    // Focus starts on the current choice.
+                    this.open_menu = Some(id);
+                    window.focus(&this.stops.handle((id, selected + 1), cx));
+                }
                 cx.notify();
-            }),
-        );
+            }));
         if !open {
             return div().flex_none().child(button).into_any_element();
         }
         let menu = ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
-            ui::focusable(
+            self.stop(
                 ui::menu_item((id, index + 1), label, value == current),
                 true,
-                keyboard,
+                cx,
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_press(cx.listener(move |this, _, window, cx| {
                 this.open_menu = None;
+                window.focus(&this.stops.handle((id, 0usize), cx));
                 this.change(cx, |settings| apply(settings, value));
             }))
         }));
@@ -1250,9 +1456,10 @@ impl Launcher {
                             .h(viewport.height)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
+                                cx.listener(move |this, _, window, cx| {
                                     this.open_menu = None;
                                     this.menu_dismissed = Some(id);
+                                    window.focus(&this.stops.handle((id, 0usize), cx));
                                     cx.notify();
                                 }),
                             ),
@@ -1276,14 +1483,13 @@ impl Launcher {
 
     /// The installed game, and installing or reinstalling it.
     fn game_page(&self, live: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let keyboard = self.keyboard;
         let choose = |label: &'static str, cx: &mut Context<Self>| {
-            ui::focusable(
+            self.stop(
                 ui::button("install", label, Kind::Secondary, Size::Regular),
                 live,
-                keyboard,
+                cx,
             )
-            .on_click(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)))
+            .on_press(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)))
             .into_any_element()
         };
         let Some(game) = &self.game else {
@@ -1340,7 +1546,7 @@ impl Launcher {
                     Some("Played from its original location.".into()),
                 ),
                 Some(
-                    ui::focusable(
+                    self.stop(
                         ui::button(
                             "install",
                             "Install into Echora",
@@ -1348,9 +1554,9 @@ impl Launcher {
                             Size::Regular,
                         ),
                         live,
-                        keyboard,
+                        cx,
                     )
-                    .on_click(
+                    .on_press(
                         cx.listener(move |this, _, _, cx| this.install_game(path.clone(), cx)),
                     )
                     .into_any_element(),
@@ -1379,12 +1585,13 @@ impl Launcher {
     fn render_about(&self, window: &Window, closing: bool, cx: &mut Context<Self>) -> AnyElement {
         let (room_w, _) = self.sheet_room(window);
         let width = room_w.min(px(560.0) * (window.rem_size() / px(16.0)));
-        let source = ui::focusable(
-            ui::button("source", "Source code", Kind::Secondary, Size::Regular),
-            !closing,
-            self.keyboard,
-        )
-        .on_click(cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")));
+        let source = self
+            .stop(
+                ui::button("source", "Source code", Kind::Secondary, Size::Regular),
+                !closing,
+                cx,
+            )
+            .on_press(cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")));
         let credit = |&(name, role): &(&'static str, &'static str)| {
             div()
                 .flex_1()
@@ -1429,7 +1636,7 @@ impl Launcher {
                     .justify_end(),
                 cx,
             )
-            .child(self.close_button(!closing, cx));
+            .child(self.close_button(cx));
         let surface = palette::SURFACE;
         let sheet = sheet("about", width, None, surface, window.rem_size())
             .flex_col()
@@ -1635,6 +1842,10 @@ fn resize_cursor(inset: Pixels) -> impl IntoElement {
 impl Launcher {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let welcome = self.game.is_none() && !self.loading && self.installing.is_none();
+        self.stops.begin_frame();
+        if std::mem::take(&mut self.refocus) {
+            window.focus(&self.default_focus(cx));
+        }
         div()
             .key_context("Launcher")
             .track_focus(&self.focus)
@@ -1644,6 +1855,20 @@ impl Launcher {
             .on_action(cx.listener(Self::choose_game))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
+                this.move_focus(Direction::Left, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusUp, window, cx| {
+                this.move_focus(Direction::Up, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
+                this.move_focus(Direction::Right, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusDown, window, cx| {
+                this.move_focus(Direction::Down, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.step_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.step_tab(-1, window, cx)))
             // Any mouse press ends keyboard navigation, hiding focus rings.
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.menu_dismissed = None;
