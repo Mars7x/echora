@@ -912,7 +912,7 @@ impl Nvn {
     /// +0x40; from the reference implementation's GLSLC notes).
     fn stage_constants(&self, core: &Guest, bit: u32) -> Option<Vec<u8>> {
         let bind = self.render.state.get(&format!("BindProgram@{bit}"))?;
-        let stage = self.objects.get(&bind.x[1])?.state.get("Stage0")?;
+        let stage = self.program_stage(core, bind.x[1], bit).ok()?;
         let (code, control) = (stage.x[0], stage.x[1]);
         let size = core.memory.read_u32(control + 0x3c).ok()?;
         let offset = core.memory.read_u32(control + 0x40).ok()?;
@@ -927,6 +927,42 @@ impl Nvn {
         Some(bytes)
     }
 
+    /// The stage of `program` bound for stage bit `bit` (0 vertex, 1
+    /// fragment): a program may hold one stage, or several (SetShadersExt
+    /// gives one program both), told apart by the shader program header's
+    /// type (word 0 bits 10..13: 1 vertex, 5 pixel; Maxwell SPH layout).
+    fn program_stage(&self, core: &Guest, program: u64, bit: u32) -> Result<super::Args, String> {
+        let program = self
+            .objects
+            .get(&program)
+            .ok_or("bound program is not initialized")?;
+        let stages: Vec<super::Args> = (0..6)
+            .map_while(|index| program.state.get(&format!("Stage{index}")).copied())
+            .collect();
+        if stages.len() <= 1 {
+            return stages
+                .first()
+                .copied()
+                .ok_or_else(|| "bound program has no shaders".into());
+        }
+        let wanted = match bit {
+            0 => 1,
+            1 => 5,
+            _ => return Err(format!("stage bit {bit} is not modeled")),
+        };
+        stages
+            .iter()
+            .find(|stage| {
+                self.stage_code(core, stage.x[0]).is_some_and(|(code, _)| {
+                    code.len() >= 4
+                        && (u32::from_le_bytes([code[0], code[1], code[2], code[3]]) >> 10) & 0xf
+                            == wanted
+                })
+            })
+            .copied()
+            .ok_or_else(|| format!("bound program has no stage of type {wanted}"))
+    }
+
     fn bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
         let mut addresses = Vec::new();
         for bit in [0u32, 1] {
@@ -935,15 +971,7 @@ impl Nvn {
                 .state
                 .get(&format!("BindProgram@{bit}"))
                 .ok_or_else(|| format!("no program bound for stage {bit}"))?;
-            let program = self
-                .objects
-                .get(&bind.x[1])
-                .ok_or("bound program is not initialized")?;
-            // Each program here holds one stage (as measured in the draw log).
-            let stage = program
-                .state
-                .get("Stage0")
-                .ok_or("bound program has no shaders")?;
+            let stage = self.program_stage(core, bind.x[1], bit)?;
             addresses.push(stage.x[0]);
         }
         let types = self
@@ -2968,12 +2996,22 @@ impl Nvn {
                 (Indices::None, command.x[3] as u32, command.x[2] as u32, 0)
             }
             // DrawElementsBaseVertex(cmd, mode, type, count, indexBuffer,
-            // baseVertex); type 1 = 16-bit, 2 = 32-bit (inferred GL order).
+            // baseVertex); type 0 = 8-bit, 1 = 16-bit, 2 = 32-bit (NVN1's
+            // NVNindexType order). 8-bit indices widen to 16-bit, which the
+            // renderer takes.
             "nvnCommandBufferDrawElementsBaseVertex"
             | "nvnCommandBufferDrawElements"
             | "nvnCommandBufferDrawElementsInstanced" => {
                 let count = command.x[3] as u32;
                 let (size, wrap): (u64, fn(Vec<u8>) -> Indices) = match command.x[2] {
+                    0 => (1, |bytes: Vec<u8>| {
+                        Indices::U16(
+                            bytes
+                                .iter()
+                                .flat_map(|&index| u16::from(index).to_le_bytes())
+                                .collect(),
+                        )
+                    }),
                     1 => (2, Indices::U16),
                     2 => (4, Indices::U32),
                     other => return Err(format!("index type {other}")),

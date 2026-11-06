@@ -412,6 +412,10 @@ enum ReadableEventKind {
     SocketPoll,
     /// nfp IUser AttachAvailabilityChangeEvent (23); never signaled.
     NfpAvailability,
+    /// Syncpoint supervisor command 22's event for an index.
+    SyncpointEvent {
+        index: u32,
+    },
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -646,6 +650,10 @@ enum ServiceObject {
     },
     /// IGraphicsSupervisor GetSyncpointSession (202) session (TIPC).
     SyncpointSupervisor,
+    /// VideoDecoderCreatorSession from graphics supervisor 906 (TIPC).
+    VideoDecoderCreator,
+    /// VideoEncoderCreatorSession from graphics supervisor 1002 (TIPC).
+    VideoEncoderCreator,
     /// DisplaySession from IGraphicsSupervisor InitializeDisplayContext (305).
     DisplaySession {
         state: crate::display::DisplaySessionState,
@@ -769,6 +777,8 @@ impl ServiceObject {
             Self::GraphicsSupervisor { .. } => "appletOE:graphics_supervisor",
             Self::NvidiaDriver { .. } => "nvdrv:gsv",
             Self::SyncpointSupervisor => "appletOE:syncpoint_supervisor",
+            Self::VideoDecoderCreator => "appletOE:video_decoder_creator",
+            Self::VideoEncoderCreator => "appletOE:video_encoder_creator",
             Self::GpuSession => "appletOE:gpu_session",
             Self::DisplaySession { .. } => "appletOE:display_session",
             Self::GpuWorker => "appletOE:gpu_worker",
@@ -1035,6 +1045,10 @@ pub struct Services {
     pub(crate) hid_disconnected_npads: BTreeSet<u32>,
     /// hid SetSupportedNpadStyleSet's style set.
     hid_supported_style_set: u32,
+    /// ISelfController idle time detection extension (62/63).
+    idle_time_detection_extension: u32,
+    /// Syncpoint supervisor command 22 events by index.
+    syncpoint_events: BTreeMap<u32, ReadableEventId>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1134,6 +1148,8 @@ impl Default for Services {
             nfp_availability_event: None,
             hid_disconnected_npads: BTreeSet::new(),
             hid_supported_style_set: 0,
+            idle_time_detection_extension: 0,
+            syncpoint_events: BTreeMap::new(),
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -2175,6 +2191,20 @@ impl Services {
                 self.graphics_supervisor(&application, call)
             }
             ServiceObject::SyncpointSupervisor => self.syncpoint_supervisor(call),
+            ServiceObject::VideoDecoderCreator => Err(call.unsupported(
+                "appletOE:video_decoder_creator",
+                format!(
+                    "video decoder creator command ({})",
+                    call.request.describe()
+                ),
+            )),
+            ServiceObject::VideoEncoderCreator => Err(call.unsupported(
+                "appletOE:video_encoder_creator",
+                format!(
+                    "video encoder creator command ({})",
+                    call.request.describe()
+                ),
+            )),
             ServiceObject::GpuSession => self.gpu_session(call),
             ServiceObject::DisplaySession { .. } => self.display_session(call),
             ServiceObject::FileSystemProxy => self.file_system_proxy(call),
@@ -2331,6 +2361,30 @@ impl Services {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
                 call.reply(0, None, SELF_CONTROLLER_INTERFACE_ID, &data)?;
+                Ok(Outcome::success())
+            }
+            // SetIdleTimeDetectionExtension (62, u32) and
+            // GetIdleTimeDetectionExtension (63) (Switchbrew "Applet Manager
+            // services"): the extension is stored; there is no idle
+            // detection on the host for it to extend.
+            ServiceObject::SelfController { application }
+                if matches!(call.request.command_id, 62 | 63) =>
+            {
+                let set = call.request.command_id == 62;
+                call.shape(if set { 4 } else { 0 }, false, false)?;
+                if self.main_application.as_ref() != Some(application) {
+                    return Err(invalid(
+                        "self-controller owner must match the trusted bootstrap main application",
+                    ));
+                }
+                if set {
+                    self.idle_time_detection_extension =
+                        crate::bytes::le_u32(&call.request.arguments[..4]);
+                    call.reply(0, None, SELF_CONTROLLER_INTERFACE_ID, &[])?;
+                } else {
+                    let value = self.idle_time_detection_extension;
+                    call.reply(0, None, SELF_CONTROLLER_INTERFACE_ID, &value.to_le_bytes())?;
+                }
                 Ok(Outcome::success())
             }
             // LockExit (1) / UnlockExit (2) (Switchbrew "Applet Manager
@@ -5719,11 +5773,13 @@ impl Services {
             // (CreateDisplayContext) and 401/402 (Create/InitializeGpuContext)
             // are documented on Switchbrew "Switch 2: GSV services"; 1101/1102
             // and 1501/1502 (CreateInterModuleImageContext / Initialize...) are
-            // listed without I/O and follow the same pattern. No backend object
+            // listed without I/O and follow the same pattern, as do 901
+            // (CreateVideoDecoderContext) and 1001 (CreateVideoEncoderContext;
+            // Switchbrew: "No input/output", unofficial names). No backend object
             // exists for these contexts yet, so each is recorded and reported;
             // the undocumented pairs as provisional. An initialize must follow
             // its create.
-            301 | 401 | 402 | 1101 | 1102 | 1501 | 1502 => {
+            301 | 401 | 402 | 901 | 1001 | 1101 | 1102 | 1501 | 1502 => {
                 call.shape(0, false, false)?;
                 let command = call.request.command_id;
                 if self.graphics_supervisor_phase != Some(GraphicsSupervisorPhase::Ready) {
@@ -5759,6 +5815,70 @@ impl Services {
                     self.provisional_commands.insert(name);
                     self.provisional_inputs.insert(name, Vec::new());
                 }
+                Ok(Outcome::success())
+            }
+            // 906 (undocumented; Switchbrew lists 901..905): u8 flag and the
+            // u64 VideoDecoderLibraryVersion (the SDK's
+            // InitializeServerContext, client at sdk+0x3379f0); moves a
+            // VideoDecoderCreatorSession like 905. Requires 901's context.
+            906 => {
+                call.shape(12, false, false)?;
+                if !self.graphics_contexts.contains(&901) {
+                    return Err(call.unsupported(SERVICE, "906 before CreateVideoDecoderContext"));
+                }
+                let handle = self.next_available_handle()?;
+                call.reply(0, Some(handle), 0, &[])?;
+                self.sessions
+                    .insert(handle, Session::regular(ServiceObject::VideoDecoderCreator));
+                self.next_handle = handle + 1;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:906");
+                Ok(Outcome::success())
+            }
+            // InitializeVideoEncoderContext (1002): no input; moves a
+            // VideoEncoderCreatorSession (Switchbrew, unofficial name).
+            1002 => {
+                call.shape(0, false, false)?;
+                if !self.graphics_contexts.contains(&1001) {
+                    return Err(call.unsupported(SERVICE, "1002 before CreateVideoEncoderContext"));
+                }
+                let handle = self.next_available_handle()?;
+                call.reply(0, Some(handle), 0, &[])?;
+                self.sessions
+                    .insert(handle, Session::regular(ServiceObject::VideoEncoderCreator));
+                self.next_handle = handle + 1;
+                Ok(Outcome::success())
+            }
+            // 991: the SDK's nn::codec::CalculateDecoderImagePoolBuffer
+            // (client sdk+0x331d24): 0x40-byte VideoDecoderImagePreference
+            // and a u32 -> u64 size, u64 alignment (the SDK rounds the size
+            // up to the alignment, at least 4 KiB). OoT asks for one
+            // 1920x1080 image (words 1 and 2: count, then height - 1 and
+            // width - 1 as u16s). No host video decoder exists yet; the size
+            // is a host value for 32-bit pixels. Provisional.
+            991 => {
+                call.shape(0x44, false, false)?;
+                let word = |at: usize| crate::bytes::le_u32(&call.request.arguments[at..at + 4]);
+                let count = u64::from(word(4).max(1));
+                let extent = word(8);
+                let (width, height) = (u64::from(extent & 0xffff) + 1, u64::from(extent >> 16) + 1);
+                let size = (count * width * height * 4).next_multiple_of(0x1000);
+                let mut reply = size.to_le_bytes().to_vec();
+                reply.extend_from_slice(&0x1000u64.to_le_bytes());
+                call.reply(0, None, 0, &reply)?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:991");
+                Ok(Outcome::success())
+            }
+            // DestroyVideoDecoderContext (903) / DestroyVideoEncoderContext
+            // (1003): no input/output (Switchbrew); undo 901 / 1001.
+            903 | 1003 => {
+                call.shape(0, false, false)?;
+                let create = call.request.command_id - 2;
+                if !self.graphics_contexts.remove(&create) {
+                    return Err(call.unsupported(SERVICE, "destroy of a context never created"));
+                }
+                call.reply(0, None, 0, &[])?;
                 Ok(Outcome::success())
             }
             // GetNvidiaDriver: after image-format setup, moves a new session
@@ -6671,6 +6791,50 @@ impl Services {
                 self.syncpoint_event_count = Some(count);
                 Ok(Outcome::success())
             }
+            // Command 22: u32 event index -> a moved event handle. The SDK's
+            // syncpt InitializeEx tries indices in turn and wraps each
+            // returned handle as a system event (sdk+0x5d41f4 reads the
+            // moved handle), skipping indices that fail. One event per
+            // index, below 1024 (the SDK's slot limit); a taken index fails.
+            // When the events should be signaled is not modeled yet.
+            22 => {
+                call.shape(4, false, false)?;
+                let index = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if index >= 1024 || self.syncpoint_events.contains_key(&index) {
+                    return Err(call.unsupported(SERVICE, format!("syncpoint event index {index}")));
+                }
+                let application = self
+                    .main_application
+                    .clone()
+                    .ok_or_else(|| invalid("syncpoint events require the main application"))?;
+                if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                    return Err(invalid("readable event backing capacity exhausted"));
+                }
+                let event = ReadableEventId(
+                    self.readable_events
+                        .keys()
+                        .map(|id| id.0)
+                        .max()
+                        .unwrap_or(0)
+                        + 1,
+                );
+                let handle = self.next_available_handle()?;
+                call.reply(0, Some(handle), 0, &[])?;
+                self.readable_events.insert(
+                    event,
+                    ReadableEvent {
+                        owner: application,
+                        kind: ReadableEventKind::SyncpointEvent { index },
+                        signaled: false,
+                    },
+                );
+                self.syncpoint_events.insert(index, event);
+                self.readable_event_handles.insert(handle, event);
+                self.next_handle = handle + 1;
+                self.provisional_commands
+                    .insert("appletOE:syncpoint_supervisor:22");
+                Ok(Outcome::success())
+            }
             _ => Err(call.unsupported(SERVICE, "syncpoint supervisor command is not implemented")),
         }
     }
@@ -7197,6 +7361,7 @@ impl Services {
             | ReadableEventKind::AudioRendererFrame
             | ReadableEventKind::SocketPoll
             | ReadableEventKind::NfpAvailability
+            | ReadableEventKind::SyncpointEvent { .. }
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
