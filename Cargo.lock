@@ -342,6 +342,7 @@ dependencies = [
  "echora-guest",
  "echora-loader",
  "echora-nup",
+ "getrandom",
  "jiff",
  "miniz_oxide",
  "serde",

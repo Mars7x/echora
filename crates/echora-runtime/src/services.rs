@@ -1054,12 +1054,11 @@ pub(crate) struct SharedMemoryObject {
 
 const TIME_SHARED_MEMORY_ID: u32 = 1;
 
-/// Per-launch steady-clock source ID from Linux randomness (zero on failure,
+/// Per-launch steady-clock source ID from host randomness (zero on failure,
 /// which is still a single consistent ID for the session).
 fn random_clock_source() -> [u8; 16] {
-    use std::io::Read;
     let mut id = [0u8; 16];
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut id));
+    let _ = getrandom::fill(&mut id);
     id
 }
 
