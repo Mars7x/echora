@@ -119,6 +119,10 @@ struct Launcher {
     /// The frosted backdrop, decoded once (BGRA, as GPUI uploads it).
     art: Option<image::RgbaImage>,
     backdrop: Option<Backdrop>,
+    /// The resize edge under the pointer, if any.
+    resize_edge: Option<ResizeEdge>,
+    /// The remembered game is still being read.
+    loading: bool,
     settings_tab: SettingsTab,
     notice: Option<SharedString>,
     notice_generation: u64,
@@ -249,14 +253,33 @@ impl Launcher {
             moving: false,
             art: decode_art(BACKDROP),
             backdrop: None,
+            resize_edge: None,
+            loading: false,
             settings_tab: SettingsTab::Game,
             notice: None,
             notice_generation: 0,
             running: false,
             installing: None,
         };
+        // Read the remembered game off the UI thread so the window opens at
+        // once; the backdrop shows while the dock waits for it.
         if let Some(last) = last_game() {
-            launcher.select_game(last, cx);
+            launcher.loading = true;
+            let task = cx
+                .background_executor()
+                .spawn(async move { read_game(&last) });
+            cx.spawn(async move |this, cx| {
+                let game = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.loading = false;
+                    match game {
+                        Ok(game) => this.game = Some(game),
+                        Err(message) => this.notify(message, cx),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         launcher
     }
@@ -714,7 +737,8 @@ fn divider() -> impl IntoElement {
 
 impl Launcher {
     fn render_art(&mut self, window: &mut Window) -> AnyElement {
-        let Some(art) = self.game.as_ref().and(self.art.as_ref()) else {
+        let shown = self.game.is_some() || self.loading;
+        let Some(art) = self.art.as_ref().filter(|_| shown) else {
             return div()
                 .size_full()
                 .rounded(self.corner)
@@ -1293,7 +1317,16 @@ impl Render for Launcher {
             .when(floating, |el| {
                 el.p(inset)
                     .child(resize_cursor(inset))
-                    .on_mouse_move(|_, window, _| window.refresh())
+                    // Redraw only when the pointer enters or leaves a resize
+                    // edge, so the cursor updates without a frame per move.
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, _| {
+                        let size = window.window_bounds().get_bounds().size;
+                        let edge = chrome::resize_edge(event.position, inset, size);
+                        if edge != this.resize_edge {
+                            this.resize_edge = edge;
+                            window.refresh();
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, move |event, window, _| {
                         let size = window.window_bounds().get_bounds().size;
                         if let Some(edge) = chrome::resize_edge(event.position, inset, size) {
@@ -1352,7 +1385,7 @@ impl Launcher {
             // and a second layer under its rounded corners would show at the
             // antialiased edge.
             .child(self.render_art(window))
-            .when(self.game.is_none(), |el| {
+            .when(self.game.is_none() && !self.loading, |el| {
                 el.child(
                     div()
                         .absolute()
@@ -1402,7 +1435,7 @@ impl Launcher {
                                 .child(notice),
                         )
                     })
-                    .child(self.render_dock(cx)),
+                    .when(!self.loading, |el| el.child(self.render_dock(cx))),
             )
             .when_some(self.sheet, |el, sheet| {
                 el.child(match sheet {
