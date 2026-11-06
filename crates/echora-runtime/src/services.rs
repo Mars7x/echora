@@ -673,6 +673,10 @@ enum ServiceObject {
     AudioInManager,
     AudioOutManager,
     AudioRendererManager,
+    /// auddmg:u, nn::audio::devmgr::IUserSessionManager ([S2], Switchbrew
+    /// Audio_services), and the IUserSession its command 0 returns.
+    AudioDeviceSessionManager,
+    AudioDeviceSession,
     /// hwopus IHardwareOpusDecoderManager.
     OpusDecoderManager,
     /// bsd:u ISocketClient with no network: sockets cannot be created.
@@ -769,6 +773,8 @@ impl ServiceObject {
             Self::AudioOut { .. } => "aud:u:audio_out",
             Self::AudioRenderer { .. } => "aud:u:audio_renderer",
             Self::OpusDecoderManager => "hwopus",
+            Self::AudioDeviceSessionManager => "auddmg:u",
+            Self::AudioDeviceSession => "auddmg:u:session",
             Self::SocketClient => "bsd:u",
             Self::SslService => "ssl",
             Self::SslContext => "ssl:context",
@@ -997,6 +1003,8 @@ pub struct Services {
     audio_volume_auto_tune: bool,
     /// IAudioDevice output volumes by device name (f32 bits).
     audio_device_volumes: BTreeMap<String, u32>,
+    /// Device functionalities the application listed virtual devices for.
+    audio_device_list_requests: BTreeSet<u32>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1088,6 +1096,7 @@ impl Default for Services {
             audio_renderers: Vec::new(),
             audio_volume_auto_tune: false,
             audio_device_volumes: BTreeMap::new(),
+            audio_device_list_requests: BTreeSet::new(),
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -2106,6 +2115,8 @@ impl Services {
             | ServiceObject::AudioDevice { .. }
             | ServiceObject::AudioOut { .. }
             | ServiceObject::AudioRenderer { .. }
+            | ServiceObject::AudioDeviceSessionManager
+            | ServiceObject::AudioDeviceSession
             | ServiceObject::OpusDecoderManager
             | ServiceObject::OpusDecoder { .. } => self.audio(&object.clone(), call),
             ServiceObject::SocketClient => self.socket_client(call),
@@ -3296,6 +3307,28 @@ impl Services {
                 )
             }
             (ServiceObject::AudioOut { id }, _) => self.audio_out(*id, call),
+            // auddmg:u command 0: "Takes a PID, an u32, an u64 pid_reserved,
+            // returns an output IUserSession" (Switchbrew Audio_services).
+            // OoT sends 24 bytes, a further u64 before the reserved one
+            // (observed: u32 2, u64 1, u64 0); none affects the session.
+            // IUserSession command 0 is devmgr ListVirtualDeviceNames
+            // (client stub sdk+0x2ade20, reached from ListVirtualInputDevices):
+            // u8 flag and u32 device functionality, names (0x100 bytes each)
+            // into an output buffer, s32 count. The host offers no virtual
+            // devices through this interface, so the count is 0.
+            (ServiceObject::AudioDeviceSession, 0) => {
+                call.shape_output(8, false)?;
+                call.output_buffer()?;
+                let functionality = crate::bytes::le_u32(&call.request.arguments[4..8]);
+                self.audio_device_list_requests.insert(functionality);
+                call.reply(0, None, AOC_INTERFACE_ID, &0u32.to_le_bytes())?;
+                self.provisional_commands.insert("auddmg:u:session:0");
+                Ok(Outcome::success())
+            }
+            (ServiceObject::AudioDeviceSessionManager, 0) => {
+                call.shape(24, true, false)?;
+                self.reply_new_object(call, ServiceObject::AudioDeviceSession, AOC_INTERFACE_ID)
+            }
             // IAudioRendererManager OpenAudioRenderer (0), as Eden-NS2
             // 1a6d7d4 audio_renderer_manager.cpp: the 0x34-byte parameters
             // (padded to 0x38), u64 transfer memory size and the applet
@@ -4297,6 +4330,18 @@ impl Services {
                     ..Outcome::success()
                 });
             }
+            // SetVoiceDropParameter (12, f32) / GetVoiceDropParameter (13).
+            12 => {
+                call.shape(4, false, false)?;
+                let value = crate::bytes::le_u32(&call.request.arguments[..4]);
+                self.audio_renderers[id].0.voice_drop_parameter = value;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+            }
+            13 => {
+                call.shape(0, false, false)?;
+                let value = self.audio_renderers[id].0.voice_drop_parameter;
+                call.reply(0, None, AOC_INTERFACE_ID, &value.to_le_bytes())?;
+            }
             // SetRenderingTimeLimit (8): u32 percent.
             8 => {
                 call.shape(4, false, false)?;
@@ -4937,20 +4982,18 @@ impl Services {
             self.provisional_commands.insert("appletOE:display_session");
             return Ok(Outcome::success());
         }
-        // 32: u32 index 0 and a copy of command 31's event; moves another
+        // 32: u32 index and a copy of command 31's event for it; moves another
         // handle to that same event. Undocumented, inferred from the SDK
         // wrapper (sdk+0x5e3af0) that replaces its stored handle with the
         // reply's. Provisional.
         if call.request.command_id == 32 {
             call.shape_with_copies(4, false, false, 1)?;
-            if call.request.arguments != [0; 4] {
-                return Err(call.unsupported(SERVICE, "command 32 index is not 0"));
-            }
+            let index = crate::bytes::le_u32(&call.request.arguments[..4]);
             let copied = self
                 .readable_event_handles
                 .get(&call.request.copy_handles[0])
                 .copied();
-            let Some(id) = copied.filter(|id| Some(id.0) == state.event_31) else {
+            let Some(id) = copied.filter(|id| state.events_31.get(&index) == Some(&id.0)) else {
                 return Err(call.unsupported(
                     SERVICE,
                     "command 32 handle is not this session's command 31 event",
@@ -4981,11 +5024,21 @@ impl Services {
         // GetNotificationEvent (11) / ReleaseNotificationEvent (13): u32 index
         // 0 (Eden 1a6d7d4). 11 moves a readable event, created once per
         // session and signaled only while notification bits are pending.
-        // 31 is undocumented with 11's shape (the SDK stores its moved
-        // handle and closes it on failure); provisional.
+        // 31 is undocumented with 11's shape and an event index below 8: the
+        // SDK keeps one moved handle per index (sdk+0x5ead6c stores it in
+        // an array by index) and closes it on failure; provisional.
         if matches!(call.request.command_id, 11 | 13 | 31) {
-            if call.request.arguments.len() != 4 || call.request.arguments != [0; 4] {
-                return Err(call.unsupported(SERVICE, "display event index is not 0"));
+            let index = if call.request.arguments.len() == 4 {
+                crate::bytes::le_u32(&call.request.arguments[..4])
+            } else {
+                u32::MAX
+            };
+            let limit = if call.request.command_id == 31 { 8 } else { 1 };
+            if index >= limit {
+                return Err(call.unsupported(
+                    SERVICE,
+                    format!("display event index {index} is not modeled"),
+                ));
             }
             let notification = matches!(call.request.command_id, 11 | 13);
             if call.request.command_id == 13 {
@@ -5000,7 +5053,7 @@ impl Services {
             let slot = if notification {
                 state.notification_event
             } else {
-                state.event_31
+                state.events_31.get(&index).copied()
             };
             let id = match slot {
                 Some(id) => ReadableEventId(id),
@@ -5022,7 +5075,7 @@ impl Services {
             if notification {
                 state.notification_event = Some(id.0);
             } else {
-                state.event_31 = Some(id.0);
+                state.events_31.insert(index, id.0);
             }
             let handle = self.next_available_handle()?;
             call.reply(0, Some(handle), 0, &[])?;
@@ -6838,6 +6891,7 @@ impl Services {
                     "acc:u0" => ServiceObject::AccountService,
                     "aud:u" => ServiceObject::AudioManager,
                     "hwopus" => ServiceObject::OpusDecoderManager,
+                    "auddmg:u" => ServiceObject::AudioDeviceSessionManager,
                     "bsd:u" => ServiceObject::SocketClient,
                     "ssl" => ServiceObject::SslService,
                     "nifm:u" => ServiceObject::NifmStatic,
@@ -6924,6 +6978,7 @@ impl Services {
             "service_backends":["lm","appletOE"], "filesystem_services_implemented":false,
             "session_close_requests":self.session_close_requests,
             "audio_outs":self.audio_outs,
+            "audio_device_list_requests":self.audio_device_list_requests,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
                 "sample_count":renderer.parameters.sample_count,
