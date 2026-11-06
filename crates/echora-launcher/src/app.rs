@@ -718,7 +718,7 @@ impl Launcher {
 
     fn close_button(&self, live: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         ui::focusable(
-            ui::icon_button("close-sheet", WindowButton::Close.icon(false)),
+            ui::round_button("close-sheet", WindowButton::Close.icon(false), true),
             live,
             self.keyboard,
         )
@@ -742,7 +742,7 @@ impl Launcher {
                 .flex()
                 .gap(px(space::M))
                 .children(side.iter().map(|&button| {
-                    ui::window_button(button.id(), button.icon(maximized), active)
+                    ui::round_button(button.id(), button.icon(maximized), active)
                         // A press on a button must not start a window drag,
                         // nor a double-click maximize the window.
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1422,7 +1422,7 @@ impl Launcher {
         let top = self
             .drag_window(
                 div()
-                    .h(u(44.0))
+                    .h(u(48.0))
                     .px(u(space::M))
                     .flex()
                     .items_center()

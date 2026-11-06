@@ -115,10 +115,15 @@ pub fn resize_edge(
 }
 
 /// The launcher's built-in icons, drawn as 16-pixel symbolic glyphs with
-/// 2 px strokes on whole pixels, so straight edges render crisp.
+/// 2 px strokes on whole pixels, so straight edges render crisp, and the
+/// 24-pixel circle behind a round button.
 pub struct Icons;
 
-const ICONS: [(&str, &str); 6] = [
+const ICONS: [(&str, &str); 7] = [
+    (
+        "icons/circle.svg",
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="12"/></svg>"##,
+    ),
     (
         "icons/check.svg",
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M3.5 8.5l3 3 6-7" stroke="#000" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>"##,
