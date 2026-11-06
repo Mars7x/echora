@@ -8896,6 +8896,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decoder_slots_pair_with_submissions_and_input_back_pressure() {
+        let mut services = Services::default();
+        services.readable_events.insert(
+            ReadableEventId(1),
+            ReadableEvent {
+                owner: MainApplicationIdentity {
+                    process_id: 1,
+                    program_id: 1,
+                    npdm_sha256: String::new(),
+                },
+                kind: ReadableEventKind::VideoDecoderInput,
+                signaled: true,
+            },
+        );
+        services.video_input_event = Some(ReadableEventId(1));
+        for id in 0..VIDEO_INPUT_DEPTH as u64 {
+            services.video_input.push((id, id * 100, Vec::new()));
+        }
+        services.decode_video_frames();
+        // No slot yet: nothing decodes and the full input clears the event.
+        assert!(services.decoded_video_frames.is_empty());
+        assert!(!services.readable_events[&ReadableEventId(1)].signaled);
+        services.decoder_slots.extend([7, 9]);
+        services.decode_video_frames();
+        assert_eq!(
+            services
+                .decoded_video_frames
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [(7, 0), (9, 100)]
+        );
+        assert_eq!(services.video_input.len(), VIDEO_INPUT_DEPTH - 2);
+        assert!(services.readable_events[&ReadableEventId(1)].signaled);
+    }
+
+    #[test]
     fn event_fds_poll_readable_only_with_a_nonzero_counter() {
         let mut fds = BTreeMap::new();
         fds.insert(3, 0u64);
