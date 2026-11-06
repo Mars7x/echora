@@ -132,6 +132,36 @@ Still unsupported: one `stg` (memory tagging). Without MTE it is an
 undefined instruction; it stays an explicit stop until a path that reaches
 it is found.
 
+## Translation size and compile cost
+
+`echora lift game.nup` (2026-11-06) writes the translation to
+`<cache>/translations/<ExeFS key>/`: a dispatch crate and one crate per
+64 KiB guest region (1 KiB dispatch windows inside each).
+
+| Measure | Value |
+|---|---|
+| Instructions | 17,343,958 |
+| Region crates | 1,111 |
+| Generated Rust | 4,220 MiB (0.57 MB to 5.3 MB per region, median 4.0 MB) |
+| Emission time / peak memory | 197 s / 6.2 GB (discovery dominates; regions stream to disk) |
+
+Compiling single regions in release mode (`opt-level = 1`, one job):
+
+| Region | Source | Time | Peak memory |
+|---|---|---|---|
+| `710000` (rtld) | 0.57 MB | 2.4 s | 0.24 GB |
+| `710335` (median) | 4.0 MB | 14.9 s | 0.81 GB |
+| `71050a` (largest) | 5.3 MB | 24.2 s | 1.12 GB |
+
+`cargo check --release -j 6` over the whole translation (1,111 regions
+plus the dispatch crate) passes with no errors or warnings in 15 min 6 s;
+the largest single process peaks at 3.8 GB. Every emitted instruction form
+therefore type-checks against `echora-guest`.
+
+Extrapolated, a full build is about 4.5 CPU-hours of region compilation;
+at six parallel jobs it needs roughly 7 GB of memory. Generated output
+belongs on disk: `/tmp` is a RAM-backed tmpfs on the development machine.
+
 ## Licensing decision
 
 Echora is GPL-3.0-or-later, matching Pokopia so its code can be carried over,

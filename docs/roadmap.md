@@ -23,9 +23,5 @@ Each phase completes only on the evidence named here, not when code exists.
 
 ## Next steps
 
-1. Measure translation and build cost for OoT's 63 MB `main` text before
-   committing to the generated-crate layout (Pokopia's split emission
-   produced about 30 GB of build output for 11.7M instructions; memory per
-   compiling region crate must stay well inside 32 GB).
-2. Build the first runtime slice: bootstrap the process (stack, TLS, rtld
+1. Build the first runtime slice: bootstrap the process (stack, TLS, rtld
    entry) and run translated rtld until its first SVC.

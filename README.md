@@ -45,6 +45,9 @@ display version 1.1.1):
   instructions, 96.6% of `main`'s text, in 14 s. Every discovered
   instruction form is translated except a single `stg` (memory tagging);
   see the [research notes](docs/research.md#code-discovery-on-the-checked-input).
+- **Translation:** `echora lift` writes the whole game as 4.2 GiB of Rust in
+  1,111 crates; all of it type-checks. A full native build has not been
+  run yet (estimated at about 4.5 CPU-hours).
 - **No game code runs yet.** Completing the lifter and the runtime are
   next; see the [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
@@ -94,6 +97,7 @@ echora verify game.nup           # decode and hash-check every file
 echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
 echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
+echora lift game.nup             # write the translation (4.2 GiB of Rust) to the cache
 echora extract game.nup out --subtree romfs
 ```
 
