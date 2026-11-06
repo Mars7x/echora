@@ -15,6 +15,7 @@ pub const FIRST_MODULE_BASE: u64 = 0x71_0000_0000;
 pub const PACIBSP: u32 = 0xd503_237f;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const RELA_ENTRY_SIZE: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -165,6 +166,43 @@ pub fn exported_function_targets(placed: &PlacedModule) -> Vec<u64> {
         .collect()
 }
 
+/// Lazy-binding stubs: the original values of `JUMP_SLOT` GOT entries that
+/// point into this module's text. Until the first call resolves an import,
+/// rtld leaves its slot holding this value plus the load base, so the PLT
+/// jumps there (normally PLT0) and nothing else names the address.
+pub fn lazy_binding_targets(placed: &PlacedModule) -> Vec<u64> {
+    let module = &placed.module;
+    let text_start = u64::from(module.text.memory_offset);
+    let text = text_start..text_start + module.text.bytes.len() as u64;
+    let Some(dynamic) = module.mod0.as_ref().and_then(|m| m.dynamic.as_ref()) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for table in &dynamic.relocation_tables {
+        if table.kind != "JMPREL/RELA" {
+            continue;
+        }
+        let Some(bytes) = original_view(module, table.memory_offset, table.byte_size) else {
+            continue;
+        };
+        for entry in bytes.as_chunks::<RELA_ENTRY_SIZE>().0 {
+            let (Some(slot), Some(info)) = (word(entry, 0), word(entry, 8)) else {
+                continue;
+            };
+            if info as u32 == R_AARCH64_JUMP_SLOT
+                && let Some(value) = original_view(module, slot, 8).and_then(|b| word(b, 0))
+                && value % 4 == 0
+                && text.contains(&value)
+            {
+                targets.push(placed.base + value);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
 /// Static constructors: `DT_INIT_ARRAY` slots whose relative relocation
 /// targets this module's text, in array order.
 pub fn init_array_targets(placed: &PlacedModule) -> Vec<u64> {
@@ -251,6 +289,10 @@ mod tests {
         put(&mut data, 0xc0, 0x1030);
         put(&mut data, 0xc8, u64::from(R_AARCH64_RELATIVE));
         put(&mut data, 0xd0, 0xc0);
+        // JMPREL: R_AARCH64_JUMP_SLOT at 0x1028, whose lazy value is text 0x60.
+        put(&mut data, 0x28, 0x60);
+        put(&mut data, 0xe0, 0x1028);
+        put(&mut data, 0xe8, 1 << 32 | u64::from(R_AARCH64_JUMP_SLOT));
         NsoModule {
             name: "m".into(),
             build_id: [0; 32],
@@ -277,6 +319,7 @@ mod tests {
                     relocation_tables: vec![
                         table("RELR", 0x1080, 16, 8),
                         table("RELA", 0x10c0, 24, 24),
+                        table("JMPREL/RELA", 0x10e0, 24, 24),
                     ],
                     init_array: Some(DynamicArrayInfo {
                         memory_offset: 0x1000,
@@ -316,5 +359,6 @@ mod tests {
         );
         assert_eq!(init_array_targets(&placed), [b + 0x40, b + 0x80]);
         assert_eq!(prologue_targets(&placed), [b + 0x40]);
+        assert_eq!(lazy_binding_targets(&placed), [b + 0x60]);
     }
 }
