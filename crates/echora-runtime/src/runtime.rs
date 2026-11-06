@@ -1167,23 +1167,29 @@ impl Machine {
     }
 
     /// WaitForAddress (Atmosphere KAddressArbiter::WaitIfLessThan /
-    /// WaitIfEqual): type 0 waits while the s32 at `address` is less than
-    /// `value`, type 1 also decrements it first, type 2 waits while it equals
-    /// `value`. A failed comparison returns InvalidState (0xfa01) without
-    /// waiting; a zero timeout returns TimedOut (0xea01) after the update.
+    /// WaitIfEqual / WaitIfEqual64): type 0 waits while the s32 at `address`
+    /// is less than `value`, type 1 also decrements it first, type 2 waits
+    /// while it equals `value`, and type 3 waits while the 8-byte-aligned u64
+    /// at `address` equals the full 64-bit `raw_value` (X2). A failed
+    /// comparison returns InvalidState (0xfa01) without waiting; a zero
+    /// timeout returns TimedOut (0xea01) after the update.
     fn wait_for_address_result(
         &mut self,
         address: u64,
         kind: u32,
-        value: i32,
+        raw_value: u64,
         timeout_ns: i64,
     ) -> Result<Option<u32>, Trap> {
+        let value = raw_value as u32 as i32;
         let address_result = Self::arbiter_address_result(address);
         if address_result != 0 {
             return Ok(Some(address_result));
         }
-        if kind > 2 {
+        if kind > 3 {
             return Ok(Some(0xf001));
+        }
+        if kind == 3 && address & 7 != 0 {
+            return Ok(Some(0xcc01));
         }
         let current = self.core.current_thread_id;
         if self.process_exit_requested || self.pending_thread_exit == Some(current) {
@@ -1198,14 +1204,21 @@ impl Machine {
                     .into(),
             });
         }
-        let current_value = match self.memory.read_u32(address) {
-            Ok(word) => word as i32,
+        let read = if kind == 3 {
+            self.memory.read_u64(address)
+        } else {
+            self.memory.read_u32(address).map(u64::from)
+        };
+        let current_raw = match read {
+            Ok(word) => word,
             Err(Trap::MemoryFault { .. }) => return Ok(Some(0xd401)),
             Err(trap) => return Err(trap),
         };
+        let current_value = current_raw as u32 as i32;
         let waits = match kind {
             0 | 1 => current_value < value,
-            _ => current_value == value,
+            2 => current_value == value,
+            _ => current_raw == raw_value,
         };
         if !waits {
             return Ok(Some(0xfa01));
@@ -2945,14 +2958,12 @@ impl Machine {
                 Ok(())
             }
             0x34 => {
-                // WaitForAddress: X0 address, W1 ArbitrationType, W2 value,
+                // WaitForAddress: X0 address, W1 ArbitrationType, W2 value
+                // (X2 for the 64-bit type),
                 // X3 timeout. A parked wait defers W0.
-                if let Some(result) = self.wait_for_address_result(
-                    args[0],
-                    args[1] as u32,
-                    args[2] as u32 as i32,
-                    args[3] as i64,
-                )? {
+                if let Some(result) =
+                    self.wait_for_address_result(args[0], args[1] as u32, args[2], args[3] as i64)?
+                {
                     self.core.cpu.regs[0] = u64::from(result);
                 }
                 Ok(())
@@ -3961,7 +3972,7 @@ mod tests {
         };
         // Unaligned address, unknown type, failed comparisons.
         assert_eq!(call(&mut m, 0x34, [word + 1, 2, 0, 0]), 0xcc01);
-        assert_eq!(call(&mut m, 0x34, [word, 3, 0, 0]), 0xf001);
+        assert_eq!(call(&mut m, 0x34, [word, 4, 0, 0]), 0xf001);
         assert_eq!(call(&mut m, 0x35, [word, 3, 0, 0]), 0xf001);
         m.memory.write_u32(word, 5).unwrap();
         assert_eq!(call(&mut m, 0x34, [word, 2, 4, u64::MAX]), 0xfa01);
@@ -3990,6 +4001,39 @@ mod tests {
         assert_eq!(m.memory.read_u32(word).unwrap(), 6);
         assert_eq!(call(&mut m, 0x35, [word, 1, 5, 1]), 0xfa01);
         assert_eq!(m.memory.read_u32(word).unwrap(), 6);
+    }
+
+    #[test]
+    fn wait_if_equal_64_compares_the_full_register() {
+        let mut m = thread_machine();
+        let base = 0x1_0000_0000;
+        m.memory
+            .map(base, 0x1000, READ | WRITE, STATE_NORMAL, "heap")
+            .unwrap();
+        let word = base + 0x20;
+        let call = |m: &mut Machine, args: [u64; 4]| {
+            m.core.cpu.regs[..4].copy_from_slice(&args);
+            m.svc(0x34).unwrap();
+            m.core.cpu.regs[0]
+        };
+        m.memory.write_u64(word, 0x1_0000_0005).unwrap();
+        // 4-byte but not 8-byte aligned: InvalidAddress.
+        assert_eq!(call(&mut m, [word + 4, 3, 5, 0]), 0xcc01);
+        // Only the low halves match: no wait.
+        assert_eq!(call(&mut m, [word, 3, 5, 0]), 0xfa01);
+        // Equal 64-bit values with a zero timeout: TimedOut, memory unchanged.
+        assert_eq!(call(&mut m, [word, 3, 0x1_0000_0005, 0]), 0xea01);
+        assert_eq!(m.memory.read_u64(word).unwrap(), 0x1_0000_0005);
+        // A timed wait parks, then times out.
+        m.core.cpu.regs[..4].copy_from_slice(&[word, 3, 0x1_0000_0005, 1_000_000]);
+        m.svc(0x34).unwrap();
+        assert_eq!(m.pending_synchronization_wait, Some(m.current_thread_id()));
+        assert!(matches!(
+            m.finish_block(),
+            Err(Trap::NoRunnableThreads { .. })
+        ));
+        assert!(m.idle_until_runnable().unwrap());
+        assert_eq!(m.core.cpu.regs[0], 0xea01);
     }
 
     #[test]
