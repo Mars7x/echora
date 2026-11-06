@@ -13,6 +13,7 @@ use crate::nso::NsoModule;
 pub const FIRST_MODULE_BASE: u64 = 0x71_0000_0000;
 /// `PACIBSP`: the prologue this toolchain emits for non-leaf functions.
 pub const PACIBSP: u32 = 0xd503_237f;
+const NOP: u32 = 0xd503_201f;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
@@ -224,6 +225,69 @@ pub fn init_array_targets(placed: &PlacedModule) -> Vec<u64> {
     slots.into_iter().map(|(_, t)| t).collect()
 }
 
+/// Whether `word` ends straight-line code (return, unconditional branch,
+/// trap, padding), so the next word can begin a function.
+fn ends_code(word: u32) -> bool {
+    word == 0
+        || word == NOP
+        || word & 0xfc00_0000 == 0x1400_0000 // B
+        || word & 0xffff_fc1f == 0xd61f_0000 // BR
+        || word & 0xffff_fc1f == 0xd65f_0000 // RET
+        || word == 0xd65f_0bff // RETAA
+        || word == 0xd65f_0fff // RETAB
+        || word & 0xffe0_001f == 0xd420_0000 // BRK
+}
+
+/// Text addresses the module computes in code with `ADR`, or `ADRP` and a
+/// following `ADD` to the same register, that sit where a function can
+/// begin. Callbacks without a `PACIBSP` prologue and without a relocation
+/// (leaf functions passed by address) are reached only this way.
+pub fn code_address_targets(placed: &PlacedModule) -> Vec<u64> {
+    let start = placed.text_range().start;
+    let words: Vec<u32> = placed
+        .module
+        .text
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
+        .collect();
+    let size = words.len() as u64 * 4;
+    let mut targets = Vec::new();
+    for (i, &word) in words.iter().enumerate() {
+        let pc = i as u64 * 4;
+        // ADR and ADRP share the 21-bit immhi:immlo field.
+        let imm = ((word >> 5 & 0x7ffff) << 2 | word >> 29 & 3) as i64;
+        let imm = imm << 43 >> 43;
+        let target = match word & 0x9f00_0000 {
+            0x1000_0000 => (pc as i64).wrapping_add(imm) as u64,
+            0x9000_0000 => {
+                let rd = word & 31;
+                let page = ((pc & !0xfff) as i64).wrapping_add(imm << 12) as u64;
+                let add = words[i + 1..words.len().min(i + 8)]
+                    .iter()
+                    .take_while(|&&next| {
+                        next & 0xffc0_0000 == 0x9100_0000 && next >> 5 & 31 == rd || next & 31 != rd
+                    })
+                    .find(|&&next| next & 0xffc0_0000 == 0x9100_0000 && next >> 5 & 31 == rd);
+                let Some(add) = add else { continue };
+                page.wrapping_add(u64::from(add >> 10 & 0xfff))
+            }
+            _ => continue,
+        };
+        if target % 4 == 0
+            && target < size
+            && (target == 0 || ends_code(words[target as usize / 4 - 1]))
+        {
+            targets.push(start + target);
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
 /// Addresses of every `PACIBSP` in the module's text.
 pub fn prologue_targets(placed: &PlacedModule) -> Vec<u64> {
     let start = placed.text_range().start;
@@ -275,6 +339,14 @@ mod tests {
     fn module() -> NsoModule {
         let mut text = vec![0u8; 0x100];
         text[0x40..0x44].copy_from_slice(&PACIBSP.to_le_bytes());
+        let code =
+            |t: &mut Vec<u8>, at: usize, w: u32| t[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        code(&mut text, 0x00, 0x1000_0100); // adr x0, 0x20 (after padding)
+        code(&mut text, 0x04, 0x9000_0001); // adrp x1, 0
+        code(&mut text, 0x08, 0x9100_c021); // add x1, x1, #0x30 (after ret)
+        code(&mut text, 0x0c, 0x1000_0042); // adr x2, 0x14 (after a mov: not a start)
+        code(&mut text, 0x10, 0xaa04_03e3); // mov x3, x4
+        code(&mut text, 0x2c, 0xd65f_03c0); // ret
         let mut data = vec![0u8; 0x100];
         let put =
             |d: &mut Vec<u8>, at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
@@ -360,5 +432,6 @@ mod tests {
         assert_eq!(init_array_targets(&placed), [b + 0x40, b + 0x80]);
         assert_eq!(prologue_targets(&placed), [b + 0x40]);
         assert_eq!(lazy_binding_targets(&placed), [b + 0x60]);
+        assert_eq!(code_address_targets(&placed), [b + 0x20, b + 0x30]);
     }
 }
