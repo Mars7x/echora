@@ -217,6 +217,10 @@ impl App {
                     window: window.window,
                 }
             }
+            (RawDisplayHandle::Windows(_), RawWindowHandle::Win32(window)) => WindowHandle::Win32 {
+                hinstance: window.hinstance.map_or(0, |h| h.get()),
+                hwnd: window.hwnd.get(),
+            },
             _ => return Err("unsupported window system".into()),
         };
         *self.shared.handle.lock().unwrap() = Some(handle);
