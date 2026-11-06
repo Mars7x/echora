@@ -725,7 +725,7 @@ impl ZeroHandleWaits {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -1015,7 +1015,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 mod zero_handle_tests {
     use super::*;
 

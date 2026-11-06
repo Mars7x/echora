@@ -24,7 +24,7 @@ impl HostMemory {
         match self.never {}
     }
 
-    pub(crate) fn guest_base(&self) -> usize {
+    pub(crate) fn guest_access(&self) -> super::GuestAccess {
         match self.never {}
     }
 

@@ -128,8 +128,14 @@ impl HostMemory {
         }
     }
 
+    /// Generated code's path into the guest view.
+    pub(crate) fn guest_access(&self) -> super::GuestAccess {
+        super::GuestAccess::new(self.guest.as_ptr() as usize, self.size)
+    }
+
     /// Host address of the guest view's first byte.
-    pub(crate) fn guest_base(&self) -> usize {
+    #[cfg(test)]
+    fn guest_base(&self) -> usize {
         self.guest.as_ptr() as usize
     }
 

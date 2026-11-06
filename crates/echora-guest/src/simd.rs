@@ -3216,7 +3216,7 @@ pub fn load_replicate(
 #[cfg(test)]
 mod vector_tests {
     use super::*;
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     use crate::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
     fn lanes32(values: [u32; 4]) -> u128 {
@@ -3627,7 +3627,7 @@ mod vector_tests {
         assert_eq!(cpu.vectors[0], 55 | (72u128 << 64));
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     #[test]
     fn structure_loads_deinterleave_and_stores_interleave() {
         let mut memory = Memory::new(0x20000);

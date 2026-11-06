@@ -12,6 +12,7 @@
 #![allow(unsafe_code)]
 
 use crate::Trap;
+use crate::host_memory::GuestAccess;
 use crate::memory::AtomicOp;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
@@ -28,11 +29,8 @@ struct Exclusive {
 
 #[derive(Debug)]
 pub struct GuestView {
-    base: usize,
+    access: GuestAccess,
     size: u64,
-    /// Bits an in-range address may have (the reservation's power-of-two
-    /// size minus one).
-    mask: u64,
     exclusive: Option<Exclusive>,
 }
 
@@ -67,14 +65,13 @@ fn orderings(acquire: bool, release: bool) -> (Ordering, Ordering) {
 }
 
 impl GuestView {
-    /// A view of the guest view mapped at host address `base`, `size` bytes
-    /// long. The mapping must outlive the view (the `Memory` that owns it
-    /// lives as long as the machine).
-    pub(crate) fn new(base: usize, size: u64) -> Self {
+    /// A view of guest memory through `access`, `size` bytes long. The
+    /// memory must outlive the view (the `Memory` that owns it lives as long
+    /// as the machine).
+    pub(crate) fn new(access: GuestAccess, size: u64) -> Self {
         Self {
-            base,
+            access,
             size,
-            mask: size.next_power_of_two() - 1,
             exclusive: None,
         }
     }
@@ -83,38 +80,14 @@ impl GuestView {
         self.size
     }
 
-    /// Host pointer to `length` bytes at `address`, if they lie inside the
-    /// guest address space.
-    #[inline(always)]
-    fn pointer(&self, address: u64, length: usize) -> Option<*mut u8> {
-        (address <= self.size.checked_sub(length as u64)?)
-            .then(|| (self.base + address as usize) as *mut u8)
-    }
-
-    /// The host address of a typed access. One test against the
-    /// reservation's power-of-two mask: an access starting past the address
-    /// space (or running past its end) lands in the reservation's
-    /// inaccessible tail and faults in the host, which reports the guest
-    /// address (`host_memory::install_fault_report`).
-    #[inline(always)]
-    fn at<T: Copy>(&self, address: u64) -> *mut T {
-        if address & !self.mask != 0 {
-            outside(address);
-        }
-        (self.base + address as usize) as *mut T
-    }
-
     #[inline(always)]
     fn load<T: Copy>(&self, address: u64) -> T {
-        // SAFETY: inside the guest reservation; the guest view's protections
-        // fault on anything the guest may not read.
-        unsafe { std::ptr::read_unaligned(self.at::<T>(address)) }
+        self.access.load(address)
     }
 
     #[inline(always)]
     fn store<T: Copy>(&mut self, address: u64, value: T) {
-        // SAFETY: as in `load`, for writes.
-        unsafe { std::ptr::write_unaligned(self.at::<T>(address), value) }
+        self.access.store(address, value)
     }
 
     #[inline(always)]
@@ -154,28 +127,26 @@ impl GuestView {
     /// fault trap when they leave the guest address space.
     #[inline]
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Trap> {
-        let pointer = self
-            .pointer(address, out.len())
-            .ok_or_else(|| Trap::MemoryFault {
+        if self.access.read(address, out) {
+            Ok(())
+        } else {
+            Err(Trap::MemoryFault {
                 address,
                 access: "read outside the guest address space".into(),
-            })?;
-        // SAFETY: as in `load`, for `out.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(pointer, out.as_mut_ptr(), out.len()) };
-        Ok(())
+            })
+        }
     }
 
     #[inline]
     pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Trap> {
-        let pointer = self
-            .pointer(address, bytes.len())
-            .ok_or_else(|| Trap::MemoryFault {
+        if self.access.write(address, bytes) {
+            Ok(())
+        } else {
+            Err(Trap::MemoryFault {
                 address,
                 access: "write outside the guest address space".into(),
-            })?;
-        // SAFETY: as in `store`, for `bytes.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
-        Ok(())
+            })
+        }
     }
 
     pub fn read_u8(&self, address: u64) -> Result<u8, Trap> {
@@ -212,7 +183,7 @@ impl GuestView {
     }
 
     fn atomic_load(&self, address: u64, bytes: u8, order: Ordering) -> u64 {
-        let pointer = self.at::<u8>(address);
+        let pointer = self.access.atomic(address, false);
         // SAFETY: aligned (checked by callers) and inside the reservation.
         unsafe {
             match bytes {
@@ -225,7 +196,7 @@ impl GuestView {
     }
 
     fn atomic_store(&self, address: u64, bytes: u8, value: u64, order: Ordering) {
-        let pointer = self.at::<u8>(address);
+        let pointer = self.access.atomic(address, true);
         // SAFETY: as in `atomic_load`.
         unsafe {
             match bytes {
@@ -247,7 +218,7 @@ impl GuestView {
         new: u64,
         orders: (Ordering, Ordering),
     ) -> u64 {
-        let pointer = self.at::<u8>(address);
+        let pointer = self.access.atomic(address, true);
         let (success, failure) = orders;
         // SAFETY: as in `atomic_load`.
         unsafe {
@@ -335,7 +306,7 @@ impl GuestView {
             8 => {
                 aligned(address, 16, "atomic pair compare-and-swap")?;
                 let join = |(lo, hi): (u64, u64)| u128::from(lo) | u128::from(hi) << 64;
-                let pointer = self.at::<u8>(address);
+                let pointer = self.access.atomic(address, true);
                 // SAFETY: 16-byte aligned (checked above) and inside the
                 // reservation; the guest view's protections fault on
                 // anything the guest may not access, as in `atomic_load`.
@@ -498,13 +469,7 @@ impl GuestView {
     }
 }
 
-#[cold]
-#[inline(never)]
-fn outside(address: u64) -> ! {
-    panic!("guest memory access at {address:#x} lies outside the guest address space")
-}
-
-#[cfg(all(test, any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::memory::{AtomicOp, Memory, READ, STATE_NORMAL, WRITE};
