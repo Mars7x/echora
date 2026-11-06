@@ -1087,6 +1087,9 @@ pub struct Services {
     native_memory_addresses: BTreeMap<u32, u64>,
     /// Decoder image pools (911) and their native memory handle.
     decoder_image_pools: BTreeMap<u32, u32>,
+    /// Each 911 request in order: its preference, u32 and native memory
+    /// (address and size), as hex for the report.
+    decoder_image_pool_requests: Vec<String>,
     /// Whether the video decoder was started (6) and not stopped (207).
     video_decoder_running: bool,
     /// Frames handed back to the decoder (command 314), output slots
@@ -1218,6 +1221,7 @@ impl Default for Services {
             native_memories: BTreeMap::new(),
             native_memory_addresses: BTreeMap::new(),
             decoder_image_pools: BTreeMap::new(),
+            decoder_image_pool_requests: Vec::new(),
             video_decoder_running: false,
             returned_frames: 0,
             decoder_slots: Default::default(),
@@ -2490,6 +2494,23 @@ impl Services {
                 // GetFrame (213) consumes submissions in order.
                 if self.video_input.len() >= 4096 {
                     return Err(invalid("video submission backlog overflow"));
+                }
+                // ECHORA_VIDEO_DUMP_DIR: the submissions of each decoder go
+                // to decoder-<n>.obu there (n counts initializations), each
+                // behind its length as a little-endian u32, for offline
+                // decoding work.
+                if let Some(directory) = std::env::var_os("ECHORA_VIDEO_DUMP_DIR") {
+                    use std::io::Write;
+                    let path = std::path::Path::new(&directory)
+                        .join(format!("decoder-{}.obu", self.video_decoders.len()));
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = file.write_all(&(bytes.len() as u32).to_le_bytes());
+                        let _ = file.write_all(&bytes);
+                    }
                 }
                 self.video_input.push((id, timestamp, bytes));
                 self.decode_video_frames();
@@ -6589,6 +6610,19 @@ impl Services {
                     .next_back()
                     .map_or(1, |pool| pool + 1);
                 self.decoder_image_pools.insert(pool, memory);
+                if self.decoder_image_pool_requests.len() < 16 {
+                    let preference: String = call.request.arguments[..0x44]
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    let address = self.native_memory_addresses[&memory];
+                    let size = self
+                        .native_memories
+                        .get(&memory)
+                        .map_or(0, |&(_, size)| size);
+                    self.decoder_image_pool_requests
+                        .push(format!("{preference} memory {address:#x}+{size:#x}"));
+                }
                 call.reply(0, None, 0, &pool.to_le_bytes())?;
                 self.provisional_commands
                     .insert("appletOE:graphics_supervisor:911");
@@ -8545,6 +8579,7 @@ impl Services {
             "video_submissions":self.video_submissions,
             "returned_frames":self.returned_frames,
             "decoded_frames":self.decoded_frames,
+            "decoder_image_pool_requests":self.decoder_image_pool_requests,
             "refused_video_submissions":self.refused_video_submissions,
             "empty_frame_requests":self.empty_frame_requests,
             "library_applets":self.library_applets,
