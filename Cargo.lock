@@ -200,6 +200,7 @@ dependencies = [
  "anyhow",
  "clap",
  "echora-content",
+ "echora-lift",
  "echora-loader",
  "echora-nup",
  "serde_json",

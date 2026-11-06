@@ -5,6 +5,7 @@
 
 pub mod mod0;
 pub mod nso;
+pub mod process;
 pub mod zbic;
 
 use std::fs;

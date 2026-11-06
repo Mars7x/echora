@@ -41,7 +41,11 @@ display version 1.1.1):
   Rust at build time; they run natively and pass integer, call, atomic,
   exclusive and acquire/release semantics checks. Guest memory currently
   needs Linux.
-- **No game code runs yet.** Lifting the real modules and the runtime are
+- **Code discovery on the real game:** `echora analyze` finds 17.3 million
+  instructions, 96.2% of `main`'s text, in 13 s. 19 instruction forms are
+  not supported by the lifter yet (listed in
+  [research notes](docs/research.md#code-discovery-on-the-checked-input)).
+- **No game code runs yet.** Completing the lifter and the runtime are
   next; see the [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
   x86-64, Windows x86-64 and macOS ARM64. Nothing beyond content tooling runs
@@ -89,6 +93,7 @@ echora inspect game.nup          # packages, versions, build ID, module hashes
 echora verify game.nup           # decode and hash-check every file
 echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
+echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
 echora extract game.nup out --subtree romfs
 ```
 

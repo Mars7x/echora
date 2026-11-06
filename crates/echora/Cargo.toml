@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 echora-content.workspace = true
+echora-lift.workspace = true
 echora-loader.workspace = true
 echora-nup.workspace = true
 serde_json.workspace = true

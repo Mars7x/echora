@@ -56,6 +56,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Load the modules and run ahead-of-time code discovery (no code
+    /// generation), reporting coverage and unsupported instructions.
+    Analyze {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Modules whose prologues and relocation targets seed discovery
+        /// (default: all). The process entry is always a root.
+        #[arg(long, value_delimiter = ',')]
+        seed: Vec<String>,
+        /// Maximum instructions to discover.
+        #[arg(long, default_value_t = 1_000_000)]
+        limit: usize,
+        /// Write the full report (including every unsupported site) as JSON.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
         input: PathBuf,
@@ -176,6 +194,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             tracing::info!(?elapsed, modules = modules.len(), "ExeFS loaded");
         }
+        Command::Analyze {
+            input,
+            cache,
+            seed,
+            limit,
+            report,
+        } => analyze(input, cache, &seed, limit, report.as_deref())?,
         Command::Extract {
             input,
             dest,
@@ -206,6 +231,137 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn analyze(
+    input: PathBuf,
+    cache: Option<PathBuf>,
+    seed: &[String],
+    limit: usize,
+    report_path: Option<&std::path::Path>,
+) -> Result<()> {
+    use echora_lift::codegen::{CodeRegion, discover_with_tables};
+    use echora_loader::process;
+
+    let cache = match cache {
+        Some(c) => c,
+        None => host_paths::cache_dir()?,
+    };
+    let source = ContentSource::open(&input)?;
+    let inv = source.inventory()?;
+    let Some(pkg) = inv.program_package else {
+        bail!("the input contains no package with an ExeFS");
+    };
+    let dir = source.materialize_exefs(&inv, pkg, &cache)?;
+    let placed = process::place_modules(echora_loader::load_exefs(&dir)?);
+
+    let regions: Vec<CodeRegion> = placed
+        .iter()
+        .map(|p| CodeRegion {
+            name: p.module.name.clone(),
+            base: p.text_range().start,
+            bytes: p.module.text.bytes.clone(),
+        })
+        .collect();
+    let rodata: Vec<CodeRegion> = placed
+        .iter()
+        .map(|p| CodeRegion {
+            name: format!("{}.rodata", p.module.name),
+            base: p.rodata_base(),
+            bytes: p.module.rodata.bytes.clone(),
+        })
+        .collect();
+
+    // The process starts in rtld's text; static constructors are primary
+    // roots, prologues and relocation targets are deferred candidates.
+    let mut roots = vec![placed[0].text_range().start];
+    let mut deferred = Vec::new();
+    for p in &placed {
+        if !seed.is_empty() && !seed.contains(&p.module.name) {
+            continue;
+        }
+        let ctors = process::init_array_targets(p);
+        let relocs = process::relative_text_targets(p);
+        let prologues = process::prologue_targets(p);
+        println!(
+            "{:<8} seeds: {} constructors, {} relocation targets, {} prologues",
+            p.module.name,
+            ctors.len(),
+            relocs.len(),
+            prologues.len()
+        );
+        roots.extend(ctors);
+        deferred.extend(relocs);
+        deferred.extend(prologues);
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    deferred.sort_unstable();
+    deferred.dedup();
+
+    let start = Instant::now();
+    let translation = discover_with_tables(
+        &regions,
+        &rodata,
+        &roots,
+        &deferred,
+        &Default::default(),
+        limit,
+    )?;
+    let elapsed = start.elapsed();
+    let report = translation.report();
+    println!(
+        "discovered {} instructions in {} blocks ({:.1} s){}",
+        report.translated_instructions,
+        report.block_count,
+        elapsed.as_secs_f64(),
+        if report.truncated {
+            ", truncated at the limit"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "jump tables {} ({} targets), unresolved indirect targets {}",
+        report.jump_tables,
+        report.jump_table_targets,
+        report.unresolved_targets.len()
+    );
+    for p in &placed {
+        let range = p.text_range();
+        let covered = translation.instructions.range(range.clone()).count();
+        let total = (range.end - range.start) / 4;
+        println!(
+            "  {:<8} {covered:>9} of {total:>9} text words ({:.1}%)",
+            p.module.name,
+            covered as f64 * 100.0 / total as f64
+        );
+    }
+    let mut by_mnemonic = std::collections::BTreeMap::<String, usize>::new();
+    for site in &report.unsupported {
+        let m = site
+            .disassembly
+            .split_whitespace()
+            .next()
+            .unwrap_or("?")
+            .to_owned();
+        *by_mnemonic.entry(m).or_default() += 1;
+    }
+    let mut ranked: Vec<_> = by_mnemonic.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    println!(
+        "unsupported: {} sites, {} mnemonics",
+        report.unsupported_instructions,
+        ranked.len()
+    );
+    for (m, n) in ranked.iter().take(25) {
+        println!("  {n:>8}  {m}");
+    }
+    if let Some(path) = report_path {
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn print_mod0(m: &echora_loader::NsoModule) {

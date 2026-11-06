@@ -96,6 +96,38 @@ section, and every symbol table is indexed by `DT_GNU_HASH` only (no
 The guest rtld applies these relocations at startup; the host only validates
 and reports them.
 
+## Code discovery on the checked input
+
+`echora analyze game.nup --limit 20000000` (2026-11-06, release build,
+Ryzen 7 5800X3D). Modules are placed from `0x7100000000`; roots are the
+rtld entry and every module's `init_array` targets; deferred roots are
+relative-relocation targets (RELA and RELR) and `PACIBSP` prologues; jump
+tables are followed through rodata.
+
+| Module | Constructors | Relocation targets | Prologues | Discovered / text words |
+|---|---|---|---|---|
+| `rtld` | 0 | 5 | 18 | 2,336 / 2,512 (93.0%) |
+| `main` | 9,783 | 151,750 | 161,622 | 15,195,537 / 15,800,436 (96.2%) |
+| `subsdk0` | 0 | 67 | 722 | 129,184 / 135,644 (95.2%) |
+| `sdk` | 96 | 7,633 | 20,524 | 1,955,604 / 2,226,708 (87.8%) |
+
+17,282,661 instructions in 3,717,732 blocks, 1,253 jump tables (37,320
+targets), no unresolved indirect targets, 13.4 s for discovery and a peak
+of 6.2 GB resident (about 340 bytes per discovered instruction).
+
+Instructions the lifter does not support yet:
+
+| Instruction | Sites | Notes |
+|---|---|---|
+| `udf` | 8,515 | permanently undefined; compiler-emitted traps |
+| `fmaxv`, `fminv`, `fmaxnmv`, `fminnmv` | 601 | floating-point across-lane reductions |
+| `crc32b/h/w/x`, `crc32cb/cx` | 325 | CRC32 and CRC32C |
+| `mrs Xt, s3_3_c4_c2_0` | 16 | `MRS Xt, NZCV` |
+| `casp`, `caspa`, `caspl`, `caspal` | 6 | pair compare-and-swap |
+| `sabal` | 2 | signed absolute difference and accumulate long |
+| `udot` | 1 | dot product |
+| `stg` | 1 | memory tagging store (MTE) |
+
 ## Licensing decision
 
 Echora is GPL-3.0-or-later, matching Pokopia so its code can be carried over,
