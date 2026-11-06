@@ -142,6 +142,9 @@ struct Launcher {
     corner: Pixels,
     /// A title bar press that turns into a window move once the mouse drags.
     moving: bool,
+    /// The desktop is moving the window. It may report the window inactive
+    /// meanwhile, which mustn't dim the window buttons.
+    dragging: bool,
     /// The resize edge under the pointer, if any.
     resize_edge: Option<ResizeEdge>,
     /// The remembered game is still being read.
@@ -304,6 +307,7 @@ impl Launcher {
             buttons,
             corner: px(0.0),
             moving: false,
+            dragging: false,
             resize_edge: None,
             loading: false,
             settings_tab: SettingsTab::Game,
@@ -336,6 +340,13 @@ impl Launcher {
             .detach();
         }
         watch_controllers(window, cx);
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.dragging = false;
+            }
+            cx.notify();
+        })
+        .detach();
         launcher
     }
 
@@ -954,7 +965,7 @@ impl Launcher {
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let client_side = matches!(window.window_decorations(), Decorations::Client { .. });
         let maximized = window.is_maximized();
-        let active = window.is_window_active();
+        let active = window.is_window_active() || self.dragging;
         let buttons = |side: &[WindowButton]| {
             div()
                 .flex()
@@ -1181,6 +1192,7 @@ impl Launcher {
         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
             if this.moving && event.dragging() {
                 this.moving = false;
+                this.dragging = true;
                 window.start_window_move();
             }
         }))
@@ -1913,6 +1925,14 @@ impl Launcher {
             .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, cx| {
                 if !this.keyboard {
                     this.keyboard = true;
+                    cx.notify();
+                }
+            }))
+            // The pointer is back with the window, button released, once a
+            // move has ended.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.dragging && event.pressed_button.is_none() {
+                    this.dragging = false;
                     cx.notify();
                 }
             }))
