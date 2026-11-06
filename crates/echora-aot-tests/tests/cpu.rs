@@ -162,3 +162,107 @@ fn unmapped_store_ends_the_process_naming_the_guest_address() {
         "{stderr}"
     );
 }
+
+#[test]
+fn crc32_crc32c_and_mrs_nzcv() {
+    let mut m = Machine::new();
+    let regs = &mut m.core.cpu.regs;
+    regs[0] = 0xffff_ffff;
+    regs[1] = 0xdead_beef_0000_0031; // only the low byte ('1') is used
+    regs[5] = 0xffff_ffff_ffff_ffff; // only W5 is the accumulator
+    regs[6] = 0x3231; // "12"
+    regs[2] = 0xffff_ffff;
+    regs[3] = 0x3837_3635_3433_3231; // "12345678"
+    m.core.cpu.nzcv = 0b1010;
+    assert!(matches!(
+        crc_and_flags::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    // Expected values: zlib's CRC32 and a CRC32C checked against its
+    // standard "123456789" value, both without the final inversion.
+    assert_eq!(m.core.cpu.regs[0], 0x7c23_1048);
+    assert_eq!(m.core.cpu.regs[5], 0xb0ac_bb32);
+    assert_eq!(m.core.cpu.regs[2], 0x9f78_7f65);
+    assert_eq!(m.core.cpu.regs[4], 0xa000_0000);
+    assert_eq!(m.core.cpu.nzcv, 0b1010);
+}
+
+fn lanes(values: [u32; 4]) -> u128 {
+    values
+        .iter()
+        .rev()
+        .fold(0u128, |acc, &v| acc << 32 | u128::from(v))
+}
+
+#[test]
+fn fp_across_lane_reductions() {
+    // [1.0, -2.0, quiet NaN, 3.0]: FMAXV/FMINV propagate the NaN, the
+    // NM forms ignore it.
+    let mut m = Machine::new();
+    m.core.cpu.vectors[1] = lanes([0x3f80_0000, 0xc000_0000, 0x7fc0_0001, 0x4040_0000]);
+    for v in [0, 2, 3, 4] {
+        m.core.cpu.vectors[v] = u128::MAX;
+    }
+    assert!(matches!(
+        fp_across::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    let v = m.core.cpu.vectors;
+    assert_eq!(v[0], 0x7fc0_0001);
+    assert_eq!(v[3], 0x7fc0_0001);
+    assert_eq!(v[4], 0x4040_0000);
+    assert_eq!(v[2], 0xc000_0000);
+
+    // [1.5, -0.0, 7.25, 2.0]: the minimum is negative zero.
+    let mut m = Machine::new();
+    m.core.cpu.vectors[1] = lanes([0x3fc0_0000, 0x8000_0000, 0x40e8_0000, 0x4000_0000]);
+    assert!(matches!(
+        fp_across::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    let v = m.core.cpu.vectors;
+    assert_eq!(
+        (v[0], v[3], v[4], v[2]),
+        (0x40e8_0000, 0x8000_0000, 0x40e8_0000, 0x8000_0000)
+    );
+}
+
+#[test]
+fn absolute_difference_long_and_dot_products() {
+    // Inputs and expected values were computed independently in Python,
+    // running the four instructions in program order (UDOT reads the V0
+    // that SABAL just wrote).
+    let mut m = Machine::new();
+    let v = &mut m.core.cpu.vectors;
+    v[0] = 0xffffffff000000030000000200000001;
+    v[2] = 0x80007ffffffb0064;
+    v[3] = 0x20001fff900077fff8000000aff9c;
+    v[4] = 0x280000001e000000140000000a;
+    v[6] = 0x4030201c80aff00;
+    v[7] = 0x1020304641400ff;
+    v[8] = 0xbeef0000deadfffffffb00000005;
+    v[9] = 0xfa05fc0302ff7f80;
+    v[10] = 0x7f9070702ff8080;
+    assert!(matches!(
+        abd_long_and_dot::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    let v = m.core.cpu.vectors;
+    assert_eq!(v[0], 0xfffe0001000200000011000000c9);
+    assert_eq!(v[5], 0x30001000100030064000a00ff00ff);
+    assert_eq!(v[4], 0x126000001250000001400007a86);
+    // The 2S form clears the upper half of the destination.
+    assert_eq!(v[8], 0xffffffa70000008a);
+}
+
+#[test]
+fn msr_nzcv_takes_bits_31_to_28() {
+    let mut m = Machine::new();
+    m.core.cpu.regs[6] = 0xffff_ffff_5fff_ffff; // N=0 Z=1 C=0 V=1; other bits ignored
+    assert!(matches!(
+        nzcv_round_trip::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    assert_eq!(m.core.cpu.nzcv, 0b0101);
+    assert_eq!(m.core.cpu.regs[7], 0x5000_0000);
+}

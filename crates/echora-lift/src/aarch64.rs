@@ -243,6 +243,16 @@ pub enum Instruction {
         acquire: bool,
         release: bool,
     },
+    /// LSE CASP{A,L,AL}: pair compare-and-swap on even register pairs;
+    /// `bytes` is the element size (4 or 8).
+    CompareAndSwapPair {
+        rs: u8,
+        rt: u8,
+        rn: u8,
+        bytes: u8,
+        acquire: bool,
+        release: bool,
+    },
     /// LSE LDADD/B/H, including STADD aliases. Ordering fields retain encoded
     /// A/R bits; effective acquire additionally requires Rt != 31.
     AtomicAdd {
@@ -381,10 +391,29 @@ pub enum Instruction {
     ReadCacheType {
         rt: u8,
     },
+    /// MRS Xt, NZCV: the flags in bits 31:28, every other bit zero.
+    ReadNzcv {
+        rt: u8,
+    },
+    /// MSR NZCV, Xt: the flags from bits 31:28; other bits are ignored.
+    WriteNzcv {
+        rt: u8,
+    },
+    /// CRC32{B,H,W,X} and CRC32C{B,H,W,X}: `Wd = crc(Wn, low bytes of Rm)`,
+    /// reflected bit order, no initial or final inversion.
+    Crc32 {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        bytes: u8,
+        castagnoli: bool,
+    },
     /// DC CVAC/CVAU/CIVAC and IC IVAU. Guest memory is coherent in this
     /// model and translated code cannot change without trapping, so cache
     /// maintenance has no observable effect.
     CacheMaintenance,
+    /// UDF #imm16: permanently undefined.
+    Undefined,
     Unsupported,
 }
 
@@ -485,6 +514,9 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
     let rm = ((word >> 16) & 31) as u8;
     let bits = if word >> 31 != 0 { 64 } else { 32 };
     let subtract = word & (1 << 30) != 0;
+    if word >> 16 == 0 {
+        return Undefined;
+    }
     let flags = word & (1 << 29) != 0;
     // NOP, YIELD, WFE, WFI, SEV and SEVL: on this single PE the event
     // register needs no other observer, and WFE/WFI may complete at once.
@@ -868,6 +900,19 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
         }
         _ => {}
     }
+    // CRC32/CRC32C: sz selects the data width; only the X form uses sf=1.
+    if word & 0x7fe0_e000 == 0x1ac0_4000 {
+        let sz = (word >> 10) & 3;
+        if (word >> 31 == 1) == (sz == 3) {
+            return Crc32 {
+                rd,
+                rn,
+                rm,
+                bytes: 1 << sz,
+                castagnoli: (word >> 12) & 1 != 0,
+            };
+        }
+    }
     match word & 0x7fe0_fc00 {
         0x1ac0_0800 => {
             return Divide {
@@ -951,6 +996,18 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
             rt: rd,
             rn,
             bytes: 1 << (word >> 30),
+            acquire: word & (1 << 22) != 0,
+            release: word & (1 << 15) != 0,
+        };
+    }
+    // CASP{A,L,AL}: sz[30], L[22], Rs[20:16], o0[15], Rn[9:5], Rt[4:0].
+    // Rs and Rt name even-numbered pairs; odd numbers are not decoded.
+    if word & 0xbfa0_7c00 == 0x0820_7c00 && rm.is_multiple_of(2) && rd.is_multiple_of(2) {
+        return CompareAndSwapPair {
+            rs: rm,
+            rt: rd,
+            rn,
+            bytes: if word & (1 << 30) != 0 { 8 } else { 4 },
             acquire: word & (1 << 22) != 0,
             release: word & (1 << 15) != 0,
         };
@@ -1204,6 +1261,8 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
         // S3_3_C14_C0_1, width 64. This identifies the register encoding only,
         // not guest hardware or clock frequency; neighboring timers stay out.
         0xd53b_e020 => ReadPhysicalCounter { rt: rd },
+        0xd53b_4200 => ReadNzcv { rt: rd },
+        0xd51b_4200 => WriteNzcv { rt: rd },
         0xd53b_d040 => ReadThreadPointer {
             rt: rd,
             read_only: false,
@@ -1248,6 +1307,7 @@ impl Instruction {
             | Self::TestBranch { target, .. } => vec![*target, next],
             Self::BranchReg { link: false, .. }
             | Self::PAuthDisabledReturn { .. }
+            | Self::Undefined
             | Self::Unsupported => vec![],
             _ => vec![next],
         }
@@ -1263,6 +1323,7 @@ impl Instruction {
                 | Self::BranchReg { .. }
                 | Self::PAuthDisabledReturn { .. }
                 | Self::Svc { .. }
+                | Self::Undefined
                 | Self::Unsupported
         )
     }
@@ -1302,6 +1363,79 @@ mod tests {
         ] {
             assert_eq!(decode(word, 0x4000), Instruction::Unsupported, "{word:#x}");
         }
+    }
+
+    #[test]
+    fn casp_decodes_pairs_and_matches_the_disassembler() {
+        for (word, text, rs, rt, bytes, acquire, release) in [
+            (
+                0x4822_7c24,
+                "casp x2, x3, x4, x5, [x1]",
+                2,
+                4,
+                8,
+                false,
+                false,
+            ),
+            (
+                0x4862_fc24,
+                "caspal x2, x3, x4, x5, [x1]",
+                2,
+                4,
+                8,
+                true,
+                true,
+            ),
+            (
+                0x0822_7c24,
+                "casp w2, w3, w4, w5, [x1]",
+                2,
+                4,
+                4,
+                false,
+                false,
+            ),
+            (
+                0x4862_7c22,
+                "caspa x2, x3, x2, x3, [x1]",
+                2,
+                2,
+                8,
+                true,
+                false,
+            ),
+            (
+                0x4822_fc24,
+                "caspl x2, x3, x4, x5, [x1]",
+                2,
+                4,
+                8,
+                false,
+                true,
+            ),
+        ] {
+            assert_eq!(disassemble(word, 0), text);
+            assert_eq!(
+                decode(word, 0),
+                Instruction::CompareAndSwapPair {
+                    rs,
+                    rt,
+                    rn: 1,
+                    bytes,
+                    acquire,
+                    release
+                }
+            );
+        }
+        // Odd register numbers do not name a pair.
+        assert!(!matches!(
+            decode(0x4823_7c24, 0),
+            Instruction::CompareAndSwapPair { .. }
+        ));
+        assert!(!matches!(
+            decode(0x4822_7c25, 0),
+            Instruction::CompareAndSwapPair { .. }
+        ));
     }
 
     #[test]
@@ -1353,8 +1487,13 @@ mod tests {
                 release: true,
             }
         );
-        // CASP and exclusive pairs (LDXP/STXP) need their own semantics.
-        for word in [0x4820_7c82, 0x887f_0801, 0x8823_0801] {
+        // CASP is a separate pair operation, not CAS.
+        assert!(matches!(
+            decode(0x4820_7c82, 0),
+            Instruction::CompareAndSwapPair { .. }
+        ));
+        // Exclusive pairs (LDXP/STXP) need their own semantics.
+        for word in [0x887f_0801, 0x8823_0801] {
             assert_eq!(decode(word, 0), Instruction::Unsupported, "{word:#x}");
         }
         // LDCLR and SWP are their own atomic operations, not CAS.
@@ -2016,9 +2155,9 @@ mod tests {
 
     #[test]
     fn unsupported_atomic_and_unmodeled_pauth_do_not_become_nops() {
-        for word in [0xc87f_0820, 0] {
-            assert_eq!(decode(word, 0), Instruction::Unsupported, "{word:08x}");
-        }
+        assert_eq!(decode(0xc87f_0820, 0), Instruction::Unsupported);
+        // Word 0 is UDF #0: an explicit undefined-instruction stop.
+        assert_eq!(decode(0, 0), Instruction::Undefined);
         assert_eq!(decode(0xd503_201f, 0), Instruction::Nop);
         // PACIA1716 uses X17/X16 implicitly; with keys disabled it is the
         // explicit disabled-key hint, not a generic NOP.
@@ -2045,6 +2184,22 @@ mod tests {
         // PACIZA with Rn != 31 is unallocated.
         assert_eq!(decode(0xdac1_2025, 0), Instruction::Unsupported);
         assert_eq!(decode(0xd53b_0029, 0), Instruction::ReadCacheType { rt: 9 });
+        assert_eq!(decode(0xd53b_4204, 0), Instruction::ReadNzcv { rt: 4 });
+        assert_eq!(decode(0xd51b_4206, 0), Instruction::WriteNzcv { rt: 6 });
+        assert_eq!(disassemble(0xd51b_4206, 0), "msr s3_3_c4_c2_0, x6");
+        assert_eq!(
+            decode(0x9ac3_5c42, 0),
+            Instruction::Crc32 {
+                rd: 2,
+                rn: 2,
+                rm: 3,
+                bytes: 8,
+                castagnoli: true
+            }
+        );
+        // sf must be set exactly for the 64-bit data form.
+        assert!(!matches!(decode(0x9ac1_4000, 0), Instruction::Crc32 { .. }));
+        assert!(!matches!(decode(0x1ac1_4c00, 0), Instruction::Crc32 { .. }));
         for word in [0xd50b_7e21, 0xd50b_7522, 0xd50b_7a20, 0xd50b_7b20] {
             assert_eq!(decode(word, 0), Instruction::CacheMaintenance, "{word:08x}");
         }

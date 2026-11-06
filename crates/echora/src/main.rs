@@ -350,6 +350,10 @@ fn analyze(
     let mut ranked: Vec<_> = by_mnemonic.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     println!(
+        "undefined (UDF) sites: {} (translated as undefined-instruction stops)",
+        report.undefined_instructions
+    );
+    println!(
         "unsupported: {} sites, {} mnemonics",
         report.unsupported_instructions,
         ranked.len()

@@ -1447,6 +1447,22 @@ pub fn vec_fp_pairwise(
     Ok(())
 }
 
+/// FMAXV/FMINV/FMAXNMV/FMINNMV on the four single-precision lanes of Vn,
+/// combined as a balanced tree, `op(op(e0, e1), op(e2, e3))`, the order of
+/// the architecture's `Reduce`. The scalar result clears the rest of Vd.
+pub fn vec_fp_across(cpu: &mut Cpu, op: VecFpOp, rd: u8, rn: u8) -> Result<(), Trap> {
+    let n = cpu.vectors[rn as usize];
+    let mut fp = Fp::new(cpu, FpSize::S)?;
+    let lane = |i| get_lane(n, 32, i);
+    let low = vec_fp_lane(&mut fp, op, lane(0), lane(1), 0);
+    let high = vec_fp_lane(&mut fp, op, lane(2), lane(3), 0);
+    let value = vec_fp_lane(&mut fp, op, low, high, 0);
+    let mut result = 0u128;
+    set_lane(&mut result, 32, 0, value);
+    cpu.vectors[rd as usize] = finish_vector(result, 32, true, true);
+    Ok(())
+}
+
 /// FP operation by element: every lane of Vn with lane `index` of Vm.
 #[allow(clippy::too_many_arguments)]
 pub fn vec_fp_element(
@@ -2316,6 +2332,10 @@ pub enum VecLongOp {
     /// SADDW/UADDW, SSUBW/USUBW: Vn is already wide.
     Addw,
     Subw,
+    /// SABAL/UABAL: d += |n - m| (widening)
+    Abal,
+    /// SABDL/UABDL: |n - m| (widening)
+    Abdl,
 }
 
 /// Widening three-operand operations on the lower or upper half (the "2"
@@ -2387,7 +2407,15 @@ fn vec_long_values(
         };
         let b = extend(get_lane(m, bits, source));
         let acc = get_lane(d, wide, lane);
+        // Both operands are extended to 64 bits, so the difference is exact.
+        let abs_diff = if signed {
+            (a as i64).abs_diff(b as i64)
+        } else {
+            a.abs_diff(b)
+        };
         let value = match op {
+            VecLongOp::Abal => acc.wrapping_add(abs_diff),
+            VecLongOp::Abdl => abs_diff,
             VecLongOp::Mlal => acc.wrapping_add(a.wrapping_mul(b)),
             VecLongOp::Mlsl => acc.wrapping_sub(a.wrapping_mul(b)),
             VecLongOp::Mull => a.wrapping_mul(b),
@@ -2397,6 +2425,33 @@ fn vec_long_values(
         set_lane(&mut result, wide, lane, value);
     }
     cpu.vectors[rd as usize] = result;
+}
+
+/// SDOT/UDOT (vector): each 32-bit lane of Vd gains the sum of the four
+/// products of the corresponding bytes of Vn and Vm.
+pub fn vec_dot(cpu: &mut Cpu, signed: bool, q: bool, rd: u8, rn: u8, rm: u8) {
+    let (n, m, d) = (
+        cpu.vectors[rn as usize],
+        cpu.vectors[rm as usize],
+        cpu.vectors[rd as usize],
+    );
+    let byte = |v: u128, i: u32| -> i64 {
+        let b = (v >> (8 * i)) as u8;
+        if signed {
+            i64::from(b as i8)
+        } else {
+            i64::from(b)
+        }
+    };
+    let mut result = 0u128;
+    for lane in 0..lane_count(32, q, false) {
+        let sum: i64 = (0..4)
+            .map(|k| byte(n, lane * 4 + k) * byte(m, lane * 4 + k))
+            .sum();
+        let value = (get_lane(d, 32, lane) as u32).wrapping_add(sum as u32);
+        set_lane(&mut result, 32, lane, u64::from(value));
+    }
+    cpu.vectors[rd as usize] = finish_vector(result, 32, q, false);
 }
 
 /// SADDLP/UADDLP (and SADALP/UADALP with `accumulate`): add adjacent pairs of

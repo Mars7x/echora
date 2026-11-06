@@ -310,6 +310,47 @@ impl GuestView {
         ))
     }
 
+    /// LSE CASP: compares the pair at `address` (first element at the lower
+    /// address) with `expected` and, if equal, stores `desired`; returns the
+    /// old pair. `bytes` is the element size (4 or 8) and the pair must be
+    /// aligned to its total size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_exchange_pair_single_thread(
+        &mut self,
+        address: u64,
+        bytes: u8,
+        expected: (u64, u64),
+        desired: (u64, u64),
+        acquire: bool,
+        release: bool,
+    ) -> Result<(u64, u64), Trap> {
+        let orders = orderings(acquire, release);
+        match bytes {
+            4 => {
+                aligned(address, 8, "atomic pair compare-and-swap")?;
+                let join = |(lo, hi): (u64, u64)| (lo & 0xffff_ffff) | hi << 32;
+                let old = self.atomic_cas(address, 8, join(expected), join(desired), orders);
+                Ok((old & 0xffff_ffff, old >> 32))
+            }
+            8 => {
+                aligned(address, 16, "atomic pair compare-and-swap")?;
+                let join = |(lo, hi): (u64, u64)| u128::from(lo) | u128::from(hi) << 64;
+                let pointer = self.at::<u8>(address);
+                // SAFETY: 16-byte aligned (checked above) and inside the
+                // reservation; the guest view's protections fault on
+                // anything the guest may not access, as in `atomic_load`.
+                let atomic = unsafe { portable_atomic::AtomicU128::from_ptr(pointer.cast()) };
+                let old = atomic
+                    .compare_exchange(join(expected), join(desired), orders.0, orders.1)
+                    .unwrap_or_else(|observed| observed);
+                Ok((old as u64, (old >> 64) as u64))
+            }
+            _ => Err(Trap::InvalidState {
+                message: format!("unsupported CASP element size {bytes}"),
+            }),
+        }
+    }
+
     /// LSE LDADD: the old value; memory takes old + `addend`.
     pub fn fetch_add_single_thread(
         &mut self,

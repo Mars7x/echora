@@ -343,6 +343,16 @@ pub enum SimdOp {
         rd: u8,
         rn: u8,
     },
+    /// SDOT/UDOT (vector), 2S or 4S accumulators.
+    VecDot {
+        signed: bool,
+        q: bool,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
+    /// FMAXV, FMINV, FMAXNMV, FMINNMV on Vn.4S into Sd.
+    VecFpAcross { op: VecFpOp, rd: u8, rn: u8 },
     VecShift {
         op: VecShiftOp,
         bits: u8,
@@ -1143,6 +1153,28 @@ fn decode_vector(word: u32, rd: u8, rn: u8, rm: u8) -> Option<SimdOp> {
             rm,
         });
     }
+    // SDOT/UDOT (vector): size 10, opcode 1001 0, bit 10 set.
+    if word & 0x9fe0_fc00 == 0x0e80_9400 {
+        return Some(SimdOp::VecDot {
+            signed: u == 0,
+            q,
+            rd,
+            rn,
+            rm,
+        });
+    }
+    // FP across lanes, single precision, Q=1 only (other forms are
+    // reserved or need half precision).
+    let fp_across = match word & 0xffff_fc00 {
+        0x6e30_f800 => Some(VecFpOp::Max),
+        0x6eb0_f800 => Some(VecFpOp::Min),
+        0x6e30_c800 => Some(VecFpOp::MaxNum),
+        0x6eb0_c800 => Some(VecFpOp::MinNum),
+        _ => None,
+    };
+    if let Some(op) = fp_across {
+        return Some(SimdOp::VecFpAcross { op, rd, rn });
+    }
     if word & 0x9f3e_0c00 == 0x0e30_0800 {
         let opcode = (word >> 12) & 31;
         let op = match (u, opcode) {
@@ -1468,6 +1500,8 @@ fn decode_vector(word: u32, rd: u8, rn: u8, rm: u8) -> Option<SimdOp> {
             0x1 => VecLongOp::Addw,
             0x2 => VecLongOp::Subl,
             0x3 => VecLongOp::Subw,
+            0x5 => VecLongOp::Abal,
+            0x7 => VecLongOp::Abdl,
             0x8 => VecLongOp::Mlal,
             0xa => VecLongOp::Mlsl,
             0xc => VecLongOp::Mull,
@@ -2166,6 +2200,16 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
         } => format!(
             "{p}::int_to_fp_fixed(&mut m.cpu, {rd}, {rn}, {gp_bits}, {p}::FpSize::{size:?}, {signed}, {fbits})?;"
         ),
+        SimdOp::VecDot {
+            signed,
+            q,
+            rd,
+            rn,
+            rm,
+        } => format!("{p}::vec_dot(&mut m.cpu, {signed}, {q}, {rd}, {rn}, {rm});"),
+        SimdOp::VecFpAcross { op, rd, rn } => {
+            format!("{p}::vec_fp_across(&mut m.cpu, {p}::VecFpOp::{op:?}, {rd}, {rn})?;")
+        }
         SimdOp::VecAcross {
             op,
             bits,
@@ -2267,6 +2311,35 @@ fn unary_path(op: FpUnaryOp) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn absolute_difference_long_and_dot_product_decode() {
+        use crate::aarch64::disassemble;
+        for (word, text) in [
+            (0x0e63_5040, "sabal v0.4s, v2.4h, v3.4h"),
+            (0x2e27_70c5, "uabdl v5.8h, v6.8b, v7.8b"),
+            (0x6e83_9404, "udot v4.4s, v0.16b, v3.16b"),
+            (0x0e8a_9528, "sdot v8.2s, v9.8b, v10.8b"),
+            (0x6e30_f820, "fmaxv s0, v1.4s"),
+            (0x6eb0_c822, "fminnmv s2, v1.4s"),
+        ] {
+            assert_eq!(disassemble(word, 0), text);
+            assert!(decode(word, 0).is_some(), "{text}");
+        }
+        assert_eq!(
+            decode(0x6e83_9404, 0),
+            Some(SimdOp::VecDot {
+                signed: false,
+                q: true,
+                rd: 4,
+                rn: 0,
+                rm: 3
+            })
+        );
+        // Double-precision FMAXV is reserved.
+        assert_eq!(decode(0x6e70_f820, 0), None);
+    }
+
     use super::*;
     use crate::aarch64::disassemble;
     use echora_guest::cpu::Cpu;

@@ -107,26 +107,30 @@ tables are followed through rodata.
 | Module | Constructors | Relocation targets | Prologues | Discovered / text words |
 |---|---|---|---|---|
 | `rtld` | 0 | 5 | 18 | 2,336 / 2,512 (93.0%) |
-| `main` | 9,783 | 151,750 | 161,622 | 15,195,537 / 15,800,436 (96.2%) |
+| `main` | 9,783 | 151,750 | 161,622 | 15,256,834 / 15,800,436 (96.6%) |
 | `subsdk0` | 0 | 67 | 722 | 129,184 / 135,644 (95.2%) |
 | `sdk` | 96 | 7,633 | 20,524 | 1,955,604 / 2,226,708 (87.8%) |
 
-17,282,661 instructions in 3,717,732 blocks, 1,253 jump tables (37,320
-targets), no unresolved indirect targets, 13.4 s for discovery and a peak
+17,343,958 instructions in 3,727,283 blocks, 1,255 jump tables (37,327
+targets), no unresolved indirect targets, 13.6 s for discovery and a peak
 of 6.2 GB resident (about 340 bytes per discovered instruction).
 
-Instructions the lifter does not support yet:
+The first run found 19 instruction forms the ported lifter did not
+support. Implemented since, each with native execution tests:
 
-| Instruction | Sites | Notes |
+| Instruction | Sites | Implementation |
 |---|---|---|
-| `udf` | 8,515 | permanently undefined; compiler-emitted traps |
-| `fmaxv`, `fminv`, `fmaxnmv`, `fminnmv` | 601 | floating-point across-lane reductions |
-| `crc32b/h/w/x`, `crc32cb/cx` | 325 | CRC32 and CRC32C |
-| `mrs Xt, s3_3_c4_c2_0` | 16 | `MRS Xt, NZCV` |
-| `casp`, `caspa`, `caspl`, `caspal` | 6 | pair compare-and-swap |
-| `sabal` | 2 | signed absolute difference and accumulate long |
-| `udot` | 1 | dot product |
-| `stg` | 1 | memory tagging store (MTE) |
+| `fmaxv`, `fminv`, `fmaxnmv`, `fminnmv` (4S) | 601 | tree reduction over the exact FP lane operations |
+| `crc32b/h/w/x`, `crc32cb/cx` | 325 | reflected bitwise CRC32 / CRC32C |
+| `mrs Xt, NZCV`, `msr NZCV, Xt` | 16 + 16 | flags in bits 31:28 |
+| `casp`, `caspa`, `caspl`, `caspal` | 6 | 64-bit or 128-bit host compare-and-swap (`portable-atomic`) |
+| `sabal` (and `sabdl`/`uabal`/`uabdl`) | 2 | widening absolute difference |
+| `udot` (and `sdot`), vector form | 1 | 32-bit lane dot products |
+| `udf` | 8,515 | `Trap::UndefinedInstruction`; execution does not continue past it |
+
+Still unsupported: one `stg` (memory tagging). Without MTE it is an
+undefined instruction; it stays an explicit stop until a path that reaches
+it is found.
 
 ## Licensing decision
 

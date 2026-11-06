@@ -42,9 +42,9 @@ display version 1.1.1):
   exclusive and acquire/release semantics checks. Guest memory currently
   needs Linux.
 - **Code discovery on the real game:** `echora analyze` finds 17.3 million
-  instructions, 96.2% of `main`'s text, in 13 s. 19 instruction forms are
-  not supported by the lifter yet (listed in
-  [research notes](docs/research.md#code-discovery-on-the-checked-input)).
+  instructions, 96.6% of `main`'s text, in 14 s. Every discovered
+  instruction form is translated except a single `stg` (memory tagging);
+  see the [research notes](docs/research.md#code-discovery-on-the-checked-input).
 - **No game code runs yet.** Completing the lifter and the runtime are
   next; see the [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux

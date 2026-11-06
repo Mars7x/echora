@@ -17,6 +17,7 @@ these separately; preserve their notices when redistributing builds.
 | `clap` | 4.6.7 | MIT OR Apache-2.0 |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 |
 | `libc` | 0.2.191 | MIT OR Apache-2.0 |
+| `portable-atomic` | 1.15.0 | Apache-2.0 OR MIT |
 | `lz4_flex` | 0.11.6 | MIT |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 |

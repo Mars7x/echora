@@ -72,6 +72,42 @@ pub const PROGRAMS: &[(&str, &[u32])] = &[
     ("stlr_doubleword", &[0xc89ffc02, 0xd40000e1]),
     ("stlr_alias", &[0xc89ffc00, 0xd40000e1]),
     ("stlr_zero_sp", &[0xc89fffff, 0xd40000e1]),
+    // Forms found unsupported by `echora analyze` on the real game.
+    (
+        "crc_and_flags",
+        &[
+            0x1ac14000, // CRC32B W0, W0, W1
+            0x1ac644a5, // CRC32H W5, W5, W6
+            0x9ac35c42, // CRC32CX W2, W2, X3
+            0xd53b4204, // MRS X4, NZCV
+            0xd40000e1,
+        ],
+    ),
+    // MSR NZCV, X6; MRS X7, NZCV
+    ("nzcv_round_trip", &[0xd51b4206, 0xd53b4207, 0xd40000e1]),
+    ("casp_x", &[0x48227c24, 0xd40000e1]),   // CASP X2, X3, X4, X5, [X1]
+    ("caspal_w", &[0x0862fc24, 0xd40000e1]), // CASPAL W2, W3, W4, W5, [X1]
+    ("caspa_alias", &[0x48627c22, 0xd40000e1]), // CASPA X2, X3, X2, X3, [X1]
+    (
+        "abd_long_and_dot",
+        &[
+            0x0e635040, // SABAL V0.4S, V2.4H, V3.4H
+            0x2e2770c5, // UABDL V5.8H, V6.8B, V7.8B
+            0x6e839404, // UDOT V4.4S, V0.16B, V3.16B
+            0x0e8a9528, // SDOT V8.2S, V9.8B, V10.8B
+            0xd40000e1,
+        ],
+    ),
+    (
+        "fp_across",
+        &[
+            0x6e30f820, // FMAXV S0, V1.4S
+            0x6eb0f823, // FMINV S3, V1.4S
+            0x6e30c824, // FMAXNMV S4, V1.4S
+            0x6eb0c822, // FMINNMV S2, V1.4S
+            0xd40000e1,
+        ],
+    ),
 ];
 
 pub const CODE_BASE: u64 = 0x1000;

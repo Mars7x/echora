@@ -66,6 +66,8 @@ pub struct TranslationReport {
     pub translated_instructions: usize,
     pub supported_instructions: usize,
     pub unsupported_instructions: usize,
+    /// UDF sites: translated as an explicit undefined-instruction stop.
+    pub undefined_instructions: usize,
     pub block_count: usize,
     pub entries: Vec<u64>,
     pub unresolved_targets: Vec<u64>,
@@ -91,6 +93,11 @@ impl Translation {
             translated_instructions: self.instructions.len(),
             supported_instructions: self.instructions.len() - unsupported.len(),
             unsupported_instructions: unsupported.len(),
+            undefined_instructions: self
+                .instructions
+                .values()
+                .filter(|record| record.instruction == Instruction::Undefined)
+                .count(),
             block_count: self.blocks.len(),
             entries: self.entries.clone(),
             unresolved_targets: self.unresolved_targets.clone(),
@@ -1400,6 +1407,43 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             // every operand is captured and the memory operation succeeds.
             put(output, *rs, bits, false, "observed");
         }
+        CompareAndSwapPair {
+            rs,
+            rt,
+            rn,
+            bytes,
+            acquire,
+            release,
+        } => {
+            address(
+                output,
+                *rn,
+                Address::Immediate {
+                    offset: 0,
+                    writeback: Writeback::None,
+                },
+            );
+            let bits = bytes * 8;
+            writeln!(
+                output,
+                "                let expected = ({}, {});\n                let desired = ({}, {});",
+                reg(*rs, bits, false),
+                reg(*rs + 1, bits, false),
+                reg(*rt, bits, false),
+                reg(*rt + 1, bits, false),
+            )
+            .unwrap();
+            writeln!(output, "                let observed = m.memory.compare_exchange_pair_single_thread(address, {bytes}, expected, desired, {acquire}, {release})?;").unwrap();
+            writeln!(
+                output,
+                "                if expected == desired {{ m.spin_hint(); }}"
+            )
+            .unwrap();
+            // As for CAS: write the pair only after every operand is
+            // captured and the memory operation succeeded.
+            put(output, *rs, bits, false, "observed.0");
+            put(output, *rs + 1, bits, false, "observed.1");
+        }
         AtomicAdd {
             rs,
             rt,
@@ -1704,6 +1748,28 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
         )
         .unwrap(),
         PAuthDisabledData | CacheMaintenance => {}
+        ReadNzcv { rt } => put(output, *rt, 64, false, "(u64::from(m.cpu.nzcv) << 28)"),
+        WriteNzcv { rt } => writeln!(
+            output,
+            "                m.cpu.nzcv = (({} >> 28) & 0xf) as u8;",
+            reg(*rt, 64, false)
+        )
+        .unwrap(),
+        Crc32 {
+            rd,
+            rn,
+            rm,
+            bytes,
+            castagnoli,
+        } => {
+            let data_bits = if *bytes == 8 { 64 } else { 32 };
+            let value = format!(
+                "u64::from(echora_guest::cpu::crc32(({}) as u32, {}, {bytes}, {castagnoli}))",
+                reg(*rn, 32, false),
+                reg(*rm, data_bits, false)
+            );
+            put(output, *rd, 32, false, &value);
+        }
         ReadCacheType { rt } => {
             // Cortex-A78 cache geometry: 64-byte I/D lines, PIPT L1I, 64-byte
             // ERG/CWG; IDC/DIC report that maintenance is required.
@@ -1893,6 +1959,10 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
                 writeln!(output, "                {call}").unwrap();
             }
         },
+        Undefined => {
+            writeln!(output, "                return Err(Trap::UndefinedInstruction {{ pc: {pc:#x}, word: {:#x} }});", record.word).unwrap();
+            sets_pc = true;
+        }
         Unsupported => {
             writeln!(output, "                return Err(Trap::UnsupportedInstruction {{ pc: {pc:#x}, word: {:#x} }});", record.word).unwrap();
             sets_pc = true;
@@ -2702,11 +2772,28 @@ mod tests {
     }
 
     #[test]
+    fn udf_is_an_undefined_instruction_stop_not_an_unsupported_one() {
+        // Execution cannot continue past UDF, so the NOP after it is not discovered.
+        let translation = discover(&[region(&[0x0000_0123, 0xd503_201f])], &[0x1000], 3).unwrap();
+        let report = translation.report();
+        assert_eq!(report.translated_instructions, 1);
+        assert_eq!(
+            (
+                report.unsupported_instructions,
+                report.undefined_instructions
+            ),
+            (0, 1)
+        );
+        let output = emit_rust(&translation);
+        assert!(output.contains("UndefinedInstruction { pc: 0x1000, word: 0x123 }"));
+    }
+
+    #[test]
     fn unknown_instruction_has_precise_pc_and_explicit_trap() {
-        let translation = discover(&[region(&[0])], &[0x1000], 3).unwrap();
+        let translation = discover(&[region(&[0xffff_ffff])], &[0x1000], 3).unwrap();
         assert_eq!(translation.report().unsupported_instructions, 1);
         let output = emit_rust(&translation);
-        assert!(output.contains("UnsupportedInstruction { pc: 0x1000, word: 0x0 }"));
+        assert!(output.contains("UnsupportedInstruction { pc: 0x1000, word: 0xffffffff }"));
         // The arm `0x1000 =>` fixes the PC; no store precedes the charge.
         assert!(output.find("0x1000 => {").unwrap() < output.find("m.tick_block(").unwrap());
         assert!(!output.contains("m.cpu.pc = 0x1000"));

@@ -331,8 +331,39 @@ impl Cpu {
     }
 }
 
+/// One CRC32 (`castagnoli` false, polynomial 0x04C11DB7) or CRC32C
+/// (polynomial 0x1EDC6F41) step over the low `bytes` bytes of `data`, in the
+/// reflected bit order the instructions use, without inversion.
+pub fn crc32(acc: u32, data: u64, bytes: u8, castagnoli: bool) -> u32 {
+    let poly: u32 = if castagnoli { 0x82f6_3b78 } else { 0xedb8_8320 };
+    let mut crc = acc;
+    for byte in 0..bytes {
+        crc ^= u32::from((data >> (8 * byte)) as u8);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (poly & (crc & 1).wrapping_neg());
+        }
+    }
+    crc
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn crc32_matches_standard_check_values() {
+        for (castagnoli, check) in [(false, 0xcbf4_3926u32), (true, 0xe306_9283)] {
+            let crc = b"123456789".iter().fold(!0u32, |acc, &b| {
+                super::crc32(acc, u64::from(b), 1, castagnoli)
+            });
+            assert_eq!(!crc, check);
+            // Wider steps equal the same bytes one at a time.
+            let word = u64::from_le_bytes(*b"12345678");
+            let bytewise = (0..8).fold(!0u32, |acc, i| {
+                super::crc32(acc, word >> (8 * i), 1, castagnoli)
+            });
+            assert_eq!(super::crc32(!0, word, 8, castagnoli), bytewise);
+        }
+    }
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::memory::{Memory, READ, STATE_STACK, WRITE};

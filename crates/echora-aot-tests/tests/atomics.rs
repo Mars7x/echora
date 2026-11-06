@@ -572,3 +572,86 @@ fn atomics_and_ordered_accesses() {
     assert_eq!(m.memory.read_u64(0x8008).unwrap(), u64::MAX);
     let mut m = machine();
 }
+
+#[test]
+fn pair_compare_and_swap() {
+    let (a, b, c, d) = (0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0xaaaa, 0xbbbb);
+    // Match: the new pair is stored and Xs:Xs+1 receive the old pair.
+    let mut m = machine();
+    m.memory.write_u64(0x8010, a).unwrap();
+    m.memory.write_u64(0x8018, b).unwrap();
+    m.core.cpu.regs[1..6].copy_from_slice(&[0x8010, a, b, c, d]);
+    assert!(matches!(casp_x::run(&mut m), Err(Trap::Exit { code: 0 })));
+    assert_eq!(
+        (
+            m.memory.read_u64(0x8010).unwrap(),
+            m.memory.read_u64(0x8018).unwrap()
+        ),
+        (c, d)
+    );
+    assert_eq!((m.core.cpu.regs[2], m.core.cpu.regs[3]), (a, b));
+    // Mismatch in the high element: memory is unchanged, the old pair is returned.
+    let mut m = machine();
+    m.memory.write_u64(0x8010, a).unwrap();
+    m.memory.write_u64(0x8018, b).unwrap();
+    m.core.cpu.regs[1..6].copy_from_slice(&[0x8010, a, b ^ 1, c, d]);
+    assert!(matches!(casp_x::run(&mut m), Err(Trap::Exit { code: 0 })));
+    assert_eq!(
+        (
+            m.memory.read_u64(0x8010).unwrap(),
+            m.memory.read_u64(0x8018).unwrap()
+        ),
+        (a, b)
+    );
+    assert_eq!((m.core.cpu.regs[2], m.core.cpu.regs[3]), (a, b));
+    // An 8-byte-aligned address is not 16-byte aligned: alignment fault, no change.
+    let mut m = machine();
+    m.core.cpu.regs[1..6].copy_from_slice(&[0x8008, 0, 0, c, d]);
+    assert!(matches!(
+        casp_x::run(&mut m),
+        Err(Trap::MemoryFault {
+            address: 0x8008,
+            ..
+        })
+    ));
+    assert_eq!(m.memory.read_u64(0x8008).unwrap(), 0);
+    assert_eq!(m.core.cpu.regs[2], 0);
+}
+
+#[test]
+fn pair_compare_and_swap_words_and_aliases() {
+    // W form: 32-bit elements; upper register halves are ignored and the
+    // returned words are zero-extended.
+    let mut m = machine();
+    m.memory.write_u64(0x8000, 0x2222_2222_1111_1111).unwrap();
+    m.core.cpu.regs[1..6].copy_from_slice(&[
+        0x8000,
+        0xffff_ffff_1111_1111,
+        0xffff_ffff_2222_2222,
+        0xdead_0000_3333_3333,
+        0x4444_4444,
+    ]);
+    assert!(matches!(caspal_w::run(&mut m), Err(Trap::Exit { code: 0 })));
+    assert_eq!(m.memory.read_u64(0x8000).unwrap(), 0x4444_4444_3333_3333);
+    assert_eq!(
+        (m.core.cpu.regs[2], m.core.cpu.regs[3]),
+        (0x1111_1111, 0x2222_2222)
+    );
+    // Rs == Rt: comparing and storing the same pair reads memory atomically.
+    let mut m = machine();
+    m.memory.write_u64(0x8020, 7).unwrap();
+    m.memory.write_u64(0x8028, 9).unwrap();
+    m.core.cpu.regs[1..4].copy_from_slice(&[0x8020, 1, 2]);
+    assert!(matches!(
+        caspa_alias::run(&mut m),
+        Err(Trap::Exit { code: 0 })
+    ));
+    assert_eq!((m.core.cpu.regs[2], m.core.cpu.regs[3]), (7, 9));
+    assert_eq!(
+        (
+            m.memory.read_u64(0x8020).unwrap(),
+            m.memory.read_u64(0x8028).unwrap()
+        ),
+        (7, 9)
+    );
+}

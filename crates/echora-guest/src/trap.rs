@@ -8,6 +8,13 @@ pub enum Trap {
         pc: u64,
         word: u32,
     },
+    /// The guest executed a permanently undefined instruction (UDF). On the
+    /// console this raises an undefined-instruction exception; compilers emit
+    /// it on paths that must not be reached.
+    UndefinedInstruction {
+        pc: u64,
+        word: u32,
+    },
     MissingBlock {
         pc: u64,
     },
