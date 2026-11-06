@@ -1,6 +1,6 @@
 use crate::cpu::Cpu;
 use crate::memory::{
-    MapMemoryError, Memory, PAGE_SIZE, READ, STATE_CODE_DATA, STATE_NORMAL, WRITE,
+    MapMemoryError, Memory, PAGE_SIZE, READ, STATE_CODE_DATA, STATE_FREE, STATE_NORMAL, WRITE,
 };
 use crate::services::Services;
 use crate::synchronization::{MutexWaits, ThreadPriority, ZeroHandleWaits};
@@ -22,6 +22,14 @@ pub enum RemoteMemoryModel {
     Unsupported,
     AbsentRegionCompatibility,
 }
+
+/// Horizon kernel results (module 1) returned by the physical memory SVCs.
+const RESULT_INVALID_SIZE: u64 = 0xca01;
+const RESULT_INVALID_ADDRESS: u64 = 0xcc01;
+const RESULT_INVALID_MEMORY_REGION: u64 = 0xd401;
+const RESULT_LIMIT_REACHED: u64 = 0x10801;
+/// Label of alias-region mappings made by MapPhysicalMemory.
+const PHYSICAL_LABEL: &str = "physical memory";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Layout {
@@ -199,6 +207,8 @@ pub struct Machine {
     pub memory: Memory,
     pub layout: Layout,
     pub heap_size: u64,
+    /// Bytes mapped into the alias region by MapPhysicalMemory.
+    pub physical_size: u64,
     pub svc_trace: Vec<SvcEvent>,
     /// The most recent SVCs (`svc_trace` keeps only the first 4096).
     pub recent_svcs: std::collections::VecDeque<SvcEvent>,
@@ -301,6 +311,7 @@ impl Machine {
             memory,
             layout,
             heap_size: 0,
+            physical_size: 0,
             svc_trace: Vec::new(),
             recent_svcs: Default::default(),
             debug_messages: Vec::new(),
@@ -3180,12 +3191,8 @@ impl Machine {
                     // GetTotal/UsedNonSystemUserPhysicalMemorySize).
                     6 => self.layout.total_memory,
                     21 => self.layout.total_memory - self.layout.system_resource_size,
-                    7 => {
-                        self.layout.initial_used_memory
-                            + self.heap_size
-                            + self.layout.system_resource_size
-                    }
-                    22 => self.layout.initial_used_memory + self.heap_size,
+                    7 => self.used_memory() + self.layout.system_resource_size,
+                    22 => self.used_memory(),
                     // SystemResourceSizeTotal / SystemResourceSizeUsed.
                     16 => self.layout.system_resource_size,
                     17 if self.layout.system_resource_size == 0 => 0,
@@ -3214,11 +3221,105 @@ impl Machine {
                 self.core.cpu.regs[1] = value;
                 Ok(())
             }
+            0x2c => {
+                let result = self.map_physical_memory(args[0], args[1])?;
+                self.core.cpu.regs[0] = result;
+                Ok(())
+            }
+            0x2d => {
+                let result = self.unmap_physical_memory(args[0], args[1])?;
+                self.core.cpu.regs[0] = result;
+                Ok(())
+            }
             _ => Err(Trap::UnsupportedSvc {
                 pc: self.core.cpu.pc,
                 number,
             }),
         }
+    }
+
+    /// User memory in use: the process image, the heap and physical memory
+    /// mapped into the alias region.
+    fn used_memory(&self) -> u64 {
+        self.layout.initial_used_memory + self.heap_size + self.physical_size
+    }
+
+    /// Validates a Map/UnmapPhysicalMemory range: page-aligned, non-empty and
+    /// inside the alias region. Returns the Horizon result for a bad range.
+    fn physical_range_error(&self, address: u64, size: u64) -> Option<u64> {
+        if !address.is_multiple_of(PAGE_SIZE) {
+            return Some(RESULT_INVALID_ADDRESS);
+        }
+        if size == 0 || !size.is_multiple_of(PAGE_SIZE) {
+            return Some(RESULT_INVALID_SIZE);
+        }
+        let alias_end = self.layout.alias_base + self.layout.alias_size;
+        let inside = address >= self.layout.alias_base
+            && address
+                .checked_add(size)
+                .is_some_and(|end| end <= alias_end);
+        (!inside).then_some(RESULT_INVALID_MEMORY_REGION)
+    }
+
+    /// SVC 0x2C MapPhysicalMemory: backs the unmapped pages of an alias-region
+    /// range with zeroed read/write Normal memory, skipping pages already
+    /// mapped, and counts them as used memory (Atmosphere
+    /// KPageTable::MapPhysicalMemory).
+    fn map_physical_memory(&mut self, address: u64, size: u64) -> Result<u64, Trap> {
+        if let Some(error) = self.physical_range_error(address, size) {
+            return Ok(error);
+        }
+        let end = address + size;
+        let mut gaps = Vec::new();
+        let mut cursor = address;
+        while cursor < end {
+            let mapping = self.memory.query(cursor);
+            let next = mapping.base.saturating_add(mapping.size).min(end);
+            if mapping.state == STATE_FREE {
+                gaps.push((cursor, next - cursor));
+            }
+            cursor = next;
+        }
+        let needed: u64 = gaps.iter().map(|(_, size)| size).sum();
+        if self.used_memory() + self.layout.system_resource_size + needed > self.layout.total_memory
+        {
+            return Ok(RESULT_LIMIT_REACHED);
+        }
+        for (base, size) in gaps {
+            self.memory
+                .map(base, size, READ | WRITE, STATE_NORMAL, PHYSICAL_LABEL)?;
+            self.physical_size += size;
+        }
+        Ok(0)
+    }
+
+    /// SVC 0x2D UnmapPhysicalMemory: releases physical memory mapped in an
+    /// alias-region range. Mappings must lie wholly inside the range.
+    fn unmap_physical_memory(&mut self, address: u64, size: u64) -> Result<u64, Trap> {
+        if let Some(error) = self.physical_range_error(address, size) {
+            return Ok(error);
+        }
+        let end = address + size;
+        let mut cursor = address;
+        while cursor < end {
+            let mapping = self.memory.query(cursor);
+            let next = mapping.base.saturating_add(mapping.size);
+            if mapping.state != STATE_FREE {
+                if mapping.label != PHYSICAL_LABEL || mapping.base < address || next > end {
+                    return Err(Trap::InvalidState {
+                        message: format!(
+                            "UnmapPhysicalMemory of {address:#x}+{size:#x} covers part of \
+                             {:?} at {:#x}+{:#x}; partial unmaps are not modeled",
+                            mapping.label, mapping.base, mapping.size
+                        ),
+                    });
+                }
+                self.memory.unmap_exact(mapping.base, mapping.size)?;
+                self.physical_size -= mapping.size;
+            }
+            cursor = next.min(end);
+        }
+        Ok(0)
     }
 
     fn memory_model_report(&self) -> serde_json::Value {
@@ -6203,6 +6304,35 @@ mod tests {
     }
 
     #[test]
+    fn physical_memory_maps_alias_pages_once_and_counts_them() {
+        let mut m = Machine::new(Layout::default(), 1);
+        let alias = m.layout.alias_base;
+        let used = |m: &mut Machine| {
+            m.core.cpu.regs[..4].copy_from_slice(&[0xdead, 22, 0xffff8001, 0]);
+            m.svc(0x29).unwrap();
+            m.core.cpu.regs[1]
+        };
+        let before = used(&mut m);
+        let call = |m: &mut Machine, number: u16, address: u64, size: u64| {
+            m.core.cpu.regs[..2].copy_from_slice(&[address, size]);
+            m.svc(number).unwrap();
+            m.core.cpu.regs[0]
+        };
+        assert_eq!(call(&mut m, 0x2c, alias, PAGE_SIZE), 0);
+        m.memory.write(alias, &[7; 8]).unwrap();
+        // Mapping an overlapping range keeps existing pages and adds the rest.
+        assert_eq!(call(&mut m, 0x2c, alias, 3 * PAGE_SIZE), 0);
+        assert_eq!(m.memory.read_u64(alias).unwrap(), 0x0707070707070707);
+        assert_eq!(m.memory.read_u64(alias + PAGE_SIZE).unwrap(), 0);
+        assert_eq!(used(&mut m), before + 3 * PAGE_SIZE);
+        assert_eq!(call(&mut m, 0x2c, alias + 1, PAGE_SIZE), 0xcc01);
+        assert_eq!(call(&mut m, 0x2c, alias, 0), 0xca01);
+        assert_eq!(call(&mut m, 0x2d, alias, 3 * PAGE_SIZE), 0);
+        assert!(m.memory.read_u64(alias).is_err());
+        assert_eq!(used(&mut m), before);
+    }
+
+    #[test]
     fn remote_region_policy_is_explicit_and_does_not_create_mappings() {
         let layout = Layout {
             remote_memory_model: RemoteMemoryModel::AbsentRegionCompatibility,
@@ -6217,7 +6347,11 @@ mod tests {
         }
         assert_eq!(m.memory.mappings().count(), 0);
         assert!(m.memory.read_u64(0).is_err());
-        assert!(matches!(m.svc(0x2c), Err(Trap::UnsupportedSvc { .. })));
+        // MapPhysicalMemory outside the alias region is refused, mapping nothing.
+        m.core.cpu.regs[..2].copy_from_slice(&[0, PAGE_SIZE]);
+        m.svc(0x2c).unwrap();
+        assert_eq!(m.core.cpu.regs[0], 0xd401);
+        assert_eq!(m.memory.mappings().count(), 0);
         let report = m.report(&Trap::Exit { code: 0 });
         assert_eq!(
             report["layout"]["remote_memory_model"],
