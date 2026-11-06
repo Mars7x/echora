@@ -899,6 +899,8 @@ pub struct Services {
     nvdrv_firmware_memory_margin: Option<bool>,
     /// Open NVIDIA driver file descriptors and their device paths.
     nvdrv_fds: BTreeMap<u32, String>,
+    /// Per-descriptor NVIDIA device state.
+    nvdrv_devices: crate::nvdrv::Devices,
     /// QueryEvent backings by (device path, event ID); each is created once.
     nvdrv_events: BTreeMap<(String, u32), ReadableEventId>,
     /// Live transfer-memory handles (CreateTransferMemory).
@@ -996,6 +998,7 @@ impl Default for Services {
             graphics_supervisor_phase: None,
             nvdrv_firmware_memory_margin: None,
             nvdrv_fds: BTreeMap::new(),
+            nvdrv_devices: Default::default(),
             nvdrv_events: BTreeMap::new(),
             transfer_memories: BTreeMap::new(),
             retained_transfer_memories: Vec::new(),
@@ -5866,6 +5869,8 @@ impl Services {
                     (0, 0)
                 };
                 let result = crate::nvdrv::ioctl(
+                    &mut self.nvdrv_devices,
+                    fd,
                     &device,
                     code,
                     &input_bytes,
@@ -5893,6 +5898,7 @@ impl Services {
                 }
                 call.reply(0, None, NVDRV_INTERFACE_ID, &0u32.to_le_bytes())?;
                 self.nvdrv_fds.remove(&fd);
+                self.nvdrv_devices.close(fd);
                 Ok(Outcome::success())
             }
             // INvDrv2User QueryEvent (4): u32 Fd, u32 EvtId; copies the

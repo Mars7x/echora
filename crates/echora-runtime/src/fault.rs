@@ -57,6 +57,20 @@ mod unix {
             }
             // SAFETY: write(2) is async-signal-safe; the buffer is valid.
             unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            // The recent block starts, oldest first. Collecting them
+            // allocates, which a dying process can afford: the fault is in
+            // translated code, not inside the allocator.
+            // SAFETY: as above.
+            let recent = unsafe { (*core).recent_thread_pcs() };
+            for entry in recent.iter().rev().take(24).rev() {
+                let mut line = *b"  recent 0x0000000000000000\n";
+                for index in 0..16 {
+                    line[11 + index] =
+                        b"0123456789abcdef"[((entry.pc >> (60 - 4 * index)) & 0xf) as usize];
+                }
+                // SAFETY: as above.
+                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            }
         }
         if let Some(previous) = PREVIOUS.get() {
             // Returning re-runs the faulting access under the previous
