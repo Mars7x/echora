@@ -564,18 +564,17 @@ fn jump_table(
     // A table address hoisted out of a loop is defined after the dispatch
     // in program order (main 0x7100b83eb0 reads its table through x30, set
     // by adrp/add pairs later in the function): when the backward walk
-    // found none, every adrp/add pair writing the table register in the
-    // next instructions must agree on one address.
-    let table = match table {
-        Some(table) => table,
-        None if entry_size != 0 => hoisted_address(pc, table_reg, read_word)?,
+    // found none, each address the adrp/add pairs writing the table
+    // register compute in the next instructions is a candidate. Later
+    // loops of the same function may hoist other tables into the same
+    // register (main 0x7101862928 and 0x7101863a28 both use x4), so every
+    // candidate's targets are taken; extra targets only add block entries.
+    let tables = match table {
+        Some(table) => vec![table],
+        None if entry_size != 0 => hoisted_addresses(pc, table_reg, read_word)?,
         None => return None,
     };
-    let base = if base_low == Some(u64::MAX) {
-        table
-    } else {
-        base?
-    };
+    let candidates = tables.len();
     // Unsigned byte or halfword entries scaled to instructions only reach
     // forward from the base, into code after the dispatch. With no bound in
     // the window (a loop counter whose exit test is elsewhere, as at main
@@ -603,38 +602,66 @@ fn jump_table(
         })
     };
     let mut targets = Vec::new();
-    for index in 0..count {
-        let Some(raw) = read_data(table.checked_add(index * entry_size)?, entry_size) else {
-            if exact {
+    for table in tables {
+        let Some(table_targets) = (|| {
+            let base = if base_low == Some(u64::MAX) {
+                table
+            } else {
+                base?
+            };
+            let mut targets = Vec::new();
+            for index in 0..count {
+                let Some(raw) = read_data(table.checked_add(index * entry_size)?, entry_size)
+                else {
+                    if exact {
+                        return None;
+                    }
+                    break;
+                };
+                let bits = entry_size * 8;
+                let mut value = if entry_signed && bits < 64 {
+                    (((raw << (64 - bits)) as i64) >> (64 - bits)) as u64
+                } else {
+                    raw
+                };
+                if sign_extend32 {
+                    value = value as u32 as i32 as i64 as u64;
+                }
+                let target = base.wrapping_add(value << shift);
+                if read_word(target).is_some() {
+                    targets.push(target);
+                } else if exact {
+                    return None;
+                }
+            }
+            Some(targets)
+        })() else {
+            // One candidate whose entries leave the code is not this
+            // dispatch's table; a lone table must read cleanly.
+            if candidates == 1 {
                 return None;
             }
-            break;
+            continue;
         };
-        let bits = entry_size * 8;
-        let mut value = if entry_signed && bits < 64 {
-            (((raw << (64 - bits)) as i64) >> (64 - bits)) as u64
-        } else {
-            raw
-        };
-        if sign_extend32 {
-            value = value as u32 as i32 as i64 as u64;
-        }
-        let target = base.wrapping_add(value << shift);
-        if read_word(target).is_some() {
-            targets.push(target);
-        } else if exact {
-            return None;
-        }
+        targets.extend(table_targets);
+    }
+    if targets.is_empty() {
+        return None;
     }
     targets.sort_unstable();
     targets.dedup();
     Some(targets)
 }
 
-/// The one address that every `adrp reg; add reg, reg, #imm` pair in the
-/// HOISTED_TABLE_WINDOW instructions after `pc` computes, if they agree.
-fn hoisted_address(pc: u64, register: u8, read_word: &dyn Fn(u64) -> Option<u32>) -> Option<u64> {
-    let mut found = None;
+/// The distinct addresses that `adrp reg; add reg, reg, #imm` pairs in the
+/// HOISTED_TABLE_WINDOW instructions after `pc` compute, in program order;
+/// none when an adrp of the register is not followed by such an add.
+fn hoisted_addresses(
+    pc: u64,
+    register: u8,
+    read_word: &dyn Fn(u64) -> Option<u32>,
+) -> Option<Vec<u64>> {
+    let mut found = Vec::new();
     for index in 1..HOISTED_TABLE_WINDOW {
         let at = pc + index * 4;
         let Some(word) = read_word(at) else {
@@ -650,12 +677,11 @@ fn hoisted_address(pc: u64, register: u8, read_word: &dyn Fn(u64) -> Option<u32>
             return None;
         }
         let address = adr_target(word, at, true) + u64::from((next >> 10) & 0xfff);
-        if found.is_some_and(|other| other != address) {
-            return None;
+        if !found.contains(&address) {
+            found.push(address);
         }
-        found = Some(address);
     }
-    found
+    (!found.is_empty()).then_some(found)
 }
 
 fn adr_target(word: u32, pc: u64, page: bool) -> u64 {
@@ -2877,6 +2903,46 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
         assert!(translation.instructions.contains_key(&0x1028));
+    }
+
+    #[test]
+    fn hoisted_tables_of_later_loops_add_their_targets() {
+        // As above, then a later loop hoists another table into x30
+        // (adrp x30, 0x2000; add x30, x30, #8): both tables' targets are
+        // block entries.
+        let words = [
+            0x7100_083f, // cmp w1, #2
+            0x5400_0128, // b.hi 0x1028
+            0x1000_0100, // adr x0, 0x1028
+            0x7861_7bc2, // ldrh w2, [x30, x1, lsl #1]
+            0x8b02_0800, // add x0, x0, x2, lsl #2
+            0xd61f_0000, // br x0
+            0xb000_001e, // adrp x30, 0x2000
+            0x9100_03de, // add x30, x30, #0
+            0xb000_001e, // adrp x30, 0x2000
+            0x9100_23de, // add x30, x30, #8
+            0xd65f_03c0, // 0x1028: cases
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0, 4, 0],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1014), Some(&5));
+        assert!(translation.instructions.contains_key(&0x1038));
     }
 
     #[test]
