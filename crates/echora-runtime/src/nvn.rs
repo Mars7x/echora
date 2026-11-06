@@ -280,6 +280,9 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// Nesting of command lists running through CallCommands.
+    #[serde(skip)]
+    call_depth: u32,
     /// ECHORA_NVN_TEXTURE_LOG: each texture initialized (format, target,
     /// size, stride and guest storage address), the first 512; a hex
     /// `low-high` value keeps those with storage in that range.
@@ -432,6 +435,14 @@ const COMMAND_BUFFER_MANAGEMENT: &[&str] = &[
     "SetRecordingMode",
 ];
 
+/// Command buffer memory the host counts as used (GetCommandMemoryUsed,
+/// GetControlMemoryUsed): per recorded command, and per non-empty list for
+/// its handle. Host lists do not live in that memory, but the application
+/// reads a list with no used memory as empty and never submits it (main
+/// 0x7100666970 keeps that flag beside each worker list's handle).
+const COMMAND_MEMORY_PER_COMMAND: u64 = 16;
+const CONTROL_MEMORY_PER_LIST: u64 = 16;
+
 /// First GPU virtual address handed to a memory pool, and pool alignment.
 const GPU_ADDRESS_BASE: u64 = 0x10_0000_0000;
 const GPU_ADDRESS_ALIGNMENT: u64 = 0x10000;
@@ -512,6 +523,16 @@ fn split_name(name: &str) -> Option<(&'static str, &str)> {
 }
 
 impl Nvn {
+    /// Count `bytes` of a command buffer's command or control memory as
+    /// used, up to the memory it was given.
+    fn use_command_memory(&mut self, buffer: u64, key: &str, bytes: u64) {
+        if let Some(object) = self.objects.get_mut(&buffer) {
+            let size = object.state.get(key).map_or(0, |value| value.x[0]);
+            let used = object.state.entry(format!("{key}Used")).or_default();
+            used.x[0] = (used.x[0] + bytes).min(size);
+        }
+    }
+
     pub fn add_hook(&mut self, address: u64, entry: HostEntry) {
         self.hooks.insert(address, entry);
     }
@@ -1038,6 +1059,8 @@ impl Nvn {
                 let object = self.objects.get_mut(&this).unwrap();
                 let total = object.state.entry(key.into()).or_default();
                 total.x[0] = size;
+                // New memory starts unused.
+                object.state.remove(&format!("{key}Used"));
                 return Ok(true);
             }
             "nvnCommandBufferGetCommandMemorySize"
@@ -1053,7 +1076,17 @@ impl Nvn {
                     "ControlMemory"
                 };
                 let size = object.state.get(key).map_or(0, |value| value.x[0]);
-                core.cpu.regs[0] = if name.ends_with("Used") { 0 } else { size };
+                let used = object
+                    .state
+                    .get(&format!("{key}Used"))
+                    .map_or(0, |value| value.x[0]);
+                core.cpu.regs[0] = if name.ends_with("Used") {
+                    used
+                } else if name.ends_with("Free") {
+                    size - used
+                } else {
+                    size
+                };
                 return Ok(true);
             }
             // Memory callbacks are recorded; the host never runs out of
@@ -1090,8 +1123,35 @@ impl Nvn {
                     .recording
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
+                if !commands.is_empty() {
+                    self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
+                }
                 self.next_command_handle += 1;
                 let handle = 0x4e56_0000_0000_0000 | self.next_command_handle;
+                // Only in a sequenced present: lists are recorded by the
+                // dozen per frame.
+                if debug_var_os("ECHORA_GPU_FLOW").is_some() && self.sequencing() {
+                    let mut names: BTreeMap<&str, usize> = BTreeMap::new();
+                    for command in &commands {
+                        *names
+                            .entry(command.name.trim_start_matches("nvnCommandBuffer"))
+                            .or_default() += 1;
+                    }
+                    let work: Vec<String> = names
+                        .iter()
+                        .filter(|(name, _)| {
+                            is_work_command(name) || name.starts_with("Call") || name.ends_with("Event")
+                        })
+                        .map(|(name, count)| format!("{name} {count}"))
+                        .collect();
+                    let note = format!(
+                        "flow recorded {this:x} list {handle:x} from lr {:#x} commands {} [{}]",
+                        core.cpu.regs[30],
+                        commands.len(),
+                        work.join(", ")
+                    );
+                    self.gpu_note(note);
+                }
                 self.command_list_clock += 1;
                 self.command_list_commands += commands.len();
                 self.command_lists.insert(
@@ -1255,11 +1315,27 @@ impl Nvn {
             // value 0 at main+0x2cb41c).
             "nvnEventSignal" | "nvnEventGetValue" => {
                 let address = self.event_address(this).map_err(invalid)?;
+                let flow = debug_var_os("ECHORA_GPU_FLOW").is_some() && self.sequencing();
                 if name == "nvnEventGetValue" {
-                    core.cpu.regs[0] = u64::from(core.memory.read_u32(address)?);
+                    let value = core.memory.read_u32(address)?;
+                    if flow {
+                        let note = format!(
+                            "flow event {this:x} read {value} from lr {:#x}",
+                            core.cpu.regs[30]
+                        );
+                        self.gpu_note(note);
+                    }
+                    core.cpu.regs[0] = u64::from(value);
                     return Ok(true);
                 }
                 let (mode, value) = (x[1] as u32, x[2] as u32);
+                if flow {
+                    let note = format!(
+                        "flow event {this:x} cpu signal mode {mode} value {value} from lr {:#x}",
+                        core.cpu.regs[30]
+                    );
+                    self.gpu_note(note);
+                }
                 let new = match mode {
                     0 => value,
                     1 => core.memory.read_u32(address)?.wrapping_add(value),
@@ -1810,12 +1886,34 @@ impl Nvn {
                     states: Default::default(),
                 };
                 capture(&mut command, core)?;
+                // CallCommands / CopyCommands(cmd, int count, const
+                // NVNcommandHandle* handles): the handles are read now.
+                if matches!(rest, "CallCommands" | "CopyCommands") {
+                    let count = x[1] as u32;
+                    if count > 4096 {
+                        return Err(invalid(format!("{count} called command handles")));
+                    }
+                    for index in 0..u64::from(count) {
+                        command
+                            .captured
+                            .push(core.memory.read_u64(x[2] + index * 8)?);
+                    }
+                }
                 self.snapshot_states(&mut command);
                 if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
                     let view = self.bag(command.x[3], "TextureView").map_err(invalid)?;
                     for (index, key) in ["Levels", "Layers"].iter().enumerate() {
                         command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
                     }
+                }
+                if command.name == "nvnCommandBufferClearTexture" {
+                    let bases = if command.x[2] == 0 {
+                        [0, 0]
+                    } else {
+                        let view = self.bag(command.x[2], "TextureView").map_err(invalid)?;
+                        ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
+                    };
+                    command.captured.extend(bases);
                 }
                 if command.name == "nvnCommandBufferCopyTextureToTexture" {
                     // After both regions: each view's level and layer base
@@ -1861,6 +1959,7 @@ impl Nvn {
                     command.captured.extend(views);
                 }
                 self.recording.get_mut(&this).unwrap().push(command);
+                self.use_command_memory(this, "CommandMemory", COMMAND_MEMORY_PER_COMMAND);
                 return Ok(true);
             }
         }
@@ -2076,6 +2175,24 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        // A guest memory fault names the command that made it.
+        self.execute_command(command, core)
+            .map_err(|trap| match trap {
+                Trap::MemoryFault { address, access } => Trap::UnsupportedService {
+                    pc: core.cpu.pc,
+                    service: "nvn".into(),
+                    command_id: None,
+                    message: format!(
+                        "executing {}: {access} fault at {address:#x} (x {:x?})",
+                        command.name,
+                        &command.x[..5]
+                    ),
+                },
+                other => other,
+            })
+    }
+
+    fn execute_command(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
         // Commands that read or write guest memory themselves see earlier
         // dispatches' results in place (draws and dispatches resolve what
         // they read).
@@ -2102,6 +2219,29 @@ impl Nvn {
             message: format!("executing {}: {message}", command.name),
         };
         match command.name.as_str() {
+            // CallCommands / CopyCommands: the called lists run in place, in
+            // order (a copy runs the same commands when it is submitted).
+            // Lists no longer kept are skipped and counted, as at
+            // submission.
+            "nvnCommandBufferCallCommands" | "nvnCommandBufferCopyCommands" => {
+                if self.call_depth >= 8 {
+                    return Err(stop("command lists call each other too deeply".into()));
+                }
+                for handle in command.captured.clone() {
+                    let Some((list, ..)) = self.command_lists.get(&handle) else {
+                        self.stale_command_submissions += 1;
+                        continue;
+                    };
+                    let list = list.clone();
+                    self.call_depth += 1;
+                    let result = list
+                        .iter()
+                        .try_for_each(|called| self.execute(called, core));
+                    self.call_depth -= 1;
+                    result?;
+                }
+                Ok(())
+            }
             // SetRenderTargets(cmd, int colors, const NVNtexture* const*,
             // const NVNtextureView* const*, depth, depthView). Captured:
             // color texture pointers, then color view pointers.
@@ -2173,6 +2313,45 @@ impl Nvn {
                     command.x[3] as i32,
                     command.x[4] as i32,
                 ]);
+                Ok(())
+            }
+            // ClearTexture: as ClearColor on the texture's level and layer
+            // (the view's bases), whole level; a region smaller than the
+            // level and partial masks are noted, not modeled.
+            "nvnCommandBufferClearTexture" => {
+                let texture = command.x[1];
+                self.object(texture, "Texture").map_err(stop)?;
+                let captured = &command.captured;
+                let (level, layer) = (
+                    captured[captured.len() - 2] as u32,
+                    captured[captured.len() - 1] as u32,
+                );
+                let color: [u32; 4] = std::array::from_fn(|channel| captured[channel] as u32);
+                if command.x[5] as u32 & 0xf != 0xf {
+                    self.gpu_note("masked texture clears are not modeled");
+                }
+                if captured.len() == 12 {
+                    let (width, height) = self.texture_extent(texture).map_err(stop)?;
+                    let region = &captured[4..10];
+                    let whole = region[0] == 0
+                        && region[1] == 0
+                        && region[3] as u32 >= width >> level
+                        && region[4] as u32 >= height >> level;
+                    if !whole {
+                        self.gpu_note(
+                            "partial texture clears are not modeled (whole level cleared)",
+                        );
+                    }
+                }
+                if level != 0 && debug_var_os("ECHORA_GPU_MIPS").is_none() {
+                    return Ok(());
+                }
+                if self.gpu().is_some() {
+                    return self
+                        .gpu_clear_color(texture, level, layer, color)
+                        .map_err(stop);
+                }
+                self.gpu_note("texture clears without the GPU are not modeled");
                 Ok(())
             }
             // ClearColor(cmd, int index, const float color[4], int mask):
@@ -2568,6 +2747,7 @@ impl Nvn {
         source: u64,
         to_texture: bool,
     ) -> Result<(), TexelError> {
+        let texture_object = texture;
         let texture = self
             .object(texture, "Texture")
             .map_err(TexelError::Invalid)?;
@@ -2632,10 +2812,11 @@ impl Nvn {
             .builder
             .get("Storage")
             .ok_or_else(|| TexelError::Stop("texture has no storage".into()))?;
-        let pool = self
-            .object(storage.x[0], "MemoryPool")
+        self.object(storage.x[0], "MemoryPool")
             .map_err(TexelError::Invalid)?;
-        let base = pool.builder["Storage"].x[0] + storage.x[1];
+        let base = self
+            .texture_storage(texture_object)
+            .ok_or_else(|| TexelError::Stop("texture storage is in no mapped memory".into()))?;
         let (bw, bh) = (info.block_width, info.block_height);
         if rx % bw != 0 || ry % bh != 0 {
             return Err(TexelError::Invalid("region is not block aligned".into()));
@@ -3309,6 +3490,25 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
                         .map(u64::from)
                 })
                 .collect::<Result<_, _>>()?;
+        }
+        // ClearTexture(cmd, const NVNtexture*, const NVNtextureView*, const
+        // NVNcopyRegion*, const float color[4], int mask): the four color
+        // words, then the region's six words (none for a null region); the
+        // view's level and layer bases follow at record time.
+        "nvnCommandBufferClearTexture" => {
+            let mut captured: Vec<u64> = (0..4)
+                .map(|channel| {
+                    core.memory
+                        .read_u32(command.x[4] + channel * 4)
+                        .map(u64::from)
+                })
+                .collect::<Result<_, _>>()?;
+            if command.x[3] != 0 {
+                for word in 0..6 {
+                    captured.push(u64::from(core.memory.read_u32(command.x[3] + word * 4)?));
+                }
+            }
+            command.captured = captured;
         }
         _ => {}
     }

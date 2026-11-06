@@ -1313,11 +1313,18 @@ impl Nvn {
             .map_or(1, |value| (value.x[0] as u32).clamp(1, 16))
     }
 
-    /// Guest address of a texture object's storage.
+    /// Guest address of a texture object's storage. A virtual pool has no
+    /// storage of its own: its offset resolves through the pool's GPU
+    /// range to the physical pool mapped there (MapVirtual).
     pub(super) fn texture_storage(&self, texture: u64) -> Option<u64> {
         let storage = self.objects.get(&texture)?.builder.get("Storage")?;
         let pool = self.objects.get(&storage.x[0])?;
-        Some(pool.builder.get("Storage")?.x[0] + storage.x[1])
+        let base = pool.builder.get("Storage")?.x[0];
+        if base != 0 {
+            return Some(base + storage.x[1]);
+        }
+        let gpu = pool.state.get("GpuAddress")?.x[0] + storage.x[1];
+        self.pool_for(gpu).map(|(guest, _)| guest)
     }
 
     /// A render target whose texture object shares `texture`'s storage and
