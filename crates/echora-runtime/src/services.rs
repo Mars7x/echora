@@ -1079,14 +1079,28 @@ pub struct Services {
     syncpoint_events: BTreeMap<u32, ReadableEventId>,
     /// Syncpoint event indices armed by 201 and not yet disarmed by 202.
     armed_syncpoint_events: BTreeSet<u32>,
+    /// Decoder output fences: the value of each slot's syncpoint token (see
+    /// `decoder_fence_token`), advanced when a frame is decoded into it.
+    decoder_fences: BTreeMap<u32, u64>,
+    /// Syncpoint events armed (201) on a decoder fence that has not reached
+    /// its value yet: event index -> (token, value).
+    decoder_fence_waits: BTreeMap<u32, (u32, u64)>,
+    /// Set by Stop (207) and Finalize (115) until the next Start (6) or
+    /// decoder (201): no frame will arrive, so every decoder fence counts
+    /// as reached (the movie library waits on them while tearing down).
+    decoder_fences_released: bool,
     /// Initialized video decoders: transfer memory size and parameters.
     video_decoders: Vec<(u64, Vec<u32>)>,
     /// Graphics supervisor native memories (111) by handle: kind, size.
     native_memories: BTreeMap<u32, (u8, u64)>,
     /// Application addresses bound to native memories (114).
     native_memory_addresses: BTreeMap<u32, u64>,
-    /// Decoder image pools (911) and their native memory handle.
-    decoder_image_pools: BTreeMap<u32, u32>,
+    /// Decoder image pools (911) by their first native image handle: the
+    /// native memory handle and the number of images.
+    decoder_image_pools: BTreeMap<u32, (u32, u32)>,
+    /// The picture last decoded into each output slot (native image
+    /// handle), handed out by GetFrame (213) and read through 961.
+    slot_pictures: BTreeMap<u32, Box<crate::av1::Picture>>,
     /// Each 911 request in order: its preference, u32 and native memory
     /// (address and size), as hex for the report.
     decoder_image_pool_requests: Vec<String>,
@@ -1099,16 +1113,23 @@ pub struct Services {
     decoded_frames: u64,
     /// Submissions refused while the decoder's input was full.
     refused_video_submissions: u64,
-    /// Decoded frames waiting for GetFrame: (slot, timestamp).
-    decoded_video_frames: std::collections::VecDeque<(u32, u64)>,
+    /// Decoded frames waiting for GetFrame: (slot, timestamp, picture).
+    decoded_video_frames: std::collections::VecDeque<(u32, u64, Option<Box<crate::av1::Picture>>)>,
     /// The decoder's input event (GetInputEvent), for back-pressure.
     video_input_event: Option<ReadableEventId>,
     /// GetFrame calls answered "no output" (213).
     empty_frame_requests: u64,
     /// Video decoder submissions so far and the queued input (id,
-    /// timestamp argument, bitstream).
+    /// timestamp argument, the picture the submission decoded to).
     video_submissions: u64,
-    video_input: Vec<(u64, u64, Vec<u8>)>,
+    video_input: Vec<(u64, u64, Option<Box<crate::av1::Picture>>)>,
+    /// The host AV1 decoder of the current decoder session (created by
+    /// 201, dropped by 115), and its failures.
+    av1_decoder: Option<crate::av1::Decoder>,
+    av1_errors: Vec<String>,
+    /// The last 600 video decoder requests: command and leading argument
+    /// bytes (hex); GetFrame (213) and syncpoint waits add what they did.
+    video_log: std::collections::VecDeque<String>,
     /// Library applets and applet storages.
     library_applets: Vec<LibraryApplet>,
     applet_storages: Vec<Vec<u8>>,
@@ -1217,10 +1238,14 @@ impl Default for Services {
             idle_time_detection_extension: 0,
             syncpoint_events: BTreeMap::new(),
             armed_syncpoint_events: BTreeSet::new(),
+            decoder_fences: BTreeMap::new(),
+            decoder_fence_waits: BTreeMap::new(),
+            decoder_fences_released: false,
             video_decoders: Vec::new(),
             native_memories: BTreeMap::new(),
             native_memory_addresses: BTreeMap::new(),
             decoder_image_pools: BTreeMap::new(),
+            slot_pictures: BTreeMap::new(),
             decoder_image_pool_requests: Vec::new(),
             video_decoder_running: false,
             returned_frames: 0,
@@ -1232,6 +1257,9 @@ impl Default for Services {
             empty_frame_requests: 0,
             video_submissions: 0,
             video_input: Vec::new(),
+            av1_decoder: None,
+            av1_errors: Vec::new(),
+            video_log: Default::default(),
             library_applets: Vec::new(),
             applet_storages: Vec::new(),
             library_applet_launchable_event: None,
@@ -1604,6 +1632,12 @@ fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
 
 /// Submissions the host video decoder holds before its input event clears.
 const VIDEO_INPUT_DEPTH: usize = 8;
+
+/// The syncpoint token of a decoder output slot's fence: a range no
+/// syncpoint the SDK opens reaches (its tokens are small inverted ids).
+fn decoder_fence_token(slot: u32) -> u32 {
+    0x5644_0000 | (slot & 0xffff)
+}
 
 /// AppletId of the controller applet (yuzu applet AppletId::Controller).
 const LIBRARY_APPLET_CONTROLLER: u32 = 0x0c;
@@ -2306,6 +2340,13 @@ impl Services {
                 ),
             )
         })?;
+        if matches!(object, ServiceObject::VideoDecoder) {
+            let arguments: String = call.request.arguments[..call.request.arguments.len().min(16)]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            self.note_video(format!("{} {arguments}", call.request.command_id));
+        }
         match object {
             ServiceObject::ServiceManager {
                 registered_process_id,
@@ -2348,6 +2389,9 @@ impl Services {
                     .collect();
                 call.reply(0, None, 0, &[])?;
                 self.video_decoders.push((size, parameters));
+                self.av1_decoder = None;
+                self.decoder_fences.clear();
+                self.decoder_fences_released = false;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:201");
                 Ok(Outcome::success())
@@ -2396,10 +2440,12 @@ impl Services {
             // handle the SDK keeps per output slot, then 12 (311) or 28 (314:
             // u32 0, the slot's previous sync handle, u64 0) bytes -> the
             // slot's 16-byte NativeSyncHandle, which the SDK stores before
-            // putting the slot on its ready ring (sdk+0x331810). The slot is
-            // queued for the next decoded frame; the handle is the slot and
-            // a zero value (syncpoint waits always pass, see the syncpoint
-            // supervisor's 103). Provisional.
+            // putting the slot on its ready ring (sdk+0x331810), from which
+            // AcquireAv1DecoderOutputBuffer hands it out. The slot is queued
+            // for the next decoded frame and the handle is a fence on that
+            // frame: the slot's decoder fence token and the value it takes
+            // once the frame is decoded (syncpoint supervisor 103/201/202
+            // answer from it). Provisional.
             ServiceObject::VideoDecoder if matches!(call.request.command_id, 311 | 314) => {
                 let register = call.request.command_id == 311;
                 call.shape(if register { 16 } else { 32 }, false, false)?;
@@ -2407,11 +2453,18 @@ impl Services {
                 if self.decoder_slots.len() >= 64 {
                     return Err(invalid("decoder output slot queue overflow"));
                 }
+                // The slot's sync handle (u32 token, u8 64-bit flag, u64
+                // threshold; layout from sdk+0x5d3a50) completes when the
+                // next frame is decoded into the slot.
+                let token = decoder_fence_token(slot);
+                let threshold = self.decoder_fences.get(&token).copied().unwrap_or(0) + 1;
+                self.decoder_fences.entry(token).or_insert(0);
+                let mut reply = token.to_le_bytes().to_vec();
+                reply.extend_from_slice(&1u32.to_le_bytes());
+                reply.extend_from_slice(&threshold.to_le_bytes());
+                call.reply(0, None, 0, &reply)?;
                 self.decoder_slots.push_back(slot);
                 self.decode_video_frames();
-                let mut reply = u64::from(slot).to_le_bytes().to_vec();
-                reply.extend_from_slice(&0u64.to_le_bytes());
-                call.reply(0, None, 0, &reply)?;
                 if !register {
                     self.returned_frames += 1;
                 }
@@ -2433,10 +2486,11 @@ impl Services {
             ServiceObject::VideoDecoder if call.request.command_id == 213 => {
                 call.shape(0, false, false)?;
                 self.decode_video_frames();
-                let Some((slot, timestamp)) = self.decoded_video_frames.pop_front() else {
+                let Some((slot, timestamp, picture)) = self.decoded_video_frames.pop_front() else {
                     const NO_OUTPUT: u32 = 0x1c_286f;
                     call.reply(NO_OUTPUT, None, 0, &[])?;
                     self.empty_frame_requests += 1;
+                    self.note_video("213 -> no output".into());
                     return Ok(Outcome::result(NO_OUTPUT));
                 };
                 let (width, height) = self
@@ -2451,6 +2505,14 @@ impl Services {
                 data.extend_from_slice(&timestamp.to_le_bytes());
                 data.extend_from_slice(&0u32.to_le_bytes());
                 call.reply(0, None, 0, &data)?;
+                match picture {
+                    Some(picture) => {
+                        self.slot_pictures.insert(slot, picture);
+                    }
+                    None => {
+                        self.slot_pictures.remove(&slot);
+                    }
+                }
                 self.provisional_commands
                     .insert("appletOE:video_decoder:213");
                 Ok(Outcome::success())
@@ -2512,7 +2574,8 @@ impl Services {
                         let _ = file.write_all(&bytes);
                     }
                 }
-                self.video_input.push((id, timestamp, bytes));
+                let picture = self.decode_av1(&bytes);
+                self.video_input.push((id, timestamp, picture));
                 self.decode_video_frames();
                 call.reply(0, None, 0, &id.to_le_bytes())?;
                 self.provisional_commands
@@ -2529,6 +2592,8 @@ impl Services {
                 self.decoded_video_frames.clear();
                 self.video_input_event = None;
                 self.video_decoder_running = false;
+                self.av1_decoder = None;
+                self.release_decoder_fences();
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:115");
@@ -2540,8 +2605,14 @@ impl Services {
             ServiceObject::VideoDecoder if matches!(call.request.command_id, 6 | 8 | 207) => {
                 call.shape(0, false, false)?;
                 match call.request.command_id {
-                    6 => self.video_decoder_running = true,
-                    207 => self.video_decoder_running = false,
+                    6 => {
+                        self.video_decoder_running = true;
+                        self.decoder_fences_released = false;
+                    }
+                    207 => {
+                        self.video_decoder_running = false;
+                        self.release_decoder_fences();
+                    }
                     _ => {}
                 }
                 call.reply(0, None, 0, &[])?;
@@ -4332,9 +4403,30 @@ impl Services {
     fn decode_video_frames(&mut self) {
         while !self.decoder_slots.is_empty() && !self.video_input.is_empty() {
             let slot = self.decoder_slots.pop_front().unwrap_or_default();
-            let (_, timestamp, _) = self.video_input.remove(0);
-            self.decoded_video_frames.push_back((slot, timestamp));
+            let (_, timestamp, picture) = self.video_input.remove(0);
+            self.decoded_video_frames
+                .push_back((slot, timestamp, picture));
             self.decoded_frames += 1;
+            *self
+                .decoder_fences
+                .entry(decoder_fence_token(slot))
+                .or_insert(0) += 1;
+        }
+        let reached: Vec<u32> = self
+            .decoder_fence_waits
+            .iter()
+            .filter(|(_, (token, value))| self.decoder_fence_reached(*token, *value))
+            .map(|(&index, _)| index)
+            .collect();
+        for index in reached {
+            self.decoder_fence_waits.remove(&index);
+            if let Some(event) = self
+                .syncpoint_events
+                .get(&index)
+                .and_then(|event| self.readable_events.get_mut(event))
+            {
+                event.signaled = true;
+            }
         }
         let accepting = self.video_input.len() < VIDEO_INPUT_DEPTH;
         if let Some(event) = self
@@ -4342,6 +4434,73 @@ impl Services {
             .and_then(|id| self.readable_events.get_mut(&id))
         {
             event.signaled = accepting;
+        }
+    }
+
+    /// Add to the video decoder log, keeping the last 600 entries.
+    fn note_video(&mut self, entry: String) {
+        if self.video_log.len() == 600 {
+            self.video_log.pop_front();
+        }
+        self.video_log.push_back(entry);
+    }
+
+    /// Whether decoder fence `token` (or its complement, as some SDK paths
+    /// pass it) has reached `value`; tokens that are not decoder fences
+    /// always have (host GPU work completes at submission).
+    fn decoder_fence_reached(&self, token: u32, value: u64) -> bool {
+        self.decoder_fence_value(token)
+            .is_none_or(|current| current >= value)
+    }
+
+    fn decoder_fence_value(&self, token: u32) -> Option<u64> {
+        let value = self
+            .decoder_fences
+            .get(&token)
+            .or_else(|| self.decoder_fences.get(&!token))
+            .copied()?;
+        Some(if self.decoder_fences_released {
+            u64::MAX >> 1
+        } else {
+            value
+        })
+    }
+
+    /// Stop or Finalize: release every decoder fence and signal the events
+    /// armed on them.
+    fn release_decoder_fences(&mut self) {
+        self.decoder_fences_released = true;
+        for (index, _) in std::mem::take(&mut self.decoder_fence_waits) {
+            if let Some(event) = self
+                .syncpoint_events
+                .get(&index)
+                .and_then(|event| self.readable_events.get_mut(event))
+            {
+                event.signaled = true;
+            }
+        }
+    }
+
+    /// Decode one submission with the session's host decoder (created on
+    /// first use): the last picture it completes, if any. Failures are
+    /// recorded (the first 16) and give no picture.
+    fn decode_av1(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
+        let result = match &mut self.av1_decoder {
+            Some(decoder) => decoder.decode(bytes),
+            None => crate::av1::Decoder::new().and_then(|mut decoder| {
+                let result = decoder.decode(bytes);
+                self.av1_decoder = Some(decoder);
+                result
+            }),
+        };
+        match result {
+            Ok(mut pictures) => pictures.pop().map(Box::new),
+            Err(error) => {
+                if self.av1_errors.len() < 16 {
+                    self.av1_errors.push(error);
+                }
+                None
+            }
         }
     }
 
@@ -6598,18 +6757,25 @@ impl Services {
             // no reply data (inferred from its name and 911's result).
             911 => {
                 call.shape(0x48, false, false)?;
+                let images = crate::bytes::le_u32(&call.request.arguments[0x40..0x44]);
                 let memory = crate::bytes::le_u32(&call.request.arguments[0x44..0x48]);
-                if !self.native_memory_addresses.contains_key(&memory) {
-                    return Err(
-                        call.unsupported(SERVICE, format!("image pool on native memory {memory}"))
-                    );
+                if !self.native_memory_addresses.contains_key(&memory)
+                    || !(1..=64).contains(&images)
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("image pool of {images} images on native memory {memory}"),
+                    ));
                 }
+                // The SDK names image i of the pool by base + i
+                // (CalculateNativeImageHandle, sdk+0x477d40), so pools
+                // take disjoint handle ranges.
                 let pool = self
                     .decoder_image_pools
-                    .keys()
+                    .iter()
                     .next_back()
-                    .map_or(1, |pool| pool + 1);
-                self.decoder_image_pools.insert(pool, memory);
+                    .map_or(1, |(base, (_, count))| base + count);
+                self.decoder_image_pools.insert(pool, (memory, images));
                 if self.decoder_image_pool_requests.len() < 16 {
                     let preference: String = call.request.arguments[..0x44]
                         .iter()
@@ -6626,6 +6792,74 @@ impl Services {
                 call.reply(0, None, 0, &pool.to_le_bytes())?;
                 self.provisional_commands
                     .insert("appletOE:graphics_supervisor:911");
+                Ok(Outcome::success())
+            }
+            // 961 (the SDK's ReadDecoderOutputImageNv12 asks it before
+            // ReadUserImageNv12, client sdk+0x3321e0): u32 native image
+            // handle -> the image's 0x80-byte CpuUserImageDescriptor, read
+            // relative to the pool's memory. The picture last decoded into
+            // that image is written there as pitch-linear NV12 (Y rows, then
+            // interleaved UV rows, each the picture's width apart) and the
+            // descriptor says so: kind 0x14 with u32 Y offset at +8, u64 Y
+            // pitch at +0x10, u32 UV offset at +0x18 and u64 UV pitch at
+            // +0x20 (the kind 0x14 copy at sdk+0x478d9c). Images are equal
+            // shares of their pool's memory. Provisional.
+            961 => {
+                call.shape(4, false, false)?;
+                let image = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let Some((&base, &(memory, images))) = self
+                    .decoder_image_pools
+                    .range(..=image)
+                    .next_back()
+                    .filter(|(base, (_, count))| image - *base < *count)
+                else {
+                    return Err(call.unsupported(SERVICE, format!("native image {image}")));
+                };
+                let address = self.native_memory_addresses[&memory];
+                let size = self
+                    .native_memories
+                    .get(&memory)
+                    .map_or(0, |&(_, size)| size);
+                let share = size / u64::from(images);
+                let offset = share * u64::from(image - base);
+                let mut descriptor = [0u8; 0x80];
+                descriptor[0] = 0x14;
+                if let Some(picture) = self.slot_pictures.get(&image) {
+                    let (width, height) = (picture.width as usize, picture.height as usize);
+                    let chroma_width = width.div_ceil(2);
+                    let mut uv = Vec::with_capacity(chroma_width * 2 * height.div_ceil(2));
+                    for (u, v) in picture.u.iter().zip(&picture.v) {
+                        uv.push(*u);
+                        uv.push(*v);
+                    }
+                    let pitch = chroma_width as u64 * 2;
+                    let uv_offset = offset + pitch * height as u64;
+                    if uv_offset + uv.len() as u64 > offset + share {
+                        return Err(call.unsupported(
+                            SERVICE,
+                            format!("{width}x{height} picture in a {share:#x}-byte image"),
+                        ));
+                    }
+                    let mut y = Vec::with_capacity(pitch as usize * height);
+                    for row in picture.y.chunks(width) {
+                        y.extend_from_slice(row);
+                        y.resize(y.len() + pitch as usize - width, 0);
+                    }
+                    call.memory.write(address + offset, &y)?;
+                    call.memory.write(address + uv_offset, &uv)?;
+                    descriptor[8..12].copy_from_slice(&(offset as u32).to_le_bytes());
+                    descriptor[0x10..0x18].copy_from_slice(&pitch.to_le_bytes());
+                    descriptor[0x18..0x1c].copy_from_slice(&(uv_offset as u32).to_le_bytes());
+                    descriptor[0x20..0x28].copy_from_slice(&pitch.to_le_bytes());
+                } else {
+                    // No decoded picture (the decoder failed): a zero-pitch
+                    // image reads as its first bytes repeated.
+                    descriptor[8..12].copy_from_slice(&(offset as u32).to_le_bytes());
+                    descriptor[0x18..0x1c].copy_from_slice(&(offset as u32).to_le_bytes());
+                }
+                call.reply(0, None, 0, &descriptor)?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:961");
                 Ok(Outcome::success())
             }
             912 => {
@@ -7624,7 +7858,11 @@ impl Services {
             // threshold up to 0x7fffffff. Provisional.
             103 => {
                 call.shape(4, false, false)?;
-                let mut reply = 0x7fff_ffff_7fff_ffffu64.to_le_bytes().to_vec();
+                let token = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let value = self
+                    .decoder_fence_value(token)
+                    .unwrap_or(0x7fff_ffff_7fff_ffff);
+                let mut reply = value.to_le_bytes().to_vec();
                 reply.extend_from_slice(&1u32.to_le_bytes());
                 call.reply(0, None, 0, &reply)?;
                 self.provisional_commands
@@ -7647,6 +7885,25 @@ impl Services {
                     ));
                 };
                 call.reply(0, None, 0, &[])?;
+                // A decoder fence short of its value arms the event for the
+                // frame that reaches it (see decode_video_frames).
+                let token = crate::bytes::le_u32(&call.request.arguments[4..8]);
+                let value = crate::bytes::le_u64(&call.request.arguments[8..16]);
+                self.note_video(format!(
+                    "syncpoint 201 index {index} token {token:#x} value {value}"
+                ));
+                if !self.decoder_fence_reached(token, value) {
+                    // An index armed before for a reached target would read
+                    // as signaled (see readable_event_signaled).
+                    self.armed_syncpoint_events.remove(&index);
+                    self.decoder_fence_waits.insert(index, (token, value));
+                    if let Some(event) = self.readable_events.get_mut(&event) {
+                        event.signaled = false;
+                    }
+                    self.provisional_commands
+                        .insert("appletOE:syncpoint_supervisor:201");
+                    return Ok(Outcome::success());
+                }
                 if let Some(event) = self.readable_events.get_mut(&event) {
                     event.signaled = true;
                 }
@@ -7671,8 +7928,15 @@ impl Services {
                     ));
                 };
                 call.reply(0, None, 0, &[])?;
-                if let Some(event) = self.readable_events.get_mut(&event) {
-                    event.signaled = true;
+                let pending = self
+                    .decoder_fence_waits
+                    .get(&index)
+                    .is_some_and(|&(token, value)| !self.decoder_fence_reached(token, value));
+                if !pending {
+                    self.decoder_fence_waits.remove(&index);
+                    if let Some(event) = self.readable_events.get_mut(&event) {
+                        event.signaled = true;
+                    }
                 }
                 self.provisional_commands
                     .insert("appletOE:syncpoint_supervisor:202");
@@ -8579,6 +8843,8 @@ impl Services {
             "video_submissions":self.video_submissions,
             "returned_frames":self.returned_frames,
             "decoded_frames":self.decoded_frames,
+            "av1_errors":self.av1_errors,
+            "video_log":self.video_log,
             "decoder_image_pool_requests":self.decoder_image_pool_requests,
             "refused_video_submissions":self.refused_video_submissions,
             "empty_frame_requests":self.empty_frame_requests,
@@ -8947,7 +9213,7 @@ mod tests {
         );
         services.video_input_event = Some(ReadableEventId(1));
         for id in 0..VIDEO_INPUT_DEPTH as u64 {
-            services.video_input.push((id, id * 100, Vec::new()));
+            services.video_input.push((id, id * 100, None));
         }
         services.decode_video_frames();
         // No slot yet: nothing decodes and the full input clears the event.
@@ -8959,12 +9225,54 @@ mod tests {
             services
                 .decoded_video_frames
                 .iter()
-                .copied()
+                .map(|&(slot, timestamp, _)| (slot, timestamp))
                 .collect::<Vec<_>>(),
             [(7, 0), (9, 100)]
         );
         assert_eq!(services.video_input.len(), VIDEO_INPUT_DEPTH - 2);
         assert!(services.readable_events[&ReadableEventId(1)].signaled);
+    }
+
+    #[test]
+    fn decoder_fences_complete_with_their_slots_frame_or_on_stop() {
+        let mut services = Services::default();
+        let owner = MainApplicationIdentity {
+            process_id: 1,
+            program_id: 1,
+            npdm_sha256: String::new(),
+        };
+        services.readable_events.insert(
+            ReadableEventId(1),
+            ReadableEvent {
+                owner,
+                kind: ReadableEventKind::SyncpointEvent { index: 0 },
+                signaled: false,
+            },
+        );
+        services.syncpoint_events.insert(0, ReadableEventId(1));
+        let token = decoder_fence_token(1);
+        services.decoder_fences.insert(token, 0);
+        // A wait armed on slot 1's first frame is pending until the frame.
+        services.decoder_fence_waits.insert(0, (token, 1));
+        assert!(!services.decoder_fence_reached(token, 1));
+        services.decoder_slots.push_back(1);
+        services.video_input.push((1, 0, None));
+        services.decode_video_frames();
+        assert_eq!(services.decoder_fence_value(token), Some(1));
+        assert!(services.decoder_fence_waits.is_empty());
+        assert!(services.readable_events[&ReadableEventId(1)].signaled);
+        // The next frame is never decoded; stopping releases the fence.
+        services
+            .readable_events
+            .get_mut(&ReadableEventId(1))
+            .unwrap()
+            .signaled = false;
+        services.decoder_fence_waits.insert(0, (token, 2));
+        services.release_decoder_fences();
+        assert!(services.decoder_fence_reached(token, 2));
+        assert!(services.readable_events[&ReadableEventId(1)].signaled);
+        // Tokens that are not decoder fences always count as reached.
+        assert!(services.decoder_fence_reached(7, u64::MAX));
     }
 
     #[test]

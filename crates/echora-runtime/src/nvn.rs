@@ -280,6 +280,10 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// ECHORA_NVN_TEXTURE_LOG: each texture initialized (format, target,
+    /// size, stride and guest storage address), the first 512; a hex
+    /// `low-high` value keeps those with storage in that range.
+    texture_log: Vec<String>,
     /// Order of flow notes in the sequenced frame (see `sequence_note`).
     pub sequence: u64,
     /// The present ECHORA_GPU_SEQUENCE_AFTER chose to sequence.
@@ -1500,6 +1504,34 @@ impl Nvn {
                 // A texture structure reused for other storage: what the GPU
                 // kept under its address describes the old texture.
                 let storage = self.texture_storage(this);
+                // ECHORA_NVN_TEXTURE_LOG=<low>-<high> (hex) logs only textures
+                // whose storage starts in that range.
+                let logged = std::env::var("ECHORA_NVN_TEXTURE_LOG").ok().is_some_and(|range| {
+                    let bounds = range.split_once('-').and_then(|(low, high)| {
+                        let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+                        Some((parse(low)?, parse(high)?))
+                    });
+                    match (bounds, storage) {
+                        (Some((low, high)), Some(storage)) => (low..high).contains(&storage),
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    }
+                });
+                if self.texture_log.len() < 512 && logged {
+                    let get = |key: &str| self.objects[&this].builder.get(key).map_or(0, |v| v.x[0]);
+                    self.texture_log.push(format!(
+                        "format {} target {} {}x{}x{} levels {} stride {:#x} storage {:#x} after {} frames",
+                        get("Format"),
+                        get("Target"),
+                        get("Width"),
+                        get("Height"),
+                        get("Depth"),
+                        get("Levels"),
+                        get("Stride"),
+                        storage.unwrap_or(0),
+                        self.presented_frames,
+                    ));
+                }
                 if let Some(previous) = previous.filter(|previous| Some(*previous) != storage) {
                     self.gpu_move_texture(this, previous, storage);
                 }
@@ -3040,6 +3072,7 @@ impl Nvn {
             "calls": self.calls,
             "call_microseconds": self.call_microseconds,
             "presented_frames": self.presented_frames,
+            "texture_log": self.texture_log,
             "stale_command_submissions": self.stale_command_submissions,
             "skipped_work": self.skipped_work,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
