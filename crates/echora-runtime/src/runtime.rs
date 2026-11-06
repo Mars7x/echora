@@ -873,6 +873,62 @@ impl Machine {
         Ok(0)
     }
 
+    /// SetGpuMemoryAttribute: only the GpuSharable bit (0x20) may be set or
+    /// cleared, on page-aligned normal or code/data memory, with the
+    /// SetMemoryAttribute result codes. Switchbrew documents only the
+    /// signature; CreateGpuMemory requires its range to carry 0x20. The
+    /// ranges are recorded here; QueryMemory does not report the bit yet.
+    fn set_gpu_memory_attribute(
+        &mut self,
+        address: u64,
+        size: u64,
+        mask: u32,
+        attr: u32,
+    ) -> Result<u32, Trap> {
+        const GPU_SHARABLE: u32 = 0x20;
+        if !address.is_multiple_of(PAGE_SIZE) {
+            return Ok(0xcc01);
+        }
+        if size == 0 || !size.is_multiple_of(PAGE_SIZE) {
+            return Ok(0xca01);
+        }
+        if mask != GPU_SHARABLE || attr & !mask != 0 {
+            return Ok(0xe801);
+        }
+        let Some(end) = address.checked_add(size) else {
+            return Ok(0xcc01);
+        };
+        let mut cursor = address;
+        while cursor < end {
+            let mapping = self.memory.query(cursor);
+            if !matches!(mapping.state, STATE_CODE_DATA | STATE_NORMAL) {
+                return Ok(0xd401);
+            }
+            cursor = mapping.base.saturating_add(mapping.size).min(end);
+        }
+        // Remove the range from every recorded run, then add it back if set.
+        let overlapping: Vec<(u64, u64)> = self
+            .services
+            .gpu_sharable
+            .range(..end)
+            .filter(|&(_, &run_end)| run_end > address)
+            .map(|(&start, &run_end)| (start, run_end))
+            .collect();
+        for (start, run_end) in overlapping {
+            self.services.gpu_sharable.remove(&start);
+            if start < address {
+                self.services.gpu_sharable.insert(start, address);
+            }
+            if run_end > end {
+                self.services.gpu_sharable.insert(end, run_end);
+            }
+        }
+        if attr == GPU_SHARABLE {
+            self.services.gpu_sharable.insert(address, end);
+        }
+        Ok(0)
+    }
+
     fn thread_priorities(&self) -> Result<BTreeMap<u64, ThreadPriority>, Trap> {
         let mut priorities = BTreeMap::new();
         if self.main_thread_alive() {
@@ -2768,6 +2824,17 @@ impl Machine {
                 self.core.cpu.regs[0] = 0;
                 Ok(())
             }
+            0x80 => {
+                // SetGpuMemoryAttribute (Switchbrew SVC, [S2]): X0 address,
+                // X1 size, W2 mask, W3 attr; W0 result.
+                self.core.cpu.regs[0] = u64::from(self.set_gpu_memory_attribute(
+                    args[0],
+                    args[1],
+                    args[2] as u32,
+                    args[3] as u32,
+                )?);
+                Ok(())
+            }
             0x04 => {
                 // Raw A64 ABI: X0=destination, X1=source, X2=size. X3 is not an
                 // argument. Only W0 is returned, zero-extended into X0.
@@ -4454,6 +4521,27 @@ mod tests {
         m.core.cpu.regs[..2].copy_from_slice(&[handle, priority]);
         m.svc(0x0d).unwrap();
         m.core.cpu.regs[0]
+    }
+
+    #[test]
+    fn gpu_memory_attribute_marks_and_clears_sharable_pages() {
+        let mut m = mutex_test_machine();
+        let svc = |m: &mut Machine, address: u64, size: u64, mask: u64, attr: u64| {
+            m.core.cpu.regs[..4].copy_from_slice(&[address, size, mask, attr]);
+            m.svc(0x80).unwrap();
+            m.core.cpu.regs[0]
+        };
+        assert_eq!(svc(&mut m, 0xa001, PAGE_SIZE, 0x20, 0x20), 0xcc01);
+        assert_eq!(svc(&mut m, 0xa000, 0, 0x20, 0x20), 0xca01);
+        assert_eq!(svc(&mut m, 0xa000, PAGE_SIZE, 0x8, 0x8), 0xe801);
+        assert_eq!(svc(&mut m, 0xa000, PAGE_SIZE, 0x20, 0x21), 0xe801);
+        assert_eq!(svc(&mut m, 0x7000_0000, PAGE_SIZE, 0x20, 0x20), 0xd401);
+        assert!(!m.services.is_gpu_sharable(0xa000, PAGE_SIZE));
+        assert_eq!(svc(&mut m, 0xa000, PAGE_SIZE, 0x20, 0x20), 0);
+        assert!(m.services.is_gpu_sharable(0xa000, PAGE_SIZE));
+        assert!(!m.services.is_gpu_sharable(0xa000, 2 * PAGE_SIZE));
+        assert_eq!(svc(&mut m, 0xa000, PAGE_SIZE, 0x20, 0), 0);
+        assert!(!m.services.is_gpu_sharable(0xa000, PAGE_SIZE));
     }
 
     #[test]
