@@ -26,6 +26,7 @@ these separately; preserve their notices when redistributing builds.
 | `libc` | 0.2.189 | MIT OR Apache-2.0 |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `portable-atomic` | 1.15.0 | Apache-2.0 OR MIT |
+| `rav1d` | 1.1.0 | BSD-2-Clause |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | `lz4_flex` | 0.11.6 | MIT |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 |

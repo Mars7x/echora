@@ -11,6 +11,7 @@
 
 pub mod audio;
 pub mod audio_renderer;
+pub mod av1;
 pub mod bootstrap;
 mod bytes;
 pub mod content;

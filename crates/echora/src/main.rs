@@ -708,14 +708,16 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         &out.join("runner/src/main.rs"),
         &RUNNER_MAIN.replace("    // EXPECTED\n", &expected),
     )?;
-    // Generated code is compiled at a moderate level; the guest crate and
-    // the runtime it calls into get full optimization.
+    // Generated code is compiled at a moderate level; the guest crate, the
+    // runtime it calls into and the runtime's AV1 decoder (several times
+    // slower at level 1) get full optimization.
     // `rpath` lets the runner find the bundles and the shared guest crate.
     write_if_changed(
         &out.join("Cargo.toml"),
         "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
          [profile.release]\nopt-level = 1\nrpath = true\n\n[profile.release.package.echora-guest]\nopt-level = 3\n\n\
-         [profile.release.package.echora-runtime]\nopt-level = 3\n",
+         [profile.release.package.echora-runtime]\nopt-level = 3\n\n\
+         [profile.release.package.rav1d]\nopt-level = 3\n",
     )?;
     // Linking the bundles as shared libraries needs the standard library
     // linked dynamically too; on Unix the runner records where it lives.
