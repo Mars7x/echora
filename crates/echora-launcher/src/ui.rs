@@ -7,15 +7,16 @@
 //! - One type scale (44/26/15/14/13/12) in Inter, bundled so every
 //!   platform shows the same type with real weights; sentence case for
 //!   every label.
-//! - Semantic dark colours (label, secondary label, separator, fills) with
-//!   text contrast of at least 4.5:1, and white as the single accent.
+//! - Semantic dark colours from the author's GTK theme (label, secondary
+//!   label, separator, fills, selection) with text contrast of at least
+//!   4.5:1, and the light foreground as the single accent.
 //! - Controls at least 32 px tall (40 px in the dock), each with hover,
 //!   pressed and keyboard-focus states. The focus ring shows only while the
 //!   keyboard is being used, as both guidelines ask.
 //! - Short motion (120-200 ms, easing out) for things that appear or
 //!   change, skipped when the desktop asks for reduced motion.
-//! - Switches for on/off settings, segmented controls for small sets of
-//!   choices, boxed lists for settings rows.
+//! - Switches for on/off settings, pop-up menus for choices, boxed lists
+//!   for settings rows.
 
 use std::time::Duration;
 
@@ -53,32 +54,38 @@ pub mod text {
     pub const CAPTION: f32 = 12.0;
 }
 
-/// Colours as `0xRRGGBBAA`: near-black grays, white labels and white as
-/// the accent.
+/// Colours as `0xRRGGBBAA`, from the author's GTK theme
+/// (github.com/Mars7x/mygtktheme), keeping its neutrals and selection
+/// colour; the accent is its light foreground rather than the teal.
 pub mod palette {
-    pub const BACKDROP: u32 = 0x121214ff;
-    /// Sheets and the sidebar.
-    pub const SURFACE: u32 = 0x1c1c1eff;
-    pub const SIDEBAR: u32 = 0x161618ff;
-    /// The bar and toasts float over the background.
-    pub const MATERIAL: u32 = 0x18181ae0;
-    /// Boxed lists on a surface.
-    pub const CARD: u32 = 0xffffff0d;
-    pub const SEPARATOR: u32 = 0xffffff14;
-    pub const BORDER: u32 = 0xffffff14;
-    pub const LABEL: u32 = 0xffffffff;
-    /// About 60% white: 6.5:1 on the surface.
-    pub const SECONDARY_LABEL: u32 = 0xebebf599;
-    pub const FILL: u32 = 0xffffff1a;
-    pub const FILL_HOVER: u32 = 0xffffff26;
-    pub const FILL_PRESSED: u32 = 0xffffff33;
-    pub const SELECTED: u32 = 0xffffff2e;
-    pub const ACCENT: u32 = 0xffffffff;
-    pub const ACCENT_HOVER: u32 = 0xe5e5eaff;
-    pub const ACCENT_PRESSED: u32 = 0xd1d1d6ff;
-    pub const ON_ACCENT: u32 = 0x0d0d0dff;
-    pub const FOCUS: u32 = 0xffffffa6;
-    pub const SCRIM: u32 = 0x00000080;
+    /// The window, headers and sheets' content.
+    pub const BACKDROP: u32 = 0x101010ff;
+    /// Sheets, as the theme's dialogs.
+    pub const SURFACE: u32 = 0x191919ff;
+    pub const SIDEBAR: u32 = 0x171717ff;
+    /// Floating bars and toasts.
+    pub const MATERIAL: u32 = 0x252525f0;
+    /// Boxed lists.
+    pub const CARD: u32 = 0x1c1c1cff;
+    pub const SEPARATOR: u32 = 0x262626ff;
+    pub const BORDER: u32 = 0x303030ff;
+    pub const LABEL: u32 = 0xf0f0f0ff;
+    /// 7:1 on the window background.
+    pub const SECONDARY_LABEL: u32 = 0x9a9a9aff;
+    pub const FILL: u32 = 0x242424ff;
+    pub const FILL_HOVER: u32 = 0x2b2b2bff;
+    pub const FILL_PRESSED: u32 = 0x303030ff;
+    /// The theme's selection colour.
+    pub const SELECTED: u32 = 0x2e3a46ff;
+    pub const ACCENT: u32 = 0xf0f0f0ff;
+    pub const ACCENT_HOVER: u32 = 0xddddddff;
+    pub const ACCENT_PRESSED: u32 = 0xc8c8c8ff;
+    pub const ON_ACCENT: u32 = 0x101010ff;
+    pub const FOCUS: u32 = 0xf0f0f0a6;
+    pub const SCRIM: u32 = 0x00000099;
+    /// Pop-up menus, as the theme's popovers.
+    pub const MENU: u32 = 0x191919ff;
+    pub const SWITCH_OFF: u32 = 0x3a3a3aff;
 }
 
 /// `0xRRGGBBAA`.
@@ -186,8 +193,10 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> Statef
         )
 }
 
-/// An on/off switch, 40 by 24 px; the knob slides when it changes.
-pub fn switch(id: &'static str, on: bool, motion: bool) -> Stateful<Div> {
+/// An on/off switch, 40 by 24 px: the same dark knob in both states, on a
+/// white track when on and a gray one when off. `animate` slides the knob,
+/// for the switch that was just flipped.
+pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
     // Knob travel: from 2 px in to 18 px in.
     let at = move |t: f32| px(2.0 + 16.0 * if on { t } else { 1.0 - t });
     let knob = div()
@@ -195,12 +204,8 @@ pub fn switch(id: &'static str, on: bool, motion: bool) -> Stateful<Div> {
         .top(px(2.0))
         .size(px(20.0))
         .rounded_full()
-        .bg(color(if on {
-            palette::ON_ACCENT
-        } else {
-            palette::LABEL
-        }));
-    let knob = if motion {
+        .bg(color(palette::BACKDROP));
+    let knob = if animate {
         knob.with_animation(
             ElementId::Name(format!("{id}-{on}").into()),
             Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
@@ -219,9 +224,9 @@ pub fn switch(id: &'static str, on: bool, motion: bool) -> Stateful<Div> {
         .rounded_full()
         .cursor_pointer()
         .bg(color(if on {
-            palette::ACCENT
+            palette::LABEL
         } else {
-            palette::FILL_PRESSED
+            palette::SWITCH_OFF
         }))
         .child(knob)
 }
@@ -258,43 +263,77 @@ pub fn motion_enabled() -> bool {
     true
 }
 
-/// A segmented control's track; `items` come from [`segment`].
-pub fn segmented(items: impl IntoIterator<Item = Stateful<Div>>) -> Div {
+/// A pop-up button: the current choice and a chevron; it opens a [`menu`].
+pub fn popup_button(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
     div()
-        .flex()
-        .w_full()
+        .id(id)
+        .flex_none()
         .h(px(32.0))
-        .p(px(2.0))
-        .gap(px(2.0))
+        .pl(px(space::M))
+        .pr(px(space::S))
+        .flex()
+        .items_center()
+        .gap(px(space::XS + 2.0))
         .rounded(px(radius::CONTROL))
         .bg(color(palette::FILL))
+        .hover(|style| style.bg(color(palette::FILL_HOVER)))
+        .active(|style| style.bg(color(palette::FILL_PRESSED)))
+        .cursor_pointer()
+        .text_size(px(text::BODY))
+        .text_color(color(palette::LABEL))
+        .child(label)
+        .child(
+            gpui::svg()
+                .path("icons/chevron-down.svg")
+                .size(px(16.0))
+                .text_color(color(palette::SECONDARY_LABEL)),
+        )
+}
+
+/// A pop-up menu's panel; `items` come from [`menu_item`].
+pub fn menu(items: impl IntoIterator<Item = Stateful<Div>>) -> Div {
+    div()
+        .w(px(200.0))
+        .p(px(space::XS))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .rounded(px(radius::CARD))
+        .border_1()
+        .border_color(color(palette::BORDER))
+        .bg(color(palette::MENU))
+        .shadow(vec![BoxShadow {
+            color: Hsla::black().opacity(0.35),
+            blur_radius: px(16.0),
+            spread_radius: px(0.0),
+            offset: gpui::point(px(0.0), px(6.0)),
+        }])
         .children(items)
 }
 
-/// One choice in a segmented control; the choices share the width equally.
-pub fn segment(
-    id: impl Into<gpui::ElementId>,
-    label: &'static str,
-    selected: bool,
-) -> Stateful<Div> {
+/// One choice in a pop-up menu, with a check mark when it is selected.
+pub fn menu_item(id: impl Into<ElementId>, label: &'static str, selected: bool) -> Stateful<Div> {
     div()
         .id(id)
-        .flex_1()
+        .h(px(32.0))
+        .px(px(space::S))
         .flex()
         .items_center()
-        .justify_center()
+        .gap(px(space::S))
         .rounded(px(radius::INNER))
         .cursor_pointer()
-        .text_size(px(text::CALLOUT))
-        .when(selected, |el| {
-            el.bg(color(palette::SELECTED))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(color(palette::LABEL))
-        })
-        .when(!selected, |el| {
-            el.text_color(color(palette::SECONDARY_LABEL))
-                .hover(|style| style.text_color(color(palette::LABEL)))
-        })
+        .hover(|style| style.bg(color(palette::FILL)))
+        .active(|style| style.bg(color(palette::FILL_HOVER)))
+        .text_size(px(text::BODY))
+        .text_color(color(palette::LABEL))
+        .child(div().size(px(16.0)).when(selected, |el| {
+            el.child(
+                gpui::svg()
+                    .path("icons/check.svg")
+                    .size(px(16.0))
+                    .text_color(color(palette::LABEL)),
+            )
+        }))
         .child(label)
 }
 
@@ -372,45 +411,6 @@ pub fn row(leading: Option<AnyElement>, titles: Div, trailing: Option<AnyElement
         .children(leading)
         .child(titles)
         .children(trailing)
-}
-
-/// A list row whose control is too wide to sit beside its title, so it
-/// goes underneath at full width.
-pub fn stacked_row(title: &'static str, control: impl IntoElement) -> Div {
-    div()
-        .px(px(space::L))
-        .py(px(space::M))
-        .flex()
-        .flex_col()
-        .gap(px(space::S + 2.0))
-        .child(
-            div()
-                .text_size(px(text::BODY))
-                .text_color(color(palette::LABEL))
-                .child(title),
-        )
-        .child(control)
-}
-
-/// A sheet's header: the title at the start and the close button at the
-/// end.
-pub fn sheet_header(title: impl Into<SharedString>, close: Stateful<Div>) -> Div {
-    div()
-        .flex_none()
-        .h(px(48.0))
-        .pl(px(space::XL))
-        .pr(px(space::M))
-        .flex()
-        .items_center()
-        .justify_between()
-        .child(
-            div()
-                .text_size(px(text::HEADLINE))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(color(palette::LABEL))
-                .child(title.into()),
-        )
-        .child(close)
 }
 
 /// A thin progress bar; `fraction` runs from 0 to 1.

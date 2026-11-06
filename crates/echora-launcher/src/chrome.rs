@@ -117,7 +117,15 @@ pub fn resize_edge(
 /// The launcher's built-in icons, drawn as 16-pixel symbolic glyphs.
 pub struct Icons;
 
-const ICONS: [(&str, &str); 4] = [
+const ICONS: [(&str, &str); 6] = [
+    (
+        "icons/check.svg",
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M3.5 8.5l3 3 6-7" stroke="#000" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>"##,
+    ),
+    (
+        "icons/chevron-down.svg",
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4.5 6.5l3.5 3.5 3.5-3.5" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>"##,
+    ),
     (
         "icons/close.svg",
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="#000" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>"##,

@@ -14,8 +14,8 @@ use gpui::{
     CursorStyle, Decorations, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
     ImageFormat, KeyBinding, MouseButton, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
     ResizeEdge, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, actions, canvas, div, ease_out_quint, img, point, prelude::*,
-    px, size,
+    WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, ease_out_quint,
+    img, point, prelude::*, px, size,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
@@ -102,6 +102,14 @@ struct Launcher {
     settings: Settings,
     settings_path: Option<PathBuf>,
     sheet: Option<Sheet>,
+    /// Holds focus while a sheet is open, so Escape always reaches it.
+    sheet_focus: FocusHandle,
+    /// A sheet fading out after being closed.
+    closing: Option<Sheet>,
+    /// The settings pop-up menu that is open, by id.
+    open_menu: Option<&'static str>,
+    /// The switch just flipped; only it animates.
+    toggled: Option<&'static str>,
     /// Window buttons the desktop asks for, when decorations are ours.
     buttons: ButtonLayout,
     /// Corner radius of the window this frame (zero when maximized or tiled).
@@ -250,6 +258,10 @@ impl Launcher {
             settings,
             settings_path,
             sheet: None,
+            sheet_focus: cx.focus_handle(),
+            closing: None,
+            open_menu: None,
+            toggled: None,
             buttons,
             corner: px(0.0),
             moving: false,
@@ -422,18 +434,50 @@ impl Launcher {
         .detach();
     }
 
-    fn toggle_settings(&mut self, _: &ToggleSettings, _: &mut Window, cx: &mut Context<Self>) {
-        self.sheet = match self.sheet {
-            Some(Sheet::Settings) => None,
-            _ => Some(Sheet::Settings),
-        };
+    fn toggle_settings(&mut self, _: &ToggleSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet == Some(Sheet::Settings) {
+            self.close_sheet(&CloseSheet, window, cx);
+        } else {
+            self.open_sheet(Sheet::Settings, window, cx);
+        }
+    }
+
+    fn open_sheet(&mut self, sheet: Sheet, window: &mut Window, cx: &mut Context<Self>) {
+        self.sheet = Some(sheet);
+        self.closing = None;
+        self.open_menu = None;
+        self.toggled = None;
+        window.focus(&self.sheet_focus);
         cx.notify();
     }
 
+    /// Escape and the close buttons: closes an open menu first, then the
+    /// sheet, which fades out.
     fn close_sheet(&mut self, _: &CloseSheet, window: &mut Window, cx: &mut Context<Self>) {
-        self.sheet = None;
+        if self.open_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let Some(sheet) = self.sheet.take() else {
+            return;
+        };
+        if self.motion {
+            self.closing = Some(sheet);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SHEET_OUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.closing == Some(sheet) {
+                        this.closing = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         if self.game.is_some() {
             window.focus(&self.play_focus);
+        } else {
+            window.focus(&self.focus);
         }
         cx.notify();
     }
@@ -551,15 +595,21 @@ const WINDOW_INSET: f32 = 16.0;
 /// Margin between a sheet and the window's edges.
 const SHEET_MARGIN: f32 = 24.0;
 
+/// How long a closing sheet takes to fade out.
+const SHEET_OUT: Duration = Duration::from_millis(140);
+
 /// Dims the launcher behind a sheet; clicking outside the sheet closes it.
+/// A closing sheet fades out instead of in and takes no input.
 fn scrim(
     sheet: gpui::Stateful<gpui::Div>,
     corner: Pixels,
     motion: bool,
+    closing: bool,
     cx: &mut Context<Launcher>,
 ) -> AnyElement {
+    let sheet = sheet.on_click(|_, _, cx| cx.stop_propagation());
     let backdrop = div()
-        .id("scrim")
+        .id(if closing { "scrim-closing" } else { "scrim" })
         .absolute()
         .inset_0()
         .rounded(corner)
@@ -567,16 +617,28 @@ fn scrim(
         .items_center()
         .justify_center()
         .bg(color(palette::SCRIM))
-        .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
+        .when(!closing, |el| {
+            el.on_click(
+                cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)),
+            )
+        })
         // Clicks inside the sheet must not reach the scrim behind it.
-        .child(ui::appear(
-            sheet.on_click(|_, _, cx| cx.stop_propagation()),
-            "sheet-in",
-            space::S,
-            motion,
-        ));
+        .child(if closing {
+            sheet.into_any_element()
+        } else {
+            ui::appear(sheet, "sheet-in", space::S, motion)
+        });
     if !motion {
         return backdrop.into_any_element();
+    }
+    if closing {
+        return backdrop
+            .with_animation(
+                "scrim-out",
+                Animation::new(SHEET_OUT).with_easing(ease_out_quint()),
+                |el, t| el.opacity(1.0 - t),
+            )
+            .into_any_element();
     }
     backdrop
         .with_animation(
@@ -587,15 +649,14 @@ fn scrim(
         .into_any_element()
 }
 
-/// A sheet's surface at a fixed size, so wrapped text is measured at its
-/// real width.
+/// A sheet's surface: the window's own background, at a fixed size so
+/// wrapped text is measured at its real width.
 fn sheet(id: &'static str, width: Pixels, height: Option<Pixels>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w(width)
         .when_some(height, |el, height| el.h(height))
         .flex()
-        .overflow_hidden()
         .rounded(px(radius::SHEET))
         .border_1()
         .border_color(color(palette::BORDER))
@@ -610,10 +671,10 @@ impl Launcher {
         (viewport.width - frame, viewport.height - frame)
     }
 
-    fn close_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn close_button(&self, live: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         ui::focusable(
             ui::icon_button("close-sheet", WindowButton::Close.icon(false)),
-            true,
+            live,
             self.keyboard,
         )
         .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
@@ -730,10 +791,7 @@ impl Launcher {
             active,
             self.keyboard,
         )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.sheet = Some(Sheet::About);
-            cx.notify();
-        }));
+        .on_click(cx.listener(|this, _, window, cx| this.open_sheet(Sheet::About, window, cx)));
         [settings, about]
     }
 
@@ -825,30 +883,60 @@ impl Launcher {
             .into_any_element()
     }
 
-    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Lets `el` drag the window, like the title bar.
+    fn drag_window(&self, el: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        el.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _| this.moving = true),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _| this.moving = false),
+        )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
+            if this.moving && event.dragging() {
+                this.moving = false;
+                window.start_window_move();
+            }
+        }))
+    }
+
+    /// The settings sheet. A `closing` sheet is drawn for its fade-out only.
+    fn render_settings(
+        &self,
+        window: &Window,
+        closing: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (room_w, room_h) = self.sheet_room(window);
         let width = room_w.min(px(760.0));
-        let height = room_h.min(px(480.0));
+        let height = room_h.min(px(460.0));
         let keyboard = self.keyboard;
+        let title = self.drag_window(
+            div()
+                .flex_none()
+                .h(px(48.0))
+                .px(px(space::L + space::XS))
+                .flex()
+                .items_center()
+                .text_size(px(text::HEADLINE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color(palette::LABEL))
+                .child("Settings"),
+            cx,
+        );
+        // The sidebar's own colour, rounded on the sheet's left corners:
+        // children are not clipped to the sheet's rounding.
         let tabs = div()
             .flex_none()
             .w(px(180.0))
             .flex()
             .flex_col()
+            .rounded_l(px(radius::SHEET))
             .bg(color(palette::SIDEBAR))
             .border_r_1()
-            .border_color(color(palette::SEPARATOR))
-            .child(
-                div()
-                    .h(px(48.0))
-                    .px(px(space::L + space::XS))
-                    .flex()
-                    .items_center()
-                    .text_size(px(text::HEADLINE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(color(palette::LABEL))
-                    .child("Settings"),
-            )
+            .border_color(color(palette::BORDER))
+            .child(title)
             .child(
                 div()
                     .px(px(space::S))
@@ -874,32 +962,55 @@ impl Launcher {
                                 })
                                 .when(!selected, |el| {
                                     el.text_color(color(palette::SECONDARY_LABEL))
-                                        .hover(|style| style.bg(color(palette::FILL)))
+                                        .hover(|style| {
+                                            style
+                                                .bg(color(palette::FILL))
+                                                .text_color(color(palette::LABEL))
+                                        })
                                 })
                                 .child(tab.label()),
-                            true,
+                            !closing,
                             keyboard,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.settings_tab = tab;
+                            this.open_menu = None;
+                            this.toggled = None;
                             cx.notify();
                         }))
                     })),
             );
+        let header = self
+            .drag_window(
+                div()
+                    .flex_none()
+                    .h(px(48.0))
+                    .pl(px(space::XL))
+                    .pr(px(space::M))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(text::HEADLINE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(palette::LABEL))
+                            .child(self.settings_tab.label()),
+                    ),
+                cx,
+            )
+            .child(self.close_button(!closing, cx));
         let page = div()
             .flex()
             .flex_col()
             .gap(px(space::XL))
-            .children(self.settings_page(cx));
+            .children(self.settings_page(window, !closing, cx));
         let content = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(ui::sheet_header(
-                self.settings_tab.label(),
-                self.close_button(cx),
-            ))
+            .child(header)
             .child(
                 div()
                     .id("settings-page")
@@ -918,46 +1029,67 @@ impl Launcher {
                     )),
             );
         let sheet = sheet("settings", width, Some(height))
+            .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(tabs)
             .child(content);
-        scrim(sheet, self.corner, self.motion, cx)
+        scrim(sheet, self.corner, self.motion, closing, cx)
     }
 
-    fn settings_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn settings_page(
+        &self,
+        window: &Window,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let settings = &self.settings;
         let keyboard = self.keyboard;
+        let motion = self.motion;
+        let toggled = self.toggled;
+        let switch =
+            |id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<Self>| {
+                ui::focusable(
+                    ui::switch(id, on, motion && toggled == Some(id)),
+                    live,
+                    keyboard,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggled = Some(id);
+                    this.change(cx, flip);
+                }))
+                .into_any_element()
+            };
         match self.settings_tab {
-            SettingsTab::Game => self.game_page(cx),
+            SettingsTab::Game => self.game_page(live, cx),
             SettingsTab::Display => vec![
                 ui::group(
-                    Some("Window"),
+                    None,
                     vec![
-                        ui::stacked_row(
-                            "Mode",
-                            self.choices(
+                        ui::row(
+                            None,
+                            ui::titles("Window mode", None),
+                            Some(self.popup(
                                 "mode",
                                 &WINDOW_MODES,
                                 settings.display.window_mode,
+                                window,
+                                live,
                                 cx,
                                 |s, v| s.display.window_mode = v,
-                            ),
+                            )),
                         )
                         .into_any_element(),
-                    ],
-                )
-                .into_any_element(),
-                ui::group(
-                    Some("Rendering"),
-                    vec![
-                        ui::stacked_row(
-                            "Internal resolution",
-                            self.choices(
+                        ui::row(
+                            None,
+                            ui::titles("Internal resolution", None),
+                            Some(self.popup(
                                 "resolution",
                                 &RESOLUTIONS,
                                 settings.display.internal_resolution,
+                                window,
+                                live,
                                 cx,
                                 |s, v| s.display.internal_resolution = v,
-                            ),
+                            )),
                         )
                         .into_any_element(),
                     ],
@@ -971,17 +1103,12 @@ impl Launcher {
                         ui::row(
                             None,
                             ui::titles("Vibration", None),
-                            Some(
-                                ui::focusable(
-                                    ui::switch("vibration", settings.input.vibration, self.motion),
-                                    true,
-                                    keyboard,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.change(cx, |s| s.input.vibration = !s.input.vibration)
-                                }))
-                                .into_any_element(),
-                            ),
+                            Some(switch(
+                                "vibration",
+                                settings.input.vibration,
+                                |s| s.input.vibration = !s.input.vibration,
+                                cx,
+                            )),
                         )
                         .into_any_element(),
                     ],
@@ -1002,17 +1129,12 @@ impl Launcher {
                                         .into(),
                                 ),
                             ),
-                            Some(
-                                ui::focusable(
-                                    ui::switch("skip", settings.launcher.skip, self.motion),
-                                    true,
-                                    keyboard,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.change(cx, |s| s.launcher.skip = !s.launcher.skip)
-                                }))
-                                .into_any_element(),
-                            ),
+                            Some(switch(
+                                "skip",
+                                settings.launcher.skip,
+                                |s| s.launcher.skip = !s.launcher.skip,
+                                cx,
+                            )),
                         )
                         .into_any_element(),
                     ],
@@ -1022,35 +1144,94 @@ impl Launcher {
         }
     }
 
-    /// A segmented control over `choices`, saving the picked value.
-    fn choices<T: Copy + PartialEq + 'static>(
+    /// A pop-up button over `choices` that opens a menu of them; picking
+    /// one saves it.
+    #[allow(clippy::too_many_arguments)]
+    fn popup<T: Copy + PartialEq + 'static>(
         &self,
         id: &'static str,
-        choices: &[(&'static str, T)],
+        choices: &'static [(&'static str, T)],
         current: T,
+        window: &Window,
+        live: bool,
         cx: &mut Context<Self>,
         apply: fn(&mut Settings, T),
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let keyboard = self.keyboard;
-        ui::segmented(choices.iter().enumerate().map(|(index, &(label, value))| {
+        let open = live && self.open_menu == Some(id);
+        let label = choices
+            .iter()
+            .find(|(_, value)| *value == current)
+            .map_or(choices[0].0, |(label, _)| label);
+        let button = ui::focusable(ui::popup_button((id, 0usize), label), live, keyboard).on_click(
+            cx.listener(move |this, _, _, cx| {
+                this.open_menu = if this.open_menu == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+                cx.notify();
+            }),
+        );
+        if !open {
+            return div().flex_none().child(button).into_any_element();
+        }
+        let menu = ui::menu(choices.iter().enumerate().map(|(index, &(label, value))| {
             ui::focusable(
-                ui::segment((id, index), label, value == current),
+                ui::menu_item((id, index + 1), label, value == current),
                 true,
                 keyboard,
             )
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_menu = None;
                 this.change(cx, |settings| apply(settings, value));
             }))
-        }))
+        }));
+        let viewport = window.viewport_size();
+        div()
+            .relative()
+            .flex_none()
+            .child(button)
+            // A click anywhere outside the menu closes it.
+            .child(
+                deferred(
+                    anchored().position(point(px(0.0), px(0.0))).child(
+                        div()
+                            .id((id, 100usize))
+                            .w(viewport.width)
+                            .h(viewport.height)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_menu = None;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+                )
+                .with_priority(1),
+            )
+            .child(
+                div().absolute().top(px(36.0)).right_0().child(
+                    deferred(
+                        anchored()
+                            .anchor(gpui::Corner::TopRight)
+                            .snap_to_window_with_margin(px(space::S))
+                            .child(ui::appear(menu, (id, 101usize), -4.0, self.motion)),
+                    )
+                    .with_priority(2),
+                ),
+            )
+            .into_any_element()
     }
 
     /// The installed game, and installing or reinstalling it.
-    fn game_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn game_page(&self, live: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let keyboard = self.keyboard;
         let choose = |label: &'static str, cx: &mut Context<Self>| {
             ui::focusable(
                 ui::button("install", label, Kind::Secondary, Size::Regular),
-                true,
+                live,
                 keyboard,
             )
             .on_click(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)))
@@ -1117,7 +1298,7 @@ impl Launcher {
                             Kind::Secondary,
                             Size::Regular,
                         ),
-                        true,
+                        live,
                         keyboard,
                     )
                     .on_click(
@@ -1144,57 +1325,77 @@ impl Launcher {
         ]
     }
 
-    fn render_about(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let (room_w, room_h) = self.sheet_room(window);
-        let width = room_w.min(px(480.0));
-        // Header and footer take about 115 px; the rest scrolls if needed.
-        let body = (room_h - px(115.0)).max(px(120.0));
+    /// About: name, version and description, the credits in two columns,
+    /// and the licence with a link to the source, all without scrolling.
+    fn render_about(&self, window: &Window, closing: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (room_w, _) = self.sheet_room(window);
+        let width = room_w.min(px(560.0));
         let source = ui::focusable(
             ui::button("source", "Source code", Kind::Secondary, Size::Regular),
-            true,
+            !closing,
             self.keyboard,
         )
         .on_click(cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")));
-        let credits = CREDITS
-            .iter()
-            .map(|&(name, role)| {
-                ui::row(
-                    None,
-                    ui::titles(name, None),
-                    Some(
-                        div()
-                            .flex_none()
-                            .text_size(px(text::CALLOUT))
-                            .text_color(color(palette::SECONDARY_LABEL))
-                            .child(role)
-                            .into_any_element(),
-                    ),
+        let credit = |&(name, role): &(&'static str, &'static str)| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(text::BODY))
+                        .text_color(color(palette::LABEL))
+                        .truncate()
+                        .child(name),
                 )
-                .min_h(px(38.0))
-                .py(px(space::S - 2.0))
-                .into_any_element()
-            })
-            .collect();
+                .child(
+                    div()
+                        .text_size(px(text::CAPTION))
+                        .text_color(color(palette::SECONDARY_LABEL))
+                        .child(role),
+                )
+        };
+        let credits = div()
+            .p(px(space::L))
+            .flex()
+            .flex_col()
+            .gap(px(space::M))
+            .rounded(px(radius::CARD))
+            .bg(color(palette::CARD))
+            .children(CREDITS.chunks(2).map(|pair| {
+                div()
+                    .flex()
+                    .gap(px(space::L))
+                    .children(pair.iter().map(credit))
+            }));
+        let top = self
+            .drag_window(
+                div()
+                    .h(px(44.0))
+                    .px(px(space::M))
+                    .flex()
+                    .items_center()
+                    .justify_end(),
+                cx,
+            )
+            .child(self.close_button(!closing, cx));
         let sheet = sheet("about", width, None)
             .flex_col()
-            .child(ui::sheet_header("", self.close_button(cx)))
+            .when(!closing, |el| el.track_focus(&self.sheet_focus))
+            .child(top)
             .child(
                 div()
-                    .id("about-body")
-                    .flex_none()
-                    .max_h(body)
-                    .overflow_y_scroll()
-                    .px(px(space::XL))
-                    .pb(px(space::L))
+                    .px(px(space::XL + space::XS))
                     .flex()
                     .flex_col()
-                    .gap(px(space::L))
+                    .gap(px(space::XS + 2.0))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
                             .items_center()
-                            .gap(px(space::S - 2.0))
+                            .gap(px(space::S + 2.0))
                             .child(
                                 div()
                                     .text_size(px(text::LARGE_TITLE))
@@ -1204,40 +1405,50 @@ impl Launcher {
                             )
                             .child(
                                 div()
-                                    .px(px(space::S + 2.0))
+                                    .px(px(space::S))
                                     .py(px(2.0))
                                     .rounded_full()
                                     .bg(color(palette::FILL))
                                     .text_size(px(text::CAPTION))
                                     .text_color(color(palette::LABEL))
                                     .child(env!("CARGO_PKG_VERSION")),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .pt(px(space::XS))
-                                    .text_center()
-                                    .text_size(px(text::BODY))
-                                    .text_color(color(palette::SECONDARY_LABEL))
-                                    .child(
-                                        "A native recompilation of The Legend of Zelda: \
-                                         Ocarina of Time for Nintendo Switch 2. You need your \
-                                         own copy of the game.",
-                                    ),
                             ),
                     )
-                    .child(ui::group(Some("Credits"), credits)),
+                    .child(
+                        div()
+                            .text_size(px(text::BODY))
+                            .text_color(color(palette::SECONDARY_LABEL))
+                            .child(
+                                "A native recompilation of The Legend of Zelda: Ocarina of \
+                                 Time for Nintendo Switch 2. You need your own copy of the game.",
+                            ),
+                    ),
             )
             .child(
                 div()
                     .px(px(space::XL))
+                    .pt(px(space::L + space::XS))
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::S))
+                    .child(
+                        div()
+                            .px(px(space::XS))
+                            .text_size(px(text::CALLOUT))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(palette::SECONDARY_LABEL))
+                            .child("Credits"),
+                    )
+                    .child(credits),
+            )
+            .child(
+                div()
+                    .px(px(space::XL + space::XS))
                     .py(px(space::L))
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(space::L))
-                    .border_t_1()
-                    .border_color(color(palette::SEPARATOR))
                     .child(
                         div()
                             .text_size(px(text::CAPTION))
@@ -1246,7 +1457,7 @@ impl Launcher {
                     )
                     .child(source),
             );
-        scrim(sheet, self.corner, self.motion, cx)
+        scrim(sheet, self.corner, self.motion, closing, cx)
     }
 }
 
@@ -1366,10 +1577,20 @@ impl Launcher {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
             // Any mouse press ends keyboard navigation, hiding focus rings.
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 if this.keyboard {
                     this.keyboard = false;
                     cx.notify();
+                }
+                // Keep focus inside the launcher, so its shortcuts (Escape
+                // above all) keep working after clicks on plain areas.
+                if !this.focus.contains_focused(window, cx) {
+                    let target = if this.sheet.is_some() {
+                        &this.sheet_focus
+                    } else {
+                        &this.focus
+                    };
+                    window.focus(target);
                 }
             }))
             .size_full()
@@ -1434,10 +1655,16 @@ impl Launcher {
                     )
                 }
             })
+            .when_some(self.closing, |el, sheet| {
+                el.child(match sheet {
+                    Sheet::Settings => self.render_settings(window, true, cx),
+                    Sheet::About => self.render_about(window, true, cx),
+                })
+            })
             .when_some(self.sheet, |el, sheet| {
                 el.child(match sheet {
-                    Sheet::Settings => self.render_settings(window, cx),
-                    Sheet::About => self.render_about(window, cx),
+                    Sheet::Settings => self.render_settings(window, false, cx),
+                    Sheet::About => self.render_about(window, false, cx),
                 })
             })
     }
