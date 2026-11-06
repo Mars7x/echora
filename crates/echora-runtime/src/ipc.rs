@@ -493,8 +493,12 @@ pub fn parse_request_with_domain(bytes: &[u8], is_domain: bool) -> Result<Reques
             bail!("unsupported IPC input buffer descriptors: require one X/A pair, one X or one A")
         }
     };
+    // TIPC requests may send a lone mapped (A) buffer (the Switch 2
+    // video decoder's Configure does); pointers stay CMIF-only here.
     ensure!(
-        !has_input_buffer || (protocol == Protocol::Cmif && kind == RequestKind::Request),
+        !has_input_buffer
+            || (kind == RequestKind::Request
+                && (protocol == Protocol::Cmif || (pointer_count, send_count) == (0, 1))),
         "unsupported IPC input buffer descriptors for this protocol or control frame"
     );
     // Receive-list mode: 0 none, 2 one entry, N > 2 N-2 entries (1 would
@@ -1607,6 +1611,23 @@ mod tests {
     }
 
     #[test]
+    fn tipc_requests_may_send_one_mapped_buffer() {
+        // Header, one A descriptor (size 0x40 at 0x1000), one raw word.
+        let mut bytes = vec![0u8; 24];
+        put_u32(&mut bytes, 0, (101 + 16) | 1 << 20);
+        put_u32(&mut bytes, 4, 1);
+        put_u32(&mut bytes, 8, 0x40);
+        put_u32(&mut bytes, 12, 0x1000);
+        put_u32(&mut bytes, 20, 7);
+        let request = parse_request(&bytes).unwrap();
+        assert_eq!(request.protocol, Protocol::Tipc);
+        assert_eq!(request.command_id, 101);
+        let input = request.input_buffer.unwrap();
+        assert_eq!((input.address, input.size), (0x1000, 0x40));
+        assert_eq!(request.arguments, 7u32.to_le_bytes());
+    }
+
+    #[test]
     fn unsupported_frames_and_descriptors_are_rejected_explicitly() {
         let ordinary = tipc(1, b"lm:\0\0\0\0\0", None);
         for tag in [0, 1, 2, 3, 15] {
@@ -1619,7 +1640,8 @@ mod tests {
                     .contains("unsupported IPC tag")
             );
         }
-        for descriptor_bit in [16, 20, 28] {
+        // X pointers and W exchanges (a lone A buffer is valid TIPC).
+        for descriptor_bit in [16, 28] {
             let mut bytes = ordinary.clone();
             put_u32(&mut bytes, 0, 17 | (1 << descriptor_bit));
             assert!(

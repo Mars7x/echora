@@ -416,6 +416,8 @@ enum ReadableEventKind {
     SyncpointEvent {
         index: u32,
     },
+    /// Video decoder GetInputEvent (3): signaled while input is accepted.
+    VideoDecoderInput,
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -654,6 +656,10 @@ enum ServiceObject {
     VideoDecoderCreator,
     /// VideoEncoderCreatorSession from graphics supervisor 1002 (TIPC).
     VideoEncoderCreator,
+    /// VideoDecoderSession / VideoEncoderSession from the creators'
+    /// command 1 (TIPC; Switchbrew names their commands only).
+    VideoDecoder,
+    VideoEncoder,
     /// DisplaySession from IGraphicsSupervisor InitializeDisplayContext (305).
     DisplaySession {
         state: crate::display::DisplaySessionState,
@@ -779,6 +785,8 @@ impl ServiceObject {
             Self::SyncpointSupervisor => "appletOE:syncpoint_supervisor",
             Self::VideoDecoderCreator => "appletOE:video_decoder_creator",
             Self::VideoEncoderCreator => "appletOE:video_encoder_creator",
+            Self::VideoDecoder => "appletOE:video_decoder",
+            Self::VideoEncoder => "appletOE:video_encoder",
             Self::GpuSession => "appletOE:gpu_session",
             Self::DisplaySession { .. } => "appletOE:display_session",
             Self::GpuWorker => "appletOE:gpu_worker",
@@ -1049,6 +1057,22 @@ pub struct Services {
     idle_time_detection_extension: u32,
     /// Syncpoint supervisor command 22 events by index.
     syncpoint_events: BTreeMap<u32, ReadableEventId>,
+    /// Initialized video decoders: transfer memory size and parameters.
+    video_decoders: Vec<(u64, Vec<u32>)>,
+    /// Graphics supervisor native memories (111) by handle: kind, size.
+    native_memories: BTreeMap<u32, (u8, u64)>,
+    /// Application addresses bound to native memories (114).
+    native_memory_addresses: BTreeMap<u32, u64>,
+    /// Decoder image pools (911) and their native memory handle.
+    decoder_image_pools: BTreeMap<u32, u32>,
+    /// Decoder frames bound with BindFrame (311) and their image pool.
+    decoder_frames: BTreeMap<u32, u32>,
+    /// Whether the video decoder was started (6) and not stopped (207).
+    video_decoder_running: bool,
+    /// Video decoder submissions so far and the queued input (id,
+    /// timestamp argument, bitstream).
+    video_submissions: u64,
+    video_input: Vec<(u64, u64, Vec<u8>)>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1150,6 +1174,14 @@ impl Default for Services {
             hid_supported_style_set: 0,
             idle_time_detection_extension: 0,
             syncpoint_events: BTreeMap::new(),
+            video_decoders: Vec::new(),
+            native_memories: BTreeMap::new(),
+            native_memory_addresses: BTreeMap::new(),
+            decoder_image_pools: BTreeMap::new(),
+            decoder_frames: BTreeMap::new(),
+            video_decoder_running: false,
+            video_submissions: 0,
+            video_input: Vec::new(),
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -2191,19 +2223,203 @@ impl Services {
                 self.graphics_supervisor(&application, call)
             }
             ServiceObject::SyncpointSupervisor => self.syncpoint_supervisor(call),
-            ServiceObject::VideoDecoderCreator => Err(call.unsupported(
-                "appletOE:video_decoder_creator",
-                format!(
-                    "video decoder creator command ({})",
-                    call.request.describe()
-                ),
-            )),
-            ServiceObject::VideoEncoderCreator => Err(call.unsupported(
-                "appletOE:video_encoder_creator",
-                format!(
-                    "video encoder creator command ({})",
-                    call.request.describe()
-                ),
+            // CreateVideoDecoderSession / CreateVideoEncoderSession (1): no
+            // input, moves the session (Switchbrew "Switch 2: GSV services").
+            ServiceObject::VideoDecoderCreator | ServiceObject::VideoEncoderCreator
+                if call.request.command_id == 1 =>
+            {
+                call.shape(0, false, false)?;
+                let decoder = matches!(object, ServiceObject::VideoDecoderCreator);
+                let handle = self.next_available_handle()?;
+                call.reply(0, Some(handle), 0, &[])?;
+                let session = if decoder {
+                    ServiceObject::VideoDecoder
+                } else {
+                    ServiceObject::VideoEncoder
+                };
+                self.sessions.insert(handle, Session::regular(session));
+                self.next_handle = handle + 1;
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 201 (TIPC 217; Switchbrew's
+            // InitializeVideoDecoderWithTransferMemory, listed as 200):
+            // u64 transfer memory size, four u32s (OoT's AV1 decoder sends
+            // 3, 3, 3, 1) and the copied transfer memory; no reply data
+            // (client sdk+0x330d6c). The parameters are recorded. No host
+            // video decoder exists yet. Provisional.
+            ServiceObject::VideoDecoder if call.request.command_id == 201 => {
+                call.shape_with_copies(24, false, false, 1)?;
+                let arguments = &call.request.arguments;
+                let size = crate::bytes::le_u64(&arguments[..8]);
+                let parameters: Vec<u32> = (0..4)
+                    .map(|index| crate::bytes::le_u32(&arguments[8 + index * 4..12 + index * 4]))
+                    .collect();
+                call.reply(0, None, 0, &[])?;
+                self.video_decoders.push((size, parameters));
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:201");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 3 (GetInputEvent): no input; moves an
+            // event the SDK wraps as an auto-clear system event (client
+            // sdk+0x33109c). Signaled while the decoder accepts input; with
+            // no host decoder it never holds input, so it starts signaled.
+            ServiceObject::VideoDecoder if call.request.command_id == 3 => {
+                call.shape(0, false, false)?;
+                let application = self
+                    .main_application
+                    .clone()
+                    .ok_or_else(|| invalid("video decoding requires the main application"))?;
+                if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                    return Err(invalid("readable event backing capacity exhausted"));
+                }
+                let event = ReadableEventId(
+                    self.readable_events
+                        .keys()
+                        .map(|id| id.0)
+                        .max()
+                        .unwrap_or(0)
+                        + 1,
+                );
+                let handle = self.next_available_handle()?;
+                call.reply(0, Some(handle), 0, &[])?;
+                self.readable_events.insert(
+                    event,
+                    ReadableEvent {
+                        owner: application,
+                        kind: ReadableEventKind::VideoDecoderInput,
+                        signaled: true,
+                    },
+                );
+                self.readable_event_handles.insert(handle, event);
+                self.next_handle = handle + 1;
+                self.provisional_commands.insert("appletOE:video_decoder:3");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 311 (BindFrame; the SDK's
+            // RegisterAv1DecoderBuffer, client sdk+0x330854): u32 image pool,
+            // then 12 bytes OoT leaves zero -> 16 bytes the SDK keeps per
+            // frame slot. Answered with a frame id (from 1) and a zero word;
+            // the frame and its pool are recorded. Provisional.
+            ServiceObject::VideoDecoder if call.request.command_id == 311 => {
+                call.shape(16, false, false)?;
+                let pool = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if !self.decoder_image_pools.contains_key(&pool) {
+                    return Err(
+                        call.unsupported(object.service(), format!("frame in image pool {pool}"))
+                    );
+                }
+                let frame = self
+                    .decoder_frames
+                    .keys()
+                    .next_back()
+                    .map_or(1, |frame| frame + 1);
+                self.decoder_frames.insert(frame, pool);
+                let mut reply = u64::from(frame).to_le_bytes().to_vec();
+                reply.extend_from_slice(&0u64.to_le_bytes());
+                call.reply(0, None, 0, &reply)?;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:311");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 109 (Decode; the SDK's
+            // SubmitAv1DecoderInputBuffer, client sdk+0x330b00): u32 and u64
+            // arguments (the presentation time is among them) and the AV1
+            // bitstream (low-overhead OBUs) in a mapped buffer -> u64
+            // submission id (sdk+0x330b44). Submissions are queued with
+            // their arguments for a host decoder; none decodes them yet, so
+            // no frame is produced. Ids count from 1. Provisional.
+            ServiceObject::VideoDecoder if call.request.command_id == 109 => {
+                let Some(input) = call
+                    .request
+                    .input_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.address, buffer.size))
+                else {
+                    return Err(call.unsupported(object.service(), "Decode without input"));
+                };
+                if call.request.arguments.len() != 12 || input.1 > 0x100_0000 {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!("Decode shape ({})", call.request.describe()),
+                    ));
+                }
+                let mut bytes = vec![0u8; input.1 as usize];
+                call.memory.read(input.0, &mut bytes)?;
+                let timestamp = crate::bytes::le_u64(&call.request.arguments[4..12]);
+                self.video_submissions += 1;
+                let id = self.video_submissions;
+                // Keep a bounded backlog until a decoder consumes it.
+                if self.video_input.len() < 64 {
+                    self.video_input.push((id, timestamp, bytes));
+                }
+                call.reply(0, None, 0, &id.to_le_bytes())?;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:109");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession Start (6), Flush (8) and Stop (207)
+            // (Switchbrew names): no input observed for Start; no reply data
+            // (inferred). The decoder's running state is recorded.
+            ServiceObject::VideoDecoder if matches!(call.request.command_id, 6 | 8 | 207) => {
+                call.shape(0, false, false)?;
+                match call.request.command_id {
+                    6 => self.video_decoder_running = true,
+                    207 => self.video_decoder_running = false,
+                    _ => {}
+                }
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:start_stop");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 314 (DestroyFrame): u32 frame from 311 and
+            // 28 bytes OoT leaves zero; no reply data (inferred). The frame
+            // is forgotten.
+            ServiceObject::VideoDecoder if call.request.command_id == 314 => {
+                call.shape(32, false, false)?;
+                let frame = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if self.decoder_frames.remove(&frame).is_none() {
+                    return Err(
+                        call.unsupported(object.service(), format!("destroy of frame {frame}"))
+                    );
+                }
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:314");
+                Ok(Outcome::success())
+            }
+            // VideoDecoderSession 101 (Configure): u32 width, u32 height,
+            // u32 frame rate (OoT: 1920, 1080, 60), four more words and a
+            // mapped codec configuration buffer; no reply data (client
+            // sdk+0x330fe4). Recorded with the last initialized decoder.
+            ServiceObject::VideoDecoder if call.request.command_id == 101 => {
+                if call.request.arguments.len() != 32 || call.request.input_buffer.is_none() {
+                    return Err(call.unsupported(
+                        object.service(),
+                        format!("Configure shape ({})", call.request.describe()),
+                    ));
+                }
+                let words: Vec<u32> = call
+                    .request
+                    .arguments
+                    .chunks(4)
+                    .map(crate::bytes::le_u32)
+                    .collect();
+                call.reply(0, None, 0, &[])?;
+                if let Some((_, parameters)) = self.video_decoders.last_mut() {
+                    parameters.extend(&words[..3]);
+                }
+                self.provisional_commands
+                    .insert("appletOE:video_decoder:101");
+                Ok(Outcome::success())
+            }
+            ServiceObject::VideoDecoderCreator
+            | ServiceObject::VideoEncoderCreator
+            | ServiceObject::VideoDecoder
+            | ServiceObject::VideoEncoder => Err(call.unsupported(
+                object.service(),
+                format!("video command ({})", call.request.describe()),
             )),
             ServiceObject::GpuSession => self.gpu_session(call),
             ServiceObject::DisplaySession { .. } => self.display_session(call),
@@ -5817,6 +6033,89 @@ impl Services {
                 }
                 Ok(Outcome::success())
             }
+            // 111 (nn::gs::sdk native memory creation, client sdk+0x48f744):
+            // u8 kind and u64 size -> u32 NativeMemoryHandle (sdk+0x48f7cc).
+            // Handles count from 1; kind and size are recorded. The memory
+            // itself is the application's (CreateNativeMemory takes its
+            // pointer); nothing is reserved on the host. Provisional.
+            111 => {
+                call.shape(12, false, false)?;
+                let arguments = &call.request.arguments;
+                let kind = arguments[0];
+                let size = crate::bytes::le_u64(&arguments[4..12]);
+                let handle = self
+                    .native_memories
+                    .keys()
+                    .next_back()
+                    .map_or(1, |handle| handle + 1);
+                self.native_memories.insert(handle, (kind, size));
+                call.reply(0, None, 0, &handle.to_le_bytes())?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:111");
+                Ok(Outcome::success())
+            }
+            // 114 (CreateNativeMemory, client sdk+0x48ec88): u32 handle from
+            // 111, u64 address and u64 size of the application's memory, and
+            // 16 bytes OoT leaves zero; no reply data. The address is
+            // recorded with the handle; the size must match 111's.
+            114 => {
+                call.shape(36, false, false)?;
+                let arguments = &call.request.arguments;
+                let handle = crate::bytes::le_u32(&arguments[..4]);
+                let address = crate::bytes::le_u64(&arguments[4..12]);
+                let size = crate::bytes::le_u64(&arguments[12..20]);
+                if self
+                    .native_memories
+                    .get(&handle)
+                    .map(|&(_, expected)| expected)
+                    != Some(size)
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("native memory {handle} of {size:#x} bytes at {address:#x}"),
+                    ));
+                }
+                self.native_memory_addresses.insert(handle, address);
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:114");
+                Ok(Outcome::success())
+            }
+            // InitializeDecoderImagePool (911; Switchbrew name): the 0x40-byte
+            // VideoDecoderImagePreference, a u32 and the u32 native memory
+            // handle (from 111/114) -> u32 pool (client sdk+0x331fc0).
+            // Pools count from 1. FinalizeDecoderImagePool (912): u32 pool,
+            // no reply data (inferred from its name and 911's result).
+            911 => {
+                call.shape(0x48, false, false)?;
+                let memory = crate::bytes::le_u32(&call.request.arguments[0x44..0x48]);
+                if !self.native_memory_addresses.contains_key(&memory) {
+                    return Err(
+                        call.unsupported(SERVICE, format!("image pool on native memory {memory}"))
+                    );
+                }
+                let pool = self
+                    .decoder_image_pools
+                    .keys()
+                    .next_back()
+                    .map_or(1, |pool| pool + 1);
+                self.decoder_image_pools.insert(pool, memory);
+                call.reply(0, None, 0, &pool.to_le_bytes())?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:911");
+                Ok(Outcome::success())
+            }
+            912 => {
+                call.shape(4, false, false)?;
+                let pool = crate::bytes::le_u32(&call.request.arguments[..4]);
+                if self.decoder_image_pools.remove(&pool).is_none() {
+                    return Err(call.unsupported(SERVICE, format!("finalize of image pool {pool}")));
+                }
+                call.reply(0, None, 0, &[])?;
+                self.provisional_commands
+                    .insert("appletOE:graphics_supervisor:912");
+                Ok(Outcome::success())
+            }
             // 906 (undocumented; Switchbrew lists 901..905): u8 flag and the
             // u64 VideoDecoderLibraryVersion (the SDK's
             // InitializeServerContext, client at sdk+0x3379f0); moves a
@@ -6791,6 +7090,68 @@ impl Services {
                 self.syncpoint_event_count = Some(count);
                 Ok(Outcome::success())
             }
+            // Command 103 (the SDK's TryWaitSyncPoint, client sdk+0x5d3e0c):
+            // u32 inverted syncpoint handle -> u64 current value and u8
+            // "64-bit" flag; the SDK counts its threshold as reached unless
+            // the value is below it, or for some callers unless the 32-bit
+            // difference value - threshold is negative (sdk+0x5d3e9c,
+            // sdk+0x5d3ea8). Syncpoint values are not tracked and host GPU
+            // work completes at submission, so every threshold counts as
+            // reached: 0x7fffffff_7fffffff passes both comparisons for any
+            // threshold up to 0x7fffffff. Provisional.
+            103 => {
+                call.shape(4, false, false)?;
+                let mut reply = 0x7fff_ffff_7fff_ffffu64.to_le_bytes().to_vec();
+                reply.extend_from_slice(&1u32.to_le_bytes());
+                call.reply(0, None, 0, &reply)?;
+                self.provisional_commands
+                    .insert("appletOE:syncpoint_supervisor:103");
+                Ok(Outcome::success())
+            }
+            // Command 201 (the SDK's RequestSyncPointEvent, client
+            // sdk+0x5d4eb0): u32 event index (from 22), u32 syncpoint, u64
+            // value, u8 flag; no reply data. It arms the index's event for
+            // the syncpoint reaching the value. Host GPU work completes at
+            // submission, so the value counts as reached: the event is
+            // signaled at once. Provisional.
+            201 => {
+                call.shape(20, false, false)?;
+                let index = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let Some(&event) = self.syncpoint_events.get(&index) else {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("syncpoint event index {index} was not acquired"),
+                    ));
+                };
+                call.reply(0, None, 0, &[])?;
+                if let Some(event) = self.readable_events.get_mut(&event) {
+                    event.signaled = true;
+                }
+                self.provisional_commands
+                    .insert("appletOE:syncpoint_supervisor:201");
+                Ok(Outcome::success())
+            }
+            // Command 202: u32 event index; no reply data. The SDK sends it
+            // once a requested syncpoint wait succeeded (client
+            // sdk+0x5d5138), so it disarms 201's request: the event is
+            // unsignaled. Provisional.
+            202 => {
+                call.shape(4, false, false)?;
+                let index = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let Some(&event) = self.syncpoint_events.get(&index) else {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!("syncpoint event index {index} was not acquired"),
+                    ));
+                };
+                call.reply(0, None, 0, &[])?;
+                if let Some(event) = self.readable_events.get_mut(&event) {
+                    event.signaled = false;
+                }
+                self.provisional_commands
+                    .insert("appletOE:syncpoint_supervisor:202");
+                Ok(Outcome::success())
+            }
             // Command 22: u32 event index -> a moved event handle. The SDK's
             // syncpt InitializeEx tries indices in turn and wraps each
             // returned handle as a system event (sdk+0x5d41f4 reads the
@@ -6835,7 +7196,13 @@ impl Services {
                     .insert("appletOE:syncpoint_supervisor:22");
                 Ok(Outcome::success())
             }
-            _ => Err(call.unsupported(SERVICE, "syncpoint supervisor command is not implemented")),
+            _ => Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "syncpoint supervisor command is not implemented ({})",
+                    call.request.describe()
+                ),
+            )),
         }
     }
 
@@ -7362,6 +7729,7 @@ impl Services {
             | ReadableEventKind::SocketPoll
             | ReadableEventKind::NfpAvailability
             | ReadableEventKind::SyncpointEvent { .. }
+            | ReadableEventKind::VideoDecoderInput
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
@@ -7679,6 +8047,9 @@ impl Services {
             "socket_poll_timeouts":self.socket_poll_timeouts,
             "hid_disconnected_npads":self.hid_disconnected_npads,
             "hid_supported_style_set":self.hid_supported_style_set,
+            "video_decoders":self.video_decoders,
+            "video_decoding_implemented":false,
+            "video_submissions":self.video_submissions,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
                 "sample_count":renderer.parameters.sample_count,
