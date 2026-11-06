@@ -14,8 +14,8 @@ use gpui::{
     CursorStyle, Decorations, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
     ImageFormat, KeyBinding, MouseButton, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
     ResizeEdge, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, ease_out_quint,
-    img, point, prelude::*, px, size,
+    WindowDecorations, WindowOptions, actions, anchored, canvas, deferred, div, img, point,
+    prelude::*, px, size,
 };
 
 use crate::chrome::{self, ButtonLayout, WindowButton};
@@ -600,7 +600,7 @@ const WINDOW_INSET: f32 = 16.0;
 const SHEET_MARGIN: f32 = 24.0;
 
 /// How long a closing sheet takes to fade out.
-const SHEET_OUT: Duration = Duration::from_millis(140);
+const SHEET_OUT: Duration = Duration::from_millis(180);
 
 /// Dims the launcher behind a sheet; clicking outside the sheet closes it.
 /// A closing sheet fades out instead of in and takes no input.
@@ -630,7 +630,7 @@ fn scrim(
         .child(if closing {
             sheet.into_any_element()
         } else {
-            ui::appear(sheet, "sheet-in", space::S, motion)
+            ui::appear(sheet, "sheet-in", space::L, motion)
         });
     if !motion {
         return backdrop.into_any_element();
@@ -639,16 +639,17 @@ fn scrim(
         return backdrop
             .with_animation(
                 "scrim-out",
-                Animation::new(SHEET_OUT).with_easing(ease_out_quint()),
-                |el, t| el.opacity(1.0 - t),
+                Animation::new(SHEET_OUT),
+                // Leaving needs no bounce: a quick fade.
+                |el, t| el.opacity(1.0 - ui::ease_out(t)),
             )
             .into_any_element();
     }
     backdrop
         .with_animation(
             "scrim-in",
-            Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
-            |el, t| el.opacity(t),
+            Animation::new(Duration::from_millis(220)),
+            |el, t| el.opacity(ui::ease_out(t)),
         )
         .into_any_element()
 }
@@ -1025,13 +1026,7 @@ impl Launcher {
                     .px(px(space::XL))
                     .pt(px(space::XS))
                     .pb(px(space::XL))
-                    // Pages crossfade when the tab changes.
-                    .child(ui::appear(
-                        page,
-                        ElementId::Name(format!("page-{}", self.settings_tab.label()).into()),
-                        0.0,
-                        self.motion,
-                    )),
+                    .child(page),
             );
         let sheet = sheet("settings", width, Some(height))
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
@@ -1222,7 +1217,7 @@ impl Launcher {
                         anchored()
                             .anchor(gpui::Corner::TopRight)
                             .snap_to_window_with_margin(px(space::S))
-                            .child(ui::appear(menu, (id, 101usize), -4.0, self.motion)),
+                            .child(ui::appear(menu, (id, 101usize), -6.0, self.motion)),
                     )
                     .with_priority(2),
                 ),
