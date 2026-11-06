@@ -9,7 +9,8 @@
 //! controls record where they were laid out, and a move picks among those.
 //!
 //! One focus ring serves every control, drawn above everything (menus
-//! included), and springs from the control focus left to the one it went to.
+//! included). It springs in when it appears and from the control focus left
+//! to the one it went to.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -136,7 +137,9 @@ struct Glide {
 impl Glide {
     fn at(&self, now: Instant) -> ui::RingShape {
         let t = now.saturating_duration_since(self.start).as_secs_f32() / GLIDE.as_secs_f32();
-        self.from.lerp(&self.to, ui::spring(t))
+        // Fully opaque well before the spring settles, as things appear.
+        self.from
+            .lerp(&self.to, ui::spring(t), ui::ease_out(t / 0.4))
     }
 }
 
@@ -216,10 +219,11 @@ impl Stops {
                     start: now,
                 }
             }
+            // Appearing: spring in from a little larger while fading in.
             _ => {
                 *ring = Some(Glide {
                     handle: stop.handle.clone(),
-                    from: target,
+                    from: if motion { target.appearing() } else { target },
                     to: target,
                     start: now,
                 })

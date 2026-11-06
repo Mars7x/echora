@@ -111,35 +111,48 @@ pub fn color(hex: u32) -> Hsla {
     rgba(hex).into()
 }
 
-/// The focus ring: the same for every control, 2 px wide and 2 px clear
-/// of the control's edge, following its rounding. The gap keeps it apart
-/// from light and dark controls alike. Painted rather than a box shadow,
-/// which GPUI draws nothing for without blur.
+/// The focus ring: the same for every control, 2 px wide around its edge
+/// and following its rounding. Painted rather than a box shadow, which
+/// GPUI draws nothing for without blur.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RingShape {
     bounds: Bounds<Pixels>,
     radius: Pixels,
+    opacity: f32,
 }
 
 impl RingShape {
-    const GAP: f32 = 2.0;
     const WIDTH: f32 = 2.0;
+    /// How much larger the ring starts when it appears, as it springs in.
+    const APPEAR_GROWTH: f32 = 6.0;
 
     /// The ring around a control laid out in `bounds` with corners rounded
     /// `corner` design pixels ([`radius::FULL`] for pills and circles).
     pub fn around(bounds: Bounds<Pixels>, corner: f32, window: &Window) -> Self {
         let scale = window.rem_size() / px(16.0);
         let corner = (px(corner) * scale).min(bounds.size.height.min(bounds.size.width) / 2.0);
-        let outset = px(Self::GAP + Self::WIDTH);
+        let outset = px(Self::WIDTH);
         Self {
             bounds: bounds.dilate(outset),
             radius: corner + outset,
+            opacity: 1.0,
         }
     }
 
-    /// The shape `t` of the way from `self` to `to` (beyond 1 overshoots).
-    pub fn lerp(&self, to: &Self, t: f32) -> Self {
-        let mix = |a: Pixels, b: Pixels| a + (b - a) * t;
+    /// Where the ring starts when it appears: a little larger and clear.
+    pub fn appearing(&self) -> Self {
+        let growth = px(Self::APPEAR_GROWTH);
+        Self {
+            bounds: self.bounds.dilate(growth),
+            radius: self.radius + growth,
+            opacity: 0.0,
+        }
+    }
+
+    /// The shape `motion` of the way from `self` to `to` (beyond 1
+    /// overshoots), faded `fade` of the way, which must not.
+    pub fn lerp(&self, to: &Self, motion: f32, fade: f32) -> Self {
+        let mix = |a: Pixels, b: Pixels| a + (b - a) * motion;
         Self {
             bounds: Bounds {
                 origin: gpui::point(
@@ -152,6 +165,7 @@ impl RingShape {
                 ),
             },
             radius: mix(self.radius, to.radius),
+            opacity: self.opacity + (to.opacity - self.opacity) * fade.clamp(0.0, 1.0),
         }
     }
 
@@ -161,7 +175,7 @@ impl RingShape {
             self.radius,
             gpui::transparent_black(),
             px(Self::WIDTH),
-            color(palette::FOCUS),
+            color(palette::FOCUS).opacity(self.opacity),
             BorderStyle::Solid,
         ));
     }
