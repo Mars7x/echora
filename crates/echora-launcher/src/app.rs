@@ -684,8 +684,8 @@ fn fade(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
 
 /// Window pixels as rems, so a sheet sized from the window scales with the
 /// rest of its contents.
-fn to_rems(pixels: Pixels) -> gpui::Rems {
-    gpui::rems(f32::from(pixels) / 16.0)
+fn to_rems(pixels: Pixels, rem: Pixels) -> gpui::Rems {
+    gpui::rems(f32::from(pixels) / f32::from(rem))
 }
 
 /// A sheet's surface: the window's own background, at a fixed size so
@@ -695,11 +695,12 @@ fn sheet(
     width: Pixels,
     height: Option<Pixels>,
     surface: u32,
+    rem: Pixels,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .w(to_rems(width))
-        .when_some(height, |el, height| el.h(to_rems(height)))
+        .w(to_rems(width, rem))
+        .when_some(height, |el, height| el.h(to_rems(height, rem)))
         .flex()
         .rounded(u(radius::SHEET))
         .border_1()
@@ -735,18 +736,24 @@ impl Launcher {
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let client_side = matches!(window.window_decorations(), Decorations::Client { .. });
         let maximized = window.is_maximized();
+        let active = window.is_window_active();
         let buttons = |side: &[WindowButton]| {
             div()
                 .flex()
                 .gap(px(space::M))
                 .children(side.iter().map(|&button| {
-                    ui::icon_button(button.id(), button.icon(maximized)).on_click(
-                        move |_, window, _| match button {
-                            WindowButton::Minimize => window.minimize_window(),
-                            WindowButton::Maximize => window.zoom_window(),
-                            WindowButton::Close => window.remove_window(),
-                        },
-                    )
+                    ui::window_button(button.id(), button.icon(maximized), active)
+                        // A press on a button must not start a window drag,
+                        // nor a double-click maximize the window.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            match button {
+                                WindowButton::Minimize => window.minimize_window(),
+                                WindowButton::Maximize => window.zoom_window(),
+                                WindowButton::Close => window.remove_window(),
+                            }
+                        })
                 }))
         };
         div()
@@ -800,22 +807,22 @@ impl Launcher {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(space::S))
-            .pb(px(72.0))
+            .gap(u(space::S))
+            .pb(u(72.0))
             .child(
                 div()
-                    .text_size(px(text::LARGE_TITLE))
+                    .text_size(u(text::LARGE_TITLE))
                     .font_weight(FontWeight::BOLD)
                     .text_color(color(palette::LABEL))
                     .child("Echora"),
             )
             .child(
                 div()
-                    .text_size(px(text::HEADLINE))
+                    .text_size(u(text::HEADLINE))
                     .text_color(color(palette::SECONDARY_LABEL))
                     .child("Choose your NUP package or dump folder to install the game."),
             )
-            .child(div().pt(px(space::L)).child(choose))
+            .child(div().pt(u(space::L)).child(choose))
     }
 
     /// Settings and About; the whole bottom bar on the empty screen, and
@@ -844,9 +851,9 @@ impl Launcher {
         div()
             .flex()
             .items_center()
-            .gap(px(space::S))
-            .p(px(space::S))
-            .rounded(px(radius::DOCK))
+            .gap(u(space::S))
+            .p(u(space::S))
+            .rounded(u(radius::DOCK))
             .border_1()
             .border_color(color(palette::BORDER))
             .bg(color(palette::MATERIAL))
@@ -871,7 +878,7 @@ impl Launcher {
         let (series, name) = split_title(&title);
         let actions = if let Some((_, progress)) = &self.installing {
             div()
-                .w(px(320.0))
+                .w(u(320.0))
                 .child(ui::progress(progress.fraction()))
                 .into_any_element()
         } else {
@@ -883,16 +890,16 @@ impl Launcher {
                     Kind::Primary,
                     Size::Large,
                 )
-                .px(px(36.0)),
+                .px(u(36.0)),
                 active,
                 self.keyboard,
             )
             .when(active, |el| el.track_focus(&self.play_focus))
-            .when(self.running, |el| el.opacity(0.6).cursor_default())
+            .when(self.running, |el| el.opacity(0.6))
             .on_click(cx.listener(|this, _, window, cx| this.play(&Play, window, cx)));
             div()
                 .flex()
-                .gap(px(space::S))
+                .gap(u(space::S))
                 .child(play)
                 .children(self.secondary_actions(cx))
                 .into_any_element()
@@ -904,7 +911,7 @@ impl Launcher {
                 el.child(
                     div()
                         .font_family(ui::TITLE_FONT)
-                        .text_size(px(text::HEADLINE))
+                        .text_size(u(text::HEADLINE))
                         .text_color(color(palette::SECONDARY_LABEL))
                         .child(series),
                 )
@@ -912,7 +919,7 @@ impl Launcher {
             .child(
                 div()
                     .font_family(ui::TITLE_FONT)
-                    .text_size(px(text::HERO))
+                    .text_size(u(text::HERO))
                     .line_height(gpui::relative(1.1))
                     .font_weight(FontWeight::BOLD)
                     .text_color(color(palette::LABEL))
@@ -920,12 +927,12 @@ impl Launcher {
             )
             .child(
                 div()
-                    .pt(px(space::XS + 2.0))
-                    .text_size(px(text::CALLOUT))
+                    .pt(u(space::XS + 2.0))
+                    .text_size(u(text::CALLOUT))
                     .text_color(color(palette::SECONDARY_LABEL))
                     .child(detail),
             )
-            .child(div().pt(px(space::XL)).child(actions))
+            .child(div().pt(u(space::XL)).child(actions))
             .into_any_element()
     }
 
@@ -955,8 +962,9 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (room_w, room_h) = self.sheet_room(window);
-        let width = room_w.min(px(760.0));
-        let height = room_h.min(px(460.0));
+        let scale = window.rem_size() / px(16.0);
+        let width = room_w.min(px(760.0) * scale);
+        let height = room_h.min(px(460.0) * scale);
         let keyboard = self.keyboard;
         let title = self.drag_window(
             div()
@@ -998,7 +1006,6 @@ impl Launcher {
                                 .items_center()
                                 .rounded(u(radius::CONTROL))
                                 .text_size(u(text::BODY))
-                                .cursor_pointer()
                                 .when(selected, |el| {
                                     el.bg(color(palette::SELECTED))
                                         .text_color(color(palette::LABEL))
@@ -1066,7 +1073,7 @@ impl Launcher {
                     .child(page),
             );
         let surface = palette::VIEW;
-        let sheet = sheet("settings", width, Some(height), surface)
+        let sheet = sheet("settings", width, Some(height), surface, window.rem_size())
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(tabs)
             .child(content);
@@ -1371,7 +1378,7 @@ impl Launcher {
     /// and the licence with a link to the source, all without scrolling.
     fn render_about(&self, window: &Window, closing: bool, cx: &mut Context<Self>) -> AnyElement {
         let (room_w, _) = self.sheet_room(window);
-        let width = room_w.min(px(560.0));
+        let width = room_w.min(px(560.0) * (window.rem_size() / px(16.0)));
         let source = ui::focusable(
             ui::button("source", "Source code", Kind::Secondary, Size::Regular),
             !closing,
@@ -1424,7 +1431,7 @@ impl Launcher {
             )
             .child(self.close_button(!closing, cx));
         let surface = palette::SURFACE;
-        let sheet = sheet("about", width, None, surface)
+        let sheet = sheet("about", width, None, surface, window.rem_size())
             .flex_col()
             .when(!closing, |el| el.track_focus(&self.sheet_focus))
             .child(top)
@@ -1504,8 +1511,26 @@ impl Launcher {
     }
 }
 
+/// The artwork tile beside the title, and the narrowest window (in design
+/// pixels) that shows it.
+const ART_SIZE: f32 = 220.0;
+const ART_MIN_WIDTH: f32 = 860.0;
+
+/// The window size the design is drawn for; larger windows scale it up.
+const DESIGN_SIZE: (f32, f32) = (960.0, 600.0);
+/// The most the UI grows on large windows.
+const MAX_SCALE: f32 = 1.6;
+
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Everything sized in rems grows with the window: 16 px per rem at
+        // the design size, up to 1.6 times that on large windows.
+        let content =
+            window.viewport_size() - gpui::size(px(WINDOW_INSET * 2.0), px(WINDOW_INSET * 2.0));
+        let scale = (f32::from(content.width) / DESIGN_SIZE.0)
+            .min(f32::from(content.height) / DESIGN_SIZE.1)
+            .clamp(1.0, MAX_SCALE);
+        window.set_rem_size(px(16.0 * scale));
         let Decorations::Client { tiling } = window.window_decorations() else {
             self.corner = px(0.0);
             return self.render_content(window, cx).into_any_element();
@@ -1641,7 +1666,7 @@ impl Launcher {
             .relative()
             .overflow_hidden()
             .font_family(self.font.clone())
-            .text_size(px(text::BODY))
+            .text_size(u(text::BODY))
             .child(self.render_background())
             .when(welcome, |el| el.child(self.render_welcome(cx)))
             .child(self.render_title_bar(window, cx))
@@ -1657,26 +1682,56 @@ impl Launcher {
                 if self.loading {
                     return el;
                 }
+                // The game's artwork balances the title on the right, where
+                // the window is wide enough for both.
+                let wide = f32::from(window.viewport_size().width)
+                    / (f32::from(window.rem_size()) / 16.0)
+                    >= ART_MIN_WIDTH;
+                let art = self
+                    .game
+                    .as_ref()
+                    .and_then(|game| game.icon.clone())
+                    .filter(|_| wide)
+                    .map(|icon| {
+                        img(icon)
+                            .flex_none()
+                            .size(u(ART_SIZE))
+                            .rounded(u(radius::DOCK))
+                            .border_1()
+                            .border_color(color(palette::WINDOW_EDGE))
+                            .object_fit(ObjectFit::Cover)
+                    });
                 if self.game.is_some() || self.installing.is_some() {
                     // The title hero sits in the bottom left; messages
                     // appear above it.
                     el.child(
                         div()
                             .absolute()
-                            .left(px(space::XL + space::L))
-                            .right(px(space::XL + space::L))
-                            .bottom(px(space::XL + space::L))
+                            .left(u(space::XL + space::L))
+                            .right(u(space::XL + space::L))
+                            .bottom(u(space::XL + space::L))
                             .flex()
                             .flex_col()
                             .items_start()
-                            .gap(px(space::L))
+                            .gap(u(space::L))
                             .children(toast)
-                            .child(ui::appear(
-                                div().child(self.render_hero(cx)),
-                                "hero-in",
-                                space::L,
-                                self.motion,
-                            )),
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_end()
+                                    .justify_between()
+                                    .gap(u(space::XL))
+                                    .child(ui::appear(
+                                        div().child(self.render_hero(cx)),
+                                        "hero-in",
+                                        space::L,
+                                        self.motion,
+                                    ))
+                                    .children(art.map(|art| {
+                                        ui::appear(art, "art-in", space::L, self.motion)
+                                    })),
+                            ),
                     )
                 } else {
                     el.child(
@@ -1684,11 +1739,11 @@ impl Launcher {
                             .absolute()
                             .left_0()
                             .right_0()
-                            .bottom(px(space::XL))
+                            .bottom(u(space::XL))
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap(px(space::M))
+                            .gap(u(space::M))
                             .children(toast)
                             .child(ui::appear(
                                 div().child(self.render_dock(cx)),
