@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Echora
+GenericName=Game Launcher
+Comment=Native recompilation of The Legend of Zelda: Ocarina of Time (Nintendo Switch 2)
+Exec=echora-launcher
+Icon=applications-games
+Terminal=false
+Categories=Game;
+Keywords=Zelda;Ocarina;Switch;
+StartupNotify=true
