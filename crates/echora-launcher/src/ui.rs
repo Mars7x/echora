@@ -23,8 +23,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, FontWeight, Hsla,
-    SharedString, Stateful, div, prelude::*, px, rgba,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, Div, Element, ElementId,
+    FontWeight, GlobalElementId, Hsla, InspectorElementId, LayoutId, Pixels, Rems, SharedString,
+    Stateful, Window, div, prelude::*, px, rems, rgba,
 };
 
 /// Spacing on a 4 px grid.
@@ -90,6 +91,101 @@ pub mod palette {
     /// Pop-up menus, as the theme's popovers.
     pub const MENU: u32 = 0x191919ff;
     pub const SWITCH_OFF: u32 = 0x3a3a3aff;
+}
+
+/// A length in the design system's pixels, as rems (1 rem = 16 px at rest),
+/// so a subtree drawn at a different rem size scales as a whole; see
+/// [`Scaled`].
+pub fn u(pixels: f32) -> Rems {
+    rems(pixels / 16.0)
+}
+
+/// Draws its child at `scale` times the size: every rem-based length and
+/// font size in the subtree follows the rem size it is laid out with. Used
+/// to grow sheets from their centre as they open.
+pub struct Scaled {
+    child: AnyElement,
+    scale: f32,
+    rem: Pixels,
+}
+
+pub fn scaled(child: impl IntoElement, scale: f32) -> Scaled {
+    Scaled {
+        child: child.into_any_element(),
+        scale,
+        rem: px(16.0),
+    }
+}
+
+impl Scaled {
+    pub fn scale(mut self, scale: f32) -> Self {
+        self.scale = scale;
+        self
+    }
+}
+
+impl IntoElement for Scaled {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Scaled {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        self.rem = window.rem_size() * self.scale;
+        let rem = self.rem;
+        let layout =
+            window.with_rem_size(Some(rem), |window| self.child.request_layout(window, cx));
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let rem = self.rem;
+        window.with_rem_size(Some(rem), |window| {
+            self.child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let rem = self.rem;
+        window.with_rem_size(Some(rem), |window| self.child.paint(window, cx));
+    }
 }
 
 /// `0xRRGGBBAA`.
@@ -160,17 +256,17 @@ pub fn button(
     div()
         .id(id)
         .flex_none()
-        .h(px(height))
-        .px(px(padding))
+        .h(u(height))
+        .px(u(padding))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(radius::CONTROL))
+        .rounded(u(radius::CONTROL))
         .bg(color(fill))
         .hover(|style| style.bg(color(hover)))
         .active(|style| style.bg(color(pressed)))
         .cursor_pointer()
-        .text_size(px(font))
+        .text_size(u(font))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color(label_color))
         .child(label.into())
@@ -181,7 +277,7 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> Statef
     div()
         .id(id)
         .flex_none()
-        .size(px(24.0))
+        .size(u(24.0))
         .flex()
         .items_center()
         .justify_center()
@@ -192,7 +288,7 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> Statef
         .child(
             gpui::svg()
                 .path(icon)
-                .size(px(16.0))
+                .size(u(16.0))
                 .text_color(color(palette::LABEL)),
         )
 }
@@ -202,11 +298,11 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> Statef
 /// for the switch that was just flipped.
 pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
     // Knob travel: from 2 px in to 18 px in.
-    let at = move |t: f32| px(2.0 + 16.0 * if on { t } else { 1.0 - t });
+    let at = move |t: f32| u(2.0 + 16.0 * if on { t } else { 1.0 - t });
     let knob = div()
         .absolute()
-        .top(px(2.0))
-        .size(px(20.0))
+        .top(u(2.0))
+        .size(u(20.0))
         .rounded_full()
         .bg(color(palette::BACKDROP));
     let knob = if animate {
@@ -223,8 +319,8 @@ pub fn switch(id: &'static str, on: bool, animate: bool) -> Stateful<Div> {
         .id(id)
         .relative()
         .flex_none()
-        .w(px(40.0))
-        .h(px(24.0))
+        .w(u(40.0))
+        .h(u(24.0))
         .rounded_full()
         .cursor_pointer()
         .bg(color(if on {
@@ -270,7 +366,7 @@ where
         // Fully opaque by 40% of the way, while the spring still settles.
         el.opacity(ease_out(t / 0.4))
             .relative()
-            .top(px(rise * (1.0 - spring(t))))
+            .top(u(rise * (1.0 - spring(t))))
     })
     .into_any_element()
 }
@@ -296,24 +392,24 @@ pub fn popup_button(id: impl Into<ElementId>, label: &'static str) -> Stateful<D
     div()
         .id(id)
         .flex_none()
-        .h(px(32.0))
-        .pl(px(space::M))
-        .pr(px(space::S))
+        .h(u(32.0))
+        .pl(u(space::M))
+        .pr(u(space::S))
         .flex()
         .items_center()
-        .gap(px(space::XS + 2.0))
-        .rounded(px(radius::CONTROL))
+        .gap(u(space::XS + 2.0))
+        .rounded(u(radius::CONTROL))
         .bg(color(palette::FILL))
         .hover(|style| style.bg(color(palette::FILL_HOVER)))
         .active(|style| style.bg(color(palette::FILL_PRESSED)))
         .cursor_pointer()
-        .text_size(px(text::BODY))
+        .text_size(u(text::BODY))
         .text_color(color(palette::LABEL))
         .child(label)
         .child(
             gpui::svg()
                 .path("icons/chevron-down.svg")
-                .size(px(16.0))
+                .size(u(16.0))
                 .text_color(color(palette::SECONDARY_LABEL)),
         )
 }
@@ -321,12 +417,12 @@ pub fn popup_button(id: impl Into<ElementId>, label: &'static str) -> Stateful<D
 /// A pop-up menu's panel; `items` come from [`menu_item`].
 pub fn menu(items: impl IntoIterator<Item = Stateful<Div>>) -> Div {
     div()
-        .w(px(200.0))
-        .p(px(space::XS))
+        .w(u(200.0))
+        .p(u(space::XS))
         .flex()
         .flex_col()
-        .gap(px(2.0))
-        .rounded(px(radius::CARD))
+        .gap(u(2.0))
+        .rounded(u(radius::CARD))
         .border_1()
         .border_color(color(palette::BORDER))
         .bg(color(palette::MENU))
@@ -343,22 +439,22 @@ pub fn menu(items: impl IntoIterator<Item = Stateful<Div>>) -> Div {
 pub fn menu_item(id: impl Into<ElementId>, label: &'static str, selected: bool) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(32.0))
-        .px(px(space::S))
+        .h(u(32.0))
+        .px(u(space::S))
         .flex()
         .items_center()
-        .gap(px(space::S))
-        .rounded(px(radius::INNER))
+        .gap(u(space::S))
+        .rounded(u(radius::INNER))
         .cursor_pointer()
         .hover(|style| style.bg(color(palette::FILL)))
         .active(|style| style.bg(color(palette::FILL_HOVER)))
-        .text_size(px(text::BODY))
+        .text_size(u(text::BODY))
         .text_color(color(palette::LABEL))
-        .child(div().size(px(16.0)).when(selected, |el| {
+        .child(div().size(u(16.0)).when(selected, |el| {
             el.child(
                 gpui::svg()
                     .path("icons/check.svg")
-                    .size(px(16.0))
+                    .size(u(16.0))
                     .text_color(color(palette::LABEL)),
             )
         }))
@@ -372,15 +468,15 @@ pub fn group(title: Option<&'static str>, rows: Vec<AnyElement>) -> Div {
     let mut card = div()
         .flex()
         .flex_col()
-        .rounded(px(radius::CARD))
+        .rounded(u(radius::CARD))
         .bg(color(palette::CARD));
     for (index, row) in rows.into_iter().enumerate() {
         card = card.child(row);
         if index + 1 < count {
             card = card.child(
                 div()
-                    .mx(px(space::L))
-                    .h(px(1.0))
+                    .mx(u(space::L))
+                    .h(u(1.0))
                     .bg(color(palette::SEPARATOR)),
             );
         }
@@ -388,12 +484,12 @@ pub fn group(title: Option<&'static str>, rows: Vec<AnyElement>) -> Div {
     div()
         .flex()
         .flex_col()
-        .gap(px(space::S))
+        .gap(u(space::S))
         .when_some(title, |el, title| {
             el.child(
                 div()
-                    .px(px(space::XS))
-                    .text_size(px(text::CALLOUT))
+                    .px(u(space::XS))
+                    .text_size(u(text::CALLOUT))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(color(palette::SECONDARY_LABEL))
                     .child(title),
@@ -409,10 +505,10 @@ pub fn titles(title: impl Into<SharedString>, subtitle: Option<SharedString>) ->
         .flex_col()
         .flex_1()
         .min_w_0()
-        .gap(px(2.0))
+        .gap(u(2.0))
         .child(
             div()
-                .text_size(px(text::BODY))
+                .text_size(u(text::BODY))
                 .text_color(color(palette::LABEL))
                 .truncate()
                 .child(title.into()),
@@ -420,7 +516,7 @@ pub fn titles(title: impl Into<SharedString>, subtitle: Option<SharedString>) ->
         .when_some(subtitle, |el, subtitle| {
             el.child(
                 div()
-                    .text_size(px(text::CALLOUT))
+                    .text_size(u(text::CALLOUT))
                     .text_color(color(palette::SECONDARY_LABEL))
                     .child(subtitle),
             )
@@ -430,12 +526,12 @@ pub fn titles(title: impl Into<SharedString>, subtitle: Option<SharedString>) ->
 /// A list row: optional leading content, titles, and a trailing control.
 pub fn row(leading: Option<AnyElement>, titles: Div, trailing: Option<AnyElement>) -> Div {
     div()
-        .min_h(px(52.0))
-        .px(px(space::L))
-        .py(px(space::S + 2.0))
+        .min_h(u(52.0))
+        .px(u(space::L))
+        .py(u(space::S + 2.0))
         .flex()
         .items_center()
-        .gap(px(space::M))
+        .gap(u(space::M))
         .children(leading)
         .child(titles)
         .children(trailing)
@@ -444,7 +540,7 @@ pub fn row(leading: Option<AnyElement>, titles: Div, trailing: Option<AnyElement
 /// A thin progress bar; `fraction` runs from 0 to 1.
 pub fn progress(fraction: f32) -> Div {
     div()
-        .h(px(4.0))
+        .h(u(4.0))
         .w_full()
         .rounded_full()
         .bg(color(palette::FILL))
@@ -460,13 +556,13 @@ pub fn progress(fraction: f32) -> Div {
 /// A short message floating above the dock.
 pub fn toast(message: SharedString) -> Div {
     div()
-        .px(px(space::L))
-        .py(px(space::S + 2.0))
+        .px(u(space::L))
+        .py(u(space::S + 2.0))
         .rounded_full()
         .bg(color(palette::MATERIAL))
         .border_1()
         .border_color(color(palette::BORDER))
-        .text_size(px(text::BODY))
+        .text_size(u(text::BODY))
         .text_color(color(palette::LABEL))
         .child(message)
 }
