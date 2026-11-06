@@ -294,6 +294,34 @@ struct SyncpointCache {
 
 /// Interface tag written into this prototype's nvdrv CMIF replies.
 const NVDRV_INTERFACE_ID: u32 = 0x6e76_6472;
+const NVDRV_MAX_FDS: usize = 64;
+/// Device paths listed on Switchbrew "NV services".
+const NVDRV_DEVICES: &[&str] = &[
+    "/dev/nvhost-ctrl",
+    "/dev/nvmap",
+    "/dev/nvdisp-ctrl",
+    "/dev/nvdisp-disp0",
+    "/dev/nvdisp-disp1",
+    "/dev/nvhdcp_up-ctrl",
+    "/dev/nvcec-ctrl",
+    "/dev/nvdcutil-disp0",
+    "/dev/nvdcutil-disp1",
+    "/dev/nvsched-ctrl",
+    "/dev/nverpt-ctrl",
+    "/dev/nvhost-as-gpu",
+    "/dev/nvhost-dbg-gpu",
+    "/dev/nvhost-prof-gpu",
+    "/dev/nvhost-ctrl-gpu",
+    "/dev/nvhost-tsg-gpu",
+    "/dev/nvhost-prof-dev-gpu",
+    "/dev/nvhost-gpu",
+    "/dev/nvhost-msenc",
+    "/dev/nvhost-nvdec",
+    "/dev/nvhost-nvjpg",
+    "/dev/nvhost-vic",
+    "/dev/nvhost-tsec",
+    "/dev/nvhost-display",
+];
 
 /// Interface tag written into this prototype's fsp-srv CMIF replies.
 const FSP_INTERFACE_ID: u32 = 0x6673_7073;
@@ -859,6 +887,8 @@ pub struct Services {
     graphics_supervisor_handle: Option<u32>,
     graphics_supervisor_phase: Option<GraphicsSupervisorPhase>,
     nvdrv_firmware_memory_margin: Option<bool>,
+    /// Open NVIDIA driver file descriptors and their device paths.
+    nvdrv_fds: BTreeMap<u32, String>,
     /// Live transfer-memory handles (CreateTransferMemory).
     transfer_memories: BTreeMap<u32, TransferMemory>,
     /// Transfer memories referenced by a server object after their handle
@@ -949,6 +979,7 @@ impl Default for Services {
             graphics_supervisor_handle: None,
             graphics_supervisor_phase: None,
             nvdrv_firmware_memory_margin: None,
+            nvdrv_fds: BTreeMap::new(),
             transfer_memories: BTreeMap::new(),
             retained_transfer_memories: Vec::new(),
             writable_event_handles: BTreeMap::new(),
@@ -1206,6 +1237,26 @@ impl Call<'_> {
     /// The selected AutoSelect output buffer: the B descriptor when it has a
     /// size, otherwise the receive-list entry (this server has no pointer
     /// buffer, so clients normally use B).
+    /// Auto-select output `index`: its B descriptor, or the C receive-list
+    /// entry of the same index when the B descriptor is empty.
+    fn output_buffer_at(&self, index: usize) -> Result<(u64, u64), Trap> {
+        let &(address, size, mode) = self
+            .request
+            .receive_buffers
+            .get(index)
+            .ok_or_else(|| invalid("missing output buffer descriptor"))?;
+        if mode == 2 {
+            return Err(invalid("invalid B descriptor mode 2"));
+        }
+        if size != 0 {
+            return Ok((address, size));
+        }
+        match self.request.receive_list.get(index) {
+            Some(&(address, size)) if size != 0 => Ok((address, size)),
+            _ => Ok((address, 0)),
+        }
+    }
+
     fn output_buffer(&self) -> Result<(u64, u64), Trap> {
         let (address, size, mode) = self.request.receive_buffers[0];
         // Modes 0 (normal), 1 (non-secure) and 3 (non-device) only differ in
@@ -5602,6 +5653,104 @@ impl Services {
             ));
         }
         match call.request.command_id {
+            // INvDrv2User Open (0): a type-0x5 input buffer Path; returns u32
+            // FdOut then u32 Err (Switchbrew "NV services" classic Open; the
+            // S2 table names the command without details). Only device paths
+            // the page documents open; descriptors count up from 1.
+            0 => {
+                call.shape(0, false, true)?;
+                let buffer = call
+                    .request
+                    .input_buffer
+                    .clone()
+                    .ok_or_else(|| invalid("Open shape check guarantees a path buffer"))?;
+                if buffer.size == 0 || buffer.size > 0x100 {
+                    return Err(call.unsupported(SERVICE, "Open path size is not 1..=0x100"));
+                }
+                let mut bytes = vec![0u8; buffer.size as usize];
+                call.memory.read(buffer.address, &mut bytes)?;
+                let end = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                let path = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                if !NVDRV_DEVICES.contains(&path.as_str()) {
+                    return Err(
+                        call.unsupported(SERVICE, format!("Open of undocumented device {path:?}"))
+                    );
+                }
+                if self.nvdrv_fds.len() >= NVDRV_MAX_FDS {
+                    return Err(call.unsupported(SERVICE, "too many open NVIDIA driver devices"));
+                }
+                let fd = self.nvdrv_fds.keys().next_back().map_or(1, |last| last + 1);
+                let mut reply = fd.to_le_bytes().to_vec();
+                reply.extend_from_slice(&0u32.to_le_bytes());
+                call.reply(0, None, NVDRV_INTERFACE_ID, &reply)?;
+                self.nvdrv_fds.insert(fd, path);
+                Ok(Outcome::success())
+            }
+            // INvDrv2User Ioctl (1) and Ioctl3 (12): u32 Fd, u32 Iocode, an
+            // input buffer and one output buffer (Ioctl3: main and inline);
+            // returns u32 Err (classic layout, Eden 1a6d7d4). Device ioctls
+            // live in nvdrv.rs.
+            command @ (1 | 12) => {
+                let outputs = if command == 1 { 1 } else { 2 };
+                let request = &call.request;
+                if request.arguments.len() < 8
+                    || request.pid.is_some()
+                    || !request.copy_handles.is_empty()
+                    || request.input_buffer.is_none()
+                    || request.receive_buffers.len() != outputs
+                {
+                    return Err(call.unsupported(
+                        SERVICE,
+                        format!(
+                            "ioctl shape is not the documented one ({})",
+                            request.describe()
+                        ),
+                    ));
+                }
+                let word = |at: usize| crate::bytes::le_u32(&request.arguments[at..at + 4]);
+                let (fd, code) = (word(0), word(4));
+                let Some(device) = self.nvdrv_fds.get(&fd).cloned() else {
+                    return Err(call.unsupported(SERVICE, format!("ioctl on unopened fd {fd}")));
+                };
+                let input = request
+                    .input_buffer
+                    .clone()
+                    .ok_or_else(|| invalid("checked above"))?;
+                let mut input_bytes = vec![
+                    0u8;
+                    usize::try_from(input.size)
+                        .unwrap_or(usize::MAX)
+                        .min(0x10000)
+                ];
+                call.memory.read(input.address, &mut input_bytes)?;
+                let main = call.output_buffer_at(0)?;
+                let inline = if outputs == 2 {
+                    call.output_buffer_at(1)?
+                } else {
+                    (0, 0)
+                };
+                let result = crate::nvdrv::ioctl(
+                    &device,
+                    code,
+                    &input_bytes,
+                    main.1 as usize,
+                    inline.1 as usize,
+                )
+                .map_err(|message| call.unsupported(SERVICE, message))?;
+                if result.output.len() as u64 > main.1
+                    || result.inline_output.len() as u64 > inline.1
+                {
+                    return Err(invalid("ioctl output exceeds its buffer"));
+                }
+                call.memory.write(main.0, &result.output)?;
+                call.memory.write(inline.0, &result.inline_output)?;
+                call.reply(0, None, NVDRV_INTERFACE_ID, &result.result.to_le_bytes())?;
+                self.provisional_commands.insert("nvdrv:gsv:ioctl");
+                Ok(Outcome::success())
+            }
             // INvDrv2User SetConfiguration (13): a u64 whose bit 0 is the old
             // GraphicsFirmwareMemoryMarginEnabled option (Switchbrew "NV
             // services", [S2]). Other bits are undocumented and stop. There is
@@ -5629,7 +5778,13 @@ impl Services {
                 self.nvdrv_firmware_memory_margin = Some(enabled == 1);
                 Ok(Outcome::success())
             }
-            _ => Err(call.unsupported(SERVICE, "NVIDIA driver command is not implemented")),
+            _ => Err(call.unsupported(
+                SERVICE,
+                format!(
+                    "NVIDIA driver command is not implemented ({})",
+                    call.request.describe()
+                ),
+            )),
         }
     }
 
@@ -6159,6 +6314,7 @@ impl Services {
             "supported_window_controller_commands":[1,10],
             "window_controller_aruid_source":"addressed_application_process_id",
             "graphics_supervisor_phase":self.graphics_supervisor_phase,
+            "nvdrv_open_devices":self.nvdrv_fds,
             "hid_registration_implemented":false,
             "window_system_backend_implemented":false,
         });

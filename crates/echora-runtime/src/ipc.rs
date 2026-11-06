@@ -266,12 +266,15 @@ fn align_16(offset: usize) -> Result<usize> {
 }
 
 fn validate_input_range(address: u64, size: u64, kind: &str) -> Result<bool> {
-    if address == 0 && size == 0 {
+    // A zero-size descriptor transfers nothing whatever its address (SDK
+    // ioctl wrappers pass their buffer pointer with size 0 for output-only
+    // ioctls).
+    if size == 0 {
         return Ok(false);
     }
     ensure!(
-        address != 0 && size != 0,
-        "unsupported partially empty IPC {kind} input descriptor"
+        address != 0,
+        "unsupported IPC {kind} input descriptor with a size but no address"
     );
     ensure!(
         size <= MAX_INPUT_BUFFER_SIZE,
@@ -292,11 +295,10 @@ fn parse_auto_select_input(bytes: &[u8], offset: usize) -> Result<InputBuffer> {
     let map_alias = parse_map_alias_input(bytes, offset + 8)?;
     let pointer_active = validate_input_range(pointer.address, pointer.size, "X")?;
     let map_active = validate_input_range(map_alias.address, map_alias.size, "A")?;
-    ensure!(
-        pointer_active || map_active,
-        "IPC AutoSelect input requires one active X/A descriptor"
-    );
-    let (kind, address, size) = if pointer_active && map_active {
+    // Both empty is an empty input (an output-only ioctl, for example).
+    let (kind, address, size) = if !pointer_active && !map_active {
+        (InputBufferKind::Pointer, pointer.address, 0)
+    } else if pointer_active && map_active {
         (
             InputBufferKind::PointerAndMapAlias,
             map_alias.address,
@@ -2157,9 +2159,8 @@ mod tests {
     #[test]
     fn auto_select_rejects_ambiguous_unsafe_or_unsupported_descriptors() {
         for (pointer, map_alias) in [
-            ((0, 0), (0, 0)),
             ((0, 0), (0, 32)),
-            ((0, 0), (0x1000, 0)),
+            ((0, 32), (0, 0)),
             ((0, 0), (GUEST_ADDRESS_SPACE_END, 32)),
             ((GUEST_ADDRESS_SPACE_END, 32), (0, 0)),
             ((0, 0), (GUEST_ADDRESS_SPACE_END - 15, 16)),
@@ -2168,6 +2169,18 @@ mod tests {
         ] {
             assert!(parse_request(&auto_select(pointer, map_alias, None)).is_err());
         }
+        // Zero-size halves are empty whatever their address; both empty is
+        // an empty input.
+        for (pointer, map_alias) in [((0, 0), (0, 0)), ((0x1000, 0), (0x2000, 0))] {
+            let empty = parse_request(&auto_select(pointer, map_alias, None)).unwrap();
+            assert_eq!(empty.input_buffer.unwrap().size, 0);
+        }
+        let half = parse_request(&auto_select((0x1000, 0), (0x2000, 16), None)).unwrap();
+        let half = half.input_buffer.unwrap();
+        assert_eq!(
+            (half.kind, half.address, half.size),
+            (InputBufferKind::MapAlias, 0x2000, 16)
+        );
         // Both active: two inputs, not an AutoSelect choice.
         let both = parse_request(&auto_select((0x1000, 32), (0x2000, 48), None)).unwrap();
         let both = both.input_buffer.unwrap();
