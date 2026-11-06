@@ -641,7 +641,7 @@ const CREDITS: [(&str, &str); 6] = [
     ("Switchbrew, libnx, Atmosphère", "Format documentation"),
 ];
 
-fn about_page(cx: &mut Context<Launcher>) -> Vec<AnyElement> {
+fn about_page() -> Vec<AnyElement> {
     let mut page = vec![
         div()
             .pt(px(8.0))
@@ -674,24 +674,6 @@ fn about_page(cx: &mut Context<Launcher>) -> Vec<AnyElement> {
             .child(div().text_color(color(palette::TEXT_MUTED)).child(role))
             .into_any_element()
     }));
-    page.push(
-        div()
-            .pt(px(12.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.0))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(color(palette::TEXT_MUTED))
-                    .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
-            )
-            .child(button("source", "Source code").h(px(32.0)).on_click(
-                cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")),
-            ))
-            .into_any_element(),
-    );
     page
 }
 
@@ -706,6 +688,8 @@ fn scrim(
         .absolute()
         .inset_0()
         .rounded(corner)
+        // Keeps sheets inside the window on small or scaled displays.
+        .p(px(24.0))
         .flex()
         .items_center()
         .justify_center()
@@ -713,6 +697,24 @@ fn scrim(
         .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
         // Clicks inside the sheet must not reach the scrim behind it.
         .child(sheet.on_click(|_, _, cx| cx.stop_propagation()))
+}
+
+/// A frosted-glass version of the backdrop: shrunk, then blurred with its
+/// edge pixels repeated so the borders don't darken. The GPU scales it back
+/// up, which smooths it further.
+fn frost(art: &image::RgbaImage) -> image::RgbaImage {
+    use image::imageops::{self, FilterType};
+    const WIDTH: u32 = 160;
+    const PAD: u32 = 24;
+    let height = (art.height() * WIDTH / art.width().max(1)).max(1);
+    let small = imageops::resize(art, WIDTH, height, FilterType::Triangle);
+    let padded = image::RgbaImage::from_fn(WIDTH + 2 * PAD, height + 2 * PAD, |x, y| {
+        let x = x.saturating_sub(PAD).min(WIDTH - 1);
+        let y = y.saturating_sub(PAD).min(height - 1);
+        *small.get_pixel(x, y)
+    });
+    let blurred = imageops::fast_blur(&padded, 7.0);
+    imageops::crop_imm(&blurred, PAD, PAD, WIDTH, height).to_image()
 }
 
 /// A thin line between settings rows.
@@ -752,7 +754,7 @@ impl Launcher {
             .is_none_or(|backdrop| backdrop.crop != crop)
         {
             let (x, y, w, h) = crop;
-            let pixels = image::imageops::crop_imm(art, x, y, w, h).to_image();
+            let pixels = frost(&image::imageops::crop_imm(art, x, y, w, h).to_image());
             let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));
             if let Some(old) = self.backdrop.replace(Backdrop { crop, image }) {
                 let _ = window.drop_image(old.image);
@@ -1078,8 +1080,8 @@ impl Launcher {
             .id("sheet")
             .w_full()
             .max_w(px(760.0))
-            .mx(px(24.0))
             .h(px(420.0))
+            .max_h_full()
             .flex()
             .rounded(px(16.0))
             .border_1()
@@ -1090,12 +1092,16 @@ impl Launcher {
         scrim(sheet, self.corner, cx)
     }
 
-    fn render_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_about(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Room left for the credits once the window frame, the sheet's
+        // margins, header and footer are taken out.
+        let inset = window.client_inset().unwrap_or(px(0.0)) * 2.0;
+        let body = (window.viewport_size().height - inset - px(190.0)).max(px(80.0));
         let sheet = div()
             .id("about")
-            .w_full()
-            .max_w(px(560.0))
-            .mx(px(24.0))
+            // A fixed width (the window is at least 720 wide) so wrapped
+            // text is measured at its real width.
+            .w(px(560.0))
             .flex()
             .flex_col()
             .px(px(24.0))
@@ -1127,11 +1133,37 @@ impl Launcher {
                                     .child(env!("CARGO_PKG_VERSION")),
                             ),
                     )
-                    .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
-                        |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
-                    ))),
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(button("source", "Source code").h(px(32.0)).on_click(
+                                cx.listener(|_, _, _, cx| {
+                                    cx.open_url("https://github.com/Mars7x/echora")
+                                }),
+                            ))
+                            .child(button("done", "Done").h(px(32.0)).on_click(cx.listener(
+                                |this, _, window, cx| this.close_sheet(&CloseSheet, window, cx),
+                            ))),
+                    ),
             )
-            .children(about_page(cx));
+            .child(
+                div()
+                    .id("about-body")
+                    // Wrapped text is measured late; never let the credits
+                    // shrink to make room for it, only cap them below.
+                    .flex_none()
+                    .max_h(body)
+                    .overflow_y_scroll()
+                    .children(about_page()),
+            )
+            .child(
+                div()
+                    .pt(px(12.0))
+                    .text_xs()
+                    .text_color(color(palette::TEXT_MUTED))
+                    .child("GPL-3.0-or-later. Not affiliated with Nintendo."),
+            );
         scrim(sheet, self.corner, cx)
     }
 
@@ -1224,7 +1256,7 @@ impl Launcher {
 }
 
 /// Space around the window for the shadow and the resize handles.
-const WINDOW_INSET: f32 = 12.0;
+const WINDOW_INSET: f32 = 16.0;
 const WINDOW_RADIUS: f32 = 14.0;
 
 impl Render for Launcher {
@@ -1243,12 +1275,22 @@ impl Render for Launcher {
             .when(floating, |el| {
                 el.border_1()
                     .border_color(color(palette::WINDOW_BORDER))
-                    .shadow(vec![BoxShadow {
-                        color: Hsla::black().opacity(0.45),
-                        blur_radius: inset * 0.75,
-                        spread_radius: px(0.0),
-                        offset: point(px(0.0), px(2.0)),
-                    }])
+                    // Faint, like the desktop's own window shadows: a soft
+                    // drop and a hairline that separates the edge.
+                    .shadow(vec![
+                        BoxShadow {
+                            color: Hsla::black().opacity(0.18),
+                            blur_radius: px(10.0),
+                            spread_radius: px(0.0),
+                            offset: point(px(0.0), px(2.0)),
+                        },
+                        BoxShadow {
+                            color: Hsla::black().opacity(0.12),
+                            blur_radius: px(1.0),
+                            spread_radius: px(0.0),
+                            offset: point(px(0.0), px(0.0)),
+                        },
+                    ])
             });
         div()
             .id("window")
@@ -1368,7 +1410,7 @@ impl Launcher {
             .when_some(self.sheet, |el, sheet| {
                 el.child(match sheet {
                     Sheet::Settings => self.render_settings(cx).into_any_element(),
-                    Sheet::About => self.render_about(cx).into_any_element(),
+                    Sheet::About => self.render_about(window, cx).into_any_element(),
                 })
             })
     }
