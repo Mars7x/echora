@@ -80,6 +80,22 @@ reproduces libzstd's own frames byte for byte. On the checked input all three
 
 `main` has NSO flags `0xff`: bits 0-5 as usual, bit 7 ZBIC, bit 6 unknown.
 
+## Module metadata
+
+From `echora load` on the checked input. Every module has MOD0 and a dynamic
+section, and every symbol table is indexed by `DT_GNU_HASH` only (no
+`DT_HASH`). Relative relocations are packed as RELR.
+
+| Module | soname / needs | Symbols (defined/undefined) | RELA (ABS64, GLOB_DAT) | RELR | JUMP_SLOT | init_array |
+|---|---|---|---|---|---|---|
+| `rtld` | `nnrtld.nss` | 3 (0/2) | 1 (0, 1) | 2 | 1 | 0 |
+| `main` | needs `movie.nss`, `nnSdk.nss` | 1,249 (65/1,183) | 2,051 (2,004, 47) | 10,138 | 1,110 | 9,783 |
+| `subsdk0` | `movie.nss` | 1,083 (824/258) | 462 (420, 42) | 16 | 506 | 0 |
+| `sdk` | `nnSdk.nss` | 28,707 (28,698/8) | 10,857 (9,414, 1,443) | 531 | 10,082 | 96 |
+
+The guest rtld applies these relocations at startup; the host only validates
+and reports them.
+
 ## Licensing decision
 
 Echora is GPL-3.0-or-later, matching Pokopia so its code can be carried over,

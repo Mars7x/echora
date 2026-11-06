@@ -115,8 +115,8 @@ fn exefs_order_and_required_modules() {
     assert!(exefs_load_order(dir.path()).is_err());
 }
 
-/// Loads a real ExeFS, including ZBIC modules, and checks every enabled
-/// segment hash: `ECHORA_TEST_EXEFS=/path/exefs cargo test -p echora-loader -- --ignored`.
+/// Loads a real ExeFS, including ZBIC modules, checks every enabled segment
+/// hash and requires MOD0 dynamic metadata with a counted symbol table: `ECHORA_TEST_EXEFS=/path/exefs cargo test -p echora-loader -- --ignored`.
 #[test]
 #[ignore = "needs a user-supplied ExeFS in ECHORA_TEST_EXEFS"]
 fn real_exefs_loads_with_verified_hashes() {
@@ -130,5 +130,12 @@ fn real_exefs_loads_with_verified_hashes() {
                 m.name
             );
         }
+        let dynamic = m.mod0.as_ref().and_then(|i| i.dynamic.as_ref());
+        let symbols = dynamic.and_then(|d| d.symbol_table.as_ref());
+        assert!(
+            symbols.and_then(|t| t.count).is_some(),
+            "{}: no counted symbol table",
+            m.name
+        );
     }
 }

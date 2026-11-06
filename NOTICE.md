@@ -33,7 +33,8 @@ these separately; preserve their notices when redistributing builds.
   independent Rust implementation of that specification.
 - [pokopia-recomp](https://github.com/Mars7x/pokopia-recomp) (GPL-3.0-or-later),
   the design basis for Echora's recompiler and runtime.
-  `crates/echora-loader/src/nso.rs` is adapted from its `src/loader/nso.rs`.
+  `crates/echora-loader/src/nso.rs` and `mod0.rs` are adapted from its
+  `src/loader/nso.rs` and `src/loader/mod0.rs`.
 - [kinnay/zbic](https://github.com/kinnay/zbic) (GPLv2) was studied to learn
   the ZBIC format; Echora's decoder contains no code from it.
 - Zstandard format: RFC 8878.

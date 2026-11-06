@@ -33,7 +33,9 @@ display version 1.1.1):
   data)
   and every segment matches the SHA-256 stored in its NSO header. `main` uses
   ZBIC, a Zstandard variant from Switch firmware 22, which Echora decodes by
-  transcoding to standard Zstandard. Loading takes about 0.2 s.
+  transcoding to standard Zstandard. MOD0 and dynamic-section metadata
+  (GNU-hash symbol tables, RELA/RELR/PLT relocations, init arrays) are
+  validated for every module. Loading takes about 0.2 s.
 - **No game code runs yet.** The recompiler and runtime are next; see the
   [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux

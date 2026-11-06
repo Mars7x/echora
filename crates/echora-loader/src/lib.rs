@@ -3,6 +3,7 @@
 //! Loading parses, decompresses and verifies modules; it never executes guest
 //! code or applies relocations (the guest's own rtld does that at startup).
 
+pub mod mod0;
 pub mod nso;
 pub mod zbic;
 
@@ -10,6 +11,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub use mod0::{DynamicInfo, Mod0Info, defined_symbol};
 pub use nso::{Compression, NsoModule, Segment};
 
 /// Combined mapped size of all modules of one process.

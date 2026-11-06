@@ -70,6 +70,7 @@ pub struct NsoModule {
     pub bss_size: u32,
     /// Size of the mapped image (segments plus BSS), rounded up to 4 KiB.
     pub image_size: u64,
+    pub mod0: Option<crate::mod0::Mod0Info>,
 }
 
 impl NsoModule {
@@ -233,7 +234,7 @@ pub fn parse(name: &str, bytes: &[u8], image_limit: u64) -> Result<NsoModule> {
     let (Some(text), Some(rodata), Some(data)) = (it.next(), it.next(), it.next()) else {
         unreachable!("three segments were parsed")
     };
-    Ok(NsoModule {
+    let mut module = NsoModule {
         name: name.to_owned(),
         build_id,
         flags,
@@ -242,7 +243,10 @@ pub fn parse(name: &str, bytes: &[u8], image_limit: u64) -> Result<NsoModule> {
         data,
         bss_size,
         image_size,
-    })
+        mod0: None,
+    };
+    module.mod0 = crate::mod0::analyze(&module).map_err(|e| ctx(format!("MOD0 metadata: {e}")))?;
+    Ok(module)
 }
 
 /// Fails if any two nonempty `(start, len)` ranges overlap.

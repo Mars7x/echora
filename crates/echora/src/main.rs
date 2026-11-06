@@ -171,6 +171,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                             }
                         );
                     }
+                    print_mod0(m);
                 }
             }
             tracing::info!(?elapsed, modules = modules.len(), "ExeFS loaded");
@@ -205,6 +206,58 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_mod0(m: &echora_loader::NsoModule) {
+    let Some(info) = &m.mod0 else {
+        println!("  MOD0   absent");
+        return;
+    };
+    println!(
+        "  MOD0   at {:#x}, bss {:#x}..{:#x}, unwind {:#x} bytes",
+        info.memory_offset,
+        info.bss_start,
+        info.bss_end,
+        info.unwind_end - info.unwind_start
+    );
+    let Some(d) = &info.dynamic else {
+        println!("  dynamic absent");
+        return;
+    };
+    print!("  dynamic {} entries", d.entries.len());
+    if let Some(name) = &d.soname {
+        print!(", soname {name}");
+    }
+    if !d.needed_libraries.is_empty() {
+        print!(", needs {}", d.needed_libraries.join(" "));
+    }
+    println!();
+    if let Some(t) = &d.symbol_table {
+        let hashes = match (t.has_sysv_hash, t.has_gnu_hash) {
+            (true, true) => "SysV+GNU",
+            (true, false) => "SysV",
+            (false, true) => "GNU only",
+            (false, false) => "none",
+        };
+        println!(
+            "  symbols {} ({} defined, {} undefined), hash {hashes}",
+            t.count.map_or("?".into(), |c| c.to_string()),
+            t.defined_count.unwrap_or(0),
+            t.undefined_count.unwrap_or(0)
+        );
+    }
+    for r in &d.relocation_tables {
+        let types: Vec<_> = r.types.iter().map(|(t, n)| format!("{t}x{n}")).collect();
+        println!(
+            "  {:<12} {} entries  types {}",
+            r.kind,
+            r.count,
+            types.join(" ")
+        );
+    }
+    if let Some(a) = &d.init_array {
+        println!("  init_array {} entries", a.count);
+    }
 }
 
 fn hex_prefix(id: &[u8; 32]) -> String {

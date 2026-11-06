@@ -1,7 +1,6 @@
 # Known limitations
 
 - Game code is loaded and verified but not yet translated or executed.
-- MOD0 and dynamic-section metadata are not parsed yet.
 - NSO flag bit 6 (`0x40`) is set in `main` alongside the ZBIC bit; its meaning
   is unknown. It is accepted only together with ZBIC, and segment hashes
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
