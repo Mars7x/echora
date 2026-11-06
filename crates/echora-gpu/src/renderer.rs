@@ -1572,6 +1572,16 @@ impl Renderer {
     }
 
     /// Whether images of `format` can be storage images (compute writes).
+    /// The UNORM twin an sRGB format stores through, when that twin
+    /// supports storage.
+    pub fn storage_twin(&self, format: vk::Format) -> Option<vk::Format> {
+        let srgb = matches!(
+            format,
+            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+        );
+        srgb_twin(format).filter(|twin| srgb && self.supports_storage(*twin))
+    }
+
     pub fn supports_storage(&self, format: vk::Format) -> bool {
         // SAFETY: the instance and physical device are live.
         unsafe {
@@ -1733,7 +1743,7 @@ impl Renderer {
         levels: u32,
         scale: Scale,
     ) -> Result<Target, String> {
-        let storage = if self.supports_storage(format) {
+        let storage = if self.supports_storage(format) || self.storage_twin(format).is_some() {
             vk::ImageUsageFlags::STORAGE
         } else {
             vk::ImageUsageFlags::empty()
@@ -1882,6 +1892,45 @@ impl Renderer {
 
     /// A 2D view of one mip level of target `key` (the target's own view
     /// when it has a single level), for attachments and storage images.
+    /// A view of mip level `level` of target `key` in `format` (a format
+    /// the target was created to allow), for storage through a twin.
+    pub(crate) fn level_view_as(
+        &mut self,
+        key: u64,
+        level: u32,
+        format: vk::Format,
+    ) -> Result<vk::ImageView, String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if format == target.format {
+            return self.level_view(key, level);
+        }
+        if level >= target.levels {
+            return Err(format!("level {level} of a {}-level target", target.levels));
+        }
+        // Keyed apart from level_view's (i32::MAX - level) entries.
+        let cache = (target.image, i32::MIN + format.as_raw() * 32 + level as i32);
+        if let Some(view) = self.extra_views.get(&cache) {
+            return Ok(*view);
+        }
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::STORAGE);
+        let info = vk::ImageViewCreateInfo::default()
+            .image(target.image)
+            .view_type(own_view_type(target.shape))
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                base_mip_level: level,
+                level_count: 1,
+                layer_count: target.shape.layers(),
+                ..range(target.format)
+            })
+            .push_next(&mut usage);
+        // SAFETY: the image is live; the view is destroyed with it.
+        let view = unsafe { self.gpu.device.create_image_view(&info, None) }
+            .map_err(vk_error("vkCreateImageView"))?;
+        self.extra_views.insert(cache, view);
+        Ok(view)
+    }
+
     pub(crate) fn level_view(&mut self, key: u64, level: u32) -> Result<vk::ImageView, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
         if target.levels == 1 && level == 0 {
@@ -1975,11 +2024,21 @@ impl Renderer {
         // view's format): listed, so the driver keeps its compression.
         // Storage images stay single-format: sRGB formats have no storage
         // use, which a listed view format would need.
-        let twin = srgb_twin(format).filter(|_| !usage.contains(vk::ImageUsageFlags::STORAGE));
+        // An sRGB format stores through its UNORM twin (image stores do
+        // no sRGB encoding): STORAGE then applies to the twin's view only,
+        // which EXTENDED_USAGE allows.
+        let store_twin = self.storage_twin(format);
+        let twin = srgb_twin(format)
+            .filter(|_| !usage.contains(vk::ImageUsageFlags::STORAGE) || store_twin.is_some());
         let listed = [format, twin.unwrap_or(format)];
         let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&listed);
         let flags = if twin.is_some() {
             flags | vk::ImageCreateFlags::MUTABLE_FORMAT
+        } else {
+            flags
+        };
+        let flags = if store_twin.is_some() && usage.contains(vk::ImageUsageFlags::STORAGE) {
+            flags | vk::ImageCreateFlags::EXTENDED_USAGE
         } else {
             flags
         };

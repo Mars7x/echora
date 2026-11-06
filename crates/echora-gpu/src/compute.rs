@@ -97,12 +97,16 @@ impl Renderer {
                     .existing_target(key)
                     .ok_or("compute image is not a target")?
                     .format;
-                if !self.supports_storage(format) {
-                    return Err(format!("storage image format {format:?} is not supported"));
-                }
+                let view_format = if self.supports_storage(format) {
+                    format
+                } else {
+                    self.storage_twin(format).ok_or_else(|| {
+                        format!("storage image format {format:?} is not supported")
+                    })?
+                };
                 self.transition(key, vk::ImageLayout::GENERAL)?;
                 // Storage image views name one mip level.
-                let image_view = self.level_view(key, level)?;
+                let image_view = self.level_view_as(key, level, view_format)?;
                 storage_images.push((
                     binding,
                     [vk::DescriptorImageInfo {

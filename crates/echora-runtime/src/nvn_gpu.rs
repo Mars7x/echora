@@ -2327,16 +2327,25 @@ impl Nvn {
         // address and size), storage buffers (16 bytes), texture handles
         // (8 bytes), image handles (8 bytes). The counts are bytes 0xb1 (+1),
         // 0xb2, 0xb3 and 0xb6 of the control section, whose word 0xb8 holds
-        // the table's size in its high half (inferred; it matches all 472
-        // compute programs dumped).
+        // the table's size in its high half (inferred from the compute
+        // programs dumped).
         let mut header = [0u8; 12];
         core.memory
             .read(control + 0xb0, &mut header)
             .map_err(|trap| format!("compute control section: {trap:?}"))?;
-        let storage_base = 16 * (u32::from(header[1]) + 1);
-        let texture_base = storage_base + 16 * u32::from(header[2]);
-        let image_base = texture_base + 8 * u32::from(header[3]);
-        let table_end = image_base + 8 * u32::from(header[6]);
+        // The resources are packed against the table's end: uniform
+        // buffers may be followed by padding (program 0xf9e5b02b5fabff78:
+        // one uniform buffer, textures from 0x50 in a 0x70-byte table), so
+        // the bases count back from the size.
+        let table_end = u32::from(u16::from_le_bytes([header[10], header[11]]));
+        let image_base = table_end.saturating_sub(8 * u32::from(header[6]));
+        let texture_base = image_base.saturating_sub(8 * u32::from(header[3]));
+        let storage_base = texture_base.saturating_sub(16 * u32::from(header[2]));
+        if storage_base < 16 * (u32::from(header[1]) + 1) {
+            return Err(format!(
+                "compute resource table {header:02x?} overlaps its uniform buffers"
+            ));
+        }
         let slot = |descriptor: &shader::Descriptor, kind: DescriptorKind| -> Option<u32> {
             if descriptor.cbuf_index != 0 {
                 return None;
@@ -2359,10 +2368,11 @@ impl Nvn {
         };
         let unplaced = |descriptor: &shader::Descriptor| {
             format!(
-                "{:?} binding at c{}+{:#x} in compute: {layout}",
+                "{:?} binding at c{}+{:#x} in compute (control 0xb0.. {:02x?}): {layout}",
                 descriptor.kind(),
                 descriptor.cbuf_index,
-                descriptor.cbuf_offset
+                descriptor.cbuf_offset,
+                header
             )
         };
         let mut c0 = vec![0u8; (table_end as usize).max(0x100)];
