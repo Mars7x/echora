@@ -418,6 +418,8 @@ enum ReadableEventKind {
     },
     /// Video decoder GetInputEvent (3): signaled while input is accepted.
     VideoDecoderInput,
+    /// Library applet state-changed and pop-out-data events.
+    LibraryApplet,
     /// nifm IRequest state-change and second event.
     NetworkRequest,
     /// hid AcquireNpadStyleSetUpdateEventHandle (106); no controller
@@ -592,6 +594,19 @@ enum ServiceObject {
     },
     LibraryAppletCreator {
         application: MainApplicationIdentity,
+    },
+    /// ILibraryAppletAccessor; its state is `Services::library_applets[id]`.
+    LibraryAppletAccessor {
+        id: usize,
+    },
+    /// A writable IStorage made by the library applet creator or an
+    /// applet, and its IStorageAccessor; contents in
+    /// `Services::applet_storages[id]`.
+    LibraryStorage {
+        id: usize,
+    },
+    LibraryStorageAccessor {
+        id: usize,
     },
     ApplicationFunctions {
         application: MainApplicationIdentity,
@@ -835,6 +850,9 @@ impl ServiceObject {
             Self::DisplayController { .. } => "appletOE:display_controller",
             Self::ProcessWindingController { .. } => "appletOE:process_winding_controller",
             Self::LibraryAppletCreator { .. } => "appletOE:library_applet_creator",
+            Self::LibraryAppletAccessor { .. } => "appletOE:library_applet_accessor",
+            Self::LibraryStorage { .. } => "appletOE:library_storage",
+            Self::LibraryStorageAccessor { .. } => "appletOE:library_storage_accessor",
             Self::ApplicationFunctions { .. } => "appletOE:application_functions",
             Self::PerformanceFunctions => "appletOE:performance_functions",
             Self::GraphicsScalingParametersFunctions { .. } => {
@@ -1069,10 +1087,17 @@ pub struct Services {
     decoder_frames: BTreeMap<u32, u32>,
     /// Whether the video decoder was started (6) and not stopped (207).
     video_decoder_running: bool,
+    /// Frames handed back to the decoder (command 314).
+    returned_frames: u64,
     /// Video decoder submissions so far and the queued input (id,
     /// timestamp argument, bitstream).
     video_submissions: u64,
     video_input: Vec<(u64, u64, Vec<u8>)>,
+    /// Library applets and applet storages.
+    library_applets: Vec<LibraryApplet>,
+    applet_storages: Vec<Vec<u8>>,
+    /// ISelfController GetLibraryAppletLaunchableEvent (9), always signaled.
+    library_applet_launchable_event: Option<ReadableEventId>,
     terminate_result: Option<u32>,
     /// hid applet resource shared memory, once created.
     hid_memory: Option<u32>,
@@ -1180,8 +1205,12 @@ impl Default for Services {
             decoder_image_pools: BTreeMap::new(),
             decoder_frames: BTreeMap::new(),
             video_decoder_running: false,
+            returned_frames: 0,
             video_submissions: 0,
             video_input: Vec::new(),
+            library_applets: Vec::new(),
+            applet_storages: Vec::new(),
+            library_applet_launchable_event: None,
             terminate_result: None,
             ssl_next_id: 0,
             streamplay_hid_memory: None,
@@ -1547,6 +1576,27 @@ fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
         ready += i32::from(revents != 0);
     }
     ready
+}
+
+/// AppletId of the controller applet (yuzu applet AppletId::Controller).
+const LIBRARY_APPLET_CONTROLLER: u32 = 0x0c;
+
+/// A library applet created through ILibraryAppletCreator: its id and
+/// mode, the storages pushed in and waiting to be popped, and its events.
+#[derive(Clone, Debug, Default, Serialize)]
+struct LibraryApplet {
+    applet_id: u32,
+    mode: u32,
+    in_data: Vec<usize>,
+    out_data: std::collections::VecDeque<usize>,
+    started: bool,
+    completed: bool,
+    #[serde(skip)]
+    state_event: Option<ReadableEventId>,
+    #[serde(skip)]
+    pop_out_event: Option<ReadableEventId>,
+    #[serde(skip)]
+    event_170: Option<ReadableEventId>,
 }
 
 struct Outcome {
@@ -2373,18 +2423,21 @@ impl Services {
                     .insert("appletOE:video_decoder:start_stop");
                 Ok(Outcome::success())
             }
-            // VideoDecoderSession 314 (DestroyFrame): u32 frame from 311 and
-            // 28 bytes OoT leaves zero; no reply data (inferred). The frame
-            // is forgotten.
+            // VideoDecoderSession 314 (named DestroyFrame on Switchbrew; the
+            // SDK's client at sdk+0x331730 is 311's counterpart): u32 frame
+            // slot handle, u32 0, the slot's previous 16-byte value and u64
+            // 0 -> 16 bytes the SDK stores back into the slot before putting
+            // it on its free ring (sdk+0x331810), so it hands a frame back to
+            // the decoder. Answered like 311. With no host decoder no frame
+            // ever comes out, and OoT calls it continuously; the calls are
+            // counted. Provisional.
             ServiceObject::VideoDecoder if call.request.command_id == 314 => {
                 call.shape(32, false, false)?;
-                let frame = crate::bytes::le_u32(&call.request.arguments[..4]);
-                if self.decoder_frames.remove(&frame).is_none() {
-                    return Err(
-                        call.unsupported(object.service(), format!("destroy of frame {frame}"))
-                    );
-                }
-                call.reply(0, None, 0, &[])?;
+                let slot = crate::bytes::le_u32(&call.request.arguments[..4]);
+                let mut reply = u64::from(slot).to_le_bytes().to_vec();
+                reply.extend_from_slice(&0u64.to_le_bytes());
+                call.reply(0, None, 0, &reply)?;
+                self.returned_frames += 1;
                 self.provisional_commands
                     .insert("appletOE:video_decoder:314");
                 Ok(Outcome::success())
@@ -2522,6 +2575,12 @@ impl Services {
             ServiceObject::ApplicationProxyService if call.request.command_id == 10 => {
                 self.open_application_proxy(call)
             }
+            ServiceObject::LibraryAppletCreator { .. }
+            | ServiceObject::LibraryAppletAccessor { .. }
+            | ServiceObject::LibraryStorage { .. }
+            | ServiceObject::LibraryStorageAccessor { .. } => {
+                self.library_applet(&object.clone(), call)
+            }
             ServiceObject::ApplicationProxy { application } if call.request.command_id == 1 => {
                 self.open_self_controller(application, call)
             }
@@ -2578,6 +2637,21 @@ impl Services {
                 }
                 call.reply(0, None, SELF_CONTROLLER_INTERFACE_ID, &data)?;
                 Ok(Outcome::success())
+            }
+            // GetLibraryAppletLaunchableEvent (9; Switchbrew "Applet Manager
+            // services"): a copied event, signaled while library applets can
+            // be launched, which on the host is always (Eden signals it too).
+            ServiceObject::SelfController { application } if call.request.command_id == 9 => {
+                call.shape(0, false, false)?;
+                if self.main_application.as_ref() != Some(application) {
+                    return Err(invalid(
+                        "self-controller owner must match the trusted bootstrap main application",
+                    ));
+                }
+                let slot = self.library_applet_launchable_event;
+                let (event, outcome) = self.reply_applet_event(call, slot, true)?;
+                self.library_applet_launchable_event = Some(event);
+                Ok(outcome)
             }
             // SetIdleTimeDetectionExtension (62, u32) and
             // GetIdleTimeDetectionExtension (63) (Switchbrew "Applet Manager
@@ -3760,6 +3834,292 @@ impl Services {
                 Ok(Outcome::success())
             }
             _ => Err(call.unsupported(object.service(), "audio command is not implemented")),
+        }
+    }
+
+    /// A copied handle to `slot`'s event (created on first use, never
+    /// auto-cleared), signaled now when `signaled`.
+    fn reply_applet_event(
+        &mut self,
+        call: &mut Call<'_>,
+        slot: Option<ReadableEventId>,
+        signaled: bool,
+    ) -> Result<(ReadableEventId, Outcome), Trap> {
+        let application = self
+            .main_application
+            .clone()
+            .ok_or_else(|| invalid("applet events require the main application"))?;
+        let event = match slot {
+            Some(event) => event,
+            None => {
+                if self.readable_events.len() >= MAX_READABLE_EVENTS {
+                    return Err(invalid("readable event backing capacity exhausted"));
+                }
+                ReadableEventId(
+                    self.readable_events
+                        .keys()
+                        .map(|id| id.0)
+                        .max()
+                        .unwrap_or(0)
+                        + 1,
+                )
+            }
+        };
+        let handle = self.next_available_handle()?;
+        let reply = call.prepare_copy_handle_reply(handle, 0)?;
+        call.write_reply(&reply)?;
+        let entry = self.readable_events.entry(event).or_insert(ReadableEvent {
+            owner: application,
+            kind: ReadableEventKind::LibraryApplet,
+            signaled: false,
+        });
+        entry.signaled |= signaled;
+        self.readable_event_handles.insert(handle, event);
+        self.next_handle = handle + 1;
+        Ok((
+            event,
+            Outcome {
+                output_copy_handle_count: 1,
+                ..Outcome::success()
+            },
+        ))
+    }
+
+    /// Library applets (Switchbrew "Applet Manager services"): the creator,
+    /// ILibraryAppletAccessor, IStorage and IStorageAccessor. Applets run
+    /// on the host: the controller applet completes as soon as it starts,
+    /// reporting the one connected controller; others stop when started.
+    fn library_applet(
+        &mut self,
+        object: &ServiceObject,
+        call: &mut Call<'_>,
+    ) -> Result<Outcome, Trap> {
+        let command = call.request.command_id;
+        let service = object.service();
+        let reply_u64 =
+            |call: &mut Call<'_>, value: u64| call.reply(0, None, 0, &value.to_le_bytes());
+        match (object, command) {
+            // CreateLibraryAppletOld (0: u32 AppletId, u32 mode) and
+            // CreateLibraryApplet (3, [20.0.0+]: the same and a u64 thread
+            // id) -> ILibraryAppletAccessor.
+            (ServiceObject::LibraryAppletCreator { .. }, 0 | 3) => {
+                call.shape(if command == 0 { 8 } else { 16 }, false, false)?;
+                let arguments = &call.request.arguments;
+                let applet = LibraryApplet {
+                    applet_id: crate::bytes::le_u32(&arguments[..4]),
+                    mode: crate::bytes::le_u32(&arguments[4..8]),
+                    ..LibraryApplet::default()
+                };
+                if self.library_applets.len() >= 64 {
+                    return Err(invalid("library applet capacity exhausted"));
+                }
+                let id = self.library_applets.len();
+                self.library_applets.push(applet);
+                self.reply_new_object(call, ServiceObject::LibraryAppletAccessor { id }, 0)
+            }
+            // CreateStorage (10): s64 size -> IStorage of that many zeros.
+            (ServiceObject::LibraryAppletCreator { .. }, 10) => {
+                call.shape(8, false, false)?;
+                let size = crate::bytes::le_u64(&call.request.arguments[..8]);
+                if size > 0x100_0000 || self.applet_storages.len() >= 4096 {
+                    return Err(call.unsupported(service, format!("storage of {size:#x} bytes")));
+                }
+                let id = self.applet_storages.len();
+                self.applet_storages.push(vec![0; size as usize]);
+                self.reply_new_object(call, ServiceObject::LibraryStorage { id }, 0)
+            }
+            // IStorage Open (0) -> IStorageAccessor.
+            (ServiceObject::LibraryStorage { id }, 0) => {
+                call.shape(0, false, false)?;
+                let id = *id;
+                self.reply_new_object(call, ServiceObject::LibraryStorageAccessor { id }, 0)
+            }
+            // IStorageAccessor GetSize (0) -> s64; Write (10: s64 offset,
+            // input buffer); Read (11: s64 offset, output buffer).
+            (ServiceObject::LibraryStorageAccessor { id }, 0) => {
+                call.shape(0, false, false)?;
+                let size = self.applet_storages[*id].len() as u64;
+                reply_u64(call, size)?;
+                Ok(Outcome::success())
+            }
+            (ServiceObject::LibraryStorageAccessor { id }, 10 | 11) => {
+                if call.request.arguments.len() != 8 {
+                    return Err(call.unsupported(
+                        service,
+                        format!("storage access ({})", call.request.describe()),
+                    ));
+                }
+                let offset = crate::bytes::le_u64(&call.request.arguments[..8]) as usize;
+                let (address, size) = if command == 10 {
+                    call.request
+                        .input_buffer
+                        .as_ref()
+                        .map(|buffer| (buffer.address, buffer.size))
+                        .ok_or_else(|| invalid("storage Write without data"))?
+                } else {
+                    call.output_buffer()?
+                };
+                let storage = &mut self.applet_storages[*id];
+                let end = offset
+                    .checked_add(size as usize)
+                    .filter(|end| *end <= storage.len());
+                let Some(end) = end else {
+                    // ResultObjectInvalid-style range error: am result 503.
+                    call.reply(0x3e880, None, 0, &[])?;
+                    return Ok(Outcome::result(0x3e880));
+                };
+                if command == 10 {
+                    call.memory.read(address, &mut storage[offset..end])?;
+                } else {
+                    call.memory.write(address, &storage[offset..end])?;
+                }
+                call.reply(0, None, 0, &[])?;
+                Ok(Outcome::success())
+            }
+            // GetAppletStateChangedEvent (0): signaled once the applet ends.
+            (ServiceObject::LibraryAppletAccessor { id }, 0) => {
+                call.shape(0, false, false)?;
+                let id = *id;
+                let applet = &self.library_applets[id];
+                let (event, outcome) =
+                    self.reply_applet_event(call, applet.state_event, applet.completed)?;
+                self.library_applets[id].state_event = Some(event);
+                Ok(outcome)
+            }
+            // 170 ([22.0.0+], unnamed): no input; a copied event the SDK
+            // wraps as a system event next to the state-changed one when it
+            // creates the applet handle (sdk+0x1e3954). What signals it is
+            // not known; it is never signaled here. Provisional.
+            (ServiceObject::LibraryAppletAccessor { id }, 170) => {
+                call.shape(0, false, false)?;
+                let id = *id;
+                let slot = self.library_applets[id].event_170;
+                let (event, outcome) = self.reply_applet_event(call, slot, false)?;
+                self.library_applets[id].event_170 = Some(event);
+                self.provisional_commands
+                    .insert("appletOE:library_applet_accessor:170");
+                Ok(outcome)
+            }
+            // IsCompleted (1) -> u8.
+            (ServiceObject::LibraryAppletAccessor { id }, 1) => {
+                call.shape(0, false, false)?;
+                let completed = u32::from(self.library_applets[*id].completed);
+                call.reply(0, None, 0, &completed.to_le_bytes())?;
+                Ok(Outcome::success())
+            }
+            // Start (10), and 90 ([20.0.0+], unnamed), which the SDK's
+            // StartLibraryApplet sends instead with 32 bytes (sdk+0x1e3b94;
+            // OoT's are zero): the applet runs to completion on the host.
+            (ServiceObject::LibraryAppletAccessor { id }, 10 | 90) => {
+                call.shape(if command == 90 { 32 } else { 0 }, false, false)?;
+                let id = *id;
+                // The low byte is the AppletId; OoT's controller applet is
+                // 0x0100000c (the high byte's meaning is not known).
+                let output = match self.library_applets[id].applet_id & 0xff {
+                    LIBRARY_APPLET_CONTROLLER => {
+                        // ControllerSupportResultInfo (yuzu applet_controller.h):
+                        // s8 player count, 3 pad bytes, u32 selected npad id,
+                        // u32 result. One controller, Player 1, success.
+                        let mut info = vec![0u8; 0xc];
+                        info[0] = 1;
+                        info
+                    }
+                    other => {
+                        return Err(call.unsupported(
+                            service,
+                            format!("library applet {other:#x} is not modeled"),
+                        ));
+                    }
+                };
+                let storage = self.applet_storages.len();
+                self.applet_storages.push(output);
+                let applet = &mut self.library_applets[id];
+                applet.started = true;
+                applet.completed = true;
+                applet.out_data.push_back(storage);
+                for event in [applet.state_event, applet.pop_out_event]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(event) = self.readable_events.get_mut(&event) {
+                        event.signaled = true;
+                    }
+                }
+                call.reply(0, None, 0, &[])?;
+                Ok(Outcome::success())
+            }
+            // RequestExit (20) / Terminate (25): the applet has ended.
+            // GetResult (30): success once completed. Focus and GPU slice
+            // settings (50, 60) have nothing to adjust on the host.
+            (ServiceObject::LibraryAppletAccessor { id }, 20 | 25 | 30 | 50 | 60) => {
+                if call.request.arguments.len() > 4 {
+                    return Err(call.unsupported(
+                        service,
+                        format!("applet command ({})", call.request.describe()),
+                    ));
+                }
+                let applet = &mut self.library_applets[*id];
+                if matches!(command, 20 | 25) {
+                    applet.completed = true;
+                }
+                call.reply(0, None, 0, &[])?;
+                Ok(Outcome::success())
+            }
+            // PushInData (100): an IStorage domain object of this session.
+            (ServiceObject::LibraryAppletAccessor { id }, 100) => {
+                let id = *id;
+                let input = call
+                    .request
+                    .domain
+                    .as_ref()
+                    .and_then(|domain| domain.input_objects.first().copied());
+                let storage = input.and_then(|object| {
+                    match self.sessions[&call.handle].object(Some(object)) {
+                        Some(ServiceObject::LibraryStorage { id }) => Some(*id),
+                        _ => None,
+                    }
+                });
+                let Some(storage) = storage else {
+                    return Err(call.unsupported(
+                        service,
+                        format!("PushInData ({})", call.request.describe()),
+                    ));
+                };
+                self.library_applets[id].in_data.push(storage);
+                call.reply(0, None, 0, &[])?;
+                Ok(Outcome::success())
+            }
+            // PopOutData (101) -> IStorage, or am ResultNoDataInChannel
+            // (module 128, description 2) when empty.
+            (ServiceObject::LibraryAppletAccessor { id }, 101) => {
+                call.shape(0, false, false)?;
+                match self.library_applets[*id].out_data.pop_front() {
+                    Some(storage) => self.reply_new_object(
+                        call,
+                        ServiceObject::LibraryStorage { id: storage },
+                        0,
+                    ),
+                    None => {
+                        call.reply(0x480, None, 0, &[])?;
+                        Ok(Outcome::result(0x480))
+                    }
+                }
+            }
+            // GetPopOutDataEvent (105): signaled while output is pending.
+            (ServiceObject::LibraryAppletAccessor { id }, 105) => {
+                call.shape(0, false, false)?;
+                let id = *id;
+                let applet = &self.library_applets[id];
+                let pending = !applet.out_data.is_empty();
+                let (event, outcome) =
+                    self.reply_applet_event(call, applet.pop_out_event, pending)?;
+                self.library_applets[id].pop_out_event = Some(event);
+                Ok(outcome)
+            }
+            _ => Err(call.unsupported(
+                service,
+                format!("library applet command ({})", call.request.describe()),
+            )),
         }
     }
 
@@ -7730,6 +8090,7 @@ impl Services {
             | ReadableEventKind::NfpAvailability
             | ReadableEventKind::SyncpointEvent { .. }
             | ReadableEventKind::VideoDecoderInput
+            | ReadableEventKind::LibraryApplet
             | ReadableEventKind::NetworkRequest
             | ReadableEventKind::BcatProgress
             | ReadableEventKind::NpadStyleSetUpdate
@@ -8050,6 +8411,8 @@ impl Services {
             "video_decoders":self.video_decoders,
             "video_decoding_implemented":false,
             "video_submissions":self.video_submissions,
+            "returned_frames":self.returned_frames,
+            "library_applets":self.library_applets,
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| serde_json::json!({
                 "sample_rate":renderer.parameters.sample_rate,
                 "sample_count":renderer.parameters.sample_count,
@@ -8110,10 +8473,10 @@ impl Services {
         });
         let library_report = serde_json::json!({
             "library_applet_creator_endpoint_implemented":true,
-            "library_applet_creator_model":"immutable_identity_only",
-            "supported_library_applet_creator_commands":[],
-            "library_applet_creation_implemented":false,
-            "library_applet_storage_implemented":false,
+            "library_applet_creator_model":"host_applets_complete_on_start",
+            "supported_library_applet_creator_commands":[0, 3, 10],
+            "library_applet_creation_implemented":true,
+            "library_applet_storage_implemented":true,
             "library_applet_window_backend_implemented":false,
         });
         let common_report = serde_json::json!({
@@ -9566,8 +9929,9 @@ mod tests {
                     || (expected.command == 1
                         && matches!(
                             command,
-                            1 | 2 | 10 | 11 | 12 | 13 | 14 | 16 | 19 | 50 | 91 | 2000 | 2400
+                            1 | 2 | 9 | 10 | 11 | 12 | 13 | 14 | 16 | 19 | 50 | 91 | 2000 | 2400
                         ))
+                    || (expected.command == 11 && matches!(command, 0 | 3 | 10))
                     || (expected.command == 60 && matches!(command, 10 | 1050))
                     || (expected.command == 20
                         && matches!(command, 1 | 20 | 40 | 130 | 320 | 321 | 330))
@@ -9636,14 +10000,14 @@ mod tests {
             assert_eq!(report["library_applet_creator_endpoint_implemented"], true);
             assert_eq!(
                 report["library_applet_creator_model"],
-                "immutable_identity_only"
+                "host_applets_complete_on_start"
             );
             assert_eq!(
                 report["supported_library_applet_creator_commands"],
-                serde_json::json!([])
+                serde_json::json!([0, 3, 10])
             );
-            assert_eq!(report["library_applet_creation_implemented"], false);
-            assert_eq!(report["library_applet_storage_implemented"], false);
+            assert_eq!(report["library_applet_creation_implemented"], true);
+            assert_eq!(report["library_applet_storage_implemented"], true);
             assert_eq!(report["library_applet_window_backend_implemented"], false);
             assert_eq!(report["window_controller_endpoint_implemented"], true);
             assert_eq!(
@@ -9753,8 +10117,9 @@ mod tests {
                     || (expected.command == 1
                         && matches!(
                             command,
-                            1 | 2 | 10 | 11 | 12 | 13 | 14 | 16 | 19 | 50 | 91 | 2000 | 2400
+                            1 | 2 | 9 | 10 | 11 | 12 | 13 | 14 | 16 | 19 | 50 | 91 | 2000 | 2400
                         ))
+                    || (expected.command == 11 && matches!(command, 0 | 3 | 10))
                     || (expected.command == 60 && matches!(command, 10 | 1050))
                     || (expected.command == 20
                         && matches!(command, 1 | 20 | 40 | 130 | 320 | 321 | 330))
