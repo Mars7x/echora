@@ -40,7 +40,7 @@ display version 1.1.1):
   CPU/memory model (ported from pokopia-recomp) translate test programs to
   Rust at build time; they run natively and pass integer, call, atomic,
   exclusive and acquire/release semantics checks. Guest memory works on
-  Linux and Windows (10 1803 or later); macOS has no backend yet.
+  Linux, Windows (10 1803 or later) and macOS.
 - **Code discovery on the real game:** `echora analyze` finds 17.3 million
   instructions, 96.6% of `main`'s text, in 14 s. Every discovered
   instruction form is translated except a single `stg` (memory tagging);
@@ -52,7 +52,7 @@ display version 1.1.1):
   next; see the [roadmap](docs/roadmap.md).
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
   x86-64, Windows x86-64 and macOS ARM64. Synthetic programs run natively on
-  Linux and Windows; no game code runs on any platform.
+  all three; no game code runs on any platform.
 
 ## How it works
 
