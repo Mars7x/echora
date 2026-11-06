@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 astc-decode = "0.3"
+echora-audio.workspace = true
 echora-gpu.workspace = true
 echora-guest.workspace = true
 echora-input.workspace = true
