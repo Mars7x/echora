@@ -3178,12 +3178,25 @@ impl Machine {
                 Ok(())
             }
             0x26 if args[0] as u32 & 0x80000000 != 0 => Ok(()),
-            0x26 => Err(Trap::GuestBreak {
-                pc: self.core.cpu.pc,
-                reason: args[0],
-                address: args[1],
-                size: args[2],
-            }),
+            0x26 => {
+                // The payload (for an SDK abort, the failing Result) goes
+                // to the report's debug messages when it is small and
+                // readable.
+                if (1..=0x100).contains(&args[2]) {
+                    let mut payload = vec![0u8; args[2] as usize];
+                    if self.memory.read(args[1], &mut payload).is_ok() {
+                        let hex: String =
+                            payload.iter().map(|byte| format!("{byte:02x}")).collect();
+                        self.debug_messages.push(format!("break payload: {hex}"));
+                    }
+                }
+                Err(Trap::GuestBreak {
+                    pc: self.core.cpu.pc,
+                    reason: args[0],
+                    address: args[1],
+                    size: args[2],
+                })
+            }
             0x27 => {
                 let size = usize::try_from(args[1])
                     .ok()
