@@ -309,6 +309,8 @@ fn low_mask_cases(word: u32) -> Option<u64> {
 
 /// Most cases a recovered jump table may have.
 const MAX_JUMP_TABLE_ENTRIES: u64 = 65536;
+/// Instructions after a dispatch searched for a hoisted table address.
+const HOISTED_TABLE_WINDOW: u64 = 1024;
 /// Entries read from an unsigned byte table whose bound is not found.
 const UNBOUNDED_BYTE_TABLE_ENTRIES: u64 = 64;
 /// Entries read from an unsigned halfword table whose bound is not found.
@@ -559,7 +561,16 @@ fn jump_table(
             _ => {}
         }
     }
-    let table = table?;
+    // A table address hoisted out of a loop is defined after the dispatch
+    // in program order (main 0x7100b83eb0 reads its table through x30, set
+    // by adrp/add pairs later in the function): when the backward walk
+    // found none, every adrp/add pair writing the table register in the
+    // next instructions must agree on one address.
+    let table = match table {
+        Some(table) => table,
+        None if entry_size != 0 => hoisted_address(pc, table_reg, read_word)?,
+        None => return None,
+    };
     let base = if base_low == Some(u64::MAX) {
         table
     } else {
@@ -618,6 +629,33 @@ fn jump_table(
     targets.sort_unstable();
     targets.dedup();
     Some(targets)
+}
+
+/// The one address that every `adrp reg; add reg, reg, #imm` pair in the
+/// HOISTED_TABLE_WINDOW instructions after `pc` computes, if they agree.
+fn hoisted_address(pc: u64, register: u8, read_word: &dyn Fn(u64) -> Option<u32>) -> Option<u64> {
+    let mut found = None;
+    for index in 1..HOISTED_TABLE_WINDOW {
+        let at = pc + index * 4;
+        let Some(word) = read_word(at) else {
+            break;
+        };
+        if word & 0x9f00_0000 != 0x9000_0000 || (word & 31) as u8 != register {
+            continue;
+        }
+        let next = read_word(at + 4)?;
+        let rd = (next & 31) as u8;
+        let rn = ((next >> 5) & 31) as u8;
+        if next & 0xffc0_0000 != 0x9100_0000 || rd != register || rn != register {
+            return None;
+        }
+        let address = adr_target(word, at, true) + u64::from((next >> 10) & 0xfff);
+        if found.is_some_and(|other| other != address) {
+            return None;
+        }
+        found = Some(address);
+    }
+    found
 }
 
 fn adr_target(word: u32, pc: u64, page: bool) -> u64 {
@@ -2803,6 +2841,42 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
         assert!(translation.instructions.contains_key(&0x102c));
+    }
+
+    #[test]
+    fn hoisted_table_addresses_are_found_after_the_dispatch() {
+        // cmp w1, #2; b.hi 0x1020; adr x0, 0x1020; ldrh w2, [x30, x1, lsl
+        // #1]; add x0, x0, x2, lsl #2; br x0; then the table base x30 set
+        // after the dispatch (adrp x30, 0x2000; add x30, x30, #0); cases.
+        let words = [
+            0x7100_083f, // cmp w1, #2
+            0x5400_00e8, // b.hi 0x1020
+            0x1000_00c0, // adr x0, 0x1020
+            0x7861_7bc2, // ldrh w2, [x30, x1, lsl #1]
+            0x8b02_0800, // add x0, x0, x2, lsl #2
+            0xd61f_0000, // br x0
+            0xb000_001e, // adrp x30, 0x2000
+            0x9100_03de, // add x30, x30, #0
+            0xd65f_03c0, // 0x1020: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 1, 0, 2, 0],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
+        assert!(translation.instructions.contains_key(&0x1028));
     }
 
     #[test]
