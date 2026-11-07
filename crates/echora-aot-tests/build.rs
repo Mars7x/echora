@@ -267,32 +267,34 @@ fn semantic_code(out: &mut String) {
 fn simd_semantic_code(out: &mut String) {
     use echora_lift::simd::SimdOp;
 
-    let covered_simd = |op: &SimdOp| match *op {
-        SimdOp::VecInt { .. }
-        | SimdOp::VecShift { .. }
-        | SimdOp::VecIntElement { .. }
-        | SimdOp::VecIntPairwise { .. }
-        | SimdOp::VecLong { .. }
-        | SimdOp::VecLongElement { .. }
-        | SimdOp::VecNarrow { .. }
-        | SimdOp::VecPairwiseLong { .. }
-        | SimdOp::VecAcross { .. }
-        | SimdOp::VecUnary { .. }
-        | SimdOp::VecPermute { .. }
-        | SimdOp::VecExt { .. }
-        | SimdOp::VecTable { .. }
-        | SimdOp::VecShiftLong { .. }
-        | SimdOp::VecDot { .. }
-        | SimdOp::VecPolyMulLong { .. }
-        | SimdOp::VectorLogical { .. }
-        | SimdOp::DupElement { .. }
-        | SimdOp::DupGeneral { .. }
-        | SimdOp::InsertElement { .. }
-        | SimdOp::InsertGeneral { .. }
-        | SimdOp::MoveToGeneral { .. }
-        | SimdOp::MoveImmediate { .. }
-        | SimdOp::ModifyImmediate { .. } => true,
-        _ => false,
+    let covered_simd = |op: &SimdOp| {
+        matches!(
+            op,
+            SimdOp::VecInt { .. }
+                | SimdOp::VecShift { .. }
+                | SimdOp::VecIntElement { .. }
+                | SimdOp::VecIntPairwise { .. }
+                | SimdOp::VecLong { .. }
+                | SimdOp::VecLongElement { .. }
+                | SimdOp::VecNarrow { .. }
+                | SimdOp::VecPairwiseLong { .. }
+                | SimdOp::VecAcross { .. }
+                | SimdOp::VecUnary { .. }
+                | SimdOp::VecPermute { .. }
+                | SimdOp::VecExt { .. }
+                | SimdOp::VecTable { .. }
+                | SimdOp::VecShiftLong { .. }
+                | SimdOp::VecDot { .. }
+                | SimdOp::VecPolyMulLong { .. }
+                | SimdOp::VectorLogical { .. }
+                | SimdOp::DupElement { .. }
+                | SimdOp::DupGeneral { .. }
+                | SimdOp::InsertElement { .. }
+                | SimdOp::InsertGeneral { .. }
+                | SimdOp::MoveToGeneral { .. }
+                | SimdOp::MoveImmediate { .. }
+                | SimdOp::ModifyImmediate { .. }
+        )
     };
     let covered = |instruction: &echora_lift::aarch64::Instruction| matches!(instruction, echora_lift::aarch64::Instruction::Simd(op) if covered_simd(op));
     sampled_simd_program(
