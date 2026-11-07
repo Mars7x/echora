@@ -6,21 +6,27 @@
 #![allow(unsafe_code)]
 
 use echora_guest::Core;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
-static CORE: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// The core this host thread runs guest code on (parallel workers each
+    /// have their own); the handler runs on the faulting thread.
+    static CORE: Cell<usize> = const { Cell::new(0) };
+}
 
-/// Reports faults with `core`'s context until another core is registered.
-/// The caller keeps `core` in place while guest code runs on it.
+/// Reports faults on this thread with `core`'s context until another core
+/// is registered here. The caller keeps `core` in place while guest code
+/// runs on it.
 pub(crate) fn watch(core: &Core) {
-    CORE.store(core as *const Core as usize, Ordering::Relaxed);
+    CORE.with(|cell| cell.set(core as *const Core as usize));
     #[cfg(unix)]
     unix::install();
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::{CORE, Core, Ordering};
+    use super::{CORE, Core};
+    use std::cell::Cell;
     use std::sync::OnceLock;
 
     /// The handlers this one replaced (SIGSEGV, SIGBUS), restored on a fault.
@@ -43,7 +49,7 @@ mod unix {
     }
 
     extern "C" fn report(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
-        let core = CORE.load(Ordering::Relaxed) as *const Core;
+        let core = CORE.with(Cell::get) as *const Core;
         if !core.is_null() {
             // SAFETY: `watch` registered a core its caller keeps alive while
             // guest code runs; only two integers are read.
