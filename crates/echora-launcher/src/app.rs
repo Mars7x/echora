@@ -268,18 +268,31 @@ fn last_game() -> Option<PathBuf> {
         .filter(|path| path.exists())
 }
 
-/// `echora run GAME` using the `echora` binary next to the launcher.
+/// `echora run GAME` using the `echora` binary next to the launcher, with
+/// no instruction budget: `run` stops test runs after a billion guest
+/// instructions by default (a few seconds), but a player's game runs until
+/// they close it.
 fn game_command(game: &Path, settings: Option<&Path>) -> Option<Command> {
     let echora = std::env::current_exe()
         .ok()
         .map(|exe| exe.with_file_name(format!("echora{}", std::env::consts::EXE_SUFFIX)))
         .filter(|path| path.is_file())?;
     let mut command = Command::new(echora);
-    command.arg("run").arg(game);
+    command.args(run_arguments(game));
     game_environment(&mut command, settings, |name| {
         std::env::var_os(name).is_some()
     });
     Some(command)
+}
+
+/// `run GAME --budget MAX`: the largest budget never runs out.
+fn run_arguments(game: &Path) -> [std::ffi::OsString; 4] {
+    [
+        "run".into(),
+        game.into(),
+        "--budget".into(),
+        u64::MAX.to_string().into(),
+    ]
 }
 
 /// The game's window and sound are on, as a player starting it expects,
@@ -2137,7 +2150,16 @@ impl Launcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{game_environment, split_title};
+    use super::{game_environment, run_arguments, split_title};
+
+    #[test]
+    fn the_game_runs_without_a_budget() {
+        let arguments = run_arguments(std::path::Path::new("game.nup"));
+        assert_eq!(arguments[0], "run");
+        assert_eq!(arguments[1], "game.nup");
+        assert_eq!(arguments[2], "--budget");
+        assert_eq!(arguments[3], u64::MAX.to_string().as_str());
+    }
 
     /// The variables `command` sets for the game, by name.
     fn environment(command: &std::process::Command) -> Vec<(String, Option<String>)> {
