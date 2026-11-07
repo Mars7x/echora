@@ -173,6 +173,9 @@ pub struct Renderer {
     /// Spans the driver refused to import (file-backed memory, on drivers
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
+    /// Storage buffers kept on the GPU between dispatches (see
+    /// `resident_buffer`), by the caller's key: buffer, memory, size.
+    resident: HashMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
     /// How each sampled view was made (image, type, format, range), so a
     /// swizzled copy of it can be made.
     view_infos: HashMap<vk::ImageView, ViewInfo>,
@@ -389,6 +392,7 @@ impl Renderer {
             extra_views: HashMap::new(),
             imported: HashMap::new(),
             import_refused: Default::default(),
+            resident: HashMap::new(),
             view_infos: HashMap::new(),
             fresh_targets: Vec::new(),
             ring: HostBuffer::empty(),
@@ -483,6 +487,157 @@ impl Renderer {
 
     /// Copy `bytes` into the ring at an `alignment`-aligned offset, flushing
     /// first when the ring is full.
+    /// A device-local storage buffer of `size` bytes kept under `key`
+    /// across dispatches (created, or recreated at another size, as
+    /// needed), and whether it is new (its contents undefined).
+    pub fn resident_buffer(&mut self, key: u64, size: u64) -> Result<(vk::Buffer, bool), String> {
+        let size = size.max(16).next_multiple_of(16);
+        if let Some(&(buffer, _, held)) = self.resident.get(&key) {
+            if held == size {
+                return Ok((buffer, false));
+            }
+            // Another size: the old one retires after the work using it.
+            self.flush()?;
+            let (buffer, memory, _) = self.resident.remove(&key).unwrap();
+            // SAFETY: the flush finished every use.
+            unsafe {
+                self.gpu.device.destroy_buffer(buffer, None);
+                self.gpu.device.free_memory(memory, None);
+            }
+        }
+        let device = self.gpu.device.clone();
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: valid create info; destroyed with the renderer.
+        let buffer =
+            unsafe { device.create_buffer(&info, None) }.map_err(vk_error("vkCreateBuffer"))?;
+        // SAFETY: the buffer is live.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        // SAFETY: fresh buffer and memory of the required size.
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(vk_error("vkBindBufferMemory"))?;
+        self.resident.insert(key, (buffer, memory, size));
+        Ok((buffer, true))
+    }
+
+    /// Record a copy of `bytes` into resident buffer `key` (before work that
+    /// reads it, after work that used it).
+    pub fn upload_resident(&mut self, key: u64, bytes: &[u8]) -> Result<(), String> {
+        let (source, offset) = self.ring_upload(bytes, 16)?;
+        let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
+        let commands = self.commands()?;
+        let length = (bytes.len() as u64).min(size);
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        // SAFETY: recording outside rendering; both buffers are live.
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(
+                commands,
+                source,
+                buffer,
+                &[vk::BufferCopy {
+                    src_offset: offset,
+                    dst_offset: 0,
+                    size: length,
+                }],
+            );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// Record a copy of `length` bytes of resident buffer `key` for the
+    /// host: its token completes with the next flush (see
+    /// `take_completed_reads`).
+    pub fn read_resident(&mut self, key: u64, length: u64) -> Result<u64, String> {
+        let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
+        let length = length.min(size);
+        let (target, offset) = self.ring_alloc(length, 16)?;
+        let commands = self.commands()?;
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        // SAFETY: recording outside rendering; both buffers are live.
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(
+                commands,
+                buffer,
+                target,
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: offset,
+                    size: length,
+                }],
+            );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        Ok(self.defer_ring_read(offset, length as usize))
+    }
+
+    /// Room for `size` bytes in the ring (flushing when it is full).
+    fn ring_alloc(&mut self, size: u64, alignment: u64) -> Result<(vk::Buffer, u64), String> {
+        if size > RING_SIZE {
+            return Err(format!("{size}-byte read exceeds the ring"));
+        }
+        let mut offset = self.ring_used.next_multiple_of(alignment);
+        if offset + size > RING_SIZE {
+            self.flush()?;
+            offset = 0;
+        }
+        self.ring_used = offset + size;
+        Ok((self.ring.buffer, offset))
+    }
+
     pub(crate) fn ring_upload(
         &mut self,
         bytes: &[u8],
@@ -3148,6 +3303,13 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.flush();
+        for (_, (buffer, memory, _)) in std::mem::take(&mut self.resident) {
+            // SAFETY: the flush above finished every use of the buffer.
+            unsafe {
+                self.gpu.device.destroy_buffer(buffer, None);
+                self.gpu.device.free_memory(memory, None);
+            }
+        }
         for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
