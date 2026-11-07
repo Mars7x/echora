@@ -505,6 +505,33 @@ fn fp_binary_exact(
 fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
     let size = fp.size;
     let format = fp.format;
+    // With FPSR.IXC already set (it is sticky), the arithmetic of two normal
+    // numbers with a normal result raises nothing new, and the host's
+    // round-to-nearest result is the Arm one (FPCR's other rounding modes
+    // stop in `mode`): no flag or NaN work is needed. Anything else (zeros,
+    // denormals, infinities, NaNs, overflow, underflow) takes the exact path.
+    if matches!(
+        op,
+        FpBinaryOp::Add | FpBinaryOp::Sub | FpBinaryOp::Mul | FpBinaryOp::Div
+    ) && fp.cpu.fpsr & FPSR_IXC != 0
+    {
+        let exponent = format.exponent_mask();
+        let normal = |value: u64| {
+            let field = value & exponent;
+            field != 0 && field != exponent
+        };
+        if normal(a) && normal(b) {
+            let raw = match op {
+                FpBinaryOp::Add => native!(size, a, b, |x, y| x + y),
+                FpBinaryOp::Sub => native!(size, a, b, |x, y| x - y),
+                FpBinaryOp::Mul => native!(size, a, b, |x, y| x * y),
+                _ => native!(size, a, b, |x, y| x / y),
+            };
+            if normal(raw) {
+                return raw;
+            }
+        }
+    }
     let a = fp.input(a);
     let b = fp.input(b);
     let numeric = matches!(op, FpBinaryOp::MaxNum | FpBinaryOp::MinNum);
@@ -3743,6 +3770,58 @@ mod fast_path_tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sticky_inexact_tests {
+    use super::*;
+
+    /// With FPSR.IXC set, the fast path must give the exact path's result
+    /// and leave the flags as the exact path would (FPCR.FZ set, as games
+    /// run).
+    #[test]
+    fn fast_arithmetic_matches_the_exact_path() {
+        let values: [f32; 12] = [
+            1.0, -2.5, 3.0e38, -3.0e38, 1.2e-38, 1.5e-38, 0.1, 7.0, -0.333, 65504.0, 1.0e-20,
+            -9.0e20,
+        ];
+        for op in [
+            FpBinaryOp::Add,
+            FpBinaryOp::Sub,
+            FpBinaryOp::Mul,
+            FpBinaryOp::Div,
+        ] {
+            for a in values {
+                for b in values {
+                    let run = |fpsr: u32| {
+                        let mut cpu = Cpu::default();
+                        cpu.fpcr = 1 << 24;
+                        cpu.fpsr = fpsr;
+                        cpu.vectors[1] = u128::from(a.to_bits());
+                        cpu.vectors[2] = u128::from(b.to_bits());
+                        fp_binary(&mut cpu, op, FpSize::S, 0, 1, 2).unwrap();
+                        (cpu.vectors[0], cpu.fpsr)
+                    };
+                    // The exact path from the same sticky flag: identical.
+                    let mut cpu = Cpu::default();
+                    cpu.fpcr = 1 << 24;
+                    cpu.fpsr = FPSR_IXC;
+                    cpu.vectors[1] = u128::from(a.to_bits());
+                    cpu.vectors[2] = u128::from(b.to_bits());
+                    let mut fp = Fp::new(&mut cpu, FpSize::S).unwrap();
+                    fp.cpu.fpsr = 0;
+                    let exact =
+                        binary_lane(&mut fp, op, u64::from(a.to_bits()), u64::from(b.to_bits()));
+                    let exact_flags = cpu.fpsr | FPSR_IXC;
+                    assert_eq!(
+                        run(FPSR_IXC),
+                        (u128::from(exact as u32), exact_flags),
+                        "{op:?} {a} {b}"
+                    );
                 }
             }
         }

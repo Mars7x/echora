@@ -2233,6 +2233,9 @@ impl Machine {
         let placeholder = idle(self);
         let mut cores = vec![std::mem::replace(&mut self.core, placeholder)];
         cores.extend((1..workers).map(|_| idle(self)));
+        for core in &mut cores {
+            core.parallel = true;
+        }
         self.preempt_flags = cores.iter().map(|core| core.preempt.clone()).collect();
         self.core_threads = vec![None; workers];
         self.core_threads[0] = Some(cores[0].current_thread_id);
