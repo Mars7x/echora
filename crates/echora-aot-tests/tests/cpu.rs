@@ -1,6 +1,5 @@
 //! Integer, flag, call/return, PAuth-hint, budget and SIMD stack programs,
-//! executed natively. Expected values follow pokopia-recomp
-//! `tests/aot_execution.rs`.
+//! executed natively.
 #![cfg(any(target_os = "linux", windows, target_os = "macos"))]
 #![allow(clippy::unwrap_used, unsafe_code)]
 

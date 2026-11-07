@@ -2,8 +2,8 @@
 //! local storage, and set the registers for the first instruction (rtld's
 //! entry). Relocation and module initialization are left to the guest rtld.
 //!
-//! Adapted from pokopia-recomp `src/bootstrap.rs`. Module placement comes
-//! from `echora_loader::process`, the same placement the lifter used.
+//! Module placement comes from `echora_loader::process`, the same
+//! placement the lifter used.
 
 use std::path::{Path, PathBuf};
 

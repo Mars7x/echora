@@ -1,8 +1,5 @@
 //! NPDM program metadata: process parameters, kernel capabilities and
 //! service access control. Signatures are not checked.
-//!
-//! Adapted from pokopia-recomp `src/loader/npdm.rs` and the NPDM types in
-//! `src/loader.rs`.
 
 use serde::Serialize;
 

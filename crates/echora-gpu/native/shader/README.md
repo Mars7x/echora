@@ -10,7 +10,7 @@ ECHORA_SHADER_SRC=~/.cache/echora/shader-src cargo build -p echora-gpu
 ```
 
 `fetch-shader-sources.sh` checks out PokeDinner at a pinned commit, applies
-`patches/` (Echora's lowering extensions, inherited from pokopia-recomp), and
+`patches/` (Echora's lowering extensions), and
 clones sirit, fmt, SPIRV-Headers and the needed Boost headers at pinned
 tags. `build.rs` compiles them with the `cc` crate when `ECHORA_SHADER_SRC`
 is set; otherwise shader translation reports that the library is absent.

@@ -4,8 +4,6 @@
 //! the guest's loader does; the guest rtld relocates them at startup. The
 //! root helpers find candidate code addresses for ahead-of-time discovery.
 //! A root is only a candidate: it does not claim the guest will run it.
-//!
-//! Root extraction is adapted from pokopia-recomp `src/diagnostics.rs`.
 
 use crate::nso::NsoModule;
 

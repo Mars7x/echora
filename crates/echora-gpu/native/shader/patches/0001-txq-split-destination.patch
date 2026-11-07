@@ -7,7 +7,7 @@ index f99098d..4748d82 100644
          }
          case 0xb6f: { // TXQ texture dimensions, two packed scalar outputs.
 -            if (insn.Bits(59, 5) || insn.Bits(64, 8) != 255 || insn.Bits(72, 4) == 0 || insn.Bits(72, 4) > 3 ||
-+            // Pokopia: mask 7 with a second destination (bits 64..71) puts
++            // Mask 7 with a second destination (bits 64..71) puts
 +            // width/height in the dest pair and depth in the second register,
 +            // as SM70+ texture results split; lowered as two Maxwell TXQs.
 +            const u64 second = insn.Bits(64, 8);

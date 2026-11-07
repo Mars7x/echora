@@ -1,5 +1,5 @@
-// Original synthetic instruction sequences, never copied from a game. Most
-// come from pokopia-recomp `tests/aot_execution.rs`. Shared by `build.rs`
+// Original synthetic instruction sequences, never copied from a game.
+// Shared by `build.rs`
 // (which lifts them) and the tests (which run them).
 
 /// `(name, words)`; each program is loaded at `CODE_BASE` and entered there.

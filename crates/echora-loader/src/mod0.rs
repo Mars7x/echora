@@ -1,8 +1,5 @@
 //! Analysis of module-relative MOD0 and dynamic-section metadata. No address
 //! is rebased or relocated; the guest's rtld does that at startup.
-//!
-//! Adapted from pokopia-recomp `src/loader/mod0.rs` (same author,
-//! GPL-3.0-or-later).
 
 use std::collections::BTreeMap;
 

@@ -1,7 +1,4 @@
-//! NSO executable modules.
-//!
-//! Adapted from pokopia-recomp `src/loader/nso.rs` (same author,
-//! GPL-3.0-or-later), with ZBIC segment support and Echora error types.
+//! NSO executable modules, including ZBIC-compressed segments.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};

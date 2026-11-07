@@ -6,7 +6,7 @@ index 4748d82..c8d7b5f 100644
              } else {
                  for (u32 i = 0; i < rg_masks.size(); ++i) if (rg_masks[i] == mask) swizzle = i;
              }
-+            // Pokopia: mask 5 (x, z) into a register pair has no TLDS
++            // Mask 5 (x, z) into a register pair has no TLDS
 +            // swizzle; fetch x into dest and z into dest + 1 separately
 +            // (F32 results only).
 +            const bool pair_xz = !split && mask == 5 && !insn.Bits(79, 1);

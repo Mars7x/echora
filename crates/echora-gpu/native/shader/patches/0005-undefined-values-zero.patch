@@ -6,7 +6,7 @@ index 0649290..7ed21b6 100644
  
  namespace Shader::Backend::SPIRV {
  
-+// Pokopia: registers never written read as zero, as on the hardware;
++// Registers never written read as zero, as on the hardware;
 +// OpUndef let drivers pick any value (RADV produced black materials).
  Id EmitUndefU1(EmitContext& ctx) {
 -    return ctx.OpUndef(ctx.U1);

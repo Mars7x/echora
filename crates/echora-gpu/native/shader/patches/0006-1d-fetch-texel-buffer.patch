@@ -7,7 +7,7 @@ index fae69ab..7c968eb 100644
                  break;
              }
 -            if (ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
-+            // Pokopia: every 1D texel fetch reads a texel buffer. NVN buffer
++            // Every 1D texel fetch reads a texel buffer. NVN buffer
 +            // textures are far longer than the largest 1D image (light lists
 +            // of a million texels), and the host backs a 1D fetch with the
 +            // texture's level-0 texels either way.

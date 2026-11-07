@@ -1,6 +1,4 @@
 //! Host GPU side of the NVN layer: native shader translation and Vulkan.
-//!
-//! Adapted from pokopia-recomp `crates/gpu` (same author, GPL-3.0-or-later).
 
 // Vulkan and the shader library are FFI: unsafe code is inherent here.
 #![allow(

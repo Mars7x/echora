@@ -7,7 +7,7 @@ index b562e82..1007974 100644
          const Id variable{AddGlobalVariable(pointer, spv::StorageClass::Workgroup)};
          Decorate(variable, spv::Decoration::Aliased);
 -        interfaces.push_back(variable);
-+        // Pokopia: only SPIR-V 1.4+ lists non-Input/Output variables in the
++        // Only SPIR-V 1.4+ lists non-Input/Output variables in the
 +        // entry point interface (as for the other storage classes here).
 +        if (profile.supported_spirv >= 0x00010400) {
 +            interfaces.push_back(variable);
