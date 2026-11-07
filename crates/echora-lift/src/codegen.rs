@@ -2213,9 +2213,11 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
 /// Blocks a split window runs inside their predecessor's arm instead of
 /// coming back through its dispatch loop: those with exactly one constant
 /// predecessor, in the same window, that nothing else can enter. Entries
-/// (function starts and other roots), jump-table targets and the block
-/// after anything that continues through the dispatcher (a call, an
-/// indirect branch, an SVC: the host resumes there) keep their own arm, and
+/// (function starts and other roots), call targets (a call runs the
+/// target's window from the dispatcher), addresses taken with ADR,
+/// jump-table targets and the block after anything that continues through
+/// the dispatcher (a call, an indirect branch, an SVC: the host resumes
+/// there) keep their own arm, and
 /// so does every block a host boundary can resume at, since only arms set
 /// `next_pc` before the loop's boundary check.
 fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
@@ -2225,6 +2227,17 @@ fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
     entered.extend(translation.indirect_targets.iter().copied());
     // Constant successor -> (its one predecessor so far, predecessor count).
     let mut predecessors: BTreeMap<u64, (u64, usize)> = BTreeMap::new();
+    for record in translation.instructions.values() {
+        match &record.instruction {
+            Branch { target, link: true } => {
+                entered.insert(*target);
+            }
+            Adr { address, .. } => {
+                entered.insert(*address);
+            }
+            _ => {}
+        }
+    }
     for block in &translation.blocks {
         let last = block
             .instructions
@@ -2996,6 +3009,25 @@ mod tests {
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
         assert!(window.contains("0x1000 => {\n                m.spin_hint();\n"));
         assert_eq!(window.matches("m.spin_hint();").count(), 1);
+    }
+
+    #[test]
+    fn split_windows_keep_arms_for_call_targets() {
+        // BL +0xc; B +8; RET; RET: 0x100c is both the call's target and the
+        // B's only constant successor; the call enters it from the
+        // dispatcher, so it keeps an arm.
+        let translation = discover(
+            &[region(&[
+                0x9400_0003,
+                0x1400_0002,
+                0xd65f_03c0,
+                0xd65f_03c0,
+            ])],
+            &[0x1000],
+            8,
+        )
+        .unwrap();
+        assert!(!inlined_blocks(&translation).contains(&0x100c));
     }
 
     #[test]
