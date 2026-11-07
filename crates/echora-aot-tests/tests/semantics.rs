@@ -3,10 +3,13 @@
 //!
 //! `build.rs` picks random encodings of each integer class (ALU, shifts,
 //! extends, compares, selects, multiplies, divides, bit operations, loads
-//! and stores), each followed by SVC #7, and lifts them through split
-//! emission. Every instruction runs natively from random register, SP, flag
-//! and memory states; the registers, SP, NZCV and memory afterwards must
-//! equal what the interpreter below computes from the Arm pseudocode. The
+//! and stores, conditional branches, CRC32, LSE atomics, acquire/release
+//! and exclusive accesses, MRS/MSR NZCV), each followed by SVC #7 and SVC
+//! #8 (branches jump to the second), and lifts them through split emission.
+//! Every instruction runs natively from random register, SP, flag and
+//! memory states; whether a branch was taken, and the registers, SP, NZCV
+//! and memory afterwards, must equal what the interpreter below computes
+//! from the Arm pseudocode. The
 //! interpreter shares only the decoded operand fields with the lifter (the
 //! decoder is checked separately against yaxpeax-arm), not its semantics.
 #![cfg(any(target_os = "linux", windows))]
@@ -14,8 +17,8 @@
 
 use echora_aot_tests::{Machine, Trap, semantic_code};
 use echora_lift::aarch64::{
-    Address, BitfieldOp, CompareOperand, Instruction, LogicalOp, MemoryOp, WideOp, Writeback,
-    decode,
+    Address, AtomicOp, BitfieldOp, CompareOperand, Instruction, LogicalOp, MemoryOp, WideOp,
+    Writeback, decode,
 };
 
 const DATA: u64 = 0x80_0000;
@@ -23,6 +26,8 @@ const DATA_SIZE: u64 = 0x1_0000;
 /// Base registers point here, so every immediate offset stays mapped.
 const BASE_ADDRESS: u64 = DATA + DATA_SIZE / 2;
 const STATES_PER_WORD: usize = 24;
+/// Bytes per entry: the instruction, SVC #7 and SVC #8.
+const STRIDE: u64 = 12;
 
 #[derive(Clone, PartialEq, Eq)]
 struct State {
@@ -258,10 +263,99 @@ fn loaded(value: u64, bytes: u64, op: MemoryOp) -> u64 {
     }
 }
 
-/// Runs `instruction` on `state`; `None` for an access outside the data.
-fn interpret(instruction: &Instruction, state: &mut State) -> Option<()> {
+/// Runs `instruction` on `state`: whether it branched, or `None` for an
+/// access outside the data.
+fn interpret(instruction: &Instruction, state: &mut State) -> Option<bool> {
     use Instruction::*;
     match *instruction {
+        BranchCond { condition, .. } => return Some(condition_holds(condition, state.nzcv)),
+        CompareBranch {
+            rt, bits, nonzero, ..
+        } => {
+            let zero = get(state, rt) & mask(u32::from(bits)) == 0;
+            return Some(zero != nonzero);
+        }
+        TestBranch {
+            rt, bit, nonzero, ..
+        } => {
+            let set = (get(state, rt) >> bit) & 1 == 1;
+            return Some(set == nonzero);
+        }
+        Crc32 {
+            rd,
+            rn,
+            rm,
+            bytes,
+            castagnoli,
+        } => {
+            let polynomial: u32 = if castagnoli { 0x82f6_3b78 } else { 0xedb8_8320 };
+            let mut crc = get(state, rn) as u32;
+            let data = get(state, rm);
+            for i in 0..bytes {
+                crc ^= u32::from((data >> (8 * i)) as u8);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (polynomial & (crc & 1).wrapping_neg());
+                }
+            }
+            set(state, rd, u64::from(crc));
+        }
+        CompareAndSwap {
+            rs, rt, rn, bytes, ..
+        } => {
+            let bytes = u64::from(bytes);
+            let address = get_sp(state, rn);
+            let old = read(state, address, bytes)?;
+            if old == get(state, rs) & mask(8 * bytes as u32) {
+                write(state, address, bytes, get(state, rt))?;
+            }
+            set(state, rs, old);
+        }
+        CompareAndSwapPair {
+            rs, rt, rn, bytes, ..
+        } => {
+            let bytes = u64::from(bytes);
+            let m = mask(8 * bytes as u32);
+            let address = get_sp(state, rn);
+            let first = read(state, address, bytes)?;
+            let second = read(state, address + bytes, bytes)?;
+            if first == get(state, rs) & m && second == get(state, rs + 1) & m {
+                let (new_first, new_second) = (get(state, rt), get(state, rt + 1));
+                write(state, address, bytes, new_first)?;
+                write(state, address + bytes, bytes, new_second)?;
+            }
+            set(state, rs, first);
+            set(state, rs + 1, second);
+        }
+        AtomicAdd {
+            rs, rt, rn, bytes, ..
+        } => {
+            atomic(state, AtomicOp::Swap, rs, rt, rn, bytes, true)?;
+        }
+        AtomicMemory {
+            op,
+            rs,
+            rt,
+            rn,
+            bytes,
+            ..
+        } => {
+            atomic(state, op, rs, rt, rn, bytes, false)?;
+        }
+        LoadAcquireRcpc { rt, rn, bytes }
+        | LoadAcquireRcsc { rt, rn, bytes }
+        | LoadExclusive { rt, rn, bytes, .. } => {
+            let value = read(state, get_sp(state, rn), u64::from(bytes))?;
+            set(state, rt, value);
+        }
+        StoreRelease { rt, rn, bytes } => {
+            let value = get(state, rt);
+            write(state, get_sp(state, rn), u64::from(bytes), value)?;
+        }
+        // With the monitor open (every run starts so) the store fails:
+        // status 1 and memory unchanged.
+        StoreExclusive { rs, .. } => set(state, rs, 1),
+        ReadNzcv { rt } => set(state, rt, u64::from(state.nzcv) << 28),
+        WriteNzcv { rt } => state.nzcv = ((get(state, rt) >> 28) & 15) as u8,
         AddSubImmediate {
             rd,
             rn,
@@ -690,6 +784,53 @@ fn interpret(instruction: &Instruction, state: &mut State) -> Option<()> {
         }
         ref other => panic!("no reference semantics for {other:?}"),
     }
+    Some(false)
+}
+
+/// LD<op>, ST<op> and SWP; `add` for LDADD (where `op` is unused).
+fn atomic(
+    state: &mut State,
+    op: AtomicOp,
+    rs: u8,
+    rt: u8,
+    rn: u8,
+    bytes: u8,
+    add: bool,
+) -> Option<()> {
+    let bits = 8 * u32::from(bytes);
+    let m = mask(bits);
+    let address = get_sp(state, rn);
+    let old = read(state, address, u64::from(bytes))?;
+    let operand = get(state, rs) & m;
+    let signed = |value: u64| sign_extend(value, bits) as i64;
+    let new = if add {
+        old.wrapping_add(operand)
+    } else {
+        match op {
+            AtomicOp::Clear => old & !operand,
+            AtomicOp::ExclusiveOr => old ^ operand,
+            AtomicOp::Set => old | operand,
+            AtomicOp::SignedMax => {
+                if signed(old) >= signed(operand) {
+                    old
+                } else {
+                    operand
+                }
+            }
+            AtomicOp::SignedMin => {
+                if signed(old) <= signed(operand) {
+                    old
+                } else {
+                    operand
+                }
+            }
+            AtomicOp::UnsignedMax => old.max(operand),
+            AtomicOp::UnsignedMin => old.min(operand),
+            AtomicOp::Swap => operand,
+        }
+    };
+    write(state, address, u64::from(bytes), new & m)?;
+    set(state, rt, old);
     Some(())
 }
 
@@ -723,7 +864,16 @@ fn address_registers(instruction: &Instruction) -> Option<(u8, Option<u8>)> {
                 Address::Immediate { .. } => None,
             },
         )),
-        Instruction::LoadStorePair { rn, .. } => Some((rn, None)),
+        Instruction::LoadStorePair { rn, .. }
+        | Instruction::CompareAndSwap { rn, .. }
+        | Instruction::CompareAndSwapPair { rn, .. }
+        | Instruction::AtomicAdd { rn, .. }
+        | Instruction::AtomicMemory { rn, .. }
+        | Instruction::LoadAcquireRcpc { rn, .. }
+        | Instruction::LoadAcquireRcsc { rn, .. }
+        | Instruction::StoreRelease { rn, .. }
+        | Instruction::LoadExclusive { rn, .. }
+        | Instruction::StoreExclusive { rn, .. } => Some((rn, None)),
         _ => None,
     }
 }
@@ -746,30 +896,45 @@ fn random_state(random: &mut Random, instruction: &Instruction, memory: &[u8]) -
     state
 }
 
-fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<State, Trap> {
+/// Runs one lifted instruction: whether it branched, and the state after.
+fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<(bool, State), Trap> {
+    m.core.memory.clear_exclusive();
     m.core.cpu.regs = state.x;
     m.core.cpu.sp = state.sp;
     m.core.cpu.nzcv = state.nzcv;
     m.core.cpu.pc = entry;
     m.memory.write(DATA, &state.memory).expect("data is mapped");
+    m.core.spin_polls = 0;
     let trap = loop {
         match semantic_code::dispatch(&mut m.core) {
             Ok(()) => continue,
+            // A CAS that cannot change memory counts as a spin poll, and
+            // enough of them end the slice at a block boundary: resume, as
+            // the host would.
+            Err(Trap::HostBoundary) => {
+                m.core.spin_polls = 0;
+                m.core.host_check_at = u64::MAX;
+            }
             Err(trap) => break trap,
         }
     };
     m.core.settle_block_trap();
-    if !matches!(trap, Trap::SupervisorCall { number: 7 }) {
-        return Err(trap);
-    }
+    let taken = match trap {
+        Trap::SupervisorCall { number: 7 } => false,
+        Trap::SupervisorCall { number: 8 } => true,
+        other => return Err(other),
+    };
     let mut memory = vec![0; DATA_SIZE as usize];
     m.memory.read(DATA, &mut memory).expect("data is mapped");
-    Ok(State {
-        x: m.core.cpu.regs,
-        sp: m.core.cpu.sp,
-        nzcv: m.core.cpu.nzcv,
-        memory,
-    })
+    Ok((
+        taken,
+        State {
+            x: m.core.cpu.regs,
+            sp: m.core.cpu.sp,
+            nzcv: m.core.cpu.nzcv,
+            memory,
+        },
+    ))
 }
 
 /// The first difference between two states, described.
@@ -808,11 +973,12 @@ fn difference(expected: &State, actual: &State) -> String {
 
 #[test]
 fn lifted_integer_and_memory_instructions_match_the_reference() {
-    let code_size = (semantic_code::WORDS.len() as u64 * 8).next_multiple_of(0x1000);
+    let code_size = (semantic_code::WORDS.len() as u64 * STRIDE).next_multiple_of(0x1000);
     let mut image = Vec::new();
     for word in semantic_code::WORDS {
         image.extend(word.to_le_bytes());
         image.extend(0xd400_00e1_u32.to_le_bytes());
+        image.extend(0xd400_0101_u32.to_le_bytes());
     }
     let mut m = Machine::with_layout(semantic_code::BASE, &image, code_size, DATA, DATA_SIZE);
     semantic_code::install();
@@ -821,7 +987,7 @@ fn lifted_integer_and_memory_instructions_match_the_reference() {
     let mut failures = Vec::new();
     let mut runs = 0;
     for (index, &word) in semantic_code::WORDS.iter().enumerate() {
-        let entry = semantic_code::BASE + 8 * index as u64;
+        let entry = semantic_code::BASE + STRIDE * index as u64;
         let instruction = decode(word, entry);
         for _ in 0..STATES_PER_WORD {
             let before = random_state(&mut random, &instruction, &memory);
@@ -830,14 +996,19 @@ fn lifted_integer_and_memory_instructions_match_the_reference() {
             let lifted = run_lifted(&mut m, entry, &before);
             runs += 1;
             let problem = match (reference, lifted) {
-                (Some(()), Ok(actual)) if actual == expected => continue,
-                (Some(()), Ok(actual)) => difference(&expected, &actual),
-                (Some(()), Err(trap)) => format!("lifted trapped: {trap:?}"),
+                (Some(branch), Ok((taken, actual))) if branch == taken && actual == expected => {
+                    continue;
+                }
+                (Some(branch), Ok((taken, _))) if branch != taken => {
+                    format!("branch taken: expected {branch}, lifted {taken}")
+                }
+                (Some(_), Ok((_, actual))) => difference(&expected, &actual),
+                (Some(_), Err(trap)) => format!("lifted trapped: {trap:?}"),
                 (None, Ok(_)) => "the reference access left the data".to_owned(),
                 (None, Err(_)) => continue,
             };
             failures.push(format!(
-                "{word:#010x} {instruction:?} from {before:?}: {problem}"
+                "{word:#010x} {instruction:?}: {problem}\n    from {before:?}"
             ));
             break;
         }

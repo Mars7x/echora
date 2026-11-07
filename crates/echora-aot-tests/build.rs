@@ -116,9 +116,10 @@ fn kernel_code(out: &mut String) {
     writeln!(out, "{root}\n}}").expect("write");
 }
 
-/// Integer and memory instructions for the semantic differential test
-/// (`tests/semantics.rs`): random operand fields of each class, each word
-/// followed by SVC #7 and entered at its own address.
+/// Instructions for the semantic differential test (`tests/semantics.rs`):
+/// random operand fields of each class, each word followed by SVC #7 and
+/// SVC #8 and entered at its own address. Branches jump 8 bytes, to the
+/// SVC #8, so the SVC number tells whether they were taken.
 fn semantic_code(out: &mut String) {
     use echora_lift::aarch64::{Address, Instruction, decode};
 
@@ -146,6 +147,17 @@ fn semantic_code(out: &mut String) {
         ("load/store unscaled, pre, post", 0x3f20_0000, 0x3800_0000),
         ("load/store register offset", 0x3f20_0c00, 0x3820_0800),
         ("load/store pair", 0x3e00_0000, 0x2800_0000),
+        ("B.cond", 0xff00_0010, 0x5400_0000),
+        ("CBZ/CBNZ", 0x7e00_0000, 0x3400_0000),
+        ("TBZ/TBNZ", 0x7e00_0000, 0x3600_0000),
+        ("CRC32", 0x7fe0_e000, 0x1ac0_4000),
+        ("CAS", 0x3fa0_7c00, 0x08a0_7c00),
+        ("CASP", 0xbfa0_7c00, 0x0820_7c00),
+        ("LSE atomics", 0x3f20_0c00, 0x3820_0000),
+        ("load/store exclusive", 0x3f80_7c00, 0x0800_7c00),
+        ("LDAPR", 0x3fff_fc00, 0x38bf_c000),
+        ("LDAR/STLR", 0x3f7f_fc00, 0x089f_fc00),
+        ("MRS/MSR NZCV", 0xffdf_ffe0, 0xd51b_4200),
     ];
     let mut state: u64 = 0x5eed_0f5e_3a17_1c5d;
     let mut next = || {
@@ -158,7 +170,15 @@ fn semantic_code(out: &mut String) {
     for &(_, mask, value) in CLASSES {
         let mut taken = 0;
         while taken < PER_CLASS {
-            let word = (next() & !mask) | value;
+            let mut word = (next() & !mask) | value;
+            // Branch offsets of 8 bytes (imm19 or imm14 = 2).
+            if word & 0x7c00_0000 == 0x3400_0000 || word & 0xff00_0010 == 0x5400_0000 {
+                word = if word & 0x7e00_0000 == 0x3600_0000 {
+                    (word & !0x0007_ffe0) | (2 << 5)
+                } else {
+                    (word & !0x00ff_ffe0) | (2 << 5)
+                };
+            }
             let usable = match decode(word, 0) {
                 // The forms the reference interpreter covers.
                 Instruction::AddSubImmediate { .. }
@@ -183,6 +203,21 @@ fn semantic_code(out: &mut String) {
                 | Instruction::ReverseBits { .. }
                 | Instruction::ReverseBytes { .. }
                 | Instruction::LoadStorePair { .. }
+                | Instruction::BranchCond { .. }
+                | Instruction::CompareBranch { .. }
+                | Instruction::TestBranch { .. }
+                | Instruction::Crc32 { .. }
+                | Instruction::CompareAndSwap { .. }
+                | Instruction::CompareAndSwapPair { .. }
+                | Instruction::AtomicAdd { .. }
+                | Instruction::AtomicMemory { .. }
+                | Instruction::LoadAcquireRcpc { .. }
+                | Instruction::LoadAcquireRcsc { .. }
+                | Instruction::StoreRelease { .. }
+                | Instruction::LoadExclusive { .. }
+                | Instruction::StoreExclusive { .. }
+                | Instruction::ReadNzcv { .. }
+                | Instruction::WriteNzcv { .. }
                 | Instruction::LoadStore {
                     address: Address::Immediate { .. },
                     ..
@@ -205,15 +240,16 @@ fn semantic_code(out: &mut String) {
     let mut image = Vec::new();
     for word in &words {
         image.extend(word.to_le_bytes());
-        image.extend(0xd400_00e1_u32.to_le_bytes());
+        image.extend(0xd400_00e1_u32.to_le_bytes()); // SVC #7
+        image.extend(0xd400_0101_u32.to_le_bytes()); // SVC #8
     }
-    let entries: Vec<u64> = (0..words.len()).map(|i| BASE + 8 * i as u64).collect();
+    let entries: Vec<u64> = (0..words.len()).map(|i| BASE + 12 * i as u64).collect();
     let region = CodeRegion {
         name: "semantic".into(),
         base: BASE,
         bytes: image,
     };
-    let translation = discover(&[region], &entries, words.len() * 2 + 16).expect("semantic");
+    let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("semantic");
     let (root, regions) = emit_rust_split(&translation, 10);
     writeln!(out, "pub mod semantic_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
