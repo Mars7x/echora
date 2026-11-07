@@ -79,6 +79,7 @@ fn main() {
     simd_memory_code(&mut out);
     sequence_code(&mut out);
     call_code(&mut out);
+    loop_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -765,6 +766,129 @@ fn call_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Loop programs for `tests/loops.rs`: counted loops (X25) with a mid-loop
+/// label that is also an entry, an ADR + BR to a later block reached only
+/// through the register, and an ADRP + ADD + BLR into a leaf function,
+/// either at its start or partway through its first block. Leaves sit in
+/// the middle of windows of their own. Indirect targets are entries, as
+/// relocation roots would be.
+fn loop_code(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xb0_0000;
+    const LEAVES: usize = 4;
+    const PROGRAMS: usize = 300;
+    const RET: u32 = 0xd65f_03c0;
+    let mut state: u64 = 0x1319_8a2e_0370_7344;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    // X24 holds indirect targets, X25 the loop count, X26-X28 and X30 as
+    // in the other programs; SP stays.
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        [24, 25, 26, 27, 28, 30].iter().any(|&n| writes.has_gpr(n)) || writes.sp
+    };
+    let adr = |from: u64, to: u64| {
+        let offset = to.wrapping_sub(from) as u32;
+        0x1000_0000 | ((offset & 3) << 29) | (((offset >> 2) & 0x7ffff) << 5) | 24
+    };
+    let adrp = |from: u64, to: u64| {
+        let pages = ((to >> 12).wrapping_sub(from >> 12)) as u32;
+        0x9000_0000 | ((pages & 3) << 29) | (((pages >> 2) & 0x7ffff) << 5) | 24
+    };
+    let add_low = |to: u64| 0x9100_0000 | (((to & 0xfff) as u32) << 10) | (24 << 5) | 24;
+    let cbnz = |from: u64, to: u64| {
+        let offset = (to.wrapping_sub(from) as i64 / 4) as u32;
+        0xb500_0000 | ((offset & 0x7ffff) << 5) | 25
+    };
+
+    let mut image: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let place = |image: &mut Vec<u32>, address: u64, words: &[u32]| {
+        let at = ((address - BASE) / 4) as usize;
+        if image.len() < at + words.len() {
+            image.resize(at + words.len(), 0);
+        }
+        image[at..at + words.len()].copy_from_slice(words);
+    };
+    // Leaves at offset 0x100 of windows 0..LEAVES, and their BLR targets:
+    // the start, or the second or third instruction of the first block.
+    let mut targets = Vec::new();
+    for leaf in 0..LEAVES {
+        let address = BASE + 0x400 * leaf as u64 + 0x100;
+        let mut words: Vec<u32> = (0..3 + next() % 4)
+            .map(|_| body_instruction(&mut next, &reserved))
+            .collect();
+        words.push(RET);
+        place(&mut image, address, &words);
+        for skip in 0..3 {
+            targets.push(address + 4 * skip);
+            entries.push(address + 4 * skip);
+        }
+    }
+    let mut cursor = BASE + 0x400 * LEAVES as u64;
+    let mut programs = Vec::new();
+    for _ in 0..PROGRAMS {
+        let start = cursor;
+        programs.push(start);
+        entries.push(start);
+        let mut words = vec![0xd280_0000 | ((1 + next() % 5) << 5) | 25]; // movz x25, #n
+        let head = start + 4 * words.len() as u64;
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        // A mid-loop block start, entered by fall-through and as an entry.
+        entries.push(start + 4 * words.len() as u64);
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        words.push(0xd100_0739); // sub x25, x25, #1
+        let at = start + 4 * words.len() as u64;
+        words.push(cbnz(at, head));
+        // ADR + BR over a block that never runs, to one reached only so.
+        let adr_at = start + 4 * words.len() as u64;
+        words.push(0);
+        words.push(0xd61f_0000 | (24 << 5)); // br x24
+        words.push(0); // UDF: never reached
+        let landing = start + 4 * words.len() as u64;
+        words[((adr_at - start) / 4) as usize] = adr(adr_at, landing);
+        entries.push(landing);
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        // ADRP + ADD + BLR into a leaf.
+        let target = targets[next() as usize % targets.len()];
+        let adrp_at = start + 4 * words.len() as u64;
+        words.push(adrp(adrp_at, target));
+        words.push(add_low(target));
+        words.push(0xd63f_0000 | (24 << 5)); // blr x24
+        words.push(body_instruction(&mut next, &reserved));
+        words.push(0xd400_00e1);
+        place(&mut image, start, &words);
+        cursor += 4 * words.len() as u64;
+    }
+    let bytes: Vec<u8> = image.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "loops".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &entries, image.len() + 16).expect("loops");
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod loop_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{image:#x?};").expect("write");
+    writeln!(out, "pub const PROGRAMS: &[u64] = &{programs:#x?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
