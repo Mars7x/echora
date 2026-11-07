@@ -2182,14 +2182,20 @@ fn traced_pcs() -> &'static std::collections::BTreeSet<u64> {
 fn emit_block_cases(output: &mut String, blocks: &[BasicBlock], check_entry: bool) {
     for block in blocks {
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
-        emit_block_body(output, block, check_entry);
+        emit_block_body(output, block, check_entry, false);
         output.push_str("            }\n");
     }
 }
 
-fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool) {
+fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, spin_head: bool) {
     if traced_pcs().contains(&block.start) {
         output.push_str("                m.trace_hit();\n");
+    }
+    // A loop that only another thread can end polls on (see `crate::spin`):
+    // each pass through its head counts as a poll, so the thread hands its
+    // worker on soon instead of spinning out its slice.
+    if spin_head {
+        output.push_str("                m.spin_hint();\n");
     }
     let count = block.instructions.len();
     for (index, instruction) in block.instructions.iter().enumerate() {
@@ -2263,12 +2269,17 @@ fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
 
 /// A split window's match arms: one per block that keeps an arm, each with
 /// its inlined successors written in place of `next_pc` assignments.
-fn emit_split_cases(output: &mut String, blocks: &[BasicBlock], inlined: &BTreeSet<u64>) {
+fn emit_split_cases(
+    output: &mut String,
+    blocks: &[BasicBlock],
+    inlined: &BTreeSet<u64>,
+    spin_heads: &BTreeSet<u64>,
+) {
     let bodies: BTreeMap<u64, String> = blocks
         .iter()
         .map(|block| {
             let mut body = String::new();
-            emit_block_body(&mut body, block, false);
+            emit_block_body(&mut body, block, false, spin_heads.contains(&block.start));
             (block.start, body)
         })
         .collect();
@@ -2383,6 +2394,10 @@ pub fn emit_rust_split_to<E>(
     }
     let shift = region_bits - SPLIT_WINDOW_BITS;
     let inlined = inlined_blocks(translation);
+    let spin_heads: BTreeSet<u64> = crate::spin::find_spin_loops(&translation.blocks)
+        .into_iter()
+        .map(|spin| spin.head)
+        .collect();
     let mut root = format!(
         "// Generated from user-provided executable bytes. Keep this file local.\n\
          use echora_guest::{{Core, Trap, WindowFn}};\n\n\
@@ -2411,7 +2426,7 @@ pub fn emit_rust_split_to<E>(
         // SVCs, which leave the window: one execute check on entry covers
         // every block run before it returns.
         let mut cases = String::new();
-        emit_split_cases(&mut cases, blocks, &inlined);
+        emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
         writeln!(
             cases,
             "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
@@ -2966,6 +2981,21 @@ mod tests {
         assert!(window.contains("m.tick_block_at(0x1004, 2)?;"));
         assert_eq!(window.matches("next_pc = 0x1010;").count(), 2);
         assert!(!window.contains("next_pc = if"));
+    }
+
+    #[test]
+    fn split_windows_hint_at_spin_loop_heads() {
+        // LDR W8, [X0]; CBZ W8, -4; RET: a poll only another thread can end.
+        let translation = discover(
+            &[region(&[0xb940_0008, 0x34ff_ffe8, 0xd65f_03c0])],
+            &[0x1000],
+            8,
+        )
+        .unwrap();
+        let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
+        let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
+        assert!(window.contains("0x1000 => {\n                m.spin_hint();\n"));
+        assert_eq!(window.matches("m.spin_hint();").count(), 1);
     }
 
     #[test]
