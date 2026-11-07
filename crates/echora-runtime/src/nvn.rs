@@ -1820,9 +1820,11 @@ impl Nvn {
                         }
                     }
                 }
+                if self.gpu().is_some() {
+                    self.gpu_dump_targets().map_err(stop)?;
+                }
                 if let Some(directory) = debug_var_os("ECHORA_FRAME_DIR") {
                     if self.gpu().is_some() {
-                        self.gpu_dump_targets().map_err(stop)?;
                         self.log_cache_sizes();
                     }
                     // Reading back, encoding and hashing a frame costs more
