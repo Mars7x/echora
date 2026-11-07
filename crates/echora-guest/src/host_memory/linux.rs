@@ -1,7 +1,5 @@
 //! Linux backend: guest RAM as one sparse memfd seen through two host views.
 //!
-//! Adapted from pokopia-recomp `crates/guest/src/host_memory.rs`.
-//!
 //! The file's offsets are canonical guest page addresses (the backing page
 //! of an alias is its source). The physical view maps the whole file
 //! read-write for host-side accesses, which follow their own permission

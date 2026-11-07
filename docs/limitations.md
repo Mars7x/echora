@@ -14,8 +14,8 @@
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
-- The NVN layer is Pokopia's: OoT's mesh/task pipelines, AV1 video and other
-  Switch 2 graphics features it needs are not implemented. NVN calls the
+- The NVN layer does not yet implement OoT's mesh/task pipelines or the
+  other Switch 2 graphics features it needs. NVN calls the
   Vulkan backend directly; a backend trait (for Metal and Direct3D 12) is
   still to be introduced. Gamepads on Windows and macOS (gilrs) are untested on hardware, audio
   output does not resample (the device must accept the guest's rate and

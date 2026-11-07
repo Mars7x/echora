@@ -28,8 +28,6 @@ NUP reference tool (`a55uka/nup` `d40d9cf`).
 
 | Source | License | What exists | Decision |
 |---|---|---|---|
-| [Mars7x/pokopia-recomp](https://github.com/Mars7x/pokopia-recomp) `8a308dd` | GPL-3.0-or-later | AArch64 lifter emitting Rust (`src/aarch64.rs`, `src/codegen.rs`, `src/simd.rs`); guest CPU/memory/SIMD crate (`crates/guest`); NSO/NPDM/MOD0 loader (`src/loader/`); kernel SVCs, threads, synchronization, IPC, ~11k lines of services (`src/runtime.rs`, `src/threads.rs`, `src/synchronization.rs`, `src/ipc.rs`, `src/services.rs`); high-level NVN on Vulkan (`src/nvn*.rs`, `crates/gpu`) with Eden-derived shader translation; evdev input; PipeWire audio. Reaches gameplay in another Switch 2 title. | Primary base. Port the loader, lifter and guest crate first, then runtime pieces as OoT reaches them. Keep Pokopia's repository untouched; Echora carries adapted copies with provenance notes until shared crates are agreed. |
-| Pokopia, known limits | — | NSO loader rejects ZBIC; `crates/guest/src/host_memory.rs` uses Linux `mmap` directly; input is evdev-only; audio is PipeWire-only; every NVN draw runs under a global machine lock (its README names this as the main frame-rate limit); resolution scaling is an env var (`4ac0962`). | Each becomes an Echora boundary: ZBIC decoder in the loader, host-memory backend trait, portable input/audio backends, NVN execution designed without a global lock, resolution through `echora-resolution`. |
 | [a55uka/nup](https://github.com/a55uka/nup) `d40d9cf` | MIT | Format spec and Python reference (pack, info, extract, verify). | Used for format rules and cross-validation. A Rust reader was still needed: the runtime must read RomFS files in place (24 GiB) without extraction or a Python dependency. |
 | [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames) issue #1773 | MIT | OoT bring-up on the same build (v131072) on a direct-execution Apple-silicon runtime. Branch `MD5Visual/MacNativeGames` `feat/oot-boot` (`2e7e6036`) reaches the first presented frame, then stalls before frame 2; a later report aborts in `InitializeAv1DecoderByTransferMemory`. | Checklist of required behavior (below). Their architecture runs guest ARM64 code directly and is a reference for a future ARM64-host backend, not for the x86-64 path. |
 | [seedds/nxnative](https://github.com/seedds/nxnative) | MIT | NSO rewriter, Horizon HLE host, NVN→Metal, AV1 backend; PRs #599 (clock_gettime ifunc), #1283 (socket event counters). | Reference for SDK 22 behavior and the Metal backend. |
@@ -45,7 +43,7 @@ confirmed against Echora's own runs rather than assumed:
 
 - ZBIC-compressed NSO segments in `main`.
 - Dynamic symbol tables with `DT_GNU_HASH` only (no `DT_HASH`).
-- Thread ID seeded at TLR+0x110 at thread creation (Pokopia already does this).
+- Thread ID seeded at TLR+0x110 at thread creation.
 - SDK 22 `clock_gettime` bound to `nn::time` shared memory.
 - `IAudioDevice` commands 15–18, `IAudioRenderer` 12/13, `auddmg:u`.
 - RomFS directory listing and multiple mount aliases (`content`, `_npln`).
@@ -182,6 +180,5 @@ route to mesh support; it has not been validated by tests yet.
 
 ## Licensing decision
 
-Echora is GPL-3.0-or-later, matching Pokopia so its code can be carried over,
-and compatible with the GPL-3.0 emulators and MIT/0BSD/Apache dependencies.
+Echora is GPL-3.0-or-later, compatible with the GPL-3.0 emulators and MIT/0BSD/Apache dependencies.
 GPLv2-only sources are not incorporated.

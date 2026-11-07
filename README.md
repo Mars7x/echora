@@ -37,7 +37,7 @@ display version 1.1.1):
   (GNU-hash symbol tables, RELA/RELR/PLT relocations, init arrays) are
   validated for every module. Loading takes about 0.2 s.
 - **Native execution of synthetic code works.** The AArch64 lifter and guest
-  CPU/memory model (ported from pokopia-recomp) translate test programs to
+  CPU/memory model translate test programs to
   Rust at build time; they run natively and pass integer, call, atomic,
   exclusive and acquire/release semantics checks. Guest memory works on
   Linux, Windows (10 1803 or later) and macOS.
@@ -66,8 +66,7 @@ display version 1.1.1):
    segment hash.
 2. **Translation** (planned). Executable modules are decoded and translated
    ahead of time into native code through an architecture-neutral
-   representation, following the approach proven in
-   [pokopia-recomp](https://github.com/Mars7x/pokopia-recomp).
+   representation.
 3. **Runtime** (planned). Guest memory, threads, synchronization, IPC and the
    system services the game reaches, implemented as the executable requires
    them.

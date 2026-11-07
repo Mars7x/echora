@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the pinned shader recompiler sources (GPL-3.0-or-later, PokeDinner,
-# an Eden fork) and its header dependencies into $POKOPIA_WORK/shader-src.
+# an Eden fork) and its header dependencies into $ECHORA_SHADER_SRC
+# (default ~/.cache/echora/shader-src).
 # Nothing here enters Git.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

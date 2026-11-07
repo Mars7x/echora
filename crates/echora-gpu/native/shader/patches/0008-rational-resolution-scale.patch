@@ -6,7 +6,7 @@ index cae8110..7c94c29 100644
      inst.SetArg(1, upscaled_point_value);
  }
  
-+// Pokopia: scales are rational, up_scale / ScaleDenominator() (a 4/3
++// Scales are rational, up_scale / ScaleDenominator() (a 4/3
 +// scale renders 1920x1080 targets at 2560x1440). The denominator is
 +// up_scale * down_factor (with down_shift 0 it is 1, as before).
 +[[nodiscard]] u32 ScaleDenominator() {

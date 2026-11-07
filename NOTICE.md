@@ -70,19 +70,6 @@ and `Cinzel-OFL.txt` alongside). They are embedded in the launcher binary.
 - NUP format specification and reference implementation:
   [a55uka/nup](https://github.com/a55uka/nup) (MIT). `echora-nup` is an
   independent Rust implementation of that specification.
-- [pokopia-recomp](https://github.com/Mars7x/pokopia-recomp) (GPL-3.0-or-later),
-  the design basis for Echora's recompiler and runtime.
-  `crates/echora-loader/src/nso.rs` and `mod0.rs` are adapted from its
-  `src/loader/nso.rs` and `src/loader/mod0.rs`; `crates/echora-guest` from
-  its `crates/guest`; `crates/echora-lift` from its `src/aarch64.rs`,
-  `src/simd.rs` and `src/codegen.rs`; `crates/echora-runtime` from its
-  runtime, threads, synchronization, IPC, services, logging, file system,
-  RomFS, HID, display, content, HLE, audio, bootstrap, NVN, SASS, format
-  and window modules; `crates/echora-gpu` from its `crates/gpu` and
-  `native/shader`; `crates/echora-input` from its `crates/input`; and the
-  synthetic programs and
-  atomics assertions in `crates/echora-aot-tests` from its
-  `tests/aot_execution.rs`.
 - [kinnay/zbic](https://github.com/kinnay/zbic) (GPLv2) was studied to learn
   the ZBIC format; Echora's decoder contains no code from it.
 - Zstandard format: RFC 8878.

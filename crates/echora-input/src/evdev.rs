@@ -15,8 +15,6 @@
 //! Only reading the device, asking for its axis ranges and uploading the
 //! rumble effect needs the kernel; capabilities, names and drivers come
 //! from sysfs.
-//!
-//! Adapted from pokopia-recomp `crates/input` (same author, GPL-3.0-or-later).
 
 // The kernel interface (ioctl on device nodes) needs unsafe calls.
 #![allow(unsafe_code)]

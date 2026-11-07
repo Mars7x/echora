@@ -6,9 +6,6 @@
 //! builds basic blocks, and emits Rust that operates on
 //! [`echora_guest::Core`]. The host toolchain compiles that Rust to native
 //! code for whichever architecture it targets.
-//!
-//! Adapted from pokopia-recomp `src/aarch64.rs`, `src/simd.rs` and
-//! `src/codegen.rs` (same author, GPL-3.0-or-later).
 
 // Ported code keeps its original structure; these lints flag style only.
 #![allow(missing_debug_implementations)]

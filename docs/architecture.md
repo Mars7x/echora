@@ -12,12 +12,12 @@ crates selected per host.
 | `echora-nup` | core | NUP v1 reader: superblock/TOC validation, tree lookup, streaming zstd reads with SHA-256 checks, safe extraction, parallel verification. | Implemented, tested on synthetic and real input. |
 | `echora-content` | core | One content model for NUP and dump directories: packages, versions, ExeFS module identification (NSO/NPDM headers), program-package selection, content-addressed ExeFS cache. | Implemented, tested. |
 | `echora-loader` | core | NSO parsing with bounds checks, LZ4 and ZBIC segment decompression, segment hash verification, ExeFS load order and image budget, process layout and discovery roots (prologues, RELA/RELR relative targets, `init_array`). ZBIC frames are transcoded to standard Zstandard and decoded by libzstd. MOD0 and dynamic-section analysis (symbols via SysV or GNU hash, RELA/REL/RELR/JMPREL tables, init/fini arrays, exported-symbol lookup), read-only. | Implemented, verified on the real modules. |
-| `echora-guest` | core + host backend | Guest CPU state, guest memory (mappings, permissions, TLB, exclusive monitor), SIMD/FP semantics, traps, and the `Core` that generated code runs against. Guest memory has a per-host backend (`host_memory/`): Linux maps one memfd twice, Windows maps pagefile-backed sections into placeholder reservations, so generated code accesses guest memory directly; macOS translates each access through a per-guest-page table. | Ported from Pokopia. Linux, Windows and macOS backends. |
-| `echora-lift` | core | AArch64 decoding (scalar and SIMD/FP), code discovery from entries, prologues, relocation targets and jump tables, basic blocks, and Rust emission. Generated code depends only on `echora-guest` and exposes `dispatch(&mut Core)`. | Ported from Pokopia; 53 tests. |
+| `echora-guest` | core + host backend | Guest CPU state, guest memory (mappings, permissions, TLB, exclusive monitor), SIMD/FP semantics, traps, and the `Core` that generated code runs against. Guest memory has a per-host backend (`host_memory/`): Linux maps one memfd twice, Windows maps pagefile-backed sections into placeholder reservations, so generated code accesses guest memory directly; macOS translates each access through a per-guest-page table. | Linux, Windows and macOS backends. |
+| `echora-lift` | core | AArch64 decoding (scalar and SIMD/FP), code discovery from entries, prologues, relocation targets and jump tables, basic blocks, and Rust emission. Generated code depends only on `echora-guest` and exposes `dispatch(&mut Core)`. | 53 tests. |
 | `echora-aot-tests` | test | Synthetic AArch64 programs lifted by `build.rs` and run natively on a minimal host loop (integer, flags, calls, PAuth hints, budgets, window dispatch, missing blocks, CAS/LDADD/exclusives, acquire/release). | Execution tests (Linux, Windows and macOS). |
-| `echora-runtime` | core (+ host stand-ins) | Process bootstrap (module mapping, stack, TLS, entry registers, NPDM capabilities including the private kernel resource pool), scheduler and threads, synchronization, kernel SVCs, IPC framing and the system services, file systems and RomFS images, HID shared memory, and high-level NVN (objects, command buffers, execution on `echora-gpu`, presentation to a winit window with `ECHORA_WINDOW=1`). Gamepads come from `echora-input`; audio plays through `echora-audio` with `ECHORA_AUDIO=1`. | Ported from Pokopia; tests on Linux, Windows and macOS. Boots the real game's process; not yet run. NVN calls the Vulkan backend directly rather than through a backend trait. |
-| `echora-gpu` | host backend | Vulkan device, renderer, draws, compute, presentation, and shader translation through the PokeDinner recompiler (C ABI shim built by `build.rs` when `ECHORA_SHADER_SRC` is set). | Ported from Pokopia; 9 tests. Used by the runtime's NVN layer. |
-| `echora-input` | host backend | Gamepads as a Switch controller state behind a platform-neutral interface: Linux reads evdev devices (hotplug, axis ranges, rumble); Windows and macOS use gilrs with the same layout, dead zone and rumble bands. | evdev ported from Pokopia; 4 tests. gilrs backend compile-checked for Windows, not yet run on hardware. |
+| `echora-runtime` | core (+ host stand-ins) | Process bootstrap (module mapping, stack, TLS, entry registers, NPDM capabilities including the private kernel resource pool), scheduler and threads, synchronization, kernel SVCs, IPC framing and the system services, file systems and RomFS images, HID shared memory, and high-level NVN (objects, command buffers, execution on `echora-gpu`, presentation to a winit window with `ECHORA_WINDOW=1`). Gamepads come from `echora-input`; audio plays through `echora-audio` with `ECHORA_AUDIO=1`. | Tests on Linux, Windows and macOS. Boots the real game's process; not yet run. NVN calls the Vulkan backend directly rather than through a backend trait. |
+| `echora-gpu` | host backend | Vulkan device, renderer, draws, compute, presentation, and shader translation through the PokeDinner recompiler (C ABI shim built by `build.rs` when `ECHORA_SHADER_SRC` is set). | 9 tests. Used by the runtime's NVN layer. |
+| `echora-input` | host backend | Gamepads as a Switch controller state behind a platform-neutral interface: Linux reads evdev devices (hotplug, axis ranges, rumble); Windows and macOS use gilrs with the same layout, dead zone and rumble bands. | 4 tests. gilrs backend compile-checked for Windows, not yet run on hardware. |
 | `echora-resolution` | core | Resolution planning: guest logical size, guest view, internal scene size, presentation rectangle, output size; target/viewport mapping; change impact. | Implemented, tested. Not yet used by a renderer. |
 | `echora-audio` | host backend | The guest's PCM16 audio-out streams on the default output device through CPAL (ALSA/PipeWire, WASAPI, CoreAudio), fed through a bounded queue by a stream-owning thread. | 2 tests; plays on the development machine. |
 | `echora-config` | core | Versioned TOML settings, validation, migration, requested vs effective settings, apply classes for live changes. | Implemented, tested. Not yet used by a runtime or launcher. |
@@ -57,15 +57,14 @@ therefore pins `libc` 0.2.189 until GPUI moves to a fixed `xattr`.
 
 ## Execution model (planned)
 
-The design follows pokopia-recomp, which already runs another Switch 2 game
-through gameplay on Linux:
+The model has four parts:
 
 1. Load `rtld`, `main`, `subsdk*`, `sdk` at deterministic bases; the guest's
    own rtld performs relocation.
 2. Discover code from function prologues, relocation targets and jump
    tables; translate ahead of time; report every unresolved indirect target
    as a deterministic missing-block stop.
-3. Emit generated code that the host toolchain compiles natively. Pokopia
+3. Emit generated code that the host toolchain compiles natively. Echora
    emits Rust and relies on LLVM for x86-64 code; the same path reaches ARM64
    hosts without a second backend. The IR boundary is kept so that a direct
    machine-code backend can be added if measurements justify it.

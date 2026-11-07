@@ -1,7 +1,5 @@
 //! Guest state shared by the runtime and generated code.
 //!
-//! Adapted from pokopia-recomp `crates/guest` (same author, GPL-3.0-or-later).
-//!
 //! Generated region crates depend only on this crate, so changes to services,
 //! the scheduler or the kernel model never force them to recompile. Generated
 //! code runs against [`Core`]; anything that needs the host (an SVC, or a block
