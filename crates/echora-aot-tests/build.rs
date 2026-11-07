@@ -81,6 +81,7 @@ fn main() {
     call_code(&mut out);
     loop_code(&mut out);
     exclusive_code(&mut out);
+    switch_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -983,6 +984,137 @@ fn exclusive_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Programs with jump tables for `tests/switches.rs`: random instructions,
+/// a 2-, 4- or 8-way switch on a masked register through a halfword or
+/// byte table (ADRP + ADD to the table, ADR + ADD + BR to the case), case
+/// bodies that branch to a merge point, more instructions and SVC #7. The
+/// tables sit in the test's data, below every address the random stores
+/// reach, and discovery reads them there.
+fn switch_code(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xd0_0000;
+    const TABLES: u64 = 0x80_0100;
+    const PROGRAMS: usize = 200;
+    let mut state: u64 = 0x082e_fa98_ec4e_6c89;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        writes.has_gpr(27) || writes.has_gpr(28)
+    };
+    let branch = |from: u64, to: u64| {
+        0x1400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut table_bytes: Vec<u8> = Vec::new();
+    let mut entries = Vec::new();
+    for _ in 0..PROGRAMS {
+        let start = BASE + 4 * words.len() as u64;
+        entries.push(start);
+        let at = |words: &Vec<u32>| BASE + 4 * words.len() as u64;
+        for _ in 0..next() % 4 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        let bits = 1 + next() % 3;
+        let cases = 1u32 << bits;
+        let source = next() % 31;
+        let halfwords = next() % 2 == 0;
+        // Table address, aligned for halfwords.
+        table_bytes.resize(table_bytes.len().next_multiple_of(2), 0);
+        let table = TABLES + table_bytes.len() as u64;
+        // and w17, wSource, #(cases - 1)
+        words.push(0x1200_0000 | ((bits - 1) << 10) | (source << 5) | 17);
+        let adrp_at = at(&words);
+        let pages = ((table >> 12).wrapping_sub(adrp_at >> 12)) as u32;
+        words.push(0x9000_0000 | ((pages & 3) << 29) | (((pages >> 2) & 0x7ffff) << 5) | 16);
+        words.push(0x9100_0000 | (((table & 0xfff) as u32) << 10) | (16 << 5) | 16);
+        words.push(if halfwords { 0x7871_7a09 } else { 0x3871_6a09 });
+        let adr_at = at(&words);
+        words.push(0); // adr x3, cases
+        words.push(0x8b09_0863); // add x3, x3, x9, lsl #2
+        words.push(0xd61f_0060); // br x3
+        let cases_at = at(&words);
+        let offset = cases_at - adr_at;
+        words[((adr_at - BASE) / 4) as usize] = 0x1000_0000
+            | (((offset & 3) as u32) << 29)
+            | ((((offset >> 2) & 0x7ffff) as u32) << 5)
+            | 3;
+        // Case bodies; the table may send several indices to one case.
+        let mut starts = Vec::new();
+        let mut patches = Vec::new();
+        let bodies = 1 + next() % cases;
+        for _ in 0..bodies {
+            starts.push(((at(&words) - cases_at) / 4) as u16);
+            for _ in 0..1 + next() % 2 {
+                words.push(body_instruction(&mut next, &reserved));
+            }
+            patches.push(words.len());
+            words.push(0);
+        }
+        let merge = at(&words);
+        for index in patches {
+            let from = BASE + 4 * index as u64;
+            words[index] = branch(from, merge);
+        }
+        for case in 0..cases {
+            let target = starts[if case < bodies {
+                case as usize
+            } else {
+                next() as usize % starts.len()
+            }];
+            if halfwords {
+                table_bytes.extend(target.to_le_bytes());
+            } else {
+                table_bytes.push(target as u8);
+            }
+        }
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        words.push(0xd400_00e1);
+    }
+    let code = CodeRegion {
+        name: "switches".into(),
+        base: BASE,
+        bytes: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    };
+    let tables = CodeRegion {
+        name: "switch tables".into(),
+        base: TABLES,
+        bytes: table_bytes.clone(),
+    };
+    let translation = discover_with_tables(
+        std::slice::from_ref(&code),
+        std::slice::from_ref(&tables),
+        &entries,
+        &[],
+        &Default::default(),
+        words.len() + 16,
+    )
+    .expect("switches");
+    assert_eq!(
+        translation.jump_tables.len(),
+        PROGRAMS,
+        "every switch's table must be recovered"
+    );
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod switch_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    writeln!(out, "pub const TABLES: u64 = {TABLES:#x};").expect("write");
+    writeln!(out, "pub const TABLE_BYTES: &[u8] = &{table_bytes:?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
