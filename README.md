@@ -113,9 +113,8 @@ Echora's data folder (`~/.local/share/echora/game` on Linux), after which
 the original is no longer needed, edits the settings the runtime applies
 and starts it. It runs on Linux, Windows and macOS; place it next to
 the `echora` binary. With "Skip launcher" on it starts the game directly;
-`echora-launcher --show` opens the window again. Play currently starts the
-game without its window or sound unless `ECHORA_WINDOW` and `ECHORA_AUDIO`
-are set in the launcher's environment.
+`echora-launcher --show` opens the window again. The launcher starts the
+game with its window and sound on.
 
 See [local setup](docs/local-setup.md) and [content input](docs/content.md).
 

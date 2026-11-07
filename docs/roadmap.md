@@ -13,7 +13,7 @@ Each phase completes only on the evidence named here, not when code exists.
 | 6. First real game frame | A correct game-generated frame. | In progress. The title logo and the intro movie render; frames are checked from captures (`ECHORA_CAPTURE_EVERY`). |
 | 7. Input, audio, interactive gameplay | Interactive scene with graphics, input and audio. | In progress. Keyboard and gamepad input reach the game and its audio plays (`ECHORA_AUDIO=1`); gameplay has not been reached. |
 | 8. Native resolution support | Internal render size verified at several arbitrary resolutions. | — |
-| 9. Launcher (GPUI) | Launcher configures and starts Echora; exposed settings work. | In progress. Installs the game, edits and saves the settings, starts the game, and works with mouse, keyboard and controllers. Play does not yet open the game's window or sound. |
+| 9. Launcher (GPUI) | Launcher configures and starts Echora; exposed settings work. | In progress. Installs the game, edits and saves the settings, starts the game, and works with mouse, keyboard and controllers. Play starts the game with its window and sound. |
 | 10. In-game settings | Dropped: settings are changed in the launcher, with no in-game interface. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | — |
 | 12. High frame rates | No timing, physics or animation regressions. | — |
@@ -30,6 +30,5 @@ Each phase completes only on the evidence named here, not when code exists.
    outside task and mesh programs, gather forms).
 3. Add the mesh and task draw path (`DrawMeshTasks`, `VK_EXT_mesh_shader`)
    that gameplay scenes need, and advance to gameplay.
-4. Start the game from the launcher with its window and sound.
-5. Measure and raise the frame rate, starting with guest threads on several
+4. Measure and raise the frame rate, starting with guest threads on several
    host threads (`ECHORA_WORKERS`).

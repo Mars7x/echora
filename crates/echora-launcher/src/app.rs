@@ -276,10 +276,24 @@ fn game_command(game: &Path, settings: Option<&Path>) -> Option<Command> {
         .filter(|path| path.is_file())?;
     let mut command = Command::new(echora);
     command.arg("run").arg(game);
+    game_environment(&mut command, settings, |name| {
+        std::env::var_os(name).is_some()
+    });
+    Some(command)
+}
+
+/// The game's window and sound are on, as a player starting it expects,
+/// unless the launcher's own environment already chooses (`is_set`); the
+/// runtime leaves both off without them, for headless runs.
+fn game_environment(command: &mut Command, settings: Option<&Path>, is_set: impl Fn(&str) -> bool) {
     if let Some(settings) = settings {
         command.env("ECHORA_SETTINGS", settings);
     }
-    Some(command)
+    for name in ["ECHORA_WINDOW", "ECHORA_AUDIO"] {
+        if !is_set(name) {
+            command.env(name, "1");
+        }
+    }
 }
 
 impl Launcher {
@@ -2123,7 +2137,51 @@ impl Launcher {
 
 #[cfg(test)]
 mod tests {
-    use super::split_title;
+    use super::{game_environment, split_title};
+
+    /// The variables `command` sets for the game, by name.
+    fn environment(command: &std::process::Command) -> Vec<(String, Option<String>)> {
+        command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_game_starts_with_its_window_and_sound() {
+        let mut command = std::process::Command::new("echora");
+        game_environment(&mut command, Some(std::path::Path::new("s.toml")), |_| {
+            false
+        });
+        let env = environment(&command);
+        for (name, value) in [
+            ("ECHORA_SETTINGS", "s.toml"),
+            ("ECHORA_WINDOW", "1"),
+            ("ECHORA_AUDIO", "1"),
+        ] {
+            assert!(
+                env.contains(&(name.into(), Some(value.into()))),
+                "{name} in {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_or_sound_choice_in_the_environment_is_kept() {
+        let mut command = std::process::Command::new("echora");
+        game_environment(&mut command, None, |name| name == "ECHORA_AUDIO");
+        let env = environment(&command);
+        assert!(env.contains(&("ECHORA_WINDOW".into(), Some("1".into()))));
+        assert!(
+            !env.iter()
+                .any(|(name, _)| name == "ECHORA_AUDIO" || name == "ECHORA_SETTINGS")
+        );
+    }
 
     #[test]
     fn splits_series_from_the_title() {
