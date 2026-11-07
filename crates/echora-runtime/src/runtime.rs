@@ -1629,6 +1629,16 @@ impl Machine {
         pick(true).or_else(|| pick(false))
     }
 
+    /// Whether a thread no worker runs could run on some core (for parked
+    /// workers: one core's worker finding nothing is not a deadlock).
+    fn runnable_on_any_core(&mut self) -> bool {
+        let core = self.worker_core.take();
+        let current = self.core.current_thread_id;
+        let any = self.next_runnable_thread(current, Some(current)).is_some();
+        self.worker_core = core;
+        any
+    }
+
     fn saved_thread_cpu(&self, id: u64) -> Result<Cpu, Trap> {
         self.thread_processor_id(id)?;
         if id == self.layout.main_thread_id {
@@ -4023,17 +4033,11 @@ impl Worker {
                     held.elapsed().as_micros() as u64;
                 match outcome {
                     Ok(()) => {
-                        let spare = machine.parked_workers != 0
-                            && machine
-                                .next_runnable_thread(
-                                    machine.core.current_thread_id,
-                                    Some(machine.core.current_thread_id),
-                                )
-                                .is_some();
+                        let spare = machine.parked_workers != 0 && machine.runnable_on_any_core();
                         self.swap_out(&mut machine, true);
                         drop(machine);
                         if spare {
-                            shared.wake.notify_one();
+                            shared.wake.notify_all();
                         }
                         continue;
                     }
@@ -4072,7 +4076,13 @@ impl Worker {
                     Err(Trap::NoRunnableThreads { waiting_threads }) => {
                         let deadline = machine.next_wait_deadline();
                         let everyone_parked = machine.running.is_empty();
-                        if everyone_parked && deadline.is_none() {
+                        // Nothing for this core may still be something for
+                        // another parked worker's core.
+                        let elsewhere = machine.runnable_on_any_core();
+                        if elsewhere {
+                            shared.wake.notify_all();
+                        }
+                        if everyone_parked && deadline.is_none() && !elsewhere {
                             machine.parked_workers -= 1;
                             return self.stop(
                                 shared,
