@@ -137,7 +137,7 @@ pub fn write_controller(
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
     use crate::memory::{READ, STATE_SHARED};

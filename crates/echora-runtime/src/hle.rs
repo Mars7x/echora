@@ -333,7 +333,7 @@ fn inflate_zlib(input: &[u8], capacity: usize) -> Option<Vec<u8>> {
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 

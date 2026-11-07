@@ -750,7 +750,7 @@ impl ThreadCollection {
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
     use crate::memory::{ATTRIBUTE_LOCKED, STATE_CODE_DATA, STATE_FREE, STATE_NORMAL, STATE_STACK};

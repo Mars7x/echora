@@ -156,7 +156,7 @@ pub fn shared() -> Option<&'static Shared> {
 fn run(shared: &'static Shared) -> Result<(), String> {
     let mut builder = EventLoop::builder();
     // The event loop runs on its own thread, which winit allows on Linux
-    // and Windows; macOS requires the main thread (not supported yet).
+    // and Windows.
     #[cfg(target_os = "linux")]
     {
         winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);

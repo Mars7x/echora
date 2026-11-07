@@ -765,7 +765,7 @@ impl ZeroHandleWaits {
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 
@@ -1056,7 +1056,7 @@ mod tests {
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod zero_handle_tests {
     use super::*;
 

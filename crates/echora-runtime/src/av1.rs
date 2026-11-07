@@ -19,7 +19,6 @@ use std::ptr::NonNull;
 /// dav1d's "try again" result (-EAGAIN, rav1d takes the platform's
 /// value): input not consumed yet, or no picture ready.
 #[cfg(any(
-    target_vendor = "apple",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
@@ -27,7 +26,6 @@ use std::ptr::NonNull;
 ))]
 const AGAIN: i32 = -35;
 #[cfg(not(any(
-    target_vendor = "apple",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
