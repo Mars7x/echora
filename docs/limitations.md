@@ -1,7 +1,14 @@
 # Known limitations
 
-- Game code is loaded and verified but not yet translated or executed.
-  Synthetic AArch64 programs are lifted and executed natively.
+- The game runs as far as the intro movie; gameplay has not been reached.
+  Each unimplemented operation still stops the run with a report.
+- Runs are far below full speed (test runs average about 4 to 13 presented
+  frames per second, including startup and debugging instrumentation). By
+  default every guest thread runs on one host thread; `ECHORA_WORKERS` runs
+  them on several, which is not yet the default or measured for OoT.
+- Launching from the launcher's Play button does not open the game's window
+  or play its sound: the runtime opens them only with `ECHORA_WINDOW=1` and
+  `ECHORA_AUDIO=1`, which the launcher does not yet set.
 - Guest memory reaches host memory directly on Linux and Windows (10 1803 or
   later), which need 4 KiB host pages. macOS uses a checked backend that
   looks every guest access up in a table, which is slower.
@@ -14,13 +21,15 @@
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
-- The NVN layer does not yet implement OoT's mesh/task pipelines or the
-  other Switch 2 graphics features it needs. NVN calls the
-  Vulkan backend directly; a backend trait (for Metal and Direct3D 12) is
-  still to be introduced. Gamepads on Windows and macOS (gilrs) are untested on hardware, audio
-  output does not resample (the device must accept the guest's rate and
-  channel count), and the window runs on its own thread, which macOS does
-  not allow.
+- The NVN layer does not yet draw mesh and task pipelines (`DrawMeshTasks`),
+  which gameplay scenes need. Of the 6,074 shader stages OoT reached in a
+  test run, 114 do not translate yet (mostly stage-buffer reads outside task
+  and mesh programs, and gather forms); draws that need them are skipped.
+  NVN calls the Vulkan backend directly; a backend trait (for Metal and
+  Direct3D 12) is still to be introduced. Gamepads on Windows and macOS
+  (gilrs) are untested on hardware, audio output does not resample (the
+  device must accept the guest's rate and channel count), and the window
+  runs on its own thread, which macOS does not allow.
 - Shader translation needs the fetched recompiler sources
   (`ECHORA_SHADER_SRC`); binaries built with them include AGPL-3.0 code
   (sirit).

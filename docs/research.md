@@ -53,6 +53,11 @@ confirmed against Echora's own runs rather than assumed:
 - NVN2 mesh/task pipelines (`DrawMeshTasksIndirect` in the opening), AV1 and
   NDVE movie decoding, resolution-dependent `TLD4.SCR` gathers.
 
+Confirmed in Echora so far: ZBIC segments in `main` (see below), symbol
+tables reached only through `DT_GNU_HASH`, and AV1 for the intro movie
+(decoded with rav1d). The mesh and task pipelines are translated by the
+shader recompiler but not yet drawn.
+
 ## ZBIC format
 
 Studied from `kinnay/zbic` (`src/zstd.c`, the code under

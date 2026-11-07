@@ -15,44 +15,41 @@ display, input and audio, rather than emulating the console.
 ## Status
 
 Latest measured state (2026-11-06, update `0400486024DEC000` v131072,
-display version 1.1.1):
+display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
 
+- **The game runs.** The whole of the game's code is translated ahead of
+  time (17.3 million instructions, 4.2 GiB of generated Rust in 1,111
+  crates), compiled natively, and run on Echora's runtime. It boots, draws
+  on the host GPU through Vulkan and presents frames: test runs go through
+  3,000 presented frames, show the title logo and play the intro movie
+  (AV1, decoded on the host).
+- **Not playable yet.** Runs have been seen as far as the intro movie;
+  gameplay has not been reached. The mesh and task shaders that gameplay
+  scenes need have no draw path in the runtime yet. Runs are far below full
+  speed: test runs average about 4 to 13 presented frames per second,
+  including startup and debugging instrumentation, with every guest thread
+  on one host thread by default.
+- **Shaders.** The console's GPU programs are translated to SPIR-V by the
+  Lichii shader recompiler with Echora's patches. Of the 6,074 shader stages
+  OoT reached in a test run, 5,960 translate and compile on the driver.
 - **Content input works.** Echora opens the game's NUP container directly,
   validates its whole table of contents, and identifies the executable set.
   A full content check of the 25 GB package (186,592 files, 23.5 GiB after
-  deduplication) passes in 12.6 s on a Ryzen 7 5800X3D. The ExeFS is placed
-  in a content-addressed cache; NUP and extracted-directory input produce the
-  same cache key.
-- **Resolution and settings foundations** exist as tested libraries: a
-  resolution planner that keeps guest, internal scene, UI and output sizes
-  separate (arbitrary sizes, non-integer ratios, ultrawide), and a versioned
-  settings model with requested-versus-effective resolution and live-change
-  classes. Neither is connected to a renderer yet.
-- **Executable loading works.** `echora load` decompresses all four modules
-  (`rtld`, `main`, `subsdk0`, `sdk`; `main` alone is 81 MB of text, rodata and
-  data)
-  and every segment matches the SHA-256 stored in its NSO header. `main` uses
-  ZBIC, a Zstandard variant from Switch firmware 22, which Echora decodes by
-  transcoding to standard Zstandard. MOD0 and dynamic-section metadata
-  (GNU-hash symbol tables, RELA/RELR/PLT relocations, init arrays) are
-  validated for every module. Loading takes about 0.2 s.
-- **Native execution of synthetic code works.** The AArch64 lifter and guest
-  CPU/memory model translate test programs to
-  Rust at build time; they run natively and pass integer, call, atomic,
-  exclusive and acquire/release semantics checks. Guest memory works on
-  Linux, Windows (10 1803 or later) and macOS.
-- **Code discovery on the real game:** `echora analyze` finds 17.3 million
-  instructions, 96.6% of `main`'s text, in 14 s. Every discovered
-  instruction form is translated except a single `stg` (memory tagging);
-  see the [research notes](docs/research.md#code-discovery-on-the-checked-input).
-- **Translation:** `echora lift` writes the whole game as 4.2 GiB of Rust in
-  1,111 crates; all of it type-checks. A full native build has not been
-  run yet (estimated at about 4.5 CPU-hours).
-- **No game code runs yet.** Completing the lifter and the runtime are
-  next; see the [roadmap](docs/roadmap.md).
+  deduplication) passes in 12.6 s on a Ryzen 7 5800X3D. NUP and
+  extracted-directory input produce the same cache key.
+- **Executable loading works.** All four modules (`rtld`, `main`,
+  `subsdk0`, `sdk`) are decompressed and every segment matches the SHA-256
+  stored in its NSO header. `main` uses ZBIC, a Zstandard variant from
+  Switch firmware 22, which Echora decodes by transcoding to standard
+  Zstandard.
+- **Launcher.** A GPUI launcher installs the game, edits the settings the
+  runtime applies and starts it. It works with the mouse, the keyboard and
+  controllers.
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
-  x86-64, Windows x86-64 and macOS ARM64. Synthetic programs run natively on
-  all three; no game code runs on any platform.
+  x86-64, Windows x86-64 and macOS ARM64. The game's translation has only
+  been built and run on Linux.
+
+See the [roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md).
 
 ## How it works
 
@@ -64,17 +61,20 @@ display version 1.1.1):
    materializes the program's ExeFS in a cache keyed by its content.
    `echora-loader` decompresses NSO modules (LZ4 or ZBIC) and verifies each
    segment hash.
-2. **Translation** (planned). Executable modules are decoded and translated
-   ahead of time into native code through an architecture-neutral
-   representation.
-3. **Runtime** (planned). Guest memory, threads, synchronization, IPC and the
-   system services the game reaches, implemented as the executable requires
-   them.
-4. **Graphics** (planned). NVN calls are handled on the host and executed on
-   Vulkan first, behind a backend boundary that also admits Metal and
-   Direct3D 12. Render targets are sized by `echora-resolution`, so the scene
-   renders at the selected internal resolution instead of being stretched.
-5. **Host integration** (planned). Native windowing, input, audio and a
+2. **Translation.** `echora-lift` discovers the game's code from its entry
+   points, function prologues, relocation targets and jump tables, and emits
+   it as Rust that the host toolchain compiles to native code. Each 64 KiB
+   guest region becomes its own crate; the crates link into shared-library
+   bundles.
+3. **Runtime.** `echora-runtime` provides guest memory, threads and
+   scheduling, synchronization, kernel SVCs, IPC and the system services the
+   game reaches, implemented as the executable requires them. An operation
+   that is not implemented stops the run with a report rather than
+   returning invented success.
+4. **Graphics.** NVN calls are handled on the host and executed on Vulkan
+   (`echora-gpu`); shader programs are translated to SPIR-V. Movies are
+   decoded on the host.
+5. **Host integration.** Windowing, keyboard and gamepad input, audio, and a
    GPUI launcher on Linux, Windows and macOS, where all settings are
    changed.
 
@@ -97,17 +97,25 @@ echora verify game.nup           # decode and hash-check every file
 echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
 echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
+echora boot game.nup             # create the game process without running it
 echora lift game.nup             # write the translation (4.2 GiB of Rust) to the cache
 echora run game.nup              # run the built translation (see docs/local-setup.md)
 echora extract game.nup out --subtree romfs
 ```
+
+Running the game needs the translation built first and the shader
+recompiler sources fetched; [local setup](docs/local-setup.md) has the
+steps. `ECHORA_WINDOW=1` opens the game's window and `ECHORA_AUDIO=1`
+plays its sound.
 
 `echora-launcher` (GPUI) installs the game from your NUP or dump into
 Echora's data folder (`~/.local/share/echora/game` on Linux), after which
 the original is no longer needed, edits the settings the runtime applies
 and starts it. It runs on Linux, Windows and macOS; place it next to
 the `echora` binary. With "Skip launcher" on it starts the game directly;
-`echora-launcher --show` opens the window again.
+`echora-launcher --show` opens the window again. Play currently starts the
+game without its window or sound unless `ECHORA_WINDOW` and `ECHORA_AUDIO`
+are set in the launcher's environment.
 
 See [local setup](docs/local-setup.md) and [content input](docs/content.md).
 
