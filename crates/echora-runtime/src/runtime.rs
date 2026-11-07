@@ -3924,6 +3924,7 @@ impl Worker {
         dispatch: &(impl Fn(&mut Core) -> Result<(), Trap> + Sync),
     ) -> (Core, Option<Trap>) {
         use std::sync::atomic::Ordering;
+        crate::fault::watch(&self.core);
         loop {
             if self.active {
                 let ran = std::time::Instant::now();
