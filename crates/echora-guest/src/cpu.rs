@@ -277,6 +277,7 @@ impl Cpu {
 
     /// CCMP tests the incoming NZCV before replacing it. When the predicate is
     /// false, all four flags come directly from the instruction's NZCV literal.
+    #[inline]
     pub fn conditional_compare(&mut self, lhs: u64, rhs: u64, bits: u8, condition: u8, nzcv: u8) {
         if self.condition(condition) {
             self.add_sub(lhs, rhs, true, bits, true);
@@ -286,6 +287,7 @@ impl Cpu {
     }
 
     /// CCMN: as CCMP, with flags from Rn + operand.
+    #[inline]
     pub fn conditional_compare_negative(
         &mut self,
         lhs: u64,
@@ -301,6 +303,7 @@ impl Cpu {
         }
     }
 
+    #[inline]
     pub fn logical_flags(&mut self, value: u64, bits: u8) {
         let value = value & width_mask(bits);
         self.nzcv = (((value >> (bits - 1)) as u8) << 3) | (u8::from(value == 0) << 2);

@@ -850,7 +850,8 @@ fn emit_instruction(
 ) {
     let pc = record.pc;
     let mut body = String::new();
-    emit_instruction_body(&mut body, record, last);
+    // Split windows (no per-block entry check) dispatch on a local PC.
+    emit_instruction_body(&mut body, record, last, !check_entry);
     // The PC is stored where it can be observed: before anything that can
     // trap, read the PC or call a helper that might. Plain register and flag arithmetic skips
     // it, which keeps the host code smaller.
@@ -1097,11 +1098,27 @@ fn needs_pc(body: &str) -> bool {
         .any(|(at, _)| !PURE.iter().any(|pure| body[at..].starts_with(pure)))
 }
 
-fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, last: bool) {
+/// `local_pc`: the block's successor goes to the window's `next_pc` local,
+/// which its loop stores into `m.cpu.pc` after the block (see
+/// `emit_split_windows`), so the host compiler can see constant successors
+/// and branch to them directly instead of dispatching through memory.
+fn emit_instruction_body(
+    output: &mut String,
+    record: &TranslatedInstruction,
+    last: bool,
+    local_pc: bool,
+) {
     use Instruction::*;
     let pc = record.pc;
     let next = pc.wrapping_add(4);
     let mut sets_pc = false;
+    let successor = if local_pc { "next_pc" } else { "m.cpu.pc" };
+    // After a direct call the callee left its return PC in `m.cpu.pc`.
+    let after_call = if local_pc {
+        "                next_pc = m.cpu.pc;\n"
+    } else {
+        ""
+    };
     match &record.instruction {
         Nop => {}
         SpinHint => writeln!(output, "                m.spin_hint();").unwrap(),
@@ -1113,7 +1130,7 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             .unwrap();
         }
         PAuthDisabledReturn { key } => {
-            writeln!(output, "                m.cpu.pc = m.cpu.pauth_disabled_return(cpu::InstructionAuthKey::{key:?});").unwrap();
+            writeln!(output, "                {successor} = m.cpu.pauth_disabled_return(cpu::InstructionAuthKey::{key:?});").unwrap();
             sets_pc = true;
         }
         StripLrInstructionPac => output.push_str(
@@ -1128,14 +1145,17 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             if *link {
                 put(output, 30, 64, false, &format!("{next:#x}"));
             }
-            writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
             if *link {
+                writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 emit_call(output, next);
+                output.push_str(after_call);
+            } else {
+                writeln!(output, "                {successor} = {target:#x};").unwrap();
             }
             sets_pc = true;
         }
         BranchCond { target, condition } => {
-            writeln!(output, "                m.cpu.pc = if m.cpu.condition({condition}) {{ {target:#x} }} else {{ {next:#x} }};").unwrap();
+            writeln!(output, "                {successor} = if m.cpu.condition({condition}) {{ {target:#x} }} else {{ {next:#x} }};").unwrap();
             sets_pc = true;
         }
         CompareBranch {
@@ -1145,7 +1165,7 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             target,
         } => {
             let comparison = if *nonzero { "!=" } else { "==" };
-            writeln!(output, "                m.cpu.pc = if {} {comparison} 0 {{ {target:#x} }} else {{ {next:#x} }};", reg(*rt, *bits, false)).unwrap();
+            writeln!(output, "                {successor} = if {} {comparison} 0 {{ {target:#x} }} else {{ {next:#x} }};", reg(*rt, *bits, false)).unwrap();
             sets_pc = true;
         }
         TestBranch {
@@ -1155,7 +1175,7 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             target,
         } => {
             let comparison = if *nonzero { "!=" } else { "==" };
-            writeln!(output, "                m.cpu.pc = if ({} & (1u64 << {bit})) {comparison} 0 {{ {target:#x} }} else {{ {next:#x} }};", reg(*rt, 64, false)).unwrap();
+            writeln!(output, "                {successor} = if ({} & (1u64 << {bit})) {comparison} 0 {{ {target:#x} }} else {{ {next:#x} }};", reg(*rt, 64, false)).unwrap();
             sets_pc = true;
         }
         BranchReg { rn, link } => {
@@ -1168,9 +1188,12 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
             if *link {
                 put(output, 30, 64, false, &format!("{next:#x}"));
             }
-            output.push_str("                m.cpu.pc = target;\n");
             if *link {
+                output.push_str("                m.cpu.pc = target;\n");
                 emit_call(output, next);
+                output.push_str(after_call);
+            } else {
+                writeln!(output, "                {successor} = target;").unwrap();
             }
             sets_pc = true;
         }
@@ -2074,7 +2097,7 @@ fn emit_instruction_body(output: &mut String, record: &TranslatedInstruction, la
         }
     }
     if !sets_pc && last {
-        writeln!(output, "                m.cpu.pc = {next:#x};").unwrap();
+        writeln!(output, "                {successor} = {next:#x};").unwrap();
     }
 }
 
@@ -2196,11 +2219,13 @@ pub fn emit_rust_split_to<E>(
         let locals = RegisterLocals::of(&cases);
         writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
         output.push_str(&locals.load());
+        // The PC is a local the blocks set; memory gets it after each block,
+        // where the boundary check and anything leaving the window see it.
         output.push_str(
-            "    let result = (|| -> Result<(), Trap> {\n    loop {\n        match m.cpu.pc {\n",
+            "    let result = (|| -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    loop {\n        match next_pc {\n",
         );
         output.push_str(&locals.rewrite(&cases));
-        output.push_str("        }\n        m.finish_block()?;\n    }\n    })();\n");
+        output.push_str("        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    })();\n");
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }
@@ -2646,7 +2671,12 @@ mod tests {
         let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
         assert_eq!(regions.len(), 1);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
-        assert!(window.contains("        }\n        m.finish_block()?;\n    }\n    })();\n"));
+        assert!(window.contains(
+            "        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    })();\n"
+        ));
+        // The loop's successor is a local constant the host compiler sees.
+        assert!(window.contains("match next_pc {"));
+        assert!(window.contains("next_pc = 0x1000;"));
     }
 
     #[test]
