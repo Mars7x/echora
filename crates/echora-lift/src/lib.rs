@@ -10,6 +10,10 @@
 // Ported code keeps its original structure; these lints flag style only.
 #![allow(missing_debug_implementations)]
 
+// The tests execute guest SIMD/FP operations, which echora-simd provides.
+#[cfg(test)]
+extern crate echora_simd;
+
 pub mod aarch64;
 pub mod codegen;
 pub mod defuse;
