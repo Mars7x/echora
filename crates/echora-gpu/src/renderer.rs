@@ -234,6 +234,8 @@ pub struct Renderer {
     last_attachments: Vec<vk::Image>,
     /// Memory barriers recorded for those hazards.
     pub hazard_barriers: u64,
+    /// GPU time per submission (ECHORA_GPU_TIME=1).
+    timer: Option<crate::timing::GpuTimer>,
 }
 
 type SamplerKey = (i32, i32, i32, bool, [i32; 3], [u32; 3]);
@@ -374,7 +376,20 @@ impl Renderer {
             retired_texel_buffers: Vec::new(),
             in_flight: false,
         };
+        // SAFETY: the physical device belongs to the live instance.
+        let (period, valid_bits) = unsafe {
+            let limits = gpu.instance.get_physical_device_properties(gpu.physical).limits;
+            let families = gpu
+                .instance
+                .get_physical_device_queue_family_properties(gpu.physical);
+            let bits = families
+                .get(gpu.queue_family as usize)
+                .map_or(0, |family| family.timestamp_valid_bits);
+            (limits.timestamp_period, bits)
+        };
+        let timer = crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
         let mut renderer = Self {
+            timer,
             gpu,
             pool,
             commands,
@@ -461,6 +476,9 @@ impl Renderer {
             unsafe { self.device().begin_command_buffer(self.commands, &begin) }
                 .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
+            if let Some(timer) = &self.timer {
+                timer.begin(&self.gpu.device, self.commands, self.fence);
+            }
             if self.spare.in_flight {
                 // The other slot's batch may still run: this one starts
                 // after it, so batches finish in submission order and each
@@ -1295,6 +1313,9 @@ impl Renderer {
             let _ = std::fs::write(path, labels.join("\n"));
         }
         self.submitted_labels = labels;
+        if let Some(timer) = &self.timer {
+            timer.end(&self.gpu.device, self.commands, self.fence);
+        }
         let device = &self.gpu.device;
         let buffers = [self.commands];
         let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
@@ -1336,6 +1357,9 @@ impl Renderer {
         }
         self.current_in_flight = false;
         self.flush_wait_microseconds += wait_start.elapsed().as_micros() as u64;
+        if let Some(timer) = self.timer.as_mut() {
+            timer.finished(&self.gpu.device, self.fence, self.flush_wait_microseconds);
+        }
         if wait_start.elapsed() > std::time::Duration::from_secs(1) {
             if let Some(path) = std::env::var_os("ECHORA_SLOW_SUBMITS") {
                 use std::io::Write;
@@ -3311,6 +3335,9 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.flush();
+        if let Some(timer) = self.timer.take() {
+            timer.destroy(&self.gpu.device);
+        }
         for (_, (buffer, memory, _)) in std::mem::take(&mut self.resident) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
