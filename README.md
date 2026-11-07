@@ -60,8 +60,8 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
   runtime applies and starts it. It works with the mouse, the keyboard and
   controllers.
 - **Platforms:** the workspace builds and its tests pass in CI on Linux
-  x86-64, Windows x86-64 and macOS ARM64. The game's translation has only
-  been built and run on Linux.
+  x86-64 and Windows x86-64. The game's translation has only been built
+  and run on Linux. macOS is not supported.
 
 See the [roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md).
 
@@ -89,49 +89,43 @@ See the [roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md).
    (`echora-gpu`); shader programs are translated to SPIR-V. Movies are
    decoded on the host.
 5. **Host integration.** Windowing, keyboard and gamepad input, audio, and a
-   GPUI launcher on Linux, Windows and macOS, where all settings are
-   changed.
+   GPUI launcher on Linux and Windows, where all settings are changed.
 
 See [architecture](docs/architecture.md) for the crate boundaries.
 
-## Building and running
+## Building
 
-The game's translation only builds and runs on Linux for now. Build
-Echora, then let the launcher do the rest:
+The game runs on Linux only. You need:
 
-```sh
-cargo build --release                 # echora and echora-launcher
-target/release/echora-launcher        # choose your game, then Play
-```
-
-The first Play fetches the shader recompiler, translates the game and
-builds the translation, showing its progress; that takes about an hour,
-and later starts are immediate. You need your own dump of the game,
-Rust 1.88 or newer, C and C++ compilers, the system libraries listed in
-the guide, about 16 GB of RAM and about 30 GB of disk. See
-[local setup](docs/local-setup.md) for details and troubleshooting.
-
-Other commands work on your NUP file or extracted dump directory:
+- your own dump of the game: the Switch 2 update 1.1.1, as a NUP file or
+  an extracted dump;
+- a Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk;
+- Rust 1.88 or newer, `git`, C and C++ compilers, and the system
+  libraries:
 
 ```sh
-echora inspect game.nup          # packages, versions, build ID, module hashes
-echora verify game.nup           # decode and hash-check every file
-echora import game.nup           # validate and cache the program's ExeFS
-echora load game.nup             # decompress and verify every module
-echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
-echora boot game.nup             # create the game process without running it
-echora prepare game.nup          # fetch, translate and build, as the launcher does
-echora lift game.nup             # only translate (4.2 GiB of Rust)
-echora run game.nup              # run the built translation without the launcher
-echora extract game.nup out --subtree romfs
+# Ubuntu
+sudo apt install build-essential libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
+# Fedora
+sudo dnf install gcc gcc-c++ alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel libxcb-devel vulkan-loader-devel
 ```
 
-See [content input](docs/content.md) for the formats Echora reads.
+Then build Echora and open the launcher:
+
+```sh
+git clone https://github.com/Mars7x/echora.git
+cd echora
+cargo build --release
+target/release/echora-launcher
+```
+
+Choose your game, then press Play. The first start translates and builds
+the game, which takes about an hour; later starts are immediate.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
-- [Local setup](docs/local-setup.md)
+- [Development](docs/development.md)
 - [Content input](docs/content.md)
 - [Roadmap](docs/roadmap.md)
 - [Research notes and reuse audit](docs/research.md)

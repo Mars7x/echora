@@ -52,7 +52,7 @@ supplied without its base or NSO flags beyond the classic ones.
 and their SHA-256 values. An existing entry is reused when its manifest and
 file sizes match; otherwise it is rebuilt in a staging directory and renamed
 into place. The cache root is `ECHORA_CACHE_DIR`, else
-`$XDG_CACHE_HOME/echora` (Linux), `~/Library/Caches/Echora` (macOS) or
+`$XDG_CACHE_HOME/echora` (Linux) or
 `%LOCALAPPDATA%\Echora\cache` (Windows). It is never inside the repository.
 
 ## Updates and DLC

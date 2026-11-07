@@ -5,9 +5,9 @@ Each phase completes only on the evidence named here, not when code exists.
 | Phase | Completion evidence | State |
 |---|---|---|
 | 0. Reuse audit | Reuse matrix and architecture decision ([research](research.md)). | Done 2026-11-06. |
-| 1. Repository and portable foundation | Workspace builds; tests pass on Linux, Windows and macOS CI. | Done 2026-11-06. |
+| 1. Repository and portable foundation | Workspace builds; tests pass on Linux and Windows CI. | Done 2026-11-06. |
 | 2. Content processing | The supplied NUP is validated, inventoried and its ExeFS cached without manual extraction; NUP and directory input normalize identically. | Done for the checked input. RomFS base/update overlay not yet needed. |
-| 3. Compiler foundation | Synthetic guest functions translated and executed natively with verified semantics; missing-block reports. | Done 2026-11-06. Synthetic programs run natively on Linux, Windows and macOS; the whole game (17.3M instructions, 96.6% of `main`'s text discovered) is translated and runs on Linux. |
+| 3. Compiler foundation | Synthetic guest functions translated and executed natively with verified semantics; missing-block reports. | Done 2026-11-06. Synthetic programs run natively on Linux and Windows; the whole game (17.3M instructions, 96.6% of `main`'s text discovered) is translated and runs on Linux. |
 | 4. Guest runtime | Translated startup reaches a recorded runtime milestone. | Done 2026-11-06. Translated startup runs through boot, the system services and GPU setup to presented frames; runs end with a JSON report. |
 | 5. Graphics and resolution foundations | Synthetic workloads at arbitrary sizes; safe resizes. | In progress. NVN runs on Vulkan with shaders translated to SPIR-V; the internal render scale from the settings is applied. The resolution planner is not yet connected to the renderer. |
 | 6. First real game frame | A correct game-generated frame. | In progress. The title logo and the intro movie render; frames are checked from captures (`ECHORA_CAPTURE_EVERY`). |

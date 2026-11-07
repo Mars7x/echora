@@ -13,8 +13,7 @@
   replaced with host code; its streaming zstd decoder (about an eighth of
   run time) still runs translated.
 - Guest memory reaches host memory directly on Linux and Windows (10 1803 or
-  later), which need 4 KiB host pages. macOS uses a checked backend that
-  looks every guest access up in a table, which is slower.
+  later), which need 4 KiB host pages. macOS is not supported.
 - On Windows, releasing part of a 2 MiB memory chunk zeroes it but keeps its
   storage committed until the whole chunk is released.
 - A guest access to unmapped or protected memory ends the process (with the
@@ -28,11 +27,10 @@
   which gameplay scenes need. Of the 6,074 shader stages OoT reached in a
   test run, 114 do not translate yet (mostly stage-buffer reads outside task
   and mesh programs, and gather forms); draws that need them are skipped.
-  NVN calls the Vulkan backend directly; a backend trait (for Metal and
-  Direct3D 12) is still to be introduced. Gamepads on Windows and macOS
-  (gilrs) are untested on hardware, audio output does not resample (the
-  device must accept the guest's rate and channel count), and the window
-  runs on its own thread, which macOS does not allow.
+  NVN calls the Vulkan backend directly; a backend trait (for Direct3D
+  12) is still to be introduced. Gamepads on Windows (gilrs) are untested
+  on hardware, and audio output does not resample (the device must accept
+  the guest's rate and channel count).
 - Shader translation needs the fetched recompiler sources
   (`ECHORA_SHADER_SRC`); binaries built with them include AGPL-3.0 code
   (sirit).
@@ -50,8 +48,7 @@
   `echora-config`; `echora-resolution` is not yet connected to the renderer.
   View expansion (`AspectPolicy::Expand`) will need
   game-specific projection and UI changes before it can be offered.
-- CI covers Linux x86-64, Windows x86-64 and macOS ARM64 compilation and
-  tests only.
+- CI covers Linux x86-64 and Windows x86-64 compilation and tests only.
 - The translation links as shared-library bundles (192 regions, about
   500 MB of code each). On Windows a Rust dylib may export at most 65,535
   symbols, which bundles of this size will exceed; building the
