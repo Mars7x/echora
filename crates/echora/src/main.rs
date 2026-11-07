@@ -339,6 +339,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if std::env::var_os("ECHORA_GPU").is_none() {
                 command.env("ECHORA_GPU", "1");
             }
+            // The shader translator rejects tensor matrix multiplies unless
+            // asked to expand them; the game's movie and upscaling passes
+            // use them, so runs expand them unless the environment chooses.
+            if std::env::var_os("EDEN_NX2_TENSOR").is_none() {
+                command.env("EDEN_NX2_TENSOR", "1");
+            }
             // Saves go under the per-user data directory unless the
             // environment chooses a save or work directory.
             if std::env::var_os("ECHORA_SAVE_DIR").is_none()
