@@ -76,6 +76,7 @@ fn main() {
     semantic_code(&mut out);
     simd_semantic_code(&mut out);
     fp_semantic_code(&mut out);
+    simd_memory_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -266,7 +267,7 @@ fn semantic_code(out: &mut String) {
 fn simd_semantic_code(out: &mut String) {
     use echora_lift::simd::{SimdOp, VecIntOp, VecShiftOp};
 
-    let covered = |op: &SimdOp| match *op {
+    let covered_simd = |op: &SimdOp| match *op {
         SimdOp::VecInt { op, .. } => !matches!(
             op,
             VecIntOp::Sqshl | VecIntOp::Uqshl | VecIntOp::Sqrshl | VecIntOp::Uqrshl
@@ -299,6 +300,7 @@ fn simd_semantic_code(out: &mut String) {
         | SimdOp::ModifyImmediate { .. } => true,
         _ => false,
     };
+    let covered = |instruction: &echora_lift::aarch64::Instruction| matches!(instruction, echora_lift::aarch64::Instruction::Simd(op) if covered_simd(op));
     sampled_simd_program(
         out,
         "simd_semantic_code",
@@ -317,7 +319,7 @@ fn simd_semantic_code(out: &mut String) {
 fn fp_semantic_code(out: &mut String) {
     use echora_lift::simd::{FpPrecision, SimdOp, VecFpOp, VecFpUnaryOp};
 
-    let covered = |op: &SimdOp| match *op {
+    let covered_simd = |op: &SimdOp| match *op {
         SimdOp::VecFp { op, .. } | SimdOp::VecFpElement { op, .. } => {
             !matches!(op, VecFpOp::RecipStep | VecFpOp::RSqrtStep)
         }
@@ -345,6 +347,7 @@ fn fp_semantic_code(out: &mut String) {
         | SimdOp::VecFpAcross { .. } => true,
         _ => false,
     };
+    let covered = |instruction: &echora_lift::aarch64::Instruction| matches!(instruction, echora_lift::aarch64::Instruction::Simd(op) if covered_simd(op));
     sampled_simd_program(
         out,
         "fp_semantic_code",
@@ -366,8 +369,8 @@ fn fp_semantic_code(out: &mut String) {
     );
 }
 
-/// Random words under `generators` (mask, fixed value) that decode to SIMD
-/// operations `covered` accepts, up to 160 per variant, each followed by
+/// Random words under `generators` (mask, fixed value) that decode to
+/// instructions `covered` accepts, up to 160 per variant, each followed by
 /// SVC #7 and SVC #8, lifted through split emission as module `name`.
 fn sampled_simd_program(
     out: &mut String,
@@ -375,7 +378,7 @@ fn sampled_simd_program(
     base: u64,
     seed: u64,
     generators: &[(u32, u32)],
-    covered: &dyn Fn(&echora_lift::simd::SimdOp) -> bool,
+    covered: &dyn Fn(&echora_lift::aarch64::Instruction) -> bool,
 ) {
     use echora_lift::aarch64::{Instruction, decode};
 
@@ -393,13 +396,14 @@ fn sampled_simd_program(
         let word = next();
         let (mask, value) = generators[next() as usize % generators.len()];
         let word = (word & !mask) | value;
-        let Instruction::Simd(op) = decode(word, 0) else {
-            continue;
-        };
-        if !covered(&op) {
+        let instruction = decode(word, 0);
+        if !covered(&instruction) {
             continue;
         }
-        let variant = format!("{op:?}");
+        let variant = match &instruction {
+            Instruction::Simd(op) => format!("{op:?}"),
+            other => format!("{other:?}"),
+        };
         let variant = variant
             .split([' ', '{'])
             .next()
@@ -432,4 +436,38 @@ fn sampled_simd_program(
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// SIMD loads and stores for `tests/simd_memory_semantics.rs`.
+fn simd_memory_code(out: &mut String) {
+    use echora_lift::aarch64::Instruction;
+    use echora_lift::simd::SimdOp;
+
+    let covered = |instruction: &Instruction| match instruction {
+        Instruction::LoadStoreVectorPair { .. } => true,
+        Instruction::Simd(op) => matches!(
+            op,
+            SimdOp::LoadStore { .. }
+                | SimdOp::LoadStorePair { .. }
+                | SimdOp::TransferMultiple { .. }
+                | SimdOp::TransferSingle { .. }
+                | SimdOp::LoadReplicate { .. }
+        ),
+        _ => false,
+    };
+    sampled_simd_program(
+        out,
+        "simd_memory_code",
+        0x78_0000,
+        0x6a09_e667_f3bc_c908,
+        &[
+            (0x3f00_0000, 0x3d00_0000),
+            (0x3f20_0000, 0x3c00_0000),
+            (0x3f20_0c00, 0x3c20_0800),
+            (0x3e00_0000, 0x2c00_0000),
+            (0xbf00_0000, 0x0c00_0000),
+            (0xbf00_0000, 0x0d00_0000),
+        ],
+        &covered,
+    );
 }
