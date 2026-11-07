@@ -1788,13 +1788,15 @@ impl Nvn {
                 // ECHORA_CAPTURE_EVERY=N with ECHORA_CAPTURE_DIR (echora run
                 // sets it beside the report): the first and every N-th
                 // presented image as frame-<present>.png, unchanged frames
-                // included, so a run shows what was on screen.
+                // included, so a run shows what was on screen. N=0 is off.
                 if let (Ok(every), Some(directory)) = (
                     debug_var("ECHORA_CAPTURE_EVERY"),
                     debug_var_os("ECHORA_CAPTURE_DIR"),
                 ) {
-                    let every = every.parse::<u64>().unwrap_or(0).max(1);
-                    if self.presented_frames == 1 || self.presented_frames.is_multiple_of(every) {
+                    let every = every.parse::<u64>().unwrap_or(0);
+                    if every != 0
+                        && (self.presented_frames == 1 || self.presented_frames.is_multiple_of(every))
+                    {
                         let image = if self.gpu().is_some() {
                             self.gpu_read_back(texture).map_err(stop)?
                         } else {

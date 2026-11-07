@@ -2129,6 +2129,7 @@ impl Machine {
     ) -> Result<(), Trap> {
         self.resume_or_idle(|machine| machine.host_ready())?;
         self.check_entry_pc()?;
+        let _profile = crate::host_profile::start();
         if self.layout.workers > 1 {
             return self.run_parallel(&dispatch);
         }

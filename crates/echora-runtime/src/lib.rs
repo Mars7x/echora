@@ -20,6 +20,7 @@ mod fault;
 pub mod fs;
 pub mod hid;
 pub mod hle;
+pub mod host_profile;
 pub mod input;
 pub mod ipc;
 pub mod loader;
