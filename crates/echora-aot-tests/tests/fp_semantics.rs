@@ -98,7 +98,7 @@ fn is_denormal(bits: u64, size: u32) -> bool {
 
 /// FPUnpack's flush: under FZ a denormal input is a zero of its sign (IDC).
 fn input(bits: u64, size: u32) -> u64 {
-    if context().flush && is_denormal(bits, size) {
+    if context().flush && size != 16 && is_denormal(bits, size) {
         raise(IDC);
         bits & sign_bit(size)
     } else {
@@ -132,7 +132,7 @@ fn round_result(bits: u64, size: u32, finite: bool) -> u64 {
     if finite && is_infinite(bits, size) {
         raise(OFC);
     }
-    if context().flush {
+    if context().flush && size != 16 {
         if absolute(bits, size) == min_normal(size) {
             update(|context| context.ambiguous = true);
         }
@@ -171,7 +171,11 @@ impl Random {
     fn float(&mut self, size: u32) -> u64 {
         let pick = self.next() % 16;
         let sign = (self.next() & 1) << (size - 1);
-        let (exponent_bits, fraction_bits) = if size == 32 { (8, 23) } else { (11, 52) };
+        let (exponent_bits, fraction_bits) = match size {
+            16 => (5, 10),
+            32 => (8, 23),
+            _ => (11, 52),
+        };
         let exponent_max = (1u64 << exponent_bits) - 1;
         let fraction = self.next() & ((1 << fraction_bits) - 1);
         let quiet = 1 << (fraction_bits - 1);
@@ -212,25 +216,67 @@ fn mask(bits: u32) -> u64 {
     }
 }
 
+/// `value` rounded to nearest even in `size` bits.
 fn bits_of(value: f64, size: u32) -> u64 {
-    if size == 32 {
-        u64::from((value as f32).to_bits())
-    } else {
-        value.to_bits()
+    match size {
+        16 => half_of(value),
+        32 => u64::from((value as f32).to_bits()),
+        _ => value.to_bits(),
     }
 }
 
-/// The value as an f64 (exact for both sizes).
+/// The value as an f64 (exact for every size).
 fn value_of(bits: u64, size: u32) -> f64 {
-    if size == 32 {
-        f64::from(f32::from_bits(bits as u32))
-    } else {
-        f64::from_bits(bits)
+    match size {
+        16 => half_value(bits),
+        32 => f64::from(f32::from_bits(bits as u32)),
+        _ => f64::from_bits(bits),
     }
+}
+
+fn half_value(bits: u64) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = ((bits >> 10) & 0x1f) as i32;
+    let fraction = (bits & 0x3ff) as f64;
+    sign * match exponent {
+        0 => fraction * 2f64.powi(-24),
+        31 if fraction == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        _ => (1.0 + fraction / 1024.0) * 2f64.powi(exponent - 15),
+    }
+}
+
+/// A non-NaN value rounded to nearest even as an IEEE half.
+fn half_of(value: f64) -> u64 {
+    let sign = if value.is_sign_negative() { 0x8000 } else { 0 };
+    let magnitude = value.abs();
+    // 65504 is the largest half; from the midpoint to 65536 up, infinity.
+    if magnitude >= 65520.0 {
+        return sign | 0x7c00;
+    }
+    if magnitude < 2f64.powi(-14) {
+        // Subnormal (rounding may reach the smallest normal, 0x400).
+        return sign | (magnitude * 2f64.powi(24)).round_ties_even() as u64;
+    }
+    let mut exponent = magnitude.log2().floor() as i32;
+    // log2 can be off by one at powers of two; settle 2^e <= m < 2^(e+1).
+    while 2f64.powi(exponent) > magnitude {
+        exponent -= 1;
+    }
+    while 2f64.powi(exponent + 1) <= magnitude {
+        exponent += 1;
+    }
+    let fraction = ((magnitude / 2f64.powi(exponent) - 1.0) * 1024.0).round_ties_even() as u64;
+    // A fraction of 1024 carries into the exponent, as the bits do.
+    sign | ((((exponent + 15) as u64) << 10) + fraction)
 }
 
 fn fraction_bits(size: u32) -> u32 {
-    if size == 32 { 23 } else { 52 }
+    match size {
+        16 => 10,
+        32 => 23,
+        _ => 52,
+    }
 }
 
 fn is_nan(bits: u64, size: u32) -> bool {
@@ -250,10 +296,10 @@ fn quiet(bits: u64, size: u32) -> u64 {
 }
 
 fn default_nan(size: u32) -> u64 {
-    if size == 32 {
-        0x7fc0_0000
-    } else {
-        0x7ff8_0000_0000_0000
+    match size {
+        16 => 0x7e00,
+        32 => 0x7fc0_0000,
+        _ => 0x7ff8_0000_0000_0000,
     }
 }
 
@@ -567,10 +613,11 @@ fn convert(a: u64, from: u32, to: u32) -> u64 {
         }
         let negative = a & sign_bit(from) != 0;
         let fraction = a & mask(fraction_bits(from));
-        let fraction = if to > from {
-            fraction << 29
+        let (wide, narrow) = (fraction_bits(to), fraction_bits(from));
+        let fraction = if wide > narrow {
+            fraction << (wide - narrow)
         } else {
-            fraction >> 29
+            fraction >> (narrow - wide)
         };
         let base = quiet(bits_of(f64::INFINITY, to) | fraction, to);
         return if negative { negate(base, to) } else { base };
@@ -667,7 +714,8 @@ fn vec_fp(op: VecFpOp, n: u64, m: u64, d: u64, size: u32) -> u64 {
         VecFpOp::AcGt => compare_lanes(abs_n, abs_m, size, true, |x, y| x > y),
         VecFpOp::MulAdd => mul_add(d, n, m, size),
         VecFpOp::MulSub => mul_add(d, negate(n, size), m, size),
-        other => panic!("no reference for {other:?}"),
+        VecFpOp::RecipStep => recip_step(n, m, size),
+        VecFpOp::RSqrtStep => rsqrt_step(n, m, size),
     }
 }
 
@@ -687,8 +735,174 @@ fn vec_fp_unary(op: VecFpUnaryOp, a: u64, size: u32, fbits: u8) -> u64 {
         VecFpUnaryOp::CmGtZero => compare_lanes(a, 0, size, true, |x, y| x > y),
         VecFpUnaryOp::CmLeZero => compare_lanes(0, a, size, true, |x, y| x >= y),
         VecFpUnaryOp::CmLtZero => compare_lanes(0, a, size, true, |x, y| x > y),
-        other => panic!("no reference for {other:?}"),
+        VecFpUnaryOp::RecipEstimate => recip_estimate(a, size),
+        VecFpUnaryOp::RSqrtEstimate => rsqrt_estimate(a, size),
     }
+}
+
+/// FPRecipStepFused (FRECPS): 2 - n * m, fused; 0 x inf gives 2.
+fn recip_step(n: u64, m: u64, size: u32) -> u64 {
+    step(n, m, size, 2.0, 1.0)
+}
+
+/// FPRSqrtStepFused (FRSQRTS): (3 - n * m) / 2, fused; 0 x inf gives 1.5.
+fn rsqrt_step(n: u64, m: u64, size: u32) -> u64 {
+    step(n, m, size, 3.0, 0.5)
+}
+
+fn step(n: u64, m: u64, size: u32, addend: f64, scale: f64) -> u64 {
+    let (a, b) = (input(negate(n, size), size), input(m, size));
+    if let Some(nan) = process_nans(a, b, size) {
+        return nan;
+    }
+    let invalid =
+        (is_infinite(a, size) && is_zero(b, size)) || (is_zero(a, size) && is_infinite(b, size));
+    if invalid {
+        return bits_of(addend * scale, size);
+    }
+    if is_infinite(a, size) || is_infinite(b, size) {
+        return infinity((a ^ b) & sign_bit(size) != 0, size);
+    }
+    compute(
+        size,
+        true,
+        || f32_of(a).mul_add(f32_of(b), addend as f32) * scale as f32,
+        || f64_of(a).mul_add(f64_of(b), addend) * scale,
+    )
+}
+
+/// The exponent field and the fraction aligned to 52 bits.
+fn exponent_and_fraction(bits: u64, size: u32) -> (i64, u64) {
+    let fraction_bits = fraction_bits(size);
+    let exponent = ((absolute(bits, size)) >> fraction_bits) as i64;
+    let fraction = (bits & mask(fraction_bits)) << (52 - fraction_bits);
+    (exponent, fraction)
+}
+
+const FRACTION_52: u64 = (1 << 52) - 1;
+
+/// RecipEstimate: a in 256..512, 8 bits of 1/a.
+fn recip_estimate_table(a: u64) -> u64 {
+    let a = a * 2 + 1;
+    let b = (1 << 19) / a;
+    // (b + 1) DIV 2 in the pseudocode.
+    b.div_ceil(2)
+}
+
+/// RecipSqrtEstimate: a in 128..512, 8 bits of 1/sqrt(a).
+fn rsqrt_estimate_table(a: u64) -> u64 {
+    let a = if a < 256 {
+        a * 2 + 1
+    } else {
+        ((a >> 1) << 1) * 2 + 2
+    };
+    let mut b: u64 = 512;
+    while a * (b + 1) * (b + 1) < 1 << 28 {
+        b += 1;
+    }
+    // (b + 1) DIV 2 in the pseudocode.
+    b.div_ceil(2)
+}
+
+/// FPRecipEstimate (FRECPE), without FEAT_RPRES.
+fn recip_estimate(a: u64, size: u32) -> u64 {
+    let a = input(a, size);
+    if let Some(nan) = process_nan(a, size) {
+        return nan;
+    }
+    let negative = a & sign_bit(size) != 0;
+    let sign = a & sign_bit(size);
+    let value = value_of(a, size).abs();
+    if is_infinite(a, size) {
+        return sign;
+    }
+    if is_zero(a, size) {
+        raise(DZC);
+        return infinity(negative, size);
+    }
+    let tiny = if size == 32 {
+        2f64.powi(-128)
+    } else {
+        2f64.powi(-1024)
+    };
+    if value < tiny {
+        raise(OFC);
+        return infinity(negative, size);
+    }
+    let huge = if size == 32 {
+        2f64.powi(126)
+    } else {
+        2f64.powi(1022)
+    };
+    if context().flush && value >= huge {
+        return sign;
+    }
+    let (mut exponent, mut fraction) = exponent_and_fraction(a, size);
+    if exponent == 0 {
+        if fraction >> 51 & 1 == 0 {
+            exponent = -1;
+            fraction = (fraction << 2) & FRACTION_52;
+        } else {
+            fraction = (fraction << 1) & FRACTION_52;
+        }
+    }
+    let scaled = 256 + (fraction >> 44);
+    let mut result_exponent = if size == 32 {
+        253 - exponent
+    } else {
+        2045 - exponent
+    };
+    let estimate = recip_estimate_table(scaled);
+    let mut fraction = (estimate & 0xff) << 44;
+    if result_exponent == 0 {
+        fraction = (1 << 51) | (fraction >> 1);
+    } else if result_exponent == -1 {
+        fraction = (1 << 50) | (fraction >> 2);
+        result_exponent = 0;
+    }
+    let fraction_bits = fraction_bits(size);
+    sign | ((result_exponent as u64) << fraction_bits) | (fraction >> (52 - fraction_bits))
+}
+
+/// FPRSqrtEstimate (FRSQRTE), without FEAT_RPRES.
+fn rsqrt_estimate(a: u64, size: u32) -> u64 {
+    let a = input(a, size);
+    if let Some(nan) = process_nan(a, size) {
+        return nan;
+    }
+    let negative = a & sign_bit(size) != 0;
+    if is_zero(a, size) {
+        raise(DZC);
+        return infinity(negative, size);
+    }
+    if negative {
+        raise(IOC);
+        return default_nan(size);
+    }
+    if is_infinite(a, size) {
+        return 0;
+    }
+    let (mut exponent, mut fraction) = exponent_and_fraction(a, size);
+    if exponent == 0 {
+        while fraction >> 51 & 1 == 0 {
+            fraction = (fraction << 1) & FRACTION_52;
+            exponent -= 1;
+        }
+        fraction = (fraction << 1) & FRACTION_52;
+    }
+    let scaled = if exponent & 1 == 0 {
+        256 + (fraction >> 44)
+    } else {
+        128 + (fraction >> 45)
+    };
+    let result_exponent = if size == 32 {
+        (380 - exponent).div_euclid(2)
+    } else {
+        (3068 - exponent).div_euclid(2)
+    };
+    let estimate = rsqrt_estimate_table(scaled);
+    let fraction_bits = fraction_bits(size);
+    ((result_exponent as u64) << fraction_bits) | ((estimate & 0xff) << (fraction_bits - 8))
 }
 
 fn pairwise(op: VecFpOp, a: u64, b: u64, size: u32) -> u64 {
@@ -714,6 +928,10 @@ fn interpret(instruction: &SimdOp, s: &mut State) {
                 FpUnaryOp::RoundExact => round_integral(a, Rounding::Nearest, size),
             };
             s.v[rd as usize] = scalar(result);
+        }
+        FpConvertPrecision { rd, rn, from, to } => {
+            let (from, to) = (precision(from), precision(to));
+            s.v[rd as usize] = scalar(convert(lane(v(s, rn), from, 0), from, to));
         }
         FpConvert { rd, rn, from, to } => {
             let (from, to) = (fp_size(from), fp_size(to));
@@ -1023,21 +1241,23 @@ fn interpret(instruction: &SimdOp, s: &mut State) {
             let (from, to) = (precision(from), precision(to));
             let n = v(s, rn);
             s.v[rd as usize] = if to > from {
-                // FCVTL/FCVTL2: two narrow lanes from a half.
-                let offset = if upper { 2 } else { 0 };
-                (0..2).fold(0, |r, i| {
+                // FCVTL/FCVTL2: the narrow lanes of one half.
+                let count = 64 / from;
+                let offset = if upper { count } else { 0 };
+                (0..count).fold(0, |r, i| {
                     with_lane(r, to, i, convert(lane(n, from, i + offset), from, to))
                 })
             } else {
                 // FCVTN/FCVTN2: into the lower half, or the upper keeping
                 // the lower.
+                let count = 128 / from;
                 let mut result = if upper {
                     v(s, rd) & u128::from(u64::MAX)
                 } else {
                     0
                 };
-                let offset = if upper { 2 } else { 0 };
-                for i in 0..2 {
+                let offset = if upper { count } else { 0 };
+                for i in 0..count {
                     result = with_lane(result, to, i + offset, convert(lane(n, from, i), from, to));
                 }
                 result
@@ -1107,24 +1327,49 @@ fn difference(expected: &State, actual: &State) -> String {
 }
 
 /// A known echora-guest difference, accepted until fixed: FNMUL is
-/// FPNeg(FPMul(n, m)), and with FPCR.AH = 0 FPNeg flips a NaN's sign too,
-/// but the lifted FNMUL returns the propagated NaN unflipped. Accepts
-/// exactly that: the same state except Vd's NaN with the other sign.
-fn fnmul_nan_sign(op: &SimdOp, expected: &State, actual: &State) -> bool {
-    let SimdOp::FpBinary {
-        op: FpBinaryOp::NegMul,
-        size,
-        rd,
-        ..
-    } = *op
-    else {
-        return false;
+/// FPNeg(FPMul(n, m)), and FRECPS and FRSQRTS negate their first operand
+/// before processing NaNs. With FPCR.AH = 0, FPNeg flips a NaN's sign too,
+/// but the lifted code returns those NaNs unflipped. Accepts exactly that:
+/// the same state except NaN lanes of Vd with the other sign.
+fn negated_nan_sign(op: &SimdOp, expected: &State, actual: &State) -> bool {
+    let (size, rd, lanes) = match *op {
+        SimdOp::FpBinary {
+            op: FpBinaryOp::NegMul,
+            size,
+            rd,
+            ..
+        } => (fp_size(size), rd, 1),
+        SimdOp::VecFp {
+            op: VecFpOp::RecipStep | VecFpOp::RSqrtStep,
+            size,
+            q,
+            scalar,
+            rd,
+            ..
+        } => {
+            let size = fp_size(size);
+            let lanes = if scalar {
+                1
+            } else if q {
+                128 / size
+            } else {
+                64 / size
+            };
+            (size, rd, lanes)
+        }
+        _ => return false,
     };
-    let size = fp_size(size);
-    let result = lane(expected.v[rd as usize], size, 0);
     let mut flipped = expected.clone();
-    flipped.v[rd as usize] = u128::from(negate(result, size));
-    is_nan(result, size) && flipped == *actual
+    let mut any = false;
+    for index in 0..lanes {
+        let value = lane(expected.v[rd as usize], size, index);
+        let other = lane(actual.v[rd as usize], size, index);
+        if is_nan(value, size) && other == negate(value, size) {
+            flipped.v[rd as usize] = with_lane(flipped.v[rd as usize], size, index, other);
+            any = true;
+        }
+    }
+    any && flipped == *actual
 }
 
 /// The lane size an instruction's random vectors are built for.
@@ -1145,6 +1390,7 @@ fn lane_size(op: &SimdOp) -> u32 {
         | VecFpUnary { size, .. }
         | VecFpPairwise { size, .. } => fp_size(size),
         FpConvert { from, .. } => fp_size(from),
+        FpConvertPrecision { from, .. } => precision(from),
         VecFpConvert { from, .. } => precision(from),
         _ => 32,
     }
@@ -1210,7 +1456,7 @@ fn lifted_floating_point_matches_the_reference() {
             runs += 1;
             let problem = match run_lifted(&mut m, entry, &before) {
                 Ok(actual) if actual == expected => continue,
-                Ok(actual) if fnmul_nan_sign(&op, &expected, &actual) => {
+                Ok(actual) if negated_nan_sign(&op, &expected, &actual) => {
                     known += 1;
                     continue;
                 }
@@ -1223,9 +1469,41 @@ fn lifted_floating_point_matches_the_reference() {
             break;
         }
     }
+    let count = |test: fn(&SimdOp) -> bool| {
+        words
+            .iter()
+            .filter(|&&word| matches!(decode(word, 0), Instruction::Simd(op) if test(&op)))
+            .count()
+    };
+    let estimates = count(|op| {
+        matches!(
+            op,
+            SimdOp::VecFpUnary {
+                op: VecFpUnaryOp::RecipEstimate | VecFpUnaryOp::RSqrtEstimate,
+                ..
+            }
+        )
+    });
+    let steps = count(|op| {
+        matches!(
+            op,
+            SimdOp::VecFp {
+                op: VecFpOp::RecipStep | VecFpOp::RSqrtStep,
+                ..
+            }
+        )
+    });
+    let halves = count(|op| match *op {
+        SimdOp::FpConvertPrecision { from, to, .. } | SimdOp::VecFpConvert { from, to, .. } => {
+            from == FpPrecision::H || to == FpPrecision::H
+        }
+        _ => false,
+    });
+    println!("estimates {estimates}, steps {steps}, half-precision conversions {halves}");
+    assert!(estimates > 0 && steps > 0 && halves > 0);
     println!(
         "{} instructions, {runs} runs, {} mismatching instructions, \
-         {known} runs with the known FNMUL NaN sign difference, \
+         {known} runs with the known negated-NaN sign difference, \
          {skipped} ambiguous flush-to-zero runs skipped",
         words.len(),
         failures.len()

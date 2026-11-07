@@ -309,40 +309,40 @@ fn simd_semantic_code(out: &mut String) {
             (0x9f20_0c00, 0x0e20_0800),
         ],
         &covered,
+        None,
     );
 }
 
 /// Floating-point instructions for `tests/fp_semantics.rs`.
 fn fp_semantic_code(out: &mut String) {
-    use echora_lift::simd::{FpPrecision, SimdOp, VecFpOp, VecFpUnaryOp};
+    use echora_lift::simd::SimdOp;
 
-    let covered_simd = |op: &SimdOp| match *op {
-        SimdOp::VecFp { op, .. } | SimdOp::VecFpElement { op, .. } => {
-            !matches!(op, VecFpOp::RecipStep | VecFpOp::RSqrtStep)
-        }
-        SimdOp::VecFpUnary { op, .. } => !matches!(
+    let covered_simd = |op: &SimdOp| {
+        matches!(
             op,
-            VecFpUnaryOp::RecipEstimate | VecFpUnaryOp::RSqrtEstimate
-        ),
-        SimdOp::VecFpConvert { from, to, .. } => from != FpPrecision::H && to != FpPrecision::H,
-        SimdOp::FpUnary { .. }
-        | SimdOp::FpConvert { .. }
-        | SimdOp::FpBinary { .. }
-        | SimdOp::FpTernary { .. }
-        | SimdOp::FpCompare { .. }
-        | SimdOp::FpConditionalCompare { .. }
-        | SimdOp::FpSelect { .. }
-        | SimdOp::FpMoveImmediate { .. }
-        | SimdOp::FpMoveToGeneral { .. }
-        | SimdOp::FpMoveFromGeneral { .. }
-        | SimdOp::IntToFp { .. }
-        | SimdOp::IntToFpFixed { .. }
-        | SimdOp::SimdIntToFp { .. }
-        | SimdOp::FpToInt { .. }
-        | SimdOp::FpToFixed { .. }
-        | SimdOp::VecFpPairwise { .. }
-        | SimdOp::VecFpAcross { .. } => true,
-        _ => false,
+            SimdOp::VecFp { .. }
+                | SimdOp::VecFpElement { .. }
+                | SimdOp::VecFpUnary { .. }
+                | SimdOp::VecFpConvert { .. }
+                | SimdOp::FpConvertPrecision { .. }
+                | SimdOp::FpUnary { .. }
+                | SimdOp::FpConvert { .. }
+                | SimdOp::FpBinary { .. }
+                | SimdOp::FpTernary { .. }
+                | SimdOp::FpCompare { .. }
+                | SimdOp::FpConditionalCompare { .. }
+                | SimdOp::FpSelect { .. }
+                | SimdOp::FpMoveImmediate { .. }
+                | SimdOp::FpMoveToGeneral { .. }
+                | SimdOp::FpMoveFromGeneral { .. }
+                | SimdOp::IntToFp { .. }
+                | SimdOp::IntToFpFixed { .. }
+                | SimdOp::SimdIntToFp { .. }
+                | SimdOp::FpToInt { .. }
+                | SimdOp::FpToFixed { .. }
+                | SimdOp::VecFpPairwise { .. }
+                | SimdOp::VecFpAcross { .. }
+        )
     };
     let covered = |instruction: &echora_lift::aarch64::Instruction| matches!(instruction, echora_lift::aarch64::Instruction::Simd(op) if covered_simd(op));
     sampled_simd_program(
@@ -363,11 +363,13 @@ fn fp_semantic_code(out: &mut String) {
             (0x5f20_0000, 0x1e00_0000),
         ],
         &covered,
+        Some(24),
     );
 }
 
 /// Random words under `generators` (mask, fixed value) that decode to
-/// instructions `covered` accepts, up to 160 per variant, each followed by
+/// instructions `covered` accepts, up to 160 per variant (or, with
+/// `per_operation`, that many per variant and operation), each followed by
 /// SVC #7 and SVC #8, lifted through split emission as module `name`.
 fn sampled_simd_program(
     out: &mut String,
@@ -376,6 +378,7 @@ fn sampled_simd_program(
     seed: u64,
     generators: &[(u32, u32)],
     covered: &dyn Fn(&echora_lift::aarch64::Instruction) -> bool,
+    per_operation: Option<usize>,
 ) {
     use echora_lift::aarch64::{Instruction, decode};
 
@@ -397,17 +400,20 @@ fn sampled_simd_program(
         if !covered(&instruction) {
             continue;
         }
-        let variant = match &instruction {
+        let text = match &instruction {
             Instruction::Simd(op) => format!("{op:?}"),
             other => format!("{other:?}"),
         };
-        let variant = variant
-            .split([' ', '{'])
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        let count = counts.entry(variant).or_default();
-        if *count < PER_VARIANT {
+        // The variant, or with `per_operation` the variant and its `op`.
+        let (key, cap) = match per_operation {
+            Some(cap) => (text.split(',').next().unwrap_or_default().to_owned(), cap),
+            None => (
+                text.split([' ', '{']).next().unwrap_or_default().to_owned(),
+                PER_VARIANT,
+            ),
+        };
+        let count = counts.entry(key).or_default();
+        if *count < cap {
             *count += 1;
             words.push(word);
         }
@@ -466,6 +472,7 @@ fn simd_memory_code(out: &mut String) {
             (0xbf00_0000, 0x0d00_0000),
         ],
         &covered,
+        None,
     );
 }
 
