@@ -527,13 +527,21 @@ impl Renderer {
         Ok((buffer, true))
     }
 
-    /// Record a copy of `bytes` into resident buffer `key` (before work that
-    /// reads it, after work that used it).
-    pub fn upload_resident(&mut self, key: u64, bytes: &[u8]) -> Result<(), String> {
+    /// Record a copy of `bytes` into resident buffer `key` at `at` (before
+    /// work that reads it, after work that used it). Uploads larger than
+    /// the ring go in pieces.
+    pub fn upload_resident(&mut self, key: u64, at: u64, bytes: &[u8]) -> Result<(), String> {
+        const PIECE: usize = 8 << 20;
+        if bytes.len() > PIECE {
+            for (index, piece) in bytes.chunks(PIECE).enumerate() {
+                self.upload_resident(key, at + (index * PIECE) as u64, piece)?;
+            }
+            return Ok(());
+        }
         let (source, offset) = self.ring_upload(bytes, 16)?;
         let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
         let commands = self.commands()?;
-        let length = (bytes.len() as u64).min(size);
+        let length = (bytes.len() as u64).min(size.saturating_sub(at));
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -558,7 +566,7 @@ impl Renderer {
                 buffer,
                 &[vk::BufferCopy {
                     src_offset: offset,
-                    dst_offset: 0,
+                    dst_offset: at,
                     size: length,
                 }],
             );
@@ -578,9 +586,9 @@ impl Renderer {
     /// Record a copy of `length` bytes of resident buffer `key` for the
     /// host: its token completes with the next flush (see
     /// `take_completed_reads`).
-    pub fn read_resident(&mut self, key: u64, length: u64) -> Result<u64, String> {
+    pub fn read_resident(&mut self, key: u64, at: u64, length: u64) -> Result<u64, String> {
         let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
-        let length = length.min(size);
+        let length = length.min(size.saturating_sub(at));
         let (target, offset) = self.ring_alloc(length, 16)?;
         let commands = self.commands()?;
         let before = vk::MemoryBarrier::default()
@@ -606,7 +614,7 @@ impl Renderer {
                 buffer,
                 target,
                 &[vk::BufferCopy {
-                    src_offset: 0,
+                    src_offset: at,
                     dst_offset: offset,
                     size: length,
                 }],
