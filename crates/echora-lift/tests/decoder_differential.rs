@@ -6,10 +6,18 @@
 //! immediates, branch targets and addressing modes. Over random words, every
 //! word the decoder accepts must also be valid for yaxpeax.
 //!
-//! Known, explained differences are listed in `explained`. Hints,
-//! barriers, PAuth forms with disabled keys, prefetches (decoded as NOP),
-//! cache maintenance and SIMD are checked for acceptance only. Run with
-//! `--nocapture` to see the classes checked and their counts.
+//! SIMD and floating-point words (random fields, biased to that encoding
+//! space) are compared the same way per `SimdOp` variant: registers with
+//! their scalar size, vector arrangement, lane or register group, general
+//! registers, addressing, immediates and, where our operation maps to one
+//! mnemonic, the opcode. The immediates of MOVI/MVNI/ORR/BIC (vector) and
+//! the SHA forms compare register numbers only.
+//!
+//! Known, explained differences are listed in `explained` and
+//! `simd_same_operation`. Hints, barriers, PAuth forms with disabled keys,
+//! prefetches (decoded as NOP) and cache maintenance are checked for
+//! acceptance only. Run with `--nocapture` to see the classes checked and
+//! their counts.
 
 use echora_lift::aarch64::{
     Address, BitfieldOp, CompareOperand, Instruction, LogicalOp, MemoryOp, WideOp, Writeback,
@@ -1037,5 +1045,1067 @@ fn every_accepted_random_word_is_valid() {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+// SIMD and floating point.
+
+use echora_lift::simd::{
+    FpBinaryOp, FpPrecision, FpSize, FpTernaryOp, FpUnaryOp, Rounding, SimdOp, VecAcrossOp,
+    VecFpOp, VecFpUnaryOp, VecIntOp, VecLongOp, VecShiftOp, VecUnaryOp,
+};
+use yaxpeax_arm::armv8::a64::SIMDSizeCode;
+
+/// A SIMD operand in a form both decoders can be put into.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum V {
+    /// A whole register as a scalar: size in bits, number.
+    Scalar(u32, u8),
+    /// A vector: number, Q (128-bit), element bits.
+    Vector(u8, bool, u32),
+    /// One lane: number, element bits, index.
+    Lane(u8, u32, u8),
+    /// Consecutive registers: first, Q, element bits, count.
+    Group(u8, bool, u32, u8),
+    /// One lane of consecutive registers: first, element bits, count, index.
+    GroupLane(u8, u32, u8, u8),
+    /// A general operand, as in the scalar comparison.
+    General(Op),
+    /// A floating-point immediate, as bits of an f64.
+    Float(u64),
+}
+
+fn simd_bits(size: SIMDSizeCode) -> u32 {
+    match size {
+        SIMDSizeCode::B => 8,
+        SIMDSizeCode::H => 16,
+        SIMDSizeCode::S => 32,
+        SIMDSizeCode::D => 64,
+        SIMDSizeCode::Q => 128,
+    }
+}
+
+fn normalize_simd(operand: &Operand) -> Option<V> {
+    Some(match *operand {
+        Operand::SIMDRegister(size, n) => V::Scalar(simd_bits(size), n as u8),
+        Operand::SIMDRegisterElements(vector, n, element) => {
+            V::Vector(n as u8, vector == SIMDSizeCode::Q, simd_bits(element))
+        }
+        Operand::SIMDRegisterElementsLane(_, n, element, lane) => {
+            V::Lane(n as u8, simd_bits(element), lane)
+        }
+        Operand::SIMDRegisterGroup(vector, n, element, count) => V::Group(
+            n as u8,
+            vector == SIMDSizeCode::Q,
+            simd_bits(element),
+            count,
+        ),
+        Operand::SIMDRegisterGroupLane(n, element, count, lane) => {
+            V::GroupLane(n as u8, simd_bits(element), count, lane)
+        }
+        Operand::ImmediateDouble(value) => V::Float(value.to_bits()),
+        ref other => V::General(normalize(other)?),
+    })
+}
+
+fn fp_bits(size: FpSize) -> u32 {
+    match size {
+        FpSize::S => 32,
+        FpSize::D => 64,
+    }
+}
+
+fn precision_bits(precision: FpPrecision) -> u32 {
+    match precision {
+        FpPrecision::H => 16,
+        FpPrecision::S => 32,
+        FpPrecision::D => 64,
+    }
+}
+
+fn rounding_letter(rounding: Rounding) -> &'static str {
+    match rounding {
+        Rounding::Nearest => "N",
+        Rounding::Plus => "P",
+        Rounding::Minus => "M",
+        Rounding::Zero => "Z",
+        Rounding::Away => "A",
+    }
+}
+
+fn vec_fp_name(op: VecFpOp) -> String {
+    match op {
+        VecFpOp::MaxNum => "FMAXNM".into(),
+        VecFpOp::MinNum => "FMINNM".into(),
+        VecFpOp::AbsDiff => "FABD".into(),
+        VecFpOp::MulExtended => "FMULX".into(),
+        VecFpOp::MulAdd => "FMLA".into(),
+        VecFpOp::MulSub => "FMLS".into(),
+        VecFpOp::RecipStep => "FRECPS".into(),
+        VecFpOp::RSqrtStep => "FRSQRTS".into(),
+        other => format!("F{}", format!("{other:?}").to_uppercase()),
+    }
+}
+
+fn vec_int_name(op: VecIntOp) -> String {
+    format!("{op:?}").to_uppercase()
+}
+
+/// Operands of a SIMD register of `bits` used as a scalar or, unless
+/// `scalar`, as a vector of `element`-bit lanes.
+fn reg(n: u8, scalar: bool, q: bool, element: u32) -> V {
+    if scalar {
+        V::Scalar(element, n)
+    } else {
+        V::Vector(n, q, element)
+    }
+}
+
+/// The opcode yaxpeax should report (None: not compared) and the operands.
+fn simd_expected(op: &SimdOp) -> Option<(Option<String>, Vec<V>)> {
+    use SimdOp::*;
+    let s = |name: &str| Some(name.to_owned());
+    let gpr = |bits: u8, n: u8| V::General(Op::Zr(bits == 64, n));
+    let mem = |rn: u8, address: Address| {
+        V::General(match address {
+            Address::Immediate { offset, writeback } => Op::Mem(rn, offset, writeback),
+            Address::Register { rm, option, shift } => {
+                Op::MemReg(rn, rm, option & 1 == 1, option, shift)
+            }
+        })
+    };
+    Some(match *op {
+        LoadStore {
+            rt,
+            rn,
+            bytes,
+            address,
+            ..
+        } => (
+            None,
+            vec![V::Scalar(u32::from(bytes) * 8, rt), mem(rn, address)],
+        ),
+        LoadStorePair {
+            rt,
+            rt2,
+            rn,
+            bytes,
+            offset,
+            writeback,
+            ..
+        } => (
+            None,
+            vec![
+                V::Scalar(u32::from(bytes) * 8, rt),
+                V::Scalar(u32::from(bytes) * 8, rt2),
+                V::General(Op::Mem(rn, offset, writeback)),
+            ],
+        ),
+        LoadLiteral { rt, bytes, address } => (
+            s("LDR"),
+            vec![
+                V::Scalar(u32::from(bytes) * 8, rt),
+                V::General(Op::Target(address)),
+            ],
+        ),
+        FpUnary { op, size, rd, rn } => (
+            match op {
+                FpUnaryOp::Mov => s("FMOV"),
+                FpUnaryOp::Abs => s("FABS"),
+                FpUnaryOp::Neg => s("FNEG"),
+                FpUnaryOp::Sqrt => s("FSQRT"),
+                FpUnaryOp::Round(r) => Some(format!(
+                    "FRINT{}",
+                    match r {
+                        Rounding::Nearest => "N",
+                        Rounding::Plus => "P",
+                        Rounding::Minus => "M",
+                        Rounding::Zero => "Z",
+                        Rounding::Away => "A",
+                    }
+                )),
+                FpUnaryOp::RoundExact => s("FRINTX"),
+            },
+            vec![V::Scalar(fp_bits(size), rd), V::Scalar(fp_bits(size), rn)],
+        ),
+        FpConvert { rd, rn, from, to } => (
+            s("FCVT"),
+            vec![V::Scalar(fp_bits(to), rd), V::Scalar(fp_bits(from), rn)],
+        ),
+        FpConvertPrecision { rd, rn, from, to } => (
+            s("FCVT"),
+            vec![
+                V::Scalar(precision_bits(to), rd),
+                V::Scalar(precision_bits(from), rn),
+            ],
+        ),
+        FpBinary {
+            op,
+            size,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(match op {
+                FpBinaryOp::MaxNum => "FMAXNM".into(),
+                FpBinaryOp::MinNum => "FMINNM".into(),
+                FpBinaryOp::NegMul => "FNMUL".into(),
+                other => format!("F{}", format!("{other:?}").to_uppercase()),
+            }),
+            vec![
+                V::Scalar(fp_bits(size), rd),
+                V::Scalar(fp_bits(size), rn),
+                V::Scalar(fp_bits(size), rm),
+            ],
+        ),
+        FpTernary {
+            op,
+            size,
+            rd,
+            rn,
+            rm,
+            ra,
+        } => (
+            s(match op {
+                FpTernaryOp::MulAdd => "FMADD",
+                FpTernaryOp::MulSub => "FMSUB",
+                FpTernaryOp::NegMulAdd => "FNMADD",
+                FpTernaryOp::NegMulSub => "FNMSUB",
+            }),
+            vec![
+                V::Scalar(fp_bits(size), rd),
+                V::Scalar(fp_bits(size), rn),
+                V::Scalar(fp_bits(size), rm),
+                V::Scalar(fp_bits(size), ra),
+            ],
+        ),
+        FpCompare {
+            size,
+            rn,
+            rm,
+            signaling,
+        } => (
+            s(if signaling { "FCMPE" } else { "FCMP" }),
+            vec![
+                V::Scalar(fp_bits(size), rn),
+                match rm {
+                    Some(rm) => V::Scalar(fp_bits(size), rm),
+                    None => V::Float(0.0_f64.to_bits()),
+                },
+            ],
+        ),
+        FpConditionalCompare {
+            size,
+            rn,
+            rm,
+            condition,
+            nzcv,
+            signaling,
+        } => (
+            s(if signaling { "FCCMPE" } else { "FCCMP" }),
+            vec![
+                V::Scalar(fp_bits(size), rn),
+                V::Scalar(fp_bits(size), rm),
+                V::General(Op::Imm(u64::from(nzcv))),
+                V::General(Op::Cond(condition)),
+            ],
+        ),
+        FpSelect {
+            size,
+            rd,
+            rn,
+            rm,
+            condition,
+        } => (
+            s("FCSEL"),
+            vec![
+                V::Scalar(fp_bits(size), rd),
+                V::Scalar(fp_bits(size), rn),
+                V::Scalar(fp_bits(size), rm),
+                V::General(Op::Cond(condition)),
+            ],
+        ),
+        FpMoveImmediate { size, rd, bits } => {
+            let value = match size {
+                FpSize::S => f64::from(f32::from_bits(bits as u32)),
+                FpSize::D => f64::from_bits(bits),
+            };
+            (
+                s("FMOV"),
+                vec![V::Scalar(fp_bits(size), rd), V::Float(value.to_bits())],
+            )
+        }
+        FpMoveToGeneral {
+            rd,
+            rn,
+            bits,
+            upper,
+        } => (
+            s("FMOV"),
+            vec![
+                gpr(bits, rd),
+                if upper {
+                    V::Lane(rn, 64, 1)
+                } else {
+                    V::Scalar(u32::from(bits), rn)
+                },
+            ],
+        ),
+        FpMoveFromGeneral {
+            rd,
+            rn,
+            bits,
+            upper,
+        } => (
+            s("FMOV"),
+            vec![
+                if upper {
+                    V::Lane(rd, 64, 1)
+                } else {
+                    V::Scalar(u32::from(bits), rd)
+                },
+                gpr(bits, rn),
+            ],
+        ),
+        IntToFp {
+            rd,
+            rn,
+            gp_bits,
+            size,
+            signed,
+        } => (
+            s(if signed { "SCVTF" } else { "UCVTF" }),
+            vec![V::Scalar(fp_bits(size), rd), gpr(gp_bits, rn)],
+        ),
+        IntToFpFixed {
+            rd,
+            rn,
+            gp_bits,
+            size,
+            signed,
+            fbits,
+        } => (
+            s(if signed { "SCVTF" } else { "UCVTF" }),
+            vec![
+                V::Scalar(fp_bits(size), rd),
+                gpr(gp_bits, rn),
+                V::General(Op::Imm(u64::from(fbits))),
+            ],
+        ),
+        SimdIntToFp {
+            rd,
+            rn,
+            size,
+            signed,
+        } => (
+            s(if signed { "SCVTF" } else { "UCVTF" }),
+            vec![V::Scalar(fp_bits(size), rd), V::Scalar(fp_bits(size), rn)],
+        ),
+        FpToInt {
+            rd,
+            rn,
+            gp_bits,
+            size,
+            signed,
+            rounding,
+        } => (
+            Some(format!(
+                "FCVT{}{}",
+                rounding_letter(rounding),
+                if signed { "S" } else { "U" }
+            )),
+            vec![gpr(gp_bits, rd), V::Scalar(fp_bits(size), rn)],
+        ),
+        FpToFixed {
+            rd,
+            rn,
+            gp_bits,
+            size,
+            signed,
+            fbits,
+        } => (
+            s(if signed { "FCVTZS" } else { "FCVTZU" }),
+            vec![
+                gpr(gp_bits, rd),
+                V::Scalar(fp_bits(size), rn),
+                V::General(Op::Imm(u64::from(fbits))),
+            ],
+        ),
+        VectorLogical { op, rd, rn, rm, q } => (
+            Some(format!("{op:?}").to_uppercase()),
+            vec![
+                V::Vector(rd, q, 8),
+                V::Vector(rn, q, 8),
+                V::Vector(rm, q, 8),
+            ],
+        ),
+        InsertElement {
+            rd,
+            rn,
+            bytes,
+            dst,
+            src,
+        } => (
+            s("INS"),
+            vec![
+                V::Lane(rd, u32::from(bytes) * 8, dst),
+                V::Lane(rn, u32::from(bytes) * 8, src),
+            ],
+        ),
+        InsertGeneral {
+            rd,
+            rn,
+            bytes,
+            index,
+        } => (
+            s("INS"),
+            vec![
+                V::Lane(rd, u32::from(bytes) * 8, index),
+                gpr(if bytes == 8 { 64 } else { 32 }, rn),
+            ],
+        ),
+        MoveToGeneral {
+            rd,
+            rn,
+            bytes,
+            index,
+            signed,
+            gp_bits,
+        } => (
+            s(if signed { "SMOV" } else { "UMOV" }),
+            vec![gpr(gp_bits, rd), V::Lane(rn, u32::from(bytes) * 8, index)],
+        ),
+        DupElement {
+            rd,
+            rn,
+            bytes,
+            index,
+            q,
+            scalar,
+        } => (
+            None,
+            vec![
+                reg(rd, scalar, q, u32::from(bytes) * 8),
+                V::Lane(rn, u32::from(bytes) * 8, index),
+            ],
+        ),
+        DupGeneral { rd, rn, bytes, q } => (
+            s("DUP"),
+            vec![
+                V::Vector(rd, q, u32::from(bytes) * 8),
+                gpr(if bytes == 8 { 64 } else { 32 }, rn),
+            ],
+        ),
+        VecFp {
+            op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(vec_fp_name(op)),
+            vec![
+                reg(rd, scalar, q, fp_bits(size)),
+                reg(rn, scalar, q, fp_bits(size)),
+                reg(rm, scalar, q, fp_bits(size)),
+            ],
+        ),
+        VecInt {
+            op,
+            bits,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(vec_int_name(op)),
+            vec![
+                reg(rd, scalar, q, u32::from(bits)),
+                reg(rn, scalar, q, u32::from(bits)),
+                reg(rm, scalar, q, u32::from(bits)),
+            ],
+        ),
+        VecUnary {
+            op,
+            bits,
+            q,
+            scalar,
+            rd,
+            rn,
+        } => (
+            match op {
+                VecUnaryOp::CmEqZero => s("CMEQ"),
+                VecUnaryOp::CmGeZero => s("CMGE"),
+                VecUnaryOp::CmGtZero => s("CMGT"),
+                VecUnaryOp::CmLeZero => s("CMLE"),
+                VecUnaryOp::CmLtZero => s("CMLT"),
+                other => Some(format!("{other:?}").to_uppercase()),
+            },
+            {
+                let mut operands = vec![
+                    reg(rd, scalar, q, u32::from(bits)),
+                    reg(rn, scalar, q, u32::from(bits)),
+                ];
+                if matches!(
+                    op,
+                    VecUnaryOp::CmEqZero
+                        | VecUnaryOp::CmGeZero
+                        | VecUnaryOp::CmGtZero
+                        | VecUnaryOp::CmLeZero
+                        | VecUnaryOp::CmLtZero
+                ) {
+                    operands.push(V::General(Op::Imm(0)));
+                }
+                operands
+            },
+        ),
+        VecPermute {
+            op,
+            bits,
+            q,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(format!("{op:?}").to_uppercase()),
+            vec![
+                V::Vector(rd, q, u32::from(bits)),
+                V::Vector(rn, q, u32::from(bits)),
+                V::Vector(rm, q, u32::from(bits)),
+            ],
+        ),
+        VecExt {
+            q,
+            rd,
+            rn,
+            rm,
+            index,
+        } => (
+            s("EXT"),
+            vec![
+                V::Vector(rd, q, 8),
+                V::Vector(rn, q, 8),
+                V::Vector(rm, q, 8),
+                V::General(Op::Imm(u64::from(index))),
+            ],
+        ),
+        VecTable {
+            q,
+            extend,
+            rd,
+            rn,
+            regs,
+            rm,
+        } => (
+            s(if extend { "TBX" } else { "TBL" }),
+            vec![
+                V::Vector(rd, q, 8),
+                V::Group(rn, true, 8, regs),
+                V::Vector(rm, q, 8),
+            ],
+        ),
+        TransferMultiple {
+            rt,
+            rn,
+            registers,
+            structure,
+            bits,
+            q,
+            load,
+            post,
+        } => (
+            Some(format!("{}{structure}", if load { "LD" } else { "ST" })),
+            vec![
+                V::Group(rt, q, u32::from(bits), registers),
+                post_address(rn, post, u64::from(registers) * if q { 16 } else { 8 }),
+            ],
+        ),
+        TransferSingle {
+            rt,
+            rn,
+            registers,
+            bits,
+            index,
+            load,
+            post,
+        } => (
+            Some(format!("{}{registers}", if load { "LD" } else { "ST" })),
+            vec![
+                V::GroupLane(rt, u32::from(bits), registers, index),
+                post_address(rn, post, u64::from(registers) * u64::from(bits) / 8),
+            ],
+        ),
+        LoadReplicate {
+            rt,
+            rn,
+            registers,
+            bits,
+            q,
+            post,
+        } => (
+            Some(format!("LD{registers}R")),
+            vec![
+                V::Group(rt, q, u32::from(bits), registers),
+                post_address(rn, post, u64::from(registers) * u64::from(bits) / 8),
+            ],
+        ),
+        VecIntElement {
+            op,
+            bits,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+            index,
+        } => (
+            Some(vec_int_name(op)),
+            vec![
+                reg(rd, scalar, q, u32::from(bits)),
+                reg(rn, scalar, q, u32::from(bits)),
+                V::Lane(rm, u32::from(bits), index),
+            ],
+        ),
+        VecFpElement {
+            op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+            index,
+        } => (
+            Some(vec_fp_name(op)),
+            vec![
+                reg(rd, scalar, q, fp_bits(size)),
+                reg(rn, scalar, q, fp_bits(size)),
+                V::Lane(rm, fp_bits(size), index),
+            ],
+        ),
+        VecFpPairwise {
+            op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(format!("{}P", vec_fp_name(op))),
+            if scalar {
+                vec![
+                    V::Scalar(fp_bits(size), rd),
+                    V::Vector(rn, size == FpSize::D, fp_bits(size)),
+                ]
+            } else {
+                vec![
+                    V::Vector(rd, q, fp_bits(size)),
+                    V::Vector(rn, q, fp_bits(size)),
+                    V::Vector(rm, q, fp_bits(size)),
+                ]
+            },
+        ),
+        VecIntPairwise {
+            op,
+            bits,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => (
+            Some(format!("{}P", vec_int_name(op))),
+            if scalar {
+                vec![V::Scalar(64, rd), V::Vector(rn, true, 64)]
+            } else {
+                vec![
+                    V::Vector(rd, q, u32::from(bits)),
+                    V::Vector(rn, q, u32::from(bits)),
+                    V::Vector(rm, q, u32::from(bits)),
+                ]
+            },
+        ),
+        VecLong {
+            op,
+            signed,
+            bits,
+            upper,
+            rd,
+            rn,
+            rm,
+        } => {
+            let bits = u32::from(bits);
+            let wide_source = matches!(op, VecLongOp::Addw | VecLongOp::Subw);
+            (
+                Some(format!(
+                    "{}{}{}",
+                    if signed { "S" } else { "U" },
+                    format!("{op:?}").to_uppercase(),
+                    if upper { "2" } else { "" }
+                )),
+                vec![
+                    V::Vector(rd, true, 2 * bits),
+                    if wide_source {
+                        V::Vector(rn, true, 2 * bits)
+                    } else {
+                        V::Vector(rn, upper, bits)
+                    },
+                    V::Vector(rm, upper, bits),
+                ],
+            )
+        }
+        VecLongElement {
+            op,
+            signed,
+            bits,
+            upper,
+            rd,
+            rn,
+            rm,
+            index,
+        } => (
+            Some(format!(
+                "{}{}{}",
+                if signed { "S" } else { "U" },
+                format!("{op:?}").to_uppercase(),
+                if upper { "2" } else { "" }
+            )),
+            vec![
+                V::Vector(rd, true, 2 * u32::from(bits)),
+                V::Vector(rn, upper, u32::from(bits)),
+                V::Lane(rm, u32::from(bits), index),
+            ],
+        ),
+        VecNarrow {
+            bits,
+            upper,
+            scalar,
+            rd,
+            rn,
+            shift,
+            ..
+        } => {
+            let bits = u32::from(bits);
+            let mut operands = if scalar {
+                vec![V::Scalar(bits / 2, rd), V::Scalar(bits, rn)]
+            } else {
+                vec![V::Vector(rd, upper, bits / 2), V::Vector(rn, true, bits)]
+            };
+            if shift != 0 {
+                operands.push(V::General(Op::Imm(u64::from(shift))));
+            }
+            (None, operands)
+        }
+        VecPolyMulLong {
+            bits,
+            upper,
+            rd,
+            rn,
+            rm,
+        } => (
+            s(if upper { "PMULL2" } else { "PMULL" }),
+            vec![
+                V::Vector(rd, true, 2 * u32::from(bits)),
+                V::Vector(rn, upper, u32::from(bits)),
+                V::Vector(rm, upper, u32::from(bits)),
+            ],
+        ),
+        VecShift {
+            op,
+            bits,
+            q,
+            scalar,
+            rd,
+            rn,
+            shift,
+        } => (
+            None,
+            vec![
+                if op == VecShiftOp::Shrn {
+                    V::Vector(rd, q, u32::from(bits) / 2)
+                } else {
+                    reg(rd, scalar, q, u32::from(bits))
+                },
+                if op == VecShiftOp::Shrn {
+                    V::Vector(rn, true, u32::from(bits))
+                } else {
+                    reg(rn, scalar, q, u32::from(bits))
+                },
+                V::General(Op::Imm(u64::from(shift))),
+            ],
+        ),
+        VecShiftLong {
+            signed,
+            bits,
+            upper,
+            rd,
+            rn,
+            shift,
+        } => (
+            Some(format!(
+                "{}SHLL{}",
+                if signed { "S" } else { "U" },
+                if upper { "2" } else { "" }
+            )),
+            vec![
+                V::Vector(rd, true, 2 * u32::from(bits)),
+                V::Vector(rn, upper, u32::from(bits)),
+                V::General(Op::Imm(u64::from(shift))),
+            ],
+        ),
+        VecPairwiseLong {
+            signed,
+            accumulate,
+            bits,
+            q,
+            rd,
+            rn,
+        } => (
+            Some(format!(
+                "{}{}",
+                if signed { "S" } else { "U" },
+                if accumulate { "ADALP" } else { "ADDLP" }
+            )),
+            vec![
+                V::Vector(rd, q, 2 * u32::from(bits)),
+                V::Vector(rn, q, u32::from(bits)),
+            ],
+        ),
+        VecAcross {
+            op,
+            bits,
+            q,
+            rd,
+            rn,
+        } => {
+            let widening = matches!(op, VecAcrossOp::SAddLV | VecAcrossOp::UAddLV);
+            (
+                Some(format!("{op:?}").to_uppercase()),
+                vec![
+                    V::Scalar(u32::from(bits) * if widening { 2 } else { 1 }, rd),
+                    V::Vector(rn, q, u32::from(bits)),
+                ],
+            )
+        }
+        VecFpAcross { op, rd, rn } => (
+            Some(format!("{}V", vec_fp_name(op))),
+            vec![V::Scalar(32, rd), V::Vector(rn, true, 32)],
+        ),
+        VecFpConvert {
+            from,
+            to,
+            upper,
+            rd,
+            rn,
+        } => {
+            let (from, to) = (precision_bits(from), precision_bits(to));
+            let widening = to > from;
+            (
+                Some(format!(
+                    "FCVT{}{}",
+                    if widening { "L" } else { "N" },
+                    if upper { "2" } else { "" }
+                )),
+                if widening {
+                    vec![V::Vector(rd, true, to), V::Vector(rn, upper, from)]
+                } else {
+                    vec![V::Vector(rd, upper, to), V::Vector(rn, true, from)]
+                },
+            )
+        }
+        VecFpUnary {
+            op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            fbits,
+        } => {
+            let mut operands = vec![
+                reg(rd, scalar, q, fp_bits(size)),
+                reg(rn, scalar, q, fp_bits(size)),
+            ];
+            match op {
+                VecFpUnaryOp::CmEqZero
+                | VecFpUnaryOp::CmGeZero
+                | VecFpUnaryOp::CmGtZero
+                | VecFpUnaryOp::CmLeZero
+                | VecFpUnaryOp::CmLtZero => operands.push(V::Float(0.0_f64.to_bits())),
+                _ if fbits != 0 => operands.push(V::General(Op::Imm(u64::from(fbits)))),
+                _ => {}
+            }
+            (None, operands)
+        }
+        VecDot {
+            signed,
+            q,
+            rd,
+            rn,
+            rm,
+        } => (
+            s(if signed { "SDOT" } else { "UDOT" }),
+            vec![
+                V::Vector(rd, q, 32),
+                V::Vector(rn, q, 8),
+                V::Vector(rm, q, 8),
+            ],
+        ),
+        // Immediates and the mixed scalar/vector SHA forms: register
+        // numbers only (`simd_register_numbers`).
+        Crypto { .. } | MoveImmediate { .. } | ModifyImmediate { .. } => return None,
+    })
+}
+
+/// The SIMD register numbers of the shapes `simd_expected` leaves out, in
+/// operand order.
+fn simd_register_numbers(op: &SimdOp) -> Vec<u8> {
+    match *op {
+        SimdOp::Crypto { op, rd, rn, rm } => {
+            let three = !matches!(
+                format!("{op:?}").as_str(),
+                "Aese" | "Aesd" | "Aesmc" | "Aesimc" | "Sha1h" | "Sha1su1" | "Sha256su0"
+            );
+            if three {
+                vec![rd, rn, rm]
+            } else {
+                vec![rd, rn]
+            }
+        }
+        SimdOp::MoveImmediate { rd, .. } | SimdOp::ModifyImmediate { rd, .. } => vec![rd],
+        _ => Vec::new(),
+    }
+}
+
+/// SIMD opcode names that are the same operation as ours.
+fn simd_same_operation(ours: &str, theirs: &str) -> bool {
+    // FRINTI rounds in the FPCR mode, which the runtime holds at
+    // round-to-nearest-even (simd.rs: other modes stop explicitly).
+    let frinti = ours == "FRINTN" && theirs == "FRINTI";
+    // SHLL shifts by the element size; USHLL/SSHLL by that amount is the
+    // same result (the extension is shifted out), and the operands, shift
+    // included, are compared as usual.
+    let shll = matches!(
+        (ours, theirs),
+        ("USHLL" | "SSHLL", "SHLL") | ("USHLL2" | "SSHLL2", "SHLL2")
+    );
+    frinti || shll
+}
+
+/// The address of a structure transfer: post-indexed by a register, or by
+/// the transfer size when `post` is 31.
+fn post_address(rn: u8, post: Option<u8>, size: u64) -> V {
+    V::General(match post {
+        None => Op::Mem(rn, 0, Writeback::None),
+        Some(31) => Op::Mem(rn, size as i64, Writeback::Post),
+        Some(rm) => Op::Other(format!("RegPostIndexReg({rn}, {rm})")),
+    })
+}
+
+/// The register numbers a SIMD operation names, in operand order: the
+/// fallback comparison for shapes `simd_expected` leaves out.
+fn simd_registers(operands: &[V]) -> Vec<u8> {
+    operands
+        .iter()
+        .filter_map(|operand| match *operand {
+            V::Scalar(_, n)
+            | V::Vector(n, _, _)
+            | V::Lane(n, _, _)
+            | V::Group(n, _, _, _)
+            | V::GroupLane(n, _, _, _) => Some(n),
+            V::General(Op::Zr(_, n) | Op::Sp(_, n)) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Words in the SIMD and floating-point encoding space: data processing
+/// (bits 27:25 = 111) and, more densely, its scalar floating-point,
+/// scalar SIMD and two-register/across-lanes parts; and loads and stores of
+/// SIMD registers (bits 27:25 = 110).
+fn simd_word(random: &mut Random) -> u32 {
+    let word = random.next();
+    let (mask, value) = match random.next() % 5 {
+        0 => (0x0e00_0000, 0x0e00_0000),
+        1 => (0x5f20_0000, 0x1e20_0000),
+        2 => (0xdf00_0000, 0x5e00_0000),
+        3 => (0x9f20_0c00, 0x0e20_0800),
+        _ => (0x0e00_0000, 0x0c00_0000),
+    };
+    (word & !mask) | value
+}
+
+fn variant_name(op: &SimdOp) -> String {
+    let text = format!("{op:?}");
+    text.split([' ', '(', '{'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn simd_operands_agree_with_yaxpeax() {
+    let mut random = Random(0x0123_4567_89ab_cdef);
+    let mut counts: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+    let mut failures: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for _ in 0..4_000_000 {
+        let word = simd_word(&mut random);
+        let Instruction::Simd(op) = decode(word, PC) else {
+            continue;
+        };
+        let variant = variant_name(&op);
+        let count = counts.entry(variant.clone()).or_default();
+        count.0 += 1;
+        let Some(instruction) = theirs(word) else {
+            failures
+                .entry(variant)
+                .or_default()
+                .push(format!("{word:#010x} {op:?}: invalid for yaxpeax"));
+            continue;
+        };
+        let actual: Vec<V> = instruction
+            .operands
+            .iter()
+            .filter_map(normalize_simd)
+            .collect();
+        let name = format!("{:?}", instruction.opcode);
+        count.1 += 1;
+        let problem = match simd_expected(&op) {
+            Some((expected_name, expected)) => {
+                let name_ok = expected_name.as_ref().is_none_or(|expected| {
+                    *expected == name || simd_same_operation(expected, &name)
+                });
+                (!name_ok || expected != actual)
+                    .then(|| format!("expects {expected_name:?} {expected:?}"))
+            }
+            None => {
+                let expected = simd_register_numbers(&op);
+                (expected != simd_registers(&actual))
+                    .then(|| format!("expects registers {expected:?}"))
+            }
+        };
+        if let Some(problem) = problem {
+            failures.entry(variant).or_default().push(format!(
+                "{word:#010x} {op:?}: {problem}, yaxpeax {name} {actual:?}"
+            ));
+        }
+    }
+    for (variant, (accepted, compared)) in &counts {
+        println!("{variant:<24} accepted {accepted:>6} compared {compared:>6}");
+    }
+    let total: usize = failures.values().map(Vec::len).sum();
+    let shown: Vec<String> = failures
+        .values()
+        .flat_map(|list| list.iter().take(3).cloned())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{total} SIMD disagreements in {} variants:\n{}",
+        failures.len(),
+        shown.join("\n")
     );
 }
