@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Lift every program with common vector operations as native code
+# (codegen's EmitOptions::inline_vector):
+# `cargo test -p echora-aot-tests --features inline-vector`.
+inline-vector = []
+
 [dependencies]
 echora-guest.workspace = true
 echora-simd.workspace = true

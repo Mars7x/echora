@@ -2145,7 +2145,13 @@ fn emit_instruction_body(
                 writeln!(output, "                echora_guest::simd::load(&mut m.cpu, &m.memory, {address:#x}, {rt}, {bytes})?;").unwrap();
             }
             other => {
-                let call = crate::simd::emit_call(other).expect("non-memory SIMD operation");
+                let inline = INLINE_VECTOR
+                    .get()
+                    .then(|| crate::simd::emit_inline(other))
+                    .flatten();
+                let call = inline.unwrap_or_else(|| {
+                    crate::simd::emit_call(other).expect("non-memory SIMD operation")
+                });
                 writeln!(output, "                {call}").unwrap();
             }
         },
@@ -2324,6 +2330,22 @@ fn emit_split_cases(
     }
 }
 
+/// A block body ending in `next_pc = if CONDITION { A } else { B };` with
+/// constant targets: the body before that line, the condition, A and B.
+fn split_conditional(body: &str) -> Option<(&str, &str, u64, u64)> {
+    let trimmed = body.trim_end_matches('\n');
+    let split = trimmed.rfind('\n').map_or(0, |at| at + 1);
+    let target = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+    let rest = trimmed[split..]
+        .trim()
+        .strip_prefix("next_pc = if ")?
+        .strip_suffix(" };")?;
+    let (condition, arms) = rest.split_once(" { ")?;
+    let (taken, other) = arms.split_once(" } else { ")?;
+    let (taken, other) = (target(taken)?, target(other)?);
+    (!condition.contains('{')).then_some((&body[..split], condition, taken, other))
+}
+
 /// `start`'s body with each successor that is inlined here written out in
 /// place of its `next_pc` assignment. An inlined block stores its PC first:
 /// its first instruction relies on `m.cpu.pc` as an arm's does.
@@ -2358,15 +2380,8 @@ fn expand_block(
         branch(output, next);
         return;
     }
-    let conditional = statement
-        .strip_prefix("next_pc = if ")
-        .and_then(|rest| rest.strip_suffix(" };"))
-        .and_then(|rest| {
-            let (condition, arms) = rest.split_once(" { ")?;
-            let (taken, rest) = arms.split_once(" } else { ")?;
-            let (taken, other) = (target(taken)?, target(rest)?);
-            (!condition.contains('{')).then_some((condition, taken, other))
-        })
+    let conditional = split_conditional(body)
+        .map(|(_, condition, taken, other)| (condition, taken, other))
         .filter(|&(_, taken, other)| here(taken) || here(other));
     match conditional {
         Some((condition, taken, other)) => {
@@ -2383,6 +2398,36 @@ fn expand_block(
     }
 }
 
+/// Code generation choices. The defaults are what the game build uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmitOptions {
+    /// Run common vector float, logic and integer operations as native
+    /// code instead of helper calls (`crate::simd::emit_inline`), with the
+    /// exact helper still taking every float case its fast path would not.
+    pub inline_vector: bool,
+}
+
+thread_local! {
+    /// `EmitOptions::inline_vector` of the emission running on this thread,
+    /// read where SIMD operations are written.
+    static INLINE_VECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`INLINE_VECTOR`] for as long as it lives.
+struct InlineVector(bool);
+
+impl InlineVector {
+    fn set(on: bool) -> Self {
+        Self(INLINE_VECTOR.replace(on))
+    }
+}
+
+impl Drop for InlineVector {
+    fn drop(&mut self) {
+        INLINE_VECTOR.set(self.0);
+    }
+}
+
 /// Split emission: one library source per region of `1 << region_bits` guest
 /// bytes, each holding public 4 KiB window functions, plus a root dispatcher.
 /// Unchanged regions produce byte-identical sources, so a caller that writes
@@ -2392,8 +2437,17 @@ pub fn emit_rust_split(
     translation: &Translation,
     region_bits: u32,
 ) -> (String, Vec<(u64, String)>) {
+    emit_rust_split_with(translation, region_bits, EmitOptions::default())
+}
+
+/// [`emit_rust_split`] with options.
+pub fn emit_rust_split_with(
+    translation: &Translation,
+    region_bits: u32,
+    options: EmitOptions,
+) -> (String, Vec<(u64, String)>) {
     let mut regions = Vec::new();
-    let root = emit_rust_split_to(translation, region_bits, &mut |region, source| {
+    let root = emit_rust_split_to_with(translation, region_bits, options, &mut |region, source| {
         regions.push((region, source));
         Ok::<(), std::convert::Infallible>(())
     });
@@ -2411,7 +2465,18 @@ pub fn emit_rust_split_to<E>(
     region_bits: u32,
     sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
 ) -> Result<String, E> {
+    emit_rust_split_to_with(translation, region_bits, EmitOptions::default(), sink)
+}
+
+/// [`emit_rust_split_to`] with options.
+pub fn emit_rust_split_to_with<E>(
+    translation: &Translation,
+    region_bits: u32,
+    options: EmitOptions,
+    sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
+) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
+    let _inline_vector = InlineVector::set(options.inline_vector);
     let mut windows: Vec<(u64, &[BasicBlock])> = Vec::new();
     let mut first = 0;
     for index in 1..=translation.blocks.len() {

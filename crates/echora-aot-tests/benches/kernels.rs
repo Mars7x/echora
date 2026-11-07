@@ -99,6 +99,9 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             regs[1] = VECTOR_A;
             regs[2] = VECTOR_B;
             regs[3] = BUFFER / 16;
+            // Sticky inexact, as in any program that has rounded once:
+            // the float helpers' fast paths need it.
+            m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
         }
         "poll" => {
             regs[0] = FLAG;
@@ -123,7 +126,7 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
     m.core.cpu.pc = KERNEL_BASE + entry;
     let other_thread = prepare(&mut m, name, scale);
     m.core.host_check_at = SLICE;
-    let mut slices = 0;
+    let mut flag_set = false;
     let start = Instant::now();
     loop {
         let trap = match kernel_code::dispatch(&mut m.core) {
@@ -139,11 +142,15 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
         match trap {
             Trap::HostBoundary => {
                 // Where the host would schedule another thread; here that
-                // thread only ends the polling kernel once its time comes.
-                slices += 1;
-                if other_thread == Some(slices) {
+                // thread only ends the polling kernel once its time comes:
+                // after as many instructions as its slices would take (the
+                // spin hint ends a polling slice early, so counting slices
+                // would end it almost at once).
+                if !flag_set && other_thread.is_some_and(|slices| m.core.steps >= slices * SLICE) {
                     m.memory.write(FLAG, &1_u32.to_le_bytes()).expect("flag");
+                    flag_set = true;
                 }
+                m.core.spin_polls = 0;
                 m.core.host_check_at = m.core.steps + SLICE;
             }
             Trap::SupervisorCall { number: 7 } => break,

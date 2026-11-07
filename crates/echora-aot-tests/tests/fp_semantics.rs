@@ -45,6 +45,7 @@ const IOC: u32 = 1;
 const DZC: u32 = 1 << 1;
 const OFC: u32 = 1 << 2;
 const IDC: u32 = 1 << 7;
+const IXC: u32 = 1 << 4;
 /// The cumulative FPSR flags the runtime models.
 const FLAGS: u32 = IOC | DZC | OFC | IDC;
 const FPCR_FZ: u32 = 1 << 24;
@@ -1409,6 +1410,7 @@ fn lifted_floating_point_matches_the_reference() {
     let mut m = Machine::with_layout(fp_semantic_code::BASE, &image, code_size, 0x80_0000, 0x1000);
     fp_semantic_code::install();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let mut ixc_random = Random(0xa54f_f53a_5f1d_36f1);
     let mut failures = Vec::new();
     let mut runs = 0;
     let mut known = 0;
@@ -1436,7 +1438,15 @@ fn lifted_floating_point_matches_the_reference() {
                     2 => FPCR_DN,
                     _ => FPCR_FZ | FPCR_DN,
                 },
-                fpsr: 0,
+                // IXC is sticky and not compared, but with it already set
+                // the helpers (and inlined vector code) take their native
+                // fast paths: half the runs start with it, chosen by a
+                // generator of its own so the states stay as they were.
+                fpsr: if ixc_random.next().is_multiple_of(2) {
+                    IXC
+                } else {
+                    0
+                },
             };
             let mut expected = before.clone();
             CONTEXT.with(|cell| {
@@ -1448,7 +1458,7 @@ fn lifted_floating_point_matches_the_reference() {
             });
             interpret(&op, &mut expected);
             let raised = context();
-            expected.fpsr |= raised.flags;
+            expected.fpsr = (expected.fpsr | raised.flags) & FLAGS;
             if raised.ambiguous {
                 skipped += 1;
                 continue;

@@ -4,8 +4,16 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use echora_lift::codegen::{
-    CodeRegion, discover, discover_with_tables, emit_rust, emit_rust_split,
+    CodeRegion, EmitOptions, discover, discover_with_tables, emit_rust, emit_rust_split_with,
 };
+
+/// Codegen options: common vector operations as native code with the
+/// `inline-vector` feature.
+fn options() -> EmitOptions {
+    EmitOptions {
+        inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
+    }
+}
 
 include!("src/programs.rs");
 
@@ -52,7 +60,7 @@ fn main() {
 
     // The same program through split emission (the layout real builds use):
     // region sources become child modules named as the root expects.
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod split_call_return {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
@@ -118,7 +126,7 @@ fn kernel_code(out: &mut String) {
         report.unresolved_targets
     );
     assert_eq!(report.jump_tables, 1, "the switch kernel's jump table");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
@@ -260,7 +268,7 @@ fn semantic_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("semantic");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod semantic_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -438,7 +446,7 @@ fn sampled_simd_program(
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() * 3 + 16).expect(name);
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod {name} {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {base:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -550,7 +558,7 @@ fn sequence_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() + 16).expect("sequences");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod sequence_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -765,7 +773,7 @@ fn call_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod call_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -888,7 +896,7 @@ fn loop_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &entries, image.len() + 16).expect("loops");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod loop_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{image:#x?};").expect("write");
@@ -982,7 +990,7 @@ fn exclusive_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &entries, words.len() + 16).expect("exclusives");
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod exclusive_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -1111,7 +1119,7 @@ fn switch_code(out: &mut String) {
         PROGRAMS,
         "every switch's table must be recovered"
     );
-    let (root, regions) = emit_rust_split(&translation, 10);
+    let (root, regions) = emit_rust_split_with(&translation, 10, options());
     writeln!(out, "pub mod switch_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");

@@ -2309,6 +2309,146 @@ fn unary_path(op: FpUnaryOp) -> String {
     }
 }
 
+/// Native code for the common vector operations, in place of their helper
+/// calls ([`emit_call`]), or `None` for an operation without one. Float
+/// add, subtract, multiply and fused multiply-add or -subtract on whole
+/// vectors (4S, 2S, 2D) run natively only under the guard the helpers' own
+/// fast path uses: a rounding mode and FPCR the helpers accept (round to
+/// nearest, no AH or FZ16), FPSR.IXC already set, every operand lane normal
+/// or zero and every result lane normal or an exact zero. Then the host's
+/// result is the Arm one and no flag changes; otherwise the exact helper
+/// runs, from the unchanged registers. Vector logic and integer add and
+/// subtract have no flags and always run natively.
+pub fn emit_inline(op: &SimdOp) -> Option<String> {
+    let p = "echora_guest::simd";
+    match *op {
+        SimdOp::VecFp {
+            op: fp_op,
+            size,
+            q,
+            scalar: false,
+            rd,
+            rn,
+            rm,
+        } if matches!(
+            fp_op,
+            VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+        ) && (q || size == FpSize::S) =>
+        {
+            let (float, int, width, exponent, sign) = match size {
+                FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+                FpSize::D => (
+                    "f64",
+                    "u64",
+                    64,
+                    "0x7ff0_0000_0000_0000u64",
+                    "0x8000_0000_0000_0000u64",
+                ),
+            };
+            let lanes = if q { 128 / width } else { 64 / width };
+            let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+            let (value, exact) = match fp_op {
+                VecFpOp::Add => (
+                    format!("{float}::from_bits(x) + {float}::from_bits(y)"),
+                    "true",
+                ),
+                VecFpOp::Sub => (
+                    format!("{float}::from_bits(x) - {float}::from_bits(y)"),
+                    "true",
+                ),
+                VecFpOp::Mul => (
+                    format!("{float}::from_bits(x) * {float}::from_bits(y)"),
+                    "zero(x) | zero(y)",
+                ),
+                // FMLS is the fused (-n) * m + d.
+                VecFpOp::MulAdd => (
+                    format!(
+                        "{float}::from_bits(x).mul_add({float}::from_bits(y), {float}::from_bits(z))"
+                    ),
+                    "(zero(x) | zero(y)) & zero(z)",
+                ),
+                _ => (
+                    format!(
+                        "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
+                    ),
+                    "(zero(x) | zero(y)) & zero(z)",
+                ),
+            };
+            let operand_d = if fused {
+                format!("let z = (d >> (lane * {width})) as {int}; fast &= usable(z);")
+            } else {
+                String::new()
+            };
+            let call = emit_call(op)?;
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let d = m.cpu.vectors[{rd}]; \
+                 let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+                 let zero = |value: {int}| value & !{sign} == 0; \
+                 let usable = |value: {int}| normal(value) | zero(value); \
+                 let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+                 && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
+                 let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
+                 fast &= usable(x) & usable(y); {operand_d} \
+                 let raw = ({value}).to_bits(); \
+                 fast &= normal(raw) | (zero(raw) & ({exact})); \
+                 out |= u128::from(raw) << (lane * {width}); }} \
+                 let _ = d; \
+                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            ))
+        }
+        SimdOp::VectorLogical { op, rd, rn, rm, q } => {
+            use VectorLogicalOp::*;
+            let value = match op {
+                And => "n & v",
+                Bic => "n & !v",
+                Orr => "n | v",
+                Orn => "n | !v",
+                Eor => "n ^ v",
+                Bsl => "(d & n) | (!d & v)",
+                Bit => "(n & v) | (d & !v)",
+                Bif => "(d & v) | (n & !v)",
+            };
+            let mask = if q { "" } else { " & u128::from(u64::MAX)" };
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let d = m.cpu.vectors[{rd}]; \
+                 let _ = d; m.cpu.vectors[{rd}] = ({value}){mask}; }}"
+            ))
+        }
+        SimdOp::VecInt {
+            op: int_op @ (VecIntOp::Add | VecIntOp::Sub),
+            bits,
+            q,
+            scalar: false,
+            rd,
+            rn,
+            rm,
+        } if q || bits < 64 => {
+            let int = match bits {
+                8 => "u8",
+                16 => "u16",
+                32 => "u32",
+                _ => "u64",
+            };
+            let lanes = if q { 128 } else { 64 } / u32::from(bits);
+            let method = if int_op == VecIntOp::Add {
+                "wrapping_add"
+            } else {
+                "wrapping_sub"
+            };
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {bits})) as {int}; let y = (v >> (lane * {bits})) as {int}; \
+                 out |= u128::from(x.{method}(y)) << (lane * {bits}); }} \
+                 m.cpu.vectors[{rd}] = out; }}"
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
