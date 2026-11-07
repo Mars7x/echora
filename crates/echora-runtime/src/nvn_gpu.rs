@@ -1571,7 +1571,11 @@ impl Nvn {
             .get("Storage")
             .ok_or("texture has no storage")?;
         let pool = self.object(storage.x[0], "MemoryPool")?;
-        let base = pool.builder["Storage"].x[0] + storage.x[1];
+        // Through texture_storage: a virtual pool's offset resolves to the
+        // physical memory mapped there.
+        let base = self
+            .texture_storage(texture)
+            .ok_or("texture storage is in no mapped memory")?;
         // NVN memory pool flags (same bits as NVN1): CPU_UNCACHED 2,
         // CPU_CACHED 4; the builder default 0x21 gives the CPU no access.
         let pool_flags = pool.builder.get("Flags").map_or(0x21, |value| value.x[0]);
