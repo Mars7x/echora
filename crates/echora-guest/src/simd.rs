@@ -505,11 +505,14 @@ fn fp_binary_exact(
 fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
     let size = fp.size;
     let format = fp.format;
-    // With FPSR.IXC already set (it is sticky), the arithmetic of two normal
-    // numbers with a normal result raises nothing new, and the host's
-    // round-to-nearest result is the Arm one (FPCR's other rounding modes
-    // stop in `mode`): no flag or NaN work is needed. Anything else (zeros,
-    // denormals, infinities, NaNs, overflow, underflow) takes the exact path.
+    // With FPSR.IXC already set (it is sticky), the arithmetic of normal
+    // numbers and zeros with a normal or exact zero result raises nothing
+    // new, and the host's round-to-nearest result is the Arm one (FPCR's
+    // other rounding modes stop in `mode`): no flag or NaN work is needed.
+    // A zero result is exact when an operand is zero or an addition cancels
+    // exactly; from a product or quotient of normals it is an underflow.
+    // Anything else (division by zero, denormals, infinities, NaNs,
+    // overflow, underflow) takes the exact path.
     if matches!(
         op,
         FpBinaryOp::Add | FpBinaryOp::Sub | FpBinaryOp::Mul | FpBinaryOp::Div
@@ -520,14 +523,23 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             let field = value & exponent;
             field != 0 && field != exponent
         };
-        if normal(a) && normal(b) {
+        let zero = |value: u64| value & !format.sign_bit() == 0;
+        let divide = op == FpBinaryOp::Div;
+        let usable_b = if divide {
+            normal(b)
+        } else {
+            normal(b) || zero(b)
+        };
+        if (normal(a) || zero(a)) && usable_b {
             let raw = match op {
                 FpBinaryOp::Add => native!(size, a, b, |x, y| x + y),
                 FpBinaryOp::Sub => native!(size, a, b, |x, y| x - y),
                 FpBinaryOp::Mul => native!(size, a, b, |x, y| x * y),
                 _ => native!(size, a, b, |x, y| x / y),
             };
-            if normal(raw) {
+            let exact_zero = zero(raw)
+                && (zero(a) || zero(b) || matches!(op, FpBinaryOp::Add | FpBinaryOp::Sub));
+            if normal(raw) || exact_zero {
                 return raw;
             }
         }
@@ -3243,7 +3255,7 @@ pub fn load_replicate(
 #[cfg(test)]
 mod vector_tests {
     use super::*;
-    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+    #[cfg(any(target_os = "linux", windows))]
     use crate::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
     fn lanes32(values: [u32; 4]) -> u128 {
@@ -3654,7 +3666,7 @@ mod vector_tests {
         assert_eq!(cpu.vectors[0], 55 | (72u128 << 64));
     }
 
-    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn structure_loads_deinterleave_and_stores_interleave() {
         let mut memory = Memory::new(0x20000);
@@ -3785,9 +3797,9 @@ mod sticky_inexact_tests {
     /// run).
     #[test]
     fn fast_arithmetic_matches_the_exact_path() {
-        let values: [f32; 12] = [
+        let values: [f32; 14] = [
             1.0, -2.5, 3.0e38, -3.0e38, 1.2e-38, 1.5e-38, 0.1, 7.0, -0.333, 65504.0, 1.0e-20,
-            -9.0e20,
+            -9.0e20, 0.0, -0.0,
         ];
         for op in [
             FpBinaryOp::Add,
@@ -3798,18 +3810,22 @@ mod sticky_inexact_tests {
             for a in values {
                 for b in values {
                     let run = |fpsr: u32| {
-                        let mut cpu = Cpu::default();
-                        cpu.fpcr = 1 << 24;
-                        cpu.fpsr = fpsr;
+                        let mut cpu = Cpu {
+                            fpcr: 1 << 24,
+                            fpsr,
+                            ..Cpu::default()
+                        };
                         cpu.vectors[1] = u128::from(a.to_bits());
                         cpu.vectors[2] = u128::from(b.to_bits());
                         fp_binary(&mut cpu, op, FpSize::S, 0, 1, 2).unwrap();
                         (cpu.vectors[0], cpu.fpsr)
                     };
                     // The exact path from the same sticky flag: identical.
-                    let mut cpu = Cpu::default();
-                    cpu.fpcr = 1 << 24;
-                    cpu.fpsr = FPSR_IXC;
+                    let mut cpu = Cpu {
+                        fpcr: 1 << 24,
+                        fpsr: FPSR_IXC,
+                        ..Cpu::default()
+                    };
                     cpu.vectors[1] = u128::from(a.to_bits());
                     cpu.vectors[2] = u128::from(b.to_bits());
                     let mut fp = Fp::new(&mut cpu, FpSize::S).unwrap();

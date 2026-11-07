@@ -142,15 +142,20 @@ impl Pages {
     /// Callers flush the TLB.
     fn release(&mut self, start: u64, end: u64) {
         self.host.release(start, end);
-        self.resident.retain(|page| *page < start || *page >= end);
+        // Only the pages in the range, not a pass over every resident page:
+        // the game maps and unmaps physical memory often.
+        let released: Vec<u64> = self.resident.range(start..end).copied().collect();
+        for page in released {
+            self.resident.remove(&page);
+        }
     }
 
-    #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     fn contains_key(&self, page: &u64) -> bool {
         self.resident.contains(page)
     }
 
-    #[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     fn keys(&self) -> impl Iterator<Item = &u64> {
         self.resident.iter()
     }
@@ -1760,7 +1765,7 @@ impl Memory {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

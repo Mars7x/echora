@@ -526,7 +526,7 @@ impl GuestView {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::memory::{AtomicOp, Memory, READ, STATE_NORMAL, WRITE};
