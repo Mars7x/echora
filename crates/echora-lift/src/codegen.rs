@@ -868,7 +868,11 @@ fn emit_instruction(
         if check_entry {
             writeln!(output, "                m.enter_window()?;").unwrap();
         }
-        writeln!(output, "                m.tick_block({count})?;").unwrap();
+        writeln!(
+            output,
+            "                m.tick_block_at({pc:#x}, {count})?;"
+        )
+        .unwrap();
     }
     output.push_str(&body);
 }
@@ -983,30 +987,35 @@ impl RegisterLocals {
         rest.starts_with(" = ")
     }
 
+    /// The window's `R` (one field per local) and `r`, read from the Core.
     fn load(&self) -> String {
-        let mut text = String::new();
+        let mut fields = String::new();
+        let mut values = String::new();
         for index in &self.used {
-            writeln!(text, "    let mut x{index} = m.cpu.regs[{index}];").unwrap();
+            write!(fields, "x{index}: u64, ").unwrap();
+            write!(values, "x{index}: m.cpu.regs[{index}], ").unwrap();
         }
         if self.sp_used {
-            text.push_str("    let mut sp = m.cpu.sp;\n");
+            fields.push_str("sp: u64, ");
+            values.push_str("sp: m.cpu.sp, ");
         }
         if self.flags {
-            text.push_str("    let mut fl = cpu::Flags { nzcv: m.cpu.nzcv };\n");
+            fields.push_str("fl: cpu::Flags, ");
+            values.push_str("fl: cpu::Flags { nzcv: m.cpu.nzcv }, ");
         }
-        text
+        format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
     }
 
     fn store(&self) -> String {
         let mut text = String::new();
         for index in &self.written {
-            writeln!(text, "    m.cpu.regs[{index}] = x{index};").unwrap();
+            writeln!(text, "    m.cpu.regs[{index}] = r.x{index};").unwrap();
         }
         if self.sp_written {
-            text.push_str("    m.cpu.sp = sp;\n");
+            text.push_str("    m.cpu.sp = r.sp;\n");
         }
         if self.flags {
-            text.push_str("    m.cpu.nzcv = fl.nzcv;\n");
+            text.push_str("    m.cpu.nzcv = r.fl.nzcv;\n");
         }
         text
     }
@@ -1014,13 +1023,13 @@ impl RegisterLocals {
     fn reload(&self) -> String {
         let mut text = String::new();
         for index in &self.used {
-            write!(text, "x{index} = m.cpu.regs[{index}]; ").unwrap();
+            write!(text, "r.x{index} = m.cpu.regs[{index}]; ").unwrap();
         }
         if self.sp_used {
-            text.push_str("sp = m.cpu.sp; ");
+            text.push_str("r.sp = m.cpu.sp; ");
         }
         if self.flags {
-            text.push_str("fl.nzcv = m.cpu.nzcv; ");
+            text.push_str("r.fl.nzcv = m.cpu.nzcv; ");
         }
         text
     }
@@ -1032,19 +1041,20 @@ impl RegisterLocals {
         for line in cases.lines() {
             let mut line = line.replace("m.cpu.regs[", "x[");
             for index in &self.used {
-                line = line.replace(&format!("x[{index}]"), &format!("x{index}"));
+                line = line.replace(&format!("x[{index}]"), &format!("r.x{index}"));
             }
             let mut line = replace_sp(&line);
             if self.flags {
-                line = line.replace("m.cpu.nzcv", "fl.nzcv");
+                line = line.replace("m.cpu.nzcv", "r.fl.nzcv");
                 for operation in FLAG_OPERATIONS {
-                    line = line.replace(&format!("m.cpu.{operation}"), &format!("fl.{operation}"));
+                    line =
+                        line.replace(&format!("m.cpu.{operation}"), &format!("r.fl.{operation}"));
                 }
                 if USES_FLAGS.iter().any(|helper| line.contains(helper)) {
                     let indent = &line[..line.len() - line.trim_start().len()];
                     writeln!(
                         text,
-                        "{indent}m.cpu.nzcv = fl.nzcv;\n{line}\n{indent}fl.nzcv = m.cpu.nzcv;"
+                        "{indent}m.cpu.nzcv = r.fl.nzcv;\n{line}\n{indent}r.fl.nzcv = m.cpu.nzcv;"
                     )
                     .unwrap();
                     continue;
@@ -1078,7 +1088,7 @@ impl RegisterLocals {
     }
 }
 
-/// `m.cpu.sp` (the place, not a longer name) replaced by the local `sp`.
+/// `m.cpu.sp` (the place, not a longer name) replaced by the local `r.sp`.
 fn replace_sp(line: &str) -> String {
     let mut text = String::with_capacity(line.len());
     let mut rest = line;
@@ -1088,7 +1098,7 @@ fn replace_sp(line: &str) -> String {
         if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
             text.push_str("m.cpu.sp");
         } else {
-            text.push_str("sp");
+            text.push_str("r.sp");
         }
         rest = after;
     }
@@ -2266,13 +2276,17 @@ pub fn emit_rust_split_to<E>(
         let locals = RegisterLocals::of(&cases);
         writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
         output.push_str(&locals.load());
-        // The PC is a local the blocks set; memory gets it after each block,
-        // where the boundary check and anything leaving the window see it.
+        // The blocks run in a nested function so their early returns still
+        // pass the final store; it is always inlined, as a closure is not,
+        // so `r`'s fields stay host registers instead of stack slots
+        // reached through pointers. The PC is a local the blocks set;
+        // memory gets it after each block, where the boundary check and
+        // anything leaving the window see it.
         output.push_str(
-            "    let result = (|| -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    loop {\n        match next_pc {\n",
+            "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    loop {\n        match next_pc {\n",
         );
         output.push_str(&locals.rewrite(&cases));
-        output.push_str("        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    })();\n");
+        output.push_str("        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    }\n    let result = body(m, &mut r);\n");
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }
@@ -2406,9 +2420,17 @@ mod tests {
     /// Guest instructions charged by the emitted per-block accounting.
     fn charged(output: &str) -> usize {
         output
-            .split("m.tick_block(")
+            .split("m.tick_block_at(")
             .skip(1)
-            .map(|rest| rest[..rest.find(')').unwrap()].parse::<usize>().unwrap())
+            .map(|rest| {
+                let arguments = &rest[..rest.find(')').unwrap()];
+                arguments
+                    .rsplit(", ")
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
             .sum()
     }
     fn region(words: &[u32]) -> CodeRegion {
@@ -2429,7 +2451,7 @@ mod tests {
             // The block's first instruction runs with the PC its arm tested.
             assert!(!output.contains("m.cpu.pc = 0x1000;"));
             let current_pc = output.find("0x1000 => {").unwrap();
-            let tick = output.find("m.tick_block(").unwrap();
+            let tick = output.find("m.tick_block_at(").unwrap();
             let sample = output
                 .find("let counter = m.physical_counter_ticks();")
                 .unwrap();
@@ -2719,7 +2741,7 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
         assert!(window.contains(
-            "        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    })();\n"
+            "        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    }\n    let result = body(m, &mut r);\n"
         ));
         // The loop's successor is a local constant the host compiler sees.
         assert!(window.contains("match next_pc {"));
@@ -2735,15 +2757,15 @@ mod tests {
             discover(&[region(&[0x9100_0421, 0x9400_0002, 0, 0])], &[0x1000], 4).unwrap();
         let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
-        assert!(window.contains("    let mut x1 = m.cpu.regs[1];\n"));
+        assert!(window.contains("let mut r = R { x1: m.cpu.regs[1], "));
         assert!(window.contains("x1 = (x1).wrapping_add(") || window.contains("x1 = "));
-        assert!(!window.contains("match m.cpu.pc {\n") || window.contains("m.cpu.regs[1] = x1;"));
+        assert!(!window.contains("match m.cpu.pc {\n") || window.contains("m.cpu.regs[1] = r.x1;"));
         let call = window.find("let called = m.call(0x1008);").unwrap();
-        let stored = window[..call].rfind("m.cpu.regs[1] = x1;").unwrap();
-        assert!(window[call..].find("x1 = m.cpu.regs[1];").unwrap() > 0);
+        let stored = window[..call].rfind("m.cpu.regs[1] = r.x1;").unwrap();
+        assert!(window[call..].find("r.x1 = m.cpu.regs[1];").unwrap() > 0);
         assert!(stored < call);
         assert!(
-            window.ends_with("    m.cpu.regs[1] = x1;\n    m.cpu.regs[30] = x30;\n    m.cpu.nzcv = fl.nzcv;\n    result\n}\n")
+            window.ends_with("    m.cpu.regs[1] = r.x1;\n    m.cpu.regs[30] = r.x30;\n    m.cpu.nzcv = r.fl.nzcv;\n    result\n}\n")
         );
     }
 
@@ -2759,14 +2781,15 @@ mod tests {
         .unwrap();
         let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
-        assert!(window.contains("    let mut fl = cpu::Flags { nzcv: m.cpu.nzcv };\n"));
-        assert!(window.contains("fl.add_sub("));
-        assert!(window.contains("fl.condition(0)"));
+        assert!(window.contains("fl: cpu::Flags { nzcv: m.cpu.nzcv }, };\n"));
+        assert!(window.contains("#[inline(always)]\n    fn body(m: &mut Machine, r: &mut R)"));
+        assert!(window.contains("r.fl.add_sub("));
+        assert!(window.contains("r.fl.condition(0)"));
         assert!(!window.contains("m.cpu.add_sub(") && !window.contains("m.cpu.condition("));
         let call = window.find("let called = m.call(").unwrap();
-        assert!(window[..call].rfind("m.cpu.nzcv = fl.nzcv;").is_some());
-        assert!(window[call..].contains("fl.nzcv = m.cpu.nzcv;"));
-        assert!(window.ends_with("    m.cpu.nzcv = fl.nzcv;\n    result\n}\n"));
+        assert!(window[..call].rfind("m.cpu.nzcv = r.fl.nzcv;").is_some());
+        assert!(window[call..].contains("r.fl.nzcv = m.cpu.nzcv;"));
+        assert!(window.ends_with("    m.cpu.nzcv = r.fl.nzcv;\n    result\n}\n"));
     }
 
     #[test]
@@ -3213,7 +3236,7 @@ mod tests {
         let output = emit_rust(&translation);
         assert!(output.contains("UnsupportedInstruction { pc: 0x1000, word: 0xffffffff }"));
         // The arm `0x1000 =>` fixes the PC; no store precedes the charge.
-        assert!(output.find("0x1000 => {").unwrap() < output.find("m.tick_block(").unwrap());
+        assert!(output.find("0x1000 => {").unwrap() < output.find("m.tick_block_at(").unwrap());
         assert!(!output.contains("m.cpu.pc = 0x1000"));
     }
 
