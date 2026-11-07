@@ -85,7 +85,7 @@ pub struct Backend {
     in_place_writes: Vec<std::ops::Range<u64>>,
     /// Storage buffers kept on the GPU between dispatches (when guest
     /// memory cannot be imported), by guest address: see `Resident`.
-    resident: HashMap<(u64, u64), Resident>,
+    resident: HashMap<u64, ResidentPool>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -447,9 +447,13 @@ impl Nvn {
     pub(super) fn gpu_invalidate(&mut self, range: std::ops::Range<u64>, texture: Option<u64>) {
         self.binding_serial += 1;
         if let Some(backend) = self.gpu.as_mut() {
-            for ((start, length), resident) in backend.resident.iter_mut() {
-                if *start < range.end && range.start < start + length {
-                    resident.guest_dirty = true;
+            for pool in backend.resident.values_mut() {
+                let start = range.start.max(pool.base);
+                let end = range.end.min(pool.base + pool.size);
+                if start < end {
+                    // The CPU's bytes are newer there than the GPU's.
+                    remove_range(&mut pool.gpu_dirty, start..end);
+                    add_range(&mut pool.guest_dirty, start..end);
                 }
             }
             let mut touched = Vec::new();
@@ -2434,9 +2438,9 @@ impl Nvn {
                 c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
             }
         }
-        let storage = HashMap::new();
+        let mut storage = HashMap::new();
         let mut storage_in_place = HashMap::new();
-        let written_back: Vec<(u32, u64)> = Vec::new();
+        let mut written_back = Vec::new();
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
         let mut images = HashMap::new();
@@ -2480,89 +2484,31 @@ impl Nvn {
                         }
                         continue;
                     }
-                    // Otherwise the buffer stays on the GPU between
-                    // dispatches: uploaded when the guest bytes changed,
-                    // copied back only when the CPU needs them.
-                    // Other views of these bytes with newer GPU data come
-                    // back to the guest first; the sample then sees them.
-                    self.resolve_resident(
-                        core,
-                        Some(guest..guest + length),
-                        Some((guest, length)),
-                    )?;
-                    let sample = storage_sample(core, guest, length);
-                    let cpu_visible = self.pool_cpu_visible(guest);
-                    if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
-                        let flags = self
-                            .objects
-                            .values()
-                            .filter(|object| object.kind == "MemoryPool")
-                            .find(|pool| {
-                                pool.builder.get("Storage").is_some_and(|storage| {
-                                    storage.x[0] <= guest && guest < storage.x[0] + storage.x[1]
-                                })
-                            })
-                            .map(|pool| {
-                                (
-                                    pool.builder.get("Flags").map_or(0, |flags| flags.x[0]),
-                                    pool.builder["Storage"].x[0],
-                                    pool.builder["Storage"].x[1],
-                                )
-                            });
-                        let note = format!("storage pool {flags:x?}");
-                        self.gpu.as_mut().unwrap().note(note);
-                    }
-                    let state = self
-                        .gpu
-                        .as_ref()
-                        .unwrap()
-                        .resident
-                        .get(&(guest, length))
-                        .copied();
-                    let key = resident_key(guest, length);
-                    let (buffer, created) = self
-                        .gpu
-                        .as_mut()
-                        .unwrap()
-                        .renderer
-                        .resident_buffer(key, length)?;
-                    let upload = created
-                        || state.is_none_or(|state| {
-                            state.length != length || state.guest_dirty || state.sample != sample
-                        });
-                    if upload {
-                        let reason = match state {
-                            _ if created => "stat: storage upload: new buffer",
-                            None => "stat: storage upload: no state",
-                            Some(state) if state.length != length => {
-                                "stat: storage upload: other length"
+                    // Otherwise the pool holding it stays on the GPU between
+                    // dispatches (see `ResidentPool`); outside any pool the
+                    // bytes are copied in and out.
+                    match self.resident_pool_binding(core, guest, length)? {
+                        Some((buffer, offset)) => {
+                            storage_in_place.insert(descriptor.binding, (buffer, offset, length));
+                            if descriptor.flags & 1 != 0 {
+                                let backend = self.gpu.as_mut().unwrap();
+                                if let Some(pool) = backend
+                                    .resident
+                                    .values_mut()
+                                    .find(|pool| pool.contains(guest))
+                                {
+                                    add_range(&mut pool.gpu_dirty, guest..guest + length);
+                                }
                             }
-                            Some(state) if state.guest_dirty => {
-                                "stat: storage upload: CPU flushed the range"
+                        }
+                        None => {
+                            self.resolve_storage(core, Some(guest..guest + length))?;
+                            storage.insert(descriptor.binding, self.gpu_bytes(core, base, length)?);
+                            if descriptor.flags & 1 != 0 {
+                                written_back.push((descriptor.binding, base));
                             }
-                            Some(_) => "stat: storage upload: guest bytes changed",
-                        };
-                        self.gpu.as_mut().unwrap().stat(reason, 1);
-                        self.resolve_copies(core, Some(guest..guest + length))?;
-                        let bytes = self.gpu_bytes(core, base, length)?;
-                        let backend = self.gpu.as_mut().unwrap();
-                        backend.renderer.upload_resident(key, &bytes)?;
-                        backend.stat("stat: dispatch storage bytes", length);
+                        }
                     }
-                    let backend = self.gpu.as_mut().unwrap();
-                    let gpu_newer = (!upload && state.is_some_and(|state| state.gpu_newer))
-                        || descriptor.flags & 1 != 0;
-                    backend.resident.insert(
-                        (guest, length),
-                        Resident {
-                            length,
-                            sample,
-                            gpu_newer,
-                            guest_dirty: false,
-                            cpu_visible,
-                        },
-                    );
-                    storage_in_place.insert(descriptor.binding, (buffer, 0, length));
                 }
                 // Texel buffers (buffer textures) bind like textures.
                 kind @ (DescriptorKind::Texture | DescriptorKind::TextureBuffer) => {
@@ -2861,44 +2807,44 @@ impl Nvn {
             }
         }
         self.resolve_copies(core, range.clone())?;
-        self.resolve_resident(core, range, None)
+        self.resolve_resident(core, range)
     }
 
-    /// Copy GPU-newer resident storage back to the guest: what overlaps
-    /// `range`, or with `None` (a CPU wait) what the CPU can read.
+    /// Copy GPU-newer resident pool ranges back to the guest: what overlaps
+    /// `range`, or with `None` (a CPU wait) what uncached pools hold (the
+    /// CPU must invalidate a cached pool's range before reading it).
     fn resolve_resident(
         &mut self,
         core: &mut Guest,
         range: Option<std::ops::Range<u64>>,
-        except: Option<(u64, u64)>,
     ) -> Result<(), String> {
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
         };
-        let wanted: Vec<(u64, u64)> = backend
-            .resident
-            .iter()
-            .filter(|&(&(start, length), resident)| {
-                resident.gpu_newer
-                    && except != Some((start, length))
-                    && match &range {
-                        Some(range) => start < range.end && range.start < start + length,
-                        None => resident.cpu_visible,
-                    }
-            })
-            .map(|(key, _)| *key)
-            .collect();
+        let mut wanted = Vec::new();
+        for pool in backend.resident.values() {
+            for dirty in &pool.gpu_dirty {
+                let piece = match &range {
+                    Some(range) => range.start.max(dirty.start)..range.end.min(dirty.end),
+                    None if pool.uncached => dirty.clone(),
+                    None => continue,
+                };
+                if piece.start < piece.end {
+                    wanted.push((pool.base, piece));
+                }
+            }
+        }
         if wanted.is_empty() {
             return Ok(());
         }
         let mut tokens = Vec::new();
-        for &(start, length) in &wanted {
-            tokens.push((
-                backend
-                    .renderer
-                    .read_resident(resident_key(start, length), length)?,
-                (start, length),
-            ));
+        for (base, piece) in &wanted {
+            let token = backend.renderer.read_resident(
+                *base,
+                piece.start - base,
+                piece.end - piece.start,
+            )?;
+            tokens.push((token, *base, piece.clone()));
         }
         backend.renderer.flush()?;
         let mut completed: HashMap<u64, Vec<u8>> = backend
@@ -2906,43 +2852,75 @@ impl Nvn {
             .take_completed_reads()
             .into_iter()
             .collect();
-        backend.stat("stat: resident storage copied back", wanted.len() as u64);
-        for (token, (start, length)) in tokens {
+        backend.stat("stat: resident ranges copied back", wanted.len() as u64);
+        for (token, base, piece) in tokens {
             let bytes = completed
                 .remove(&token)
                 .ok_or_else(|| format!("resident read {token} never completed"))?;
             core.memory
-                .write(start, &bytes)
+                .write(piece.start, &bytes)
                 .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-            let sample = storage_sample(core, start, length);
-            if let Some(resident) = self
-                .gpu
-                .as_mut()
-                .unwrap()
-                .resident
-                .get_mut(&(start, length))
-            {
-                resident.gpu_newer = false;
-                resident.sample = sample;
+            if let Some(pool) = self.gpu.as_mut().unwrap().resident.get_mut(&base) {
+                remove_range(&mut pool.gpu_dirty, piece);
             }
         }
         Ok(())
     }
 
-    /// Whether the CPU can access the memory pool holding guest address
-    /// `guest` (pool flags CPU_UNCACHED 2 or CPU_CACHED 4); unknown counts
-    /// as visible.
-    fn pool_cpu_visible(&self, guest: u64) -> bool {
-        self.objects
+    /// The device buffer and offset for `length` storage bytes at guest
+    /// `guest`: their memory pool, mirrored on the GPU (created and filled
+    /// on first use, with the ranges the CPU changed since uploaded first).
+    /// `None` outside a pool with storage of its own.
+    fn resident_pool_binding(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+        length: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let Some((base, size, flags)) = self
+            .objects
             .values()
             .filter(|object| object.kind == "MemoryPool")
-            .find(|pool| {
-                pool.builder.get("Storage").is_some_and(|storage| {
-                    storage.x[0] <= guest && guest < storage.x[0] + storage.x[1]
-                })
+            .filter_map(|pool| {
+                let storage = pool.builder.get("Storage")?;
+                let flags = pool.builder.get("Flags").map_or(0, |flags| flags.x[0]);
+                Some((storage.x[0], storage.x[1], flags))
             })
-            .and_then(|pool| pool.builder.get("Flags"))
-            .is_none_or(|flags| flags.x[0] & 6 != 0)
+            .find(|&(base, size, _)| base != 0 && base <= guest && guest + length <= base + size)
+        else {
+            return Ok(None);
+        };
+        let backend = self.gpu.as_mut().unwrap();
+        let (buffer, created) = backend.renderer.resident_buffer(base, size)?;
+        let pool = backend
+            .resident
+            .entry(base)
+            .or_insert_with(|| ResidentPool {
+                base,
+                size,
+                uncached: flags & 2 != 0,
+                guest_dirty: Vec::new(),
+                gpu_dirty: Vec::new(),
+            });
+        if created || pool.size != size {
+            *pool = ResidentPool {
+                base,
+                size,
+                uncached: flags & 2 != 0,
+                guest_dirty: vec![base..base + size],
+                gpu_dirty: Vec::new(),
+            };
+        }
+        let uploads = std::mem::take(&mut pool.guest_dirty);
+        for range in uploads {
+            let bytes = read_storage(core, range.start, range.end - range.start);
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat("stat: dispatch storage bytes", bytes.len() as u64);
+            backend
+                .renderer
+                .upload_resident(base, range.start - base, &bytes)?;
+        }
+        Ok(Some((buffer, guest - base)))
     }
 
     /// Store deferred dispatch results (storage copied back from the GPU)
@@ -4117,33 +4095,62 @@ fn dense_sample(core: &Guest, base: u64, length: u64) -> u64 {
     sample
 }
 
-/// A storage buffer kept on the GPU (`Renderer::resident_buffer`): its
-/// guest range, a sample of the guest bytes it was last in step with,
-/// whether the GPU holds writes the guest does not have yet, whether the
-/// CPU flushed writes into the range since, and whether the CPU can read
-/// its pool at all (GPU-only pools are never copied back at CPU waits).
-#[derive(Clone, Copy, Debug)]
-struct Resident {
-    length: u64,
-    sample: u64,
-    gpu_newer: bool,
-    guest_dirty: bool,
-    cpu_visible: bool,
+/// A memory pool mirrored in a device-local buffer while compute shaders
+/// use storage in it (`Renderer::resident_buffer`, keyed by `base`). The
+/// pools the game puts storage in are CPU-cached: the CPU flushes ranges it
+/// wrote (FlushMappedRange) and invalidates ranges it will read
+/// (InvalidateMappedRange), which keeps the two copies in step without
+/// comparing bytes. `guest_dirty` ranges are newer in guest memory (uploaded
+/// before the next use), `gpu_dirty` ranges newer on the GPU (copied back
+/// when the CPU or a CPU-executed command needs them).
+#[derive(Clone, Debug)]
+struct ResidentPool {
+    base: u64,
+    size: u64,
+    /// The CPU reads the pool without invalidating (CPU_UNCACHED): GPU
+    /// writes come back at every CPU wait.
+    uncached: bool,
+    guest_dirty: Vec<std::ops::Range<u64>>,
+    gpu_dirty: Vec<std::ops::Range<u64>>,
 }
 
-/// The renderer key of the resident buffer for `length` bytes at `guest`.
-fn resident_key(guest: u64, length: u64) -> u64 {
-    guest ^ length.rotate_left(40)
-}
-
-/// A change check of `length` guest bytes: all of them up to 256 KiB, a
-/// spread sample beyond.
-fn storage_sample(core: &Guest, base: u64, length: u64) -> u64 {
-    if length <= 256 << 10 {
-        hash_bytes(&read_storage(core, base, length))
-    } else {
-        dense_sample(core, base, length)
+impl ResidentPool {
+    fn contains(&self, guest: u64) -> bool {
+        (self.base..self.base + self.size).contains(&guest)
     }
+}
+
+/// Add `range` to a sorted list of disjoint ranges, merging neighbours.
+fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
+    let mut merged = range;
+    ranges.retain(|existing| {
+        if existing.start <= merged.end && merged.start <= existing.end {
+            merged = merged.start.min(existing.start)..merged.end.max(existing.end);
+            false
+        } else {
+            true
+        }
+    });
+    let at = ranges.partition_point(|existing| existing.start < merged.start);
+    ranges.insert(at, merged);
+}
+
+/// Remove `range` from a list of disjoint ranges.
+fn remove_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
+    let mut kept = Vec::with_capacity(ranges.len() + 1);
+    for existing in ranges.drain(..) {
+        if existing.end <= range.start || range.end <= existing.start {
+            kept.push(existing);
+            continue;
+        }
+        if existing.start < range.start {
+            kept.push(existing.start..range.start);
+        }
+        if range.end < existing.end {
+            kept.push(range.end..existing.end);
+        }
+    }
+    *ranges = kept;
 }
 
 /// Uploads from CPU-uncached pools up to this size keep a copy of their
@@ -4254,5 +4261,27 @@ fn attribute_format_size(format: vk::Format) -> u64 {
         | F::R16G16_SFLOAT
         | F::B10G11R11_UFLOAT_PACK32 => 4,
         _ => 16,
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{add_range, remove_range};
+
+    #[test]
+    fn ranges_merge_and_split() {
+        let mut ranges = Vec::new();
+        add_range(&mut ranges, 10..20);
+        add_range(&mut ranges, 30..40);
+        add_range(&mut ranges, 18..32);
+        assert_eq!(ranges, [10..40]);
+        add_range(&mut ranges, 0..5);
+        assert_eq!(ranges, [0..5, 10..40]);
+        remove_range(&mut ranges, 15..25);
+        assert_eq!(ranges, [0..5, 10..15, 25..40]);
+        remove_range(&mut ranges, 0..12);
+        assert_eq!(ranges, [12..15, 25..40]);
+        remove_range(&mut ranges, 100..200);
+        assert_eq!(ranges, [12..15, 25..40]);
     }
 }
