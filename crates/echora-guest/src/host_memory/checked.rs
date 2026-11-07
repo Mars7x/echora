@@ -41,6 +41,11 @@ pub(crate) struct GuestAccess {
 }
 
 impl GuestAccess {
+    /// Checked memory has no contiguous host view to share.
+    pub(crate) fn host_span(&self, _address: u64, _length: usize) -> Option<*mut u8> {
+        None
+    }
+
     fn new(table: usize, size: u64) -> Self {
         Self {
             table,

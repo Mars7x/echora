@@ -19,6 +19,10 @@ pub struct Dispatch<'a> {
     pub uniforms: HashMap<u32, Vec<u8>>,
     /// Storage buffer contents by binding, before the dispatch.
     pub storage: HashMap<u32, Vec<u8>>,
+    /// Storage buffers bound in place instead (imported host memory, see
+    /// `Renderer::import_host`): buffer, offset and range by binding. The
+    /// shader's writes land in that memory; nothing is uploaded or read back.
+    pub storage_in_place: HashMap<u32, (vk::Buffer, u64, u64)>,
     /// Sampled textures by binding.
     pub textures: HashMap<u32, (TextureSource, Sampler)>,
     /// Storage images by binding: the render target each binding writes.
@@ -61,8 +65,10 @@ impl Renderer {
                 }
                 DescriptorKind::Image => descriptors[3] += 1,
                 DescriptorKind::StorageBuffer => {
-                    let length = dispatch.storage.get(&binding).map_or(16, Vec::len) as u64;
-                    bytes += length.max(16) + 256;
+                    if !dispatch.storage_in_place.contains_key(&binding) {
+                        let length = dispatch.storage.get(&binding).map_or(16, Vec::len) as u64;
+                        bytes += length.max(16) + 256;
+                    }
                     descriptors[2] += 1;
                 }
                 _ => {
@@ -138,6 +144,20 @@ impl Renderer {
                     }],
                 ));
                 continue;
+            }
+            if descriptor.kind() == DescriptorKind::StorageBuffer {
+                if let Some(&(buffer, offset, range)) = dispatch.storage_in_place.get(&binding) {
+                    writes.push((
+                        binding,
+                        vk::DescriptorType::STORAGE_BUFFER,
+                        [vk::DescriptorBufferInfo {
+                            buffer,
+                            offset,
+                            range: range.max(16).next_multiple_of(16),
+                        }],
+                    ));
+                    continue;
+                }
             }
             let (kind, bytes) = match descriptor.kind() {
                 DescriptorKind::UniformBuffer => (
@@ -342,6 +362,7 @@ mod tests {
             groups: [1, 1, 1],
             uniforms: HashMap::from([(0, value)]),
             storage: HashMap::from([(1, vec![0xaa; 8])]),
+            storage_in_place: HashMap::new(),
             textures: HashMap::new(),
             images: HashMap::new(),
         };

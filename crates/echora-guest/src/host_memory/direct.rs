@@ -63,6 +63,12 @@ impl GuestAccess {
             .then(|| (self.base + address as usize) as *mut u8)
     }
 
+    /// Host address of `length` guest bytes at `address`, for sharing them
+    /// with a device (Vulkan host-memory import); `None` outside the space.
+    pub(crate) fn host_span(&self, address: u64, length: usize) -> Option<*mut u8> {
+        self.pointer(address, length)
+    }
+
     /// Copy guest bytes at `address` into `out`; false when they leave the
     /// guest address space.
     #[inline]

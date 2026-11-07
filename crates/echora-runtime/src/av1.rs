@@ -67,8 +67,9 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl Decoder {
-    /// A single-threaded decoder with a frame delay of one, so each
-    /// submission's picture comes out of the same `decode` call.
+    /// A decoder with a frame delay of one, so each submission's picture
+    /// comes out of the same `decode` call; up to four threads share each
+    /// frame's tiles and rows (the guest runs on another host core).
     pub fn new() -> Result<Self, String> {
         let mut settings = MaybeUninit::<Dav1dSettings>::zeroed();
         // SAFETY: the pointer is to writable storage for a Dav1dSettings,
@@ -77,7 +78,8 @@ impl Decoder {
             dav1d_default_settings(NonNull::from(&mut settings).cast());
             settings.assume_init()
         };
-        settings.n_threads = 1;
+        settings.n_threads =
+            std::thread::available_parallelism().map_or(1, |cores| cores.get().min(4) as i32);
         settings.max_frame_delay = 1;
         let mut context = None;
         // SAFETY: both pointers are to live, initialized locals.
