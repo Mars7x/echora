@@ -77,6 +77,7 @@ fn main() {
     simd_semantic_code(&mut out);
     fp_semantic_code(&mut out);
     simd_memory_code(&mut out);
+    sequence_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -466,4 +467,134 @@ fn simd_memory_code(out: &mut String) {
         ],
         &covered,
     );
+}
+
+/// Random straight-line sequences of integer, flag and memory instructions
+/// with forward branches, each ending in SVC #7, for `tests/sequences.rs`.
+/// Memory instructions use X28 as their base and X27 as their index, and
+/// no instruction writes either, so every access stays in the test's data.
+fn sequence_code(out: &mut String) {
+    use echora_lift::aarch64::{Address, Instruction, decode};
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0x90_0000;
+    const SEQUENCES: usize = 600;
+    // (mask of fixed bits, their value, has a base register in bits 9:5).
+    const CLASSES: &[(u32, u32, bool)] = &[
+        (0x1f80_0000, 0x1100_0000, false),
+        (0x1f20_0000, 0x0b00_0000, false),
+        (0x1fe0_0000, 0x0b20_0000, false),
+        (0x1fe0_fc00, 0x1a00_0000, false),
+        (0x1f00_0000, 0x0a00_0000, false),
+        (0x1f80_0000, 0x1200_0000, false),
+        (0x1f80_0000, 0x1280_0000, false),
+        (0x1f80_0000, 0x1300_0000, false),
+        (0x7fa0_0000, 0x1380_0000, false),
+        (0x3fe0_0410, 0x3a40_0000, false),
+        (0x3fe0_0800, 0x1a80_0000, false),
+        (0x7fe0_0000, 0x1b00_0000, false),
+        (0xff60_0000, 0x9b20_0000, false),
+        (0x7fe0_c000, 0x1ac0_0000, false),
+        (0x7fff_f000, 0x5ac0_0000, false),
+        (0x7fe0_e000, 0x1ac0_4000, false),
+        (0xffdf_ffe0, 0xd51b_4200, false),
+        (0x3f00_0000, 0x3900_0000, true),
+        (0x3f20_0000, 0x3800_0000, true),
+        (0x3f20_0c00, 0x3820_0800, true),
+        (0x3e00_0000, 0x2800_0000, true),
+        (0x3fa0_7c00, 0x08a0_7c00, true),
+        (0x3f20_0c00, 0x3820_0000, true),
+        (0x3f7f_fc00, 0x089f_fc00, true),
+    ];
+    let mut state: u64 = 0x2b7e_1516_28ae_d2a6;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &Instruction| {
+        let writes = effects(instruction).writes;
+        writes.has_gpr(27) || writes.has_gpr(28)
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for _ in 0..SEQUENCES {
+        let length = 4 + next() as usize % 9;
+        entries.push(BASE + 4 * words.len() as u64);
+        let mut body = Vec::new();
+        while body.len() < length {
+            let (mask, value, memory) = CLASSES[next() as usize % CLASSES.len()];
+            let mut word = (next() & !mask) | value;
+            if memory {
+                word = (word & !(31 << 5)) | (28 << 5);
+            }
+            let instruction = decode(word, 0);
+            let word = match instruction {
+                Instruction::LoadStore {
+                    address: Address::Register { .. },
+                    ..
+                } => (word & !(31 << 16)) | (27 << 16),
+                _ => word,
+            };
+            let instruction = decode(word, 0);
+            let usable = !matches!(
+                instruction,
+                Instruction::Unsupported
+                    | Instruction::Nop
+                    | Instruction::PacGeneric { .. }
+                    | Instruction::LoadExclusive { .. }
+                    | Instruction::StoreExclusive { .. }
+            ) && !reserved(&instruction);
+            if usable {
+                body.push(word);
+            }
+        }
+        // Forward branches to a later instruction of the sequence (or its
+        // SVC): conditional, compare, test and unconditional.
+        for index in 0..body.len() {
+            if next() % 4 != 0 {
+                continue;
+            }
+            let distance = 1 + next() % (body.len() - index) as u32;
+            let register = next() & 31;
+            let branch = match next() % 4 {
+                0 => 0x5400_0000 | (next() & 15),
+                1 => 0x3400_0000 | ((next() & 1) << 24) | ((next() & 1) << 31) | register,
+                2 => {
+                    let bit = next() & 63;
+                    0x3600_0000
+                        | ((bit >> 5) << 31)
+                        | ((bit & 31) << 19)
+                        | ((next() & 1) << 24)
+                        | register
+                }
+                _ => 0x1400_0000,
+            };
+            // B takes imm26 in bits 25:0; the others imm19 or imm14 from bit 5.
+            body[index] = if branch & 0x7c00_0000 == 0x1400_0000 {
+                branch | distance
+            } else {
+                branch | (distance << 5)
+            };
+        }
+        words.extend(body);
+        words.push(0xd400_00e1);
+    }
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "sequences".into(),
+        base: BASE,
+        bytes: image,
+    };
+    let translation = discover(&[region], &entries, words.len() + 16).expect("sequences");
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod sequence_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
 }
