@@ -6,6 +6,15 @@ AArch64 code ahead of time into native host code and run it on a portable
 reimplementation of the console services it uses, with native graphics,
 display, input and audio, rather than emulating the console.
 
+> [!CAUTION]
+> **Echora is NOT ready for stable gameplay.** You cannot play the game
+> with it today. It does not reach gameplay, runs far below full speed,
+> is missing large parts of the graphics path, and can hang, crash or
+> render incorrectly at any point. Saves are untested and may be lost or
+> corrupted. It needs much more work before it is usable, and there is
+> no timeline for when that will be. Do not expect a working game, and
+> do not report gameplay problems as bugs yet.
+
 > **This is an early development project, not a playable port.** It contains
 > no game code, assets or keys, and it cannot run anything without a legally
 > obtained copy of the game that you dump and supply yourself.
