@@ -11,7 +11,7 @@ publish.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 gilrs = "0.11"
 
 [lints]

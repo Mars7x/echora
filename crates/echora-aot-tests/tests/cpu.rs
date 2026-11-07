@@ -1,6 +1,6 @@
 //! Integer, flag, call/return, PAuth-hint, budget and SIMD stack programs,
 //! executed natively.
-#![cfg(any(target_os = "linux", windows, target_os = "macos"))]
+#![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used, unsafe_code)]
 
 use echora_aot_tests::*;

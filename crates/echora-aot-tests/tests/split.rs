@@ -2,7 +2,7 @@
 //! (`echora_guest::install_windows`), and `Core::call` uses that table for
 //! every program. It runs in its own test binary, so the table cannot reach
 //! the single-dispatch programs in `cpu.rs`.
-#![cfg(any(target_os = "linux", windows, target_os = "macos"))]
+#![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
 use echora_aot_tests::*;

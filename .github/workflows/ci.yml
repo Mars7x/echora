@@ -19,7 +19,6 @@ jobs:
         include:
           - { name: Linux x86-64, os: ubuntu-latest }
           - { name: Windows x86-64, os: windows-latest }
-          - { name: macOS ARM64, os: macos-latest }
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

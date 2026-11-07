@@ -13,8 +13,6 @@ pub fn cache_dir() -> Result<PathBuf> {
     let env = |k| std::env::var_os(k).map(PathBuf::from);
     let dir = if cfg!(target_os = "windows") {
         env("LOCALAPPDATA").map(|d| d.join("Echora").join("cache"))
-    } else if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Caches/Echora"))
     } else {
         env("XDG_CACHE_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".cache")))
@@ -35,8 +33,6 @@ pub fn data_dir() -> Result<PathBuf> {
     let env = |k| std::env::var_os(k).map(PathBuf::from);
     let dir = if cfg!(target_os = "windows") {
         env("APPDATA").map(|d| d.join("Echora"))
-    } else if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Application Support/Echora"))
     } else {
         env("XDG_DATA_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".local/share")))

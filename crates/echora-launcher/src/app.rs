@@ -201,8 +201,8 @@ pub fn run() -> ExitCode {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Echora".into()),
-                    appears_transparent: cfg!(target_os = "macos"),
-                    traffic_light_position: Some(point(px(14.0), px(14.0))),
+                    appears_transparent: false,
+                    traffic_light_position: None,
                 }),
                 app_id: Some(APP_ID.into()),
                 window_min_size: Some(size(px(720.0), px(460.0))),

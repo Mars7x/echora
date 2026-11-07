@@ -151,7 +151,6 @@ impl DisplaySettings {
 #[serde(rename_all = "snake_case")]
 pub enum GraphicsBackend {
     Vulkan,
-    Metal,
     D3d12,
 }
 
@@ -160,7 +159,6 @@ pub enum GraphicsBackend {
 pub enum BackendPreference {
     Auto,
     Vulkan,
-    Metal,
     D3d12,
 }
 
@@ -465,7 +463,6 @@ impl Settings {
         let wanted = match self.graphics.backend {
             BackendPreference::Auto => None,
             BackendPreference::Vulkan => Some(GraphicsBackend::Vulkan),
-            BackendPreference::Metal => Some(GraphicsBackend::Metal),
             BackendPreference::D3d12 => Some(GraphicsBackend::D3d12),
         };
         let backend = match wanted {
@@ -529,8 +526,6 @@ pub fn default_path() -> Option<std::path::PathBuf> {
     let env = |k| std::env::var_os(k).map(PathBuf::from);
     let dir = if cfg!(target_os = "windows") {
         env("APPDATA").map(|d| d.join("Echora"))
-    } else if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Application Support/Echora"))
     } else {
         env("XDG_CONFIG_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".config")))
@@ -656,7 +651,7 @@ mod tests {
     #[test]
     fn unsupported_requests_are_reported_not_hidden() {
         let mut s = Settings::default();
-        s.graphics.backend = BackendPreference::Metal;
+        s.graphics.backend = BackendPreference::D3d12;
         s.display.window_mode = WindowMode::ExclusiveFullscreen;
         s.display.internal_resolution = InternalResolutionSetting::Height { height: 16384 };
         let mut caps = linux_caps();
@@ -681,7 +676,7 @@ mod tests {
             ]
         );
         // The requested settings are untouched.
-        assert_eq!(s.graphics.backend, BackendPreference::Metal);
+        assert_eq!(s.graphics.backend, BackendPreference::D3d12);
     }
 
     #[test]

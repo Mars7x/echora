@@ -1,7 +1,7 @@
 //! Host audio output: the interleaved signed 16-bit PCM that the guest's
 //! audio-out buffers carry, played on the default output device through
 //! CPAL (ALSA on Linux, which reaches PipeWire and PulseAudio; WASAPI on
-//! Windows; CoreAudio on macOS). Opt-in with `ECHORA_AUDIO=1`.
+//! Windows). Opt-in with `ECHORA_AUDIO=1`.
 //!
 //! A dedicated thread owns the stream (CPAL streams are not `Send` on every
 //! platform) and moves submitted samples into a bounded queue that the

@@ -1,5 +1,5 @@
-//! Windows and macOS backend: gamepads through gilrs (XInput and Windows
-//! Gaming Input, or GameController). Buttons are mapped by position as on
+//! Windows backend: gamepads through gilrs (XInput and Windows Gaming
+//! Input). Buttons are mapped by position as on
 //! Linux: the bottom face button is B, the right one A, the top one X and
 //! the left one Y. Several pads at once act as one controller.
 //!

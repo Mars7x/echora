@@ -20,8 +20,6 @@ pub fn data_dir() -> Option<PathBuf> {
     let env = |key| std::env::var_os(key).map(PathBuf::from);
     if cfg!(target_os = "windows") {
         env("LOCALAPPDATA").map(|dir| dir.join("Echora"))
-    } else if cfg!(target_os = "macos") {
-        env("HOME").map(|home| home.join("Library/Application Support/Echora"))
     } else {
         env("XDG_DATA_HOME")
             .or_else(|| env("HOME").map(|home| home.join(".local/share")))
