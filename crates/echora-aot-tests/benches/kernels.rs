@@ -5,13 +5,17 @@
 //! guest instructions each retires per second. See `docs/testing.md`.
 //!
 //! ```text
-//! cargo bench -p echora-aot-tests --bench kernels [-- [FILTER] [--scale N] [--runs N]]
+//! cargo bench -p echora-aot-tests --bench kernels [-- [FILTER] [--scale N] [--runs N]
+//!     [--save FILE] [--compare FILE]]
 //! ```
 //!
 //! `FILTER` keeps kernels whose name contains it; `--scale` multiplies the
 //! work of each kernel (default 1: about 15-140 million instructions);
 //! `--runs` sets how many times each kernel runs (default 3; the best and
-//! the median are reported).
+//! the median are reported). `--save` writes the results to a file and
+//! `--compare` reads one written earlier and prints, per kernel, the earlier
+//! and current best and median rates with the change: save before a codegen
+//! change, compare after it.
 
 use std::time::{Duration, Instant};
 
@@ -36,6 +40,8 @@ struct Options {
     filter: Option<String>,
     scale: u64,
     runs: usize,
+    save: Option<String>,
+    compare: Option<String>,
 }
 
 fn options() -> Options {
@@ -43,6 +49,8 @@ fn options() -> Options {
         filter: None,
         scale: 1,
         runs: 3,
+        save: None,
+        compare: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -55,6 +63,8 @@ fn options() -> Options {
         match arg.as_str() {
             "--scale" => options.scale = number("--scale"),
             "--runs" => options.runs = number("--runs") as usize,
+            "--save" => options.save = Some(args.next().expect("--save takes a file")),
+            "--compare" => options.compare = Some(args.next().expect("--compare takes a file")),
             // Passed by `cargo bench`.
             "--bench" => {}
             other if other.starts_with('-') => panic!("unknown option {other}"),
@@ -143,6 +153,50 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
     (m.core.steps, start.elapsed())
 }
 
+/// One kernel's result: name, best and median million instructions per
+/// second.
+type Result = (String, f64, f64);
+
+/// The lines `--save` writes: `name best median`.
+fn read_results(path: &str) -> Vec<Result> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"));
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?.to_owned();
+            let best = fields.next()?.parse().ok()?;
+            let median = fields.next()?.parse().ok()?;
+            Some((name, best, median))
+        })
+        .collect()
+}
+
+fn change(before: f64, after: f64) -> String {
+    if before > 0.0 {
+        format!("{:+.1}%", (after / before - 1.0) * 100.0)
+    } else {
+        "-".into()
+    }
+}
+
+fn print_comparison(before: &[Result], after: &[Result]) {
+    println!(
+        "\n{:<8} {:>12} {:>12} {:>8} {:>14} {:>14} {:>8}",
+        "kernel", "best before", "best after", "change", "median before", "median after", "change"
+    );
+    for (name, best, median) in after {
+        let Some((_, old_best, old_median)) = before.iter().find(|(old, _, _)| old == name) else {
+            continue;
+        };
+        println!(
+            "{name:<8} {old_best:>12.1} {best:>12.1} {:>8} {old_median:>14.1} {median:>14.1} {:>8}",
+            change(*old_best, *best),
+            change(*old_median, *median)
+        );
+    }
+}
+
 fn main() {
     let options = options();
     kernel_code::install();
@@ -150,6 +204,7 @@ fn main() {
         "{:<8} {:>14} {:>12} {:>14} {:>14}",
         "kernel", "instructions", "best ms", "best Minstr/s", "median Minstr/s"
     );
+    let mut results: Vec<Result> = Vec::new();
     for &(name, entry) in KERNEL_ENTRIES {
         if options
             .filter
@@ -174,5 +229,16 @@ fn main() {
             "{name:<8} {instructions:>14} {:>12.1} {fastest:>14.1} {median:>14.1}",
             best.as_secs_f64() * 1e3
         );
+        results.push((name.to_owned(), fastest, median));
+    }
+    if let Some(path) = &options.save {
+        let text: String = results
+            .iter()
+            .map(|(name, best, median)| format!("{name} {best:.3} {median:.3}\n"))
+            .collect();
+        std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {path}: {error}"));
+    }
+    if let Some(path) = &options.compare {
+        print_comparison(&read_results(path), &results);
     }
 }

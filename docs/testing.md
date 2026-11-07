@@ -96,6 +96,16 @@ llvm-objcopy and llvm-objdump) to regenerate `src/kernels.rs`. The words are
 checked in, so building needs no assembler. `cargo test` builds the kernels
 but does not run the benchmark.
 
+To compare a change, save a run before it and compare after it:
+
+```
+cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --save /tmp/before.txt
+cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --compare /tmp/before.txt
+```
+
+The second run prints each kernel's best and median rate before and after,
+with the change. Single runs vary by several percent, so use several runs.
+
 CI runs formatting, clippy with warnings denied, and the tests on Linux
 x86-64 and Windows x86-64. Passing CI means the code compiles
 and the tests pass on that host; it says nothing about running the game.
