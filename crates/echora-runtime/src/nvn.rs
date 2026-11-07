@@ -658,7 +658,6 @@ impl Nvn {
             name,
             "nvnSyncWait"
                 | "nvnQueueFinish"
-                | "nvnMemoryPoolInvalidateMappedRange"
                 | "nvnBufferInvalidateMappedRange"
                 | "nvnTextureReadTexels"
                 | "nvnQueuePresentTexture"
@@ -982,9 +981,15 @@ impl Nvn {
                         x[1], x[2]
                     )));
                 }
+                let start = base + x[1];
                 if name == "nvnMemoryPoolFlushMappedRange" {
-                    let start = base + x[1];
                     self.gpu_invalidate(start..start + x[2], None);
+                } else if let Err(message) = self.resolve_storage(core, Some(start..start + x[2])) {
+                    // The CPU is about to read the range: GPU results in it
+                    // come back first.
+                    return Err(Trap::InvalidState {
+                        message: format!("{name}: dispatch results: {message}"),
+                    });
                 }
                 return Ok(true);
             }

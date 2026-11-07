@@ -83,6 +83,9 @@ pub struct Backend {
     /// over imported guest memory) since the GPU last finished: a CPU read
     /// of one waits for the GPU first (see `resolve_storage`).
     in_place_writes: Vec<std::ops::Range<u64>>,
+    /// Storage buffers kept on the GPU between dispatches (when guest
+    /// memory cannot be imported), by guest address: see `Resident`.
+    resident: HashMap<(u64, u64), Resident>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -142,6 +145,7 @@ impl Backend {
             shadow_quiet: HashMap::new(),
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
+            resident: HashMap::new(),
             target_index: HashMap::new(),
             target_index_stamp: None,
         }))
@@ -443,6 +447,11 @@ impl Nvn {
     pub(super) fn gpu_invalidate(&mut self, range: std::ops::Range<u64>, texture: Option<u64>) {
         self.binding_serial += 1;
         if let Some(backend) = self.gpu.as_mut() {
+            for ((start, length), resident) in backend.resident.iter_mut() {
+                if *start < range.end && range.start < start + length {
+                    resident.guest_dirty = true;
+                }
+            }
             let mut touched = Vec::new();
             backend.textures.retain(|key, (_, _, storage)| {
                 // WriteTexels names the texture: its contents changed.
@@ -2425,9 +2434,9 @@ impl Nvn {
                 c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
             }
         }
-        let mut storage = HashMap::new();
+        let storage = HashMap::new();
         let mut storage_in_place = HashMap::new();
-        let mut written_back = Vec::new();
+        let written_back: Vec<(u32, u64)> = Vec::new();
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
         let mut images = HashMap::new();
@@ -2471,16 +2480,89 @@ impl Nvn {
                         }
                         continue;
                     }
-                    self.resolve_storage(core, Some(guest..guest + length))?;
-                    storage.insert(descriptor.binding, self.gpu_bytes(core, base, length)?);
-                    // Buffers the shader only reads need no write-back.
-                    if descriptor.flags & 1 != 0 {
-                        written_back.push((descriptor.binding, base));
+                    // Otherwise the buffer stays on the GPU between
+                    // dispatches: uploaded when the guest bytes changed,
+                    // copied back only when the CPU needs them.
+                    // Other views of these bytes with newer GPU data come
+                    // back to the guest first; the sample then sees them.
+                    self.resolve_resident(
+                        core,
+                        Some(guest..guest + length),
+                        Some((guest, length)),
+                    )?;
+                    let sample = storage_sample(core, guest, length);
+                    let cpu_visible = self.pool_cpu_visible(guest);
+                    if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                        let flags = self
+                            .objects
+                            .values()
+                            .filter(|object| object.kind == "MemoryPool")
+                            .find(|pool| {
+                                pool.builder.get("Storage").is_some_and(|storage| {
+                                    storage.x[0] <= guest && guest < storage.x[0] + storage.x[1]
+                                })
+                            })
+                            .map(|pool| {
+                                (
+                                    pool.builder.get("Flags").map_or(0, |flags| flags.x[0]),
+                                    pool.builder["Storage"].x[0],
+                                    pool.builder["Storage"].x[1],
+                                )
+                            });
+                        let note = format!("storage pool {flags:x?}");
+                        self.gpu.as_mut().unwrap().note(note);
                     }
-                    self.gpu
+                    let state = self
+                        .gpu
+                        .as_ref()
+                        .unwrap()
+                        .resident
+                        .get(&(guest, length))
+                        .copied();
+                    let key = resident_key(guest, length);
+                    let (buffer, created) = self
+                        .gpu
                         .as_mut()
                         .unwrap()
-                        .stat("stat: dispatch storage bytes", length);
+                        .renderer
+                        .resident_buffer(key, length)?;
+                    let upload = created
+                        || state.is_none_or(|state| {
+                            state.length != length || state.guest_dirty || state.sample != sample
+                        });
+                    if upload {
+                        let reason = match state {
+                            _ if created => "stat: storage upload: new buffer",
+                            None => "stat: storage upload: no state",
+                            Some(state) if state.length != length => {
+                                "stat: storage upload: other length"
+                            }
+                            Some(state) if state.guest_dirty => {
+                                "stat: storage upload: CPU flushed the range"
+                            }
+                            Some(_) => "stat: storage upload: guest bytes changed",
+                        };
+                        self.gpu.as_mut().unwrap().stat(reason, 1);
+                        self.resolve_copies(core, Some(guest..guest + length))?;
+                        let bytes = self.gpu_bytes(core, base, length)?;
+                        let backend = self.gpu.as_mut().unwrap();
+                        backend.renderer.upload_resident(key, &bytes)?;
+                        backend.stat("stat: dispatch storage bytes", length);
+                    }
+                    let backend = self.gpu.as_mut().unwrap();
+                    let gpu_newer = (!upload && state.is_some_and(|state| state.gpu_newer))
+                        || descriptor.flags & 1 != 0;
+                    backend.resident.insert(
+                        (guest, length),
+                        Resident {
+                            length,
+                            sample,
+                            gpu_newer,
+                            guest_dirty: false,
+                            cpu_visible,
+                        },
+                    );
+                    storage_in_place.insert(descriptor.binding, (buffer, 0, length));
                 }
                 // Texel buffers (buffer textures) bind like textures.
                 kind @ (DescriptorKind::Texture | DescriptorKind::TextureBuffer) => {
@@ -2778,7 +2860,89 @@ impl Nvn {
                 backend.in_place_writes.clear();
             }
         }
-        self.resolve_copies(core, range)
+        self.resolve_copies(core, range.clone())?;
+        self.resolve_resident(core, range, None)
+    }
+
+    /// Copy GPU-newer resident storage back to the guest: what overlaps
+    /// `range`, or with `None` (a CPU wait) what the CPU can read.
+    fn resolve_resident(
+        &mut self,
+        core: &mut Guest,
+        range: Option<std::ops::Range<u64>>,
+        except: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        let wanted: Vec<(u64, u64)> = backend
+            .resident
+            .iter()
+            .filter(|&(&(start, length), resident)| {
+                resident.gpu_newer
+                    && except != Some((start, length))
+                    && match &range {
+                        Some(range) => start < range.end && range.start < start + length,
+                        None => resident.cpu_visible,
+                    }
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut tokens = Vec::new();
+        for &(start, length) in &wanted {
+            tokens.push((
+                backend
+                    .renderer
+                    .read_resident(resident_key(start, length), length)?,
+                (start, length),
+            ));
+        }
+        backend.renderer.flush()?;
+        let mut completed: HashMap<u64, Vec<u8>> = backend
+            .renderer
+            .take_completed_reads()
+            .into_iter()
+            .collect();
+        backend.stat("stat: resident storage copied back", wanted.len() as u64);
+        for (token, (start, length)) in tokens {
+            let bytes = completed
+                .remove(&token)
+                .ok_or_else(|| format!("resident read {token} never completed"))?;
+            core.memory
+                .write(start, &bytes)
+                .map_err(|trap| format!("resident write-back: {trap:?}"))?;
+            let sample = storage_sample(core, start, length);
+            if let Some(resident) = self
+                .gpu
+                .as_mut()
+                .unwrap()
+                .resident
+                .get_mut(&(start, length))
+            {
+                resident.gpu_newer = false;
+                resident.sample = sample;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the CPU can access the memory pool holding guest address
+    /// `guest` (pool flags CPU_UNCACHED 2 or CPU_CACHED 4); unknown counts
+    /// as visible.
+    fn pool_cpu_visible(&self, guest: u64) -> bool {
+        self.objects
+            .values()
+            .filter(|object| object.kind == "MemoryPool")
+            .find(|pool| {
+                pool.builder.get("Storage").is_some_and(|storage| {
+                    storage.x[0] <= guest && guest < storage.x[0] + storage.x[1]
+                })
+            })
+            .and_then(|pool| pool.builder.get("Flags"))
+            .is_none_or(|flags| flags.x[0] & 6 != 0)
     }
 
     /// Store deferred dispatch results (storage copied back from the GPU)
@@ -3951,6 +4115,35 @@ fn dense_sample(core: &Guest, base: u64, length: u64) -> u64 {
         sample = sample.rotate_left(7) ^ hash_bytes(&piece);
     }
     sample
+}
+
+/// A storage buffer kept on the GPU (`Renderer::resident_buffer`): its
+/// guest range, a sample of the guest bytes it was last in step with,
+/// whether the GPU holds writes the guest does not have yet, whether the
+/// CPU flushed writes into the range since, and whether the CPU can read
+/// its pool at all (GPU-only pools are never copied back at CPU waits).
+#[derive(Clone, Copy, Debug)]
+struct Resident {
+    length: u64,
+    sample: u64,
+    gpu_newer: bool,
+    guest_dirty: bool,
+    cpu_visible: bool,
+}
+
+/// The renderer key of the resident buffer for `length` bytes at `guest`.
+fn resident_key(guest: u64, length: u64) -> u64 {
+    guest ^ length.rotate_left(40)
+}
+
+/// A change check of `length` guest bytes: all of them up to 256 KiB, a
+/// spread sample beyond.
+fn storage_sample(core: &Guest, base: u64, length: u64) -> u64 {
+    if length <= 256 << 10 {
+        hash_bytes(&read_storage(core, base, length))
+    } else {
+        dense_sample(core, base, length)
+    }
 }
 
 /// Uploads from CPU-uncached pools up to this size keep a copy of their
