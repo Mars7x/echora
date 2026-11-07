@@ -1969,6 +1969,10 @@ impl Nvn {
                 {
                     return Err(stop("memory pool finalized while buffers use it".into()));
                 }
+                if kind == "MemoryPool" {
+                    let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
+                    self.gpu_forget_pool(base);
+                }
                 self.objects.remove(&this);
                 return Ok(true);
             }

@@ -2867,6 +2867,15 @@ impl Nvn {
         Ok(())
     }
 
+    /// A memory pool at guest `base` is finalized: its mirror is dropped
+    /// (the memory may hold something else next). GPU writes the guest has
+    /// not seen are lost with it, as the pool is.
+    pub(super) fn gpu_forget_pool(&mut self, base: u64) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.resident.remove(&base);
+        }
+    }
+
     /// The device buffer and offset for `length` storage bytes at guest
     /// `guest`: their memory pool, mirrored on the GPU (created and filled
     /// on first use, with the ranges the CPU changed since uploaded first).
@@ -2877,21 +2886,35 @@ impl Nvn {
         guest: u64,
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
-        let Some((base, size, flags)) = self
-            .objects
+        // A pool already mirrored first (no scan of every NVN object); a
+        // pool finalized since is dropped with its buffer key reused only
+        // by a pool at the same address and size.
+        let known = self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .resident
             .values()
-            .filter(|object| object.kind == "MemoryPool")
-            .filter_map(|pool| {
-                let storage = pool.builder.get("Storage")?;
-                let flags = pool.builder.get("Flags").map_or(0, |flags| flags.x[0]);
-                Some((storage.x[0], storage.x[1], flags))
-            })
-            .find(|&(base, size, _)| base != 0 && base <= guest && guest + length <= base + size)
-        else {
+            .find(|pool| pool.base <= guest && guest + length <= pool.base + pool.size)
+            .map(|pool| (pool.base, pool.size, if pool.uncached { 2 } else { 0 }));
+        let Some((base, size, flags)) = known.or_else(|| {
+            self.objects
+                .values()
+                .filter(|object| object.kind == "MemoryPool")
+                .filter_map(|pool| {
+                    let storage = pool.builder.get("Storage")?;
+                    let flags = pool.builder.get("Flags").map_or(0, |flags| flags.x[0]);
+                    Some((storage.x[0], storage.x[1], flags))
+                })
+                .find(|&(base, size, _)| {
+                    base != 0 && base <= guest && guest + length <= base + size
+                })
+        }) else {
             return Ok(None);
         };
         let backend = self.gpu.as_mut().unwrap();
         let (buffer, created) = backend.renderer.resident_buffer(base, size)?;
+        let fresh = !backend.resident.contains_key(&base);
         let pool = backend
             .resident
             .entry(base)
@@ -2902,7 +2925,7 @@ impl Nvn {
                 guest_dirty: Vec::new(),
                 gpu_dirty: Vec::new(),
             });
-        if created || pool.size != size {
+        if created || fresh || pool.size != size {
             *pool = ResidentPool {
                 base,
                 size,
