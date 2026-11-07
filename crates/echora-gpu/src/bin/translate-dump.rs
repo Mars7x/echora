@@ -38,7 +38,39 @@ fn main() {
             resolution_scale: echora_gpu::renderer::Scale::from_env().terms(),
             ..Default::default()
         };
-        match shader::translate(&bytes, parameters, &mut NoEnvironment) {
+        // As at run time: a program whose control section gives mesh output
+        // sizes (+0x60) is a mesh program. Without a capture of its draw, a
+        // program that reads the stage buffer otherwise is taken as a task
+        // program (its control +0x58 is then SET_MESH_INIT_SHADER).
+        let sizes = control_word(path, 0x60).unwrap_or(0);
+        let threads = control_word(path, 0x58).unwrap_or(0);
+        let mesh = |task: bool| {
+            let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
+            shader::MeshParameters {
+                task,
+                registers: [
+                    4 | (vertices & 0x1ff) << 4 | (primitives & 0x3ff) << 13,
+                    (threads & 0x3f) << 20,
+                    if task { threads } else { threads & !0x3f },
+                ],
+                primitive_header: None,
+            }
+        };
+        let parameters = Parameters {
+            mesh: (sizes != 0).then(|| mesh(false)),
+            ..parameters
+        };
+        let mut result = shader::translate(&bytes, parameters, &mut NoEnvironment);
+        if sizes == 0
+            && matches!(&result, Err(error) if error.contains("outside task and mesh programs"))
+        {
+            let parameters = Parameters {
+                mesh: Some(mesh(true)),
+                ..parameters
+            };
+            result = shader::translate(&bytes, parameters, &mut NoEnvironment);
+        }
+        match result {
             Ok(program) => {
                 translated += 1;
                 *stages.entry(format!("{:?}", program.stage)).or_default() += 1;
