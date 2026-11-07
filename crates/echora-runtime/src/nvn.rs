@@ -3126,28 +3126,34 @@ impl Nvn {
                     let offset = u64::from(ry / bh + row) * stride + u64::from(rx / bw) * bytes;
                     transfer(core, &mut line, base + offset)?;
                 } else {
-                    for column in 0..columns {
-                        let (z, layer) = if layers > 1 {
-                            (0, u64::from(rz + slice))
-                        } else {
-                            (rz + slice, 0)
-                        };
+                    let (z, layer) = if layers > 1 {
+                        (0, u64::from(rz + slice))
+                    } else {
+                        (rz + slice, 0)
+                    };
+                    // A run of blocks at consecutive addresses at a time.
+                    let mut column = 0;
+                    while column < columns {
+                        let x = rx / bw + column;
+                        let run =
+                            crate::nvn_format::block_linear_run(info, x).min(columns - column);
                         let offset = layer * layer_stride
                             + crate::nvn_format::block_linear_offset(
                                 info,
                                 width,
                                 height,
                                 depth,
-                                rx / bw + column,
+                                x,
                                 ry / bh + row,
                                 z,
                             );
                         let start = (u64::from(column) * bytes) as usize;
                         transfer(
                             core,
-                            &mut line[start..start + bytes as usize],
+                            &mut line[start..start + (u64::from(run) * bytes) as usize],
                             base + offset,
                         )?;
+                        column += run;
                     }
                 }
                 if !to_texture {

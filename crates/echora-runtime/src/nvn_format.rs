@@ -278,6 +278,17 @@ pub fn block_linear_offset(
     block_linear_offset_in(format, width, height, shape, x, y, z)
 }
 
+/// How many blocks from column `x` of a row lie at consecutive addresses:
+/// within a GOB, 16-byte runs of a row are contiguous, so blocks whose size
+/// divides 16 run to the next 16-byte boundary (at least one block).
+pub fn block_linear_run(format: FormatInfo, x: u32) -> u32 {
+    let bytes = format.bytes_per_block;
+    if bytes == 0 || 16 % bytes != 0 {
+        return 1;
+    }
+    (16 - (x * bytes) % 16) / bytes
+}
+
 /// As `block_linear_offset`, within a level `width` x `height` texels
 /// whose blocks have `shape` (see `level_block_shape`).
 pub fn block_linear_offset_in(
@@ -317,6 +328,22 @@ pub fn block_linear_offset_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runs_are_contiguous_to_the_next_16_bytes() {
+        let format = info(37).unwrap();
+        let bytes = format.bytes_per_block;
+        for x in 0..96u32 {
+            let run = block_linear_run(format, x);
+            let start = block_linear_offset(format, 96, 32, 1, x, 5, 0);
+            for step in 0..run {
+                assert_eq!(
+                    block_linear_offset(format, 96, 32, 1, x + step, 5, 0),
+                    start + u64::from(step * bytes)
+                );
+            }
+        }
+    }
 
     #[test]
     fn mip_levels_follow_each_other() {

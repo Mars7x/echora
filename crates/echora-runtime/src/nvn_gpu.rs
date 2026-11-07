@@ -1817,7 +1817,11 @@ impl Nvn {
                             copy_block(line, u64::from(row) * stride);
                             continue;
                         }
-                        for column in 0..columns {
+                        // A run of blocks at consecutive addresses at a time.
+                        let mut column = 0;
+                        while column < columns {
+                            let run = crate::nvn_format::block_linear_run(info, column)
+                                .min(columns - column);
                             let offset = crate::nvn_format::block_linear_offset_in(
                                 info,
                                 level_width,
@@ -1828,9 +1832,10 @@ impl Nvn {
                                 z,
                             );
                             copy_block(
-                                &mut line[column as usize * block..][..block],
+                                &mut line[column as usize * block..][..run as usize * block],
                                 layer_base + offset,
                             );
+                            column += run;
                         }
                     }
                 }
