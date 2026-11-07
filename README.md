@@ -26,7 +26,7 @@ display, input and audio, rather than emulating the console.
 - Written in Rust, apart from the C++ shader recompiler and a few C
   libraries.
 - The Switch's kernel, system services and NVN graphics API are
-  reimplemented; the game's own code is never modified.
+  reimplemented; by default, the game's own code is never modified.
 - Unimplemented instructions, system calls and services stop the run with
   a report instead of returning invented success.
 - Translated code is checked against a reference interpreter written from
@@ -34,6 +34,8 @@ display, input and audio, rather than emulating the console.
 - The game is read straight from its NUP file or a dump, without
   unpacking it.
 - The core is portable, and is built and tested on Linux and Windows.
+- Anything beyond the console's own behaviour, such as frame rates above
+  60 or ultrawide, will only come as opt-in extras, off by default.
 
 ## Status
 
