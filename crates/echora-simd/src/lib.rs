@@ -484,7 +484,13 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
         (a, b)
     };
     if let Some(nan) = fp.process_nans(&[a, b]) {
-        nan
+        // FNMUL is FPNeg(FPMul): with FPCR.AH clear, FPNeg flips a NaN's
+        // sign as well.
+        if op == FpBinaryOp::NegMul {
+            nan ^ format.sign_bit()
+        } else {
+            nan
+        }
     } else {
         let finite = fp.is_finite(a) && fp.is_finite(b);
         match op {
@@ -509,12 +515,8 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             }
             FpBinaryOp::NegMul => {
                 let raw = native!(size, a, b, |x, y| x * y);
-                let out = fp.output(raw, finite);
-                if format.is_nan(out) {
-                    out
-                } else {
-                    out ^ format.sign_bit()
-                }
+                // FPNeg of the product, a default NaN included.
+                fp.output(raw, finite) ^ format.sign_bit()
             }
             FpBinaryOp::Mul => {
                 let raw = native!(size, a, b, |x, y| x * y);
@@ -3591,6 +3593,22 @@ mod fast_path_tests {
 #[cfg(test)]
 mod sticky_inexact_tests {
     use super::*;
+
+    /// FNMUL negates a NaN result too (FPNeg with FPCR.AH clear).
+    #[test]
+    fn negated_multiply_flips_a_nan_sign() {
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(0x7ffd_8a83_e451_dfa2u64);
+        cpu.vectors[2] = u128::from(2.0f64.to_bits());
+        fp_binary(&mut cpu, FpBinaryOp::NegMul, FpSize::D, 0, 1, 2).unwrap();
+        assert_eq!(cpu.vectors[0] as u64, 0xfffd_8a83_e451_dfa2);
+        // Infinity times zero: the default NaN, negated.
+        cpu.vectors[1] = u128::from(f64::INFINITY.to_bits());
+        cpu.vectors[2] = 0;
+        cpu.fpcr = FPCR_DN;
+        fp_binary(&mut cpu, FpBinaryOp::NegMul, FpSize::D, 0, 1, 2).unwrap();
+        assert_eq!(cpu.vectors[0] as u64, 0xfff8_0000_0000_0000);
+    }
 
     /// The whole-vector fast path gives every lane the exact path's result
     /// and the exact path's flags (FPCR.FZ set, as games run).
