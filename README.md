@@ -95,7 +95,7 @@ See [architecture](docs/architecture.md) for the crate boundaries.
 
 ## Building
 
-The game runs on Linux only. You need:
+The game runs only on Linux for now. You need:
 
 - your own dump of the game: the Switch 2 update 1.1.1, as a NUP file or
   an extracted dump;
