@@ -262,6 +262,29 @@ impl Core {
         result
     }
 
+    /// As `call`, but runs `function` first: the window function holding
+    /// the callee's PC, as the window table would give. Generated code
+    /// passes it for a BL to a known translated function, skipping the
+    /// table lookup and the indirect call. Same depth limit, traps and
+    /// return: Ok can still mean the callee left early (a host function,
+    /// the depth limit), and the caller checks the PC as after `call`.
+    #[inline]
+    pub fn call_window(&mut self, return_to: u64, function: WindowFn) -> Result<(), Trap> {
+        if WINDOWS.get().is_none() || self.call_depth >= MAX_CALL_DEPTH {
+            return Ok(());
+        }
+        if self.cpu.pc == return_to {
+            return Ok(());
+        }
+        self.call_depth += 1;
+        let result = function(self);
+        self.call_depth -= 1;
+        match result {
+            Ok(()) if self.cpu.pc != return_to => self.call(return_to),
+            other => other,
+        }
+    }
+
     /// Per-instruction accounting. Thread-state checks happen in the host at
     /// block boundaries, which is the only place that state can change. The
     /// common path is a budget compare, an alignment check and a ring store.
