@@ -35,8 +35,8 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
 - **Not playable yet.** Runs have been seen as far as the intro movie;
   gameplay has not been reached. The mesh and task shaders that gameplay
   scenes need have no draw path in the runtime yet.
-- **Far below full speed.** The intro movie runs at about 6 frames per
-  second against the game's 30; the first 1,200 frames take about 165 s,
+- **Far below full speed.** The game runs at 60 frames per second on the
+  console; here the intro movie plays at about 6. The first 1,200 frames take about 165 s,
   down from 323 s. Every guest thread runs on one host thread by default,
   and that thread does most of the work, so faster translated code alone
   cannot reach full speed. Running guest threads on several host threads
