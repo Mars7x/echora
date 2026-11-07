@@ -75,6 +75,7 @@ fn main() {
     kernel_code(&mut out);
     semantic_code(&mut out);
     simd_semantic_code(&mut out);
+    fp_semantic_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -261,15 +262,10 @@ fn semantic_code(out: &mut String) {
     writeln!(out, "{root}\n}}").expect("write");
 }
 
-/// Integer SIMD and data-movement instructions for `tests/simd_semantics.rs`:
-/// random words in the SIMD encoding space, kept when the reference
-/// interpreter there covers them; laid out like `semantic_code`.
+/// Integer SIMD and data-movement instructions for `tests/simd_semantics.rs`.
 fn simd_semantic_code(out: &mut String) {
-    use echora_lift::aarch64::{Instruction, decode};
     use echora_lift::simd::{SimdOp, VecIntOp, VecShiftOp};
 
-    const BASE: u64 = 0x60_0000;
-    const PER_VARIANT: usize = 160;
     let covered = |op: &SimdOp| match *op {
         SimdOp::VecInt { op, .. } => !matches!(
             op,
@@ -303,7 +299,88 @@ fn simd_semantic_code(out: &mut String) {
         | SimdOp::ModifyImmediate { .. } => true,
         _ => false,
     };
-    let mut state: u64 = 0x51d0_5e3a_9c2b_7e41;
+    sampled_simd_program(
+        out,
+        "simd_semantic_code",
+        0x60_0000,
+        0x51d0_5e3a_9c2b_7e41,
+        &[
+            (0x0e00_0000, 0x0e00_0000),
+            (0xdf00_0000, 0x5e00_0000),
+            (0x9f20_0c00, 0x0e20_0800),
+        ],
+        &covered,
+    );
+}
+
+/// Floating-point instructions for `tests/fp_semantics.rs`.
+fn fp_semantic_code(out: &mut String) {
+    use echora_lift::simd::{FpPrecision, SimdOp, VecFpOp, VecFpUnaryOp};
+
+    let covered = |op: &SimdOp| match *op {
+        SimdOp::VecFp { op, .. } | SimdOp::VecFpElement { op, .. } => {
+            !matches!(op, VecFpOp::RecipStep | VecFpOp::RSqrtStep)
+        }
+        SimdOp::VecFpUnary { op, .. } => !matches!(
+            op,
+            VecFpUnaryOp::RecipEstimate | VecFpUnaryOp::RSqrtEstimate
+        ),
+        SimdOp::VecFpConvert { from, to, .. } => from != FpPrecision::H && to != FpPrecision::H,
+        SimdOp::FpUnary { .. }
+        | SimdOp::FpConvert { .. }
+        | SimdOp::FpBinary { .. }
+        | SimdOp::FpTernary { .. }
+        | SimdOp::FpCompare { .. }
+        | SimdOp::FpConditionalCompare { .. }
+        | SimdOp::FpSelect { .. }
+        | SimdOp::FpMoveImmediate { .. }
+        | SimdOp::FpMoveToGeneral { .. }
+        | SimdOp::FpMoveFromGeneral { .. }
+        | SimdOp::IntToFp { .. }
+        | SimdOp::IntToFpFixed { .. }
+        | SimdOp::SimdIntToFp { .. }
+        | SimdOp::FpToInt { .. }
+        | SimdOp::FpToFixed { .. }
+        | SimdOp::VecFpPairwise { .. }
+        | SimdOp::VecFpAcross { .. } => true,
+        _ => false,
+    };
+    sampled_simd_program(
+        out,
+        "fp_semantic_code",
+        0x70_0000,
+        0x0f1e_2d3c_4b5a_6978,
+        &[
+            (0x5f20_0000, 0x1e20_0000),
+            (0x5f00_0000, 0x1f00_0000),
+            (0x9f20_0400, 0x0e20_0400),
+            (0xdf20_0400, 0x5e20_0400),
+            (0x9f00_0400, 0x0f00_0000),
+            (0x9f3e_0c00, 0x0e20_0800),
+            (0xdf3e_0c00, 0x5e20_0800),
+            (0x9f3e_0c00, 0x0e30_0800),
+            (0xdf3e_0c00, 0x5e30_0800),
+            (0x5f20_0000, 0x1e00_0000),
+        ],
+        &covered,
+    );
+}
+
+/// Random words under `generators` (mask, fixed value) that decode to SIMD
+/// operations `covered` accepts, up to 160 per variant, each followed by
+/// SVC #7 and SVC #8, lifted through split emission as module `name`.
+fn sampled_simd_program(
+    out: &mut String,
+    name: &str,
+    base: u64,
+    seed: u64,
+    generators: &[(u32, u32)],
+    covered: &dyn Fn(&echora_lift::simd::SimdOp) -> bool,
+) {
+    use echora_lift::aarch64::{Instruction, decode};
+
+    const PER_VARIANT: usize = 160;
+    let mut state = seed;
     let mut next = || {
         state ^= state << 13;
         state ^= state >> 7;
@@ -314,11 +391,7 @@ fn simd_semantic_code(out: &mut String) {
     let mut words = Vec::new();
     for _ in 0..4_000_000 {
         let word = next();
-        let (mask, value) = match next() % 3 {
-            0 => (0x0e00_0000, 0x0e00_0000),
-            1 => (0xdf00_0000, 0x5e00_0000),
-            _ => (0x9f20_0c00, 0x0e20_0800),
-        };
+        let (mask, value) = generators[next() as usize % generators.len()];
         let word = (word & !mask) | value;
         let Instruction::Simd(op) = decode(word, 0) else {
             continue;
@@ -344,16 +417,16 @@ fn simd_semantic_code(out: &mut String) {
         image.extend(0xd400_00e1_u32.to_le_bytes()); // SVC #7
         image.extend(0xd400_0101_u32.to_le_bytes()); // SVC #8
     }
-    let entries: Vec<u64> = (0..words.len()).map(|i| BASE + 12 * i as u64).collect();
+    let entries: Vec<u64> = (0..words.len()).map(|i| base + 12 * i as u64).collect();
     let region = CodeRegion {
-        name: "simd semantic".into(),
-        base: BASE,
+        name: name.into(),
+        base,
         bytes: image,
     };
-    let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("simd semantic");
+    let translation = discover(&[region], &entries, words.len() * 3 + 16).expect(name);
     let (root, regions) = emit_rust_split(&translation, 10);
-    writeln!(out, "pub mod simd_semantic_code {{").expect("write");
-    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub mod {name} {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {base:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
