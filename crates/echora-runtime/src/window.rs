@@ -279,12 +279,13 @@ impl ApplicationHandler for App {
         self.window = Some(window);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
                 // Closing the window ends the run at the next host boundary
-                // (with its report).
+                // (with its report). The window and its surface stay until
+                // the process ends: a present may be using them right now,
+                // and destroying them under it crashed the run.
                 STOP_REQUESTED.store(true, Ordering::Relaxed);
             }
             WindowEvent::Resized(size) => {
