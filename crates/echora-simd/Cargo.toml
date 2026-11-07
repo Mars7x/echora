@@ -1,0 +1,15 @@
+[package]
+name = "echora-simd"
+description = "The guest's SIMD and floating-point operations, reached by generated code through echora-guest's declarations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+echora-guest.workspace = true
+
+[lints]
+workspace = true

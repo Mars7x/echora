@@ -56,7 +56,9 @@ ECHORA_TEST_NUP=/path/to/game.nup cargo test --workspace --release -- --include-
 - The translation is built against the clone's sources and links to the
   Rust toolchain that built it: after changing either, run
   `echora prepare --force`. Any change to `echora-guest` recompiles all
-  1,111 region crates.
+  1,111 region crates; a change to how a SIMD/FP operation works belongs in
+  `echora-simd`, which rebuilds alone (generated code reaches it through
+  `echora_guest::simd`'s declarations) before the bundles relink.
 - `prepare` runs as many build jobs as the processors and memory allow
   (about 1.5 GB each); `-j N` overrides it.
 - Keep the cache on disk: on systems where `/tmp` is a RAM-backed tmpfs,

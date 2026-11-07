@@ -16,6 +16,8 @@
 pub use echora_guest::cpu::Cpu;
 pub use echora_guest::memory::{EXECUTE, Memory, READ, STATE_CODE, STATE_NORMAL, WRITE};
 pub use echora_guest::{Core, Trap};
+// The SIMD/FP operations generated code calls (see `echora_guest::simd`).
+extern crate echora_simd;
 
 mod programs_list {
     include!("programs.rs");

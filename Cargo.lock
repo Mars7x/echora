@@ -1807,6 +1807,7 @@ version = "0.1.0"
 dependencies = [
  "echora-guest",
  "echora-lift",
+ "echora-simd",
  "libc",
  "windows-sys 0.61.2",
 ]
@@ -1942,6 +1943,13 @@ dependencies = [
  "tempfile",
  "winit",
  "zstd",
+]
+
+[[package]]
+name = "echora-simd"
+version = "0.1.0"
+dependencies = [
+ "echora-guest",
 ]
 
 [[package]]

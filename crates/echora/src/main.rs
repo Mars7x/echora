@@ -677,6 +677,13 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         .canonicalize()
         .context("locate the echora-guest crate")?;
     let guest = guest.to_string_lossy().into_owned();
+    // The SIMD/FP operations generated code reaches through echora-guest's
+    // declarations; only the shared library links them.
+    let simd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../echora-simd")
+        .canonicalize()
+        .context("locate the echora-simd crate")?;
+    let simd = simd.to_string_lossy().into_owned();
 
     let start = Instant::now();
     let mut regions = Vec::new();
@@ -722,12 +729,12 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         &format!(
             "[package]\nname = \"echora-guest-shared\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
              [lib]\ncrate-type = [\"dylib\"]\n\n\
-             [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
+             [dependencies]\nechora-guest = {{ path = {guest:?} }}\nechora-simd = {{ path = {simd:?} }}\n"
         ),
     )?;
     write_if_changed(
         &out.join("guest/src/lib.rs"),
-        "// Generated. Keep this file local.\npub use echora_guest::*;\n",
+        "// Generated. Keep this file local.\npub use echora_guest::*;\nextern crate echora_simd;\n",
     )?;
     let mut imports = String::new();
     let bundles: Vec<&[u64]> = regions.chunks(BUNDLE_REGIONS).collect();
