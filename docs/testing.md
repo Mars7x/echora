@@ -12,6 +12,11 @@
 | `echora-aot-tests` | Programs lifted at build time and executed natively: CRC32/CRC32C against zlib-derived values, MRS/MSR NZCV, FP across-lane reductions with NaNs and signed zeros, CASP (X and W forms, aliasing, misalignment), SABAL/UABDL, UDOT/SDOT against independently computed results, integer and flag results, call/return with and without PAuth hints, step budget, unsupported system registers, undiscovered indirect targets, calls across dispatch windows and holes inside them, CAS/LDADD at every width including register aliasing and SP forms, load/store-exclusive loops and monitor clearing, LDAR/LDAPR/STLR, alignment faults, and a store to an unmapped page ending the process with the guest address (in a child process with core dumps disabled). |
 | `echora-resolution` | Non-integer scales, internal resolution independent of output, exact-size aspect checks, ultrawide pillarboxing and view expansion (21:9, 32:9), 16:10, seamless viewport tiling at 1366x768, fixed versus screen-relative targets, change impact, degenerate sizes. |
 | `echora-config` | Round trip, partial files, unknown-field and range rejection, future schema rejection, change classification, requested-versus-effective resolution, atomic save. |
+| `echora-runtime` | 261 tests: IPC framing and the system services, threads, scheduling and synchronization, NPDM capabilities, content metadata and RomFS, file systems, display and HID, the NVIDIA driver, NVN formats and SASS program lengths, the audio renderer, AV1 decoding, logging. |
+| `echora-gpu` | Vulkan on the host's driver: a triangle draw, a compute dispatch into a storage buffer, whole and partial clears read back; the shader library's ABI layout and short-program rejection; loop guards on SPIR-V; rational resolution scales and aspect-preserving presentation. |
+| `echora-launcher` | Installing a file or dump and reinstalling in place; GNOME button layouts; resize edges; directional focus (in-line preference, returning where a move came from); the spring curve; series titles. |
+| `echora-input` | evdev capability words, button mapping by position (with the xpad north/west swap), triggers, hats and sticks within the circle. |
+| `echora-audio` | Volume scaling and clamping; a bounded queue that plays silence on underrun. |
 
 Ignored tests, run with `ECHORA_TEST_NUP` set, open the real archive, verify
 every ExeFS file, and check that NUP and directory inputs produce the same
@@ -19,6 +24,15 @@ ExeFS key and build ID. With `ECHORA_TEST_EXEFS` set to a cached ExeFS
 directory, the loader test decompresses every module, requires every
 segment to be hash-checked and every module to carry MOD0 dynamic metadata
 with a counted symbol table.
+
+Shader translation is checked offline against the stages a run dumps
+(`ECHORA_SHADER_DIR`): `translate-dump` in `echora-gpu` translates each one
+and groups the failures by reason, and `shader-check` also compiles each
+translation on the host's Vulkan driver.
+
+The running game is checked from its run reports and from presented frames
+saved with `ECHORA_CAPTURE_EVERY` ([local setup](local-setup.md)). These
+checks need the game and are not part of CI.
 
 CI runs formatting, clippy with warnings denied, and the tests on Linux
 x86-64, Windows x86-64 and macOS ARM64. Passing CI means the code compiles
