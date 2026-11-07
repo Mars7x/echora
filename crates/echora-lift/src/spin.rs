@@ -10,30 +10,43 @@
 //! thread can make the loop exit, and translated code may hand the core on at
 //! the loop's back-edges.
 //!
-//! Three kinds of memory write are also allowed, because they too leave the
-//! state unchanged across an iteration:
+//! Some memory writes are also allowed, because they too leave the state
+//! unchanged across an iteration:
 //!
-//! * an exclusive add of a constant (LDXR, ADD/SUB #imm, STXR) whose sum over
-//!   every path back to T is zero on each address, such as a reader count
-//!   taken and dropped again;
-//! * a lock taken with LDXR, a zero test and STXR, and released with a store
-//!   of zero (STLR/STR WZR) to the same address on every path back to T;
+//! * an atomic add of a constant whose sum over every path back to T is zero
+//!   on each address, such as a reader count taken and dropped again: either
+//!   exclusive (LDXR, ADD/SUB #imm, STXR) or LSE (LDADD/STADD of a register
+//!   holding a known constant);
+//! * a lock taken and released on the same address on every path back to T.
+//!   It is taken with LDXR, a zero test and STXR; with CAS whose expected
+//!   value is a known zero; or with SWP of a nonzero value whose old value
+//!   is then tested for zero. It is released with a store of zero (STR/STLR
+//!   of WZR or of a register known to be zero) or a SWP of zero;
 //! * at most [`INVARIANT_STORE_LIMIT`] other stores whose value and address
 //!   registers the loop never writes.
 //!
-//! An exclusive store counts only on the edge where its status register
-//! reports success (CBZ/CBNZ on the status register right after it).
-//! Addresses are compared by base register, which the loop must not write.
+//! STXR, CAS and SWP acquires count only on the edge where their result
+//! reports success: CBZ/CBNZ on the status (STXR) or old value (CAS, SWP)
+//! register, or CMP of it with #0 and B.EQ/B.NE. Constants are those moved
+//! into registers on the path (MOVZ, MOVN, MOV of WZR or a bitmask
+//! immediate), or before the loop in the straight-line code that falls
+//! into T when nothing else branches to T. Addresses are compared by base
+//! register, which the loop must not write. The other register of a
+//! CASP and the remaining LSE operations are not recognised.
 //!
-//! Paths longer than the window are treated as exits. Indirect branches other
-//! than returns, and branches to undiscovered code, reachable from T within
-//! the window reject the loop, since they might lead back to T.
+//! Paths longer than the window are treated as exits, and so are indirect
+//! branches (such as a tail call through X16 after the loop's exit): the
+//! detector does not see where they go. Branches to undiscovered code within
+//! the window reject the loop.
+//!
+//! A wrong answer costs only speed, never correctness: generated code can
+//! hand the core on at any block boundary.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use serde::Serialize;
 
-use crate::aarch64::{Address, Instruction, MemoryOp, Writeback};
+use crate::aarch64::{Address, AtomicOp, Instruction, LogicalOp, MemoryOp, WideOp, Writeback};
 use crate::codegen::BasicBlock;
 use crate::defuse::{Effects, Regs, effects};
 
@@ -48,6 +61,9 @@ pub const INVARIANT_STORE_LIMIT: usize = 2;
 /// that needs more is rejected.
 const PATH_STATE_LIMIT: usize = 1 << 16;
 
+/// Instructions walked back from the head to find constants set before it.
+const ENTRY_CONSTANT_REACH: usize = 64;
+
 /// A loop that cannot exit by itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SpinLoop {
@@ -58,31 +74,80 @@ pub struct SpinLoop {
     pub back_edges: Vec<u64>,
 }
 
-/// [`find_spin_loops_within`] with [`DEFAULT_SPIN_WINDOW`].
+/// Detector settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpinOptions {
+    /// The longest path from the head back to the head, in instructions,
+    /// that belongs to the loop.
+    pub window: usize,
+    /// Leave out back-edges that are only taken after a failed STXR, and
+    /// loops that only have those. Such a loop retries a store that lost
+    /// the exclusive monitor; it does not wait for another thread.
+    pub exclude_store_retries: bool,
+}
+
+impl Default for SpinOptions {
+    fn default() -> Self {
+        Self {
+            window: DEFAULT_SPIN_WINDOW,
+            exclude_store_retries: true,
+        }
+    }
+}
+
+/// [`find_spin_loops_with`] with the default [`SpinOptions`].
 pub fn find_spin_loops(blocks: &[BasicBlock]) -> Vec<SpinLoop> {
-    find_spin_loops_within(blocks, DEFAULT_SPIN_WINDOW)
+    find_spin_loops_with(blocks, SpinOptions::default())
+}
+
+/// [`find_spin_loops_with`] with the default options and another window.
+pub fn find_spin_loops_within(blocks: &[BasicBlock], window: usize) -> Vec<SpinLoop> {
+    find_spin_loops_with(
+        blocks,
+        SpinOptions {
+            window,
+            ..SpinOptions::default()
+        },
+    )
 }
 
 /// Lists the spin-wait loops among `blocks`, ordered by head address.
 ///
 /// Candidate heads are the targets of backward direct branches (target at or
-/// before the branch). `window` bounds, in instructions, the paths from the
-/// head back to the head that make up the loop.
-pub fn find_spin_loops_within(blocks: &[BasicBlock], window: usize) -> Vec<SpinLoop> {
+/// before the branch).
+pub fn find_spin_loops_with(blocks: &[BasicBlock], options: SpinOptions) -> Vec<SpinLoop> {
     let code: BTreeMap<u64, &Instruction> = blocks
         .iter()
         .flat_map(|block| block.instructions.iter())
         .map(|record| (record.pc, &record.instruction))
         .collect();
-    let heads: BTreeSet<u64> = code
+    let mut targets: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (&pc, instruction) in &code {
+        if let Some(target) = direct_target(instruction) {
+            targets.entry(target).or_default().push(pc);
+        }
+    }
+    let heads: BTreeSet<u64> = targets
         .iter()
-        .filter_map(|(&pc, instruction)| direct_target(instruction).filter(|&target| target <= pc))
-        .filter(|target| code.contains_key(target))
+        .filter(|(target, sources)| {
+            code.contains_key(target) && sources.iter().any(|source| source >= target)
+        })
+        .map(|(&target, _)| target)
         .collect();
+    let program = Program {
+        code: &code,
+        targets: &targets,
+    };
     heads
         .into_iter()
-        .filter_map(|head| analyze(&code, head, window))
+        .filter_map(|head| analyze(&program, head, options))
         .collect()
+}
+
+struct Program<'a> {
+    code: &'a BTreeMap<u64, &'a Instruction>,
+    /// Direct branch target -> the branches to it.
+    targets: &'a BTreeMap<u64, Vec<u64>>,
 }
 
 /// The taken target of a direct, non-linking branch.
@@ -100,28 +165,23 @@ fn direct_target(instruction: &Instruction) -> Option<u64> {
 }
 
 /// Where control can go after `instruction` runs at `pc`, with calls and
-/// SVCs returning to the next instruction. `None` means unknown (an indirect
-/// branch that is not a return); an empty list means the code is left (a
-/// return or a trap).
-fn flow(pc: u64, instruction: &Instruction) -> Option<Vec<u64>> {
+/// SVCs returning to the next instruction. An empty list means the code is
+/// left (a return, an indirect branch or a trap).
+fn flow(pc: u64, instruction: &Instruction) -> Vec<u64> {
     let next = pc.wrapping_add(4);
     match *instruction {
         Instruction::Branch {
             target,
             link: false,
-        } => Some(vec![target]),
+        } => vec![target],
         Instruction::BranchCond { target, .. }
         | Instruction::CompareBranch { target, .. }
-        | Instruction::TestBranch { target, .. } => Some(vec![target, next]),
-        Instruction::BranchReg {
-            rn: 30,
-            link: false,
-        }
+        | Instruction::TestBranch { target, .. } => vec![target, next],
+        Instruction::BranchReg { link: false, .. }
         | Instruction::PAuthDisabledReturn { .. }
         | Instruction::Undefined
-        | Instruction::Unsupported => Some(vec![]),
-        Instruction::BranchReg { link: false, .. } => None,
-        _ => Some(vec![next]),
+        | Instruction::Unsupported => vec![],
+        _ => vec![next],
     }
 }
 
@@ -131,20 +191,30 @@ struct Graph<'a> {
     distance: BTreeMap<u64, usize>,
     /// Successors of each explored instruction (only those explored).
     successors: BTreeMap<u64, Vec<u64>>,
-    /// Instructions with a successor that was not explored or is unknown.
+    /// Instructions with a successor that was not explored or that leave.
     leaves: BTreeSet<u64>,
 }
 
-fn analyze(code: &BTreeMap<u64, &Instruction>, head: u64, window: usize) -> Option<SpinLoop> {
+/// What the path simulation found.
+struct Simulation {
+    /// Plain zero stores that released a lock.
+    releases: BTreeSet<u64>,
+    /// Back-edges taken on some path without a failed STXR.
+    waiting_back_edges: BTreeSet<u64>,
+}
+
+fn analyze(program: &Program, head: u64, options: SpinOptions) -> Option<SpinLoop> {
+    let window = options.window;
     if window == 0 {
         return None;
     }
+    let code = program.code;
     let graph = explore(code, head, window)?;
     let members = loop_members(&graph, head, window);
     if !members.contains(&head) {
         return None;
     }
-    let back_edges: Vec<u64> = members
+    let mut back_edges: Vec<u64> = members
         .iter()
         .copied()
         .filter(|pc| direct_target(code[pc]) == Some(head))
@@ -154,25 +224,30 @@ fn analyze(code: &BTreeMap<u64, &Instruction>, head: u64, window: usize) -> Opti
     }
 
     let mut written = Regs::NONE;
-    let mut plain_stores = BTreeSet::new();
-    let mut exclusive_stores = false;
     let mut all_effects = BTreeMap::new();
     for &pc in &members {
         let e = effects(code[&pc]);
-        if e.calls || e.svc || e.system || e.event_wait || e.traps || e.atomic {
+        if e.calls || e.svc || e.system || e.event_wait || e.traps {
             return None;
         }
         written = written.union(e.writes);
         all_effects.insert(pc, e);
     }
+    let mut plain_stores = BTreeSet::new();
+    let mut must_release = BTreeSet::new();
+    let mut simulate = false;
     for (&pc, e) in &all_effects {
-        if !e.stores {
+        if e.atomic || (e.stores && e.exclusive) {
+            simulate = true;
+        } else if !e.stores {
             continue;
-        }
-        if e.exclusive {
-            exclusive_stores = true;
         } else if e.writes.is_empty() && !e.reads.intersects(written) {
             plain_stores.insert(pc);
+        } else if release_base(code[&pc]).is_some_and(|rn| !written.has_gpr_or_sp(rn)) {
+            // A store of a changing register: only a zero store releasing a
+            // lock on every path is allowed.
+            must_release.insert(pc);
+            simulate = true;
         } else {
             return None;
         }
@@ -182,19 +257,56 @@ fn analyze(code: &BTreeMap<u64, &Instruction>, head: u64, window: usize) -> Opti
         return None;
     }
 
-    let releases = if exclusive_stores {
-        simulate_paths(&graph, &members, head, window, written)?
+    let simulation = if simulate {
+        let constants = entry_constants(program, head, &members, written);
+        simulate_paths(
+            &graph,
+            &members,
+            head,
+            window,
+            written,
+            constants,
+            &must_release,
+        )?
     } else {
-        BTreeSet::new()
+        Simulation {
+            releases: BTreeSet::new(),
+            waiting_back_edges: back_edges.iter().copied().collect(),
+        }
     };
-    if plain_stores.difference(&releases).count() > INVARIANT_STORE_LIMIT {
+    if plain_stores.difference(&simulation.releases).count() > INVARIANT_STORE_LIMIT {
         return None;
+    }
+    if options.exclude_store_retries {
+        back_edges.retain(|pc| simulation.waiting_back_edges.contains(pc));
+        if back_edges.is_empty() {
+            return None;
+        }
     }
     Some(SpinLoop { head, back_edges })
 }
 
+/// The base register of a store that can release a lock: STLR, or STR with
+/// a zero immediate offset and no writeback.
+fn release_base(instruction: &Instruction) -> Option<u8> {
+    match *instruction {
+        Instruction::StoreRelease { rn, .. }
+        | Instruction::LoadStore {
+            rn,
+            op: MemoryOp::Store,
+            address:
+                Address::Immediate {
+                    offset: 0,
+                    writeback: Writeback::None,
+                },
+            ..
+        } => Some(rn),
+        _ => None,
+    }
+}
+
 /// Breadth-first exploration from `head` up to `window - 1` instructions
-/// deep. Fails when an unknown successor is reachable.
+/// deep. Fails when a branch to undiscovered code is reachable.
 fn explore<'a>(
     code: &'a BTreeMap<u64, &'a Instruction>,
     head: u64,
@@ -209,7 +321,7 @@ fn explore<'a>(
     let mut queue = VecDeque::from([head]);
     while let Some(pc) = queue.pop_front() {
         let depth = graph.distance[&pc];
-        let targets = flow(pc, code[&pc])?;
+        let targets = flow(pc, code[&pc]);
         if targets.is_empty() {
             graph.leaves.insert(pc);
         }
@@ -267,8 +379,8 @@ fn loop_members(graph: &Graph, head: u64, window: usize) -> BTreeSet<u64> {
 }
 
 /// Registers that may be read on some path from `head` before being written.
-/// Everything is live where exploration stops, at returns and traps, and
-/// across calls and SVCs.
+/// Everything is live where exploration stops, at returns, indirect
+/// branches and traps, and across calls and SVCs.
 fn live_at(graph: &Graph, head: u64) -> Regs {
     let effects: BTreeMap<u64, Effects> = graph
         .successors
@@ -298,7 +410,101 @@ fn live_at(graph: &Graph, head: u64) -> Regs {
     live.get(&head).copied().unwrap_or(Regs::ALL)
 }
 
-/// An address used by exclusive accesses: base register and access size.
+/// The constant `instruction` moves into a general register, if it does.
+fn moved_constant(instruction: &Instruction) -> Option<(u8, u64)> {
+    let mask = |bits: u8| {
+        if bits == 64 {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        }
+    };
+    match *instruction {
+        Instruction::MoveWide {
+            rd,
+            bits,
+            op,
+            immediate,
+            shift,
+        } if rd != 31 => {
+            let value = u64::from(immediate) << shift;
+            match op {
+                WideOp::Zero => Some((rd, value & mask(bits))),
+                WideOp::Not => Some((rd, !value & mask(bits))),
+                WideOp::Keep => None,
+            }
+        }
+        // MOV Rd, ZR.
+        Instruction::LogicalShifted {
+            rd,
+            rn: 31,
+            rm: 31,
+            op: LogicalOp::Orr,
+            invert: false,
+            ..
+        } if rd != 31 => Some((rd, 0)),
+        // MOV Rd, #bitmask (ORR Rd, ZR, #imm). Rd = 31 is SP.
+        Instruction::LogicalImmediate {
+            rd,
+            rn: 31,
+            op: LogicalOp::Orr,
+            mask,
+            ..
+        } if rd != 31 => Some((rd, mask)),
+        _ => None,
+    }
+}
+
+/// Constants set before the loop by the straight-line code that falls into
+/// the head, when nothing outside the loop branches to the head. Only
+/// registers the loop never writes are kept.
+fn entry_constants(
+    program: &Program,
+    head: u64,
+    members: &BTreeSet<u64>,
+    written: Regs,
+) -> BTreeMap<u8, u64> {
+    let mut constants = BTreeMap::new();
+    let outside_branch = program
+        .targets
+        .get(&head)
+        .is_some_and(|sources| sources.iter().any(|source| !members.contains(source)));
+    if outside_branch {
+        return constants;
+    }
+    let mut decided = Regs::NONE;
+    let mut pc = head;
+    for _ in 0..ENTRY_CONSTANT_REACH {
+        let Some(previous) = pc.checked_sub(4) else {
+            break;
+        };
+        let Some(&instruction) = program.code.get(&previous) else {
+            break;
+        };
+        if members.contains(&previous) || flow(previous, instruction) != vec![pc] {
+            break;
+        }
+        let e = effects(instruction);
+        if e.calls || e.svc || e.branch {
+            break;
+        }
+        if let Some((rd, value)) = moved_constant(instruction)
+            && !decided.has_gpr(rd)
+        {
+            constants.insert(rd, value);
+        }
+        decided = decided.union(e.writes);
+        pc = previous;
+        // Anything before a branch target may hold other values there.
+        if program.targets.contains_key(&pc) {
+            break;
+        }
+    }
+    constants.retain(|&reg, _| !written.has_gpr(reg));
+    constants
+}
+
+/// An address used by atomic accesses: base register and access size.
 type Location = (u8, u8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -310,27 +516,44 @@ struct Monitor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Update {
-    Add(i64),
+    Add(u64),
     Acquire,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Pending {
+    /// Zero on success: the STXR status, or the CAS/SWP old value.
     status: u8,
     location: Location,
     update: Update,
+    /// A STXR, which fails only when it loses the monitor.
+    store_exclusive: bool,
+    /// The status has been compared with zero into NZCV.
+    compared: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct PathState {
     monitor: Option<Monitor>,
     /// Registers holding the exclusively loaded value plus a constant.
-    derived: BTreeMap<u8, i64>,
-    /// An exclusive store whose status has not been tested yet.
+    derived: BTreeMap<u8, u64>,
+    /// Registers holding known constants.
+    constants: BTreeMap<u8, u64>,
+    /// An atomic acquire or exclusive store whose result is untested.
     pending: Option<Pending>,
-    /// Net exclusive adds per location, without zero entries.
-    deltas: BTreeMap<Location, i64>,
+    /// Net atomic adds per location, without zero entries.
+    deltas: BTreeMap<Location, u64>,
     held: BTreeSet<Location>,
+    /// A STXR failed on this path.
+    store_failed: bool,
+}
+
+fn size_mask(bytes: u8) -> u64 {
+    if bytes >= 8 {
+        u64::MAX
+    } else {
+        (1 << (8 * u32::from(bytes))) - 1
+    }
 }
 
 impl PathState {
@@ -338,21 +561,24 @@ impl PathState {
         self.pending.is_none() && self.deltas.is_empty() && self.held.is_empty()
     }
 
+    fn add(&mut self, location: Location, amount: u64) {
+        let total = self
+            .deltas
+            .get(&location)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(amount)
+            & size_mask(location.1);
+        if total == 0 {
+            self.deltas.remove(&location);
+        } else {
+            self.deltas.insert(location, total);
+        }
+    }
+
     fn commit(&mut self, pending: Pending) -> Option<()> {
         match pending.update {
-            Update::Add(amount) => {
-                let total = self
-                    .deltas
-                    .get(&pending.location)
-                    .copied()
-                    .unwrap_or(0)
-                    .wrapping_add(amount);
-                if total == 0 {
-                    self.deltas.remove(&pending.location);
-                } else {
-                    self.deltas.insert(pending.location, total);
-                }
-            }
+            Update::Add(amount) => self.add(pending.location, amount),
             Update::Acquire => {
                 if !self.held.insert(pending.location) {
                     return None;
@@ -361,21 +587,56 @@ impl PathState {
         }
         Some(())
     }
+
+    /// The edges of a result test: the success edge commits.
+    fn split(
+        mut self,
+        pending: Pending,
+        success: u64,
+        failure: u64,
+    ) -> Option<Vec<(u64, PathState)>> {
+        self.pending = None;
+        let mut failed = self.clone();
+        failed.store_failed |= pending.store_exclusive;
+        self.commit(pending)?;
+        Some(vec![(success, self), (failure, failed)])
+    }
+
+    fn is_zero(&self, register: u8) -> bool {
+        register == 31 || self.constants.get(&register) == Some(&0)
+    }
+
+    /// Whether `register` holds a value the loop leaves alone.
+    fn is_fixed(&self, register: u8, written: Regs) -> bool {
+        !written.has_gpr(register) || self.constants.contains_key(&register)
+    }
+
+    fn release(&mut self, location: Location) -> bool {
+        self.held.remove(&location)
+    }
 }
 
 /// Follows every path from `head` back to `head` through the loop, checking
-/// that exclusive adds cancel and locks are released. Returns the plain
-/// stores that served as lock releases.
+/// that atomic adds cancel and locks are released.
 fn simulate_paths(
     graph: &Graph,
     members: &BTreeSet<u64>,
     head: u64,
     window: usize,
     written: Regs,
-) -> Option<BTreeSet<u64>> {
-    let mut releases = BTreeSet::new();
+    constants: BTreeMap<u8, u64>,
+    must_release: &BTreeSet<u64>,
+) -> Option<Simulation> {
+    let mut simulation = Simulation {
+        releases: BTreeSet::new(),
+        waiting_back_edges: BTreeSet::new(),
+    };
     let mut seen = HashSet::new();
-    let mut stack = vec![(head, 0_usize, PathState::default())];
+    let start = PathState {
+        constants,
+        ..PathState::default()
+    };
+    let mut stack = vec![(head, 0_usize, start)];
     while let Some((pc, steps, state)) = stack.pop() {
         if !seen.insert((pc, steps, state.clone())) {
             continue;
@@ -383,17 +644,29 @@ fn simulate_paths(
         if seen.len() > PATH_STATE_LIMIT {
             return None;
         }
-        for (target, next) in step(pc, graph.code[&pc], state, written, &mut releases)? {
+        let instruction = graph.code[&pc];
+        let successors = step(
+            pc,
+            instruction,
+            state,
+            written,
+            must_release,
+            &mut simulation,
+        )?;
+        for (target, next) in successors {
             if target == head {
                 if !next.at_rest() {
                     return None;
+                }
+                if !next.store_failed && direct_target(instruction) == Some(head) {
+                    simulation.waiting_back_edges.insert(pc);
                 }
             } else if members.contains(&target) && steps + 2 <= window {
                 stack.push((target, steps + 1, next));
             }
         }
     }
-    Some(releases)
+    Some(simulation)
 }
 
 /// One instruction of a path: its successors with the path state on each.
@@ -402,36 +675,70 @@ fn step(
     instruction: &Instruction,
     mut state: PathState,
     written: Regs,
-    releases: &mut BTreeSet<u64>,
+    must_release: &BTreeSet<u64>,
+    simulation: &mut Simulation,
 ) -> Option<Vec<(u64, PathState)>> {
     let next = pc.wrapping_add(4);
     let e = effects(instruction);
-    if let Some(pending) = state.pending {
-        if let Instruction::CompareBranch {
-            rt,
-            nonzero,
-            target,
-            ..
-        } = *instruction
-            && rt == pending.status
-        {
-            // STXR writes 0 on success.
-            let (success, failure) = if nonzero {
-                (next, target)
-            } else {
-                (target, next)
-            };
-            state.pending = None;
-            let failed = state.clone();
-            state.commit(pending)?;
-            return Some(vec![(success, state), (failure, failed)]);
+    if let Some(mut pending) = state.pending {
+        match *instruction {
+            Instruction::CompareBranch {
+                rt,
+                nonzero,
+                target,
+                ..
+            } if !pending.compared && rt == pending.status => {
+                let (success, failure) = if nonzero {
+                    (next, target)
+                } else {
+                    (target, next)
+                };
+                return state.split(pending, success, failure);
+            }
+            // CMP status, #0.
+            Instruction::AddSubImmediate {
+                rd: 31,
+                rn,
+                immediate: 0,
+                subtract: true,
+                flags: true,
+                ..
+            } if !pending.compared && rn == pending.status => {
+                pending.compared = true;
+                state.pending = Some(pending);
+                return Some(vec![(next, state)]);
+            }
+            // B.EQ (0) or B.NE (1) after the compare.
+            Instruction::BranchCond { target, condition } if pending.compared => {
+                let (success, failure) = match condition {
+                    0 => (target, next),
+                    1 => (next, target),
+                    _ => return None,
+                };
+                return state.split(pending, success, failure);
+            }
+            _ => {}
         }
-        let status = Regs::gpr(pending.status);
+        let status = if pending.compared {
+            Regs {
+                nzcv: true,
+                ..Regs::NONE
+            }
+        } else {
+            Regs::gpr(pending.status)
+        };
         if e.branch || e.reads.intersects(status) || e.writes.intersects(status) {
             return None;
         }
     }
 
+    let constant = |state: &PathState, register: u8| {
+        if register == 31 {
+            Some(0)
+        } else {
+            state.constants.get(&register).copied()
+        }
+    };
     match *instruction {
         Instruction::LoadExclusive { rt, rn, bytes, .. } => {
             if written.has_gpr_or_sp(rn) {
@@ -460,11 +767,10 @@ fn step(
             };
             state.derived.remove(&rd);
             if let (Some(base), true) = (source, rd != 31) {
-                let amount = immediate as i64;
                 let value = if subtract {
-                    base.wrapping_sub(amount)
+                    base.wrapping_sub(immediate)
                 } else {
-                    base.wrapping_add(amount)
+                    base.wrapping_add(immediate)
                 };
                 state.derived.insert(rd, value);
             }
@@ -475,13 +781,15 @@ fn step(
             let monitor = state.monitor.filter(|m| m.location == (rn, bytes))?;
             let update = match state.derived.get(&rt) {
                 Some(&amount) if rt != 31 => Update::Add(amount),
-                _ if monitor.zero && !written.has_gpr(rt) => Update::Acquire,
+                _ if monitor.zero && state.is_fixed(rt, written) => Update::Acquire,
                 _ => return None,
             };
             state.pending = Some(Pending {
                 status: rs,
                 location: monitor.location,
                 update,
+                store_exclusive: true,
+                compared: false,
             });
             state.monitor = None;
             state.derived.clear();
@@ -507,9 +815,68 @@ fn step(
             state.monitor = None;
             state.derived.clear();
         }
-        Instruction::StoreRelease { rt: 31, rn, bytes }
+        // CAS with a zero expected value: the lock is taken when the old
+        // value that comes back in Rs is zero.
+        Instruction::CompareAndSwap {
+            rs, rt, rn, bytes, ..
+        } => {
+            if written.has_gpr_or_sp(rn)
+                || rs == 31
+                || rs == rt
+                || !state.is_zero(rs)
+                || !state.is_fixed(rt, written)
+            {
+                return None;
+            }
+            state.pending = Some(Pending {
+                status: rs,
+                location: (rn, bytes),
+                update: Update::Acquire,
+                store_exclusive: false,
+                compared: false,
+            });
+        }
+        // SWP of zero releases; SWP of a fixed nonzero value acquires when
+        // the old value in Rt is zero.
+        Instruction::AtomicMemory {
+            op: AtomicOp::Swap,
+            rs,
+            rt,
+            rn,
+            bytes,
+            ..
+        } => {
+            if written.has_gpr_or_sp(rn) {
+                return None;
+            }
+            let location = (rn, bytes);
+            if state.is_zero(rs) {
+                if !state.release(location) {
+                    return None;
+                }
+            } else {
+                if rt == 31 || rt == rs || !state.is_fixed(rs, written) {
+                    return None;
+                }
+                state.pending = Some(Pending {
+                    status: rt,
+                    location,
+                    update: Update::Acquire,
+                    store_exclusive: false,
+                    compared: false,
+                });
+            }
+        }
+        Instruction::AtomicAdd { rs, rn, bytes, .. } => {
+            if written.has_gpr_or_sp(rn) {
+                return None;
+            }
+            state.add((rn, bytes), constant(&state, rs)?);
+        }
+        Instruction::CompareAndSwapPair { .. } | Instruction::AtomicMemory { .. } => return None,
+        Instruction::StoreRelease { rt, rn, bytes }
         | Instruction::LoadStore {
-            rt: 31,
+            rt,
             rn,
             bytes,
             op: MemoryOp::Store,
@@ -518,18 +885,22 @@ fn step(
                     offset: 0,
                     writeback: Writeback::None,
                 },
-        } => {
-            if state.held.remove(&(rn, bytes)) {
-                releases.insert(pc);
-            }
+        } if state.is_zero(rt) && state.release((rn, bytes)) => {
+            simulation.releases.insert(pc);
         }
         _ => {
+            if must_release.contains(&pc) {
+                return None;
+            }
             state.derived.retain(|&reg, _| !e.writes.has_gpr(reg));
         }
     }
-    let targets = flow(pc, instruction)?;
+    state.constants.retain(|&reg, _| !e.writes.has_gpr(reg));
+    if let Some((rd, value)) = moved_constant(instruction) {
+        state.constants.insert(rd, value);
+    }
     Some(
-        targets
+        flow(pc, instruction)
             .into_iter()
             .map(|target| (target, state.clone()))
             .collect(),
@@ -547,18 +918,39 @@ mod tests {
         BASE + 4 * index
     }
 
-    fn spin_loops_within(words: &[u32], window: usize) -> Vec<SpinLoop> {
+    fn spin_loops_with(words: &[u32], options: SpinOptions) -> Vec<SpinLoop> {
         let region = CodeRegion {
             name: "test".into(),
             base: BASE,
             bytes: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
         };
         let translation = discover(&[region], &[BASE], 4096).expect("discover test code");
-        find_spin_loops_within(&translation.blocks, window)
+        find_spin_loops_with(&translation.blocks, options)
+    }
+
+    fn spin_loops_within(words: &[u32], window: usize) -> Vec<SpinLoop> {
+        spin_loops_with(
+            words,
+            SpinOptions {
+                window,
+                ..SpinOptions::default()
+            },
+        )
     }
 
     fn spin_loops(words: &[u32]) -> Vec<SpinLoop> {
-        spin_loops_within(words, DEFAULT_SPIN_WINDOW)
+        find_spin_loops_in(words)
+    }
+
+    /// Through the public default entry point.
+    fn find_spin_loops_in(words: &[u32]) -> Vec<SpinLoop> {
+        let region = CodeRegion {
+            name: "test".into(),
+            base: BASE,
+            bytes: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let translation = discover(&[region], &[BASE], 4096).expect("discover test code");
+        find_spin_loops(&translation.blocks)
     }
 
     fn found(head: u64, back_edges: &[u64]) -> SpinLoop {
@@ -605,10 +997,15 @@ mod tests {
             0x54ff_ffc1, // 9: b.ne wait
             0xd65f_03c0, // 10: done: ret
         ];
-        // The ticket is taken once: the STXR only loops back when it fails,
-        // so the retry loop changes nothing either.
+        assert_eq!(spin_loops(&words), vec![found(at(7), &[at(9)])]);
+        // The ticket STXR loops back only when it fails. That retry changes
+        // nothing either, so without the exclusion it is a spin loop too.
+        let all = SpinOptions {
+            exclude_store_retries: false,
+            ..SpinOptions::default()
+        };
         assert_eq!(
-            spin_loops(&words),
+            spin_loops_with(&words, all),
             vec![found(at(0), &[at(3)]), found(at(7), &[at(9)])]
         );
     }
@@ -630,7 +1027,7 @@ mod tests {
             0xd65f_03c0, // 11: done: ret
         ];
         let loops = spin_loops(&words);
-        assert!(loops.contains(&found(at(0), &[at(3), at(10)])), "{loops:?}");
+        assert!(loops.contains(&found(at(0), &[at(10)])), "{loops:?}");
     }
 
     #[test]
@@ -667,10 +1064,8 @@ mod tests {
             0x34ff_ff4b, // 6: cbz w11, retry
             0xd65f_03c0, // 7: ret
         ];
-        assert_eq!(
-            spin_loops(&words),
-            vec![found(at(0), &[at(1), at(3), at(6)])]
-        );
+        // The STXR-failure back-edge (3) is a retry, not a wait.
+        assert_eq!(spin_loops(&words), vec![found(at(0), &[at(1), at(6)])]);
     }
 
     #[test]
@@ -766,11 +1161,111 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_indirect_branch_within_reach() {
+    fn allows_a_tail_call_after_the_exit() {
         let words = [
             0xb940_0008, // 0: wait: ldr w8, [x0]
             0x34ff_ffe8, // 1: cbz w8, wait
             0xd61f_0200, // 2: br x16
+        ];
+        assert_eq!(spin_loops(&words), vec![found(at(0), &[at(1)])]);
+    }
+
+    #[test]
+    fn finds_a_cas_lock_released_by_a_zero_store() {
+        let words = [
+            0x2a1f_03e8, // 0: retry: mov w8, wzr
+            0x88e8_7c09, // 1: casa w8, w9, [x0]
+            0x35ff_ffc8, // 2: cbnz w8, retry
+            0xb940_002a, // 3: ldr w10, [x1]
+            0x889f_fc1f, // 4: stlr wzr, [x0]
+            0x34ff_ff6a, // 5: cbz w10, retry
+            0xd65f_03c0, // 6: ret
+        ];
+        // A failed CAS means the lock is held: that back-edge waits.
+        assert_eq!(spin_loops(&words), vec![found(at(0), &[at(2), at(5)])]);
+    }
+
+    #[test]
+    fn finds_a_cas_lock_tested_with_cmp_and_released_from_a_zero_register() {
+        let words = [
+            0x5280_0029, // 0: mov w9, #1
+            0x2a1f_03e8, // 1: retry: mov w8, wzr
+            0x88e8_7c09, // 2: casa w8, w9, [x0]
+            0x7100_011f, // 3: cmp w8, #0
+            0x54ff_ffa1, // 4: b.ne retry
+            0xb940_002a, // 5: ldr w10, [x1]
+            0x2a1f_03eb, // 6: mov w11, wzr
+            0x889f_fc0b, // 7: stlr w11, [x0]
+            0x34ff_ff2a, // 8: cbz w10, retry
+            0xd65f_03c0, // 9: ret
+        ];
+        assert_eq!(spin_loops(&words), vec![found(at(1), &[at(4), at(8)])]);
+    }
+
+    #[test]
+    fn rejects_a_cas_lock_still_held_at_the_head() {
+        let words = [
+            0x2a1f_03e8, // 0: retry: mov w8, wzr
+            0x88e8_7c09, // 1: casa w8, w9, [x0]
+            0x35ff_ffc8, // 2: cbnz w8, retry
+            0xb940_002a, // 3: ldr w10, [x1]
+            0x34ff_ff8a, // 4: cbz w10, retry
+            0x889f_fc1f, // 5: stlr wzr, [x0]
+            0xd65f_03c0, // 6: ret
+        ];
+        assert_eq!(spin_loops(&words), vec![]);
+    }
+
+    #[test]
+    fn finds_a_swap_lock_released_by_a_swap_of_zero() {
+        let words = [
+            0xb8a9_8008, // 0: retry: swpa w9, w8, [x0]
+            0x35ff_ffe8, // 1: cbnz w8, retry
+            0xb940_002a, // 2: ldr w10, [x1]
+            0xb87f_800b, // 3: swpl wzr, w11, [x0]
+            0x34ff_ff8a, // 4: cbz w10, retry
+            0xd65f_03c0, // 5: ret
+        ];
+        assert_eq!(spin_loops(&words), vec![found(at(0), &[at(1), at(4)])]);
+    }
+
+    #[test]
+    fn finds_an_lse_add_undone_on_every_path() {
+        let words = [
+            0x5280_0029, // 0: mov w9, #1
+            0x1280_000b, // 1: mov w11, #-1
+            0xb8a9_0008, // 2: retry: ldadda w9, w8, [x0]
+            0x88df_fc2a, // 3: ldar w10, [x1]
+            0x3400_006a, // 4: cbz w10, done
+            0xb86b_0008, // 5: ldaddl w11, w8, [x0]
+            0x17ff_fffc, // 6: b retry
+            0xd65f_03c0, // 7: done: ret
+        ];
+        assert_eq!(spin_loops(&words), vec![found(at(2), &[at(6)])]);
+    }
+
+    #[test]
+    fn rejects_an_lse_add_left_in_place() {
+        let words = [
+            0x5280_0029, // 0: mov w9, #1
+            0xb8a9_0008, // 1: retry: ldadda w9, w8, [x0]
+            0x88df_fc2a, // 2: ldar w10, [x1]
+            0x34ff_ffca, // 3: cbz w10, retry
+            0xd65f_03c0, // 4: ret
+        ];
+        assert_eq!(spin_loops(&words), vec![]);
+    }
+
+    #[test]
+    fn rejects_an_lse_add_of_an_unknown_amount() {
+        let words = [
+            0xb8a9_0008, // 0: retry: ldadda w9, w8, [x0]
+            0x88df_fc2a, // 1: ldar w10, [x1]
+            0x3400_008a, // 2: cbz w10, done
+            0x1280_000b, // 3: mov w11, #-1
+            0xb86b_0008, // 4: ldaddl w11, w8, [x0]
+            0x17ff_fffb, // 5: b retry
+            0xd65f_03c0, // 6: done: ret
         ];
         assert_eq!(spin_loops(&words), vec![]);
     }
