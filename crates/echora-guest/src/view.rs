@@ -76,6 +76,14 @@ impl GuestView {
         }
     }
 
+    /// Host address of `length` guest bytes at `address` when the backend
+    /// keeps guest memory contiguous in the host (not checked memory), for
+    /// importing it into a device. Accesses through it bypass the guest's
+    /// page permissions.
+    pub fn host_span(&self, address: u64, length: usize) -> Option<*mut u8> {
+        self.access.host_span(address, length)
+    }
+
     pub fn address_space_end(&self) -> u64 {
         self.size
     }

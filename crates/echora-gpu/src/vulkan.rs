@@ -28,6 +28,9 @@ pub struct Gpu {
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
     pub compute_subgroup_32: bool,
+    /// VK_EXT_external_memory_host: guest memory can be imported as device
+    /// memory, so buffers in it are shared with the GPU without copies.
+    pub host_import: Option<ash::ext::external_memory_host::Device>,
     pub name: String,
 }
 
@@ -171,6 +174,11 @@ impl Gpu {
         if robustness2 {
             enabled_extensions.push(ash::ext::robustness2::NAME.as_ptr());
         }
+        let host_import = has(ash::ext::external_memory_host::NAME)
+            && std::env::var_os("ECHORA_NO_HOST_IMPORT").is_none();
+        if host_import {
+            enabled_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
 
         let features = vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(core.robust_buffer_access != 0)
@@ -258,6 +266,8 @@ impl Gpu {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let shader_object =
             use_objects.then(|| ash::ext::shader_object::Device::new(&instance, &device));
+        let host_import =
+            host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         Ok(Self {
             entry,
             instance,
@@ -270,6 +280,7 @@ impl Gpu {
             depth_clip_control,
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
+            host_import,
             name,
         })
     }

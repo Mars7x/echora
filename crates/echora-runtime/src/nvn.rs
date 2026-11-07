@@ -36,6 +36,15 @@ pub enum GuestMemory<'a> {
 }
 
 impl GuestMemory<'_> {
+    /// Host address of `length` guest bytes, when guest memory is one
+    /// contiguous host mapping (for sharing it with the GPU in place).
+    pub fn host_span(&self, address: u64, length: usize) -> Option<*mut u8> {
+        match self {
+            Self::Checked(memory) => memory.view().host_span(address, length),
+            Self::View(view) => view.host_span(address, length),
+        }
+    }
+
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Trap> {
         match self {
             Self::Checked(memory) => memory.read(address, out),

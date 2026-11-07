@@ -167,6 +167,12 @@ pub struct Renderer {
     /// Views of another type than an image's own (a 2D-array view of a 2D
     /// image, ...), by image and view type.
     extra_views: HashMap<(vk::Image, i32), vk::ImageView>,
+    /// Host memory imported as storage buffers (VK_EXT_external_memory_host),
+    /// by page-aligned host address and length.
+    imported: HashMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
+    /// Spans the driver refused to import (file-backed memory, on drivers
+    /// that only import anonymous memory): not tried again.
+    import_refused: std::collections::HashSet<(usize, u64)>,
     /// How each sampled view was made (image, type, format, range), so a
     /// swizzled copy of it can be made.
     view_infos: HashMap<vk::ImageView, ViewInfo>,
@@ -381,6 +387,8 @@ impl Renderer {
             work_items: 0,
             samplers: HashMap::new(),
             extra_views: HashMap::new(),
+            imported: HashMap::new(),
+            import_refused: Default::default(),
             view_infos: HashMap::new(),
             fresh_targets: Vec::new(),
             ring: HostBuffer::empty(),
@@ -1073,6 +1081,13 @@ impl Renderer {
         self.finish_current()
     }
 
+    /// End of a frame: submit what was recorded without waiting for it, so
+    /// the GPU renders this frame while the CPU prepares the next. Reads of
+    /// results still go through `flush`, which waits.
+    pub fn submit_frame(&mut self) -> Result<(), String> {
+        self.flush_async()
+    }
+
     /// Submit what was recorded and continue in the other slot, waiting
     /// only for that slot's previous submission: the GPU runs one batch
     /// while the CPU records the next. For capacity limits (work items,
@@ -1259,6 +1274,92 @@ impl Renderer {
         // SAFETY: the work reading it has completed.
         unsafe { self.device().destroy_buffer_view(view, None) };
         buffer.destroy(self.device());
+    }
+
+    /// `length` bytes of host memory at `pointer` as a storage buffer the
+    /// GPU reads and writes in place (no copies): the buffer and the offset
+    /// of `pointer` in it. `None` without host-memory import. The memory
+    /// must stay mapped while the renderer lives; imports are kept per
+    /// page-aligned span and reused.
+    pub fn import_host(
+        &mut self,
+        pointer: *mut u8,
+        length: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let Some(host) = self.gpu.host_import.clone() else {
+            return Ok(None);
+        };
+        const PAGE: usize = 4096;
+        let start = pointer as usize & !(PAGE - 1);
+        let offset = (pointer as usize - start) as u64;
+        let span = (offset + length.max(1)).next_multiple_of(PAGE as u64);
+        if let Some((buffer, _)) = self.imported.get(&(start, span)) {
+            return Ok(Some((*buffer, offset)));
+        }
+        if self.import_refused.contains(&(start, span)) {
+            return Ok(None);
+        }
+        let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: `start` is a page-aligned host address the caller keeps
+        // mapped (guest memory).
+        unsafe {
+            (host.fp().get_memory_host_pointer_properties_ext)(
+                host.device(),
+                handle,
+                start as *const std::ffi::c_void,
+                &mut properties,
+            )
+        }
+        .result()
+        .map_err(vk_error("vkGetMemoryHostPointerPropertiesEXT"))?;
+        let device = self.gpu.device.clone();
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
+        let info = vk::BufferCreateInfo::default()
+            .size(span)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        // SAFETY: valid create info; destroyed with the renderer.
+        let buffer =
+            unsafe { device.create_buffer(&info, None) }.map_err(vk_error("vkCreateBuffer"))?;
+        // SAFETY: the buffer is live.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let bits = properties.memory_type_bits & requirements.memory_type_bits;
+        let Some(index) =
+            (0..self.memory_types.memory_type_count).find(|index| bits & (1 << index) != 0)
+        else {
+            // SAFETY: unused buffer.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err("no memory type can import host memory".into());
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle)
+            .host_pointer(start as *mut std::ffi::c_void);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(span)
+            .memory_type_index(index)
+            .push_next(&mut import);
+        // SAFETY: the pointer is page aligned and `span` bytes stay mapped.
+        let memory = match unsafe { device.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(_) => {
+                // The caller copies instead.
+                // SAFETY: unused buffer.
+                unsafe { device.destroy_buffer(buffer, None) };
+                self.import_refused.insert((start, span));
+                return Ok(None);
+            }
+        };
+        // SAFETY: fresh buffer and memory of the required size.
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(vk_error("vkBindBufferMemory"))?;
+        self.imported.insert((start, span), (buffer, memory));
+        Ok(Some((buffer, offset)))
     }
 
     pub(crate) fn allocate(
@@ -3047,6 +3148,13 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.flush();
+        for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
+            // SAFETY: the flush above finished every use of the buffer.
+            unsafe {
+                self.gpu.device.destroy_buffer(buffer, None);
+                self.gpu.device.free_memory(memory, None);
+            }
+        }
         for (_, target) in std::mem::take(&mut self.targets) {
             self.destroy_target(target);
         }

@@ -79,6 +79,10 @@ pub struct Backend {
     /// stored at the end of the submission, or before work that may read
     /// that memory (`resolve_storage`): one wait for several dispatches.
     pending_storage: Vec<(u64, std::ops::Range<u64>, u32, u64, u64)>,
+    /// Guest ranges compute shaders wrote in place (storage buffers bound
+    /// over imported guest memory) since the GPU last finished: a CPU read
+    /// of one waits for the GPU first (see `resolve_storage`).
+    in_place_writes: Vec<std::ops::Range<u64>>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -137,6 +141,7 @@ impl Backend {
             shadows: HashMap::new(),
             shadow_quiet: HashMap::new(),
             pending_storage: Vec::new(),
+            in_place_writes: Vec::new(),
             target_index: HashMap::new(),
             target_index_stamp: None,
         }))
@@ -2142,10 +2147,11 @@ impl Nvn {
 
     /// Show presented texture `texture` in the host window (ECHORA_WINDOW).
     /// Returns false when there is no window to present to.
-    /// Submit the recorded work and wait for it (at each present).
+    /// Submit the recorded work at each present without waiting for it (the
+    /// GPU runs a frame behind; reads of results wait in `resolve_storage`).
     pub(super) fn gpu_submit(&mut self) -> Result<(), String> {
         match self.gpu.as_mut() {
-            Some(backend) => backend.renderer.flush(),
+            Some(backend) => backend.renderer.submit_frame(),
             None => Ok(()),
         }
     }
@@ -2420,6 +2426,7 @@ impl Nvn {
             }
         }
         let mut storage = HashMap::new();
+        let mut storage_in_place = HashMap::new();
         let mut written_back = Vec::new();
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
@@ -2441,6 +2448,29 @@ impl Nvn {
                     c0[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
                     c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
                     let guest = self.gpu_to_guest(base, length)?;
+                    // In place when guest memory can be imported: the GPU
+                    // reads and writes it directly, with no copies either
+                    // way (earlier in-place writes are already ordered on
+                    // the GPU).
+                    let in_place = match core.memory.host_span(guest, length as usize) {
+                        Some(pointer) => self
+                            .gpu
+                            .as_mut()
+                            .unwrap()
+                            .renderer
+                            .import_host(pointer, length)?,
+                        None => None,
+                    };
+                    if let Some((buffer, offset)) = in_place {
+                        self.resolve_copies(core, Some(guest..guest + length))?;
+                        storage_in_place.insert(descriptor.binding, (buffer, offset, length));
+                        let written = &mut self.gpu.as_mut().unwrap().in_place_writes;
+                        if descriptor.flags & 1 != 0 && !written.contains(&(guest..guest + length))
+                        {
+                            written.push(guest..guest + length);
+                        }
+                        continue;
+                    }
                     self.resolve_storage(core, Some(guest..guest + length))?;
                     storage.insert(descriptor.binding, self.gpu_bytes(core, base, length)?);
                     // Buffers the shader only reads need no write-back.
@@ -2659,6 +2689,7 @@ impl Nvn {
             ],
             uniforms,
             storage,
+            storage_in_place,
             textures,
             images,
         };
@@ -2728,6 +2759,31 @@ impl Nvn {
     /// (`None`), or, when any overlaps `range`, all of them (results come
     /// back in dispatch order, so an earlier one never lands on a later).
     pub(super) fn resolve_storage(
+        &mut self,
+        core: &mut Guest,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<(), String> {
+        // Writes made in place reach guest memory when the GPU finishes.
+        if let Some(backend) = self.gpu.as_mut() {
+            let waits = match &range {
+                Some(range) => backend
+                    .in_place_writes
+                    .iter()
+                    .any(|written| written.start < range.end && range.start < written.end),
+                None => !backend.in_place_writes.is_empty(),
+            };
+            if waits {
+                backend.stat("stat: GPU waits for in-place writes", 1);
+                backend.renderer.flush()?;
+                backend.in_place_writes.clear();
+            }
+        }
+        self.resolve_copies(core, range)
+    }
+
+    /// Store deferred dispatch results (storage copied back from the GPU)
+    /// that overlap `range` (all of them for `None`).
+    fn resolve_copies(
         &mut self,
         core: &mut Guest,
         range: Option<std::ops::Range<u64>>,
