@@ -276,6 +276,9 @@ pub struct Machine {
     /// core is swapped in. Threads are picked for it by affinity and
     /// priority (see `next_runnable_thread`).
     worker_core: Option<u8>,
+    /// Times a worker took a thread another worker was running (a
+    /// scheduler error; see `Worker::swap_out`).
+    double_dispatches: u64,
     /// Several workers run: an idle boundary returns instead of sleeping.
     parallel: bool,
     /// Workers parked without a thread, waiting for one to become runnable.
@@ -368,6 +371,7 @@ impl Machine {
             last_wake_check: 0,
             running: Default::default(),
             worker_core: None,
+            double_dispatches: 0,
             parallel: false,
             parked_workers: 0,
             lock_stats: [0; 3],
@@ -3069,8 +3073,15 @@ impl Machine {
                 Ok(())
             }
             0x10 => {
-                self.core.cpu.regs[0] =
-                    u64::from(self.thread_processor_id(self.core.current_thread_id)?);
+                // With several workers, the core the thread runs on now: the
+                // game indexes per-core data by it without locks, so two
+                // threads must never get the same number while running at
+                // once.
+                let processor = match self.worker_core {
+                    Some(core) => core,
+                    None => self.thread_processor_id(self.core.current_thread_id)?,
+                };
+                self.core.cpu.regs[0] = u64::from(processor);
                 Ok(())
             }
             0x16 => {
@@ -4185,8 +4196,14 @@ impl Worker {
     }
 
     fn swap_out(&mut self, machine: &mut Machine, active: bool) {
-        if active {
-            machine.running.insert(machine.core.current_thread_id);
+        if active && !machine.running.insert(machine.core.current_thread_id) {
+            // Two workers running one guest thread from the same saved
+            // context corrupt it: report it where it happens.
+            eprintln!(
+                "worker {}: thread {} is already running on another worker (pc {:#x})",
+                self.index, machine.core.current_thread_id, machine.core.cpu.pc
+            );
+            machine.double_dispatches += 1;
         }
         std::mem::swap(&mut machine.core, &mut self.core);
         machine.core.steps = self.core.steps;
