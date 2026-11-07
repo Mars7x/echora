@@ -1196,6 +1196,94 @@ fn fp_compare_lane(fp: &mut Fp<'_>, op: VecFpOp, a: u64, b: u64) -> bool {
     }
 }
 
+/// A whole vector of the sticky-inexact fast path (see `binary_lane`): every
+/// lane natively when all of them qualify (`fast_vec_fp_lane`), else `None`
+/// and the lanes take the exact path. `m` gives each lane's second operand.
+fn fast_vector(
+    fp: &Fp<'_>,
+    op: VecFpOp,
+    q: bool,
+    scalar: bool,
+    n: u128,
+    d: u128,
+    m: impl Fn(u32) -> u64,
+) -> Option<u128> {
+    if fp.cpu.fpsr & FPSR_IXC == 0 {
+        return None;
+    }
+    let bits = size_bits(fp.size);
+    let mut result = 0u128;
+    for lane in 0..lane_count(bits, q, scalar) {
+        let value = fast_vec_fp_lane(
+            fp.format,
+            fp.size,
+            op,
+            get_lane(n, bits, lane),
+            m(lane),
+            get_lane(d, bits, lane),
+        )?;
+        set_lane(&mut result, bits, lane, value);
+    }
+    Some(finish_vector(result, bits, q, scalar))
+}
+
+/// One lane of the sticky-inexact vector fast path: add, subtract,
+/// multiply and fused multiply-add or -subtract of normal numbers and
+/// zeros whose result is normal or an exact zero, natively. With FPSR.IXC
+/// set and round-to-nearest (`Fp::new` stops the other modes), such a lane
+/// raises nothing new and the host's result is the Arm one. A zero product
+/// or fused result of nonzero operands may be an underflow, so it takes the
+/// exact path; `None` means the exact path.
+fn fast_vec_fp_lane(
+    format: Format,
+    size: FpSize,
+    op: VecFpOp,
+    a: u64,
+    b: u64,
+    d: u64,
+) -> Option<u64> {
+    let exponent = format.exponent_mask();
+    let normal = |value: u64| {
+        let field = value & exponent;
+        field != 0 && field != exponent
+    };
+    let zero = |value: u64| value & !format.sign_bit() == 0;
+    let usable = |value: u64| normal(value) || zero(value);
+    if !(usable(a) && usable(b)) {
+        return None;
+    }
+    let raw = match op {
+        VecFpOp::Add => native!(size, a, b, |x, y| x + y),
+        VecFpOp::Sub => native!(size, a, b, |x, y| x - y),
+        VecFpOp::Mul => native!(size, a, b, |x, y| x * y),
+        VecFpOp::MulAdd | VecFpOp::MulSub if usable(d) => {
+            // FMLS is the fused (-n) * m + d.
+            let negate = op == VecFpOp::MulSub;
+            match size {
+                FpSize::S => {
+                    let x = f32::from_bits(a as u32);
+                    let x = if negate { -x } else { x };
+                    let fused = x.mul_add(f32::from_bits(b as u32), f32::from_bits(d as u32));
+                    u64::from(fused.to_bits())
+                }
+                FpSize::D => {
+                    let x = f64::from_bits(a);
+                    let x = if negate { -x } else { x };
+                    x.mul_add(f64::from_bits(b), f64::from_bits(d)).to_bits()
+                }
+            }
+        }
+        _ => return None,
+    };
+    let exact_zero = zero(raw)
+        && match op {
+            VecFpOp::Add | VecFpOp::Sub => true,
+            VecFpOp::Mul => zero(a) || zero(b),
+            _ => (zero(a) || zero(b)) && zero(d),
+        };
+    (normal(raw) || exact_zero).then_some(raw)
+}
+
 fn vec_fp_lane(fp: &mut Fp<'_>, op: VecFpOp, a: u64, b: u64, d: u64) -> u64 {
     let format = fp.format;
     let all_ones = lane_mask(format.bits);
@@ -1427,6 +1515,10 @@ pub fn vec_fp(
     );
     let bits = size_bits(size);
     let mut fp = Fp::new(cpu, size)?;
+    if let Some(result) = fast_vector(&fp, op, q, scalar, n, d, |lane| get_lane(m, bits, lane)) {
+        fp.cpu.vectors[rd as usize] = result;
+        return Ok(());
+    }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
         let value = vec_fp_lane(
@@ -1519,6 +1611,10 @@ pub fn vec_fp_element(
     let element = get_lane(cpu.vectors[rm as usize], bits, u32::from(index));
     let (n, d) = (cpu.vectors[rn as usize], cpu.vectors[rd as usize]);
     let mut fp = Fp::new(cpu, size)?;
+    if let Some(result) = fast_vector(&fp, op, q, scalar, n, d, |_| element) {
+        fp.cpu.vectors[rd as usize] = result;
+        return Ok(());
+    }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
         let value = vec_fp_lane(
@@ -3791,6 +3887,76 @@ mod fast_path_tests {
 #[cfg(test)]
 mod sticky_inexact_tests {
     use super::*;
+
+    /// The whole-vector fast path gives every lane the exact path's result
+    /// and the exact path's flags (FPCR.FZ set, as games run).
+    #[test]
+    fn fast_vectors_match_the_exact_path() {
+        let values: [f32; 10] = [
+            1.0, -2.5, 3.0e38, 1.2e-38, 0.1, 7.0, -0.333, 1.0e-20, 0.0, -0.0,
+        ];
+        let vector = |lanes: [f32; 4]| {
+            lanes.iter().enumerate().fold(0u128, |acc, (lane, value)| {
+                acc | u128::from(value.to_bits()) << (32 * lane)
+            })
+        };
+        for op in [
+            VecFpOp::Add,
+            VecFpOp::Sub,
+            VecFpOp::Mul,
+            VecFpOp::MulAdd,
+            VecFpOp::MulSub,
+        ] {
+            for (index, &a) in values.iter().enumerate() {
+                for &b in &values {
+                    let c = values[(index + 3) % values.len()];
+                    let (n, m, d) = (
+                        vector([a, b, c, a]),
+                        vector([b, a, a, c]),
+                        vector([c, c, b, b]),
+                    );
+                    let run = |fpsr: u32| {
+                        let mut cpu = Cpu {
+                            fpcr: 1 << 24,
+                            fpsr,
+                            ..Cpu::default()
+                        };
+                        cpu.vectors[1] = n;
+                        cpu.vectors[2] = m;
+                        cpu.vectors[0] = d;
+                        vec_fp(&mut cpu, op, FpSize::S, true, false, 0, 1, 2).unwrap();
+                        (cpu.vectors[0], cpu.fpsr)
+                    };
+                    // The exact lanes, starting without the sticky flag.
+                    let (exact, flags) = run(0);
+                    assert_eq!(
+                        run(FPSR_IXC),
+                        (exact, flags | FPSR_IXC),
+                        "{op:?} {a} {b} {c}"
+                    );
+                    let by_element = |fpsr: u32| {
+                        let mut cpu = Cpu {
+                            fpcr: 1 << 24,
+                            fpsr,
+                            ..Cpu::default()
+                        };
+                        cpu.vectors[1] = n;
+                        cpu.vectors[2] = m;
+                        cpu.vectors[0] = d;
+                        vec_fp_element(&mut cpu, op, FpSize::S, true, false, 0, 1, 2, 2).unwrap();
+                        (cpu.vectors[0], cpu.fpsr)
+                    };
+                    let (exact, flags) = by_element(0);
+                    let fast = by_element(FPSR_IXC);
+                    assert_eq!(
+                        fast,
+                        (exact, flags | FPSR_IXC),
+                        "{op:?} {a} {b} {c} element"
+                    );
+                }
+            }
+        }
+    }
 
     /// With FPSR.IXC set, the fast path must give the exact path's result
     /// and leave the flags as the exact path would (FPCR.FZ set, as games

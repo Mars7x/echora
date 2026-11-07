@@ -455,8 +455,35 @@ impl Core {
         if self.steps >= self.host_check_at
             || (self.parallel && self.preempt.load(std::sync::atomic::Ordering::Relaxed))
         {
+            // The block ran to its end: settling must refund none of it,
+            // even when it loops to its own start (the next PC then lies in
+            // its range).
+            self.block_tag = 0;
             return Err(Trap::HostBoundary);
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod block_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn a_boundary_after_a_block_looping_to_itself_refunds_nothing() {
+        let memory = memory::Memory::new(0x1_0000_0000);
+        let mut core = Core::new(memory.view());
+        core.max_steps = u64::MAX;
+        core.host_check_at = 3;
+        core.tick_block_at(0x1000, 3).unwrap();
+        core.cpu.pc = 0x1000;
+        assert!(matches!(core.finish_block(), Err(Trap::HostBoundary)));
+        core.settle_block_trap();
+        assert_eq!(core.steps, 3);
+        // A trap inside a block still charges only what ran.
+        core.tick_block_at(0x2000, 4).unwrap();
+        core.cpu.pc = 0x2004;
+        core.settle_block_trap();
+        assert_eq!(core.steps, 3 + 2);
     }
 }
