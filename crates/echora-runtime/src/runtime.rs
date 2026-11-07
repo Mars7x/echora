@@ -2315,6 +2315,7 @@ impl Machine {
             HostEntry::BootstrapLoader => "nvnBootstrapLoader".to_string(),
             HostEntry::Proc(name) => name.clone(),
             HostEntry::ZlibUncompress => "hle:zlib_uncompress".to_string(),
+            HostEntry::ZstdDecompress => "hle:zstd_decompress".to_string(),
             HostEntry::InflateFinishCall => "hle:inflate_finish".to_string(),
         };
         if entry == HostEntry::InflateFinishCall {
@@ -2337,6 +2338,22 @@ impl Machine {
                 crate::hle::zlib_uncompress(&mut self.memory, destination, capacity, source, size)?;
             return Ok(());
         }
+        if entry == HostEntry::ZstdDecompress {
+            *self.nvn.calls.entry(name).or_default() += 1;
+            let regs = &self.core.cpu.regs;
+            let (destination, capacity, source, size, workspace, ddict) =
+                (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+            self.core.cpu.regs[0] = crate::hle::zstd_decompress(
+                &mut self.memory,
+                destination,
+                capacity,
+                source,
+                size,
+                workspace,
+                ddict,
+            )?;
+            return Ok(());
+        }
         match self.nvn.calls.get_mut(&name) {
             Some(count) => *count += 1,
             None => {
@@ -2350,7 +2367,10 @@ impl Machine {
             HostEntry::Proc(ref proc) if proc == "nvnDeviceGetProcAddress" => {
                 Some(self.core.cpu.regs[1])
             }
-            HostEntry::Proc(_) | HostEntry::ZlibUncompress | HostEntry::InflateFinishCall => None,
+            HostEntry::Proc(_)
+            | HostEntry::ZlibUncompress
+            | HostEntry::ZstdDecompress
+            | HostEntry::InflateFinishCall => None,
         };
         if let Some(address) = lookup {
             let requested = self.read_string(address, crate::nvn::MAX_NAME)?;

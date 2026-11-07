@@ -80,6 +80,27 @@ pub fn hooked_export_addresses(placed: &[PlacedModule]) -> Result<Vec<u64>> {
     Ok(addresses)
 }
 
+/// Guest functions replaced whole by host code (`crate::hle`): translation
+/// leaves them out, so calls reach the host entry. Unless ECHORA_NO_HLE is
+/// set when translating, the translation can only run with them replaced.
+pub fn hle_function_addresses(placed: &[PlacedModule]) -> Vec<u64> {
+    if std::env::var_os("ECHORA_NO_HLE").is_some() {
+        return Vec::new();
+    }
+    placed
+        .iter()
+        .flat_map(|p| {
+            [
+                crate::hle::zlib_uncompress_offset(&p.module),
+                crate::hle::zstd_decompress_offset(&p.module),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|offset| p.base + offset)
+        })
+        .collect()
+}
+
 pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     let modules = echora_loader::load_exefs(exefs)?;
     let npdm = crate::npdm::load_npdm(&exefs.join("main.npdm"))?;
@@ -221,6 +242,11 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
                 machine
                     .nvn
                     .add_hook(p.base + offset, crate::nvn::HostEntry::ZlibUncompress);
+            }
+            if let Some(offset) = crate::hle::zstd_decompress_offset(&p.module) {
+                machine
+                    .nvn
+                    .add_hook(p.base + offset, crate::nvn::HostEntry::ZstdDecompress);
             }
             for offset in crate::hle::inflate_finish_sites(&p.module) {
                 machine

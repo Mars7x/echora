@@ -60,6 +60,35 @@ const INFLATE: [InflateBuild; 2] = [
 ];
 const MOV_W1_4: u32 = 0x5280_0081;
 
+/// The game's zstd wrapper in `main` per known build: (offset, SHA-256 of
+/// its 50 instructions, offset and SHA-256 of the first 0x200 bytes of the
+/// frame decoder it calls), as disassembled from update 655360:
+/// `s64 decompress(void* dst, u32 dst_size, const void* src, u32 src_size,
+/// ZSTD_DCtx* workspace, const ZSTD_DDict* ddict)`. A workspace not 8-byte
+/// aligned returns -1 (as a 32-bit value). Otherwise it resets the context
+/// and runs `ZSTD_decompressMultiFrame` over every frame of the input,
+/// with the DDict's content (`+0x8`) and size (`+0x10`) as its dictionary
+/// when one is given, and returns the decompressed size; on a zstd error it
+/// returns -2 (32-bit) for dstSize_tooSmall and -1 (32-bit) for any other.
+/// Its callers re-reset the context before every use and read nothing else
+/// from it, so leaving the context untouched has no other observable effect.
+struct ZstdBuild {
+    offset: u64,
+    sha256: &'static str,
+    decoder: u64,
+    decoder_prefix_sha256: &'static str,
+}
+
+const ZSTD_DECOMPRESS: [ZstdBuild; 1] = [ZstdBuild {
+    offset: 0xf5_00d0,
+    sha256: "2c2f3f52f9adf84b10a59342ec71fcd19346e4cbe8da38dc62818139fb6064ed",
+    decoder: 0xe_b380,
+    decoder_prefix_sha256: "e05842eb4639c59511480117c47a7b980ed1625881bb99a8f37e2c090ebb912b",
+}];
+const ZSTD_DECOMPRESS_WORDS: usize = 50;
+/// zstd's error code for an output buffer too small.
+const ZSTD_DST_SIZE_TOO_SMALL: usize = 70;
+
 const Z_STREAM_END: i32 = 1;
 const Z_DATA_ERROR: i32 = -3;
 const Z_BUF_ERROR: i32 = -5;
@@ -82,6 +111,23 @@ pub fn zlib_uncompress_offset(module: &NsoModule) -> Option<u64> {
         let start = offset.checked_sub(u64::from(text.memory_offset))? as usize;
         let bytes = text.bytes.get(start..start + ZLIB_UNCOMPRESS_WORDS * 4)?;
         (sha256_hex(bytes) == sha256).then_some(offset)
+    })
+}
+
+/// The text offset of the zstd wrapper in `module`, if the exact code of a
+/// known build is present there.
+pub fn zstd_decompress_offset(module: &NsoModule) -> Option<u64> {
+    let text = &module.text;
+    let hashed = |offset: u64, length: usize, sha256: &str| {
+        offset
+            .checked_sub(u64::from(text.memory_offset))
+            .and_then(|start| text.bytes.get(start as usize..start as usize + length))
+            .is_some_and(|bytes| sha256_hex(bytes) == sha256)
+    };
+    ZSTD_DECOMPRESS.iter().find_map(|build| {
+        (hashed(build.offset, ZSTD_DECOMPRESS_WORDS * 4, build.sha256)
+            && hashed(build.decoder, 0x200, build.decoder_prefix_sha256))
+        .then_some(build.offset)
     })
 }
 
@@ -192,6 +238,94 @@ pub fn zlib_uncompress(
     }
 }
 
+/// Host equivalent of the zstd wrapper: X0 as the wrapper returns it.
+pub fn zstd_decompress(
+    memory: &mut Memory,
+    destination: u64,
+    capacity: u64,
+    source: u64,
+    size: u64,
+    workspace: u64,
+    ddict: u64,
+) -> Result<u64, Trap> {
+    const FAILED: u64 = 0xffff_ffff;
+    const TOO_SMALL: u64 = 0xffff_fffe;
+    if workspace & 7 != 0 {
+        return Ok(FAILED);
+    }
+    let (capacity, size) = (capacity & 0xffff_ffff, size & 0xffff_ffff);
+    let dictionary = if ddict == 0 {
+        None
+    } else {
+        let (content, length) = (
+            memory.read_u64(ddict + 0x8)?,
+            memory.read_u64(ddict + 0x10)?,
+        );
+        if length > MAX_INPUT {
+            return Err(Trap::InvalidState {
+                message: format!("zstd dictionary of {length:#x} bytes exceeds the local bound"),
+            });
+        }
+        let mut bytes = vec![0u8; length as usize];
+        memory.read(content, &mut bytes)?;
+        Some(bytes)
+    };
+    let mut input = vec![0u8; size as usize];
+    memory.read(source, &mut input)?;
+    let mut output = Vec::with_capacity(capacity as usize);
+    match zstd_decode(&input, &mut output, dictionary.as_deref()) {
+        Ok(_) => {
+            memory.write(destination, &output)?;
+            Ok(output.len() as u64)
+        }
+        Err(code) if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL => Ok(TOO_SMALL),
+        Err(_) => Ok(FAILED),
+    }
+}
+
+/// Every frame of `input` into `output`'s capacity, through this thread's
+/// decompression context and the digested form of `dictionary` (kept for
+/// the few most recent dictionaries, by content).
+fn zstd_decode(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    dictionary: Option<&[u8]>,
+) -> Result<usize, usize> {
+    use std::cell::RefCell;
+    use std::hash::{Hash, Hasher};
+    use zstd::zstd_safe::{DCtx, DDict};
+    thread_local! {
+        static CONTEXT: RefCell<Option<DCtx<'static>>> = const { RefCell::new(None) };
+        static DICTIONARIES: RefCell<Vec<(u64, Vec<u8>, DDict<'static>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    CONTEXT.with_borrow_mut(|context| {
+        let context = context.get_or_insert_with(DCtx::create);
+        let Some(dictionary) = dictionary else {
+            return context.decompress(output, input);
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dictionary.hash(&mut hasher);
+        let key = hasher.finish();
+        DICTIONARIES.with_borrow_mut(|cache| {
+            let found = cache
+                .iter()
+                .position(|(hash, bytes, _)| *hash == key && bytes == dictionary);
+            let index = match found {
+                Some(index) => index,
+                None => {
+                    if cache.len() == 4 {
+                        cache.remove(0);
+                    }
+                    cache.push((key, dictionary.to_vec(), DDict::create(dictionary)));
+                    cache.len() - 1
+                }
+            };
+            context.decompress_using_ddict(output, input, &cache[index].2)
+        })
+    })
+}
+
 /// Decode one complete zlib stream (header, data, Adler-32) of at most
 /// `capacity` bytes; trailing input after the stream end is ignored.
 fn inflate_zlib(input: &[u8], capacity: usize) -> Option<Vec<u8>> {
@@ -283,5 +417,68 @@ mod tests {
         let mut corrupt = HELLO.to_vec();
         *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(inflate_zlib(&corrupt, 64), None);
+    }
+
+    #[test]
+    fn zstd_wrapper_returns_sizes_and_its_error_values() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let text = b"zstd zstd zstd zstd zstd zstd".repeat(8);
+        let mut frames = zstd::bulk::compress(&text, 3).unwrap();
+        frames.extend(zstd::bulk::compress(b"tail", 3).unwrap());
+        let total = text.len() as u64 + 4;
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x10000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        memory.write(0x11000, &frames).unwrap();
+        let size = frames.len() as u64;
+        // Every frame, into exactly enough room.
+        let result = zstd_decompress(&mut memory, 0x14000, total, 0x11000, size, 0x10000, 0);
+        assert_eq!(result.unwrap(), total);
+        let mut out = vec![0u8; total as usize];
+        memory.read(0x14000, &mut out).unwrap();
+        assert_eq!(&out[..text.len()], &text[..]);
+        assert_eq!(&out[text.len()..], b"tail");
+        // Too little room, corrupt input and a misaligned workspace.
+        let small = zstd_decompress(&mut memory, 0x14000, total - 1, 0x11000, size, 0x10000, 0);
+        assert_eq!(small.unwrap(), 0xffff_fffe);
+        memory.write(0x11000, b"nope").unwrap();
+        let corrupt = zstd_decompress(&mut memory, 0x14000, total, 0x11000, size, 0x10000, 0);
+        assert_eq!(corrupt.unwrap(), 0xffff_ffff);
+        let misaligned = zstd_decompress(&mut memory, 0x14000, total, 0x11000, size, 0x10004, 0);
+        assert_eq!(misaligned.unwrap(), 0xffff_ffff);
+    }
+
+    #[test]
+    fn zstd_wrapper_uses_the_ddict_content() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let dictionary = b"a shared prefix the frames lean on ".repeat(4);
+        let text = b"a shared prefix the frames lean on, then more".to_vec();
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dictionary).unwrap();
+        let frame = compressor.compress(&text).unwrap();
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x10000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        memory.write(0x11000, &frame).unwrap();
+        memory.write(0x13000, &dictionary).unwrap();
+        // DDict: dictContent at +0x8, dictSize at +0x10.
+        memory.write_u64(0x12008, 0x13000).unwrap();
+        memory.write_u64(0x12010, dictionary.len() as u64).unwrap();
+        for _ in 0..2 {
+            let result = zstd_decompress(
+                &mut memory,
+                0x14000,
+                0x1000,
+                0x11000,
+                frame.len() as u64,
+                0x10000,
+                0x12000,
+            );
+            assert_eq!(result.unwrap(), text.len() as u64);
+        }
+        let mut out = vec![0u8; text.len()];
+        memory.read(0x14000, &mut out).unwrap();
+        assert_eq!(out, text);
     }
 }

@@ -124,6 +124,8 @@ pub enum HostEntry {
     /// A guest function replaced by an equivalent host implementation
     /// (`crate::hle`), installed only for its exact code bytes.
     ZlibUncompress,
+    /// The game's zstd wrapper, likewise (`crate::hle`).
+    ZstdDecompress,
     /// A `bl inflate` call site with flush Z_FINISH (`crate::hle`): the
     /// call is performed on the host and execution continues after it.
     InflateFinishCall,
