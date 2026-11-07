@@ -1,4 +1,4 @@
-//! Native NVN programs to SPIR-V through `native/shader` (the PokeDinner/Eden
+//! Native NVN programs to SPIR-V through `native/shader` (the Lichii/Eden
 //! recompiler behind a C interface). Mirrors `echora_shader.h`.
 
 use std::ffi::c_void;

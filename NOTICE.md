@@ -48,7 +48,7 @@ When `ECHORA_SHADER_SRC` is set, `echora-gpu` compiles sources fetched by
 
 | Source | Pinned | License |
 |---|---|---|
-| [PokeDinner](https://git.eden-emu.dev/Franseven/PokeDinner-a-Eglantine-Fork) shader recompiler | `c3ce9bc` plus `crates/echora-gpu/native/shader/patches` | GPL-3.0-or-later |
+| [Lichii](https://github.com/zortos293/Lichii) shader recompiler | `809fb3a` plus `crates/echora-gpu/native/shader/patches` | GPL-3.0-or-later |
 | [sirit](https://github.com/eden-emulator/sirit) | v1.0.5 | AGPL-3.0 |
 | [fmt](https://github.com/fmtlib/fmt) | 12.1.0 | MIT |
 | [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) | vulkan-sdk-1.4.341.0 | MIT-style (Khronos) |

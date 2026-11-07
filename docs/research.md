@@ -163,20 +163,43 @@ belongs on disk: `/tmp` is a RAM-backed tmpfs on the development machine.
 ## Mesh and task shaders
 
 The game's NVN table includes the whole `DrawMeshTasks` family, and the OoT
-bring-up notes say the opening uses `DrawMeshTasksIndirect`. The pinned
-PokeDinner recompiler has no task or mesh stages. Eglantine (GPL-3.0,
-branch `nx2`) added them in `310dd59` ("translate Switch 2 task and mesh
-programs", for VK_EXT_mesh_shader): task programs write a payload, mesh
-programs write vertex and primitive groups, and the two mesh instructions
-sirit lacks are patched in after assembly. The RX 9070 XT (RADV) exposes
-task and mesh stages with subgroup size control 32-64.
+bring-up notes say the opening uses `DrawMeshTasksIndirect`. The shader
+recompiler was first pinned to PokeDinner, which has no task or mesh
+stages. Eglantine (GPL-3.0, branch `nx2`) added them in `310dd59`
+("translate Switch 2 task and mesh programs", for VK_EXT_mesh_shader): task
+programs write a payload, mesh programs write vertex and primitive groups,
+and the two mesh instructions sirit lacks are patched in after assembly.
+The RX 9070 XT (RADV) exposes task and mesh stages with subgroup size
+control 32-64.
 
-Against Eglantine `nx2` at `0ca2032`, four of Echora's eight recompiler
-patches are already upstream in more general forms (TXQ second
-destination, TLDS x/z pairs, FSETP with a uniform source, undefined
-registers as zero) and the other four apply cleanly; the shim compiles
-against it. Moving the pin from PokeDinner to Eglantine is the planned
-route to mesh support; it has not been validated by tests yet.
+## Recompiler pin: Lichii
+
+The pin moved from PokeDinner (`c3ce9bc`) to Lichii (`809fb3a`), an
+Eglantine fork that carries the task and mesh work and lowers more of OoT's
+Ampere code. The two diverge from a common Eglantine base of 2026-10-30.
+Measured with `translate-dump` and `shader-check` (translate, then compile
+on RADV) over every stage OoT reached in a 3001-frame run through the title
+and intro movie (6074 stages, `EDEN_NX2_TENSOR=1`):
+
+| Pin | Translated | Compiled on the driver |
+|---|---|---|
+| PokeDinner `c3ce9bc` + 9 patches | 4472 | 4472 |
+| Lichii `809fb3a` + 5 patches | 5960 | 5960 |
+
+No stage translates with PokeDinner and fails with Lichii. The compute
+stages PokeDinner skipped in that run (LEA op 291, op 4a4, a USHF form
+op 899) all translate with Lichii. Over a further 10,044 captured Switch 2
+programs from another title, Lichii translates and compiles 8485 against
+PokeDinner's 7830, again with none lost.
+
+Five of PokeDinner's patches are upstream in Lichii in more general forms
+(TXQ second destination, TLDS x/z pairs, FSETP with a uniform source,
+undefined registers as zero, UIMAD.WIDE with an immediate) and were
+dropped. Patch `0010` keeps the uniform clamp idiom (UISETP then USEL)
+foldable to IMNMX through any UPn, as PokeDinner did; Lichii accepted only
+UP0, so indirect-branch tables guarded through another UPn failed to track.
+The remaining failures are mostly stage-buffer reads outside task and mesh
+programs (87) and gather forms (op b63, 15).
 
 ## Licensing decision
 

@@ -1,5 +1,5 @@
 //! Builds the shader translation library when `ECHORA_SHADER_SRC` names the
-//! fetched, patched sources (see `native/shader/README.md`): the PokeDinner
+//! fetched, patched sources (see `native/shader/README.md`): the Lichii
 //! shader recompiler, sirit, and Echora's C ABI shim. Without it the crate
 //! still builds and shader translation reports that the library is absent.
 
@@ -35,13 +35,13 @@ fn main() {
 
     let mut files = Vec::new();
     sources(
-        &src.join("pokedinner/src/shader_recompiler"),
+        &src.join("lichii/src/shader_recompiler"),
         &["backend/glasm", "backend/glsl"],
         &mut files,
     );
     sources(&src.join("sirit/src"), &[], &mut files);
     for file in ["common/settings.cpp", "common/settings_common.cpp"] {
-        files.push(src.join("pokedinner/src").join(file));
+        files.push(src.join("lichii/src").join(file));
     }
     files.push(native.join("echora_shader.cpp"));
     files.push(native.join("echora_common.cpp"));
@@ -52,7 +52,7 @@ fn main() {
         .opt_level(2)
         .warnings(false)
         .define("FMT_HEADER_ONLY", None)
-        .include(src.join("pokedinner/src"))
+        .include(src.join("lichii/src"))
         .include(src.join("fmt/include"))
         .include(src.join("sirit/include"))
         .include(src.join("sirit/src"))
