@@ -2770,6 +2770,16 @@ impl Nvn {
                         * u64::from(info.bytes_per_block)
                 };
                 let source = self.gpu_to_guest(command.x[1], size).map_err(stop)?;
+                if debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                    let mut sample = vec![0u8; size.min(1 << 20) as usize];
+                    core.memory.read(source, &mut sample)?;
+                    let nonzero = sample.iter().any(|byte| *byte != 0);
+                    self.gpu_note(format!(
+                        "copy to texture {:x}: source {}",
+                        command.x[2],
+                        if nonzero { "has data" } else { "is zero" }
+                    ));
+                }
                 let view = (command.captured[6] != 0).then_some(&view);
                 self.copy_texels(core, command.x[2], view, region, source, true)
                     .map_err(|error| error.into_trap(&command.name, core.cpu.pc))?;
