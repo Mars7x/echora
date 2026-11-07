@@ -1232,7 +1232,9 @@ fn step_lane(fp: &mut Fp<'_>, rsqrt: bool, a: u64, b: u64) -> u64 {
     let format = fp.format;
     let a = fp.input(a);
     let b = fp.input(b);
-    if let Some(nan) = fp.process_nans(&[a, b]) {
+    // The step starts with op1 = FPNeg(op1), which with FPCR.AH clear
+    // flips a NaN's sign too (the arithmetic below negates a itself).
+    if let Some(nan) = fp.process_nans(&[a ^ format.sign_bit(), b]) {
         return nan;
     }
     let (special, constant) = match (rsqrt, size) {
@@ -3608,6 +3610,18 @@ mod sticky_inexact_tests {
         cpu.fpcr = FPCR_DN;
         fp_binary(&mut cpu, FpBinaryOp::NegMul, FpSize::D, 0, 1, 2).unwrap();
         assert_eq!(cpu.vectors[0] as u64, 0xfff8_0000_0000_0000);
+    }
+
+    /// FRECPS and FRSQRTS negate their first operand before NaN processing.
+    #[test]
+    fn reciprocal_steps_negate_a_nan_first_operand() {
+        for op in [VecFpOp::RecipStep, VecFpOp::RSqrtStep] {
+            let mut cpu = Cpu::default();
+            cpu.vectors[1] = u128::from(0x7ffd_8a83_e451_dfa2u64);
+            cpu.vectors[2] = u128::from(2.0f64.to_bits());
+            vec_fp(&mut cpu, op, FpSize::D, false, true, 0, 1, 2).unwrap();
+            assert_eq!(cpu.vectors[0] as u64, 0xfffd_8a83_e451_dfa2, "{op:?}");
+        }
     }
 
     /// The whole-vector fast path gives every lane the exact path's result
