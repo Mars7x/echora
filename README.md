@@ -36,8 +36,8 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
   gameplay has not been reached. The mesh and task shaders that gameplay
   scenes need have no draw path in the runtime yet.
 - **Far below full speed.** The game runs at 60 frames per second on the
-  console; here the intro movie plays at about 6. The first 1,200 frames take about 165 s,
-  down from 323 s. Every guest thread runs on one host thread by default,
+  console; here the intro movie decodes about 17 pictures per second once
+  it is playing. Every guest thread runs on one host thread by default,
   and that thread does most of the work, so faster translated code alone
   cannot reach full speed. Running guest threads on several host threads
   (`ECHORA_WORKERS`, up to the console's six application cores) was 1.9

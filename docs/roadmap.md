@@ -17,7 +17,7 @@ Each phase completes only on the evidence named here, not when code exists.
 | 10. In-game settings | Dropped: settings are changed in the launcher, with no in-game interface. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | — |
 | 12. High frame rates | No timing, physics or animation regressions. | — |
-| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. 1,200-frame runs are checked against baseline captures: 323 s down to about 165 s with identical frames (contiguous texture swizzling, compute storage kept on the GPU, guest memory imported into Vulkan, frames submitted without waiting). Several workers are not yet stable. |
+| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. Speed is measured by movie pictures decoded per second (`ECHORA_MOVIE_RATE`), about 17 once the movie plays, with frames checked against baseline captures. Done so far: contiguous texture swizzling, compute storage on the GPU, guest memory imported into Vulkan, unwaited frame submits, host zstd, shorter scheduler slices, spin-wait handoff, vector FP fast paths. Code-generation benchmarks without the game: `cargo bench -p echora-aot-tests --bench kernels`. Several workers are not yet stable. |
 | 14. Other platforms | Real game code on another OS or CPU without core rewrites. | — |
 | 15. Release quality | Clean build, configure, launch with user-supplied data. | — |
 
