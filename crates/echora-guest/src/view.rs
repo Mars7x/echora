@@ -17,14 +17,29 @@ use crate::memory::AtomicOp;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 /// The local exclusive monitor in Exclusive Access state: the marked address
-/// and size, and the value LDXR observed. STXR stores only if the bytes
-/// still hold that value (a compare-and-swap), which a concurrent store by
-/// another guest thread defeats.
+/// and size, the value LDXR observed and the global monitor generation of
+/// its granule then. STXR stores only if no exclusive store to the granule
+/// succeeded since (on any thread) and the bytes still hold that value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Exclusive {
     address: u64,
     bytes: u8,
     value: u64,
+    generation: u64,
+}
+
+/// The global exclusive monitor, as Arm's makes LL/SC exclusive across
+/// cores: a generation per 8-byte granule bucket, advanced by every
+/// successful STXR there (odd while one is in progress). A compare-and-swap
+/// alone lets STXR succeed after other threads changed the value and changed
+/// it back (ABA), which corrupts lock-free lists once guest threads run on
+/// several host cores. Plain stores do not advance it; the value compare
+/// still catches the ones that leave a different value.
+static MONITOR: [AtomicU64; MONITOR_BUCKETS] = [const { AtomicU64::new(0) }; MONITOR_BUCKETS];
+const MONITOR_BUCKETS: usize = 4096;
+
+fn monitor_bucket(address: u64) -> &'static AtomicU64 {
+    &MONITOR[((address >> 3) as usize) % MONITOR_BUCKETS]
 }
 
 #[derive(Debug)]
@@ -434,11 +449,24 @@ impl GuestView {
         } else {
             Ordering::Relaxed
         };
-        let value = self.atomic_load(address, bytes, order);
+        let bucket = monitor_bucket(address);
+        // A generation read with no store in progress, unchanged across the
+        // load: the value belongs to it.
+        let (value, generation) = loop {
+            let generation = bucket.load(Ordering::Acquire);
+            if generation & 1 == 0 {
+                let value = self.atomic_load(address, bytes, order);
+                if bucket.load(Ordering::Acquire) == generation {
+                    break (value, generation);
+                }
+            }
+            std::hint::spin_loop();
+        };
         self.exclusive = Some(Exclusive {
             address,
             bytes,
             value,
+            generation,
         });
         Ok(value)
     }
@@ -463,7 +491,28 @@ impl GuestView {
         }
         let mask = u64::MAX >> (64 - u32::from(bytes) * 8);
         let orders = orderings(false, release);
-        Ok(self.atomic_cas(address, bytes, marked.value, value & mask, orders) == marked.value)
+        // Claim the granule only if no exclusive store succeeded since LDXR.
+        let bucket = monitor_bucket(address);
+        if bucket
+            .compare_exchange(
+                marked.generation,
+                marked.generation | 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let stored =
+            self.atomic_cas(address, bytes, marked.value, value & mask, orders) == marked.value;
+        let next = if stored {
+            marked.generation + 2
+        } else {
+            marked.generation
+        };
+        bucket.store(next, Ordering::Release);
+        Ok(stored)
     }
 
     /// CLREX, exception return and context switches open the monitor.
@@ -521,6 +570,44 @@ mod tests {
             view.fetch_add_single_thread(0x1001, 4, 1, false, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn store_exclusive_fails_after_another_thread_changes_the_value_and_back() {
+        // ABA: the second view's exclusive stores leave the original value,
+        // which a compare-and-swap alone would accept.
+        let memory = memory();
+        let mut first = memory.view();
+        let mut second = memory.view();
+        first.store_u64(0x1020, 5);
+        assert_eq!(
+            first.load_exclusive_single_thread(0x1020, 8, true).unwrap(),
+            5
+        );
+        for value in [6, 5] {
+            second
+                .load_exclusive_single_thread(0x1020, 8, true)
+                .unwrap();
+            assert!(
+                second
+                    .store_exclusive_single_thread(0x1020, 8, value, true)
+                    .unwrap()
+            );
+        }
+        assert!(
+            !first
+                .store_exclusive_single_thread(0x1020, 8, 7, true)
+                .unwrap()
+        );
+        assert_eq!(first.load_u64(0x1020), 5);
+        // A fresh reservation succeeds.
+        first.load_exclusive_single_thread(0x1020, 8, true).unwrap();
+        assert!(
+            first
+                .store_exclusive_single_thread(0x1020, 8, 7, true)
+                .unwrap()
+        );
+        assert_eq!(first.load_u64(0x1020), 7);
     }
 
     #[test]
