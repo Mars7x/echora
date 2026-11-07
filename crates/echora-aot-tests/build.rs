@@ -82,6 +82,7 @@ fn main() {
     loop_code(&mut out);
     exclusive_code(&mut out);
     switch_code(&mut out);
+    spin_candidates(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -1119,4 +1120,63 @@ fn switch_code(out: &mut String) {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Loop candidates for `tests/spin_semantics.rs` (not lifted): a body of
+/// one to four instructions, often loads from [X28] and compares, then a
+/// conditional branch back to the head, then SVC #7.
+fn spin_candidates(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xe0_0000;
+    const LOOPS: usize = 400;
+    let mut state: u64 = 0x4528_21e6_38d0_1377;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        writes.has_gpr(27) || writes.has_gpr(28)
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for _ in 0..LOOPS {
+        let head = BASE + 4 * words.len() as u64;
+        entries.push(head);
+        let probe = next() % 31;
+        let probe = if probe == 27 || probe == 28 { 5 } else { probe };
+        for _ in 0..1 + next() % 4 {
+            let word = match next() % 5 {
+                // ldr wProbe, [x28, #8 * k]
+                0 | 1 => 0xb940_0000 | ((next() % 64) << 10) | (28 << 5) | probe,
+                // cmp wProbe, #imm
+                2 => 0x7100_001f | ((next() % 4096) << 10) | (probe << 5),
+                _ => body_instruction(&mut next, &reserved),
+            };
+            words.push(word);
+        }
+        let at = BASE + 4 * words.len() as u64;
+        let back = (((head as i64 - at as i64) / 4) as u32) & 0x7ffff;
+        let branch = match next() % 3 {
+            0 => 0x5400_0000 | (back << 5) | (next() % 14),
+            1 => 0x3400_0000 | ((next() & 1) << 24) | (back << 5) | probe,
+            _ => {
+                let bit = next() % 32;
+                0x3600_0000 | (bit << 19) | ((next() & 1) << 24) | ((back & 0x3fff) << 5) | probe
+            }
+        };
+        words.push(branch);
+        words.push(0xd400_00e1);
+    }
+    // SVC returns, so the detector explores past each candidate's SVC; a
+    // final RET keeps the last ones from running off the end of the code.
+    words.push(0xd65f_03c0);
+    writeln!(out, "pub mod spin_candidates {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    writeln!(out, "}}").expect("write");
 }
