@@ -3,7 +3,8 @@
 //! `ECHORA_HOST_PROFILE=PATH` arms a process user-time timer (`SIGVTALRM`,
 //! 1 kHz); each signal records the interrupted host instruction pointer.
 //! When the run ends, PATH receives `/proc/self/maps` followed by one
-//! `count address` line per sampled address, for offline symbolization.
+//! `count address thread` line per sampled address and host thread id (low
+//! 16 bits), for offline symbolization.
 
 #![allow(unsafe_code)]
 
@@ -20,9 +21,15 @@ mod imp {
         let rip = unsafe {
             (*(context as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize]
         };
+        // User addresses fit 48 bits; the top 16 carry the thread's id.
+        // SAFETY: gettid is async-signal-safe.
+        let thread = unsafe { libc::gettid() } as u64 & 0xffff;
         let slot = NEXT.fetch_add(1, Ordering::Relaxed);
         if slot < CAPACITY {
-            SAMPLES[slot].store(rip as u64, Ordering::Relaxed);
+            SAMPLES[slot].store(
+                rip as u64 & 0xffff_ffff_ffff | thread << 48,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -68,8 +75,9 @@ mod imp {
             counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             let mut out = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
             out.push_str("--\n");
-            for (address, count) in counts {
-                out.push_str(&format!("{count} {address:#x}\n"));
+            for (sample, count) in counts {
+                let (thread, address) = (sample >> 48, sample & 0xffff_ffff_ffff);
+                out.push_str(&format!("{count} {address:#x} {thread}\n"));
             }
             if let Err(error) = std::fs::write(&self.path, out) {
                 eprintln!("host profile: write failed: {error}");

@@ -357,6 +357,15 @@ impl LoadedProgram {
                 })
             })
             .collect();
+        report["pc_stacks"] = self
+            .machine
+            .top_pc_stacks(32)
+            .into_iter()
+            .map(|(stack, hits)| {
+                let frames: Vec<String> = stack.iter().map(|pc| format!("{pc:#x}")).collect();
+                serde_json::json!({ "hits": hits, "frames": frames })
+            })
+            .collect();
         report
     }
 }

@@ -263,6 +263,9 @@ pub struct Machine {
     /// (thread, PC) at each host scheduling boundary, counted: a coarse
     /// guest profile (`pc_samples` in the report).
     pc_samples: std::collections::HashMap<(u64, u64), u64>,
+    /// With `ECHORA_PC_STACKS=LO-HI` (guest addresses, hex): frame-pointer
+    /// return chains of the samples whose PC is in that range.
+    pc_stacks: std::collections::HashMap<Vec<u64>, u64>,
     pc_sample_tick: u32,
     /// Threads that gave up the processor spinning, with the step count
     /// until which other runnable threads go first.
@@ -372,6 +375,7 @@ impl Machine {
             hid_mapping: None,
             hid_samples: 0,
             pc_samples: Default::default(),
+            pc_stacks: Default::default(),
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
             last_wake_check: 0,
@@ -1588,8 +1592,12 @@ impl Machine {
         // core, and the best (lowest) priority first. Threads the game pins
         // to one core then never run at once, which its per-core data
         // relies on. A mask naming none of the three is allowed anywhere.
+        // ECHORA_ANY_CORE / ECHORA_FLAT_PRIORITY (diagnostics): schedule as
+        // one worker does, ignoring affinity or priority.
+        let any_core = crate::nvn::debug_var_os("ECHORA_ANY_CORE").is_some();
+        let flat_priority = crate::nvn::debug_var_os("ECHORA_FLAT_PRIORITY").is_some();
         let allowed = |id: u64| -> bool {
-            let Some(core) = self.worker_core else {
+            let Some(core) = self.worker_core.filter(|_| !any_core) else {
                 return true;
             };
             let mask = if id == self.layout.main_thread_id {
@@ -1601,7 +1609,7 @@ impl Machine {
             mask & 0b111 == 0 || mask >> core & 1 != 0
         };
         let priority = |id: u64| -> u8 {
-            if self.worker_core.is_none() {
+            if self.worker_core.is_none() || flat_priority {
                 return 0;
             }
             if id == self.layout.main_thread_id {
@@ -2074,6 +2082,9 @@ impl Machine {
                 .pc_samples
                 .entry((self.core.current_thread_id, self.core.cpu.pc))
                 .or_default() += 16;
+            if let Some(range) = crate::nvn::debug_var_os("ECHORA_PC_STACKS") {
+                self.sample_pc_stack(range);
+            }
         }
         Ok(())
     }
@@ -4002,6 +4013,47 @@ impl Machine {
     }
 
     /// The most frequent (thread, PC) host-boundary samples, most first.
+    fn sample_pc_stack(&mut self, range: &std::ffi::OsStr) {
+        let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+        let Some((lo, hi)) = range
+            .to_str()
+            .and_then(|text| text.split_once('-'))
+            .and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)))
+        else {
+            return;
+        };
+        let pc = self.core.cpu.pc;
+        if pc < lo || pc >= hi {
+            return;
+        }
+        let mut stack = vec![pc, self.core.cpu.regs[30]];
+        let mut frame = self.core.cpu.regs[29];
+        while stack.len() < 16 && frame != 0 && frame % 8 == 0 {
+            let (Ok(next), Ok(ret)) =
+                (self.memory.read_u64(frame), self.memory.read_u64(frame + 8))
+            else {
+                break;
+            };
+            stack.push(ret);
+            if next <= frame {
+                break;
+            }
+            frame = next;
+        }
+        *self.pc_stacks.entry(stack).or_default() += 16;
+    }
+
+    pub fn top_pc_stacks(&self, count: usize) -> Vec<(Vec<u64>, u64)> {
+        let mut stacks: Vec<_> = self
+            .pc_stacks
+            .iter()
+            .map(|(s, &h)| (s.clone(), h))
+            .collect();
+        stacks.sort_unstable_by_key(|stack| std::cmp::Reverse(stack.1));
+        stacks.truncate(count);
+        stacks
+    }
+
     pub fn top_pc_samples(&self, count: usize) -> Vec<(u64, u64, u64)> {
         let mut samples: Vec<(u64, u64, u64)> = self
             .pc_samples
