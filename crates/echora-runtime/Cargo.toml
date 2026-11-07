@@ -21,7 +21,9 @@ echora-nup.workspace = true
 getrandom = { version = "0.4", features = ["std"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 miniz_oxide = "0.8"
-rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8"] }
+# "asm": rav1d's hand-written SIMD (nasm on x86-64 at build time); with it
+# rav1d links the 16-bit kernels too, so bitdepth_16 must be on.
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16", "asm"] }
 raw-window-handle = "0.6"
 serde.workspace = true
 serde_json.workspace = true

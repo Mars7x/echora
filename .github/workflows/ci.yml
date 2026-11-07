@@ -25,6 +25,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1
       - name: System libraries
         if: runner.os == 'Linux'
         run: |
