@@ -3,8 +3,10 @@
 //! `ECHORA_HOST_PROFILE=PATH` arms a process user-time timer (`SIGVTALRM`,
 //! 1 kHz); each signal records the interrupted host instruction pointer.
 //! When the run ends, PATH receives `/proc/self/maps` followed by one
-//! `count address thread` line per sampled address and host thread id (low
-//! 16 bits), for offline symbolization.
+//! `count address thread top` line per sampled address, host thread id (low
+//! 16 bits) and the word at the top of the stack, for offline
+//! symbolization. In a leaf without a frame (glibc's memcpy variants) that
+//! word is the caller's return address.
 
 #![allow(unsafe_code)]
 
@@ -14,13 +16,21 @@ mod imp {
 
     const CAPACITY: usize = 1 << 21;
     static SAMPLES: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
+    static TOPS: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn on_sample(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
         // SAFETY: the kernel passes a valid `ucontext_t` to SA_SIGINFO handlers.
-        let rip = unsafe {
-            (*(context as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize]
+        let (rip, rsp) = unsafe {
+            let registers = &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs;
+            (
+                registers[libc::REG_RIP as usize],
+                registers[libc::REG_RSP as usize],
+            )
         };
+        // SAFETY: the interrupted thread's stack pointer addresses its
+        // mapped stack.
+        let top = unsafe { *(rsp as *const u64) };
         // User addresses fit 48 bits; the top 16 carry the thread's id.
         // SAFETY: gettid is async-signal-safe.
         let thread = unsafe { libc::gettid() } as u64 & 0xffff;
@@ -30,6 +40,7 @@ mod imp {
                 rip as u64 & 0xffff_ffff_ffff | thread << 48,
                 Ordering::Relaxed,
             );
+            TOPS[slot].store(top, Ordering::Relaxed);
         }
     }
 
@@ -67,17 +78,18 @@ mod imp {
                 libc::setitimer(libc::ITIMER_VIRTUAL, &timer, std::ptr::null_mut());
             }
             let taken = NEXT.load(Ordering::Relaxed).min(CAPACITY);
-            let mut counts = std::collections::HashMap::<u64, u64>::new();
-            for sample in &SAMPLES[..taken] {
-                *counts.entry(sample.load(Ordering::Relaxed)).or_default() += 1;
+            let mut counts = std::collections::HashMap::<(u64, u64), u64>::new();
+            for (sample, top) in SAMPLES[..taken].iter().zip(&TOPS[..taken]) {
+                let key = (sample.load(Ordering::Relaxed), top.load(Ordering::Relaxed));
+                *counts.entry(key).or_default() += 1;
             }
             let mut counts: Vec<_> = counts.into_iter().collect();
             counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             let mut out = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
             out.push_str("--\n");
-            for (sample, count) in counts {
+            for ((sample, top), count) in counts {
                 let (thread, address) = (sample >> 48, sample & 0xffff_ffff_ffff);
-                out.push_str(&format!("{count} {address:#x} {thread}\n"));
+                out.push_str(&format!("{count} {address:#x} {thread} {top:#x}\n"));
             }
             if let Err(error) = std::fs::write(&self.path, out) {
                 eprintln!("host profile: write failed: {error}");

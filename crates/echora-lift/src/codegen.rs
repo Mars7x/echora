@@ -52,6 +52,8 @@ pub struct Translation {
     pub truncated: bool,
     /// Recovered jump tables: BR address -> number of distinct case targets.
     pub jump_tables: BTreeMap<u64, usize>,
+    /// Every recovered jump-table case target (reached by an indirect branch).
+    pub indirect_targets: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -197,6 +199,7 @@ pub fn discover_with_tables(
     let mut all_entries = entries.to_vec();
     let mut deferred_queued = deferred.is_empty();
     let mut jump_tables = BTreeMap::new();
+    let mut indirect_targets = BTreeSet::new();
     loop {
         let pc = match pending.pop_front() {
             Some(pc) => pc,
@@ -232,6 +235,7 @@ pub fn discover_with_tables(
             if !targets.is_empty() {
                 jump_tables.insert(pc, targets.len());
                 starts.extend(targets.iter().copied());
+                indirect_targets.extend(targets.iter().copied());
             }
             successors.extend(targets);
         }
@@ -283,6 +287,7 @@ pub fn discover_with_tables(
         unresolved_targets: unresolved.into_iter().collect(),
         truncated,
         jump_tables,
+        indirect_targets,
     })
 }
 
@@ -2177,21 +2182,162 @@ fn traced_pcs() -> &'static std::collections::BTreeSet<u64> {
 fn emit_block_cases(output: &mut String, blocks: &[BasicBlock], check_entry: bool) {
     for block in blocks {
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
-        if traced_pcs().contains(&block.start) {
-            output.push_str("                m.trace_hit();\n");
-        }
-        let count = block.instructions.len();
-        for (index, instruction) in block.instructions.iter().enumerate() {
-            let block_size = (index == 0).then_some(count);
-            emit_instruction(
-                output,
-                instruction,
-                index + 1 == count,
-                block_size,
-                check_entry,
-            );
-        }
+        emit_block_body(output, block, check_entry);
         output.push_str("            }\n");
+    }
+}
+
+fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool) {
+    if traced_pcs().contains(&block.start) {
+        output.push_str("                m.trace_hit();\n");
+    }
+    let count = block.instructions.len();
+    for (index, instruction) in block.instructions.iter().enumerate() {
+        let block_size = (index == 0).then_some(count);
+        emit_instruction(
+            output,
+            instruction,
+            index + 1 == count,
+            block_size,
+            check_entry,
+        );
+    }
+}
+
+/// Blocks a split window runs inside their predecessor's arm instead of
+/// coming back through its dispatch loop: those with exactly one constant
+/// predecessor, in the same window, that nothing else can enter. Entries
+/// (function starts and other roots), jump-table targets and the block
+/// after anything that continues through the dispatcher (a call, an
+/// indirect branch, an SVC: the host resumes there) keep their own arm, and
+/// so does every block a host boundary can resume at, since only arms set
+/// `next_pc` before the loop's boundary check.
+fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
+    use Instruction::*;
+    let starts: BTreeSet<u64> = translation.blocks.iter().map(|block| block.start).collect();
+    let mut entered: BTreeSet<u64> = translation.entries.iter().copied().collect();
+    entered.extend(translation.indirect_targets.iter().copied());
+    // Constant successor -> (its one predecessor so far, predecessor count).
+    let mut predecessors: BTreeMap<u64, (u64, usize)> = BTreeMap::new();
+    for block in &translation.blocks {
+        let last = block
+            .instructions
+            .last()
+            .expect("blocks have an instruction");
+        let next = last.pc.wrapping_add(4);
+        let constant = match &last.instruction {
+            Branch {
+                target,
+                link: false,
+            } => vec![*target],
+            BranchCond { target, .. }
+            | CompareBranch { target, .. }
+            | TestBranch { target, .. } => vec![*target, next],
+            instruction if instruction.ends_block() => {
+                entered.insert(next);
+                Vec::new()
+            }
+            Branch { link: true, .. } => {
+                entered.insert(next);
+                Vec::new()
+            }
+            _ => vec![next],
+        };
+        for target in constant {
+            let entry = predecessors.entry(target).or_insert((block.start, 0));
+            entry.1 += 1;
+        }
+    }
+    predecessors
+        .into_iter()
+        .filter(|&(target, (predecessor, count))| {
+            count == 1
+                && predecessor != target
+                && predecessor >> SPLIT_WINDOW_BITS == target >> SPLIT_WINDOW_BITS
+                && starts.contains(&target)
+                && !entered.contains(&target)
+        })
+        .map(|(target, _)| target)
+        .collect()
+}
+
+/// A split window's match arms: one per block that keeps an arm, each with
+/// its inlined successors written in place of `next_pc` assignments.
+fn emit_split_cases(output: &mut String, blocks: &[BasicBlock], inlined: &BTreeSet<u64>) {
+    let bodies: BTreeMap<u64, String> = blocks
+        .iter()
+        .map(|block| {
+            let mut body = String::new();
+            emit_block_body(&mut body, block, false);
+            (block.start, body)
+        })
+        .collect();
+    for block in blocks {
+        if inlined.contains(&block.start) {
+            continue;
+        }
+        writeln!(output, "            {:#x} => {{", block.start).unwrap();
+        expand_block(output, &bodies, inlined, block.start);
+        output.push_str("            }\n");
+    }
+}
+
+/// `start`'s body with each successor that is inlined here written out in
+/// place of its `next_pc` assignment. An inlined block stores its PC first:
+/// its first instruction relies on `m.cpu.pc` as an arm's does.
+fn expand_block(
+    output: &mut String,
+    bodies: &BTreeMap<u64, String>,
+    inlined: &BTreeSet<u64>,
+    start: u64,
+) {
+    let body = &bodies[&start];
+    let trimmed = body.trim_end_matches('\n');
+    let split = trimmed.rfind('\n').map_or(0, |at| at + 1);
+    let (head, last) = (&body[..split], &trimmed[split..]);
+    let here = |target: u64| inlined.contains(&target) && bodies.contains_key(&target);
+    let target = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+    let branch = |output: &mut String, next: u64| {
+        if here(next) {
+            writeln!(output, "                m.cpu.pc = {next:#x};").unwrap();
+            expand_block(output, bodies, inlined, next);
+        } else {
+            writeln!(output, "                next_pc = {next:#x};").unwrap();
+        }
+    };
+    output.push_str(head);
+    let statement = last.trim();
+    if let Some(next) = statement
+        .strip_prefix("next_pc = ")
+        .and_then(|rest| rest.strip_suffix(';'))
+        .and_then(target)
+        .filter(|&next| here(next))
+    {
+        branch(output, next);
+        return;
+    }
+    let conditional = statement
+        .strip_prefix("next_pc = if ")
+        .and_then(|rest| rest.strip_suffix(" };"))
+        .and_then(|rest| {
+            let (condition, arms) = rest.split_once(" { ")?;
+            let (taken, rest) = arms.split_once(" } else { ")?;
+            let (taken, other) = (target(taken)?, target(rest)?);
+            (!condition.contains('{')).then_some((condition, taken, other))
+        })
+        .filter(|&(_, taken, other)| here(taken) || here(other));
+    match conditional {
+        Some((condition, taken, other)) => {
+            writeln!(output, "                if {condition} {{").unwrap();
+            branch(output, taken);
+            output.push_str("                } else {\n");
+            branch(output, other);
+            output.push_str("                }\n");
+        }
+        None => {
+            output.push_str(last);
+            output.push('\n');
+        }
     }
 }
 
@@ -2236,6 +2382,7 @@ pub fn emit_rust_split_to<E>(
         }
     }
     let shift = region_bits - SPLIT_WINDOW_BITS;
+    let inlined = inlined_blocks(translation);
     let mut root = format!(
         "// Generated from user-provided executable bytes. Keep this file local.\n\
          use echora_guest::{{Core, Trap, WindowFn}};\n\n\
@@ -2264,7 +2411,7 @@ pub fn emit_rust_split_to<E>(
         // SVCs, which leave the window: one execute check on entry covers
         // every block run before it returns.
         let mut cases = String::new();
-        emit_block_cases(&mut cases, blocks, false);
+        emit_split_cases(&mut cases, blocks, &inlined);
         writeln!(
             cases,
             "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
@@ -2790,6 +2937,48 @@ mod tests {
         assert!(window[..call].rfind("m.cpu.nzcv = r.fl.nzcv;").is_some());
         assert!(window[call..].contains("r.fl.nzcv = m.cpu.nzcv;"));
         assert!(window.ends_with("    m.cpu.nzcv = r.fl.nzcv;\n    result\n}\n"));
+    }
+
+    #[test]
+    fn split_windows_inline_single_predecessor_blocks() {
+        // CBZ X0, +0xc; ADD X1, X1, #1; B +8; ADD X2, X2, #1; RET: both arms
+        // of the CBZ have it as their only predecessor and run inside its
+        // arm; the join at 0x1010 (two predecessors) keeps its own arm.
+        let translation = discover(
+            &[region(&[
+                0xb400_0060,
+                0x9100_0421,
+                0x1400_0002,
+                0x9100_0442,
+                0xd65f_03c0,
+            ])],
+            &[0x1000],
+            8,
+        )
+        .unwrap();
+        let inlined = inlined_blocks(&translation);
+        assert_eq!(inlined, BTreeSet::from([0x1004, 0x100c]));
+        let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
+        let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
+        assert!(window.contains("0x1000 => {") && window.contains("0x1010 => {"));
+        assert!(!window.contains("0x1004 => {") && !window.contains("0x100c => {"));
+        assert!(window.contains("m.cpu.pc = 0x1004;") && window.contains("m.cpu.pc = 0x100c;"));
+        assert!(window.contains("m.tick_block_at(0x1004, 2)?;"));
+        assert_eq!(window.matches("next_pc = 0x1010;").count(), 2);
+        assert!(!window.contains("next_pc = if"));
+    }
+
+    #[test]
+    fn split_windows_keep_arms_after_calls() {
+        // BL +8; ADD X1, X1, #1; RET: the block after the call is where the
+        // callee's return resumes, so it keeps an arm.
+        let translation = discover(
+            &[region(&[0x9400_0002, 0x9100_0421, 0xd65f_03c0])],
+            &[0x1000],
+            8,
+        )
+        .unwrap();
+        assert!(!inlined_blocks(&translation).contains(&0x1004));
     }
 
     #[test]
