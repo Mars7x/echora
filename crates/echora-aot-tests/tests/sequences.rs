@@ -50,21 +50,33 @@ fn reference(entry: u64, state: &mut State) -> Option<()> {
     }
 }
 
-fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<State, Trap> {
+/// Runs a sequence natively. With `slice`, the host boundary comes every
+/// `slice` instructions (rounded to blocks) and execution resumes through
+/// the dispatcher, as after a scheduler switch.
+fn run_lifted(
+    m: &mut Machine,
+    entry: u64,
+    state: &State,
+    slice: Option<u64>,
+    boundaries: &mut u64,
+) -> Result<State, Trap> {
     m.core.cpu.regs = state.x;
     m.core.cpu.sp = state.sp;
     m.core.cpu.nzcv = state.nzcv;
     m.core.cpu.pc = entry;
     m.memory.write(DATA, &state.memory).expect("data is mapped");
     m.core.spin_polls = 0;
+    let next_check = |steps: u64| slice.map_or(u64::MAX, |slice| steps + slice);
+    m.core.host_check_at = next_check(m.core.steps);
     let trap = loop {
         match sequence_code::dispatch(&mut m.core) {
             Ok(()) => continue,
-            // A CAS that cannot change memory counts as a spin poll; resume
-            // after the slice ends, as the host would.
+            // The end of a slice, or (after CASes that cannot change
+            // memory) a spin poll: resume, as the host would.
             Err(Trap::HostBoundary) => {
+                *boundaries += 1;
                 m.core.spin_polls = 0;
-                m.core.host_check_at = u64::MAX;
+                m.core.host_check_at = next_check(m.core.steps);
             }
             Err(trap) => break trap,
         }
@@ -98,6 +110,17 @@ fn listing(entry: u64) -> String {
 
 #[test]
 fn lifted_sequences_match_the_reference() {
+    check_sequences(None);
+}
+
+/// The same sequences with one- to three-instruction slices: nearly every
+/// block boundary returns to the host and resumes through `dispatch`.
+#[test]
+fn lifted_sequences_resume_after_host_boundaries() {
+    check_sequences(Some(3));
+}
+
+fn check_sequences(slices: Option<u64>) {
     let words = sequence_code::WORDS;
     let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
     let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -107,6 +130,7 @@ fn lifted_sequences_match_the_reference() {
     let memory: Vec<u8> = (0..DATA_SIZE).map(|_| random.next() as u8).collect();
     let mut failures = Vec::new();
     let mut runs = 0;
+    let mut boundaries = 0;
     for &entry in sequence_code::ENTRIES {
         for _ in 0..STATES_PER_SEQUENCE {
             let mut before = State {
@@ -120,7 +144,11 @@ fn lifted_sequences_match_the_reference() {
             let mut expected = before.clone();
             let reference = reference(entry, &mut expected);
             runs += 1;
-            let problem = match (reference, run_lifted(&mut m, entry, &before)) {
+            let slice = slices.map(|longest| 1 + random.next() % longest);
+            let problem = match (
+                reference,
+                run_lifted(&mut m, entry, &before, slice, &mut boundaries),
+            ) {
                 (Some(()), Ok(actual)) if actual == expected => continue,
                 (Some(()), Ok(actual)) => difference(&expected, &actual),
                 (Some(()), Err(trap)) => format!("lifted trapped: {trap:?}"),
@@ -152,12 +180,16 @@ fn lifted_sequences_match_the_reference() {
         .count();
     println!(
         "{} sequences ({} instructions, {branches} branches, {memory_instructions} memory \
-         accesses), {runs} runs, {} mismatching sequences",
+         accesses), {runs} runs, {boundaries} host boundaries, {} mismatching sequences",
         sequence_code::ENTRIES.len(),
         words.len(),
         failures.len()
     );
     assert!(branches > 0 && memory_instructions > 0);
+    assert!(
+        slices.is_none() || boundaries > runs as u64,
+        "slices must end often"
+    );
     assert!(
         failures.is_empty(),
         "{} mismatches:\n{}",
