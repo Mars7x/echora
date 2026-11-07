@@ -156,6 +156,8 @@ struct ContextSwitch {
 const KERNEL_VIRTUAL_ADDRESS_BASE: u64 = 0xffff_ff80_0000_0000;
 const KERNEL_VIRTUAL_ADDRESS_END: u64 = 0xffff_ffff_ffe0_0000;
 const MUTEX_WAIT_MASK: u32 = 0x4000_0000;
+/// The Switch 2's six application cores (affinity mask bits 0-5).
+const APPLICATION_CORES: u64 = 0x3f;
 /// Thread-local region fields after the IPC message buffer.
 const TLS_DISABLE_COUNT: u64 = 0x100;
 const TLS_INTERRUPT_FLAG: u64 = 0x102;
@@ -1645,19 +1647,30 @@ impl Machine {
     fn next_runnable_thread(&self, after: u64, exclude: Option<u64>) -> Option<u64> {
         let main =
             (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
-        // With several workers each is one of the three application cores,
-        // as on Horizon: it runs only threads whose affinity mask names its
-        // core, and the best (lowest) priority first. Threads the game pins
-        // to one core then never run at once, which its per-core data
-        // relies on. A mask naming none of the three is allowed anywhere.
+        // With several workers each runs a fixed set of the application
+        // cores (see `worker_guest_cores`), as on Horizon: only threads
+        // whose affinity mask names one of them, the best (lowest) priority
+        // first. A thread pinned to one core then always runs on one worker
+        // and never migrates, which the game's per-core data relies on. A
+        // mask naming no application core is allowed anywhere.
         // ECHORA_ANY_CORE / ECHORA_FLAT_PRIORITY (diagnostics): schedule as
         // one worker does, ignoring affinity or priority.
         let any_core = crate::nvn::debug_var_os("ECHORA_ANY_CORE").is_some();
         let flat_priority = crate::nvn::debug_var_os("ECHORA_FLAT_PRIORITY").is_some();
         let one_core = crate::nvn::debug_var_os("ECHORA_ONE_CORE").is_some();
+        // ECHORA_PARALLEL_THREADS=ID,... (diagnostic): only those threads run
+        // on worker 1, all others on worker 0.
+        let split = crate::nvn::debug_var_os("ECHORA_PARALLEL_THREADS");
         let allowed = |id: u64| -> bool {
             if one_core {
                 return self.worker_core.is_none_or(|core| core == 0);
+            }
+            if let (Some(list), Some(worker)) = (split, self.worker_core) {
+                let listed = list
+                    .to_string_lossy()
+                    .split(',')
+                    .any(|item| item.trim().parse() == Ok(id));
+                return listed == (worker == 1);
             }
             let Some(core) = self.worker_core.filter(|_| !any_core) else {
                 return true;
@@ -1668,7 +1681,7 @@ impl Machine {
                 self.threads.affinity(id).map(|(_, mask)| mask)
             }
             .unwrap_or(u64::MAX);
-            mask & 0b111 == 0 || mask >> core & 1 != 0
+            mask & APPLICATION_CORES == 0 || mask & self.worker_guest_cores(core) != 0
         };
         let priority = |id: u64| -> u8 {
             if self.worker_core.is_none() || flat_priority {
@@ -1750,7 +1763,9 @@ impl Machine {
             let Some(thread) = thread else { continue };
             let running = priority(self, thread);
             let wanted = waiting.iter().any(|&(waiting, mask)| {
-                waiting < running && (mask & 0b111 == 0 || mask >> core & 1 != 0)
+                waiting < running
+                    && (mask & APPLICATION_CORES == 0
+                        || mask & self.worker_guest_cores(core as u8) != 0)
             });
             if wanted {
                 if let Some(flag) = self.preempt_flags.get(core) {
@@ -1760,6 +1775,37 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// The application cores worker `worker` runs: core `c` belongs to
+    /// worker `c % workers`, so each core has exactly one worker.
+    fn worker_guest_cores(&self, worker: u8) -> u64 {
+        let workers = self.core_threads.len().max(1) as u64;
+        (0..u64::from(APPLICATION_CORES.count_ones()))
+            .filter(|core| core % workers == u64::from(worker))
+            .fold(0, |mask, core| mask | 1 << core)
+    }
+
+    /// The core thread `id` runs on while on worker `worker`: the first of
+    /// that worker's cores its affinity mask names, else the first core of
+    /// its mask (a diagnostic placement), else the worker's first core. The
+    /// game indexes per-core data by this number, so it is always a core
+    /// the thread may run on.
+    fn guest_core_on_worker(&self, id: u64, worker: u8) -> u8 {
+        let mask = if id == self.layout.main_thread_id {
+            self.main_thread_affinity.1
+        } else {
+            self.threads.affinity(id).map_or(u64::MAX, |(_, mask)| mask)
+        };
+        let cores = self.worker_guest_cores(worker);
+        let usable = if mask & cores != 0 {
+            mask & cores
+        } else if mask & APPLICATION_CORES != 0 {
+            mask & APPLICATION_CORES
+        } else {
+            cores
+        };
+        usable.trailing_zeros() as u8
     }
 
     /// Whether a thread no worker runs could run on some core (for parked
@@ -2016,6 +2062,25 @@ impl Machine {
             })?;
         if next == self.core.current_thread_id {
             return Ok(()); // Never rewind the active CPU to its saved snapshot.
+        }
+        // ECHORA_NO_TIMESLICE (experiment): as on Horizon, a thread keeps
+        // its core until it blocks, yields or a better priority preempts it;
+        // only priority 59 rotates.
+        if self.parallel && crate::nvn::debug_var_os("ECHORA_NO_TIMESLICE").is_some() {
+            let current = self.core.current_thread_id;
+            let priority = |id: u64| {
+                if id == self.layout.main_thread_id {
+                    self.main_thread_effective_priority
+                } else {
+                    self.threads.priority(id).unwrap_or(u8::MAX)
+                }
+            };
+            if self.thread_state(current) == Some(ThreadState::Runnable)
+                && priority(current) != 59
+                && priority(next) >= priority(current)
+            {
+                return Ok(());
+            }
         }
         let cpu = self.prepare_dispatch_cpu(next)?;
         if self.core.current_thread_id == self.layout.main_thread_id {
@@ -2304,7 +2369,10 @@ impl Machine {
         dispatch: &(impl Fn(&mut Core) -> Result<(), Trap> + Sync),
     ) -> Result<(), Trap> {
         // One worker per application core.
-        let workers = self.layout.workers.min(3);
+        let workers = self
+            .layout
+            .workers
+            .min(APPLICATION_CORES.count_ones() as usize);
         let global = self.core.steps;
         let idle = |machine: &Machine| {
             let mut core = Core::new(machine.memory.view());
@@ -3263,7 +3331,7 @@ impl Machine {
                 // threads must never get the same number while running at
                 // once.
                 let processor = match self.worker_core {
-                    Some(core) => core,
+                    Some(worker) => self.guest_core_on_worker(self.core.current_thread_id, worker),
                     None => self.thread_processor_id(self.core.current_thread_id)?,
                 };
                 self.core.cpu.regs[0] = u64::from(processor);
@@ -4352,6 +4420,12 @@ impl Worker {
                 match resumed {
                     Ok(()) => {
                         machine.parked_workers -= 1;
+                        if crate::nvn::debug_var_os("ECHORA_TRACE_WORKERS").is_some() {
+                            eprintln!(
+                                "worker {} resumes thread {}",
+                                self.index, machine.core.current_thread_id
+                            );
+                        }
                         self.swap_out(&mut machine, true);
                         break;
                     }

@@ -108,7 +108,7 @@ impl Backend {
     /// A backend when ECHORA_GPU is set, the recompiler is linked and a
     /// device with shader objects exists.
     pub fn create() -> Result<Option<Self>, String> {
-        if super::debug_var_os("ECHORA_GPU").is_none() {
+        if super::debug_var_os("ECHORA_GPU").is_none_or(|value| value == "0") {
             return Ok(None);
         }
         if !shader::AVAILABLE {
