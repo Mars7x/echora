@@ -537,10 +537,11 @@ pub fn decode(word: u32, pc: u64) -> Instruction {
         return Nop;
     }
     // PRFM (immediate, literal, register) and PRFUM: prefetch hints have no
-    // architectural effect, including for unmapped addresses.
+    // architectural effect, including for unmapped addresses. The register
+    // form's extend option must be UXTW, LSL, SXTW or SXTX (bit 14 set).
     if word & 0xffc0_0000 == 0xf980_0000
         || word & 0xff00_0000 == 0xd800_0000
-        || word & 0xffe0_0c00 == 0xf8a0_0800
+        || (word & 0xffe0_0c00 == 0xf8a0_0800 && word & (1 << 14) != 0)
         || word & 0xffe0_0c00 == 0xf880_0000
     {
         return Nop;
@@ -1353,6 +1354,17 @@ pub fn disassemble(word: u32, _pc: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_prefetch_needs_an_allocated_extend_option() {
+        // PRFM PLIL2KEEP, [X0, X2, LSL #3] (option 011) is a hint.
+        assert_eq!(decode(0xf8a2_7807, 0x1000), Instruction::Nop);
+        // Options 000, 001, 100 and 101 (bit 14 clear) are unallocated.
+        for option in [0b000, 0b001, 0b100, 0b101] {
+            let word = 0xf8a2_0807 | (option << 13);
+            assert_eq!(decode(word, 0x1000), Instruction::Unsupported, "{word:#x}");
+        }
+    }
 
     #[test]
     fn physical_counter_read_uses_only_the_exact_cntpct_encoding() {
