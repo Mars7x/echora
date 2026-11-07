@@ -2,10 +2,16 @@
 
 - The game runs as far as the intro movie; gameplay has not been reached.
   Each unimplemented operation still stops the run with a report.
-- Runs are far below full speed (test runs average about 4 to 13 presented
-  frames per second, including startup and debugging instrumentation). By
-  default every guest thread runs on one host thread; `ECHORA_WORKERS` runs
-  them on several, which is not yet the default or measured for OoT.
+- **Echora is not ready for stable gameplay.** Runs can hang, crash or
+  render incorrectly, and saves are untested.
+- Runs are far below full speed: the intro movie plays at about 6 frames
+  per second against the game's 30. By default every guest thread runs on
+  one host thread, which does about 87% of the work. `ECHORA_WORKERS` runs
+  them on up to six host threads, one per application core, but those runs
+  still crash within about half a minute.
+- Of the game's own library functions, only the zlib and zstd wrappers are
+  replaced with host code; its streaming zstd decoder (about an eighth of
+  run time) still runs translated.
 - Guest memory reaches host memory directly on Linux and Windows (10 1803 or
   later), which need 4 KiB host pages. macOS uses a checked backend that
   looks every guest access up in a table, which is slower.

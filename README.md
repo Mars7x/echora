@@ -23,7 +23,7 @@ display, input and audio, rather than emulating the console.
 
 ## Status
 
-Latest measured state (2026-11-06, update `0400486024DEC000` v131072,
+Latest measured state (2026-11-07, update `0400486024DEC000` v131072,
 display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
 
 - **The game runs.** The whole of the game's code is translated ahead of
@@ -31,13 +31,18 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
   crates), compiled natively, and run on Echora's runtime. It boots, draws
   on the host GPU through Vulkan and presents frames: test runs go through
   3,000 presented frames, show the title logo and play the intro movie
-  (AV1, decoded on the host).
+  (AV1, decoded on the host). The movie renders in colour.
 - **Not playable yet.** Runs have been seen as far as the intro movie;
   gameplay has not been reached. The mesh and task shaders that gameplay
-  scenes need have no draw path in the runtime yet. Runs are far below full
-  speed: test runs average about 4 to 13 presented frames per second,
-  including startup and debugging instrumentation, with every guest thread
-  on one host thread by default.
+  scenes need have no draw path in the runtime yet.
+- **Far below full speed.** The intro movie runs at about 6 frames per
+  second against the game's 30; the first 1,200 frames take about 165 s,
+  down from 323 s. Every guest thread runs on one host thread by default,
+  and that thread does most of the work, so faster translated code alone
+  cannot reach full speed. Running guest threads on several host threads
+  (`ECHORA_WORKERS`, up to the console's six application cores) was 1.9
+  times faster in a partial test, but full parallel runs still crash
+  within half a minute, so it stays off by default.
 - **Shaders.** The console's GPU programs are translated to SPIR-V by the
   Lichii shader recompiler with Echora's patches. Of the 6,074 shader stages
   OoT reached in a test run, 5,960 translate and compile on the driver.

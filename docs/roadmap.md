@@ -17,18 +17,18 @@ Each phase completes only on the evidence named here, not when code exists.
 | 10. In-game settings | Dropped: settings are changed in the launcher, with no in-game interface. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | — |
 | 12. High frame rates | No timing, physics or animation regressions. | — |
-| 13. Performance | Reproducible benchmarks show gains without regressions. | — |
+| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. 1,200-frame runs are checked against baseline captures: 323 s down to about 165 s with identical frames (contiguous texture swizzling, compute storage kept on the GPU, guest memory imported into Vulkan, frames submitted without waiting). Several workers are not yet stable. |
 | 14. Other platforms | Real game code on another OS or CPU without core rewrites. | — |
 | 15. Release quality | Clean build, configure, launch with user-supplied data. | — |
 
 ## Next steps
 
-1. Confirm with frame captures that the Lichii shader recompiler, which
-   translates the compute stages PokeDinner skipped, renders the intro
-   movie's colours and the menus correctly.
-2. Translate the remaining failing shader stages (stage-buffer reads
-   outside task and mesh programs, gather forms).
-3. Add the mesh and task draw path (`DrawMeshTasks`, `VK_EXT_mesh_shader`)
+1. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
+   game's per-core job threads run in parallel, which looks like one job
+   claimed by two threads. This is the largest speed gain available.
+2. Add the mesh and task draw path (`DrawMeshTasks`, `VK_EXT_mesh_shader`)
    that gameplay scenes need, and advance to gameplay.
-4. Measure and raise the frame rate, starting with guest threads on several
-   host threads (`ECHORA_WORKERS`).
+3. Translate the remaining failing shader stages (stage-buffer reads
+   outside task and mesh programs, gather forms).
+4. Reduce the cost of dispatching between translated blocks (structured
+   code generation), the largest remaining single-thread cost.

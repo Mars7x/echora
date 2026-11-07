@@ -76,12 +76,16 @@ so give test runs a larger one. The launcher starts the game with no limit. Usef
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_CAPTURE_EVERY=N` | Save the first and every N-th presented frame as PNGs in `run-<time>-frames/` beside the report. |
+| `ECHORA_CAPTURE_EVERY=N` | Save the first and every N-th presented frame as PNGs in `run-<time>-frames/` beside the report (`0` turns it off). |
 | `ECHORA_STOP_PRESENT=N` | End the run, with its report, at presented frame N. |
 | `ECHORA_WALL_SECONDS=N` | End an idle run after N host seconds, so the report shows what every thread waits on. |
 | `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames (headless runs through menus). |
 | `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for `translate-dump` and `shader-check` in `echora-gpu`. |
-| `ECHORA_WORKERS=N` | Run guest threads on N host threads (default 1). |
+| `ECHORA_WORKERS=N` | Run guest threads on N host threads, up to 6 (default 1). Each worker owns the application cores `c` with `c % N` equal to its index. Not yet stable: runs crash within about half a minute. |
+| `ECHORA_GPU=0` | Run without the GPU backend. |
+| `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread on a user-time timer and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |
+| `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |
+| `ECHORA_SERIAL_GUEST`, `ECHORA_ONE_CORE`, `ECHORA_ANY_CORE`, `ECHORA_FLAT_PRIORITY`, `ECHORA_PARALLEL_THREADS`, `ECHORA_EXCLUSIVE_THREADS`, `ECHORA_NO_TIMESLICE`, `ECHORA_TRACE_WORKERS` | Diagnostics for bisecting multi-worker faults. |
 | `ECHORA_SCHEDULER_SLICE`, `ECHORA_VIRTUAL_CLOCK`, `ECHORA_NO_HLE` | Scheduling and timing experiments. |
 
 Keep game files out of the repository; `.gitignore` excludes `*.nup`, NSO and
