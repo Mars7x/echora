@@ -892,6 +892,7 @@ fn loop_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{image:#x?};").expect("write");
     writeln!(out, "pub const PROGRAMS: &[u64] = &{programs:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
