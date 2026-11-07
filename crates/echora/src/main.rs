@@ -1,6 +1,7 @@
 //! The `echora` command-line front end.
 
 mod host_paths;
+mod prepare;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -95,6 +96,28 @@ enum Command {
         /// Guest bytes per generated crate, as a power of two.
         #[arg(long, default_value_t = 16)]
         region_bits: u32,
+    },
+    /// Set the game up to run: fetch the shader recompiler, lift the game
+    /// and build its translation. Does nothing when this build of Echora
+    /// already prepared it.
+    Prepare {
+        input: PathBuf,
+        /// Cache root (as for `import`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Build jobs (default: what the processors and memory allow).
+        #[arg(long, short)]
+        jobs: Option<usize>,
+        /// Only report whether the game is prepared (exit status 0 if so).
+        #[arg(long)]
+        check: bool,
+        /// Prepare again even when already prepared.
+        #[arg(long)]
+        force: bool,
+        /// Stop when standard input closes (for a front end that keeps it
+        /// open while it runs).
+        #[arg(long)]
+        stop_with_stdin: bool,
     },
     /// Run the built translation of the input's program (see `lift`).
     Run {
@@ -276,7 +299,45 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cache,
             limit,
             region_bits,
-        } => lift(input, cache, limit, region_bits)?,
+        } => {
+            lift(input, cache, limit, region_bits)?;
+        }
+        Command::Prepare {
+            input,
+            cache,
+            jobs,
+            check,
+            force,
+            stop_with_stdin,
+        } => {
+            if stop_with_stdin {
+                prepare::stop_with_stdin();
+            }
+            let cache = match cache {
+                Some(c) => c,
+                None => host_paths::cache_dir()?,
+            };
+            let (_, translation) = translation_dir(&input, &cache)?;
+            let ready = prepare::is_ready(&translation);
+            if check {
+                println!("{}", if ready { "prepared" } else { "not prepared" });
+                return Ok(if ready {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                });
+            }
+            if !ready || force {
+                prepare::step("fetch");
+                prepare::fetch_shader_sources(&shader_sources(&cache))?;
+                prepare::step("lift");
+                let lifted = lift(input, Some(cache), 20_000_000, 16)?;
+                prepare::step("build");
+                prepare::build(&lifted, jobs.unwrap_or_else(prepare::default_jobs))?;
+                prepare::mark_ready(&lifted)?;
+            }
+            println!("{}ready", prepare::PREFIX);
+        }
         Command::Run {
             input,
             cache,
@@ -286,23 +347,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Some(c) => c,
                 None => host_paths::cache_dir()?,
             };
-            let source = ContentSource::open(&input)?;
-            let inv = source.inventory()?;
-            let Some(pkg) = inv.program_package else {
-                bail!("the input contains no package with an ExeFS");
-            };
-            let exefs = source.materialize_exefs(&inv, pkg, &cache)?;
-            let key = inv.packages[pkg]
-                .exefs_key
-                .as_ref()
-                .context("program package has no ExeFS key")?;
-            let translation = cache.join("translations").join(key);
-            let runner = translation
-                .join("target/release/echora-run")
-                .with_extension(std::env::consts::EXE_EXTENSION);
+            let (exefs, translation) = translation_dir(&input, &cache)?;
+            let runner = prepare::runner_path(&translation);
             if !runner.is_file() {
                 bail!(
-                    "no built translation at {}; run `echora lift` and `cargo build --release -p echora-run` there",
+                    "no built translation at {}; run `echora prepare` (or `echora lift` and `cargo build --release -p echora-run` there)",
                     translation.display()
                 );
             }
@@ -577,7 +626,28 @@ fn write_if_changed(path: &std::path::Path, contents: &str) -> std::io::Result<b
     Ok(true)
 }
 
-fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<()> {
+/// The input program's ExeFS in `cache`, and where its translation lives.
+fn translation_dir(input: &std::path::Path, cache: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
+    let source = ContentSource::open(input)?;
+    let inv = source.inventory()?;
+    let Some(pkg) = inv.program_package else {
+        bail!("the input contains no package with an ExeFS");
+    };
+    let exefs = source.materialize_exefs(&inv, pkg, cache)?;
+    let key = inv.packages[pkg]
+        .exefs_key
+        .as_ref()
+        .context("program package has no ExeFS key")?;
+    Ok((exefs, cache.join("translations").join(key)))
+}
+
+/// The shader recompiler sources: `ECHORA_SHADER_SRC`, else `shader-src`
+/// in the cache, where `scripts/fetch-shader-sources.sh` puts them.
+fn shader_sources(cache: &std::path::Path) -> PathBuf {
+    std::env::var_os("ECHORA_SHADER_SRC").map_or_else(|| cache.join("shader-src"), PathBuf::from)
+}
+
+fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<PathBuf> {
     use echora_lift::codegen::emit_rust_split_to;
 
     if !(10..=24).contains(&region_bits) {
@@ -751,12 +821,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     // The shader recompiler is built into the runtime when its fetched
     // sources are present (scripts/fetch-shader-sources.sh): the workspace
     // passes them on, so a plain `cargo build` of the runner can draw.
-    let shader_sources = std::env::var_os("ECHORA_SHADER_SRC")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let fetched = d.cache.join("shader-src");
-            fetched.is_dir().then_some(fetched)
-        });
+    let shader_sources = Some(shader_sources(&d.cache)).filter(|dir| dir.is_dir());
     let mut config = format!("[build]\nrustflags = {flags:?}\n");
     if let Some(sources) = shader_sources {
         config.push_str(&format!(
@@ -776,7 +841,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         emit_time.as_secs_f64()
     );
     println!("translation: {}", out.display());
-    Ok(())
+    Ok(out)
 }
 
 /// Regions per shared library: about 500 MB of code each at the current

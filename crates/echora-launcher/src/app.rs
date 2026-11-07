@@ -22,6 +22,7 @@ use gpui::{
 use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
 use crate::nav::{Activate, Direction, Press as _, Stops};
+use crate::prepare;
 use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
@@ -159,6 +160,11 @@ struct Launcher {
     running: bool,
     /// The game being installed and how far the copy has got.
     installing: Option<(SharedString, Arc<install::Progress>)>,
+    /// The game being prepared to run (translated and built), before its
+    /// first start.
+    preparing: Option<Arc<prepare::Preparation>>,
+    /// Whether the selected game starts right away; `None` until checked.
+    prepared: Option<bool>,
 }
 
 pub fn run() -> ExitCode {
@@ -231,7 +237,12 @@ fn skip_to_game() -> Option<ExitCode> {
     if !settings.launcher.skip {
         return None;
     }
-    let mut command = game_command(&last_game()?, settings_path.as_deref())?;
+    let game = last_game()?;
+    // A game that still needs building opens the launcher, which shows it.
+    if !prepare::is_prepared(prepare::command(&echora_binary()?, &game, true)) {
+        return None;
+    }
+    let mut command = game_command(&game, settings_path.as_deref())?;
     match command.status() {
         Ok(status) if status.success() => Some(ExitCode::SUCCESS),
         Ok(status) => {
@@ -268,16 +279,20 @@ fn last_game() -> Option<PathBuf> {
         .filter(|path| path.exists())
 }
 
+/// The `echora` binary next to the launcher.
+fn echora_binary() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name(format!("echora{}", std::env::consts::EXE_SUFFIX)))
+        .filter(|path| path.is_file())
+}
+
 /// `echora run GAME` using the `echora` binary next to the launcher, with
 /// no instruction budget: `run` stops test runs after a billion guest
 /// instructions by default (a few seconds), but a player's game runs until
 /// they close it.
 fn game_command(game: &Path, settings: Option<&Path>) -> Option<Command> {
-    let echora = std::env::current_exe()
-        .ok()
-        .map(|exe| exe.with_file_name(format!("echora{}", std::env::consts::EXE_SUFFIX)))
-        .filter(|path| path.is_file())?;
-    let mut command = Command::new(echora);
+    let mut command = Command::new(echora_binary()?);
     command.args(run_arguments(game));
     game_environment(&mut command, settings, |name| {
         std::env::var_os(name).is_some()
@@ -348,6 +363,8 @@ impl Launcher {
             notice_generation: 0,
             running: false,
             installing: None,
+            preparing: None,
+            prepared: None,
         };
         // Read the remembered game off the UI thread so the window opens at
         // once; the title fills in when the game has been read.
@@ -361,7 +378,10 @@ impl Launcher {
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.loading = false;
                     match game {
-                        Ok(game) => this.game = Some(game),
+                        Ok(game) => {
+                            this.game = Some(game);
+                            this.check_prepared(cx);
+                        }
                         Err(message) => this.notify(message, cx),
                     }
                     if this.sheet.is_none() {
@@ -389,7 +409,7 @@ impl Launcher {
     fn default_focus(&self, cx: &App) -> FocusHandle {
         if self.sheet.is_some() {
             self.sheet_focus.clone()
-        } else if self.installing.is_some() || self.loading {
+        } else if self.installing.is_some() || self.preparing.is_some() || self.loading {
             self.focus.clone()
         } else if self.game.is_some() {
             self.stops.handle("play", cx)
@@ -443,6 +463,7 @@ impl Launcher {
                 }
                 self.game = Some(game);
                 self.refocus = self.sheet.is_none();
+                self.check_prepared(cx);
             }
             Err(message) => self.notify(message, cx),
         }
@@ -473,7 +494,7 @@ impl Launcher {
     /// Copies the chosen NUP or dump into Echora's data folder on another
     /// thread, then switches to the installed copy.
     fn install_game(&mut self, source: PathBuf, cx: &mut Context<Self>) {
-        if self.running || self.installing.is_some() {
+        if self.running || self.installing.is_some() || self.preparing.is_some() {
             return;
         }
         let title = match read_game(&source) {
@@ -522,9 +543,97 @@ impl Launcher {
     }
 
     fn play(&mut self, _: &Play, _: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.sheet.is_some() {
+        if self.running || self.sheet.is_some() || self.preparing.is_some() {
             return;
         }
+        let Some(game) = &self.game else {
+            return;
+        };
+        let Some(echora) = echora_binary() else {
+            self.notify("The echora command wasn't found next to the launcher", cx);
+            return;
+        };
+        if !prepare::is_prepared(prepare::command(&echora, &game.path, true)) {
+            self.prepare_game(&echora, cx);
+        } else {
+            self.start_game(cx);
+        }
+    }
+
+    /// Asks in the background whether the selected game starts right away,
+    /// so its first start can say it will build first.
+    fn check_prepared(&mut self, cx: &mut Context<Self>) {
+        self.prepared = None;
+        let (Some(game), Some(echora)) = (&self.game, echora_binary()) else {
+            return;
+        };
+        let command = prepare::command(&echora, &game.path, true);
+        let path = game.path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { prepare::is_prepared(command) });
+        cx.spawn(async move |this, cx| {
+            let prepared = task.await;
+            let _ = this.update(cx, |this, cx| {
+                // Only if the same game is still selected.
+                if this.game.as_ref().is_some_and(|game| game.path == path) {
+                    this.prepared = Some(prepared);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Translates and builds the selected game with `echora prepare`,
+    /// showing its progress, then starts it.
+    fn prepare_game(&mut self, echora: &Path, cx: &mut Context<Self>) {
+        let Some(game) = &self.game else {
+            return;
+        };
+        let preparation = Arc::new(prepare::Preparation::default());
+        if let Err(error) = preparation.start(prepare::command(echora, &game.path, false)) {
+            self.notify(format!("Couldn't prepare the game: {error}"), cx);
+            return;
+        }
+        self.preparing = Some(preparation.clone());
+        // Play goes away while it builds, so focus moves to the launcher.
+        self.open_menu = None;
+        self.refocus = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let result = preparation.take_result();
+                let done = result.is_some();
+                let updated = this.update(cx, |this, cx| {
+                    if let Some(result) = result {
+                        this.preparing = None;
+                        this.refocus = this.sheet.is_none();
+                        match result {
+                            Ok(()) => {
+                                this.prepared = Some(true);
+                                this.start_game(cx);
+                            }
+                            Err(error) => {
+                                this.prepared = Some(false);
+                                this.notify(format!("Couldn't prepare the game: {error}"), cx);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if done || updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_game(&mut self, cx: &mut Context<Self>) {
         let Some(game) = &self.game else {
             return;
         };
@@ -1162,14 +1271,29 @@ impl Launcher {
                     (progress.fraction().clamp(0.0, 1.0) * 100.0) as u32
                 ),
             ),
-            (None, Some(game)) => (game.title.clone(), game.version.to_string()),
+            (None, Some(game)) => match (&self.preparing, self.prepared) {
+                (Some(preparation), _) => (game.title.clone(), preparation.step().describe()),
+                (None, Some(false)) => (
+                    game.title.clone(),
+                    format!(
+                        "{} · Builds before its first start, about an hour",
+                        game.version
+                    ),
+                ),
+                _ => (game.title.clone(), game.version.to_string()),
+            },
             (None, None) => return div().into_any_element(),
         };
         let (series, name) = split_title(&title);
-        let actions = if let Some((_, progress)) = &self.installing {
+        let progress = match (&self.installing, &self.preparing) {
+            (Some((_, progress)), _) => Some(progress.fraction()),
+            (None, Some(preparation)) => Some(preparation.step().fraction()),
+            (None, None) => None,
+        };
+        let actions = if let Some(fraction) = progress {
             div()
                 .w(u(320.0))
-                .child(ui::progress(progress.fraction()))
+                .child(ui::progress(fraction))
                 .into_any_element()
         } else {
             let active = self.sheet.is_none();

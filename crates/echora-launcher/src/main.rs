@@ -9,6 +9,7 @@ mod app;
 mod chrome;
 mod install;
 mod nav;
+mod prepare;
 mod ui;
 
 fn main() -> std::process::ExitCode {
