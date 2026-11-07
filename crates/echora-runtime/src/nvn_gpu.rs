@@ -752,11 +752,16 @@ impl Nvn {
     /// Debug aid: with ECHORA_GPU_DUMP set to a directory, every 300th
     /// present writes each color target as target-<present>-<texture>.ppm,
     /// to see where draws land when the presented image does not change.
+    /// ECHORA_GPU_DUMP_FROM=N starts at present N (past a long movie).
     pub(super) fn gpu_dump_targets(&mut self) -> Result<(), String> {
         let Some(directory) = super::debug_var_os("ECHORA_GPU_DUMP") else {
             return Ok(());
         };
-        if !self.presented_frames.is_multiple_of(300) {
+        let from = super::debug_var("ECHORA_GPU_DUMP_FROM")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if !self.presented_frames.is_multiple_of(300) || self.presented_frames < from {
             return Ok(());
         }
         let directory = std::path::PathBuf::from(directory);
