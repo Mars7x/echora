@@ -10,9 +10,18 @@
 //! * [`entry_windows`] maps every address control can enter a window at to
 //!   that window.
 //! * [`analyze_windows`] computes, for each window, its entries, dominators,
-//!   natural loop nesting, irreducible edges and, when the window is
-//!   reducible, a [`Structured`] tree of blocks, loops and ifs built with
-//!   Ramsey's algorithm from "Beyond Relooper" (the WebAssembly stackifier).
+//!   natural loop nesting, irreducible edges and a [`Structured`] tree of
+//!   blocks, loops and ifs built with Ramsey's algorithm from "Beyond
+//!   Relooper" (the WebAssembly stackifier). Irreducible parts (strongly
+//!   connected components entered at more than one block, found at every
+//!   loop nesting level) are collapsed first and become `Region`s, local
+//!   dispatch loops over their blocks nested in the tree, followed by a
+//!   `Switch` on where they exited; the collapsed graph is reducible, so
+//!   every window gets a tree. Node splitting is not done: a `Region` costs
+//!   a local `match` per block instead of duplicated code.
+//!   [`analyze_windows_with`] can also make every block an entry
+//!   ([`StructureOptions::resume_at_every_block`]) so structured code can
+//!   resume anywhere after a host boundary.
 //!
 //! Windows are the dispatch windows of code generation: the blocks whose
 //! start shares `start >> window_bits`.
@@ -134,17 +143,21 @@ pub struct EntryKinds {
     /// here. This is a resume point, not a control entry: it is reached by
     /// the call's own fall-through edge inside the window.
     pub return_address: bool,
+    /// A block made an entry by [`StructureOptions::resume_at_every_block`]:
+    /// execution may resume here after a host boundary.
+    pub resume: bool,
 }
 
 impl EntryKinds {
     /// Whether control (rather than only resumption after a call) can
-    /// enter here.
+    /// enter here, or the analysis was asked to allow resuming here.
     pub fn is_control(&self) -> bool {
         self.translation_entry
             || self.call_target
             || self.branch_from_outside
             || self.fallthrough_from_outside
             || self.unreferenced
+            || self.resume
     }
 
     fn any(&self) -> bool {
@@ -198,13 +211,19 @@ pub struct IrreducibleEdge {
     pub to: u64,
 }
 
-/// Structured code for a reducible window.
+/// Structured code for a window.
 ///
 /// Labels are counted from the innermost: `Br(0)` targets the closest
 /// enclosing `Block` or `Loop`. Leaving a `Block` with `Br` continues after
 /// it; `Br` to a `Loop` continues at its start; reaching the end of a
 /// `Loop` body falls out of it (in Rust: `'l: loop { body; break }`, with
 /// `continue 'l` for `Br`). `If` does not take a label.
+///
+/// The tree keeps a current next PC: the entry PC on entering the window,
+/// then wherever the last block's own control transfer went. `Dispatch`,
+/// `Region` and `Switch` read it. Irreducible parts of a window (cycles
+/// entered at more than one block) are `Region`s: a local dispatch loop
+/// over their blocks, nested in the tree like a block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum Structured {
     /// The instructions of the block starting here. Its final control
@@ -222,6 +241,17 @@ pub enum Structured {
     },
     /// Selects by the entry PC; only at the top of a multi-entry window.
     Dispatch(Vec<(u64, Structured)>),
+    /// Runs these blocks as a local dispatch loop (`loop { match next_pc
+    /// { ... } }`), starting at the current next PC, which is one of them,
+    /// until control goes to a PC outside them; that PC is then the
+    /// current next PC.
+    Region(Vec<u64>),
+    /// Selects by the current next PC: the first case whose PCs include it,
+    /// else `default`. Follows a `Region` with several exits.
+    Switch {
+        cases: Vec<(Vec<u64>, Structured)>,
+        default: Box<Structured>,
+    },
     Br(usize),
     /// Leave the window: to `Some(pc)` for a direct edge to code outside
     /// it, or `None` where the block computes the next PC itself (a return,
@@ -245,8 +275,19 @@ pub struct WindowAnalysis {
     pub loops: Vec<NaturalLoop>,
     /// Empty for a reducible window.
     pub irreducible: Vec<IrreducibleEdge>,
-    /// The structured form, for a reducible window.
+    /// Block starts of each irreducible part, run as a `Region`.
+    pub regions: Vec<Vec<u64>>,
+    /// The structured form. Every window has one; `None` would mean the
+    /// analysis failed.
     pub structure: Option<Structured>,
+}
+
+/// What the structure analysis may assume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructureOptions {
+    /// Make every block an entry, so structured code can resume anywhere
+    /// after a host boundary (each becomes a `Dispatch` case at the top).
+    pub resume_at_every_block: bool,
 }
 
 impl WindowAnalysis {
@@ -303,6 +344,15 @@ fn block_successors(block: &BasicBlock) -> (Vec<u64>, bool) {
 
 /// The analysis of every window, in window order.
 pub fn analyze_windows(translation: &Translation, window_bits: u32) -> Vec<WindowAnalysis> {
+    analyze_windows_with(translation, window_bits, StructureOptions::default())
+}
+
+/// [`analyze_windows`] with options.
+pub fn analyze_windows_with(
+    translation: &Translation,
+    window_bits: u32,
+    options: StructureOptions,
+) -> Vec<WindowAnalysis> {
     let starts: BTreeMap<u64, &BasicBlock> = translation
         .blocks
         .iter()
@@ -367,6 +417,7 @@ pub fn analyze_windows(translation: &Translation, window_bits: u32) -> Vec<Windo
                     if !entry.is_control() && !referenced.contains(&block.start) {
                         entry.unreferenced = true;
                     }
+                    entry.resume = options.resume_at_every_block;
                     entry.any().then_some((block.start, entry))
                 })
                 .collect();
@@ -392,6 +443,10 @@ enum Label {
 struct Graph {
     starts: Vec<u64>,
     successors: Vec<Vec<Edge>>,
+    /// The entry PC of each root edge.
+    root_pcs: Vec<u64>,
+    /// The blocks of each node that is a collapsed irreducible part.
+    regions: Vec<Option<Vec<u64>>>,
     /// Reverse postorder number of each reachable node.
     rpo: Vec<Option<usize>>,
     idom: Vec<usize>,
@@ -432,6 +487,8 @@ fn analyze_window(
             .chain(blocks.iter().map(|block| block.start))
             .collect(),
         successors,
+        root_pcs: Vec::new(),
+        regions: vec![None; blocks.len() + 1],
         rpo: Vec::new(),
         idom: Vec::new(),
         children: Vec::new(),
@@ -444,10 +501,15 @@ fn analyze_window(
     // cycle reached only indirectly has internal predecessors).
     let mut retreating;
     loop {
-        graph.successors[0] = entries
+        graph.root_pcs = entries
             .iter()
             .filter(|(_, kinds)| kinds.is_control())
-            .map(|(pc, _)| Edge::Node(index[pc]))
+            .map(|(&pc, _)| pc)
+            .collect();
+        graph.successors[0] = graph
+            .root_pcs
+            .iter()
+            .map(|pc| Edge::Node(index[pc]))
             .collect();
         let (rpo, edges) = graph.depth_first();
         graph.rpo = rpo;
@@ -468,10 +530,17 @@ fn analyze_window(
         .collect();
     graph.classify();
     let loops = graph.natural_loops();
-    let structure = if irreducible.is_empty() {
+    let parts = graph.irreducible_parts();
+    let regions: Vec<Vec<u64>> = parts
+        .iter()
+        .map(|part| part.iter().map(|&node| graph.starts[node]).collect())
+        .collect();
+    let structure = if parts.is_empty() {
         graph.do_tree(0, &mut Vec::new())
     } else {
-        None
+        graph
+            .collapse(&parts)
+            .and_then(|collapsed| collapsed.do_tree(0, &mut Vec::new()))
     };
     WindowAnalysis {
         window,
@@ -488,11 +557,213 @@ fn analyze_window(
             .collect(),
         loops,
         irreducible,
+        regions,
         structure,
     }
 }
 
 impl Graph {
+    /// The irreducible parts: strongly connected components entered at more
+    /// than one block, found at every loop nesting level (inside a
+    /// single-entry component, with the edges back to its header removed).
+    /// Collapsing each to one node leaves a reducible graph.
+    fn irreducible_parts(&self) -> Vec<BTreeSet<usize>> {
+        let count = self.starts.len();
+        let mut predecessors = vec![Vec::new(); count];
+        for node in 0..count {
+            for next in self.nodes(node) {
+                predecessors[next].push(node);
+            }
+        }
+        let mut parts = Vec::new();
+        let mut work = vec![((1..count).collect::<BTreeSet<usize>>(), None)];
+        while let Some((nodes, header)) = work.pop() {
+            for component in self.components(&nodes, header) {
+                let cyclic = component.len() > 1
+                    || component.iter().any(|&node| {
+                        Some(node) != header && self.nodes(node).any(|next| next == node)
+                    });
+                if !cyclic {
+                    continue;
+                }
+                let entries: BTreeSet<usize> = component
+                    .iter()
+                    .copied()
+                    .filter(|&node| {
+                        predecessors[node]
+                            .iter()
+                            .any(|pred| !component.contains(pred))
+                    })
+                    .collect();
+                if entries.len() == 1 {
+                    let header = entries.into_iter().next();
+                    work.push((component, header));
+                } else {
+                    parts.push(component);
+                }
+            }
+        }
+        parts.sort_by_key(|part| part.iter().next().copied());
+        parts
+    }
+
+    /// Strongly connected components of `nodes`, ignoring edges into
+    /// `header` (Tarjan's algorithm).
+    fn components(&self, nodes: &BTreeSet<usize>, header: Option<usize>) -> Vec<BTreeSet<usize>> {
+        struct Search<'a> {
+            graph: &'a Graph,
+            nodes: &'a BTreeSet<usize>,
+            header: Option<usize>,
+            index: BTreeMap<usize, usize>,
+            low: BTreeMap<usize, usize>,
+            stack: Vec<usize>,
+            on_stack: BTreeSet<usize>,
+            components: Vec<BTreeSet<usize>>,
+        }
+        impl Search<'_> {
+            fn visit(&mut self, node: usize) {
+                let number = self.index.len();
+                self.index.insert(node, number);
+                self.low.insert(node, number);
+                self.stack.push(node);
+                self.on_stack.insert(node);
+                let successors: Vec<usize> = self
+                    .graph
+                    .nodes(node)
+                    .filter(|next| self.nodes.contains(next) && Some(*next) != self.header)
+                    .collect();
+                for next in successors {
+                    if !self.index.contains_key(&next) {
+                        self.visit(next);
+                        let low = self.low[&node].min(self.low[&next]);
+                        self.low.insert(node, low);
+                    } else if self.on_stack.contains(&next) {
+                        let low = self.low[&node].min(self.index[&next]);
+                        self.low.insert(node, low);
+                    }
+                }
+                if self.low[&node] == self.index[&node] {
+                    let mut component = BTreeSet::new();
+                    while let Some(member) = self.stack.pop() {
+                        self.on_stack.remove(&member);
+                        component.insert(member);
+                        if member == node {
+                            break;
+                        }
+                    }
+                    self.components.push(component);
+                }
+            }
+        }
+        let mut search = Search {
+            graph: self,
+            nodes,
+            header,
+            index: BTreeMap::new(),
+            low: BTreeMap::new(),
+            stack: Vec::new(),
+            on_stack: BTreeSet::new(),
+            components: Vec::new(),
+        };
+        for &node in nodes {
+            if !search.index.contains_key(&node) {
+                search.visit(node);
+            }
+        }
+        search.components
+    }
+
+    /// The graph with each part collapsed to one node, analysed again.
+    /// `None` if it is somehow still irreducible.
+    fn collapse(&self, parts: &[BTreeSet<usize>]) -> Option<Graph> {
+        let count = self.starts.len();
+        // New node of each old one: the root, the blocks outside parts, then
+        // one per part.
+        let mut map = vec![usize::MAX; count];
+        map[0] = 0;
+        let mut starts = vec![0];
+        let mut regions = vec![None];
+        for (node, slot) in map.iter_mut().enumerate().skip(1) {
+            if parts.iter().all(|part| !part.contains(&node)) {
+                *slot = starts.len();
+                starts.push(self.starts[node]);
+                regions.push(None);
+            }
+        }
+        for part in parts {
+            let id = starts.len();
+            for &node in part {
+                map[node] = id;
+            }
+            let blocks: Vec<u64> = part.iter().map(|&node| self.starts[node]).collect();
+            starts.push(blocks[0]);
+            regions.push(Some(blocks));
+        }
+        let mut successors = vec![Vec::new(); starts.len()];
+        successors[0] = self.successors[0]
+            .iter()
+            .map(|edge| match *edge {
+                Edge::Node(next) => Edge::Node(map[next]),
+                leave => leave,
+            })
+            .collect();
+        for node in 1..count {
+            let id = map[node];
+            if regions[id].is_none() {
+                successors[id] = self.successors[node]
+                    .iter()
+                    .map(|edge| match *edge {
+                        Edge::Node(next) => Edge::Node(map[next]),
+                        leave => leave,
+                    })
+                    .collect();
+                continue;
+            }
+            // A part's exits: each other node once, and leaving the window
+            // (to any PC) once.
+            for edge in &self.successors[node] {
+                let exit = match *edge {
+                    Edge::Node(next) if map[next] == id => continue,
+                    Edge::Node(next) => Edge::Node(map[next]),
+                    Edge::Leave(_) => Edge::Leave(None),
+                };
+                if !successors[id].contains(&exit) {
+                    successors[id].push(exit);
+                }
+            }
+        }
+        let mut graph = Graph {
+            starts,
+            successors,
+            root_pcs: self.root_pcs.clone(),
+            regions,
+            rpo: Vec::new(),
+            idom: Vec::new(),
+            children: Vec::new(),
+            loop_header: Vec::new(),
+            merge: Vec::new(),
+        };
+        let (rpo, retreating) = graph.depth_first();
+        graph.rpo = rpo;
+        graph.dominators();
+        if retreating
+            .iter()
+            .any(|&(from, to)| !graph.dominates(to, from))
+        {
+            return None;
+        }
+        graph.classify();
+        Some(graph)
+    }
+
+    /// The PCs at which control can arrive at `node`.
+    fn node_pcs(&self, node: usize) -> Vec<u64> {
+        match &self.regions[node] {
+            Some(blocks) => blocks.clone(),
+            None => vec![self.starts[node]],
+        }
+    }
+
     fn nodes(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
         self.successors[node].iter().filter_map(|edge| match *edge {
             Edge::Node(next) => Some(next),
@@ -703,29 +974,44 @@ impl Graph {
         }
         let edges = &self.successors[node];
         let mut code = Vec::new();
-        if node != 0 {
+        let region = self.regions[node].as_ref();
+        if let Some(blocks) = region {
+            code.push(Structured::Region(blocks.clone()));
+        } else if node != 0 {
             code.push(Structured::Code(self.starts[node]));
         }
         let ending = match edges.as_slice() {
             [] => Structured::Leave(None),
             [edge] => self.do_branch(node, *edge, context)?,
-            [taken, fallthrough] if node != 0 => Structured::If {
+            _ if node == 0 => Structured::Dispatch(
+                edges
+                    .iter()
+                    .zip(&self.root_pcs)
+                    .map(|(&edge, &pc)| Some((pc, self.do_branch(node, edge, context)?)))
+                    .collect::<Option<_>>()?,
+            ),
+            [taken, fallthrough] if region.is_none() => Structured::If {
                 block: self.starts[node],
                 taken: Box::new(self.do_branch(node, *taken, context)?),
                 fallthrough: Box::new(self.do_branch(node, *fallthrough, context)?),
             },
-            _ => Structured::Dispatch(
-                edges
-                    .iter()
-                    .map(|&edge| {
-                        let pc = match edge {
-                            Edge::Node(next) => self.starts[next],
-                            Edge::Leave(pc) => pc?,
-                        };
-                        Some((pc, self.do_branch(node, edge, context)?))
-                    })
-                    .collect::<Option<_>>()?,
-            ),
+            // A part's exits, by where control went.
+            _ => {
+                let mut cases = Vec::new();
+                let mut default = Structured::Leave(None);
+                for &edge in edges {
+                    match edge {
+                        Edge::Node(next) => {
+                            cases.push((self.node_pcs(next), self.do_branch(node, edge, context)?));
+                        }
+                        Edge::Leave(_) => default = self.do_branch(node, edge, context)?,
+                    }
+                }
+                Structured::Switch {
+                    cases,
+                    default: Box::new(default),
+                }
+            }
         };
         code.push(ending);
         Some(seq(code))
@@ -1063,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn irreducible_two_entry_loop_is_reported() {
+    fn irreducible_two_entry_loop_runs_as_a_region() {
         let words = [
             0xb400_0040, // 0x0: cbz x0, b
             0x9100_0421, // 0x4: a: add x1, x1, #1
@@ -1082,7 +1368,18 @@ mod tests {
                 to: at(8),
             }]
         );
-        assert_eq!(window.structure, None);
+        // The cycle {a, b} is entered at both: it runs as a local dispatch
+        // region, reached from either arm of the CBZ.
+        assert_eq!(window.regions, vec![vec![at(4), at(8)]]);
+        assert_eq!(
+            window.structure,
+            Some(seq(vec![
+                block(seq(vec![code(0), if_(0, Br(0), Br(0))])),
+                Structured::Region(vec![at(4), at(8)]),
+                code(0x10),
+                Leave(None),
+            ]))
+        );
         assert!(window.loops.is_empty());
     }
 

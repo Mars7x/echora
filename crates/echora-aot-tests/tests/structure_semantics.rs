@@ -1,8 +1,12 @@
 //! The structured control flow of `echora_lift::structure`, checked
 //! semantically: running a window's `Structured` tree (blocks, loops, ifs,
-//! dispatch, breaks and leaves) on the shared reference interpreter must
-//! give the same state, and leave the window at the same place, as running
-//! the window's code plainly from the same entry.
+//! dispatch, irreducible regions, switches, breaks and leaves) on the
+//! shared reference interpreter must give the same state, and leave the
+//! window at the same place, as running the window's code plainly from the
+//! same entry. Every window has a tree, and every one is checked: straight,
+//! and sliced, where every block is an entry and after a third of the
+//! blocks the tree is left and re-entered at the next PC, as after a host
+//! boundary.
 //!
 //! Calls inside a block run to their return in both. Windows of the
 //! sequence, counted-loop, switch, call and loop-candidate programs are
@@ -16,10 +20,14 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
-use echora_aot_tests::{call_code, loop_code, sequence_code, spin_candidates, switch_code};
+use echora_aot_tests::{
+    call_code, irreducible_candidates, loop_code, sequence_code, spin_candidates, switch_code,
+};
 use echora_lift::aarch64::{Instruction, decode};
 use echora_lift::codegen::{CodeRegion, discover_with_tables};
-use echora_lift::structure::{DEFAULT_WINDOW_BITS, Structured, analyze_windows};
+use echora_lift::structure::{
+    DEFAULT_WINDOW_BITS, StructureOptions, Structured, analyze_windows_with,
+};
 
 const STATES_PER_ENTRY: usize = 6;
 const SVC_EXIT: u32 = 0xd400_00e1;
@@ -140,8 +148,12 @@ struct Run<'a, 'b> {
     budget: usize,
     /// The last block's final conditional branch: taken or not.
     taken: bool,
-    /// Where the last block's own control transfer went.
+    /// Where the last block's own control transfer went: the current next
+    /// PC.
     next: u64,
+    /// With slicing, a generator deciding after each block whether a host
+    /// boundary comes there (leave, then re-enter at the next PC).
+    slicing: Option<Random>,
 }
 
 /// How a structured part ended.
@@ -164,6 +176,12 @@ impl Run<'_, '_> {
                 }
                 None => return Some(End::Stuck),
             }
+        }
+        // A host boundary after this block: resume at the next PC.
+        if let Some(random) = self.slicing.as_mut()
+            && random.next().is_multiple_of(3)
+        {
+            return Some(End::Left(self.next));
         }
         None
     }
@@ -211,10 +229,46 @@ impl Run<'_, '_> {
                 Some((_, body)) => self.run(body, entry),
                 None => panic!("no dispatch case for entry {entry:#x}"),
             },
+            Structured::Region(blocks) => {
+                while blocks.contains(&self.next) {
+                    if let Some(end) = self.code_block(self.next) {
+                        return Flow::End(end);
+                    }
+                }
+                Flow::Normal
+            }
+            Structured::Switch { cases, default } => {
+                match cases.iter().find(|(pcs, _)| pcs.contains(&self.next)) {
+                    Some((_, body)) => self.run(body, entry),
+                    None => self.run(default, entry),
+                }
+            }
             Structured::Br(depth) => Flow::Break(*depth),
             Structured::Leave(Some(pc)) => Flow::End(End::Left(*pc)),
             Structured::Leave(None) => Flow::End(End::Left(self.next)),
         }
+    }
+}
+
+/// Region and Switch nodes in a tree.
+fn fallback_nodes(tree: &Structured) -> (usize, usize) {
+    let add = |a: (usize, usize), b: (usize, usize)| (a.0 + b.0, a.1 + b.1);
+    match tree {
+        Structured::Region(_) => (1, 0),
+        Structured::Switch { cases, default } => cases
+            .iter()
+            .map(|(_, body)| fallback_nodes(body))
+            .fold(add((0, 1), fallback_nodes(default)), add),
+        Structured::Seq(parts) => parts.iter().map(fallback_nodes).fold((0, 0), add),
+        Structured::Block(body) | Structured::Loop(body) => fallback_nodes(body),
+        Structured::If {
+            taken, fallthrough, ..
+        } => add(fallback_nodes(taken), fallback_nodes(fallthrough)),
+        Structured::Dispatch(cases) => cases
+            .iter()
+            .map(|(_, body)| fallback_nodes(body))
+            .fold((0, 0), add),
+        Structured::Code(_) | Structured::Br(_) | Structured::Leave(_) => (0, 0),
     }
 }
 
@@ -230,9 +284,15 @@ fn random_state(random: &mut Random, memory: &[u8]) -> State {
     state
 }
 
-/// Checks every structured window of one program; returns (windows
-/// checked, runs compared).
-fn check(program: Program, random: &mut Random, memory: &[u8]) -> (usize, usize) {
+/// Checks every window of one program through its tree; returns (windows
+/// checked, runs compared, Switch nodes). With `sliced`, every block is an entry and a
+/// host boundary comes after a third of the blocks.
+fn check(
+    program: Program,
+    random: &mut Random,
+    memory: &[u8],
+    sliced: bool,
+) -> (usize, usize, usize) {
     let (name, base, words, entries, data) = program;
     let region = CodeRegion {
         name: name.into(),
@@ -260,14 +320,27 @@ fn check(program: Program, random: &mut Random, memory: &[u8]) -> (usize, usize)
         .collect();
     let code = Code { base, words };
     let (mut windows, mut runs, mut loops) = (0, 0, 0);
-    for window in analyze_windows(&translation, DEFAULT_WINDOW_BITS) {
+    let options = StructureOptions {
+        resume_at_every_block: sliced,
+    };
+    let (mut regions, mut switches) = (0, 0);
+    for window in analyze_windows_with(&translation, DEFAULT_WINDOW_BITS, options) {
         let Some(structure) = &window.structure else {
-            continue;
+            panic!("{name}: window {:#x} has no structure", window.window);
         };
         windows += 1;
+        regions += window.regions.len();
+        let (region_nodes, switch_nodes) = fallback_nodes(structure);
+        switches += switch_nodes;
+        assert_eq!(
+            region_nodes,
+            window.regions.len(),
+            "{name}: one Region per part"
+        );
         loops += window.loops.len();
+        let states = if sliced { 2 } else { STATES_PER_ENTRY };
         for entry in window.control_entries() {
-            for _ in 0..STATES_PER_ENTRY {
+            for _ in 0..states {
                 let start = random_state(random, memory);
                 let mut plain = start.clone();
                 let plain_end = code.plain(entry, window.window, &mut plain);
@@ -278,22 +351,33 @@ fn check(program: Program, random: &mut Random, memory: &[u8]) -> (usize, usize)
                     budget: STEP_LIMIT,
                     taken: false,
                     next: entry,
+                    slicing: sliced.then(|| Random(random.next() | 1)),
                 };
                 // A leave that lands back in the window re-enters it there,
                 // as the dispatcher does (an indirect branch to one of the
                 // window's own entries).
-                // A leave to anything else in the window would be a
-                // MissingBlock trap (an address built from random registers,
-                // say): nothing to compare.
+                // A leave to an address in the window that is no block
+                // start would be a MissingBlock trap (an address built from
+                // random registers, say): nothing to compare.
                 let entries: BTreeSet<u64> = window.control_entries().collect();
                 let mut at = entry;
                 let structured_end = loop {
                     match run.run(structure, at) {
                         Flow::End(End::Left(pc)) if pc >> DEFAULT_WINDOW_BITS == window.window => {
                             if !entries.contains(&pc) {
+                                // A block start that is not an entry can
+                                // only be reached through a wrong tree: the
+                                // structured window cannot enter there.
+                                assert!(
+                                    !blocks.contains_key(&pc),
+                                    "{name}: window {:#x} from {entry:#x} left to its own \
+                                     block {pc:#x}, which is not an entry",
+                                    window.window
+                                );
                                 break End::Stuck;
                             }
                             at = pc;
+                            run.next = pc;
                         }
                         Flow::End(end) => break end,
                         Flow::Normal => panic!(
@@ -327,8 +411,12 @@ fn check(program: Program, random: &mut Random, memory: &[u8]) -> (usize, usize)
             }
         }
     }
-    println!("{name}: {windows} structured windows ({loops} natural loops), {runs} runs compared");
-    (windows, runs)
+    println!(
+        "{name}{}: {windows} windows ({loops} natural loops, {regions} irreducible regions, \
+         {switches} switches), {runs} runs compared",
+        if sliced { " (sliced)" } else { "" }
+    );
+    (windows, runs, switches)
 }
 
 #[test]
@@ -342,7 +430,14 @@ fn structured_windows_run_like_the_plain_code() {
         base: switch_code::TABLES,
         bytes: switch_code::TABLE_BYTES.to_vec(),
     };
-    let programs: [Program; 5] = [
+    let programs: [Program; 6] = [
+        (
+            "irreducible candidates",
+            irreducible_candidates::BASE,
+            irreducible_candidates::WORDS,
+            irreducible_candidates::ENTRIES,
+            &[],
+        ),
         (
             "loop candidates",
             spin_candidates::BASE,
@@ -380,10 +475,15 @@ fn structured_windows_run_like_the_plain_code() {
         ),
     ];
     let mut total = 0;
-    for program in programs {
-        let (windows, runs) = check(program, &mut random, &memory);
-        assert!(windows > 0, "{}: no structured window", program.0);
-        total += runs;
+    for sliced in [false, true] {
+        for program in programs {
+            let (windows, runs, switches) = check(program, &mut random, &memory, sliced);
+            assert!(windows > 0, "{}: no window", program.0);
+            if program.0 == "irreducible candidates" {
+                assert!(switches > 0, "no region with several exits");
+            }
+            total += runs;
+        }
     }
     assert!(total > 1000, "too few runs compared: {total}");
 }

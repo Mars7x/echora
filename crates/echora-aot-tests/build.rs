@@ -83,6 +83,7 @@ fn main() {
     exclusive_code(&mut out);
     switch_code(&mut out);
     spin_candidates(&mut out);
+    irreducible_candidates(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -1176,6 +1177,80 @@ fn spin_candidates(out: &mut String) {
     // final RET keeps the last ones from running off the end of the code.
     words.push(0xd65f_03c0);
     writeln!(out, "pub mod spin_candidates {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    writeln!(out, "}}").expect("write");
+}
+
+/// Irreducible loops with two exits for `tests/structure_semantics.rs` (not
+/// lifted): a two-entry loop {A, B} counted in X25, entered at A or B,
+/// left by A's conditional branch to one tail or by B's fall-through to
+/// another.
+fn irreducible_candidates(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xf0_0000;
+    const PROGRAMS: usize = 300;
+    let mut state: u64 = 0xc0ac_29b7_c97c_50dd;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        [25, 27, 28].iter().any(|&n| writes.has_gpr(n))
+    };
+    let probe = |next: &mut dyn FnMut() -> u32| loop {
+        let n = next() % 31;
+        if ![25, 27, 28].contains(&n) {
+            return n;
+        }
+    };
+    let conditional = |from: u64, to: u64, register: u32, nonzero: u32| {
+        let offset = (((to as i64 - from as i64) / 4) as u32) & 0x7ffff;
+        0xb400_0000 | (nonzero << 24) | (offset << 5) | register
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let at = |words: &Vec<u32>| BASE + 4 * words.len() as u64;
+    for _ in 0..PROGRAMS {
+        entries.push(at(&words));
+        words.push(0xd280_0000 | ((1 + next() % 4) << 5) | 25); // movz x25, #n
+        let enter_b = words.len();
+        words.push(0); // cbz/cbnz probe, B
+        let a = at(&words);
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        let exit_a = words.len();
+        words.push(0); // cbz/cbnz probe, tail 1
+        let b = at(&words);
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        words.push(0xd100_0739); // sub x25, x25, #1
+        let back = at(&words);
+        words.push(0xb500_0000 | (((((a as i64 - back as i64) / 4) as u32) & 0x7ffff) << 5) | 25);
+        for _ in 0..next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        words.push(0xd400_00e1);
+        let tail = at(&words);
+        for _ in 0..1 + next() % 3 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        words.push(0xd400_00e1);
+        let (first, second) = (probe(&mut next), probe(&mut next));
+        let from = BASE + 4 * enter_b as u64;
+        words[enter_b] = conditional(from, b, first, next() & 1);
+        let from = BASE + 4 * exit_a as u64;
+        words[exit_a] = conditional(from, tail, second, next() & 1);
+    }
+    words.push(0xd65f_03c0);
+    writeln!(out, "pub mod irreducible_candidates {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
