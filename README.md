@@ -96,14 +96,23 @@ See [architecture](docs/architecture.md) for the crate boundaries.
 
 ## Building and running
 
-You need Rust 1.88 or newer and a C compiler (for the bundled zstd).
+The game's translation only builds and runs on Linux for now. In short:
 
 ```sh
-cargo build --release
-cargo test --workspace
+cargo build --release                         # echora and echora-launcher
+scripts/fetch-shader-sources.sh               # shader recompiler (before lift)
+target/release/echora lift game.nup           # translate the game; prints its folder
+(cd ~/.cache/echora/translations/<key> && cargo build --release -j 6 -p echora-run)
+target/release/echora-launcher                # install the game, then Play
 ```
 
-The current commands work on your NUP file or extracted dump directory:
+You need your own dump of the game, Rust 1.88 or newer, C and C++
+compilers, the system libraries listed in the guide, about 16 GB of RAM
+and about 30 GB of disk. The translation build takes about an hour. Follow
+[local setup](docs/local-setup.md) for each step, what it needs and what
+to do when one fails.
+
+Other commands work on your NUP file or extracted dump directory:
 
 ```sh
 echora inspect game.nup          # packages, versions, build ID, module hashes
@@ -112,25 +121,11 @@ echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
 echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
 echora boot game.nup             # create the game process without running it
-echora lift game.nup             # write the translation (4.2 GiB of Rust) to the cache
-echora run game.nup              # run the built translation (see docs/local-setup.md)
+echora run game.nup              # run the built translation without the launcher
 echora extract game.nup out --subtree romfs
 ```
 
-Running the game needs the translation built first and the shader
-recompiler sources fetched; [local setup](docs/local-setup.md) has the
-steps. `ECHORA_WINDOW=1` opens the game's window and `ECHORA_AUDIO=1`
-plays its sound.
-
-`echora-launcher` (GPUI) installs the game from your NUP or dump into
-Echora's data folder (`~/.local/share/echora/game` on Linux), after which
-the original is no longer needed, edits the settings the runtime applies
-and starts it. It runs on Linux, Windows and macOS; place it next to
-the `echora` binary. With "Skip launcher" on it starts the game directly;
-`echora-launcher --show` opens the window again. The launcher starts the
-game with its window and sound on.
-
-See [local setup](docs/local-setup.md) and [content input](docs/content.md).
+See [content input](docs/content.md) for the formats Echora reads.
 
 ## Documentation
 
