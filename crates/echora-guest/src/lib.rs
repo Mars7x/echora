@@ -168,6 +168,10 @@ pub struct Core {
     /// slices, timed waits, `attention`. Starts at 0 so the first boundary
     /// reaches the host.
     pub host_check_at: u64,
+    /// Set by another host thread when a better-priority guest thread waits
+    /// for this core: the next block boundary returns to the host, which
+    /// reschedules (the host clears it there).
+    pub preempt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Spin-poll hints (YIELD, WFE, a compare-and-swap that cannot change
     /// memory) since the host last scheduled; past SPIN_POLL_LIMIT the
     /// thread gives up the processor at its next block boundary.
@@ -204,6 +208,7 @@ impl Core {
             completed_blocks: 0,
             attention: true,
             host_check_at: 0,
+            preempt: Default::default(),
             spin_polls: 0,
             slice_start: 0,
             recent: [ThreadPc::default(); RECENT_PCS],
@@ -437,7 +442,9 @@ impl Core {
 
     #[inline]
     pub fn finish_block(&mut self) -> Result<(), Trap> {
-        if self.steps >= self.host_check_at {
+        if self.steps >= self.host_check_at
+            || self.preempt.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Trap::HostBoundary);
         }
         Ok(())

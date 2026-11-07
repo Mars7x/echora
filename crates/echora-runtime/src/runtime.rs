@@ -279,6 +279,12 @@ pub struct Machine {
     /// Times a worker took a thread another worker was running (a
     /// scheduler error; see `Worker::swap_out`).
     double_dispatches: u64,
+    /// With several workers: the thread each core runs (by core) and the
+    /// flags that make a core's next block boundary reschedule.
+    core_threads: Vec<Option<u64>>,
+    preempt_flags: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Preemptions requested (a better-priority thread waited for a core).
+    preemptions: u64,
     /// Several workers run: an idle boundary returns instead of sleeping.
     parallel: bool,
     /// Workers parked without a thread, waiting for one to become runnable.
@@ -372,6 +378,9 @@ impl Machine {
             running: Default::default(),
             worker_core: None,
             double_dispatches: 0,
+            core_threads: Vec::new(),
+            preempt_flags: Vec::new(),
+            preemptions: 0,
             parallel: false,
             parked_workers: 0,
             lock_stats: [0; 3],
@@ -1633,6 +1642,56 @@ impl Machine {
         pick(true).or_else(|| pick(false))
     }
 
+    /// Horizon preemption across workers: a runnable thread no worker runs
+    /// takes a core whose running thread has a worse priority, at that
+    /// core's next block boundary. The game relies on it (a better-priority
+    /// thread it wakes runs before the waker's core goes on).
+    fn request_preemptions(&mut self) {
+        let priority = |machine: &Machine, id: u64| -> u8 {
+            if id == machine.layout.main_thread_id {
+                machine.main_thread_effective_priority
+            } else {
+                machine.threads.priority(id).unwrap_or(u8::MAX)
+            }
+        };
+        let mask = |machine: &Machine, id: u64| -> u64 {
+            if id == machine.layout.main_thread_id {
+                machine.main_thread_affinity.1
+            } else {
+                machine
+                    .threads
+                    .affinity(id)
+                    .map_or(u64::MAX, |(_, mask)| mask)
+            }
+        };
+        let main =
+            (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
+        let waiting: Vec<(u8, u64)> = main
+            .into_iter()
+            .chain(self.threads.runnable_ids())
+            .filter(|id| !self.running.contains(id) && *id != self.core.current_thread_id)
+            .map(|id| (priority(self, id), mask(self, id)))
+            .collect();
+        for (core, thread) in self.core_threads.clone().into_iter().enumerate() {
+            // This worker's own core was just scheduled.
+            if self.worker_core == Some(core as u8) {
+                continue;
+            }
+            let Some(thread) = thread else { continue };
+            let running = priority(self, thread);
+            let wanted = waiting.iter().any(|&(waiting, mask)| {
+                waiting < running && (mask & 0b111 == 0 || mask >> core & 1 != 0)
+            });
+            if wanted {
+                if let Some(flag) = self.preempt_flags.get(core) {
+                    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        self.preemptions += 1;
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether a thread no worker runs could run on some core (for parked
     /// workers: one core's worker finding nothing is not a deadlock).
     fn runnable_on_any_core(&mut self) -> bool {
@@ -2089,6 +2148,10 @@ impl Machine {
     /// code, so host-chosen PCs are where execute permission is checked.
     fn boundary(&mut self, result: Result<(), Trap>) -> Result<(), Trap> {
         self.core.settle_block_trap();
+        // A requested preemption is this boundary's scheduling decision.
+        self.core
+            .preempt
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let kind = match &result {
             Err(Trap::SupervisorCall { number }) => (*number as usize).min(0x7f),
             Err(Trap::MissingBlock { .. }) => 0x80,
@@ -2170,6 +2233,9 @@ impl Machine {
         let placeholder = idle(self);
         let mut cores = vec![std::mem::replace(&mut self.core, placeholder)];
         cores.extend((1..workers).map(|_| idle(self)));
+        self.preempt_flags = cores.iter().map(|core| core.preempt.clone()).collect();
+        self.core_threads = vec![None; workers];
+        self.core_threads[0] = Some(cores[0].current_thread_id);
         self.running.insert(cores[0].current_thread_id);
         self.parallel = true;
         let shared = Shared {
@@ -2205,6 +2271,8 @@ impl Machine {
         self.parallel = false;
         self.running.clear();
         self.worker_core = None;
+        self.core_threads.clear();
+        self.preempt_flags.clear();
         self.parked_workers = 0;
         // The first stop is the run's result; its core is the one reports see.
         let global = self.core.steps;
@@ -3732,6 +3800,8 @@ impl Machine {
         model["physical_core_topology_implemented"] = false.into();
         model["thread_pinning_implemented"] = false.into();
         model["scheduler_affinity_notifications_implemented"] = false.into();
+        model["preemptions"] = serde_json::json!(self.preemptions);
+        model["double_dispatches"] = serde_json::json!(self.double_dispatches);
         model["main_thread_affinity"] = serde_json::json!({
             "thread_id": self.layout.main_thread_id,
             "ideal_core": self.main_thread_affinity.0,
@@ -4044,6 +4114,7 @@ impl Worker {
                     held.elapsed().as_micros() as u64;
                 match outcome {
                     Ok(()) => {
+                        machine.request_preemptions();
                         let spare = machine.parked_workers != 0 && machine.runnable_on_any_core();
                         self.swap_out(&mut machine, true);
                         drop(machine);
@@ -4204,6 +4275,9 @@ impl Worker {
                 self.index, machine.core.current_thread_id, machine.core.cpu.pc
             );
             machine.double_dispatches += 1;
+        }
+        if let Some(slot) = machine.core_threads.get_mut(usize::from(self.index)) {
+            *slot = active.then_some(machine.core.current_thread_id);
         }
         std::mem::swap(&mut machine.core, &mut self.core);
         machine.core.steps = self.core.steps;
