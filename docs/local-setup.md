@@ -70,7 +70,9 @@ applies the window size and mode, internal resolution, volume and
 vibration so far.
 
 `run` stops at the first operation that is not implemented and writes a
-JSON report (`run-<time>.json`) next to the translation. Useful switches:
+JSON report (`run-<time>.json`) next to the translation. It also stops after
+`--budget` guest instructions: a billion by default, a few seconds of play,
+so give test runs a larger one. The launcher starts the game with no limit. Useful switches:
 
 | Variable | Effect |
 |---|---|
