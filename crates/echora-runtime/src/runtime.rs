@@ -156,6 +156,9 @@ struct ContextSwitch {
 const KERNEL_VIRTUAL_ADDRESS_BASE: u64 = 0xffff_ff80_0000_0000;
 const KERNEL_VIRTUAL_ADDRESS_END: u64 = 0xffff_ffff_ffe0_0000;
 const MUTEX_WAIT_MASK: u32 = 0x4000_0000;
+/// Thread-local region fields after the IPC message buffer.
+const TLS_DISABLE_COUNT: u64 = 0x100;
+const TLS_INTERRUPT_FLAG: u64 = 0x102;
 
 pub use echora_guest::{
     PHYSICAL_COUNTER_FREQUENCY_HZ, PhysicalCounter, WindowFn, install_windows,
@@ -266,6 +269,9 @@ pub struct Machine {
     /// With `ECHORA_PC_STACKS=LO-HI` (guest addresses, hex): frame-pointer
     /// return chains of the samples whose PC is in that range.
     pc_stacks: std::collections::HashMap<Vec<u64>, u64>,
+    /// Boundaries that kept a thread running because it had user
+    /// preemption disabled.
+    user_preemption_deferrals: u64,
     pc_sample_tick: u32,
     /// Threads that gave up the processor spinning, with the step count
     /// until which other runnable threads go first.
@@ -376,6 +382,7 @@ impl Machine {
             hid_samples: 0,
             pc_samples: Default::default(),
             pc_stacks: Default::default(),
+            user_preemption_deferrals: 0,
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
             last_wake_check: 0,
@@ -1261,7 +1268,7 @@ impl Machine {
                     message: "condition waiter is not parked".into(),
                 });
             }
-            let word = match self.memory.read_u32(wait.mutex) {
+            let word = match self.update_lock_atomic(wait.mutex, wait.tag) {
                 Ok(word) => Some(word),
                 Err(Trap::MemoryFault { .. }) => None,
                 Err(trap) => return Err(trap),
@@ -1271,18 +1278,10 @@ impl Machine {
                     self.synchronization_waits.complete(id, 0xd401, 0)?;
                     self.complete_w0_wait(id, 0xd401)?;
                 }
-                Some(0) => match self.memory.check_write(wait.mutex, 4) {
-                    Ok(()) => {
-                        self.memory.write_u32(wait.mutex, wait.tag)?;
-                        self.synchronization_waits.complete(id, 0, 0)?;
-                        self.complete_w0_wait(id, 0)?;
-                    }
-                    Err(Trap::MemoryFault { .. }) => {
-                        self.synchronization_waits.complete(id, 0xd401, 0)?;
-                        self.complete_w0_wait(id, 0xd401)?;
-                    }
-                    Err(trap) => return Err(trap),
-                },
+                Some(0) => {
+                    self.synchronization_waits.complete(id, 0, 0)?;
+                    self.complete_w0_wait(id, 0)?;
+                }
                 Some(word) => {
                     let owner_handle = word & !MUTEX_WAIT_MASK;
                     let Some(owner) = self.real_thread_id_for_handle(owner_handle) else {
@@ -1290,7 +1289,6 @@ impl Machine {
                         self.complete_w0_wait(id, 0xfa01)?;
                         continue;
                     };
-                    self.memory.write_u32(wait.mutex, word | MUTEX_WAIT_MASK)?;
                     let plan = self.mutex_waits.prepare_wait(
                         id,
                         owner,
@@ -1313,6 +1311,59 @@ impl Machine {
             }
         }
         Ok(())
+    }
+
+    /// Whether the active thread has user preemption disabled (TLS
+    /// DisableCount at +0x100); if so its InterruptFlag (+0x102) is set.
+    fn user_preemption_disabled(&mut self) -> bool {
+        if crate::nvn::debug_var_os("ECHORA_IGNORE_DISABLE_COUNT").is_some() {
+            return false;
+        }
+        let tls = self.core.cpu.tpidrro_el0;
+        if tls == 0
+            || !matches!(self.memory.read_u16(tls + TLS_DISABLE_COUNT), Ok(count) if count != 0)
+        {
+            return false;
+        }
+        let _ = self.memory.write_u16(tls + TLS_INTERRUPT_FLAG, 1);
+        self.user_preemption_deferrals = self.user_preemption_deferrals.saturating_add(1);
+        true
+    }
+
+    /// Compare-and-swap on a guest word, returning the value seen. The
+    /// kernel updates user memory with LDXR/STXR loops because other cores
+    /// run user code meanwhile; with several workers so do these, so a
+    /// read-then-write here can overwrite a guest lock or unlock.
+    fn guest_cas_u32(&mut self, address: u64, expected: u32, desired: u32) -> Result<u32, Trap> {
+        self.memory.check_write(address, 4)?;
+        let seen = self.core.memory.compare_exchange_single_thread(
+            address,
+            4,
+            u64::from(expected),
+            u64::from(desired),
+            true,
+            true,
+        )?;
+        Ok(seen as u32)
+    }
+
+    /// Atmosphere UpdateLockAtomic: take the mutex word for `tag` if it is
+    /// free, else mark the current owner as having waiters. The previous
+    /// word is returned (0: `tag` now owns the mutex).
+    fn update_lock_atomic(&mut self, address: u64, tag: u32) -> Result<u32, Trap> {
+        let mut word = self.memory.read_u32(address)?;
+        loop {
+            let next = if word == 0 {
+                tag
+            } else {
+                word | MUTEX_WAIT_MASK
+            };
+            let seen = self.guest_cas_u32(address, word, next)?;
+            if seen == word {
+                return Ok(word);
+            }
+            word = seen;
+        }
     }
 
     /// Result for an arbitrated address that cannot be used: 0xcc01
@@ -1386,12 +1437,17 @@ impl Machine {
             return Ok(Some(0xfa01));
         }
         if kind == 1 {
-            match self.memory.check_write(address, 4) {
-                Ok(()) => self
-                    .memory
-                    .write_u32(address, current_value.wrapping_sub(1) as u32)?,
-                Err(Trap::MemoryFault { .. }) => return Ok(Some(0xd401)),
-                Err(trap) => return Err(trap),
+            // DecrementIfLessThan, atomically against other cores.
+            let mut seen = current_raw as u32;
+            loop {
+                let decremented = (seen as i32).wrapping_sub(1) as u32;
+                match self.guest_cas_u32(address, seen, decremented) {
+                    Ok(now) if now == seen => break,
+                    Ok(now) if (now as i32) < value => seen = now,
+                    Ok(_) => return Ok(Some(0xfa01)),
+                    Err(Trap::MemoryFault { .. }) => return Ok(Some(0xd401)),
+                    Err(trap) => return Err(trap),
+                }
             }
         }
         if timeout_ns == 0 {
@@ -1457,8 +1513,10 @@ impl Machine {
                 value
             };
             if new_value != value {
-                match self.memory.check_write(address, 4) {
-                    Ok(()) => self.memory.write_u32(address, new_value as u32)?,
+                // UpdateIfEqual, atomically against other cores.
+                match self.guest_cas_u32(address, value as u32, new_value as u32) {
+                    Ok(seen) if seen == value as u32 => {}
+                    Ok(_) => return Ok(0xfa01),
                     Err(Trap::MemoryFault { .. }) => return Ok(0xd401),
                     Err(trap) => return Err(trap),
                 }
@@ -1596,7 +1654,11 @@ impl Machine {
         // one worker does, ignoring affinity or priority.
         let any_core = crate::nvn::debug_var_os("ECHORA_ANY_CORE").is_some();
         let flat_priority = crate::nvn::debug_var_os("ECHORA_FLAT_PRIORITY").is_some();
+        let one_core = crate::nvn::debug_var_os("ECHORA_ONE_CORE").is_some();
         let allowed = |id: u64| -> bool {
+            if one_core {
+                return self.worker_core.is_none_or(|core| core == 0);
+            }
             let Some(core) = self.worker_core.filter(|_| !any_core) else {
                 return true;
             };
@@ -1924,6 +1986,14 @@ impl Machine {
             self.process_exit_reason = Some("last_started_thread_exit");
             return Err(Trap::Exit { code: 0 });
         }
+        // Horizon never preempts or migrates a thread whose thread-local
+        // DisableCount is set; it raises the InterruptFlag instead and the
+        // thread calls SynchronizePreemptionState once it re-enables. The
+        // game's per-core data (indexed by GetCurrentProcessorNumber) relies
+        // on it.
+        if self.user_preemption_disabled() {
+            return Ok(());
+        }
         // A thread that ended its slice spin-polling waits for memory other
         // threads must change: let them run first for a while. Only dense
         // polling counts (a poll per SPIN_DENSITY_INSTRUCTIONS or more):
@@ -2141,7 +2211,9 @@ impl Machine {
         self.resume_or_idle(|machine| machine.host_ready())?;
         self.check_entry_pc()?;
         let _profile = crate::host_profile::start();
-        if self.layout.workers > 1 {
+        // ECHORA_PARALLEL_PATH (diagnostic): the worker machinery even for
+        // one worker.
+        if self.layout.workers > 1 || crate::nvn::debug_var_os("ECHORA_PARALLEL_PATH").is_some() {
             return self.run_parallel(&dispatch);
         }
         crate::fault::watch(&self.core);
@@ -2260,6 +2332,14 @@ impl Machine {
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
                 .map(|_| std::sync::Mutex::new(())),
+            exclusive: crate::nvn::debug_var_os("ECHORA_EXCLUSIVE_THREADS").map(|list| {
+                let ids = list
+                    .to_string_lossy()
+                    .split(',')
+                    .filter_map(|id| id.trim().parse().ok())
+                    .collect();
+                (std::sync::RwLock::new(()), ids)
+            }),
         };
         let finished: Vec<(Core, Option<Trap>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = cores
@@ -3324,6 +3404,16 @@ impl Machine {
                 }
                 Ok(())
             }
+            0x36 => {
+                // SynchronizePreemptionState: the thread re-enabled
+                // preemption after a deferred one; clear the InterruptFlag
+                // (the next boundary may switch it out).
+                let tls = self.core.cpu.tpidrro_el0;
+                if tls != 0 {
+                    let _ = self.memory.write_u16(tls + TLS_INTERRUPT_FLAG, 0);
+                }
+                Ok(())
+            }
             0x35 => {
                 // SignalToAddress: X0 address, W1 SignalType, W2 value,
                 // W3 count (<= 0 wakes all).
@@ -4068,6 +4158,7 @@ impl Machine {
     pub fn report(&self, stop: &Trap) -> serde_json::Value {
         serde_json::json!({
             "stop":stop,"guest_instructions":self.core.steps,"pc":self.core.cpu.pc,
+            "user_preemption_deferrals":self.user_preemption_deferrals,
             "current_thread_id":self.core.current_thread_id,
             "current_processor_id":self.thread_processor_id(self.core.current_thread_id).ok(),
             "registers":self.core.cpu.regs,"sp":self.core.cpu.sp,"nzcv":self.core.cpu.nzcv,
@@ -4111,6 +4202,9 @@ struct Shared<'a> {
     /// Signaled when a submission running without the lock returns the
     /// NVN state (`Machine::nvn_away` clears).
     nvn_back: std::sync::Condvar,
+    /// ECHORA_EXCLUSIVE_THREADS=ID,... (diagnostic): those guest threads run
+    /// only while no other worker runs guest code.
+    exclusive: Option<(std::sync::RwLock<()>, Vec<u64>)>,
     /// Signaled when a thread may have become runnable or the run stops.
     wake: std::sync::Condvar,
     stop: std::sync::atomic::AtomicBool,
@@ -4151,6 +4245,24 @@ impl Worker {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
+                let thread = self.core.current_thread_id;
+                let (exclusive_write, exclusive_read) = match &shared.exclusive {
+                    Some((lock, ids)) if ids.contains(&thread) => (
+                        Some(
+                            lock.write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                        None,
+                    ),
+                    Some((lock, _)) => (
+                        None,
+                        Some(
+                            lock.read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                    ),
+                    None => (None, None),
+                };
                 let result = loop {
                     let result = dispatch(&mut self.core);
                     if result.is_err() {
@@ -4158,7 +4270,7 @@ impl Worker {
                     }
                 };
                 drop(serial);
-                let thread = self.core.current_thread_id;
+                drop((exclusive_write, exclusive_read));
                 let waited = std::time::Instant::now();
                 let mut machine = shared
                     .machine
