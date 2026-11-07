@@ -2217,7 +2217,9 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
 /// target's window from the dispatcher), addresses taken with ADR,
 /// jump-table targets and the block after anything that continues through
 /// the dispatcher (a call, an indirect branch, an SVC: the host resumes
-/// there) keep their own arm, and
+/// there) keep their own arm, as do blocks with or after an exclusive load
+/// or store (their boundaries are where another thread can take the
+/// reservation), and
 /// so does every block a host boundary can resume at, since only arms set
 /// `next_pc` before the loop's boundary check.
 fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
@@ -2267,6 +2269,20 @@ fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
             entry.1 += 1;
         }
     }
+    // Blocks holding an exclusive access keep every boundary around them.
+    let exclusive: BTreeSet<u64> = translation
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.instructions.iter().any(|record| {
+                matches!(
+                    record.instruction,
+                    LoadExclusive { .. } | StoreExclusive { .. }
+                )
+            })
+        })
+        .map(|block| block.start)
+        .collect();
     predecessors
         .into_iter()
         .filter(|&(target, (predecessor, count))| {
@@ -2275,6 +2291,8 @@ fn inlined_blocks(translation: &Translation) -> BTreeSet<u64> {
                 && predecessor >> SPLIT_WINDOW_BITS == target >> SPLIT_WINDOW_BITS
                 && starts.contains(&target)
                 && !entered.contains(&target)
+                && !exclusive.contains(&target)
+                && !exclusive.contains(&predecessor)
         })
         .map(|(target, _)| target)
         .collect()

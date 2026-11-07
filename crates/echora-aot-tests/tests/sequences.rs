@@ -186,8 +186,10 @@ fn check_sequences(slices: Option<u64>) {
         failures.len()
     );
     assert!(branches > 0 && memory_instructions > 0);
+    // Inlined single-predecessor blocks run without a boundary check
+    // between them, so short slices end at fewer places than one per block.
     assert!(
-        slices.is_none() || boundaries > runs as u64,
+        slices.is_none() || boundaries * 2 > runs as u64,
         "slices must end often"
     );
     assert!(
