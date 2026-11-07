@@ -1,9 +1,10 @@
 # Local setup
 
 This guide goes from a fresh clone to the game starting from the launcher.
-Expect it to take a couple of hours, most of it one long build. Only Linux
-can build and run the game's translation today; the tools and launcher
-also build on Windows and macOS.
+You build Echora once; the launcher does the rest. Expect the first start
+to take about an hour, most of it building the game. Only Linux can build
+and run the game's translation today; the tools and launcher also build on
+Windows and macOS.
 
 > Even when every step works, the game only reaches the intro movie, at
 > about 6 frames per second. See the [known limitations](limitations.md).
@@ -39,103 +40,92 @@ cargo build --release
 ```
 
 This builds the `echora` command-line tool and `echora-launcher` into
-`target/release/`. Keep the two side by side: the launcher starts the game
-through the `echora` binary next to it.
+`target/release/`. Keep the two side by side and keep the clone where it
+is: the launcher starts the game through the `echora` binary next to it,
+and the game's translation is built against the clone's sources.
 
-To check your copy of the game before going further:
-
-```sh
-target/release/echora inspect /path/to/game.nup   # packages, versions, build ID
-target/release/echora verify /path/to/game.nup    # hash-check every file
-```
-
-## 2. Fetch the shader recompiler
-
-```sh
-scripts/fetch-shader-sources.sh
-```
-
-The console's GPU programs are translated by the Lichii shader recompiler,
-which is not stored in this repository. The script downloads it at a pinned
-commit with its dependencies (sirit, fmt, SPIRV-Headers, Boost headers)
-into `~/.cache/echora/shader-src` (`ECHORA_SHADER_SRC` overrides it), and
-applies Echora's patches.
-
-**Do this before step 3.** `lift` records where the shader sources are;
-a translation made without them builds, but draws nothing.
-
-## 3. Translate the game
-
-```sh
-target/release/echora lift /path/to/game.nup
-```
-
-This writes the game's code as Rust (4.2 GiB in 1,111 crates) and ends by
-printing the translation folder:
-
-```
-translation: /home/you/.cache/echora/translations/<key>
-```
-
-The key comes from the game's content, so a NUP and an extracted dump of
-the same build share one translation.
-
-## 4. Build the translation
-
-```sh
-cd ~/.cache/echora/translations/<key>
-cargo build --release -j 6 -p echora-run
-```
-
-The first build takes about an hour on a Ryzen 7 5800X3D. Lower `-j` if
-you are short of memory: each job can use about 1.2 GB.
-
-- Later builds recompile only what changed, but any change to
-  `echora-guest` recompiles every region crate, so after pulling new
-  commits, run `echora lift` again and rebuild.
-- The translation links to the Rust toolchain that built it. If you
-  update or remove that toolchain, rebuild the translation.
-- Keep the cache on disk. On systems where `/tmp` is a RAM-backed tmpfs,
-  do not point `ECHORA_CACHE_DIR` there.
-
-## 5. Start the game from the launcher
+## 2. Start the launcher
 
 ```sh
 target/release/echora-launcher
 ```
 
-1. Choose your NUP file or dump. The launcher copies the game into
-   Echora's data folder (`~/.local/share/echora/game`), after which the
-   original is no longer needed.
-2. Press **Play**. The game starts in its own window with sound and no
-   time limit.
+1. **Choose your game.** Pick your NUP file or dump. The launcher copies
+   it into Echora's data folder (`~/.local/share/echora/game`), after which
+   the original is no longer needed.
+2. **Press Play.** The first time, the launcher prepares the game before
+   starting it, showing each step and a progress bar:
+   - *Getting the shader recompiler*: downloads the Lichii shader
+     recompiler, which translates the console's GPU programs, at a pinned
+     commit with its dependencies, into `~/.cache/echora/shader-src`, and
+     applies Echora's patches.
+   - *Translating the game*: writes the game's code as Rust (4.2 GiB in
+     1,111 crates) into `~/.cache/echora/translations/<key>`. The key
+     comes from the game's content, so a NUP and a dump of the same build
+     share one translation.
+   - *Building the game*: compiles that translation, counting the 1,111
+     crates. This takes about an hour on a Ryzen 7 5800X3D. The launcher
+     runs as many compiler jobs at once as your processors and memory
+     allow, leaving about 1.5 GB for each.
+
+   When it finishes, the game starts in its own window with sound and no
+   time limit. Later starts are immediate.
+
+Closing the launcher while it prepares stops the preparation; the next
+Play continues where the build left off. After you pull new commits and
+build Echora again, the next Play prepares the game again, which is
+quicker when little has changed.
 
 The launcher works with the mouse, the keyboard (Tab, arrows, Enter) and
 controllers (D-pad or stick, A, B). Its settings (window mode, internal
 resolution, vibration) are saved to `~/.config/echora/settings.toml` and
 applied by the runtime. With **Skip launcher** on, opening the launcher
-starts the game straight away; `echora-launcher --show` opens the launcher
-window again.
+starts the game straight away (or shows the launcher when the game still
+needs preparing); `echora-launcher --show` opens the launcher window
+again.
 
 In the game, keyboard and gamepads drive the controls;
 `ECHORA_GAMEPAD_LAYOUT=labels` maps face buttons by label instead of
 position. Saves go to `~/.local/share/echora/save` (`ECHORA_SAVE_DIR`
 overrides it).
 
+Keep the cache on disk: on systems where `/tmp` is a RAM-backed tmpfs, do
+not point `ECHORA_CACHE_DIR` there. The translation links to the Rust
+toolchain that built it, so if you update or remove that toolchain,
+prepare the game again (`echora prepare --force`).
+
 ## Troubleshooting
 
-- **"no built translation at …"**: steps 3 and 4 have not been done for
-  this build of the game, or the build failed. Run them again.
-- **"the ExeFS does not match this translation's build"**: the game
-  you installed is a different version from the one translated. Lift and
-  build again from the installed game.
-- **The window stays black**: the shader sources were missing when you
-  ran `lift`. Do step 2, then steps 3 and 4 again.
+- **"Couldn't prepare the game: …"**: the message names the step that
+  failed. Fetching needs `git` and a network connection; building needs
+  Rust (`cargo` on your `PATH` or in `~/.cargo/bin`), C and C++ compilers
+  and the packages above. To see the full output, run the same step in a
+  terminal: `target/release/echora prepare ~/.local/share/echora/game/game.nup`.
+- **The build runs out of memory**: run `echora prepare` yourself with
+  fewer jobs, for example `-j 2`.
+- **"the ExeFS does not match this translation's build"**: the installed
+  game is a different version from the one translated. Run
+  `echora prepare --force` on it.
 - **The game stops with a report**: every operation Echora does not
   implement yet ends the run and writes `run-<time>.json` in the
   translation folder. This is expected at the current stage.
 
 ## Running from the command line
+
+The launcher's steps are commands of their own:
+
+```sh
+target/release/echora prepare /path/to/game.nup   # fetch, translate and build (-j N, --force, --check)
+target/release/echora inspect /path/to/game.nup   # packages, versions, build ID
+target/release/echora verify /path/to/game.nup    # hash-check every file
+```
+
+`prepare` does nothing when the game is already prepared. The steps it
+runs can also be run one at a time: `scripts/fetch-shader-sources.sh`
+(before lifting, since `lift` records where the shader sources are),
+`echora lift`, then `cargo build --release -p echora-run` in the
+translation folder it prints. A translation built by hand this way is
+used as it is.
 
 `echora run` starts the built translation directly, which is how the game
 is tested:

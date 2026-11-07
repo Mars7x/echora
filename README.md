@@ -96,21 +96,20 @@ See [architecture](docs/architecture.md) for the crate boundaries.
 
 ## Building and running
 
-The game's translation only builds and runs on Linux for now. In short:
+The game's translation only builds and runs on Linux for now. Build
+Echora, then let the launcher do the rest:
 
 ```sh
-cargo build --release                         # echora and echora-launcher
-scripts/fetch-shader-sources.sh               # shader recompiler (before lift)
-target/release/echora lift game.nup           # translate the game; prints its folder
-(cd ~/.cache/echora/translations/<key> && cargo build --release -j 6 -p echora-run)
-target/release/echora-launcher                # install the game, then Play
+cargo build --release                 # echora and echora-launcher
+target/release/echora-launcher        # choose your game, then Play
 ```
 
-You need your own dump of the game, Rust 1.88 or newer, C and C++
-compilers, the system libraries listed in the guide, about 16 GB of RAM
-and about 30 GB of disk. The translation build takes about an hour. Follow
-[local setup](docs/local-setup.md) for each step, what it needs and what
-to do when one fails.
+The first Play fetches the shader recompiler, translates the game and
+builds the translation, showing its progress; that takes about an hour,
+and later starts are immediate. You need your own dump of the game,
+Rust 1.88 or newer, C and C++ compilers, the system libraries listed in
+the guide, about 16 GB of RAM and about 30 GB of disk. See
+[local setup](docs/local-setup.md) for details and troubleshooting.
 
 Other commands work on your NUP file or extracted dump directory:
 
@@ -121,6 +120,8 @@ echora import game.nup           # validate and cache the program's ExeFS
 echora load game.nup             # decompress and verify every module
 echora analyze game.nup --limit 20000000   # code discovery (needs ~6 GB RAM)
 echora boot game.nup             # create the game process without running it
+echora prepare game.nup          # fetch, translate and build, as the launcher does
+echora lift game.nup             # only translate (4.2 GiB of Rust)
 echora run game.nup              # run the built translation without the launcher
 echora extract game.nup out --subtree romfs
 ```
