@@ -61,9 +61,18 @@ fn invalid(message: impl Into<String>) -> Trap {
     }
 }
 
-fn effective_priorities(priorities: &BTreeMap<u64, ThreadPriority>) -> BTreeMap<u64, u8> {
-    priorities
+/// The effective priorities `staged` changes from `before`: plans list only
+/// those (every other thread keeps its priority), so applying one costs
+/// nothing when inheritance moved nothing.
+fn changed_priorities(
+    before: &BTreeMap<u64, ThreadPriority>,
+    staged: &BTreeMap<u64, ThreadPriority>,
+) -> BTreeMap<u64, u8> {
+    staged
         .iter()
+        .filter(|&(id, priority)| {
+            before.get(id).map(|old| old.effective) != Some(priority.effective)
+        })
         .map(|(&id, priority)| (id, priority.effective))
         .collect()
 }
@@ -168,7 +177,7 @@ impl MutexWaits {
         state.restore_priority(thread, &mut staged_priorities)?;
         Ok(WaitPlan {
             state,
-            priorities: effective_priorities(&staged_priorities),
+            priorities: changed_priorities(priorities, &staged_priorities),
         })
     }
 
@@ -216,7 +225,7 @@ impl MutexWaits {
         state.restore_priority(owner, &mut staged_priorities)?;
         Ok(WaitPlan {
             state,
-            priorities: effective_priorities(&staged_priorities),
+            priorities: changed_priorities(priorities, &staged_priorities),
         })
     }
 
@@ -237,7 +246,7 @@ impl MutexWaits {
         let Some(selected) = selected else {
             return Ok(UnlockPlan {
                 state: self.clone(),
-                priorities: effective_priorities(priorities),
+                priorities: BTreeMap::new(),
                 selected: None,
                 next_word: 0,
             });
@@ -282,7 +291,7 @@ impl MutexWaits {
         state.restore_priority(selected, &mut staged_priorities)?;
         Ok(UnlockPlan {
             state,
-            priorities: effective_priorities(&staged_priorities),
+            priorities: changed_priorities(priorities, &staged_priorities),
             selected: Some(selected),
             next_word: selected_waiter.tag | if has_waiters { HAS_WAITERS } else { 0 },
         })
@@ -785,7 +794,6 @@ mod tests {
     }
 
     fn apply_priorities(current: &mut BTreeMap<u64, ThreadPriority>, next: &BTreeMap<u64, u8>) {
-        assert_eq!(current.len(), next.len());
         for (&id, &effective) in next {
             current.get_mut(&id).unwrap().effective = effective;
         }
@@ -899,7 +907,7 @@ mod tests {
         let plan = state.prepare_unlock(1, 0xa000, &current).unwrap();
         assert_eq!(plan.state, before);
         assert_eq!((plan.selected, plan.next_word), (None, 0));
-        assert_eq!(plan.priorities, effective_priorities(&current));
+        assert!(plan.priorities.is_empty());
 
         assert_eq!(unlock(&mut state, &mut current, 1, 0x8000), (Some(2), 0));
         assert_eq!(state.waiting[&4].owner, 3);
