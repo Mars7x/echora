@@ -2380,6 +2380,40 @@ impl Nvn {
             )
         };
         let mut c0 = vec![0u8; (table_end as usize).max(0x100)];
+        // After a 16-byte head: root tables 0-7 (words pushed with
+        // PushComputeConstants), their word counts at control +0xa9..0xb0,
+        // each padded to four words; then the uniform buffers' addresses
+        // and sizes (16 bytes each) up to the storage buffers.
+        let mut root_counts = [0u8; 8];
+        core.memory
+            .read(control + 0xa9, &mut root_counts)
+            .map_err(|trap| format!("compute control section: {trap:?}"))?;
+        let mut at = 0x10usize;
+        for (table, &count) in root_counts.iter().enumerate() {
+            let words = usize::from(count).min(64);
+            if let Some(root) = self.render.roots[1].get(table) {
+                for (index, word) in root[..words].iter().enumerate() {
+                    if let Some(slot) = c0.get_mut(at + index * 4..at + index * 4 + 4) {
+                        slot.copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+            at += words.next_multiple_of(4) * 4;
+        }
+        for slot in 0..u32::from(header[1]) {
+            let entry = at + slot as usize * 16;
+            if entry + 12 > storage_base as usize {
+                break;
+            }
+            if let Some(bind) = self
+                .render
+                .state
+                .get(&format!("BindUniformBuffer/5/{slot}"))
+            {
+                c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
+                c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
+            }
+        }
         let mut storage = HashMap::new();
         let mut written_back = Vec::new();
         let mut uniforms = HashMap::new();
@@ -2812,6 +2846,14 @@ impl Nvn {
             let nvn = nvn_stage(stage.stage);
             for descriptor in &stage.descriptors {
                 match descriptor.kind() {
+                    // Constant bank 24: root table 0 of the graphics
+                    // pipeline (PushGraphicsConstants).
+                    DescriptorKind::UniformBuffer if descriptor.index == 24 => {
+                        let words = self.render.roots[0].first().copied().unwrap_or([0; 64]);
+                        let bytes: Vec<u8> =
+                            words.iter().flat_map(|word| word.to_le_bytes()).collect();
+                        uniforms.insert((index, descriptor.binding), bytes);
+                    }
                     DescriptorKind::UniformBuffer if descriptor.index >= 3 => {
                         let slot = descriptor.index - 3;
                         let bind = self
