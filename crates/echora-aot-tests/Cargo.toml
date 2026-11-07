@@ -22,3 +22,8 @@ echora-lift.workspace = true
 
 [lints]
 workspace = true
+
+# Guest instructions per second of lifted kernels; see docs/testing.md.
+[[bench]]
+name = "kernels"
+harness = false

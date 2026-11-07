@@ -35,6 +35,38 @@ The running game is checked from its run reports and from presented frames
 saved with `ECHORA_CAPTURE_EVERY` ([development](development.md)). These
 checks need the game and are not part of CI.
 
+## Codegen speed without the game
+
+`echora-aot-tests` has a benchmark of lifted code. It needs no game and runs
+in seconds, so codegen changes can be compared before a game run:
+
+```
+cargo bench -p echora-aot-tests --bench kernels
+cargo bench -p echora-aot-tests --bench kernels -- calls --scale 4 --runs 5
+```
+
+`build.rs` lifts seven kernels from `crates/echora-aot-tests/benches/kernels.s`
+through split emission, the layout real builds use, and the benchmark runs
+them natively, reporting guest instructions per second (best and median of
+`--runs`):
+
+| Kernel | What it exercises |
+|---|---|
+| `arith` | A tight integer loop: add, shifted EOR, MADD, ROR, flags and a back-edge. |
+| `memcpy` | 64 KiB copies with LDP/STP of Q registers and post-indexing. |
+| `memset` | 64 KiB fills with STP of X registers. |
+| `calls` | Two BLs per iteration to leaf functions in another dispatch window. |
+| `switch` | An eight-way switch through a halfword jump table (BR). |
+| `vector` | FMLA, FADD and FMUL on 4S vectors loaded with post-indexing. |
+| `poll` | An LDAR/CBZ polling loop; the host ends it after 500 slices of 100,000 instructions, as another thread setting the flag would. |
+
+A positional argument filters kernels by name, and `--scale` multiplies each
+kernel's work. The kernels are original code. To change them, edit
+`kernels.s` and run `benches/assemble_kernels.py` (it needs llvm-mc,
+llvm-objcopy and llvm-objdump) to regenerate `src/kernels.rs`. The words are
+checked in, so building needs no assembler. `cargo test` builds the kernels
+but does not run the benchmark.
+
 CI runs formatting, clippy with warnings denied, and the tests on Linux
 x86-64 and Windows x86-64. Passing CI means the code compiles
 and the tests pass on that host; it says nothing about running the game.

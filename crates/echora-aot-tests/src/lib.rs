@@ -22,6 +22,11 @@ mod programs_list {
 }
 pub use programs_list::{CODE_BASE, PROGRAMS};
 
+/// The benchmark kernels (`benches/kernels.rs`), lifted as `kernel_code`.
+pub mod kernels {
+    include!("kernels.rs");
+}
+
 pub struct Machine {
     pub memory: Memory,
     pub core: Core,
@@ -45,6 +50,31 @@ impl Machine {
         let mut core = Core::new(memory.view());
         core.cpu.pc = CODE_BASE;
         core.max_steps = 100;
+        core.host_check_at = u64::MAX;
+        Self { memory, core }
+    }
+
+    /// Code of `code_size` bytes from `code_base` holding `code`
+    /// (read/execute), and `data_size` bytes of zeroed data from `data_base`
+    /// (read/write). No instruction budget and no host checks.
+    pub fn with_layout(
+        code_base: u64,
+        code: &[u8],
+        code_size: u64,
+        data_base: u64,
+        data_size: u64,
+    ) -> Self {
+        let mut memory = Memory::new(ADDRESS_SPACE);
+        memory
+            .map(code_base, code_size, READ | EXECUTE, STATE_CODE, "code")
+            .expect("map code");
+        memory.initialize(code_base, code).expect("load code");
+        memory
+            .map(data_base, data_size, READ | WRITE, STATE_NORMAL, "data")
+            .expect("map data");
+        let mut core = Core::new(memory.view());
+        core.cpu.pc = code_base;
+        core.max_steps = u64::MAX;
         core.host_check_at = u64::MAX;
         Self { memory, core }
     }
