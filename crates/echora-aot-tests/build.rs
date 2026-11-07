@@ -78,6 +78,7 @@ fn main() {
     fp_semantic_code(&mut out);
     simd_memory_code(&mut out);
     sequence_code(&mut out);
+    call_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -481,38 +482,10 @@ fn simd_memory_code(out: &mut String) {
 /// Memory instructions use X28 as their base and X27 as their index, and
 /// no instruction writes either, so every access stays in the test's data.
 fn sequence_code(out: &mut String) {
-    use echora_lift::aarch64::{Address, Instruction, decode};
     use echora_lift::defuse::effects;
 
     const BASE: u64 = 0x90_0000;
     const SEQUENCES: usize = 600;
-    // (mask of fixed bits, their value, has a base register in bits 9:5).
-    const CLASSES: &[(u32, u32, bool)] = &[
-        (0x1f80_0000, 0x1100_0000, false),
-        (0x1f20_0000, 0x0b00_0000, false),
-        (0x1fe0_0000, 0x0b20_0000, false),
-        (0x1fe0_fc00, 0x1a00_0000, false),
-        (0x1f00_0000, 0x0a00_0000, false),
-        (0x1f80_0000, 0x1200_0000, false),
-        (0x1f80_0000, 0x1280_0000, false),
-        (0x1f80_0000, 0x1300_0000, false),
-        (0x7fa0_0000, 0x1380_0000, false),
-        (0x3fe0_0410, 0x3a40_0000, false),
-        (0x3fe0_0800, 0x1a80_0000, false),
-        (0x7fe0_0000, 0x1b00_0000, false),
-        (0xff60_0000, 0x9b20_0000, false),
-        (0x7fe0_c000, 0x1ac0_0000, false),
-        (0x7fff_f000, 0x5ac0_0000, false),
-        (0x7fe0_e000, 0x1ac0_4000, false),
-        (0xffdf_ffe0, 0xd51b_4200, false),
-        (0x3f00_0000, 0x3900_0000, true),
-        (0x3f20_0000, 0x3800_0000, true),
-        (0x3f20_0c00, 0x3820_0800, true),
-        (0x3e00_0000, 0x2800_0000, true),
-        (0x3fa0_7c00, 0x08a0_7c00, true),
-        (0x3f20_0c00, 0x3820_0000, true),
-        (0x3f7f_fc00, 0x089f_fc00, true),
-    ];
     let mut state: u64 = 0x2b7e_1516_28ae_d2a6;
     let mut next = || {
         state ^= state << 13;
@@ -520,7 +493,7 @@ fn sequence_code(out: &mut String) {
         state ^= state << 17;
         (state >> 16) as u32
     };
-    let reserved = |instruction: &Instruction| {
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
         let writes = effects(instruction).writes;
         writes.has_gpr(27) || writes.has_gpr(28)
     };
@@ -531,31 +504,7 @@ fn sequence_code(out: &mut String) {
         entries.push(BASE + 4 * words.len() as u64);
         let mut body = Vec::new();
         while body.len() < length {
-            let (mask, value, memory) = CLASSES[next() as usize % CLASSES.len()];
-            let mut word = (next() & !mask) | value;
-            if memory {
-                word = (word & !(31 << 5)) | (28 << 5);
-            }
-            let instruction = decode(word, 0);
-            let word = match instruction {
-                Instruction::LoadStore {
-                    address: Address::Register { .. },
-                    ..
-                } => (word & !(31 << 16)) | (27 << 16),
-                _ => word,
-            };
-            let instruction = decode(word, 0);
-            let usable = !matches!(
-                instruction,
-                Instruction::Unsupported
-                    | Instruction::Nop
-                    | Instruction::PacGeneric { .. }
-                    | Instruction::LoadExclusive { .. }
-                    | Instruction::StoreExclusive { .. }
-            ) && !reserved(&instruction);
-            if usable {
-                body.push(word);
-            }
+            body.push(body_instruction(&mut next, &reserved));
         }
         // Forward branches to a later instruction of the sequence (or its
         // SVC): conditional, compare, test and unconditional.
@@ -600,6 +549,221 @@ fn sequence_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+// (mask of fixed bits, their value, has a base register in bits 9:5).
+/// Classes the sequence and call programs draw from.
+const BODY_CLASSES: &[(u32, u32, bool)] = &[
+    (0x1f80_0000, 0x1100_0000, false),
+    (0x1f20_0000, 0x0b00_0000, false),
+    (0x1fe0_0000, 0x0b20_0000, false),
+    (0x1fe0_fc00, 0x1a00_0000, false),
+    (0x1f00_0000, 0x0a00_0000, false),
+    (0x1f80_0000, 0x1200_0000, false),
+    (0x1f80_0000, 0x1280_0000, false),
+    (0x1f80_0000, 0x1300_0000, false),
+    (0x7fa0_0000, 0x1380_0000, false),
+    (0x3fe0_0410, 0x3a40_0000, false),
+    (0x3fe0_0800, 0x1a80_0000, false),
+    (0x7fe0_0000, 0x1b00_0000, false),
+    (0xff60_0000, 0x9b20_0000, false),
+    (0x7fe0_c000, 0x1ac0_0000, false),
+    (0x7fff_f000, 0x5ac0_0000, false),
+    (0x7fe0_e000, 0x1ac0_4000, false),
+    (0xffdf_ffe0, 0xd51b_4200, false),
+    (0x3f00_0000, 0x3900_0000, true),
+    (0x3f20_0000, 0x3800_0000, true),
+    (0x3f20_0c00, 0x3820_0800, true),
+    (0x3e00_0000, 0x2800_0000, true),
+    (0x3fa0_7c00, 0x08a0_7c00, true),
+    (0x3f20_0c00, 0x3820_0000, true),
+    (0x3f7f_fc00, 0x089f_fc00, true),
+];
+
+/// A random instruction from `BODY_CLASSES` that `reserved` does not
+/// reject. Memory instructions use X28 as their base and X27 as their
+/// index; exclusives (monitor behaviour is implementation defined) and
+/// PACGA are left out.
+fn body_instruction(
+    next: &mut dyn FnMut() -> u32,
+    reserved: &dyn Fn(&echora_lift::aarch64::Instruction) -> bool,
+) -> u32 {
+    use echora_lift::aarch64::{Address, Instruction, decode};
+    loop {
+        let (mask, value, memory) = BODY_CLASSES[next() as usize % BODY_CLASSES.len()];
+        let mut word = (next() & !mask) | value;
+        if memory {
+            word = (word & !(31 << 5)) | (28 << 5);
+        }
+        if let Instruction::LoadStore {
+            address: Address::Register { .. },
+            ..
+        } = decode(word, 0)
+        {
+            word = (word & !(31 << 16)) | (27 << 16);
+        }
+        let instruction = decode(word, 0);
+        let usable = !matches!(
+            instruction,
+            Instruction::Unsupported
+                | Instruction::Nop
+                | Instruction::PacGeneric { .. }
+                | Instruction::LoadExclusive { .. }
+                | Instruction::StoreExclusive { .. }
+        ) && !reserved(&instruction);
+        if usable {
+            return word;
+        }
+    }
+}
+
+/// Programs with calls for `tests/calls.rs`: 8 leaf functions, six in
+/// windows of their own and two beside the callers, some calling a later
+/// leaf behind an STP/LDP of X29 and X30 on the stack; and 300 callers of
+/// random instructions with BL to a leaf, or BLR X26 after MOVZ/MOVK, in
+/// about a third of their slots, each ending in SVC #7.
+fn call_code(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xa0_0000;
+    const LEAVES: usize = 8;
+    const CALLERS: usize = 300;
+    const PROLOGUE: u32 = 0xa9bf_7bfd; // stp x29, x30, [sp, #-16]!
+    const EPILOGUE: u32 = 0xa8c1_7bfd; // ldp x29, x30, [sp], #16
+    const RET: u32 = 0xd65f_03c0;
+    let mut state: u64 = 0x3243_f6a8_885a_308d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    // X26 holds BLR targets, X27/X28 the data index and base, X30 the
+    // return address; SP is the stack.
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        [26, 27, 28, 30].iter().any(|&n| writes.has_gpr(n)) || writes.sp
+    };
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+
+    // Leaf bodies first (calls patched once addresses are known): each is
+    // its words and the index of a BL to patch with its callee.
+    type Leaf = (Vec<u32>, Option<(usize, usize)>);
+    let mut leaves: Vec<Leaf> = Vec::new();
+    for leaf in 0..LEAVES {
+        let mut words = Vec::new();
+        let nested = leaf + 1 < LEAVES && next() % 2 == 0;
+        if nested {
+            words.push(PROLOGUE);
+        }
+        for _ in 0..1 + next() % 5 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        let call = if nested {
+            let callee = leaf + 1 + next() as usize % (LEAVES - leaf - 1);
+            words.push(0);
+            let at = words.len() - 1;
+            for _ in 0..next() % 3 {
+                words.push(body_instruction(&mut next, &reserved));
+            }
+            words.push(EPILOGUE);
+            Some((at, callee))
+        } else {
+            None
+        };
+        words.push(RET);
+        leaves.push((words, call));
+    }
+    let mut callers: Vec<Vec<u32>> = Vec::new();
+    let mut calls = Vec::new(); // (caller, index, leaf, by register)
+    for caller in 0..CALLERS {
+        let mut words = Vec::new();
+        for _ in 0..4 + next() % 9 {
+            if next() % 3 == 0 {
+                let leaf = next() as usize % LEAVES;
+                let register = next() % 2 == 0;
+                if register {
+                    words.extend([0, 0]);
+                }
+                words.push(0);
+                calls.push((caller, words.len() - 1, leaf, register));
+            } else {
+                words.push(body_instruction(&mut next, &reserved));
+            }
+        }
+        words.push(0xd400_00e1);
+        callers.push(words);
+    }
+    // Layout: leaves 0-5 one window each, then the callers, then leaves 6
+    // and 7.
+    let mut addresses = [0; LEAVES];
+    for (leaf, address) in addresses.iter_mut().enumerate().take(6) {
+        *address = BASE + 0x400 * leaf as u64;
+    }
+    let callers_base = BASE + 0x400 * 6;
+    let mut cursor = callers_base;
+    let mut caller_addresses = Vec::new();
+    for words in &callers {
+        caller_addresses.push(cursor);
+        cursor += 4 * words.len() as u64;
+    }
+    for (leaf, address) in addresses.iter_mut().enumerate().skip(6) {
+        *address = cursor;
+        cursor += 4 * leaves[leaf].0.len() as u64;
+    }
+    for leaf in 0..LEAVES {
+        if let Some((at, callee)) = leaves[leaf].1 {
+            let from = addresses[leaf] + 4 * at as u64;
+            leaves[leaf].0[at] = bl(from, addresses[callee]);
+        }
+    }
+    for &(caller, at, leaf, register) in &calls {
+        let from = caller_addresses[caller] + 4 * at as u64;
+        let target = addresses[leaf];
+        if register {
+            let low = (target & 0xffff) as u32;
+            let high = (target >> 16) as u32;
+            callers[caller][at - 2] = 0xd280_0000 | (low << 5) | 26; // movz x26
+            callers[caller][at - 1] = 0xf2a0_0000 | (high << 5) | 26; // movk x26, lsl 16
+            callers[caller][at] = 0xd63f_0000 | (26 << 5); // blr x26
+        } else {
+            callers[caller][at] = bl(from, target);
+        }
+    }
+    let mut image = vec![0u8; (cursor - BASE) as usize];
+    let mut place = |address: u64, words: &[u32]| {
+        for (index, word) in words.iter().enumerate() {
+            let at = (address - BASE) as usize + 4 * index;
+            image[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    };
+    for leaf in 0..LEAVES {
+        place(addresses[leaf], &leaves[leaf].0);
+    }
+    for (caller, words) in callers.iter().enumerate() {
+        place(caller_addresses[caller], words);
+    }
+    let words: Vec<u32> = image
+        .chunks(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
+        .collect();
+    let region = CodeRegion {
+        name: "calls".into(),
+        base: BASE,
+        bytes: image,
+    };
+    let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod call_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
