@@ -6,9 +6,6 @@
   frames per second, including startup and debugging instrumentation). By
   default every guest thread runs on one host thread; `ECHORA_WORKERS` runs
   them on several, which is not yet the default or measured for OoT.
-- Launching from the launcher's Play button does not open the game's window
-  or play its sound: the runtime opens them only with `ECHORA_WINDOW=1` and
-  `ECHORA_AUDIO=1`, which the launcher does not yet set.
 - Guest memory reaches host memory directly on Linux and Windows (10 1803 or
   later), which need 4 KiB host pages. macOS uses a checked backend that
   looks every guest access up in a table, which is slower.
