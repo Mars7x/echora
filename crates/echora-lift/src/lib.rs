@@ -12,4 +12,6 @@
 
 pub mod aarch64;
 pub mod codegen;
+pub mod defuse;
 pub mod simd;
+pub mod spin;
