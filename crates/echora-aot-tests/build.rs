@@ -80,6 +80,7 @@ fn main() {
     sequence_code(&mut out);
     call_code(&mut out);
     loop_code(&mut out);
+    exclusive_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -889,6 +890,99 @@ fn loop_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{image:#x?};").expect("write");
     writeln!(out, "pub const PROGRAMS: &[u64] = &{programs:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Sequences with exclusive pairs for `tests/exclusives.rs`: random
+/// instructions with LDXR/LDAXR then STXR/STLXR on [X28] (sometimes of
+/// another size, with CLREX or a plain store to [X28] between them, or
+/// storing back the loaded value), each ending in SVC #7.
+fn exclusive_code(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xc8_0000;
+    const SEQUENCES: usize = 400;
+    let mut state: u64 = 0xa409_3822_299f_31d0;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        writes.has_gpr(27) || writes.has_gpr(28)
+    };
+    // A data register other than X27/X28.
+    let register = |next: &mut dyn FnMut() -> u32| loop {
+        let n = next() % 31;
+        if n != 27 && n != 28 {
+            return n;
+        }
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for _ in 0..SEQUENCES {
+        entries.push(BASE + 4 * words.len() as u64);
+        for _ in 0..1 + next() % 3 {
+            for _ in 0..next() % 3 {
+                words.push(body_instruction(&mut next, &reserved));
+            }
+            let size = next() % 4;
+            let loaded = register(&mut next);
+            let acquire = (next() & 1) << 15;
+            words.push(0x085f_7c00 | (size << 30) | acquire | (28 << 5) | loaded);
+            // Half the pairs span two blocks (B to the next instruction), so
+            // a turn can end between the load and the store.
+            if next() % 2 == 0 {
+                words.push(0x1400_0001);
+            }
+            for _ in 0..next() % 3 {
+                let word = match next() % 6 {
+                    0 => 0xd503_305f,                                   // clrex
+                    1 => 0xb900_0000 | (28 << 5) | register(&mut next), // str w, [x28]
+                    _ => body_instruction(&mut next, &reserved),
+                };
+                words.push(word);
+            }
+            let store_size = if next() % 5 == 0 { next() % 4 } else { size };
+            // A third store back the loaded register: the value does not
+            // change, so only the global generation can fail another
+            // context's pending pair.
+            let store_back = next() % 3 == 0;
+            let (status, value) = loop {
+                let status = register(&mut next);
+                let value = if store_back {
+                    loaded
+                } else {
+                    register(&mut next)
+                };
+                if status != value {
+                    break (status, value);
+                }
+            };
+            let release = (next() & 1) << 15;
+            words.push(
+                0x0800_7c00 | (store_size << 30) | (status << 16) | release | (28 << 5) | value,
+            );
+        }
+        words.push(0xd400_00e1);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "exclusives".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &entries, words.len() + 16).expect("exclusives");
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod exclusive_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
