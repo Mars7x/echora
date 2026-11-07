@@ -892,12 +892,14 @@ fn emit_call(output: &mut String, next: u64) {
 /// otherwise forces a reload of every register after each store). Direct
 /// calls and the helpers that read or write general registers through the
 /// `Core` see it current: around them the written locals are stored and the
-/// used ones reloaded.
+/// used ones reloaded. NZCV is a local (`fl`) the same way: compares the
+/// window never reads afterwards then cost nothing.
 struct RegisterLocals {
     used: BTreeSet<u8>,
     written: BTreeSet<u8>,
     sp_used: bool,
     sp_written: bool,
+    flags: bool,
 }
 
 /// Helper calls that read general registers from the `Core`.
@@ -925,6 +927,23 @@ const WRITES_REGISTERS: &[&str] = &[
 
 const CALL_PREFIX: &str = "if let Err(trap) = m.call(";
 
+/// Flag operations on the `Core`, done on the `fl` local instead.
+const FLAG_OPERATIONS: &[&str] = &[
+    "add_sub(",
+    "add_with_carry(",
+    "condition(",
+    "logical_flags(",
+    "conditional_compare(",
+    "conditional_compare_negative(",
+];
+
+/// Helper calls that read or write NZCV in the `Core`.
+const USES_FLAGS: &[&str] = &[
+    "simd::fp_compare(",
+    "simd::fp_conditional_compare(",
+    "simd::fp_select(",
+];
+
 impl RegisterLocals {
     fn of(cases: &str) -> Self {
         let mut locals = Self {
@@ -932,6 +951,10 @@ impl RegisterLocals {
             written: BTreeSet::new(),
             sp_used: false,
             sp_written: false,
+            flags: cases.contains("m.cpu.nzcv")
+                || FLAG_OPERATIONS
+                    .iter()
+                    .any(|operation| cases.contains(&format!("m.cpu.{operation}"))),
         };
         for (at, _) in cases.match_indices("m.cpu.regs[") {
             let rest = &cases[at + "m.cpu.regs[".len()..];
@@ -968,6 +991,9 @@ impl RegisterLocals {
         if self.sp_used {
             text.push_str("    let mut sp = m.cpu.sp;\n");
         }
+        if self.flags {
+            text.push_str("    let mut fl = cpu::Flags { nzcv: m.cpu.nzcv };\n");
+        }
         text
     }
 
@@ -979,6 +1005,9 @@ impl RegisterLocals {
         if self.sp_written {
             text.push_str("    m.cpu.sp = sp;\n");
         }
+        if self.flags {
+            text.push_str("    m.cpu.nzcv = fl.nzcv;\n");
+        }
         text
     }
 
@@ -989,6 +1018,9 @@ impl RegisterLocals {
         }
         if self.sp_used {
             text.push_str("sp = m.cpu.sp; ");
+        }
+        if self.flags {
+            text.push_str("fl.nzcv = m.cpu.nzcv; ");
         }
         text
     }
@@ -1002,7 +1034,22 @@ impl RegisterLocals {
             for index in &self.used {
                 line = line.replace(&format!("x[{index}]"), &format!("x{index}"));
             }
-            let line = replace_sp(&line);
+            let mut line = replace_sp(&line);
+            if self.flags {
+                line = line.replace("m.cpu.nzcv", "fl.nzcv");
+                for operation in FLAG_OPERATIONS {
+                    line = line.replace(&format!("m.cpu.{operation}"), &format!("fl.{operation}"));
+                }
+                if USES_FLAGS.iter().any(|helper| line.contains(helper)) {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    writeln!(
+                        text,
+                        "{indent}m.cpu.nzcv = fl.nzcv;\n{line}\n{indent}fl.nzcv = m.cpu.nzcv;"
+                    )
+                    .unwrap();
+                    continue;
+                }
+            }
             let indent = &line[..line.len() - line.trim_start().len()];
             if let Some(rest) = line.trim_start().strip_prefix(CALL_PREFIX) {
                 // The callee runs on the Core: store before, reload after
@@ -2696,8 +2743,30 @@ mod tests {
         assert!(window[call..].find("x1 = m.cpu.regs[1];").unwrap() > 0);
         assert!(stored < call);
         assert!(
-            window.ends_with("    m.cpu.regs[1] = x1;\n    m.cpu.regs[30] = x30;\n    result\n}\n")
+            window.ends_with("    m.cpu.regs[1] = x1;\n    m.cpu.regs[30] = x30;\n    m.cpu.nzcv = fl.nzcv;\n    result\n}\n")
         );
+    }
+
+    #[test]
+    fn split_windows_keep_flags_in_a_local() {
+        // CMP X1, #1; B.EQ +8; BL +8: the compare and the branch use the
+        // local, which the direct call and the return see.
+        let translation = discover(
+            &[region(&[0xf100_043f, 0x5400_0040, 0x9400_0002, 0, 0])],
+            &[0x1000],
+            4,
+        )
+        .unwrap();
+        let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
+        let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
+        assert!(window.contains("    let mut fl = cpu::Flags { nzcv: m.cpu.nzcv };\n"));
+        assert!(window.contains("fl.add_sub("));
+        assert!(window.contains("fl.condition(0)"));
+        assert!(!window.contains("m.cpu.add_sub(") && !window.contains("m.cpu.condition("));
+        let call = window.find("let called = m.call(").unwrap();
+        assert!(window[..call].rfind("m.cpu.nzcv = fl.nzcv;").is_some());
+        assert!(window[call..].contains("fl.nzcv = m.cpu.nzcv;"));
+        assert!(window.ends_with("    m.cpu.nzcv = fl.nzcv;\n    result\n}\n"));
     }
 
     #[test]

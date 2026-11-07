@@ -250,6 +250,73 @@ impl Cpu {
         bits: u8,
         flags: bool,
     ) -> u64 {
+        self.flags_do(|f| f.add_with_carry(lhs, rhs, carry, bits, flags))
+    }
+
+    #[inline]
+    pub fn add_sub(&mut self, lhs: u64, rhs: u64, subtract: bool, bits: u8, flags: bool) -> u64 {
+        self.flags_do(|f| f.add_sub(lhs, rhs, subtract, bits, flags))
+    }
+
+    /// CCMP tests the incoming NZCV before replacing it. When the predicate is
+    /// false, all four flags come directly from the instruction's NZCV literal.
+    #[inline]
+    pub fn conditional_compare(&mut self, lhs: u64, rhs: u64, bits: u8, condition: u8, nzcv: u8) {
+        self.flags_do(|f| f.conditional_compare(lhs, rhs, bits, condition, nzcv))
+    }
+
+    /// CCMN: as CCMP, with flags from Rn + operand.
+    #[inline]
+    pub fn conditional_compare_negative(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        bits: u8,
+        condition: u8,
+        nzcv: u8,
+    ) {
+        self.flags_do(|f| f.conditional_compare_negative(lhs, rhs, bits, condition, nzcv))
+    }
+
+    #[inline]
+    pub fn logical_flags(&mut self, value: u64, bits: u8) {
+        self.flags_do(|f| f.logical_flags(value, bits))
+    }
+
+    #[inline]
+    pub fn condition(&self, condition: u8) -> bool {
+        Flags { nzcv: self.nzcv }.condition(condition)
+    }
+
+    #[inline(always)]
+    fn flags_do<T>(&mut self, operation: impl FnOnce(&mut Flags) -> T) -> T {
+        let mut flags = Flags { nzcv: self.nzcv };
+        let result = operation(&mut flags);
+        self.nzcv = flags.nzcv;
+        result
+    }
+}
+
+/// NZCV on its own, so translated code can keep it in a local between
+/// the points where it syncs with `Cpu::nzcv`, as it does registers; the
+/// host compiler then drops flags nothing reads and folds compares into
+/// branches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// N, Z, C, V in bits 3, 2, 1, 0.
+    pub nzcv: u8,
+}
+
+impl Flags {
+    #[inline(always)]
+    pub fn add_with_carry(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        carry: bool,
+        bits: u8,
+        flags: bool,
+    ) -> u64 {
         let mask = width_mask(bits);
         let lhs = lhs & mask;
         let rhs = rhs & mask;
@@ -266,7 +333,7 @@ impl Cpu {
         result
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn add_sub(&mut self, lhs: u64, rhs: u64, subtract: bool, bits: u8, flags: bool) -> u64 {
         if subtract {
             self.add_with_carry(lhs, !rhs, true, bits, flags)
@@ -275,9 +342,7 @@ impl Cpu {
         }
     }
 
-    /// CCMP tests the incoming NZCV before replacing it. When the predicate is
-    /// false, all four flags come directly from the instruction's NZCV literal.
-    #[inline]
+    #[inline(always)]
     pub fn conditional_compare(&mut self, lhs: u64, rhs: u64, bits: u8, condition: u8, nzcv: u8) {
         if self.condition(condition) {
             self.add_sub(lhs, rhs, true, bits, true);
@@ -286,8 +351,7 @@ impl Cpu {
         }
     }
 
-    /// CCMN: as CCMP, with flags from Rn + operand.
-    #[inline]
+    #[inline(always)]
     pub fn conditional_compare_negative(
         &mut self,
         lhs: u64,
@@ -303,13 +367,13 @@ impl Cpu {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn logical_flags(&mut self, value: u64, bits: u8) {
         let value = value & width_mask(bits);
         self.nzcv = (((value >> (bits - 1)) as u8) << 3) | (u8::from(value == 0) << 2);
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn condition(&self, condition: u8) -> bool {
         let n = self.nzcv & 8 != 0;
         let z = self.nzcv & 4 != 0;
@@ -323,8 +387,7 @@ impl Cpu {
             4 => c && !z,
             5 => n == v,
             6 => n == v && !z,
-            7 => true,
-            _ => unreachable!(),
+            _ => true,
         };
         if condition & 1 != 0 && condition != 15 {
             !result
