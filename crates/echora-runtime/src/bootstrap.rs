@@ -141,8 +141,11 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
         layout.remote_memory_model = RemoteMemoryModel::AbsentRegionCompatibility;
     }
     // Any block boundary is a valid preemption point; switching at every
-    // one makes the host scheduler most of the run time.
-    layout.scheduler_slice = env_number("ECHORA_SCHEDULER_SLICE").unwrap_or(20_000);
+    // one makes the host scheduler most of the run time. Long slices waste
+    // more: a thread polling for another's progress spends its whole slice
+    // spinning. 1,000 instructions played the intro movie 1.5x faster than
+    // 20,000 (300 and 2,000 were both slower than 1,000).
+    layout.scheduler_slice = env_number("ECHORA_SCHEDULER_SLICE").unwrap_or(1_000);
     layout.workers = env_number::<usize>("ECHORA_WORKERS").unwrap_or(1).max(1);
 
     let mut machine = Machine::new(layout, max_steps);

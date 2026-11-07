@@ -8,7 +8,7 @@ use crate::threads::{ThreadCollection, ThreadCreate, ThreadState};
 pub use echora_guest::Core;
 use serde::Serialize;
 use std::collections::BTreeMap;
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 use std::time::Duration;
 
 pub use echora_guest::Trap;
@@ -1781,8 +1781,19 @@ impl Machine {
     /// worker `c % workers`, so each core has exactly one worker.
     fn worker_guest_cores(&self, worker: u8) -> u64 {
         let workers = self.core_threads.len().max(1) as u64;
+        // ECHORA_CORE_MAP=W0,W1,... (diagnostic): core c belongs to the
+        // c-th listed worker instead.
+        let map: Option<Vec<u64>> = crate::nvn::debug_var_os("ECHORA_CORE_MAP").map(|map| {
+            map.to_string_lossy()
+                .split(',')
+                .filter_map(|item| item.trim().parse().ok())
+                .collect()
+        });
         (0..u64::from(APPLICATION_CORES.count_ones()))
-            .filter(|core| core % workers == u64::from(worker))
+            .filter(|&core| match &map {
+                Some(map) => map.get(core as usize).copied().unwrap_or(0) == u64::from(worker),
+                None => core % workers == u64::from(worker),
+            })
             .fold(0, |mask, core| mask | 1 << core)
     }
 
@@ -2055,11 +2066,24 @@ impl Machine {
                 self.core.steps.saturating_add(SPIN_BACKOFF_INSTRUCTIONS),
             );
         }
-        let next = self
-            .next_runnable_thread(self.core.current_thread_id, None)
-            .ok_or_else(|| Trap::NoRunnableThreads {
+        let Some(next) = self.next_runnable_thread(self.core.current_thread_id, None) else {
+            // With several workers the running thread itself can be
+            // ineligible here (its affinity mask moved it to another core's
+            // worker). It stays runnable, so another worker resumes it from
+            // its saved context: save the live one first, or that worker
+            // runs it from a stale snapshot.
+            if self.thread_state(self.core.current_thread_id) == Some(ThreadState::Runnable) {
+                if self.core.current_thread_id == self.layout.main_thread_id {
+                    self.main_saved_cpu = Some(self.core.cpu.clone());
+                } else {
+                    self.threads
+                        .save_cpu(self.core.current_thread_id, &self.core.cpu)?;
+                }
+            }
+            return Err(Trap::NoRunnableThreads {
                 waiting_threads: self.waiting_thread_count(),
-            })?;
+            });
+        };
         if next == self.core.current_thread_id {
             return Ok(()); // Never rewind the active CPU to its saved snapshot.
         }
@@ -2400,6 +2424,8 @@ impl Machine {
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
                 .map(|_| std::sync::Mutex::new(())),
+            world: crate::nvn::debug_var_os("ECHORA_STOP_WORLD")
+                .map(|_| std::sync::RwLock::new(())),
             exclusive: crate::nvn::debug_var_os("ECHORA_EXCLUSIVE_THREADS").map(|list| {
                 let ids = list
                     .to_string_lossy()
@@ -4273,6 +4299,9 @@ struct Shared<'a> {
     /// ECHORA_EXCLUSIVE_THREADS=ID,... (diagnostic): those guest threads run
     /// only while no other worker runs guest code.
     exclusive: Option<(std::sync::RwLock<()>, Vec<u64>)>,
+    /// ECHORA_STOP_WORLD (diagnostic): no guest code runs on any worker
+    /// while one handles a boundary.
+    world: Option<std::sync::RwLock<()>>,
     /// Signaled when a thread may have become runnable or the run stops.
     wake: std::sync::Condvar,
     stop: std::sync::atomic::AtomicBool,
@@ -4331,6 +4360,11 @@ impl Worker {
                     ),
                     None => (None, None),
                 };
+                let world_read = shared.world.as_ref().map(|world| {
+                    world
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
                 let result = loop {
                     let result = dispatch(&mut self.core);
                     if result.is_err() {
@@ -4338,7 +4372,12 @@ impl Worker {
                     }
                 };
                 drop(serial);
-                drop((exclusive_write, exclusive_read));
+                drop((exclusive_write, exclusive_read, world_read));
+                let _world_write = shared.world.as_ref().map(|world| {
+                    world
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
                 let waited = std::time::Instant::now();
                 let mut machine = shared
                     .machine
@@ -4577,7 +4616,7 @@ impl Worker {
 }
 
 #[allow(clippy::unwrap_used)]
-#[cfg(all(test, any(target_os = "linux", windows, target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
     use crate::memory::{
