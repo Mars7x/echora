@@ -7,21 +7,16 @@ reimplementation of the console services it uses, with native graphics,
 display, input and audio, rather than emulating the console.
 
 > [!CAUTION]
-> **Echora is NOT ready for stable gameplay.** You cannot play the game
-> with it today. It does not reach gameplay, runs far below full speed,
-> is missing large parts of the graphics path, and can hang, crash or
-> render incorrectly at any point. Saves are untested and may be lost or
-> corrupted. It needs much more work before it is usable, and there is
-> no timeline for when that will be. Do not expect a working game, and
-> do not report gameplay problems as bugs yet.
->
-> **If you want to play Ocarina of Time, do not use Echora.** There are
-> currently far better options for playing the game. Echora is a
-> research and development project, not a way to play it.
+> **Echora is NOT ready for stable gameplay, and it is not a way to play
+> Ocarina of Time today.** It does not reach gameplay, runs far below full
+> speed, is missing large parts of the graphics path, and can hang, crash
+> or render incorrectly at any point. Saves are untested and may be lost
+> or corrupted. It needs much more work, with no timeline, so do not report
+> gameplay problems as bugs yet.
 
-> **This is an early development project, not a playable port.** It contains
-> no game code, assets or keys, and it cannot run anything without a legally
-> obtained copy of the game that you dump and supply yourself.
+> Echora contains no game code, assets or keys, and it cannot run anything
+> without a legally obtained copy of the game that you dump and supply
+> yourself.
 
 > **Note:** AI tools were used in developing this project.
 
