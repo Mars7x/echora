@@ -1862,6 +1862,11 @@ impl Nvn {
             // nvnWindowSetPresentInterval(window, int) the vsync interval.
             "nvnWindowSetCrop"
             | "nvnWindowSetPresentInterval"
+            // SetNumActiveTextures(window, int): how many of the window's
+            // textures the application cycles through (its builder's
+            // SetNumActiveTextures at run time); the host presents what is
+            // presented, so it is recorded only.
+            | "nvnWindowSetNumActiveTextures"
             | "nvnTextureSetDebugLabel"
             | "nvnBufferSetDebugLabel"
             | "nvnMemoryPoolSetDebugLabel"
