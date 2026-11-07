@@ -2246,6 +2246,8 @@ impl Machine {
             wake: std::sync::Condvar::new(),
             nvn_back: std::sync::Condvar::new(),
             stop: std::sync::atomic::AtomicBool::new(false),
+            serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
+                .map(|_| std::sync::Mutex::new(())),
         };
         let finished: Vec<(Core, Option<Trap>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = cores
@@ -4039,6 +4041,10 @@ struct Shared<'a> {
     /// Signaled when a thread may have become runnable or the run stops.
     wake: std::sync::Condvar,
     stop: std::sync::atomic::AtomicBool,
+    /// Held while a worker runs guest code when ECHORA_SERIAL_GUEST is set:
+    /// threads keep their cores but never execute at the same time, which
+    /// separates scheduling faults from memory-ordering ones.
+    serial: Option<std::sync::Mutex<()>>,
 }
 
 /// One host thread running guest threads.
@@ -4067,12 +4073,18 @@ impl Worker {
         loop {
             if self.active {
                 let ran = std::time::Instant::now();
+                let serial = shared.serial.as_ref().map(|serial| {
+                    serial
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
                 let result = loop {
                     let result = dispatch(&mut self.core);
                     if result.is_err() {
                         break result;
                     }
                 };
+                drop(serial);
                 let thread = self.core.current_thread_id;
                 let waited = std::time::Instant::now();
                 let mut machine = shared
