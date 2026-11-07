@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Adapter from one native (Ampere) NVN program to the Eden/PokeDinner shader
+// Adapter from one native (Ampere) NVN program to the Eden-family (Lichii) shader
 // recompiler: the program is captured and lowered to Maxwell form the way
 // PokeDinner's GenericEnvironment::LowerNativeCode does (GPL-3.0-or-later,
 // Eden Emulator Project and PokeDinner contributors), translated to IR and
@@ -31,7 +31,7 @@ namespace {
 using Shader::Ampere::Instruction;
 
 /// Graphics stages carry a 128-byte header whose first 0x50 bytes are a
-/// Maxwell shader program header (PokeDinner reads it as one).
+/// Maxwell shader program header (the recompiler reads it as one).
 constexpr size_t NATIVE_GRAPHICS_HEADER = 128;
 
 class Env final : public Shader::Environment {

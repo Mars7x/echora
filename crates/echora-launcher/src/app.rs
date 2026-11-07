@@ -850,7 +850,7 @@ fn last_game_file() -> Option<PathBuf> {
 /// The people and projects Echora builds on, with what each contributed.
 const CREDITS: [(&str, &str); 6] = [
     ("Andrew Slaiman (Mars7x)", "Creator of Echora"),
-    ("PokeDinner, an Eglantine fork", "Shader recompiler"),
+    ("Lichii, an Eglantine fork", "Shader recompiler"),
     ("sirit", "SPIR-V generation"),
     ("GPUI by Zed Industries", "Launcher interface"),
     ("a55uka/nup", "NUP format specification"),
