@@ -14,6 +14,10 @@ display, input and audio, rather than emulating the console.
 > corrupted. It needs much more work before it is usable, and there is
 > no timeline for when that will be. Do not expect a working game, and
 > do not report gameplay problems as bugs yet.
+>
+> **If you want to play Ocarina of Time, do not use Echora.** There are
+> currently far better options for playing the game. Echora is a
+> research and development project, not a way to play it.
 
 > **This is an early development project, not a playable port.** It contains
 > no game code, assets or keys, and it cannot run anything without a legally
