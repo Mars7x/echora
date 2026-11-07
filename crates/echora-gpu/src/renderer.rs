@@ -378,7 +378,10 @@ impl Renderer {
         };
         // SAFETY: the physical device belongs to the live instance.
         let (period, valid_bits) = unsafe {
-            let limits = gpu.instance.get_physical_device_properties(gpu.physical).limits;
+            let limits = gpu
+                .instance
+                .get_physical_device_properties(gpu.physical)
+                .limits;
             let families = gpu
                 .instance
                 .get_physical_device_queue_family_properties(gpu.physical);
@@ -387,7 +390,8 @@ impl Renderer {
                 .map_or(0, |family| family.timestamp_valid_bits);
             (limits.timestamp_period, bits)
         };
-        let timer = crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
+        let timer =
+            crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
         let mut renderer = Self {
             timer,
             gpu,

@@ -32,8 +32,7 @@ impl GpuTimer {
         valid_bits: u32,
         fences: [vk::Fence; 2],
     ) -> Option<Self> {
-        if std::env::var_os("ECHORA_GPU_TIME").is_none_or(|value| value == "0") || valid_bits == 0
-        {
+        if std::env::var_os("ECHORA_GPU_TIME").is_none_or(|value| value == "0") || valid_bits == 0 {
             return None;
         }
         let info = vk::QueryPoolCreateInfo::default()
@@ -54,11 +53,19 @@ impl GpuTimer {
     }
 
     fn first_query(&self, fence: vk::Fence) -> Option<u32> {
-        self.fences.iter().position(|known| *known == fence).map(|slot| slot as u32 * 2)
+        self.fences
+            .iter()
+            .position(|known| *known == fence)
+            .map(|slot| slot as u32 * 2)
     }
 
     /// At the start of the slot's recording.
-    pub(crate) fn begin(&self, device: &ash::Device, commands: vk::CommandBuffer, fence: vk::Fence) {
+    pub(crate) fn begin(
+        &self,
+        device: &ash::Device,
+        commands: vk::CommandBuffer,
+        fence: vk::Fence,
+    ) {
         let Some(first) = self.first_query(fence) else {
             return;
         };
