@@ -1,7 +1,8 @@
 //! Semantic differential test for floating point: lifted scalar and vector
 //! FP instructions against a reference written from the Arm pseudocode,
-//! with FPCR at its reset value (round to nearest even, no flush to zero,
-//! no default-NaN mode).
+//! rounding to nearest even with FPCR.FZ (flush to zero) and FPCR.DN
+//! (default NaN) each set at random, comparing the FPSR flags the runtime
+//! models: IOC, DZC, OFC and IDC.
 //!
 //! The reference follows FPProcessNaNs (first SNaN, then first QNaN, in
 //! operand order, quieted) and FPProcessNaNs3 for fused operations (the
@@ -11,7 +12,12 @@
 //! zero rules of FMAX/FMIN and the QNaN rule of FMAXNM/FMINNM; FMULX's
 //! 0 x inf = 2; FCVT's NaN conversion; and saturating conversions to
 //! integers in every rounding mode. Inputs include NaNs, infinities,
-//! zeros, denormals and edge integers. FPSR is not compared.
+//! zeros, denormals and edge integers. Under FZ, denormal inputs of
+//! arithmetic, compares and conversions become signed zeros (IDC) and tiny
+//! results flush to zero; under DN every NaN result is the default NaN.
+//! UFC, IXC and QC are not modeled by the runtime and not compared. A run
+//! whose FZ result rounds to exactly the smallest normal is skipped: the
+//! rounded value alone cannot tell whether the exact one was tiny.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
@@ -30,6 +36,111 @@ struct State {
     x: [u64; 31],
     v: [u128; 32],
     nzcv: u8,
+    fpcr: u32,
+    /// Only `FLAGS` are compared.
+    fpsr: u32,
+}
+
+const IOC: u32 = 1;
+const DZC: u32 = 1 << 1;
+const OFC: u32 = 1 << 2;
+const IDC: u32 = 1 << 7;
+/// The cumulative FPSR flags the runtime models.
+const FLAGS: u32 = IOC | DZC | OFC | IDC;
+const FPCR_FZ: u32 = 1 << 24;
+const FPCR_DN: u32 = 1 << 25;
+
+/// The FP mode of the current reference run and what it raised.
+#[derive(Clone, Copy, Default)]
+struct Context {
+    flush: bool,
+    default_nan: bool,
+    flags: u32,
+    /// An FZ result rounded to exactly the smallest normal.
+    ambiguous: bool,
+}
+
+thread_local! {
+    static CONTEXT: std::cell::Cell<Context> = const {
+        std::cell::Cell::new(Context {
+            flush: false,
+            default_nan: false,
+            flags: 0,
+            ambiguous: false,
+        })
+    };
+}
+
+fn context() -> Context {
+    CONTEXT.with(std::cell::Cell::get)
+}
+
+fn update(f: impl FnOnce(&mut Context)) {
+    CONTEXT.with(|cell| {
+        let mut context = cell.get();
+        f(&mut context);
+        cell.set(context);
+    });
+}
+
+fn raise(flag: u32) {
+    update(|context| context.flags |= flag);
+}
+
+fn min_normal(size: u32) -> u64 {
+    1 << fraction_bits(size)
+}
+
+fn is_denormal(bits: u64, size: u32) -> bool {
+    let magnitude = absolute(bits, size);
+    magnitude != 0 && magnitude < min_normal(size)
+}
+
+/// FPUnpack's flush: under FZ a denormal input is a zero of its sign (IDC).
+fn input(bits: u64, size: u32) -> u64 {
+    if context().flush && is_denormal(bits, size) {
+        raise(IDC);
+        bits & sign_bit(size)
+    } else {
+        bits
+    }
+}
+
+/// A propagated NaN, or the default NaN under DN.
+fn nan_result(nan: u64, size: u32) -> u64 {
+    if context().default_nan {
+        default_nan(size)
+    } else {
+        nan
+    }
+}
+
+fn finite(values: &[u64], size: u32) -> bool {
+    values
+        .iter()
+        .all(|&value| value_of(value, size).is_finite())
+}
+
+/// FPRound's view of a computed result: an invalid operation gives the
+/// default NaN (IOC), an infinity from finite inputs is an overflow (OFC),
+/// and under FZ a tiny result flushes to a zero of its sign.
+fn round_result(bits: u64, size: u32, finite: bool) -> u64 {
+    if is_nan(bits, size) {
+        raise(IOC);
+        return default_nan(size);
+    }
+    if finite && is_infinite(bits, size) {
+        raise(OFC);
+    }
+    if context().flush {
+        if absolute(bits, size) == min_normal(size) {
+            update(|context| context.ambiguous = true);
+        }
+        if is_denormal(bits, size) {
+            return bits & sign_bit(size);
+        }
+    }
+    bits
 }
 
 impl std::fmt::Debug for State {
@@ -38,7 +149,11 @@ impl std::fmt::Debug for State {
         for (n, value) in self.v.iter().enumerate() {
             write!(f, "v{n}: {value:#034x}, ")?;
         }
-        write!(f, "x: {:x?}, nzcv: {} }}", self.x, self.nzcv)
+        write!(
+            f,
+            "x: {:x?}, nzcv: {}, fpcr: {:#x}, fpsr: {:#x} }}",
+            self.x, self.nzcv, self.fpcr, self.fpsr
+        )
     }
 }
 
@@ -167,12 +282,13 @@ fn infinity(negative: bool, size: u32) -> u64 {
     if negative { negate(bits, size) } else { bits }
 }
 
-/// FPProcessNaN.
+/// FPProcessNaN: a signalling NaN raises IOC; DN gives the default NaN.
 fn process_nan(a: u64, size: u32) -> Option<u64> {
     if is_snan(a, size) {
-        Some(quiet(a, size))
+        raise(IOC);
+        Some(nan_result(quiet(a, size), size))
     } else if is_nan(a, size) {
-        Some(a)
+        Some(nan_result(a, size))
     } else {
         None
     }
@@ -181,13 +297,13 @@ fn process_nan(a: u64, size: u32) -> Option<u64> {
 /// FPProcessNaNs.
 fn process_nans(a: u64, b: u64, size: u32) -> Option<u64> {
     if is_snan(a, size) {
-        Some(quiet(a, size))
+        process_nan(a, size)
     } else if is_snan(b, size) {
-        Some(quiet(b, size))
+        process_nan(b, size)
     } else if is_nan(a, size) {
-        Some(a)
+        process_nan(a, size)
     } else if is_nan(b, size) {
-        Some(b)
+        process_nan(b, size)
     } else {
         None
     }
@@ -195,27 +311,22 @@ fn process_nans(a: u64, b: u64, size: u32) -> Option<u64> {
 
 /// FPProcessNaNs3.
 fn process_nans3(a: u64, b: u64, c: u64, size: u32) -> Option<u64> {
-    for value in [a, b, c] {
-        if is_snan(value, size) {
-            return Some(quiet(value, size));
-        }
-    }
-    [a, b, c].into_iter().find(|&value| is_nan(value, size))
+    let first = [a, b, c]
+        .into_iter()
+        .find(|&value| is_snan(value, size))
+        .or_else(|| [a, b, c].into_iter().find(|&value| is_nan(value, size)))?;
+    process_nan(first, size)
 }
 
-/// An arithmetic result in the operation's own precision; an invalid
-/// operation's NaN becomes the default NaN.
-fn compute(size: u32, f32_op: impl Fn() -> f32, f64_op: impl Fn() -> f64) -> u64 {
+/// An arithmetic result of non-NaN inputs in the operation's own
+/// precision, through `round_result`.
+fn compute(size: u32, finite: bool, f32_op: impl Fn() -> f32, f64_op: impl Fn() -> f64) -> u64 {
     let bits = if size == 32 {
         u64::from(f32_op().to_bits())
     } else {
         f64_op().to_bits()
     };
-    if is_nan(bits, size) {
-        default_nan(size)
-    } else {
-        bits
-    }
+    round_result(bits, size, finite)
 }
 
 fn f32_of(bits: u64) -> f32 {
@@ -227,26 +338,61 @@ fn f64_of(bits: u64) -> f64 {
 }
 
 fn add(a: u64, b: u64, size: u32) -> u64 {
-    process_nans(a, b, size)
-        .unwrap_or_else(|| compute(size, || f32_of(a) + f32_of(b), || f64_of(a) + f64_of(b)))
+    let (a, b) = (input(a, size), input(b, size));
+    process_nans(a, b, size).unwrap_or_else(|| {
+        compute(
+            size,
+            finite(&[a, b], size),
+            || f32_of(a) + f32_of(b),
+            || f64_of(a) + f64_of(b),
+        )
+    })
 }
 
 fn sub(a: u64, b: u64, size: u32) -> u64 {
-    process_nans(a, b, size)
-        .unwrap_or_else(|| compute(size, || f32_of(a) - f32_of(b), || f64_of(a) - f64_of(b)))
+    let (a, b) = (input(a, size), input(b, size));
+    process_nans(a, b, size).unwrap_or_else(|| {
+        compute(
+            size,
+            finite(&[a, b], size),
+            || f32_of(a) - f32_of(b),
+            || f64_of(a) - f64_of(b),
+        )
+    })
 }
 
 fn mul(a: u64, b: u64, size: u32) -> u64 {
-    process_nans(a, b, size)
-        .unwrap_or_else(|| compute(size, || f32_of(a) * f32_of(b), || f64_of(a) * f64_of(b)))
+    let (a, b) = (input(a, size), input(b, size));
+    process_nans(a, b, size).unwrap_or_else(|| {
+        compute(
+            size,
+            finite(&[a, b], size),
+            || f32_of(a) * f32_of(b),
+            || f64_of(a) * f64_of(b),
+        )
+    })
 }
 
 fn div(a: u64, b: u64, size: u32) -> u64 {
-    process_nans(a, b, size)
-        .unwrap_or_else(|| compute(size, || f32_of(a) / f32_of(b), || f64_of(a) / f64_of(b)))
+    let (a, b) = (input(a, size), input(b, size));
+    process_nans(a, b, size).unwrap_or_else(|| {
+        let dividend = value_of(a, size);
+        if is_zero(b, size) && dividend.is_finite() && dividend != 0.0 {
+            raise(DZC);
+        }
+        // A quotient by zero is an exact infinity, not an overflow.
+        let finite = finite(&[a, b], size) && !is_zero(b, size);
+        compute(
+            size,
+            finite,
+            || f32_of(a) / f32_of(b),
+            || f64_of(a) / f64_of(b),
+        )
+    })
 }
 
 fn mulx(a: u64, b: u64, size: u32) -> u64 {
+    let (a, b) = (input(a, size), input(b, size));
     if let Some(nan) = process_nans(a, b, size) {
         return nan;
     }
@@ -262,6 +408,7 @@ fn mulx(a: u64, b: u64, size: u32) -> u64 {
 
 /// FPMax/FPMin.
 fn max_min(a: u64, b: u64, size: u32, max: bool) -> u64 {
+    let (a, b) = (input(a, size), input(b, size));
     if let Some(nan) = process_nans(a, b, size) {
         return nan;
     }
@@ -292,10 +439,12 @@ fn max_min_number(mut a: u64, mut b: u64, size: u32, max: bool) -> u64 {
 
 /// FPMulAdd: addend + n * m, fused.
 fn mul_add(addend: u64, n: u64, m: u64, size: u32) -> u64 {
+    let (addend, n, m) = (input(addend, size), input(n, size), input(m, size));
     let nan = process_nans3(addend, n, m, size);
     let invalid_product =
         (is_infinite(n, size) && is_zero(m, size)) || (is_zero(n, size) && is_infinite(m, size));
     if is_qnan(addend, size) && invalid_product {
+        raise(IOC);
         return default_nan(size);
     }
     if let Some(nan) = nan {
@@ -303,13 +452,22 @@ fn mul_add(addend: u64, n: u64, m: u64, size: u32) -> u64 {
     }
     compute(
         size,
+        finite(&[addend, n, m], size),
         || f32_of(n).mul_add(f32_of(m), f32_of(addend)),
         || f64_of(n).mul_add(f64_of(m), f64_of(addend)),
     )
 }
 
 fn sqrt(a: u64, size: u32) -> u64 {
-    process_nan(a, size).unwrap_or_else(|| compute(size, || f32_of(a).sqrt(), || f64_of(a).sqrt()))
+    let a = input(a, size);
+    process_nan(a, size).unwrap_or_else(|| {
+        compute(
+            size,
+            finite(&[a], size),
+            || f32_of(a).sqrt(),
+            || f64_of(a).sqrt(),
+        )
+    })
 }
 
 fn round_value(value: f64, rounding: Rounding) -> f64 {
@@ -324,6 +482,7 @@ fn round_value(value: f64, rounding: Rounding) -> f64 {
 
 /// FRINT<r>: the result keeps the input's sign, even when zero.
 fn round_integral(a: u64, rounding: Rounding, size: u32) -> u64 {
+    let a = input(a, size);
     if let Some(nan) = process_nan(a, size) {
         return nan;
     }
@@ -337,9 +496,14 @@ fn round_integral(a: u64, rounding: Rounding, size: u32) -> u64 {
 }
 
 /// FPCompare flags: unordered 0011, equal 0110, less 1000, greater 0010.
-fn compare(a: u64, b: u64, size: u32) -> u8 {
+/// A signalling NaN raises IOC, and so does any NaN when `signaling`.
+fn compare(a: u64, b: u64, size: u32, signaling: bool) -> u8 {
+    let (a, b) = (input(a, size), input(b, size));
     let (x, y) = (value_of(a, size), value_of(b, size));
     if x.is_nan() || y.is_nan() {
+        if signaling || is_snan(a, size) || is_snan(b, size) {
+            raise(IOC);
+        }
         0b0011
     } else if x == y {
         0b0110
@@ -348,6 +512,20 @@ fn compare(a: u64, b: u64, size: u32) -> u8 {
     } else {
         0b0010
     }
+}
+
+/// A vector compare (FCMEQ, FCMGE, FCMGT and friends): true or false, with
+/// FPCompareEQ's or FPCompareGE/GT's exceptions.
+fn compare_lanes(a: u64, b: u64, size: u32, signaling: bool, test: fn(f64, f64) -> bool) -> u64 {
+    let (a, b) = (input(a, size), input(b, size));
+    let (x, y) = (value_of(a, size), value_of(b, size));
+    if x.is_nan() || y.is_nan() {
+        if signaling || is_snan(a, size) || is_snan(b, size) {
+            raise(IOC);
+        }
+        return 0;
+    }
+    if test(x, y) { mask(size) } else { 0 }
 }
 
 fn condition_holds(condition: u8, flags: u8) -> bool {
@@ -379,7 +557,14 @@ fn convert(a: u64, from: u32, to: u32) -> u64 {
     if from == to {
         return a;
     }
+    let a = input(a, from);
     if is_nan(a, from) {
+        if is_snan(a, from) {
+            raise(IOC);
+        }
+        if context().default_nan {
+            return default_nan(to);
+        }
         let negative = a & sign_bit(from) != 0;
         let fraction = a & mask(fraction_bits(from));
         let fraction = if to > from {
@@ -390,13 +575,16 @@ fn convert(a: u64, from: u32, to: u32) -> u64 {
         let base = quiet(bits_of(f64::INFINITY, to) | fraction, to);
         return if negative { negate(base, to) } else { base };
     }
-    bits_of(value_of(a, from), to)
+    round_result(bits_of(value_of(a, from), to), to, finite(&[a], from))
 }
 
-/// FPToFixed: scaled by 2^fbits, rounded, saturated; NaN gives 0.
+/// FPToFixed: scaled by 2^fbits, rounded, saturated; NaN gives 0. A NaN or
+/// out-of-range value raises IOC.
 fn to_integer(a: u64, size: u32, fbits: u8, rounding: Rounding, bits: u32, signed: bool) -> u64 {
+    let a = input(a, size);
     let value = value_of(a, size) * 2f64.powi(i32::from(fbits));
     if value.is_nan() {
+        raise(IOC);
         return 0;
     }
     // `as i128` saturates beyond the i128 range; clamp as integers (an
@@ -407,6 +595,9 @@ fn to_integer(a: u64, size: u32, fbits: u8, rounding: Rounding, bits: u32, signe
     } else {
         (0, (1i128 << bits) - 1)
     };
+    if rounded < low || rounded > high {
+        raise(IOC);
+    }
     (rounded.clamp(low, high) as u128 as u64) & mask(bits)
 }
 
@@ -457,15 +648,7 @@ fn precision(p: FpPrecision) -> u32 {
 }
 
 fn vec_fp(op: VecFpOp, n: u64, m: u64, d: u64, size: u32) -> u64 {
-    let all = |condition: bool| if condition { mask(size) } else { 0 };
-    let ordered = |f: fn(f64, f64) -> bool| {
-        let (x, y) = (value_of(n, size), value_of(m, size));
-        all(!x.is_nan() && !y.is_nan() && f(x, y))
-    };
-    let absolute_ordered = |f: fn(f64, f64) -> bool| {
-        let (x, y) = (value_of(n, size).abs(), value_of(m, size).abs());
-        all(!x.is_nan() && !y.is_nan() && f(x, y))
-    };
+    let (abs_n, abs_m) = (absolute(n, size), absolute(m, size));
     match op {
         VecFpOp::Add => add(n, m, size),
         VecFpOp::Sub => sub(n, m, size),
@@ -477,11 +660,11 @@ fn vec_fp(op: VecFpOp, n: u64, m: u64, d: u64, size: u32) -> u64 {
         VecFpOp::MinNum => max_min_number(n, m, size, false),
         VecFpOp::AbsDiff => absolute(sub(n, m, size), size),
         VecFpOp::MulExtended => mulx(n, m, size),
-        VecFpOp::CmEq => ordered(|x, y| x == y),
-        VecFpOp::CmGe => ordered(|x, y| x >= y),
-        VecFpOp::CmGt => ordered(|x, y| x > y),
-        VecFpOp::AcGe => absolute_ordered(|x, y| x >= y),
-        VecFpOp::AcGt => absolute_ordered(|x, y| x > y),
+        VecFpOp::CmEq => compare_lanes(n, m, size, false, |x, y| x == y),
+        VecFpOp::CmGe => compare_lanes(n, m, size, true, |x, y| x >= y),
+        VecFpOp::CmGt => compare_lanes(n, m, size, true, |x, y| x > y),
+        VecFpOp::AcGe => compare_lanes(abs_n, abs_m, size, true, |x, y| x >= y),
+        VecFpOp::AcGt => compare_lanes(abs_n, abs_m, size, true, |x, y| x > y),
         VecFpOp::MulAdd => mul_add(d, n, m, size),
         VecFpOp::MulSub => mul_add(d, negate(n, size), m, size),
         other => panic!("no reference for {other:?}"),
@@ -489,8 +672,6 @@ fn vec_fp(op: VecFpOp, n: u64, m: u64, d: u64, size: u32) -> u64 {
 }
 
 fn vec_fp_unary(op: VecFpUnaryOp, a: u64, size: u32, fbits: u8) -> u64 {
-    let all = |condition: bool| if condition { mask(size) } else { 0 };
-    let x = value_of(a, size);
     match op {
         VecFpUnaryOp::Abs => absolute(a, size),
         VecFpUnaryOp::Neg => negate(a, size),
@@ -500,11 +681,12 @@ fn vec_fp_unary(op: VecFpUnaryOp, a: u64, size: u32, fbits: u8) -> u64 {
         VecFpUnaryOp::ToUnsigned(rounding) => to_integer(a, size, fbits, rounding, size, false),
         VecFpUnaryOp::FromSigned => from_integer(a, size, true, fbits, size),
         VecFpUnaryOp::FromUnsigned => from_integer(a, size, false, fbits, size),
-        VecFpUnaryOp::CmEqZero => all(x == 0.0),
-        VecFpUnaryOp::CmGeZero => all(x >= 0.0),
-        VecFpUnaryOp::CmGtZero => all(x > 0.0),
-        VecFpUnaryOp::CmLeZero => all(x <= 0.0),
-        VecFpUnaryOp::CmLtZero => all(x < 0.0),
+        // FPCompareEQ/GE/GT against +0.0; LE and LT swap the operands.
+        VecFpUnaryOp::CmEqZero => compare_lanes(a, 0, size, false, |x, y| x == y),
+        VecFpUnaryOp::CmGeZero => compare_lanes(a, 0, size, true, |x, y| x >= y),
+        VecFpUnaryOp::CmGtZero => compare_lanes(a, 0, size, true, |x, y| x > y),
+        VecFpUnaryOp::CmLeZero => compare_lanes(0, a, size, true, |x, y| x >= y),
+        VecFpUnaryOp::CmLtZero => compare_lanes(0, a, size, true, |x, y| x > y),
         other => panic!("no reference for {other:?}"),
     }
 }
@@ -581,10 +763,15 @@ fn interpret(instruction: &SimdOp, s: &mut State) {
             };
             s.v[rd as usize] = scalar(result);
         }
-        FpCompare { size, rn, rm, .. } => {
+        FpCompare {
+            size,
+            rn,
+            rm,
+            signaling,
+        } => {
             let size = fp_size(size);
             let b = rm.map_or(0, |rm| lane(v(s, rm), size, 0));
-            s.nzcv = compare(lane(v(s, rn), size, 0), b, size);
+            s.nzcv = compare(lane(v(s, rn), size, 0), b, size, signaling);
         }
         FpConditionalCompare {
             size,
@@ -592,11 +779,16 @@ fn interpret(instruction: &SimdOp, s: &mut State) {
             rm,
             condition,
             nzcv,
-            ..
+            signaling,
         } => {
             let size = fp_size(size);
             s.nzcv = if condition_holds(condition, s.nzcv) {
-                compare(lane(v(s, rn), size, 0), lane(v(s, rm), size, 0), size)
+                compare(
+                    lane(v(s, rn), size, 0),
+                    lane(v(s, rm), size, 0),
+                    size,
+                    signaling,
+                )
             } else {
                 nzcv
             };
@@ -859,7 +1051,8 @@ fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<State, Trap>
     m.core.cpu.regs = state.x;
     m.core.cpu.vectors = state.v;
     m.core.cpu.nzcv = state.nzcv;
-    m.core.cpu.fpcr = 0;
+    m.core.cpu.fpcr = state.fpcr;
+    m.core.cpu.fpsr = state.fpsr;
     m.core.cpu.pc = entry;
     let trap = loop {
         match fp_semantic_code::dispatch(&mut m.core) {
@@ -875,6 +1068,8 @@ fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<State, Trap>
         x: m.core.cpu.regs,
         v: m.core.cpu.vectors,
         nzcv: m.core.cpu.nzcv,
+        fpcr: m.core.cpu.fpcr,
+        fpsr: m.core.cpu.fpsr & FLAGS,
     })
 }
 
@@ -900,6 +1095,12 @@ fn difference(expected: &State, actual: &State) -> String {
         parts.push(format!(
             "nzcv: expected {:#06b}, lifted {:#06b}",
             expected.nzcv, actual.nzcv
+        ));
+    }
+    if expected.fpsr != actual.fpsr {
+        parts.push(format!(
+            "fpsr flags: expected {:#x}, lifted {:#x}",
+            expected.fpsr, actual.fpsr
         ));
     }
     parts.join("; ")
@@ -965,6 +1166,7 @@ fn lifted_floating_point_matches_the_reference() {
     let mut failures = Vec::new();
     let mut runs = 0;
     let mut known = 0;
+    let mut skipped = 0;
     for (index, &word) in words.iter().enumerate() {
         let entry = fp_semantic_code::BASE + STRIDE * index as u64;
         let Instruction::Simd(op) = decode(word, entry) else {
@@ -982,9 +1184,29 @@ fn lifted_floating_point_matches_the_reference() {
                 }),
                 v: std::array::from_fn(|_| random.vector(size)),
                 nzcv: (random.next() & 15) as u8,
+                fpcr: match random.next() % 4 {
+                    0 => 0,
+                    1 => FPCR_FZ,
+                    2 => FPCR_DN,
+                    _ => FPCR_FZ | FPCR_DN,
+                },
+                fpsr: 0,
             };
             let mut expected = before.clone();
+            CONTEXT.with(|cell| {
+                cell.set(Context {
+                    flush: before.fpcr & FPCR_FZ != 0,
+                    default_nan: before.fpcr & FPCR_DN != 0,
+                    ..Context::default()
+                })
+            });
             interpret(&op, &mut expected);
+            let raised = context();
+            expected.fpsr |= raised.flags;
+            if raised.ambiguous {
+                skipped += 1;
+                continue;
+            }
             runs += 1;
             let problem = match run_lifted(&mut m, entry, &before) {
                 Ok(actual) if actual == expected => continue,
@@ -1003,7 +1225,8 @@ fn lifted_floating_point_matches_the_reference() {
     }
     println!(
         "{} instructions, {runs} runs, {} mismatching instructions, \
-         {known} runs with the known FNMUL NaN sign difference",
+         {known} runs with the known FNMUL NaN sign difference, \
+         {skipped} ambiguous flush-to-zero runs skipped",
         words.len(),
         failures.len()
     );
