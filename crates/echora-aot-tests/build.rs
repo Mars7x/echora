@@ -265,18 +265,12 @@ fn semantic_code(out: &mut String) {
 
 /// Integer SIMD and data-movement instructions for `tests/simd_semantics.rs`.
 fn simd_semantic_code(out: &mut String) {
-    use echora_lift::simd::{SimdOp, VecIntOp, VecShiftOp};
+    use echora_lift::simd::SimdOp;
 
     let covered_simd = |op: &SimdOp| match *op {
-        SimdOp::VecInt { op, .. } => !matches!(
-            op,
-            VecIntOp::Sqshl | VecIntOp::Uqshl | VecIntOp::Sqrshl | VecIntOp::Uqrshl
-        ),
-        SimdOp::VecShift { op, .. } => !matches!(
-            op,
-            VecShiftOp::Sqshl | VecShiftOp::Uqshl | VecShiftOp::Sqshlu
-        ),
-        SimdOp::VecIntElement { .. }
+        SimdOp::VecInt { .. }
+        | SimdOp::VecShift { .. }
+        | SimdOp::VecIntElement { .. }
         | SimdOp::VecIntPairwise { .. }
         | SimdOp::VecLong { .. }
         | SimdOp::VecLongElement { .. }

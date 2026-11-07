@@ -10,7 +10,8 @@
 //! forms), each followed by SVC #7, and lifts them through split emission.
 //! Each runs natively from random vector, general-register and flag states;
 //! the vector registers, general registers and NZCV afterwards must match
-//! the interpreter. FPSR.QC is not compared.
+//! the interpreter, saturating left shifts included. FPSR.QC is not
+//! compared.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
@@ -158,6 +159,29 @@ fn register_shift(a: u128, amount: u128, bits: u32, is_signed: bool, round: bool
     (result as u128) & mask(bits)
 }
 
+/// SQSHL/UQSHL/SQRSHL/UQRSHL (register): shift `element` by the signed
+/// low byte of `amount` (right shifts round when `round`), then saturate.
+fn saturating_shift(element: i128, amount: u128, bits: u32, is_signed: bool, round: bool) -> u128 {
+    let shift = i64::from(amount as u8 as i8);
+    let shifted = if shift >= 0 {
+        if element == 0 {
+            0
+        } else if shift >= 64 {
+            // Far out of range either way: saturates by sign.
+            if element < 0 { i128::MIN } else { i128::MAX }
+        } else {
+            element << shift
+        }
+    } else if round {
+        round_shift(element, (-shift) as u32)
+    } else if -shift >= 100 {
+        if element < 0 { -1 } else { 0 }
+    } else {
+        element >> -shift
+    };
+    saturate(shifted, bits, is_signed)
+}
+
 fn vec_int(op: VecIntOp, a: u128, b: u128, d: u128, bits: u32) -> u128 {
     let (sa, sb) = (signed(a, bits), signed(b, bits));
     let (ua, ub) = (a as i128, b as i128);
@@ -196,7 +220,10 @@ fn vec_int(op: VecIntOp, a: u128, b: u128, d: u128, bits: u32) -> u128 {
         VecIntOp::Urhadd => ((ua + ub + 1) >> 1) as u128,
         VecIntOp::Sqdmulh => saturate((2 * sa * sb) >> bits, bits, true),
         VecIntOp::Sqrdmulh => saturate((2 * sa * sb + (1i128 << (bits - 1))) >> bits, bits, true),
-        other => panic!("no reference for {other:?}"),
+        VecIntOp::Sqshl => saturating_shift(sa, b, bits, true, false),
+        VecIntOp::Uqshl => saturating_shift(ua, b, bits, false, false),
+        VecIntOp::Sqrshl => saturating_shift(sa, b, bits, true, true),
+        VecIntOp::Uqrshl => saturating_shift(ua, b, bits, false, true),
     };
     result & mask(bits)
 }
@@ -220,6 +247,9 @@ fn vec_shift(op: VecShiftOp, a: u128, d: u128, bits: u32, shift: u32) -> u128 {
         VecShiftOp::Urshr => round_shift(ua, shift) as u128,
         VecShiftOp::Srsra => d.wrapping_add(round_shift(sa, shift) as u128),
         VecShiftOp::Ursra => d.wrapping_add(round_shift(ua, shift) as u128),
+        VecShiftOp::Sqshl => saturate(sa << shift, bits, true),
+        VecShiftOp::Uqshl => saturate(ua << shift, bits, false),
+        VecShiftOp::Sqshlu => saturate(sa << shift, bits, false),
         other => panic!("no reference for {other:?}"),
     };
     result & mask(bits)
@@ -841,11 +871,30 @@ fn lifted_integer_simd_matches_the_reference() {
             break;
         }
     }
+    let saturating_shifts = words
+        .iter()
+        .filter(|&&word| {
+            matches!(
+                decode(word, 0),
+                Instruction::Simd(
+                    SimdOp::VecInt {
+                        op: VecIntOp::Sqshl | VecIntOp::Uqshl | VecIntOp::Sqrshl | VecIntOp::Uqrshl,
+                        ..
+                    } | SimdOp::VecShift {
+                        op: VecShiftOp::Sqshl | VecShiftOp::Uqshl | VecShiftOp::Sqshlu,
+                        ..
+                    }
+                )
+            )
+        })
+        .count();
     println!(
-        "{} instructions, {runs} runs, {} mismatching instructions",
+        "{} instructions ({saturating_shifts} saturating shifts), {runs} runs, \
+         {} mismatching instructions",
         words.len(),
         failures.len()
     );
+    assert!(saturating_shifts > 0, "the sample has no saturating shifts");
     assert!(
         failures.is_empty(),
         "{} mismatches:\n{}",
