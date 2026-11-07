@@ -74,6 +74,7 @@ fn main() {
 
     kernel_code(&mut out);
     semantic_code(&mut out);
+    simd_semantic_code(&mut out);
 
     let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
     std::fs::write(path, out).expect("write generated programs");
@@ -252,6 +253,106 @@ fn semantic_code(out: &mut String) {
     let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("semantic");
     let (root, regions) = emit_rust_split(&translation, 10);
     writeln!(out, "pub mod semantic_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Integer SIMD and data-movement instructions for `tests/simd_semantics.rs`:
+/// random words in the SIMD encoding space, kept when the reference
+/// interpreter there covers them; laid out like `semantic_code`.
+fn simd_semantic_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+    use echora_lift::simd::{SimdOp, VecIntOp, VecShiftOp};
+
+    const BASE: u64 = 0x60_0000;
+    const PER_VARIANT: usize = 160;
+    let covered = |op: &SimdOp| match *op {
+        SimdOp::VecInt { op, .. } => !matches!(
+            op,
+            VecIntOp::Sqshl | VecIntOp::Uqshl | VecIntOp::Sqrshl | VecIntOp::Uqrshl
+        ),
+        SimdOp::VecShift { op, .. } => !matches!(
+            op,
+            VecShiftOp::Sqshl | VecShiftOp::Uqshl | VecShiftOp::Sqshlu
+        ),
+        SimdOp::VecIntElement { .. }
+        | SimdOp::VecIntPairwise { .. }
+        | SimdOp::VecLong { .. }
+        | SimdOp::VecLongElement { .. }
+        | SimdOp::VecNarrow { .. }
+        | SimdOp::VecPairwiseLong { .. }
+        | SimdOp::VecAcross { .. }
+        | SimdOp::VecUnary { .. }
+        | SimdOp::VecPermute { .. }
+        | SimdOp::VecExt { .. }
+        | SimdOp::VecTable { .. }
+        | SimdOp::VecShiftLong { .. }
+        | SimdOp::VecDot { .. }
+        | SimdOp::VecPolyMulLong { .. }
+        | SimdOp::VectorLogical { .. }
+        | SimdOp::DupElement { .. }
+        | SimdOp::DupGeneral { .. }
+        | SimdOp::InsertElement { .. }
+        | SimdOp::InsertGeneral { .. }
+        | SimdOp::MoveToGeneral { .. }
+        | SimdOp::MoveImmediate { .. }
+        | SimdOp::ModifyImmediate { .. } => true,
+        _ => false,
+    };
+    let mut state: u64 = 0x51d0_5e3a_9c2b_7e41;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut words = Vec::new();
+    for _ in 0..4_000_000 {
+        let word = next();
+        let (mask, value) = match next() % 3 {
+            0 => (0x0e00_0000, 0x0e00_0000),
+            1 => (0xdf00_0000, 0x5e00_0000),
+            _ => (0x9f20_0c00, 0x0e20_0800),
+        };
+        let word = (word & !mask) | value;
+        let Instruction::Simd(op) = decode(word, 0) else {
+            continue;
+        };
+        if !covered(&op) {
+            continue;
+        }
+        let variant = format!("{op:?}");
+        let variant = variant
+            .split([' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let count = counts.entry(variant).or_default();
+        if *count < PER_VARIANT {
+            *count += 1;
+            words.push(word);
+        }
+    }
+    let mut image = Vec::new();
+    for word in &words {
+        image.extend(word.to_le_bytes());
+        image.extend(0xd400_00e1_u32.to_le_bytes()); // SVC #7
+        image.extend(0xd400_0101_u32.to_le_bytes()); // SVC #8
+    }
+    let entries: Vec<u64> = (0..words.len()).map(|i| BASE + 12 * i as u64).collect();
+    let region = CodeRegion {
+        name: "simd semantic".into(),
+        base: BASE,
+        bytes: image,
+    };
+    let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("simd semantic");
+    let (root, regions) = emit_rust_split(&translation, 10);
+    writeln!(out, "pub mod simd_semantic_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     for (region, source) in regions {
