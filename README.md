@@ -18,7 +18,8 @@ display, input and audio, rather than emulating the console.
 > without a legally obtained copy of the game that you dump and supply
 > yourself.
 
-> **Note:** AI tools were used in developing this project.
+> **Note:** Echora is a personal project, made for my own enjoyment. AI
+> tools were used in developing it.
 
 ## Status
 
