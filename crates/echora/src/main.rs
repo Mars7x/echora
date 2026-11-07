@@ -534,9 +534,14 @@ fn discover_game(
     // Hooked exports (the NVN bootstrap) and replaced library functions run
     // as host code, which only happens where no translated block exists;
     // exported-function roots and calls would otherwise translate them.
+    let call_sites = echora_runtime::bootstrap::hle_call_sites(&placed);
+    roots.extend(call_sites.iter().map(|site| site + 4));
+    roots.sort_unstable();
+    roots.dedup();
     let host_entries = echora_runtime::bootstrap::hooked_export_addresses(&placed)?
         .into_iter()
         .chain(echora_runtime::bootstrap::hle_function_addresses(&placed))
+        .chain(call_sites)
         .collect();
     let start = Instant::now();
     let translation =

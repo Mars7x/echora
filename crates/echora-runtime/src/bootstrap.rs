@@ -93,11 +93,25 @@ pub fn hle_function_addresses(placed: &[PlacedModule]) -> Vec<u64> {
             [
                 crate::hle::zlib_uncompress_offset(&p.module),
                 crate::hle::zstd_decompress_offset(&p.module),
+                crate::hle::zstd_frames_offset(&p.module),
             ]
             .into_iter()
             .flatten()
             .map(|offset| p.base + offset)
         })
+        .collect()
+}
+
+/// Call sites replaced by host code (`crate::hle`): translation leaves the
+/// `bl` out, so execution reaches the host there, and starts a block after
+/// it, where the host call returns. Empty when ECHORA_NO_HLE is set.
+pub fn hle_call_sites(placed: &[PlacedModule]) -> Vec<u64> {
+    if std::env::var_os("ECHORA_NO_HLE").is_some() {
+        return Vec::new();
+    }
+    placed
+        .iter()
+        .filter_map(|p| crate::hle::zstd_stream_site(&p.module).map(|(site, _)| p.base + site))
         .collect()
 }
 
@@ -250,6 +264,16 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
                 machine
                     .nvn
                     .add_hook(p.base + offset, crate::nvn::HostEntry::ZstdDecompress);
+            }
+            if let Some(offset) = crate::hle::zstd_frames_offset(&p.module) {
+                machine
+                    .nvn
+                    .add_hook(p.base + offset, crate::nvn::HostEntry::ZstdFrames);
+            }
+            if let Some((site, _)) = crate::hle::zstd_stream_site(&p.module) {
+                machine
+                    .nvn
+                    .add_hook(p.base + site, crate::nvn::HostEntry::ZstdStreamCall);
             }
             for offset in crate::hle::inflate_finish_sites(&p.module) {
                 machine

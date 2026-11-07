@@ -129,6 +129,11 @@ pub enum HostEntry {
     /// A `bl inflate` call site with flush Z_FINISH (`crate::hle`): the
     /// call is performed on the host and execution continues after it.
     InflateFinishCall,
+    /// The zstd frame decoder (`crate::hle`), likewise.
+    ZstdFrames,
+    /// The streaming zstd reader's call site (`crate::hle`): performed on
+    /// the host when it can be, else by the guest decoder it calls.
+    ZstdStreamCall,
 }
 
 #[path = "nvn_gpu.rs"]

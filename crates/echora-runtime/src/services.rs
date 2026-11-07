@@ -1127,7 +1127,7 @@ pub struct Services {
     /// 201, dropped by 115), and its failures.
     av1_decoder: Option<crate::av1::Decoder>,
     /// Pictures decoded and when the first was (ECHORA_MOVIE_RATE).
-    av1_pictures: (u64, Option<std::time::Instant>),
+    av1_pictures: (u64, Option<std::time::Instant>, std::time::Instant),
     av1_errors: Vec<String>,
     /// The last 600 video decoder requests: command and leading argument
     /// bytes (hex); GetFrame (213) and syncpoint waits add what they did.
@@ -1260,7 +1260,7 @@ impl Default for Services {
             video_submissions: 0,
             video_input: Vec::new(),
             av1_decoder: None,
-            av1_pictures: (0, None),
+            av1_pictures: (0, None, std::time::Instant::now()),
             av1_errors: Vec::new(),
             video_log: Default::default(),
             library_applets: Vec::new(),
@@ -4500,14 +4500,15 @@ impl Services {
             // ECHORA_MOVIE_RATE: decoded movie pictures per host second, a
             // speed measure tied to content rather than to presents.
             if !pictures.is_empty() && crate::nvn::debug_var_os("ECHORA_MOVIE_RATE").is_some() {
-                let (count, first) = &mut self.av1_pictures;
+                let (count, first, boot) = &mut self.av1_pictures;
                 let first = *first.get_or_insert_with(std::time::Instant::now);
                 *count += pictures.len() as u64;
                 if *count % 60 == 0 {
                     let seconds = first.elapsed().as_secs_f64();
                     eprintln!(
-                        "movie: {count} pictures in {seconds:.2} s ({:.1}/s)",
-                        *count as f64 / seconds.max(1e-9)
+                        "movie: {count} pictures in {seconds:.2} s ({:.1}/s), {:.2} s since boot",
+                        *count as f64 / seconds.max(1e-9),
+                        boot.elapsed().as_secs_f64()
                     );
                 }
             }

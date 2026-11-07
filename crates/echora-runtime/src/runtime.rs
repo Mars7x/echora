@@ -274,6 +274,11 @@ pub struct Machine {
     /// Boundaries that kept a thread running because it had user
     /// preemption disabled.
     user_preemption_deferrals: u64,
+    /// Host streams of the game's streaming zstd reader.
+    zstd_streams: crate::hle::ZstdStreams,
+    /// Where a host call continues instead of its link register (a hooked
+    /// call site the guest performs after all).
+    host_call_continue: Option<u64>,
     pc_sample_tick: u32,
     /// Threads that gave up the processor spinning, with the step count
     /// until which other runnable threads go first.
@@ -385,6 +390,8 @@ impl Machine {
             pc_samples: Default::default(),
             pc_stacks: Default::default(),
             user_preemption_deferrals: 0,
+            zstd_streams: Default::default(),
+            host_call_continue: None,
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
             last_wake_check: 0,
@@ -2365,7 +2372,10 @@ impl Machine {
     /// After a host function: return to the link register and continue (or
     /// switch threads) as after any boundary.
     fn finish_host_call(&mut self) -> Result<(), Trap> {
-        self.core.cpu.pc = self.core.cpu.regs[30];
+        self.core.cpu.pc = self
+            .host_call_continue
+            .take()
+            .unwrap_or(self.core.cpu.regs[30]);
         self.resume_or_idle(|machine| {
             machine.finish_block()?;
             machine.host_ready()
@@ -2503,7 +2513,58 @@ impl Machine {
             HostEntry::ZlibUncompress => "hle:zlib_uncompress".to_string(),
             HostEntry::ZstdDecompress => "hle:zstd_decompress".to_string(),
             HostEntry::InflateFinishCall => "hle:inflate_finish".to_string(),
+            HostEntry::ZstdStreamCall => "hle:zstd_stream".to_string(),
+            HostEntry::ZstdFrames => "hle:zstd_frames".to_string(),
         };
+        if entry == HostEntry::ZstdFrames {
+            *self.nvn.calls.entry(name).or_default() += 1;
+            let r = self.core.cpu.regs;
+            self.core.cpu.regs[0] = crate::hle::zstd_decompress_frames(
+                &mut self.memory,
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                r[5],
+                r[6],
+                r[7],
+            )?;
+            return Ok(());
+        }
+        if entry == HostEntry::ZstdStreamCall {
+            // The replaced `bl` would leave LR at the next instruction, where
+            // the host call returns; when the host cannot perform it, the
+            // guest decoder runs as the `bl` would have run it.
+            let site = self.core.cpu.pc;
+            self.core.cpu.regs[30] = site + 4;
+            let regs = self.core.cpu.regs;
+            let fed = crate::hle::zstd_stream_feed(
+                &mut self.zstd_streams,
+                &mut self.memory,
+                regs[0],
+                regs[1],
+                regs[2] as i32,
+                regs[3],
+            )?;
+            match fed {
+                Some(result) => {
+                    *self.nvn.calls.entry(name).or_default() += 1;
+                    self.core.cpu.regs[0] = u64::from(result);
+                }
+                None => {
+                    *self
+                        .nvn
+                        .calls
+                        .entry("hle:zstd_stream (guest)".into())
+                        .or_default() += 1;
+                    let decoder = (site as i64
+                        + (((self.memory.read_u32(site)? << 6) as i32 >> 4) as i64))
+                        as u64;
+                    self.host_call_continue = Some(decoder);
+                }
+            }
+            return Ok(());
+        }
         if entry == HostEntry::InflateFinishCall {
             *self.nvn.calls.entry(name).or_default() += 1;
             // The replaced `bl` would leave LR at the next instruction; the
@@ -2556,7 +2617,9 @@ impl Machine {
             HostEntry::Proc(_)
             | HostEntry::ZlibUncompress
             | HostEntry::ZstdDecompress
-            | HostEntry::InflateFinishCall => None,
+            | HostEntry::InflateFinishCall
+            | HostEntry::ZstdStreamCall
+            | HostEntry::ZstdFrames => None,
         };
         if let Some(address) = lookup {
             let requested = self.read_string(address, crate::nvn::MAX_NAME)?;

@@ -131,6 +131,171 @@ pub fn zstd_decompress_offset(module: &NsoModule) -> Option<u64> {
     })
 }
 
+/// The game's streaming zstd reader per known build: the one call site
+/// (`bl`) of its chunk decoder, the decoder's offset and the SHA-256 of its
+/// code (0x810 bytes), as disassembled from update 655360. The decoder is
+/// `s32 feed(Stream* s, const void* src, s32 size, const void* dictionary)`
+/// over a stream object: `+0x0` u8 state (1 begin, 0/2 decoding, 3 failed,
+/// 4 finished), `+0x8` output cursor, `+0x10` s32 output room, `+0x14`
+/// s32 output still expected, `+0x18` the zstd context's memory and `+0x30`
+/// the context in use. State 1 reads the frame header's content size into
+/// `+0x14` and sets up the context; every call then decodes the whole
+/// input chunk to the cursor, advancing it and lowering both counts, and
+/// returns the expected count (0 when complete), or -1 on an error, -2 when
+/// the output is too small (state 3 both), -1 when failed and -3 when
+/// finished. The frame decodes with zstd's own buffer-less API inlined.
+struct ZstdStreamBuild {
+    site: u64,
+    decoder: u64,
+    sha256: &'static str,
+}
+
+const ZSTD_STREAM: [ZstdStreamBuild; 1] = [ZstdStreamBuild {
+    site: 0xf_5c2c,
+    decoder: 0xf_5c80,
+    sha256: "8f0bf3b25c4f044d368416084ee068e6d2dfdd6a223ebe717c980baf13a800e5",
+}];
+const ZSTD_STREAM_DECODER_BYTES: usize = 0x810;
+
+/// The streaming reader's call site and decoder offsets in `module`, if
+/// the exact code of a known build is present there.
+pub fn zstd_stream_site(module: &NsoModule) -> Option<(u64, u64)> {
+    let text = &module.text;
+    let bytes = |offset: u64, length: usize| {
+        offset
+            .checked_sub(u64::from(text.memory_offset))
+            .and_then(|start| text.bytes.get(start as usize..start as usize + length))
+    };
+    ZSTD_STREAM.iter().find_map(|build| {
+        let bl = 0x9400_0000
+            | (((build.decoder.wrapping_sub(build.site) as i64 >> 2) as u32) & 0x3ff_ffff);
+        let call = bytes(build.site, 4).map(crate::bytes::le_u32);
+        (call == Some(bl)
+            && bytes(build.decoder, ZSTD_STREAM_DECODER_BYTES)
+                .is_some_and(|code| sha256_hex(code) == build.sha256))
+        .then_some((build.site, build.decoder))
+    })
+}
+
+/// Host zstd streams, one per guest stream object the host began.
+#[derive(Default)]
+pub struct ZstdStreams(std::collections::HashMap<u64, zstd::zstd_safe::DCtx<'static>>);
+
+/// One call of the streaming reader's decoder (see [`ZstdStreamBuild`]):
+/// `Some(result)` when the host performed it, `None` when the guest decoder
+/// must (a frame without a content size, or a stream the guest began).
+pub fn zstd_stream_feed(
+    streams: &mut ZstdStreams,
+    memory: &mut Memory,
+    stream: u64,
+    source: u64,
+    size: i32,
+    dictionary: u64,
+) -> Result<Option<u32>, Trap> {
+    use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer};
+    const FAILED: u8 = 3;
+    const FINISHED: u8 = 4;
+    let state = memory.read_u8(stream)?;
+    match state {
+        FAILED => return Ok(Some(-1i32 as u32)),
+        FINISHED => return Ok(Some(-3i32 as u32)),
+        1 => {
+            let mut header = [0u8; 18];
+            let length = header.len().min(size.max(0) as usize);
+            memory.read(source, &mut header[..length])?;
+            let Ok(Some(content)) = zstd::zstd_safe::get_frame_content_size(&header[..length])
+            else {
+                return Ok(None);
+            };
+            let Ok(content) = u32::try_from(content) else {
+                return Ok(None);
+            };
+            memory.write_u32(stream + 0x14, content)?;
+            let context = memory.read_u64(stream + 0x18)?;
+            memory.write_u64(stream + 0x30, context)?;
+            let mut fresh = DCtx::create();
+            if dictionary != 0 {
+                // A DDict: its content at +0x8, its size at +0x10.
+                let content = memory.read_u64(dictionary + 0x8)?;
+                let length = memory.read_u64(dictionary + 0x10)?;
+                if length > MAX_INPUT {
+                    return Ok(None);
+                }
+                let mut bytes = vec![0; length as usize];
+                memory.read(content, &mut bytes)?;
+                if fresh.load_dictionary(&bytes).is_err() {
+                    return Ok(None);
+                }
+            }
+            memory.write_u8(stream, 2)?;
+            streams.0.insert(stream, fresh);
+        }
+        _ if !streams.0.contains_key(&stream) => return Ok(None),
+        _ => {}
+    }
+    let input_length = u64::try_from(size.max(0)).unwrap_or(0).min(MAX_INPUT) as usize;
+    let mut input_bytes = vec![0; input_length];
+    memory.read(source, &mut input_bytes)?;
+    let context = streams.0.get_mut(&stream).expect("present above");
+    let mut input = InBuffer::around(&input_bytes);
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut finished = false;
+    let mut failed = None;
+    loop {
+        let room = memory.read_u32(stream + 0x10)? as i32;
+        let limit = chunk.len().min(room.max(0) as usize);
+        let consumed = input.pos;
+        let mut output = OutBuffer::around(&mut chunk[..limit]);
+        let result = context.decompress_stream(&mut output, &mut input);
+        let produced = output.pos();
+        if produced != 0 {
+            let cursor = memory.read_u64(stream + 0x8)?;
+            memory.write(cursor, &chunk[..produced])?;
+            memory.write_u64(stream + 0x8, cursor + produced as u64)?;
+            memory.write_u32(stream + 0x10, room.wrapping_sub(produced as i32) as u32)?;
+            let expected = memory.read_u32(stream + 0x14)? as i32;
+            memory.write_u32(stream + 0x14, expected.wrapping_sub(produced as i32) as u32)?;
+        }
+        match result {
+            Err(code) => {
+                failed = Some(code);
+                break;
+            }
+            Ok(0) => {
+                finished = true;
+                break;
+            }
+            // Input left, or a full pass (more output may be pending):
+            // go on while the pass made progress.
+            Ok(_) if input.pos < input_length || (produced == limit && limit != 0) => {
+                if produced == 0 && input.pos == consumed {
+                    if input.pos < input_length {
+                        // No room left for the rest: the output is too small.
+                        failed = Some(ZSTD_DST_SIZE_TOO_SMALL.wrapping_neg());
+                    }
+                    break;
+                }
+            }
+            Ok(_) => break,
+        }
+    }
+    if let Some(code) = failed {
+        streams.0.remove(&stream);
+        memory.write_u8(stream, FAILED)?;
+        let result = if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL {
+            -2
+        } else {
+            -1
+        };
+        return Ok(Some(result as u32));
+    }
+    if finished {
+        streams.0.remove(&stream);
+        memory.write_u8(stream, FINISHED)?;
+    }
+    Ok(Some(memory.read_u32(stream + 0x14)?))
+}
+
 /// The `bl inflate` / Z_FINISH call sites present with their exact code.
 pub fn inflate_finish_sites(module: &NsoModule) -> Vec<u64> {
     let text = &module.text;
@@ -280,6 +445,71 @@ pub fn zstd_decompress(
         }
         Err(code) if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL => Ok(TOO_SMALL),
         Err(_) => Ok(FAILED),
+    }
+}
+
+/// The text offset of the zstd frame decoder the wrapper calls,
+/// `size_t ZSTD_decompressMultiFrame(ZSTD_DCtx*, void* dst, size_t
+/// capacity, const void* src, size_t size, const void* dict, size_t
+/// dict_size, const ZSTD_DDict*)`, if the exact code of a known build is
+/// present. Its callers set up the context inline before every call and
+/// read only the result afterwards, so the context is left untouched.
+pub fn zstd_frames_offset(module: &NsoModule) -> Option<u64> {
+    let text = &module.text;
+    ZSTD_DECOMPRESS.iter().find_map(|build| {
+        build
+            .decoder
+            .checked_sub(u64::from(text.memory_offset))
+            .and_then(|start| text.bytes.get(start as usize..start as usize + 0x200))
+            .is_some_and(|bytes| sha256_hex(bytes) == build.decoder_prefix_sha256)
+            .then_some(build.decoder)
+    })
+}
+
+/// `ZSTD_decompressMultiFrame` on the host (see [`zstd_frames_offset`]):
+/// the decompressed size, or zstd's error code as a `size_t`.
+#[allow(clippy::too_many_arguments)]
+pub fn zstd_decompress_frames(
+    memory: &mut Memory,
+    destination: u64,
+    capacity: u64,
+    source: u64,
+    size: u64,
+    dict: u64,
+    dict_size: u64,
+    ddict: u64,
+) -> Result<u64, Trap> {
+    let (dict, dict_size) = if ddict != 0 {
+        (
+            memory.read_u64(ddict + 0x8)?,
+            memory.read_u64(ddict + 0x10)?,
+        )
+    } else {
+        (dict, dict_size)
+    };
+    if size > MAX_INPUT || dict_size > MAX_INPUT || capacity > MAX_INPUT * 16 {
+        return Err(Trap::InvalidState {
+            message: format!(
+                "zstd frames of {size:#x} bytes into {capacity:#x} exceed the local bound"
+            ),
+        });
+    }
+    let dictionary = if dict != 0 && dict_size != 0 {
+        let mut bytes = vec![0u8; dict_size as usize];
+        memory.read(dict, &mut bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    let mut input = vec![0u8; size as usize];
+    memory.read(source, &mut input)?;
+    let mut output = Vec::with_capacity(capacity as usize);
+    match zstd_decode(&input, &mut output, dictionary.as_deref()) {
+        Ok(_) => {
+            memory.write(destination, &output)?;
+            Ok(output.len() as u64)
+        }
+        Err(code) => Ok(code as u64),
     }
 }
 
@@ -480,5 +710,133 @@ mod tests {
         let mut out = vec![0u8; text.len()];
         memory.read(0x14000, &mut out).unwrap();
         assert_eq!(out, text);
+    }
+
+    #[test]
+    fn zstd_stream_decodes_chunks_into_the_cursor() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let text: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i % 251).to_le_bytes())
+            .collect();
+        let frame = zstd::bulk::compress(&text, 3).unwrap();
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x200000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let (stream, source, output) = (0x10000u64, 0x20000u64, 0x80000u64);
+        memory.write(source, &frame).unwrap();
+        memory.write_u8(stream, 1).unwrap();
+        memory.write_u64(stream + 0x8, output).unwrap();
+        memory.write_u32(stream + 0x10, text.len() as u32).unwrap();
+        memory.write_u64(stream + 0x18, 0x11000).unwrap();
+        let mut streams = ZstdStreams::default();
+        let mut results = Vec::new();
+        for (index, chunk) in frame.chunks(3000).enumerate() {
+            let address = source + (index * 3000) as u64;
+            let fed = zstd_stream_feed(
+                &mut streams,
+                &mut memory,
+                stream,
+                address,
+                chunk.len() as i32,
+                0,
+            );
+            results.push(fed.unwrap().unwrap() as i32);
+        }
+        assert_eq!(*results.last().unwrap(), 0);
+        assert!(results[..results.len() - 1].iter().all(|&left| left > 0));
+        assert_eq!(memory.read_u8(stream).unwrap(), 4);
+        assert_eq!(
+            memory.read_u64(stream + 0x8).unwrap(),
+            output + text.len() as u64
+        );
+        assert_eq!(memory.read_u32(stream + 0x10).unwrap(), 0);
+        assert_eq!(memory.read_u64(stream + 0x30).unwrap(), 0x11000);
+        let mut out = vec![0u8; text.len()];
+        memory.read(output, &mut out).unwrap();
+        assert_eq!(out, text);
+        // Finished: -3; a dictionary or a guest-begun stream: the guest's.
+        let again = zstd_stream_feed(&mut streams, &mut memory, stream, source, 4, 0);
+        assert_eq!(again.unwrap(), Some(-3i32 as u32));
+        memory.write_u8(stream, 1).unwrap();
+        assert_eq!(
+            zstd_stream_feed(&mut streams, &mut memory, stream, source, 4, 0x11000).unwrap(),
+            None
+        );
+        memory.write_u8(stream, 2).unwrap();
+        assert_eq!(
+            zstd_stream_feed(&mut streams, &mut memory, stream, source, 4, 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn zstd_frames_decodes_every_frame_and_returns_error_codes() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let dictionary = b"shared words for both frames ".repeat(8);
+        let (first, second) = (
+            b"shared words, first frame".to_vec(),
+            b"shared words, second".to_vec(),
+        );
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dictionary).unwrap();
+        let mut input = compressor.compress(&first).unwrap();
+        input.extend(compressor.compress(&second).unwrap());
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x10000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        memory.write(0x11000, &input).unwrap();
+        memory.write(0x12000, &dictionary).unwrap();
+        let size = input.len() as u64;
+        let length = dictionary.len() as u64;
+        let total = (first.len() + second.len()) as u64;
+        let decoded = zstd_decompress_frames(
+            &mut memory,
+            0x14000,
+            0x1000,
+            0x11000,
+            size,
+            0x12000,
+            length,
+            0,
+        );
+        assert_eq!(decoded.unwrap(), total);
+        let mut out = vec![0u8; total as usize];
+        memory.read(0x14000, &mut out).unwrap();
+        assert_eq!(out, [first, second].concat());
+        let small =
+            zstd_decompress_frames(&mut memory, 0x14000, 4, 0x11000, size, 0x12000, length, 0);
+        assert_eq!(
+            small.unwrap().wrapping_neg(),
+            ZSTD_DST_SIZE_TOO_SMALL as u64
+        );
+    }
+
+    #[test]
+    fn zstd_stream_reports_an_output_too_small() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let text = vec![7u8; 50_000];
+        let frame = zstd::bulk::compress(&text, 3).unwrap();
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x40000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        memory.write(0x20000, &frame).unwrap();
+        memory.write_u8(0x10000, 1).unwrap();
+        memory.write_u64(0x10008, 0x30000).unwrap();
+        memory.write_u32(0x10010, 1000).unwrap();
+        let mut streams = ZstdStreams::default();
+        let fed = zstd_stream_feed(
+            &mut streams,
+            &mut memory,
+            0x10000,
+            0x20000,
+            frame.len() as i32,
+            0,
+        );
+        assert_eq!(fed.unwrap(), Some(-2i32 as u32));
+        assert_eq!(memory.read_u8(0x10000).unwrap(), 3);
+        let after = zstd_stream_feed(&mut streams, &mut memory, 0x10000, 0x20000, 4, 0);
+        assert_eq!(after.unwrap(), Some(-1i32 as u32));
     }
 }
