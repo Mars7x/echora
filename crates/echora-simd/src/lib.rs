@@ -1321,8 +1321,14 @@ fn recip_estimate_lane(fp: &mut Fp<'_>, value: u64) -> u64 {
         return sign | format.exponent_mask();
     }
     let magnitude = fp.to_f64(value).abs();
-    // |x| < 2^-(bias+1) overflows; round-to-nearest gives infinity.
-    if magnitude < f64::from_bits(((1023 - bias - 1) as u64) << 52) {
+    // |x| < 2^-(bias+1) overflows; round-to-nearest gives infinity. For
+    // doubles that bound, 2^-1024, is itself subnormal.
+    let overflow_below = if bias + 1 < 1023 {
+        f64::from_bits(((1023 - bias - 1) as u64) << 52)
+    } else {
+        f64::from_bits(1 << (52 - (bias + 1 - 1022)))
+    };
+    if magnitude < overflow_below {
         fp.raise(FPSR_OFC | FPSR_IXC);
         return sign | format.exponent_mask();
     }
@@ -3103,6 +3109,27 @@ mod vector_tests {
         // Scalar form: one element from the two low lanes of Vn.
         vec_fp_pairwise(&mut cpu, VecFpOp::Add, FpSize::S, false, true, 0, 1, 0).unwrap();
         assert_eq!(cpu.vectors[0], u128::from(3.0f32.to_bits()));
+    }
+
+    #[test]
+    fn double_reciprocal_estimates_overflow_below_two_to_the_minus_1024() {
+        let mut cpu = Cpu::default();
+        // 2^-1030 (subnormal) and 2^-1023 (subnormal, not below 2^-1024).
+        cpu.vectors[1] = u128::from(1u64 << 44) | u128::from(1u64 << 51) << 64;
+        vec_fp_unary(
+            &mut cpu,
+            VecFpUnaryOp::RecipEstimate,
+            FpSize::D,
+            true,
+            false,
+            0,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cpu.vectors[0] as u64, 0x7ff0_0000_0000_0000);
+        assert_ne!(cpu.vectors[0] >> 64, 0x7ff0_0000_0000_0000);
+        assert_ne!(cpu.fpsr & FPSR_OFC, 0);
     }
 
     #[test]
