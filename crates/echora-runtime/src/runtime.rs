@@ -272,6 +272,10 @@ pub struct Machine {
     /// With several workers: the threads other workers are running now
     /// (never the thread of the core swapped into `core`).
     running: std::collections::BTreeSet<u64>,
+    /// With several workers: the modelled core (0-2) of the worker whose
+    /// core is swapped in. Threads are picked for it by affinity and
+    /// priority (see `next_runnable_thread`).
+    worker_core: Option<u8>,
     /// Several workers run: an idle boundary returns instead of sleeping.
     parallel: bool,
     /// Workers parked without a thread, waiting for one to become runnable.
@@ -363,6 +367,7 @@ impl Machine {
             spin_backoff: Default::default(),
             last_wake_check: 0,
             running: Default::default(),
+            worker_core: None,
             parallel: false,
             parked_workers: 0,
             lock_stats: [0; 3],
@@ -1565,12 +1570,47 @@ impl Machine {
     fn next_runnable_thread(&self, after: u64, exclude: Option<u64>) -> Option<u64> {
         let main =
             (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
+        // With several workers each is one of the three application cores,
+        // as on Horizon: it runs only threads whose affinity mask names its
+        // core, and the best (lowest) priority first. Threads the game pins
+        // to one core then never run at once, which its per-core data
+        // relies on. A mask naming none of the three is allowed anywhere.
+        let allowed = |id: u64| -> bool {
+            let Some(core) = self.worker_core else {
+                return true;
+            };
+            let mask = if id == self.layout.main_thread_id {
+                Some(self.main_thread_affinity.1)
+            } else {
+                self.threads.affinity(id).map(|(_, mask)| mask)
+            }
+            .unwrap_or(u64::MAX);
+            mask & 0b111 == 0 || mask >> core & 1 != 0
+        };
+        let priority = |id: u64| -> u8 {
+            if self.worker_core.is_none() {
+                return 0;
+            }
+            if id == self.layout.main_thread_id {
+                self.main_thread_effective_priority
+            } else {
+                self.threads.priority(id).unwrap_or(u8::MAX)
+            }
+        };
+        let best = main
+            .into_iter()
+            .chain(self.threads.runnable_ids())
+            .filter(|&id| exclude != Some(id) && !self.running.contains(&id) && allowed(id))
+            .map(priority)
+            .min();
         let pick = |skip_spinning: bool| {
             let mut first = None;
             let mut next = None;
             for id in main.into_iter().chain(self.threads.runnable_ids()) {
                 if exclude == Some(id)
                     || self.running.contains(&id)
+                    || !allowed(id)
+                    || Some(priority(id)) != best
                     || skip_spinning
                         && self
                             .spin_backoff
@@ -2102,7 +2142,8 @@ impl Machine {
         &mut self,
         dispatch: &(impl Fn(&mut Core) -> Result<(), Trap> + Sync),
     ) -> Result<(), Trap> {
-        let workers = self.layout.workers;
+        // One worker per application core.
+        let workers = self.layout.workers.min(3);
         let global = self.core.steps;
         let idle = |machine: &Machine| {
             let mut core = Core::new(machine.memory.view());
@@ -2133,6 +2174,7 @@ impl Machine {
                         core,
                         synced: global,
                         active: index == 0,
+                        index: index as u8,
                     };
                     std::thread::Builder::new()
                         .name(format!("guest-worker-{index}"))
@@ -2148,6 +2190,7 @@ impl Machine {
         });
         self.parallel = false;
         self.running.clear();
+        self.worker_core = None;
         self.parked_workers = 0;
         // The first stop is the run's result; its core is the one reports see.
         let global = self.core.steps;
@@ -3912,6 +3955,8 @@ struct Worker {
     synced: u64,
     /// Whether the core holds a thread (false while parked).
     active: bool,
+    /// The modelled core this worker is.
+    index: u8,
 }
 
 /// Parked workers recheck waits and deadlines at least this often.
@@ -4123,6 +4168,7 @@ impl Worker {
         self.core.thread_steps_base = self.core.thread_steps_base.wrapping_add(shift);
         self.core.slice_start = self.core.slice_start.wrapping_add(shift);
         std::mem::swap(&mut machine.core, &mut self.core);
+        machine.worker_core = Some(self.index);
         if self.active {
             machine.running.remove(&machine.core.current_thread_id);
         }
