@@ -11,6 +11,9 @@ publish.workspace = true
 [dependencies]
 echora-guest.workspace = true
 
+[dev-dependencies]
+echora-lift.workspace = true
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
