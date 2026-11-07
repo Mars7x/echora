@@ -382,6 +382,9 @@ pub struct RenderState {
     /// The array layer the depth target's view selects.
     pub depth_layer: u32,
     pub scissor: Option<[i32; 4]>,
+    /// Root tables written by Push{Graphics,Compute}Constants: [graphics,
+    /// compute] x 8 tables of 64 words (256 bytes each).
+    pub roots: [Vec<[u32; 64]>; 2],
     /// The latest submitted state command of each kind (viewports, bound
     /// programs, state objects, pools, resources). Kept for the host
     /// renderer; nothing consumes it until draws are implemented.
@@ -2460,6 +2463,27 @@ impl Nvn {
             message: format!("executing {}: {message}", command.name),
         };
         match command.name.as_str() {
+            // Push{Graphics,Compute}Constants: words into root table `table`
+            // at `offset` (bytes, word aligned, within the 256-byte table).
+            "nvnCommandBufferPushGraphicsConstants" | "nvnCommandBufferPushComputeConstants" => {
+                let pipeline = usize::from(command.name.ends_with("ComputeConstants"));
+                let table = (command.x[1] & 7) as usize;
+                let offset = command.x[2] as usize;
+                if offset % 4 != 0 || offset + command.captured.len() * 4 > 0x100 {
+                    self.gpu_note(format!(
+                        "push constants at {offset:#x} outside the root table"
+                    ));
+                    return Ok(());
+                }
+                let roots = &mut self.render.roots[pipeline];
+                if roots.len() < 8 {
+                    roots.resize(8, [0; 64]);
+                }
+                for (index, word) in command.captured.iter().enumerate() {
+                    roots[table][offset / 4 + index] = *word as u32;
+                }
+                Ok(())
+            }
             // CallCommands / CopyCommands: the called lists run in place, in
             // order (a copy runs the same commands when it is submitted).
             // Lists no longer kept are skipped and counted, as at
@@ -3733,6 +3757,15 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
                 .chunks(8)
                 .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
                 .collect();
+        }
+        // Push{Graphics,Compute}Constants(cmd, int table, int offset, int
+        // bytes, const void* data): the words now (the driver clamps to the
+        // 256-byte table and drops pushes under 4 bytes).
+        "nvnCommandBufferPushGraphicsConstants" | "nvnCommandBufferPushComputeConstants" => {
+            let bytes = (command.x[3] as u32).min(0x100);
+            command.captured = (0..u64::from(bytes / 4))
+                .map(|word| core.memory.read_u32(command.x[4] + word * 4).map(u64::from))
+                .collect::<Result<_, _>>()?;
         }
         "nvnCommandBufferClearColor" => {
             command.captured = (0..4)
