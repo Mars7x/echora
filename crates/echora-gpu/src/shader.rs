@@ -13,6 +13,9 @@ pub enum Stage {
     Geometry,
     Fragment,
     Compute,
+    /// Switch 2 task and mesh programs (VK_EXT_mesh_shader stages).
+    Task,
+    Mesh,
 }
 
 impl Stage {
@@ -24,6 +27,8 @@ impl Stage {
             3 => Self::Geometry,
             4 => Self::Fragment,
             5 => Self::Compute,
+            7 => Self::Task,
+            8 => Self::Mesh,
             _ => return None,
         })
     }
@@ -109,6 +114,22 @@ pub struct Parameters {
     pub resolution_scale: (u32, u32),
     /// Texture and image descriptors of the stages before this one.
     pub scaling_base: [u32; 2],
+    /// Translate a graphics program as a task or mesh program instead of the
+    /// stage its header names (the slot NVN binds it in).
+    pub mesh: Option<MeshParameters>,
+}
+
+/// The task or mesh pipeline state a program is translated against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeshParameters {
+    /// The task stage (else the mesh stage).
+    pub task: bool,
+    /// SET_MESH_SHADER_A, SET_MESH_SHADER_B and SET_MESH_INIT_SHADER.
+    pub registers: [u32; 3],
+    /// Mesh programs: the program header (0x50 bytes) of the pass-through
+    /// geometry program bound with them, whose output map lists the
+    /// per-primitive outputs.
+    pub primitive_header: Option<[u8; 0x50]>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +167,10 @@ struct Input {
     resolution_scale_denominator: u32,
     texture_scaling_base: u32,
     image_scaling_base: u32,
+    mesh_stage: u32,
+    mesh_registers: [u32; 3],
+    has_mesh_primitive_header: u32,
+    mesh_primitive_header: [u8; 0x50],
     callbacks: Callbacks,
 }
 
@@ -210,6 +235,16 @@ pub fn translate<E: Environment>(
         resolution_scale_denominator: compute.resolution_scale.1,
         texture_scaling_base: compute.scaling_base[0],
         image_scaling_base: compute.scaling_base[1],
+        mesh_stage: compute.mesh.map_or(0, |mesh| if mesh.task { 1 } else { 2 }),
+        mesh_registers: compute.mesh.map_or([0; 3], |mesh| mesh.registers),
+        has_mesh_primitive_header: compute
+            .mesh
+            .is_some_and(|mesh| mesh.primitive_header.is_some())
+            .into(),
+        mesh_primitive_header: compute
+            .mesh
+            .and_then(|mesh| mesh.primitive_header)
+            .unwrap_or([0; 0x50]),
         callbacks: Callbacks {
             user: environment as *mut E as *mut c_void,
             read_cbuf: Some(read_cbuf_thunk::<E>),

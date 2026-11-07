@@ -31,6 +31,9 @@ pub struct Gpu {
     /// VK_EXT_external_memory_host: guest memory can be imported as device
     /// memory, so buffers in it are shared with the GPU without copies.
     pub host_import: Option<ash::ext::external_memory_host::Device>,
+    /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
+    /// mesh pipelines can draw.
+    pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
     pub name: String,
 }
 
@@ -115,13 +118,15 @@ impl Gpu {
         let mut supported_objects = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
         let mut supported_clip = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut supported_robust = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut supported_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported11)
             .push_next(&mut supported12)
             .push_next(&mut supported13)
             .push_next(&mut supported_objects)
             .push_next(&mut supported_clip)
-            .push_next(&mut supported_robust);
+            .push_next(&mut supported_robust)
+            .push_next(&mut supported_mesh);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_features2(physical, &mut supported) };
         let core = supported.features;
@@ -178,6 +183,14 @@ impl Gpu {
             && std::env::var_os("ECHORA_NO_HOST_IMPORT").is_none();
         if host_import {
             enabled_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
+        // Task and mesh pipelines draw through shader objects of those stages.
+        let mesh_shader = use_objects
+            && supported_mesh.task_shader != 0
+            && supported_mesh.mesh_shader != 0
+            && has(ash::ext::mesh_shader::NAME);
+        if mesh_shader {
+            enabled_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
         }
 
         let features = vk::PhysicalDeviceFeatures::default()
@@ -259,6 +272,12 @@ impl Gpu {
         if robustness2 {
             device_info = device_info.push_next(&mut enable_robust);
         }
+        let mut enable_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+            .task_shader(true)
+            .mesh_shader(true);
+        if mesh_shader {
+            device_info = device_info.push_next(&mut enable_mesh);
+        }
         // SAFETY: every enabled feature was reported as supported.
         let device = unsafe { instance.create_device(physical, &device_info, None) }
             .map_err(vk_error("vkCreateDevice"))?;
@@ -268,6 +287,8 @@ impl Gpu {
             use_objects.then(|| ash::ext::shader_object::Device::new(&instance, &device));
         let host_import =
             host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let mesh_shader =
+            mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
         Ok(Self {
             entry,
             instance,
@@ -281,6 +302,7 @@ impl Gpu {
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
             host_import,
+            mesh_shader,
             name,
         })
     }
@@ -422,6 +444,8 @@ pub fn stage_flags(stage: Stage) -> vk::ShaderStageFlags {
         Stage::Geometry => vk::ShaderStageFlags::GEOMETRY,
         Stage::Fragment => vk::ShaderStageFlags::FRAGMENT,
         Stage::Compute => vk::ShaderStageFlags::COMPUTE,
+        Stage::Task => vk::ShaderStageFlags::TASK_EXT,
+        Stage::Mesh => vk::ShaderStageFlags::MESH_EXT,
     }
 }
 

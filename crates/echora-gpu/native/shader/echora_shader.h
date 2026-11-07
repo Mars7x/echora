@@ -15,6 +15,17 @@ enum EchoraShaderStage {
     ECHORA_SHADER_GEOMETRY = 3,
     ECHORA_SHADER_FRAGMENT = 4,
     ECHORA_SHADER_COMPUTE = 5,
+    /// Switch 2 task and mesh programs (the recompiler's Stage::Task and
+    /// Stage::Mesh; 6 is its VertexA).
+    ECHORA_SHADER_TASK = 7,
+    ECHORA_SHADER_MESH = 8,
+};
+
+/// What a graphics program is translated as.
+enum EchoraMeshStage {
+    ECHORA_MESH_NONE = 0,
+    ECHORA_MESH_TASK = 1,
+    ECHORA_MESH_MESH = 2,
 };
 
 struct EchoraShaderCallbacks {
@@ -55,6 +66,19 @@ struct EchoraShaderInput {
     /// texture and image descriptors of the stages before it).
     uint32_t texture_scaling_base;
     uint32_t image_scaling_base;
+    /// EchoraMeshStage: a task or mesh program (its header names the vertex
+    /// or tessellation slot it is bound in) instead of the header's stage.
+    uint32_t mesh_stage;
+    /// Task and mesh programs: SET_MESH_SHADER_A (topology 3:0, max vertex
+    /// 12:4, max primitive 22:13), SET_MESH_SHADER_B (mesh threads 25:20)
+    /// and SET_MESH_INIT_SHADER (task threads 5:0, local buffer lines 20:12,
+    /// lines passed to the mesh stage 30:22).
+    uint32_t mesh_registers[3];
+    /// Mesh programs: nonzero when `mesh_primitive_header` holds the program
+    /// header of the pass-through geometry program bound with them, whose
+    /// output map lists the per-primitive outputs.
+    uint32_t has_mesh_primitive_header;
+    uint8_t mesh_primitive_header[0x50];
     EchoraShaderCallbacks callbacks;
 };
 

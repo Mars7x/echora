@@ -274,6 +274,20 @@ pub struct Draw<'a> {
     pub storage: HashMap<(usize, u32), Vec<u8>>,
     pub fixed: Fixed,
     pub blends: Vec<Blend>,
+    /// A task/mesh pipeline's workgroups (the program's first stages are
+    /// task and mesh): drawn with vkCmdDrawMeshTasks*EXT, with no vertex
+    /// input.
+    pub mesh: Option<MeshGroups>,
+}
+
+/// The workgroups of a mesh draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshGroups {
+    /// X, Y and Z group counts.
+    Direct([u32; 3]),
+    /// A VkDrawMeshTasksIndirectCommandEXT (three u32 group counts) at this
+    /// offset of a device buffer (a resident pool), as the GPU last wrote it.
+    Indirect { buffer: vk::Buffer, offset: u64 },
 }
 
 fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
@@ -622,13 +636,26 @@ impl Renderer {
             .iter()
             .map(|stage| stage_flags(stage.stage))
             .collect();
-        // Unused graphics stages are bound to nothing.
-        let unused = [
+        // Graphics stages the program does not use are bound to nothing:
+        // with the mesh feature on, the task and mesh stages too, and a mesh
+        // pipeline's vertex stage.
+        let mut unused = vec![
+            vk::ShaderStageFlags::VERTEX,
             vk::ShaderStageFlags::TESSELLATION_CONTROL,
             vk::ShaderStageFlags::TESSELLATION_EVALUATION,
             vk::ShaderStageFlags::GEOMETRY,
         ];
-        let null_shaders = [vk::ShaderEXT::null(); 3];
+        if self.gpu.mesh_shader.is_some() {
+            unused.extend([
+                vk::ShaderStageFlags::TASK_EXT,
+                vk::ShaderStageFlags::MESH_EXT,
+            ]);
+        }
+        unused.retain(|stage| !stage_bits.contains(stage));
+        let null_shaders = vec![vk::ShaderEXT::null(); unused.len()];
+        if draw.mesh.is_some() && self.gpu.mesh_shader.is_none() {
+            return Err("the device has no task and mesh stages".into());
+        }
         let bindings: Vec<_> = vertex_buffers
             .iter()
             .enumerate()
@@ -730,7 +757,9 @@ impl Renderer {
                     constants,
                 );
             }
-            objects.cmd_set_vertex_input(commands, &bindings, &attributes);
+            if draw.mesh.is_none() {
+                objects.cmd_set_vertex_input(commands, &bindings, &attributes);
+            }
             for (index, (buffer, offset)) in vertex_buffers.iter().enumerate() {
                 device.cmd_bind_vertex_buffers(commands, index as u32, &[*buffer], &[*offset]);
             }
@@ -793,7 +822,15 @@ impl Renderer {
             objects.cmd_set_color_blend_enable(commands, 0, &enables);
             objects.cmd_set_color_blend_equation(commands, 0, &equations);
             objects.cmd_set_color_write_mask(commands, 0, &masks);
-            if let Some(((buffer, offset), kind)) = index {
+            if let Some(groups) = draw.mesh {
+                let mesh = self.gpu.mesh_shader.as_ref().expect("checked above");
+                match groups {
+                    MeshGroups::Direct([x, y, z]) => mesh.cmd_draw_mesh_tasks(commands, x, y, z),
+                    MeshGroups::Indirect { buffer, offset } => {
+                        mesh.cmd_draw_mesh_tasks_indirect(commands, buffer, offset, 1, 12);
+                    }
+                }
+            } else if let Some(((buffer, offset), kind)) = index {
                 device.cmd_bind_index_buffer(commands, buffer, offset, kind);
                 device.cmd_draw_indexed(
                     commands,
@@ -953,6 +990,7 @@ pub(crate) mod tests {
                 depth_bias: None,
             },
             blends: vec![Blend::default()],
+            mesh: None,
         };
         renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();

@@ -50,6 +50,16 @@ public:
         is_proprietary_driver = true;
     }
 
+    void SetupMesh(const EchoraShaderInput& input) {
+        std::copy(std::begin(input.mesh_registers), std::end(input.mesh_registers),
+                  mesh_registers.begin());
+        if (input.has_mesh_primitive_header != 0) {
+            static_assert(sizeof(mesh_primitive_header) == sizeof(input.mesh_primitive_header));
+            std::memcpy(&mesh_primitive_header, input.mesh_primitive_header,
+                        sizeof(input.mesh_primitive_header));
+        }
+    }
+
     u64 ReadInstruction(u32 address) override {
         const size_t index = address / sizeof(u64);
         if (address % sizeof(u64) != 0 || index >= code.size()) {
@@ -257,6 +267,8 @@ extern "C" int echora_shader_translate(const EchoraShaderInput* input,
         const u32 sph_type = first_word & 0x1f;
         const bool graphics =
             (sph_type == 1 || sph_type == 2) && StageFromHeader((first_word >> 10) & 0xf, stage);
+        if (graphics && input->mesh_stage == ECHORA_MESH_TASK) stage = Shader::Stage::Task;
+        if (graphics && input->mesh_stage == ECHORA_MESH_MESH) stage = Shader::Stage::Mesh;
         if (graphics) {
             if (length < NATIVE_GRAPHICS_HEADER) {
                 Fail(output, "program shorter than its header");
@@ -311,6 +323,7 @@ extern "C" int echora_shader_translate(const EchoraShaderInput* input,
         u32 cfg_start;
         if (graphics) {
             env.Setup(stage, header, 0);
+            env.SetupMesh(*input);
             // At least 16 bytes (local memory is allocated in 16-byte
             // units, inferred): 34 captured programs declare none yet store
             // at offsets up to 8, which the recompiler would drop.

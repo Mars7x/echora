@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use echora_gpu::ash::vk;
 use echora_gpu::draw::{
-    Blend, Draw, Fixed, ImageShape, Indices, Program, Sampler, StencilFace, TextureSource,
-    UploadRegion, VertexAttribute, VertexStream,
+    Blend, Draw, Fixed, ImageShape, Indices, MeshGroups, Program, Sampler, StencilFace,
+    TextureSource, UploadRegion, VertexAttribute, VertexStream,
 };
 use echora_gpu::present::Presenter;
 use echora_gpu::renderer::Renderer;
-use echora_gpu::shader::{self, DescriptorKind, Parameters, Stage, Translated};
+use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
 use super::{Command, Guest, Image, Nvn};
 
@@ -187,8 +187,15 @@ impl Backend {
 /// Stage keys (vertex, fragment) and the stages' translations.
 type BoundProgram = ((u64, u64), Vec<Arc<Translated>>);
 /// Stage key, binding base, previous stage's stores, generic input types,
-/// compute workgroup size and shared memory.
-type TranslationKey = (u64, [u32; 3], Option<[u64; 8]>, [u8; 32], [u32; 5]);
+/// compute workgroup size and shared memory, and the task/mesh state.
+type TranslationKey = (
+    u64,
+    [u32; 3],
+    Option<[u64; 8]>,
+    [u8; 32],
+    [u32; 5],
+    Option<MeshParameters>,
+);
 
 /// Shader::AttributeType of each vertex attribute's format: integer formats
 /// must reach integer shader inputs.
@@ -290,6 +297,10 @@ fn nvn_stage(stage: Stage) -> u32 {
         Stage::TessControl => 3,
         Stage::TessEval => 4,
         Stage::Compute => 5,
+        // Bound in the vertex and tessellation slots (a mesh program without
+        // a task in the vertex slot: `bound_mesh_program` gives its slot).
+        Stage::Task => 0,
+        Stage::Mesh => 4,
     }
 }
 
@@ -891,6 +902,7 @@ impl Nvn {
         previous_stores: Option<[u64; 8]>,
         generic_input_types: [u8; 32],
         compute: [u32; 5],
+        mesh: Option<MeshParameters>,
     ) -> Result<Arc<Translated>, String> {
         let (code, key) = self
             .stage_code(core, gpu)
@@ -899,12 +911,20 @@ impl Nvn {
         let resolution_scale = backend.renderer.resolution_scale().terms();
         backend
             .translations
-            .entry((key, base, previous_stores, generic_input_types, compute))
+            .entry((
+                key,
+                base,
+                previous_stores,
+                generic_input_types,
+                compute,
+                mesh,
+            ))
             .or_insert_with(|| {
                 let parameters = Parameters {
                     binding_base: base[0],
                     resolution_scale,
                     scaling_base: [base[1], base[2]],
+                    mesh,
                     previous_stores,
                     generic_input_types,
                     workgroup_size: [compute[0], compute[1], compute[2]],
@@ -931,6 +951,11 @@ impl Nvn {
     fn stage_constants(&self, core: &Guest, bit: u32) -> Option<Vec<u8>> {
         let bind = self.render.state.get(&format!("BindProgram@{bit}"))?;
         let stage = self.program_stage(core, bind.x[1], bit).ok()?;
+        self.stage_constants_of(core, stage)
+    }
+
+    /// The constants a stage's control section places beside its code.
+    fn stage_constants_of(&self, core: &Guest, stage: super::Args) -> Option<Vec<u8>> {
         let (code, control) = (stage.x[0], stage.x[1]);
         let size = core.memory.read_u32(control + 0x3c).ok()?;
         let offset = core.memory.read_u32(control + 0x40).ok()?;
@@ -997,7 +1022,7 @@ impl Nvn {
             .state
             .get("BindVertexAttribState")
             .map_or([0; 32], |bind| generic_input_types(&bind.states));
-        let vertex = self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5])?;
+        let vertex = self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None)?;
         let binding_base = vertex
             .descriptors
             .iter()
@@ -1025,6 +1050,7 @@ impl Nvn {
             Some(vertex.stores),
             [0; 32],
             [0; 5],
+            None,
         )?;
         if vertex.stage != Stage::Vertex || fragment.stage != Stage::Fragment {
             return Err(format!(
@@ -1037,6 +1063,231 @@ impl Nvn {
             self.stage_code(core, addresses[1]).unwrap().1,
         );
         Ok((keys, vec![vertex, fragment]))
+    }
+
+    /// The task (if any), mesh and fragment stages of the programs bound for
+    /// a mesh draw: their keys, translations, NVN resource slots and stage
+    /// entries. A mesh program writes the stage buffer, and its control
+    /// section gives its largest vertex and primitive counts at +0x60 (low
+    /// and high half) and its threads at +0x58; a task program has nothing
+    /// at +0x60, and its +0x58 is laid out as SET_MESH_INIT_SHADER (threads
+    /// 5:0, payload lines 30:22). Without a task the mesh program sits in
+    /// the vertex slot (its header names a vertex program), after one in the
+    /// tessellation slot; a pass-through geometry program bound with it
+    /// lists the per-primitive outputs.
+    fn bound_mesh_program(
+        &mut self,
+        core: &Guest,
+    ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
+        let programs: Vec<u64> = self
+            .render
+            .state
+            .iter()
+            .filter(|(key, _)| key.starts_with("BindProgram@"))
+            .map(|(_, bind)| bind.x[1])
+            .collect();
+        // For the skip reasons: each bound bit's program and its stages'
+        // header types and +0x60 words.
+        let bound: Vec<String> = self
+            .render
+            .state
+            .iter()
+            .filter_map(|(key, bind)| Some((key.strip_prefix("BindProgram@")?, bind)))
+            .map(|(bit, bind)| {
+                let stages: Vec<String> = (0..6)
+                    .filter_map(|index| {
+                        let stage = self
+                            .objects
+                            .get(&bind.x[1])?
+                            .state
+                            .get(&format!("Stage{index}"))?;
+                        let (code, _) = self.stage_code(core, stage.x[0])?;
+                        let kind = code.get(..4).map_or(0, |word| {
+                            (u32::from_le_bytes(word.try_into().unwrap()) >> 10) & 0xf
+                        });
+                        let sizes = core.memory.read_u32(stage.x[1] + 0x60).unwrap_or(0);
+                        Some(format!("t{kind}/{sizes:x}"))
+                    })
+                    .collect();
+                format!("{bit}:{}", stages.join("+"))
+            })
+            .collect();
+        let bound = bound.join(" ");
+        let mut stages: Vec<super::Args> = Vec::new();
+        for program in programs {
+            let Some(object) = self.objects.get(&program) else {
+                continue;
+            };
+            for index in 0..6 {
+                if let Some(stage) = object.state.get(&format!("Stage{index}")) {
+                    if !stages.iter().any(|known| known.x[0] == stage.x[0]) {
+                        stages.push(*stage);
+                    }
+                }
+            }
+        }
+        let control = |stage: &super::Args, offset: u64| {
+            core.memory.read_u32(stage.x[1] + offset).unwrap_or(0)
+        };
+        let (mut task, mut mesh, mut fragment, mut geometry) = (None, None, None, None);
+        for stage in &stages {
+            let Some((code, _)) = self.stage_code(core, stage.x[0]) else {
+                continue;
+            };
+            if code.len() < 0x50 {
+                continue;
+            }
+            let kind = (u32::from_le_bytes([code[0], code[1], code[2], code[3]]) >> 10) & 0xf;
+            match kind {
+                5 => fragment = Some(*stage),
+                4 => {
+                    let mut header = [0u8; 0x50];
+                    header.copy_from_slice(&code[..0x50]);
+                    geometry = Some(header);
+                }
+                1 | 3 if control(stage, 0x60) != 0 => mesh = Some((*stage, kind)),
+                1 => task = Some(*stage),
+                _ => {}
+            }
+        }
+        let (mesh, mesh_kind) =
+            mesh.ok_or_else(|| format!("no mesh program is bound ({bound})"))?;
+        let fragment = fragment.ok_or_else(|| {
+            format!("no fragment program is bound with the mesh program ({bound})")
+        })?;
+        let sizes = control(&mesh, 0x60);
+        let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
+        // Triangles, the only mesh output topology the recompiler takes.
+        let shader_a = 4 | (vertices & 0x1ff) << 4 | (primitives & 0x3ff) << 13;
+        let shader_b = (control(&mesh, 0x58) & 0x3f) << 20;
+        let task_init = task.map(|task| control(&task, 0x58));
+        let init = task_init.unwrap_or(control(&mesh, 0x58) & !0x3f);
+        let advance = |stage: &Translated, base: [u32; 3]| {
+            let count = |kind| {
+                stage
+                    .descriptors
+                    .iter()
+                    .filter(|descriptor| descriptor.kind() == kind)
+                    .count() as u32
+            };
+            [
+                stage
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.binding + descriptor.count)
+                    .max()
+                    .unwrap_or(base[0])
+                    .max(base[0]),
+                base[1] + count(DescriptorKind::Texture),
+                base[2] + count(DescriptorKind::Image),
+            ]
+        };
+        let (mut translated, mut slots, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+        let mut base = [0u32; 3];
+        let mut keys = 0u64;
+        if let (Some(task), Some(init)) = (task, task_init) {
+            let parameters = MeshParameters {
+                task: true,
+                registers: [shader_a, shader_b, init],
+                primitive_header: None,
+            };
+            let stage = self.translate_stage(
+                core,
+                task.x[0],
+                base,
+                None,
+                [0; 32],
+                [0; 5],
+                Some(parameters),
+            )?;
+            if stage.stage != Stage::Task {
+                return Err(format!("the task program translated as {:?}", stage.stage));
+            }
+            base = advance(&stage, base);
+            keys = self.stage_code(core, task.x[0]).map_or(0, |(_, key)| key);
+            translated.push(stage);
+            slots.push(0);
+            entries.push(task);
+        }
+        let parameters = MeshParameters {
+            task: false,
+            registers: [shader_a, shader_b, init],
+            primitive_header: geometry,
+        };
+        let stage = self.translate_stage(
+            core,
+            mesh.x[0],
+            base,
+            None,
+            [0; 32],
+            [0; 5],
+            Some(parameters),
+        )?;
+        if stage.stage != Stage::Mesh {
+            return Err(format!("the mesh program translated as {:?}", stage.stage));
+        }
+        base = advance(&stage, base);
+        let stores = stage.stores;
+        keys = keys.rotate_left(1) ^ self.stage_code(core, mesh.x[0]).map_or(0, |(_, key)| key);
+        translated.push(stage);
+        slots.push(if mesh_kind == 1 { 0 } else { 4 });
+        entries.push(mesh);
+        let stage = self.translate_stage(
+            core,
+            fragment.x[0],
+            base,
+            Some(stores),
+            [0; 32],
+            [0; 5],
+            None,
+        )?;
+        if stage.stage != Stage::Fragment {
+            return Err(format!(
+                "the fragment program translated as {:?}",
+                stage.stage
+            ));
+        }
+        translated.push(stage);
+        slots.push(1);
+        entries.push(fragment);
+        let fragment_key = self
+            .stage_code(core, fragment.x[0])
+            .map_or(0, |(_, key)| key);
+        // Mesh programs never share a key with vertex programs' pipelines.
+        Ok((
+            ((keys ^ 0x6d65_7368, fragment_key), translated),
+            slots,
+            entries,
+        ))
+    }
+
+    /// A mesh draw's workgroups: DrawMeshTasks(cmd, first, count) draws
+    /// `count` groups (from 0 only), DrawMeshTasksIndirect(cmd, address)
+    /// reads three u32 group counts at that GPU address (from the device
+    /// buffer of a resident pool when the GPU may have written them).
+    fn mesh_groups(&mut self, core: &mut Guest, command: &Command) -> Result<MeshGroups, String> {
+        match command.name.as_str() {
+            "nvnCommandBufferDrawMeshTasks" => {
+                let (first, count) = (command.x[1] as u32, command.x[2] as u32);
+                if first != 0 {
+                    return Err(format!("mesh tasks from group {first}"));
+                }
+                Ok(MeshGroups::Direct([count, 1, 1]))
+            }
+            "nvnCommandBufferDrawMeshTasksIndirect" => {
+                let address = command.x[1];
+                let guest = self.gpu_to_guest(address, 12)?;
+                if let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 12)? {
+                    return Ok(MeshGroups::Indirect { buffer, offset });
+                }
+                let bytes = self.gpu_bytes(core, address, 12)?;
+                let word = |index: usize| {
+                    u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+                };
+                Ok(MeshGroups::Direct([word(0), word(1), word(2)]))
+            }
+            other => Err(format!("{other} is not modeled on the GPU")),
+        }
     }
 
     /// Guest bytes at GPU address `address`, `size` long.
@@ -2317,7 +2568,7 @@ impl Nvn {
         if compute[..3].iter().any(|size| *size == 0 || *size > 1024) {
             return Err(format!("compute workgroup {:?}", &compute[..3]));
         }
-        let stage = self.translate_stage(core, address, [0; 3], None, [0; 32], compute)?;
+        let stage = self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
         if stage.stage != Stage::Compute {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
@@ -3024,7 +3275,19 @@ impl Nvn {
             *since = now;
         };
         let mut since = phase_start;
-        let (keys, stages) = self.bound_program(core)?;
+        let mesh_draw = command.name.contains("DrawMeshTasks");
+        let ((keys, stages), slots, mesh_entries) = if mesh_draw {
+            self.bound_mesh_program(core)?
+        } else {
+            let bound = self.bound_program(core)?;
+            let slots = bound.1.iter().map(|stage| nvn_stage(stage.stage)).collect();
+            (bound, slots, Vec::new())
+        };
+        let mesh_groups = if mesh_draw {
+            Some(self.mesh_groups(core, command)?)
+        } else {
+            None
+        };
         phase(self, "stat: draw us program", &mut since);
         // ECHORA_GPU_SEQUENCE_AFTER=<fragment key>: the present after the
         // first draw of that program is sequenced (scenes come at frames
@@ -3069,7 +3332,7 @@ impl Nvn {
         let (mut uniform_time, mut texture_time) = Default::default();
         let mut uniform_bytes = 0u64;
         for (index, stage) in stages.iter().enumerate() {
-            let nvn = nvn_stage(stage.stage);
+            let nvn = slots[index];
             for descriptor in &stage.descriptors {
                 match descriptor.kind() {
                     // Constant bank 24: root table 0 of the graphics
@@ -3098,8 +3361,11 @@ impl Nvn {
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
-                        let mut bytes =
-                            self.stage_constants(core, index as u32).unwrap_or_default();
+                        let mut bytes = match mesh_entries.get(index) {
+                            Some(&entry) => self.stage_constants_of(core, entry),
+                            None => self.stage_constants(core, index as u32),
+                        }
+                        .unwrap_or_default();
                         bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
@@ -3308,8 +3574,8 @@ impl Nvn {
                 format: vk_format,
             });
         }
-        // The draw itself.
-        let mode = command.x[1];
+        // The draw itself (a mesh pipeline's output is triangles).
+        let mode = if mesh_draw { 4 } else { command.x[1] };
         // Quads (mode 7, GL order): drawn as two triangles each.
         let quads = mode == 7;
         let topology = if quads {
@@ -3400,6 +3666,7 @@ impl Nvn {
                 };
                 (wrap(bytes), count, 0, base)
             }
+            _ if mesh_draw => (Indices::None, 0, 0, 0),
             other => return Err(format!("{other} is not modeled on the GPU")),
         };
         // A draw this large can only come from misread state; it would hold
@@ -3927,6 +4194,7 @@ impl Nvn {
         let draw = Draw {
             program: &backend.programs[&keys],
             blends,
+            mesh: mesh_groups,
             colors,
             color_levels,
             color_layers,
