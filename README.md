@@ -21,6 +21,20 @@ display, input and audio, rather than emulating the console.
 > **Note:** Echora is a personal project, made for my own enjoyment. AI
 > tools were used in developing it.
 
+## Principles
+
+- Written in Rust, apart from the C++ shader recompiler and a few C
+  libraries.
+- The Switch's kernel, system services and NVN graphics API are
+  reimplemented; the game's own code is never modified.
+- Unimplemented instructions, system calls and services stop the run with
+  a report instead of returning invented success.
+- Translated code is checked against a reference interpreter written from
+  Arm's pseudocode.
+- The game is read straight from its NUP file or a dump, without
+  unpacking it.
+- The core is portable, and is built and tested on Linux and Windows.
+
 ## Status
 
 Latest measured state (2026-11-07, update `0400486024DEC000` v131072,
