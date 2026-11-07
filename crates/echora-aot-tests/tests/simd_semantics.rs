@@ -6,8 +6,8 @@
 //! the forms covered here (vector and scalar integer arithmetic, compares,
 //! shifts, saturating and halving forms, pairwise and across-lanes
 //! reductions, widening and narrowing, dot products, polynomial multiply,
-//! permutes, EXT, TBL/TBX, DUP, INS, UMOV/SMOV, MOVI and the logical
-//! forms), each followed by SVC #7, and lifts them through split emission.
+//! permutes, EXT, TBL/TBX, DUP, INS, UMOV/SMOV, MOVI, the logical forms,
+//! and AES and SHA-1/SHA-256), each followed by SVC #7, and lifts them through split emission.
 //! Each runs natively from random vector, general-register and flag states;
 //! the vector registers, general registers and NZCV afterwards must match
 //! the interpreter, saturating left shifts included. FPSR.QC is not
@@ -18,8 +18,8 @@
 use echora_aot_tests::{Machine, Trap, simd_semantic_code};
 use echora_lift::aarch64::{Instruction, decode};
 use echora_lift::simd::{
-    SimdOp, VecAcrossOp, VecIntOp, VecLongOp, VecNarrowOp, VecPermuteOp, VecShiftOp, VecUnaryOp,
-    VectorLogicalOp,
+    CryptoOp, SimdOp, VecAcrossOp, VecIntOp, VecLongOp, VecNarrowOp, VecPermuteOp, VecShiftOp,
+    VecUnaryOp, VectorLogicalOp,
 };
 
 const STATES_PER_WORD: usize = 16;
@@ -772,7 +772,202 @@ fn interpret(instruction: &SimdOp, s: &mut State) {
             let result = if clear { d & !value } else { d | value };
             s.v[rd as usize] = width(result, q);
         }
+        Crypto { op, rd, rn, rm } => {
+            s.v[rd as usize] = crypto(op, v(s, rd), v(s, rn), v(s, rm));
+        }
         ref other => panic!("no reference for {other:?}"),
+    }
+}
+
+// AES and SHA, from the pseudocode (AESSubBytes, AESShiftRows,
+// AESMixColumns and inverses; SHA1 and SHA256 hash and schedule updates).
+
+fn gf_multiply(mut a: u8, mut b: u8) -> u8 {
+    let mut product = 0;
+    while b != 0 {
+        if b & 1 != 0 {
+            product ^= a;
+        }
+        let carry = a & 0x80 != 0;
+        a <<= 1;
+        if carry {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    product
+}
+
+/// The AES S-box: the GF(2^8) inverse, then the affine transform.
+fn sbox(x: u8) -> u8 {
+    let inverse = if x == 0 {
+        0
+    } else {
+        (1..=255u8).find(|&y| gf_multiply(x, y) == 1).unwrap()
+    };
+    inverse
+        ^ inverse.rotate_left(1)
+        ^ inverse.rotate_left(2)
+        ^ inverse.rotate_left(3)
+        ^ inverse.rotate_left(4)
+        ^ 0x63
+}
+
+fn inverse_sbox(y: u8) -> u8 {
+    (0..=255u8).find(|&x| sbox(x) == y).unwrap()
+}
+
+fn bytes(v: u128) -> [u8; 16] {
+    v.to_le_bytes()
+}
+
+/// Byte `r + 4c` is row r, column c.
+fn shift_rows(state: [u8; 16], inverse: bool) -> [u8; 16] {
+    std::array::from_fn(|i| {
+        let (row, column) = (i % 4, i / 4);
+        let source = if inverse {
+            (column + 4 - row) % 4
+        } else {
+            (column + row) % 4
+        };
+        state[row + 4 * source]
+    })
+}
+
+fn mix_columns(state: [u8; 16], inverse: bool) -> [u8; 16] {
+    let matrix: [[u8; 4]; 4] = if inverse {
+        [
+            [14, 11, 13, 9],
+            [9, 14, 11, 13],
+            [13, 9, 14, 11],
+            [11, 13, 9, 14],
+        ]
+    } else {
+        [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]]
+    };
+    std::array::from_fn(|i| {
+        let (row, column) = (i % 4, i / 4);
+        (0..4).fold(0, |sum, k| {
+            sum ^ gf_multiply(matrix[row][k], state[k + 4 * column])
+        })
+    })
+}
+
+fn lane32(v: u128, index: u32) -> u32 {
+    (v >> (32 * index)) as u32
+}
+
+fn from_lanes(lanes: [u32; 4]) -> u128 {
+    lanes
+        .iter()
+        .enumerate()
+        .fold(0, |v, (i, &lane)| v | (u128::from(lane) << (32 * i)))
+}
+
+fn choose(x: u32, y: u32, z: u32) -> u32 {
+    ((y ^ z) & x) ^ z
+}
+
+fn majority(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) | ((x | y) & z)
+}
+
+fn sha1_hash(x: u128, y: u32, w: u128, f: fn(u32, u32, u32) -> u32) -> u128 {
+    let mut x = [lane32(x, 0), lane32(x, 1), lane32(x, 2), lane32(x, 3)];
+    let mut y = y;
+    for e in 0..4 {
+        let t = f(x[1], x[2], x[3]);
+        y = y
+            .wrapping_add(x[0].rotate_left(5))
+            .wrapping_add(t)
+            .wrapping_add(lane32(w, e));
+        x[1] = x[1].rotate_left(30);
+        // <Y, X> = ROL(Y : X, 32).
+        let top = x[3];
+        x = [y, x[0], x[1], x[2]];
+        y = top;
+    }
+    from_lanes(x)
+}
+
+fn sha256_hash(x: u128, y: u128, w: u128, part1: bool) -> u128 {
+    let mut x = [lane32(x, 0), lane32(x, 1), lane32(x, 2), lane32(x, 3)];
+    let mut y = [lane32(y, 0), lane32(y, 1), lane32(y, 2), lane32(y, 3)];
+    for e in 0..4 {
+        let chs = choose(y[0], y[1], y[2]);
+        let maj = majority(x[0], x[1], x[2]);
+        let sigma1 = y[0].rotate_right(6) ^ y[0].rotate_right(11) ^ y[0].rotate_right(25);
+        let sigma0 = x[0].rotate_right(2) ^ x[0].rotate_right(13) ^ x[0].rotate_right(22);
+        let t = y[3]
+            .wrapping_add(sigma1)
+            .wrapping_add(chs)
+            .wrapping_add(lane32(w, e));
+        x[3] = t.wrapping_add(x[3]);
+        y[3] = t.wrapping_add(sigma0).wrapping_add(maj);
+        // <Y, X> = ROL(Y : X, 32).
+        let (x_top, y_top) = (x[3], y[3]);
+        x = [y_top, x[0], x[1], x[2]];
+        y = [x_top, y[0], y[1], y[2]];
+    }
+    from_lanes(if part1 { x } else { y })
+}
+
+fn crypto(op: CryptoOp, d: u128, n: u128, m: u128) -> u128 {
+    let substitute = |state: [u8; 16], inverse: bool| -> [u8; 16] {
+        state.map(|b| if inverse { inverse_sbox(b) } else { sbox(b) })
+    };
+    match op {
+        CryptoOp::Aese => u128::from_le_bytes(substitute(shift_rows(bytes(d ^ n), false), false)),
+        CryptoOp::Aesd => u128::from_le_bytes(substitute(shift_rows(bytes(d ^ n), true), true)),
+        CryptoOp::Aesmc => u128::from_le_bytes(mix_columns(bytes(n), false)),
+        CryptoOp::Aesimc => u128::from_le_bytes(mix_columns(bytes(n), true)),
+        CryptoOp::Sha1c => sha1_hash(d, lane32(n, 0), m, choose),
+        CryptoOp::Sha1p => sha1_hash(d, lane32(n, 0), m, |x, y, z| x ^ y ^ z),
+        CryptoOp::Sha1m => sha1_hash(d, lane32(n, 0), m, majority),
+        CryptoOp::Sha1h => u128::from(lane32(n, 0).rotate_left(30)),
+        CryptoOp::Sha1su0 => {
+            let result = ((n & u128::from(u64::MAX)) << 64) | (d >> 64);
+            result ^ d ^ m
+        }
+        CryptoOp::Sha1su1 => {
+            let t = d ^ (n >> 32);
+            let mut lanes = [0; 4];
+            for (e, lane) in lanes.iter_mut().enumerate() {
+                *lane = lane32(t, e as u32).rotate_left(1);
+            }
+            lanes[3] ^= lane32(t, 0).rotate_left(2);
+            from_lanes(lanes)
+        }
+        CryptoOp::Sha256h => sha256_hash(d, n, m, true),
+        CryptoOp::Sha256h2 => sha256_hash(n, d, m, false),
+        CryptoOp::Sha256su0 => {
+            let t = (u128::from(lane32(n, 0)) << 96) | (d >> 32);
+            let mut lanes = [0; 4];
+            for (e, lane) in lanes.iter_mut().enumerate() {
+                let element = lane32(t, e as u32);
+                let element = element.rotate_right(7) ^ element.rotate_right(18) ^ (element >> 3);
+                *lane = element.wrapping_add(lane32(d, e as u32));
+            }
+            from_lanes(lanes)
+        }
+        CryptoOp::Sha256su1 => {
+            let t0 = (u128::from(lane32(m, 0)) << 96) | (n >> 32);
+            let schedule = |element: u32| {
+                element.rotate_right(17) ^ element.rotate_right(19) ^ (element >> 10)
+            };
+            let mut lanes = [0u32; 4];
+            for e in 0..4 {
+                let source = if e < 2 {
+                    lane32(m, 2 + e as u32)
+                } else {
+                    lanes[e - 2]
+                };
+                lanes[e] = schedule(source)
+                    .wrapping_add(lane32(d, e as u32))
+                    .wrapping_add(lane32(t0, e as u32));
+            }
+            from_lanes(lanes)
+        }
     }
 }
 
@@ -895,6 +1090,15 @@ fn lifted_integer_simd_matches_the_reference() {
         failures.len()
     );
     assert!(saturating_shifts > 0, "the sample has no saturating shifts");
+    let crypto_ops: std::collections::BTreeSet<String> = words
+        .iter()
+        .filter_map(|&word| match decode(word, 0) {
+            Instruction::Simd(SimdOp::Crypto { op, .. }) => Some(format!("{op:?}")),
+            _ => None,
+        })
+        .collect();
+    println!("crypto operations sampled: {crypto_ops:?}");
+    assert!(crypto_ops.len() >= 12, "too few AES/SHA operations sampled");
     assert!(
         failures.is_empty(),
         "{} mismatches:\n{}",
@@ -906,4 +1110,11 @@ fn lifted_integer_simd_matches_the_reference() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[test]
+fn reference_sbox_matches_fips_197() {
+    // FIPS-197 figure 7: S(00) = 63, S(01) = 7c, S(53) = ed.
+    assert_eq!((sbox(0x00), sbox(0x01), sbox(0x53)), (0x63, 0x7c, 0xed));
+    assert_eq!(inverse_sbox(0xed), 0x53);
 }

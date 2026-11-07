@@ -295,6 +295,7 @@ fn simd_semantic_code(out: &mut String) {
                 | SimdOp::InsertGeneral { .. }
                 | SimdOp::MoveToGeneral { .. }
                 | SimdOp::MoveImmediate { .. }
+                | SimdOp::Crypto { .. }
                 | SimdOp::ModifyImmediate { .. }
         )
     };
