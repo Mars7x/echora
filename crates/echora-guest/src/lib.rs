@@ -323,10 +323,16 @@ impl Core {
     /// happen in `enter_window`.
     #[inline(always)]
     pub fn tick_block(&mut self, count: u64) -> Result<(), Trap> {
+        self.tick_block_at(self.cpu.pc, count)
+    }
+
+    /// `tick_block` for a block at `pc`, which must be the current PC;
+    /// translated code passes it as a constant, saving the PC's reload.
+    #[inline(always)]
+    pub fn tick_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
         if self.steps + count > self.max_steps {
             return self.block_budget_exhausted();
         }
-        let pc = self.cpu.pc;
         self.steps += count;
         self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
         Ok(())
