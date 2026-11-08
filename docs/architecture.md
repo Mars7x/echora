@@ -87,8 +87,13 @@ nested host frames:
 - With `EmitOptions::direct_calls`, a BL whose target is in the caller's
   own region calls `Core::call_window(return_to, run_window_W)` instead.
   The first window is a direct call to a function the crate can name, and
-  the rest is as in `Core::call`. Other BLs keep `Core::call`, because a
-  region crate cannot name a function in another region crate.
+  the rest is as in `Core::call`.
+- A BL to a block in another region goes through a call slot (option 2
+  below). The region source holds `pub static CALLS:
+  [OnceLock<WindowFn>; N]`, one slot per window it calls in other
+  regions. The root's generated `install()` fills every slot, so no build
+  change is needed. Until then, the call falls back to `Core::call`.
+  BLRs and calls to addresses with no translated block keep `Core::call`.
 
 What a direct call avoids is the table lookup for the callee's first
 window, plus an indirect call whose target the compiler cannot see. The
@@ -139,9 +144,11 @@ build in `crates/echora/src/main.rs`, and none is implemented:
    between bundles still go through the table. This gives up the
    per-region crate that makes rebuilds after a small change cheap.
 
-Option 2 is the smallest change with a portable result. Option 1 gives
-true direct calls but depends on the host's loader. Either should first
-be sized by the call-site count above.
+Option 2 is implemented, behind `EmitOptions::direct_calls`. The slots
+add about 1.4 bytes of Rust per guest instruction on the aot-tests
+programs. In the game build, before slots, 125,929 static call sites
+were direct (same region) and 853,320 went through `Core::call`. Option
+1 would give true direct calls, but depends on the host's loader.
 
 ## Guest memory backends
 

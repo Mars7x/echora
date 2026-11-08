@@ -908,17 +908,49 @@ fn emit_direct_call(output: &mut String, next: u64, window: u64) {
     .unwrap();
 }
 
-/// The window function a BL to `target` can call directly, under
-/// `EmitOptions::direct_calls`: a block start in the caller's region (the
-/// same generated source, so the function is in scope).
-fn direct_call_window(pc: u64, target: u64) -> Option<u64> {
-    DIRECT_CALLS.with_borrow(|direct| {
-        let direct = direct.as_ref()?;
-        (direct.starts.contains(&target)
-            && target >> direct.region_bits == pc >> direct.region_bits)
-            .then_some(target >> SPLIT_WINDOW_BITS)
+/// How a BL to `target` is written under `EmitOptions::direct_calls`.
+enum DirectCall {
+    /// A block start in the caller's region (the same generated source, so
+    /// the function is in scope): this window function.
+    Window(u64),
+    /// A block start in another region: this slot of the region's `CALLS`
+    /// table, which the generated `install()` fills with its window
+    /// function.
+    Slot(usize),
+}
+
+fn direct_call(pc: u64, target: u64) -> Option<DirectCall> {
+    DIRECT_CALLS.with_borrow_mut(|direct| {
+        let direct = direct.as_mut()?;
+        if !direct.starts.contains(&target) {
+            return None;
+        }
+        let window = target >> SPLIT_WINDOW_BITS;
+        if target >> direct.region_bits == pc >> direct.region_bits {
+            return Some(DirectCall::Window(window));
+        }
+        let next = direct.slots.len();
+        Some(DirectCall::Slot(
+            *direct.slots.entry(window).or_insert(next),
+        ))
     })
 }
+
+/// A BL through slot `slot` of the region's `CALLS` table (`call_slot`).
+fn emit_slot_call(output: &mut String, next: u64, slot: usize) {
+    writeln!(
+        output,
+        "                if let Err(trap) = call_slot(m, {next:#x}, &CALLS[{slot}]) {{ return Err(trap); }}"
+    )
+    .unwrap();
+}
+
+/// Written into every region source under `EmitOptions::direct_calls`: a
+/// BL to another region's window goes through a slot that the generated
+/// `install()` fills with its function, or through `Core::call` while the
+/// slot is empty (before `install()`).
+const CALL_SLOT_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn call_slot(m: &mut Machine, return_to: u64, slot: &std::sync::OnceLock<echora_guest::WindowFn>) -> Result<(), Trap> {\n\
+match slot.get() { Some(&function) => m.call_window(return_to, function), None => m.call(return_to) }\n}\n";
 
 /// Guest registers as locals of a split window function: the registers its
 /// blocks use are read into locals on entry and the ones they write are
@@ -963,8 +995,9 @@ const WRITES_REGISTERS: &[&str] = &[
 /// Calls into other windows as emitted (`emit_call`, `emit_direct_call`),
 /// with the `Core` method each makes.
 const CALL_PREFIXES: &[(&str, &str)] = &[
-    ("if let Err(trap) = m.call(", "call"),
-    ("if let Err(trap) = m.call_window(", "call_window"),
+    ("if let Err(trap) = m.call(", "m.call("),
+    ("if let Err(trap) = m.call_window(", "m.call_window("),
+    ("if let Err(trap) = call_slot(", "call_slot("),
 ];
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
@@ -1097,16 +1130,17 @@ impl RegisterLocals {
                 }
             }
             let indent = &line[..line.len() - line.trim_start().len()];
-            if let Some((rest, method)) = CALL_PREFIXES.iter().find_map(|(prefix, method)| {
-                Some((line.trim_start().strip_prefix(prefix)?, method))
-            }) {
+            if let Some((rest, call)) = CALL_PREFIXES
+                .iter()
+                .find_map(|(prefix, call)| Some((line.trim_start().strip_prefix(prefix)?, call)))
+            {
                 // The callee runs on the Core: store before, reload after
                 // (also on its error path, so the final store keeps what
                 // the callee left).
                 let arguments = &rest[..rest.find(')').expect("call target")];
                 writeln!(
                     text,
-                    "{indent}{store}let called = m.{method}({arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                    "{indent}{store}let called = {call}{arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
                 )
                 .unwrap();
                 continue;
@@ -1249,8 +1283,9 @@ fn emit_instruction_body(
             }
             if *link {
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
-                match direct_call_window(pc, *target) {
-                    Some(window) => emit_direct_call(output, next, window),
+                match direct_call(pc, *target) {
+                    Some(DirectCall::Window(window)) => emit_direct_call(output, next, window),
+                    Some(DirectCall::Slot(slot)) => emit_slot_call(output, next, slot),
                     None => emit_call(output, next),
                 }
                 output.push_str(after_call);
@@ -2835,6 +2870,8 @@ pub struct EmitOptions {
 struct DirectCalls {
     region_bits: u32,
     starts: BTreeSet<u64>,
+    /// The current region's call slots: target window -> slot.
+    slots: BTreeMap<u64, usize>,
 }
 
 thread_local! {
@@ -2932,6 +2969,7 @@ pub fn emit_rust_split_to_with<E>(
     let _direct_calls = DirectCallsSet::set(options.direct_calls.then(|| DirectCalls {
         region_bits,
         starts: translation.blocks.iter().map(|block| block.start).collect(),
+        slots: BTreeMap::new(),
     }));
     let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
         // Every block execution can resume at is an entry of its tree, so
@@ -2969,13 +3007,46 @@ pub fn emit_rust_split_to_with<E>(
         "// Generated from user-provided executable bytes. Keep this file local.\n\
          use echora_guest::{{Core, Trap, WindowFn}};\n\n\
          /// Registers the window table used for direct calls between windows.\n\
-         pub fn install() {{\n    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n}}\n\n\
+         pub fn install() {{\n    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n    install_call_slots();\n}}\n\n\
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
          pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
     );
-    let header = format!(
+    let mut header = format!(
         "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{{Core as Machine, Trap}};\n{AT_HELPER}"
     );
+    if options.direct_calls {
+        header.push_str(CALL_SLOT_HELPER);
+    }
+    // Each region's call slots, filled by `install_call_slots`: (region,
+    // [(slot, target window)]).
+    let mut slot_tables: Vec<(u64, Vec<(usize, u64)>)> = Vec::new();
+    // Ends a region's source: its call slot table, if it calls other
+    // regions' windows.
+    let mut finish_region = |region: u64, mut source: String| {
+        let slots = DIRECT_CALLS.with_borrow_mut(|direct| {
+            direct
+                .as_mut()
+                .map(|direct| std::mem::take(&mut direct.slots))
+                .unwrap_or_default()
+        });
+        if !slots.is_empty() {
+            writeln!(
+                source,
+                "\n/// Other regions' window functions this region calls, filled by install().\npub static CALLS: [std::sync::OnceLock<echora_guest::WindowFn>; {}] = [const {{ std::sync::OnceLock::new() }}; {}];",
+                slots.len(),
+                slots.len()
+            )
+            .unwrap();
+            slot_tables.push((
+                region,
+                slots
+                    .into_iter()
+                    .map(|(window, slot)| (slot, window))
+                    .collect(),
+            ));
+        }
+        unindent(&source)
+    };
     let mut current: Option<(u64, String)> = None;
     for (window, blocks) in &windows {
         let region = window >> shift;
@@ -2986,7 +3057,7 @@ pub fn emit_rust_split_to_with<E>(
         .unwrap();
         if current.as_ref().map(|(index, _)| *index) != Some(region) {
             if let Some((index, source)) = current.take() {
-                sink(index, unindent(&source))?;
+                sink(index, finish_region(index, source))?;
             }
             current = Some((region, header.clone()));
         }
@@ -3042,9 +3113,22 @@ pub fn emit_rust_split_to_with<E>(
         output.push_str("    result\n}\n");
     }
     if let Some((index, source)) = current.take() {
-        sink(index, unindent(&source))?;
+        sink(index, finish_region(index, source))?;
     }
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
+    // Fills each region's call slots (`EmitOptions::direct_calls`).
+    root.push_str("\n/// Points every region's call slots at their window functions.\nfn install_call_slots() {\n");
+    for (region, slots) in &slot_tables {
+        for (slot, window) in slots {
+            let target_region = window >> (shift);
+            writeln!(
+                root,
+                "    let _ = gen_r_{region:x}::CALLS[{slot}].set(gen_r_{target_region:x}::run_window_{window:x});"
+            )
+            .unwrap();
+        }
+    }
+    root.push_str("}\n");
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
     for (window, _) in &windows {
@@ -3652,6 +3736,31 @@ mod tests {
         assert!(source.contains("let called = m.call(0x1008);"));
         let (_, plain) = emit_rust_split_with(&translation, 16, EmitOptions::default());
         assert!(!plain[0].1.contains("call_window"));
+    }
+
+    #[test]
+    fn direct_calls_into_other_regions_go_through_slots_install_fills() {
+        // BL to 0x1400 (the next 1 KiB region); RET; ...; at 0x1400, RET.
+        let mut words = vec![0xd503_201f; 257];
+        words[0] = 0x9400_0100;
+        words[1] = 0xd65f_03c0;
+        words[256] = 0xd65f_03c0;
+        let translation = discover(&[region(&words)], &[0x1000], 8).unwrap();
+        let options = EmitOptions {
+            direct_calls: true,
+            ..EmitOptions::default()
+        };
+        let (root, regions) = emit_rust_split_with(&translation, SPLIT_WINDOW_BITS, options);
+        let caller = &regions.iter().find(|(region, _)| *region == 4).unwrap().1;
+        assert!(caller.contains("let called = call_slot(m, 0x1004, &CALLS[0]);"));
+        assert!(
+            caller.contains("pub static CALLS: [std::sync::OnceLock<echora_guest::WindowFn>; 1]")
+        );
+        assert!(caller.contains("None => m.call(return_to)"));
+        assert!(root.contains("install_call_slots();"));
+        assert!(root.contains("let _ = gen_r_4::CALLS[0].set(gen_r_5::run_window_5);"));
+        let callee = &regions.iter().find(|(region, _)| *region == 5).unwrap().1;
+        assert!(!callee.contains("pub static CALLS"));
     }
 
     #[test]

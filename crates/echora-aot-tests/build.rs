@@ -27,21 +27,18 @@ fn options() -> EmitOptions {
     }
 }
 
-/// Brought into every region module: the stand-in for `Core::call_window`
-/// (see `CallWindow` in `src/lib.rs`). An inherent method, once there, is
-/// used instead.
-const SHIM: &str = "#[allow(unused_imports)]\nuse crate::CallWindow as _;\n";
-
 /// Direct BL calls with the `direct-calls` feature.
 fn direct_calls() -> bool {
     std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some()
 }
 
 /// Region size of split emission: one 1 KiB window per region, or with
-/// direct calls 64 KiB, so that calls between windows can be direct (only
-/// a target in the caller's region can be).
+/// direct calls 64 KiB, so that most calls between windows stay in one
+/// region. With `small-regions` it stays 1 KiB, so that direct calls go
+/// through the call slots of other regions.
 fn region_bits() -> u32 {
-    if direct_calls() { 16 } else { 10 }
+    let small = std::env::var_os("CARGO_FEATURE_SMALL_REGIONS").is_some();
+    if direct_calls() && !small { 16 } else { 10 }
 }
 
 /// The benchmark kernels' options: structured also with
@@ -111,9 +108,8 @@ fn codesize(out_dir: &std::path::Path) {
         let mut text = String::new();
         split_programs(&mut text);
         writeln!(list, "{name} {} {}", LIFTED.get(), text.len()).expect("write");
-        // The stand-in the region modules import (see `SHIM`).
         let source = format!(
-            "#[allow(unused_imports)]\nuse echora_guest::{{Core as Machine, Trap}};\npub trait CallWindow {{}}\n{text}"
+            "#[allow(unused_imports)]\nuse echora_guest::{{Core as Machine, Trap}};\n{text}"
         );
         std::fs::write(dir.join(format!("{name}.rs")), source).expect("write");
     }
@@ -169,7 +165,7 @@ fn main() {
     let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod split_call_return {{").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(
         out,
@@ -227,7 +223,7 @@ fn kernel_code(out: &mut String) {
     let (root, regions) = split(&translation, kernel_options());
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -371,7 +367,7 @@ fn semantic_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -549,7 +545,7 @@ fn sampled_simd_program(
     writeln!(out, "pub const BASE: u64 = {base:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -662,7 +658,7 @@ fn sequence_code(out: &mut String) {
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -877,7 +873,7 @@ fn call_code(out: &mut String) {
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -1001,7 +997,7 @@ fn loop_code(out: &mut String) {
     writeln!(out, "pub const PROGRAMS: &[u64] = &{programs:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -1094,7 +1090,7 @@ fn exclusive_code(out: &mut String) {
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
@@ -1225,7 +1221,7 @@ fn switch_code(out: &mut String) {
     writeln!(out, "pub const TABLES: u64 = {TABLES:#x};").expect("write");
     writeln!(out, "pub const TABLE_BYTES: &[u8] = &{table_bytes:?};").expect("write");
     for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
 }
