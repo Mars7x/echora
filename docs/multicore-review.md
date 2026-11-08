@@ -246,3 +246,125 @@ crash stops names the cause:
 3. If 1 already passes, remove `ECHORA_ONE_CORE` and keep
    `ECHORA_LOCKED_SUBMIT=1`. If it then crashes, B (the processor
    numbers) or migration is the cause.
+
+## Part 3: cutting time under the machine lock
+
+At W=6, host work under the one machine mutex is about 40% of wall time.
+The main session gave only that total. The shares below are estimates
+from what each path does and how often it runs in a rendering game, so
+step 0 is to measure them. Line numbers are for `runtime.rs` at the
+commit that adds this part.
+
+### 0. Measure it (an hour, no behaviour change)
+
+`Worker::run` already times each hold (`lock_stats`, 4552;
+`thread_time`, 4555). Add the held time per boundary kind, the index
+`boundary` already computes for `boundary_kinds` (SVC number,
+0x80 NVN host call, 0x81 slice end), and per NVN entry name for kind
+0x80. Then the plan below can be ranked by data.
+
+### What takes the lock, and what could take less
+
+Most likely first.
+
+**1. NVN host calls other than submit: est. 40-60% of lock time.**
+Every NVN entry (command-buffer recording, state setters, texture and
+sampler descriptors, queries, present) is a MissingBlock at a thunk,
+handled in `boundary` → `call_nvn` (2568) under the machine lock, through
+`GuestMemory::Checked(&mut self.memory)` (2700). A frame records
+thousands of these. `submit_unlocked` (4707) already shows the state can
+leave the machine. Plan: keep `nvn` behind its own mutex in `Shared`, and
+run every NVN call under that lock only, reaching guest memory through
+the worker's guest view, as submit does, plus a read lock on the memory
+layout (see "must stay serialised"). The few NVN paths that touch other
+machine state, such as present's `publish_controller` and the
+display/vsync events, take the machine lock briefly for that part only.
+Texture uploads and shader translation then run beside other threads'
+SVCs instead of in front of them.
+
+**2. Slice ends: est. 10-25%.**
+Every host boundary takes the lock even when nothing changes: a slice
+end, a spin-hint end, or a preemption flag. Under it the worker:
+- runs `flush_core_counts` (2336) and `host_ready` (2189), which every
+  `WAKE_CHECK_INSTRUCTIONS` rescans every wait, refreshes the syncpoint
+  cache and advances audio;
+- runs `finish_block`'s scheduler, with several passes over all
+  runnable threads: `next_runnable_thread` twice (best, then pick),
+  `request_preemptions` (4586, allocating a Vec at 1759 and cloning
+  `core_threads` at 1765), and `runnable_on_any_core` (one more pass);
+- checks the entry PC against the mapping tree (2447);
+- updates `thread_time`, a hash-map lookup per hold.
+Plan: a lock-free fast path. Keep an atomic scheduler epoch, bumped by
+anything that can change the decision (a thread made runnable or
+blocked, a priority or affinity change, a new deadline, a stop request).
+At a slice end, a worker whose epoch is unchanged, whose thread has no
+pending exit or wait, and whose next deadline has not passed extends
+`host_check_at` and continues without the lock. Keep the wait rescan on
+its own timer outside the per-boundary path. Spinning threads, which end
+slices every 32 polls, then cost nothing until another thread changes
+something.
+
+**3. Synchronisation SVCs: est. 10-20%.**
+These are WaitForAddress and SignalToAddress (0x34/0x35),
+ArbitrateLock/Unlock (0x1a/0x1b), WaitProcessWideKeyAtomic and
+SignalProcessWideKey (0x1c/0x1d), WaitSynchronization, and
+Signal/Clear/ResetEvent (0x11/0x12/0x17). They need the thread states,
+the wait sets and the mutex queues, and nothing else. Plan: a scheduler
+lock (threads, `synchronization_waits`, `mutex_waits`, priorities,
+`running`, `core_threads`) separate from services, NVN and memory. A
+signal by one thread then no longer waits behind another thread's IPC
+or NVN call.
+
+**4. IPC, SendSyncRequest (0x21, 3701): est. 5-15%.**
+Services (hid, audio, vi, fs, time) are reached under the machine lock.
+Plan: the services behind their own mutex, or one per service. Most
+requests touch only their service, the handle table and guest memory
+for the message buffer.
+
+**5. Per-SVC and per-boundary bookkeeping: est. ~5%.**
+- every SVC clones its `SvcEvent` into `recent_svcs` and pushes it to
+  `svc_trace` (3225);
+- `thread_time` and `lock_stats` are updated per hold;
+- the PC sample every 16th boundary (2299) allocates a String through
+  `debug_var`.
+Plan: per-worker rings and counters, merged into the machine at report
+time.
+
+**6. Thread-local and read-only SVCs: est. small.**
+GetCurrentProcessorNumber (0x10), GetThreadId, OutputDebugString
+(0x27) and the read-only GetInfo (0x29) kinds need no shared mutable
+state. Plan: answer them from per-worker data, or from atomics and an
+RwLock read, without the machine lock.
+
+### What must stay serialised
+
+- **Memory layout changes**: Map/UnmapMemory, Map/UnmapPhysicalMemory,
+  SetHeapSize, SetMemoryPermission/Attribute, transfer, shared and code
+  memory. One writer at a time. And because guest code on other workers
+  never takes a lock, every page must go from its old state to its new
+  one in a single host step. A changed page must never pass through
+  "unmapped" or "copied out", which was today's bug: the old
+  UnmapPhysicalMemory copied the kept parts out, unmapped and remapped.
+  The fixed version (4020) changes only the covered part. `sync_guest_view`
+  maps each run with one `mmap(MAP_FIXED)`, which is atomic per page; keep
+  it that way.
+  Host code that reads or writes guest memory (NVN, services) should
+  hold a read lock on the layout. A layout change then takes it for
+  writing, and a host read never races a change of the pages it is
+  using, as the NVN submission could.
+- **Thread states and wait queues** (the scheduler lock in 3): the
+  check-then-sleep atomicity of every wait SVC relies on one lock
+  covering the word read, the decision and the parking (part 1).
+- **The handle table**: an RwLock suffices. Lookups are reads;
+  create, duplicate and close are writes.
+
+Lock order, to avoid deadlocks: scheduler → handles → services → NVN →
+memory layout (read). Memory layout writes take nothing else while held.
+
+### Expected effect
+
+If step 0 confirms the estimates, items 1 and 2 remove roughly half to
+three quarters of today's lock time, and items 3 and 4 most of the rest.
+At W=6 that would bring host work under the lock from about 40% of wall
+time to perhaps 10-15%. Item 2 is the smallest change. Item 1 is the
+largest gain, and submit already shows the way.
