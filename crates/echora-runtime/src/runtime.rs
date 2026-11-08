@@ -327,6 +327,9 @@ pub struct Machine {
     /// NVN calls workers made without the machine lock (see
     /// `Worker::held_nvn_call`).
     lock_free_nvn_calls: u64,
+    /// Microseconds those calls waited for the NVN state's own lock, and
+    /// held it.
+    nvn_lock_stats: [u64; 2],
     /// Parallel runs: host microseconds per guest thread running guest
     /// code, waiting for the machine lock and holding it (for finding the
     /// thread that bounds the frame rate).
@@ -421,6 +424,7 @@ impl Machine {
             boundary_kinds: vec![0; 0x84],
             boundary_held: vec![0; 0x84],
             lock_free_nvn_calls: 0,
+            nvn_lock_stats: [0; 2],
             thread_time: BTreeMap::new(),
             stop_check_tick: 0,
         }
@@ -2542,6 +2546,7 @@ impl Machine {
                         index: index as u8,
                         held_failed: None,
                         lock_free_calls: 0,
+                        nvn_lock_micros: [0; 2],
                     };
                     std::thread::Builder::new()
                         .name(format!("guest-worker-{index}"))
@@ -2762,6 +2767,7 @@ impl Machine {
                 {
                     self.lock_stats = [0; 3];
                     self.lock_free_nvn_calls = 0;
+                    self.nvn_lock_stats = [0; 2];
                     self.boundary_kinds.fill(0);
                     self.boundary_held.fill(0);
                     self.thread_time.clear();
@@ -4293,7 +4299,7 @@ impl Machine {
             "steps":self.core.steps,
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
-            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls},
+            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1]},
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
                 (boundary_kind_name(kind), *count)
@@ -4529,6 +4535,8 @@ struct Worker {
     held_failed: Option<Option<Trap>>,
     /// Held calls since this worker last took the machine lock.
     lock_free_calls: u64,
+    /// Their microseconds waiting for the NVN state's lock and holding it.
+    nvn_lock_micros: [u64; 2],
 }
 
 /// NVN entry points that stay under the machine lock: present publishes
@@ -4629,6 +4637,9 @@ impl Worker {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let held = std::time::Instant::now();
                 machine.lock_free_nvn_calls += std::mem::take(&mut self.lock_free_calls);
+                let [nvn_waited, nvn_held] = std::mem::take(&mut self.nvn_lock_micros);
+                machine.nvn_lock_stats[0] += nvn_waited;
+                machine.nvn_lock_stats[1] += nvn_held;
                 if shared.stop.load(Ordering::Relaxed) {
                     return (self.core, None);
                 }
@@ -4816,10 +4827,21 @@ impl Worker {
         {
             return false;
         }
+        let asked = std::time::Instant::now();
         let mut nvn = shared
             .nvn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let locked = std::time::Instant::now();
+        let made = self.held_nvn_call_locked(&mut nvn, pc);
+        drop(nvn);
+        self.nvn_lock_micros[0] += (locked - asked).as_micros() as u64;
+        self.nvn_lock_micros[1] += locked.elapsed().as_micros() as u64;
+        made
+    }
+
+    /// `held_nvn_call` with the NVN state locked.
+    fn held_nvn_call_locked(&mut self, nvn: &mut crate::nvn::Nvn, pc: u64) -> bool {
         let Some(crate::nvn::HostEntry::Proc(name)) = nvn.entry(pc) else {
             return false;
         };
