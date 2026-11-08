@@ -1815,12 +1815,26 @@ impl Machine {
         usable.trailing_zeros() as u8
     }
 
-    /// Whether a thread no worker runs could run on some core (for parked
-    /// workers: one core's worker finding nothing is not a deadlock).
-    fn runnable_on_any_core(&mut self) -> bool {
-        let core = self.worker_core.take();
+    /// Whether a thread no worker runs could run on a parked worker's core:
+    /// one parked worker finding nothing for its own core is not a deadlock,
+    /// and another parked worker is worth waking. A thread only a busy
+    /// worker may run is not counted: waking parked workers for it would
+    /// have them wake each other without end, starving the busy workers of
+    /// the machine lock.
+    fn runnable_for_parked_worker(&mut self) -> bool {
+        let core = self.worker_core;
         let current = self.core.current_thread_id;
-        let any = self.next_runnable_thread(current, Some(current)).is_some();
+        let mut any = false;
+        for worker in 0..self.core_threads.len() {
+            if self.core_threads[worker].is_some() {
+                continue;
+            }
+            self.worker_core = Some(worker as u8);
+            if self.next_runnable_thread(current, Some(current)).is_some() {
+                any = true;
+                break;
+            }
+        }
         self.worker_core = core;
         any
     }
@@ -2397,6 +2411,8 @@ impl Machine {
         &mut self,
         dispatch: &(impl Fn(&mut Core) -> Result<(), Trap> + Sync),
     ) -> Result<(), Trap> {
+        // Start ECHORA_STOP_SECONDS's clock with the workers.
+        stop_seconds_passed();
         // One worker per application core.
         let workers = self
             .layout
@@ -4368,6 +4384,21 @@ fn idle_wall_limit_passed() -> bool {
         .is_some_and(|limit| now >= limit)
 }
 
+/// ECHORA_STOP_SECONDS=N (diagnostic): a parallel run ends as a budget stop
+/// at the first worker boundary or park after N host seconds, busy or not,
+/// so a run that stops making progress still writes its report.
+fn stop_seconds_passed() -> bool {
+    static STOP_AT: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+    STOP_AT
+        .get_or_init(|| {
+            std::env::var("ECHORA_STOP_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds))
+        })
+        .is_some_and(|at| std::time::Instant::now() >= at)
+}
+
 /// What the workers of a parallel run share.
 struct Shared<'a> {
     machine: std::sync::Mutex<&'a mut Machine>,
@@ -4465,6 +4496,15 @@ impl Worker {
                 if shared.stop.load(Ordering::Relaxed) {
                     return (self.core, None);
                 }
+                if stop_seconds_passed() {
+                    self.swap_in(&mut machine);
+                    machine.core.settle_block_trap();
+                    let trap = Trap::Budget {
+                        pc: machine.core.cpu.pc,
+                        steps: machine.core.steps,
+                    };
+                    return self.stop(shared, machine, trap);
+                }
                 machine.lock_stats[0] += 1;
                 machine.lock_stats[1] += (held - waited).as_micros() as u64;
                 {
@@ -4500,7 +4540,8 @@ impl Worker {
                 match outcome {
                     Ok(()) => {
                         machine.request_preemptions();
-                        let spare = machine.parked_workers != 0 && machine.runnable_on_any_core();
+                        let spare =
+                            machine.parked_workers != 0 && machine.runnable_for_parked_worker();
                         self.swap_out(&mut machine, true);
                         drop(machine);
                         if spare {
@@ -4521,12 +4562,23 @@ impl Worker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             machine.parked_workers += 1;
+            // Parked workers' own lock use, reported as thread 10000 + index
+            // (guest: rechecks; lock_held: microseconds holding the lock).
+            let mut held_since = std::time::Instant::now();
             loop {
                 if shared.stop.load(Ordering::Relaxed) {
                     machine.parked_workers -= 1;
                     return (self.core, None);
                 }
                 self.swap_in(&mut machine);
+                if stop_seconds_passed() {
+                    machine.parked_workers -= 1;
+                    let trap = Trap::Budget {
+                        pc: machine.core.cpu.pc,
+                        steps: machine.core.steps,
+                    };
+                    return self.stop(shared, machine, trap);
+                }
                 let resumed = match machine.idle_until_runnable() {
                     Ok(true) => machine.host_ready().and_then(|()| machine.check_entry_pc()),
                     Ok(false) => Err(Trap::NoRunnableThreads {
@@ -4551,7 +4603,7 @@ impl Worker {
                         let everyone_parked = machine.running.is_empty();
                         // Nothing for this core may still be something for
                         // another parked worker's core.
-                        let elsewhere = machine.runnable_on_any_core();
+                        let elsewhere = machine.runnable_for_parked_worker();
                         if elsewhere {
                             shared.wake.notify_all();
                         }
@@ -4576,11 +4628,20 @@ impl Worker {
                             .map(|at| at.saturating_duration_since(std::time::Instant::now()))
                             .unwrap_or(PARKED_RECHECK)
                             .min(PARKED_RECHECK);
+                        {
+                            let time = machine
+                                .thread_time
+                                .entry(10_000 + u64::from(self.index))
+                                .or_default();
+                            time[0] += 1;
+                            time[2] += held_since.elapsed().as_micros() as u64;
+                        }
                         machine = shared
                             .wake
                             .wait_timeout(machine, wait)
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .0;
+                        held_since = std::time::Instant::now();
                     }
                     Err(trap) => {
                         machine.parked_workers -= 1;
