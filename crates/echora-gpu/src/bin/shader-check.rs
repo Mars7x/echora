@@ -38,12 +38,13 @@ fn main() {
                 .unwrap_or_default();
             let word = |offset: usize| {
                 control
-                    .get(offset..offset + 4)
-                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .get(offset..)
+                    .and_then(<[u8]>::first_chunk::<4>)
+                    .map_or(0, |b| u32::from_le_bytes(*b))
             };
-            let kind = bytes.get(..4).map_or(0, |b| {
-                (u32::from_le_bytes(b.try_into().unwrap()) >> 10) & 0xf
-            });
+            let kind = bytes
+                .first_chunk::<4>()
+                .map_or(0, |b| (u32::from_le_bytes(*b) >> 10) & 0xf);
             let sizes = word(0x60);
             if matches!(kind, 1 | 3) && sizes != 0 {
                 let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
