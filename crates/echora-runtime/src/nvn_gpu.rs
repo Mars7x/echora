@@ -86,6 +86,10 @@ pub struct Backend {
     /// Storage buffers kept on the GPU between dispatches (when guest
     /// memory cannot be imported), by guest address: see `Resident`.
     resident: HashMap<u64, ResidentPool>,
+    /// Memory pools the GPU can read in place through guest memory's file
+    /// (see `Renderer::import_file`), by guest base: size, file and the
+    /// file offset of the base. Learned at presents (`share_new_pools`).
+    shared_pools: HashMap<u64, (u64, i32, u64)>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -151,6 +155,7 @@ impl Backend {
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             resident: HashMap::new(),
+            shared_pools: HashMap::new(),
             target_index: HashMap::new(),
             target_index_stamp: None,
         }))
@@ -3175,7 +3180,66 @@ impl Nvn {
     pub(super) fn gpu_forget_pool(&mut self, base: u64) {
         if let Some(backend) = self.gpu.as_mut() {
             backend.resident.remove(&base);
+            // Its pages may be released and reused: shared spans of them
+            // would keep the old ones.
+            if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
+                backend.renderer.release_file_range(offset, size);
+            }
         }
+    }
+
+    /// Record the file offsets of memory pools not yet known, where the GPU
+    /// can share them in place (needs the page table: `core` under the
+    /// machine lock).
+    pub(super) fn share_new_pools(&mut self, core: &Guest) {
+        let Some(backend) = self.gpu.as_ref() else {
+            return;
+        };
+        if backend.renderer.gpu.dma_buf_import.is_none() {
+            return;
+        }
+        let pools: Vec<(u64, u64)> = self
+            .objects
+            .values()
+            .filter(|object| object.kind == "MemoryPool")
+            .filter_map(|pool| {
+                pool.builder
+                    .get("Storage")
+                    .map(|storage| (storage.x[0], storage.x[1]))
+            })
+            .filter(|&(base, size)| {
+                base != 0 && size != 0 && !backend.shared_pools.contains_key(&base)
+            })
+            .collect();
+        for (base, size) in pools {
+            if let Some((file, offset)) = core.memory.shared_span(base, size) {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .shared_pools
+                    .insert(base, (size, file, offset));
+            }
+        }
+    }
+
+    /// The buffer and offset that share `length` guest bytes at `guest` with
+    /// the GPU in place, when they lie in a shared memory pool and the span
+    /// imports; None otherwise (the caller copies).
+    fn shared_binding(
+        &mut self,
+        guest: u64,
+        length: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let backend = self.gpu.as_mut().unwrap();
+        let Some((file, offset)) = backend
+            .shared_pools
+            .iter()
+            .find(|(base, (size, _, _))| **base <= guest && guest + length <= **base + *size)
+            .map(|(base, &(_, file, offset))| (file, offset + (guest - base)))
+        else {
+            return Ok(None);
+        };
+        backend.renderer.import_file(file, offset, length)
     }
 
     /// The device buffer and offset for `length` storage bytes at guest
@@ -3377,6 +3441,7 @@ impl Nvn {
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
         let mut storage = HashMap::new();
+        let mut storage_in_place = HashMap::new();
         // Driver constant entries of bound storage buffers: (stage index,
         // c0 offset, GPU address, size).
         let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
@@ -3470,7 +3535,25 @@ impl Nvn {
                                 .note("graphics-stage storage buffer writes are not returned");
                         }
                         storage_entries.push((index, descriptor.cbuf_offset, gpu, size));
+                        // What dispatches wrote comes back to guest memory
+                        // first, for the copy or the shared span alike.
                         self.resolve_storage(core, Some(guest..guest + length))?;
+                        // A buffer the stage only reads is shared in place
+                        // when its pool's file span imports (whole buffers
+                        // copied per draw were most of the host's time after
+                        // the movie). A buffer the stage writes keeps the
+                        // copy, whose writes are dropped as before.
+                        if descriptor.flags & 1 == 0 {
+                            if let Some((buffer, offset)) = self.shared_binding(guest, length)? {
+                                storage_in_place
+                                    .insert((index, descriptor.binding), (buffer, offset, length));
+                                self.gpu
+                                    .as_mut()
+                                    .unwrap()
+                                    .stat("stat: draw storage shared", 1);
+                                continue;
+                            }
+                        }
                         self.gpu
                             .as_mut()
                             .unwrap()
@@ -4266,6 +4349,7 @@ impl Nvn {
             uniforms,
             textures,
             storage,
+            storage_in_place,
             fixed,
         };
         let probe_target = draw.colors.first().copied();

@@ -45,6 +45,17 @@ impl GuestMemory<'_> {
         }
     }
 
+    /// Guest memory's file and the file offset of `length` bytes at
+    /// `address`, when they can be shared with the GPU in place (see
+    /// `Memory::shared_span`); the page table is only reachable under the
+    /// machine lock.
+    pub fn shared_span(&self, address: u64, length: u64) -> Option<(i32, u64)> {
+        match self {
+            Self::Checked(memory) => memory.shared_span(address, length),
+            Self::View(_) => None,
+        }
+    }
+
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Trap> {
         match self {
             Self::Checked(memory) => memory.read(address, out),
@@ -1804,6 +1815,9 @@ impl Nvn {
             // written there as a PPM (frame-<present count>.ppm); GPU frames
             // are sampled (ECHORA_FRAME_EVERY).
             "nvnQueuePresentTexture" => {
+                // Presents run under the machine lock, with the page table:
+                // pools made since the last one learn their file offsets.
+                self.share_new_pools(core);
                 self.object(this, "Queue").map_err(invalid)?;
                 // The presented image needs the work queued before it.
                 self.pump_queues(core)?;

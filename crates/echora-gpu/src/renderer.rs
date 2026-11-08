@@ -141,6 +141,11 @@ impl Scale {
 
 /// Allocations at least this large are logged with their caller.
 const LARGE_ALLOCATION: u64 = 512 << 20;
+/// The largest span `import_file` shares: udmabuf's default size limit.
+const MAX_SHARED_SPAN: u64 = 64 << 20;
+/// Guest memory pinned by shared spans before the least recently used are
+/// dropped.
+const MAX_SHARED_BYTES: u64 = 1 << 30;
 /// The largest texture upload: 1.5 GiB, above the largest the game makes
 /// (a 1365x1365, 90-layer ASTC array with 11 levels, 852 MiB as RGBA8).
 const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
@@ -179,6 +184,18 @@ pub struct Renderer {
     /// Spans the driver refused to import (file-backed memory, on drivers
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
+    /// Spans of guest memory's file shared as dma-bufs (see `import_file`),
+    /// by page-aligned file offset and length, oldest use first.
+    shared: Vec<((u64, u64), vk::Buffer, vk::DeviceMemory)>,
+    /// Bytes `shared` pins in host memory (udmabuf pins its pages).
+    pub shared_bytes: u64,
+    /// /dev/udmabuf, opened on first use; None after it failed to open.
+    udmabuf: Option<Option<std::fs::File>>,
+    /// Spans that could not be shared: not tried again.
+    shared_refused: std::collections::HashSet<(u64, u64)>,
+    /// Shared spans dropped while recorded work may still read them:
+    /// destroyed after the next flush.
+    retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Storage buffers kept on the GPU between dispatches (see
     /// `resident_buffer`), by the caller's key: buffer, memory, size.
     resident: HashMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
@@ -268,6 +285,7 @@ struct Slot {
     pending_reads: Vec<(u64, u64, usize)>,
     retired_uploads: Vec<Target>,
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
+    retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
 }
@@ -387,6 +405,7 @@ impl Renderer {
             pending_reads: Vec::new(),
             retired_uploads: Vec::new(),
             retired_texel_buffers: Vec::new(),
+            retired_shared: Vec::new(),
             in_flight: false,
         };
         // SAFETY: the physical device belongs to the live instance.
@@ -426,6 +445,11 @@ impl Renderer {
             extra_views: HashMap::new(),
             imported: HashMap::new(),
             import_refused: Default::default(),
+            shared: Vec::new(),
+            shared_bytes: 0,
+            udmabuf: None,
+            shared_refused: Default::default(),
+            retired_shared: Vec::new(),
             resident: HashMap::new(),
             view_infos: HashMap::new(),
             fresh_targets: Vec::new(),
@@ -1351,6 +1375,7 @@ impl Renderer {
             &mut self.retired_texel_buffers,
             &mut spare.retired_texel_buffers,
         );
+        std::mem::swap(&mut self.retired_shared, &mut spare.retired_shared);
         std::mem::swap(&mut self.current_in_flight, &mut spare.in_flight);
     }
 
@@ -1436,6 +1461,13 @@ impl Renderer {
         for (buffer, view) in std::mem::take(&mut self.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
+        for (buffer, memory) in std::mem::take(&mut self.retired_shared) {
+            // SAFETY: the work reading it has completed.
+            unsafe {
+                self.gpu.device.destroy_buffer(buffer, None);
+                self.gpu.device.free_memory(memory, None);
+            }
+        }
         // Deferred results leave the ring before its next use overwrites
         // them.
         for (token, offset, length) in std::mem::take(&mut self.pending_reads) {
@@ -1513,6 +1545,194 @@ impl Renderer {
         // SAFETY: the work reading it has completed.
         unsafe { self.device().destroy_buffer_view(view, None) };
         buffer.destroy(self.device());
+    }
+
+    /// `length` bytes of guest memory's file `file` at `offset` as a storage
+    /// buffer the GPU reads and writes in place: the buffer and the offset
+    /// in it. The page-aligned span is shared as a dma-buf (a udmabuf of the
+    /// file, which must be sealed against shrinking), so the GPU sees the
+    /// CPU's writes without flushes, as the console's does. `None` where
+    /// that is unavailable (no dma-buf import, no /dev/udmabuf, a span over
+    /// udmabuf's 64 MiB limit, an import the driver refuses): the caller
+    /// copies instead. Spans are kept for reuse, the least recently used
+    /// dropped beyond MAX_SHARED_BYTES (udmabuf pins their pages).
+    pub fn import_file(
+        &mut self,
+        file: i32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        const PAGE: u64 = 4096;
+        let start = offset & !(PAGE - 1);
+        let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
+        let key = (start, span);
+        if let Some(index) = self.shared.iter().position(|(known, _, _)| *known == key) {
+            let entry = self.shared.remove(index);
+            let buffer = entry.1;
+            self.shared.push(entry);
+            return Ok(Some((buffer, offset - start)));
+        }
+        if span > MAX_SHARED_SPAN || self.shared_refused.contains(&key) {
+            return Ok(None);
+        }
+        let Some(imported) = self.share_span(file, start, span)? else {
+            self.shared_refused.insert(key);
+            return Ok(None);
+        };
+        self.shared.push((key, imported.0, imported.1));
+        self.shared_bytes += span;
+        while self.shared_bytes > MAX_SHARED_BYTES && self.shared.len() > 1 {
+            let ((_, dropped), buffer, memory) = self.shared.remove(0);
+            self.shared_bytes -= dropped;
+            self.retired_shared.push((buffer, memory));
+        }
+        Ok(Some((imported.0, offset - start)))
+    }
+
+    /// Stop sharing file range `[offset, offset + length)`: its pages may be
+    /// released (a udmabuf would keep the old ones).
+    pub fn release_file_range(&mut self, offset: u64, length: u64) {
+        let end = offset + length;
+        let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
+            .into_iter()
+            .partition(|((start, span), _, _)| *start < end && offset < start + span);
+        self.shared = kept;
+        for ((_, span), buffer, memory) in dropped {
+            self.shared_bytes -= span;
+            self.retired_shared.push((buffer, memory));
+        }
+        self.shared_refused
+            .retain(|(start, span)| !(*start < end && offset < start + span));
+    }
+
+    /// A udmabuf of `span` bytes of `file` at `start`, imported as a storage
+    /// buffer, or None where that is unavailable.
+    #[cfg(target_os = "linux")]
+    fn share_span(
+        &mut self,
+        file: i32,
+        start: u64,
+        span: u64,
+    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, String> {
+        use std::os::fd::AsRawFd;
+        let Some(external) = self.gpu.dma_buf_import.clone() else {
+            return Ok(None);
+        };
+        let udmabuf = self.udmabuf.get_or_insert_with(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/udmabuf")
+                .ok()
+        });
+        let Some(udmabuf) = udmabuf else {
+            return Ok(None);
+        };
+        // struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }
+        // and UDMABUF_CREATE = _IOW('u', 0x42, struct udmabuf_create).
+        #[repr(C)]
+        struct Create {
+            memfd: u32,
+            flags: u32,
+            offset: u64,
+            size: u64,
+        }
+        const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+        const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
+        let mut create = Create {
+            memfd: file as u32,
+            flags: UDMABUF_FLAGS_CLOEXEC,
+            offset: start,
+            size: span,
+        };
+        // SAFETY: a valid request for the udmabuf device; it returns a new
+        // descriptor (or -1) and does not keep the pointer.
+        let dma_buf = unsafe {
+            libc::ioctl(
+                udmabuf.as_raw_fd(),
+                UDMABUF_CREATE as _,
+                std::ptr::addr_of_mut!(create),
+            )
+        };
+        if dma_buf < 0 {
+            return Ok(None);
+        }
+        let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        let mut properties = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: `dma_buf` is a dma-buf descriptor we own.
+        let queried =
+            unsafe { external.get_memory_fd_properties(handle, dma_buf, &mut properties) };
+        let device = self.gpu.device.clone();
+        let close = || {
+            // SAFETY: ours, and not imported.
+            unsafe { libc::close(dma_buf) };
+        };
+        if queried.is_err() {
+            close();
+            return Ok(None);
+        }
+        let mut external_info = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
+        let info = vk::BufferCreateInfo::default()
+            .size(span)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external_info);
+        // SAFETY: valid create info; destroyed with the span.
+        let buffer = match unsafe { device.create_buffer(&info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                close();
+                return Err(format!("vkCreateBuffer: {error}"));
+            }
+        };
+        // SAFETY: the buffer is live.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let bits = properties.memory_type_bits & requirements.memory_type_bits;
+        let refuse = |close: &dyn Fn()| {
+            close();
+            // SAFETY: unused buffer.
+            unsafe { device.destroy_buffer(buffer, None) };
+            Ok(None)
+        };
+        if bits == 0 || requirements.size > span {
+            return refuse(&close);
+        }
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(handle)
+            .fd(dma_buf);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(bits.trailing_zeros())
+            .push_next(&mut import);
+        // SAFETY: a successful import takes ownership of `dma_buf`.
+        let memory = match unsafe { device.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(_) => return refuse(&close),
+        };
+        // SAFETY: fresh buffer and memory of the required size.
+        if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+            // SAFETY: unused buffer and memory.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Ok(None);
+        }
+        Ok(Some((buffer, memory)))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn share_span(
+        &mut self,
+        _file: i32,
+        _start: u64,
+        _span: u64,
+    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, String> {
+        Ok(None)
     }
 
     /// `length` bytes of host memory at `pointer` as a storage buffer the
@@ -3419,6 +3639,19 @@ impl Drop for Renderer {
             }
         }
         for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
+            // SAFETY: the flush above finished every use of the buffer.
+            unsafe {
+                self.gpu.device.destroy_buffer(buffer, None);
+                self.gpu.device.free_memory(memory, None);
+            }
+        }
+        let shared = std::mem::take(&mut self.shared)
+            .into_iter()
+            .map(|(_, buffer, memory)| (buffer, memory));
+        let retired = std::mem::take(&mut self.retired_shared)
+            .into_iter()
+            .chain(std::mem::take(&mut self.spare.retired_shared));
+        for (buffer, memory) in shared.chain(retired) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
                 self.gpu.device.destroy_buffer(buffer, None);

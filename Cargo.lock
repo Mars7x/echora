@@ -1849,6 +1849,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "cc",
+ "libc",
  "naga 30.0.1",
 ]
 

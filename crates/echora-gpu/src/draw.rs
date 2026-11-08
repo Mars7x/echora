@@ -272,6 +272,9 @@ pub struct Draw<'a> {
     /// Storage buffer contents by (stage index, binding). Graphics stages
     /// read them; writes are not returned.
     pub storage: HashMap<(usize, u32), Vec<u8>>,
+    /// Storage buffers shared with the GPU in place instead (see
+    /// `Renderer::import_file`): buffer, offset and length.
+    pub storage_in_place: HashMap<(usize, u32), (vk::Buffer, u64, u64)>,
     pub fixed: Fixed,
     pub blends: Vec<Blend>,
     /// A task/mesh pipeline's workgroups (the program's first stages are
@@ -446,8 +449,10 @@ impl Renderer {
                         descriptors[1] += 1;
                     }
                     DescriptorKind::StorageBuffer => {
-                        let length = draw.storage.get(&key).map_or(16, Vec::len) as u64;
-                        bytes += length.max(16) + 256;
+                        if !draw.storage_in_place.contains_key(&key) {
+                            let length = draw.storage.get(&key).map_or(16, Vec::len) as u64;
+                            bytes += length.max(16) + 256;
+                        }
                         descriptors[2] += 1;
                     }
                     _ => {
@@ -501,13 +506,23 @@ impl Renderer {
                         ));
                     }
                     DescriptorKind::StorageBuffer => {
-                        let bytes = draw
-                            .storage
-                            .get(&key)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[0; 16]);
-                        let (buffer, offset) = self.ring_upload(bytes, 256)?;
-                        let range = (bytes.len() as u64).max(16).next_multiple_of(16);
+                        let (buffer, offset, range) = if let Some(&(buffer, offset, length)) =
+                            draw.storage_in_place.get(&key)
+                        {
+                            (buffer, offset, length.max(16).next_multiple_of(16))
+                        } else {
+                            let bytes = draw
+                                .storage
+                                .get(&key)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[0; 16]);
+                            let (buffer, offset) = self.ring_upload(bytes, 256)?;
+                            (
+                                buffer,
+                                offset,
+                                (bytes.len() as u64).max(16).next_multiple_of(16),
+                            )
+                        };
                         writes.push((
                             descriptor.binding,
                             vk::DescriptorType::STORAGE_BUFFER,
@@ -978,6 +993,7 @@ pub(crate) mod tests {
             )]),
             textures: HashMap::new(),
             storage: HashMap::new(),
+            storage_in_place: HashMap::new(),
             fixed: Fixed {
                 topology: vk::PrimitiveTopology::TRIANGLE_STRIP,
                 primitive_restart: false,

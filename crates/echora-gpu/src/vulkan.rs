@@ -31,6 +31,10 @@ pub struct Gpu {
     /// VK_EXT_external_memory_host: guest memory can be imported as device
     /// memory, so buffers in it are shared with the GPU without copies.
     pub host_import: Option<ash::ext::external_memory_host::Device>,
+    /// VK_KHR_external_memory_fd with VK_EXT_external_memory_dma_buf (Linux):
+    /// a dma-buf over guest memory's file (a udmabuf) can be imported as
+    /// device memory, so guest buffers are shared with the GPU in place.
+    pub dma_buf_import: Option<ash::khr::external_memory_fd::Device>,
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
@@ -194,6 +198,15 @@ impl Gpu {
         if host_import {
             enabled_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
+        // ECHORA_NO_DMA_BUF (diagnostic): guest buffers are copied instead.
+        let dma_buf_import = cfg!(target_os = "linux")
+            && has(ash::khr::external_memory_fd::NAME)
+            && has(ash::ext::external_memory_dma_buf::NAME)
+            && std::env::var_os("ECHORA_NO_DMA_BUF").is_none();
+        if dma_buf_import {
+            enabled_extensions.push(ash::khr::external_memory_fd::NAME.as_ptr());
+            enabled_extensions.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+        }
         // Task and mesh pipelines draw through shader objects of those stages.
         let mesh_shader = use_objects
             && supported_mesh.task_shader != 0
@@ -297,6 +310,8 @@ impl Gpu {
             use_objects.then(|| ash::ext::shader_object::Device::new(&instance, &device));
         let host_import =
             host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let dma_buf_import =
+            dma_buf_import.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let mesh_shader =
             mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
         Ok(Self {
@@ -312,6 +327,7 @@ impl Gpu {
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
             host_import,
+            dma_buf_import,
             mesh_shader,
             shader_binary_version,
             name,
