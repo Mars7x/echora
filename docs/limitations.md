@@ -6,9 +6,9 @@ to be missing or incomplete.
 
 ## Gameplay and graphics
 
-- The game gets past the New Game movie and into the first scene's code, but
-  no gameplay scene has been shown yet. Every unimplemented operation still
-  stops the run with a report.
+- The game gets past the New Game movie and draws its first 3D scene, but
+  the scene is heavily overexposed and no gameplay has been reached yet.
+  Every unimplemented operation still stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`) are drawn through
   `VK_EXT_mesh_shader`, but have not yet been checked against the console's
   output.
@@ -28,8 +28,8 @@ to be missing or incomplete.
 - By default every guest thread runs on one host thread, which does most of
   the work. `ECHORA_WORKERS` spreads them over up to six host threads, one per
   application core. Those runs no longer crash in testing and get through the
-  boot about 1.4 to 1.5 times as fast, but long runs are not yet checked
-  against single-core ones, so they stay off by default. With fewer than six workers,
+  movie and into the first scene about 1.5 times as fast, but long runs are
+  not yet checked against single-core ones, so they stay off by default. With fewer than six workers,
   threads of different guest cores on one worker compete by strict priority,
   which can starve some of them.
 - The faster code-generation options (`inline-vector`, `direct-calls`,

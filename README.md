@@ -27,8 +27,9 @@ game.
 ## Status
 
 The game boots, shows the title screen and plays the opening movie in colour
-with sound. After New Game it now gets past the opening movie and into new
-code, but no gameplay scene is drawn yet, so that is what I am working on next.
+with sound. After New Game it now gets past the opening movie and draws its
+first 3D scene, a sky with a moving camera, though far too bright for now.
+Getting that scene right and reaching gameplay is what I am working on next.
 Shader support is nearly complete, with 6,058 of the 6,074 shader stages seen
 so far translating, and the launcher works with a mouse, keyboard or
 controller.
@@ -36,8 +37,9 @@ controller.
 Speed is the other big gap. The opening movie plays at about 22 to 24 pictures
 per second, against the console's 60, limited by video decoding. Running the
 game's threads on several CPU cores now works in testing and gets through the
-boot about 1.4 to 1.5 times as fast as one core, but it stays off by default
-until longer runs have been checked against single-core ones.
+movie and into the first scene about 1.5 times as fast as one core, but it
+stays off by default until longer runs have been checked against single-core
+ones.
 
 The game only runs on Linux at the moment. The rest of the project builds and
 passes its tests on Windows too. These figures come from update 1.1.1

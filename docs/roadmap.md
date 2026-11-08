@@ -12,7 +12,7 @@ when the code for it does.
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with translated shaders, and the internal render scale is applied; the resolution planner is not connected yet. |
 | 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06. The title screen and the opening movie render correctly. |
-| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie, but no scene is drawn yet. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie and draws its first 3D scene, still overexposed. |
 | 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. In-game settings | Dropped: settings are changed in the launcher only. | — |
@@ -24,8 +24,8 @@ when the code for it does.
 
 ## Next steps
 
-1. Reach the first gameplay scene after the New Game movie and check what it
-   draws, including the mesh and task pipelines.
+1. Correct the overexposed first scene after the New Game movie, check what
+   it draws (including the mesh and task pipelines) and carry on to gameplay.
 2. Translate the last 16 failing shader stages.
 3. Finish multi-core (`ECHORA_WORKERS`): runs no longer crash, so check long
    runs against single-core ones, cut the time workers spend waiting for the
