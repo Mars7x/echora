@@ -1815,28 +1815,27 @@ impl Machine {
         usable.trailing_zeros() as u8
     }
 
-    /// Whether a thread no worker runs could run on a parked worker's core:
-    /// one parked worker finding nothing for its own core is not a deadlock,
-    /// and another parked worker is worth waking. A thread only a busy
-    /// worker may run is not counted: waking parked workers for it would
-    /// have them wake each other without end, starving the busy workers of
-    /// the machine lock.
-    fn runnable_for_parked_worker(&mut self) -> bool {
+    /// The parked workers (bit per worker) whose cores allow a thread no
+    /// worker runs: one parked worker finding nothing for its own core is
+    /// not a deadlock, and these are the workers worth waking. A thread only
+    /// a busy worker may run is not counted: waking parked workers for it
+    /// would have them wake each other without end, starving the busy
+    /// workers of the machine lock.
+    fn parked_workers_with_work(&mut self) -> u64 {
         let core = self.worker_core;
         let current = self.core.current_thread_id;
-        let mut any = false;
+        let mut workers = 0;
         for worker in 0..self.core_threads.len() {
             if self.core_threads[worker].is_some() {
                 continue;
             }
             self.worker_core = Some(worker as u8);
             if self.next_runnable_thread(current, Some(current)).is_some() {
-                any = true;
-                break;
+                workers |= 1 << worker;
             }
         }
         self.worker_core = core;
-        any
+        workers
     }
 
     fn saved_thread_cpu(&self, id: u64) -> Result<Cpu, Trap> {
@@ -2440,7 +2439,7 @@ impl Machine {
         self.parallel = true;
         let shared = Shared {
             machine: std::sync::Mutex::new(&mut *self),
-            wake: std::sync::Condvar::new(),
+            wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
             nvn_back: std::sync::Condvar::new(),
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
@@ -4411,13 +4410,25 @@ struct Shared<'a> {
     /// ECHORA_STOP_WORLD (diagnostic): no guest code runs on any worker
     /// while one handles a boundary.
     world: Option<std::sync::RwLock<()>>,
-    /// Signaled when a thread may have become runnable or the run stops.
-    wake: std::sync::Condvar,
+    /// Per worker: signaled when a thread its cores allow may have become
+    /// runnable, or the run stops.
+    wake: Vec<std::sync::Condvar>,
     stop: std::sync::atomic::AtomicBool,
     /// Held while a worker runs guest code when ECHORA_SERIAL_GUEST is set:
     /// threads keep their cores but never execute at the same time, which
     /// separates scheduling faults from memory-ordering ones.
     serial: Option<std::sync::Mutex<()>>,
+}
+
+impl Shared<'_> {
+    /// Wake the parked workers named by `workers` (bit per worker).
+    fn wake_workers(&self, workers: u64) {
+        for (index, wake) in self.wake.iter().enumerate() {
+            if workers & (1 << index) != 0 {
+                wake.notify_one();
+            }
+        }
+    }
 }
 
 /// One host thread running guest threads.
@@ -4540,13 +4551,14 @@ impl Worker {
                 match outcome {
                     Ok(()) => {
                         machine.request_preemptions();
-                        let spare =
-                            machine.parked_workers != 0 && machine.runnable_for_parked_worker();
+                        let spare = if machine.parked_workers != 0 {
+                            machine.parked_workers_with_work()
+                        } else {
+                            0
+                        };
                         self.swap_out(&mut machine, true);
                         drop(machine);
-                        if spare {
-                            shared.wake.notify_all();
-                        }
+                        shared.wake_workers(spare);
                         continue;
                     }
                     Err(Trap::NoRunnableThreads { .. }) => {
@@ -4603,10 +4615,9 @@ impl Worker {
                         let everyone_parked = machine.running.is_empty();
                         // Nothing for this core may still be something for
                         // another parked worker's core.
-                        let elsewhere = machine.runnable_for_parked_worker();
-                        if elsewhere {
-                            shared.wake.notify_all();
-                        }
+                        let others = machine.parked_workers_with_work() & !(1 << self.index);
+                        let elsewhere = others != 0;
+                        shared.wake_workers(others);
                         if everyone_parked && deadline.is_none() && !elsewhere {
                             machine.parked_workers -= 1;
                             return self.stop(
@@ -4636,8 +4647,7 @@ impl Worker {
                             time[0] += 1;
                             time[2] += held_since.elapsed().as_micros() as u64;
                         }
-                        machine = shared
-                            .wake
+                        machine = shared.wake[usize::from(self.index)]
                             .wait_timeout(machine, wait)
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .0;
@@ -4757,7 +4767,7 @@ impl Worker {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.swap_out(&mut machine, false);
         drop(machine);
-        shared.wake.notify_all();
+        shared.wake_workers(u64::MAX);
         (self.core, Some(trap))
     }
 }
