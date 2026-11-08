@@ -71,6 +71,9 @@ pub struct Layout {
     /// processor; 0 switches at every block boundary.
     #[serde(skip)]
     pub scheduler_slice: u64,
+    /// `scheduler_slice` with several workers.
+    #[serde(skip)]
+    pub parallel_slice: u64,
     /// Host threads running guest threads at once; 1 runs every guest
     /// thread on the calling thread.
     #[serde(skip)]
@@ -108,6 +111,7 @@ impl Default for Layout {
             process_priority_mask: None,
             remote_memory_model: RemoteMemoryModel::Unsupported,
             scheduler_slice: 0,
+            parallel_slice: 0,
             workers: 1,
         }
     }
@@ -2277,11 +2281,12 @@ impl Machine {
                 .any(|id| id != current && !self.running.contains(&id));
         // Other workers' stops and wakeups are seen at boundaries.
         if others || self.parallel {
-            check_at = check_at.min(
-                self.core
-                    .steps
-                    .saturating_add(self.layout.scheduler_slice.max(1)),
-            );
+            let slice = if self.parallel {
+                self.layout.parallel_slice
+            } else {
+                self.layout.scheduler_slice
+            };
+            check_at = check_at.min(self.core.steps.saturating_add(slice.max(1)));
         }
         // `attention` forces the next boundary too: one compare per block.
         self.core.host_check_at = if self.core.attention { 0 } else { check_at };

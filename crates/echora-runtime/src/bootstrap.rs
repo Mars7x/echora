@@ -160,6 +160,13 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     // spinning. 1,000 instructions played the intro movie 1.5x faster than
     // 20,000 (300 and 2,000 were both slower than 1,000).
     layout.scheduler_slice = env_number("ECHORA_SCHEDULER_SLICE").unwrap_or(1_000);
+    // With several workers every slice end takes the machine lock, which
+    // the other workers then wait for: at 1,000 instructions six workers
+    // spent most of their time waiting and fell behind one worker. Other
+    // workers' wakeups and preemptions reach a running one through its
+    // preemption flag, not through slice ends. At 50,000, six workers
+    // rendered the intro about 1.4x as fast as one.
+    layout.parallel_slice = env_number("ECHORA_PARALLEL_SLICE").unwrap_or(50_000);
     layout.workers = env_number::<usize>("ECHORA_WORKERS").unwrap_or(1).max(1);
 
     let mut machine = Machine::new(layout, max_steps);
