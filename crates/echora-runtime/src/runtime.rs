@@ -2241,9 +2241,15 @@ impl Machine {
         self.core.spin_polls = 0;
         self.core.slice_start = self.core.steps;
         // Every 16th boundary: the profile keeps its shape at a fraction of
-        // the hashing cost.
+        // the hashing cost. ECHORA_PC_SAMPLES_FROM=N samples from present N
+        // on (one phase of a long run, such as after a movie).
         self.pc_sample_tick = self.pc_sample_tick.wrapping_add(1);
-        if self.pc_sample_tick.is_multiple_of(16) {
+        if self.pc_sample_tick.is_multiple_of(16)
+            && crate::nvn::debug_var("ECHORA_PC_SAMPLES_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|from| self.nvn.presented_frames >= from)
+        {
             *self
                 .pc_samples
                 .entry((self.core.current_thread_id, self.core.cpu.pc))
