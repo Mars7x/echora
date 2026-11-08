@@ -70,6 +70,18 @@ Fix options:
   compete by priority, and DisableCount holds the worker only for its own
   core's slice.
 
+Status: the second option is in. `next_runnable_thread` computes the
+best priority per guest core (a thread's core is `guest_core_on_worker`)
+and, at each decision, takes the next of the worker's cores in turn after
+the current thread's that has a runnable thread at its best. Within a core
+equal priorities rotate by id after the thread that core last ran
+(`core_last_thread`, recorded at each parallel boundary). With six workers
+each worker has one core and the choice is the same as before.
+`crates/echora-runtime/tests/folded_cores.rs` checks it at two to five
+workers. Still open: a DisableCount thread holds its whole worker, not
+only its core's slice, since the slice end that skips the switch is
+outside the scheduler.
+
 ### 2. Per-core data collisions are guarded; keep them so
 
 `GetCurrentProcessorNumber` (SVC 0x10, 3412) answers

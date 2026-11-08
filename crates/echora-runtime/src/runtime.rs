@@ -292,6 +292,10 @@ pub struct Machine {
     /// Threads that gave up the processor spinning, with the step count
     /// until which other runnable threads go first.
     spin_backoff: std::collections::BTreeMap<u64, u64>,
+    /// The thread each guest core last ran, by guest core, with several
+    /// cores folded onto a worker: equal priorities on a core take turns
+    /// after it (see `next_runnable_thread`).
+    core_last_thread: [u64; 64],
     /// Step count of the last scan of parked waits.
     last_wake_check: u64,
     /// With several workers: the threads other workers are running now
@@ -411,6 +415,7 @@ impl Machine {
             host_call_continue: None,
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
+            core_last_thread: [0; 64],
             last_wake_check: 0,
             running: Default::default(),
             worker_core: None,
@@ -1733,34 +1738,80 @@ impl Machine {
                 self.threads.priority(id).unwrap_or(u8::MAX)
             }
         };
-        let best = main
+        // A worker serving several guest cores runs each core's best
+        // priority in turn, as Horizon's cores would side by side: with
+        // strict priority across them a busy thread on one core would starve
+        // a worse-priority thread on another forever. Slice ends rotate to
+        // the next core with work after `after`'s. With one core per worker
+        // (W=6) every thread shares the worker's core and this is strict
+        // priority as before; the diagnostics above keep one group.
+        let cores = match self.worker_core {
+            Some(core) if !any_core && !one_core && split.is_none() => {
+                self.worker_guest_cores(core)
+            }
+            _ => 0,
+        };
+        let home = |id: u64| -> u8 {
+            match self.worker_core {
+                Some(core) if cores.count_ones() > 1 => self.guest_core_on_worker(id, core),
+                _ => 0,
+            }
+        };
+        // (id, home core, priority, backing off from a spin)
+        let candidates: Vec<(u64, u8, u8, bool)> = main
             .into_iter()
             .chain(self.threads.runnable_ids())
             .filter(|&id| exclude != Some(id) && !self.running.contains(&id) && allowed(id))
-            .map(priority)
-            .min();
+            .map(|id| {
+                let spinning = self
+                    .spin_backoff
+                    .get(&id)
+                    .is_some_and(|until| *until > self.core.steps);
+                (id, home(id), priority(id), spinning)
+            })
+            .collect();
+        let mut best = [u8::MAX; 64];
+        for &(_, core, priority, _) in &candidates {
+            let slot = &mut best[usize::from(core) % 64];
+            *slot = (*slot).min(priority);
+        }
+        // Cores in turn after `after`'s, ending with its own.
+        let start = home(after);
+        let turn = |core: u8| (u32::from(core) + 63 - u32::from(start)) % 64;
         let pick = |skip_spinning: bool| {
-            let mut first = None;
-            let mut next = None;
-            for id in main.into_iter().chain(self.threads.runnable_ids()) {
-                if exclude == Some(id)
-                    || self.running.contains(&id)
-                    || !allowed(id)
-                    || Some(priority(id)) != best
-                    || skip_spinning
-                        && self
-                            .spin_backoff
-                            .get(&id)
-                            .is_some_and(|until| *until > self.core.steps)
-                {
+            let mut first: Option<u32> = None;
+            let mut next: Option<(u32, u64)> = None;
+            let mut wrapped: Option<(u32, u64)> = None;
+            for &(id, core, priority, spinning) in &candidates {
+                if priority != best[usize::from(core) % 64] || skip_spinning && spinning {
                     continue;
                 }
-                first = Some(first.map_or(id, |old: u64| old.min(id)));
-                if id > after {
-                    next = Some(next.map_or(id, |old: u64| old.min(id)));
-                }
+                let turn = turn(core);
+                // Equal priorities on a core take turns: after `after` on
+                // its own core (the last turn), after the thread a core
+                // last ran on the others.
+                let key = (turn, id);
+                let previous = if turn == 63 {
+                    after
+                } else {
+                    self.core_last_thread[usize::from(core) % 64]
+                };
+                // The first core in turn decides; within it, the next id
+                // after `previous`, else (wrapping) the lowest.
+                let slot = if id > previous {
+                    &mut next
+                } else {
+                    &mut wrapped
+                };
+                *slot = Some(slot.map_or(key, |old| old.min(key)));
+                first = Some(first.map_or(turn, |old: u32| old.min(turn)));
             }
-            next.or(first)
+            let first = first?;
+            [next, wrapped]
+                .into_iter()
+                .flatten()
+                .find(|&(turn, _)| turn == first)
+                .map(|(_, id)| id)
         };
         pick(true).or_else(|| pick(false))
     }
@@ -1770,6 +1821,7 @@ impl Machine {
     /// core's next block boundary. The game relies on it (a better-priority
     /// thread it wakes runs before the waker's core goes on).
     fn request_preemptions(&mut self) {
+        self.note_core_thread();
         let priority = |machine: &Machine, id: u64| -> u8 {
             if id == machine.layout.main_thread_id {
                 machine.main_thread_effective_priority
@@ -1814,6 +1866,19 @@ impl Machine {
                     }
                 }
             }
+        }
+    }
+
+    /// Record the thread this worker runs as its guest core's last, for the
+    /// turns of equal priorities on folded cores.
+    fn note_core_thread(&mut self) {
+        let Some(worker) = self.worker_core else {
+            return;
+        };
+        let current = self.core.current_thread_id;
+        if self.worker_guest_cores(worker).count_ones() > 1 {
+            let core = self.guest_core_on_worker(current, worker);
+            self.core_last_thread[usize::from(core) % 64] = current;
         }
     }
 
