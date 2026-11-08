@@ -1,9 +1,16 @@
 //! Installing the game into Echora's own data folder, so the NUP or dump
-//! the player chose is no longer needed afterwards.
+//! the player chose can be moved, renamed or deleted afterwards.
 //!
-//! The copy is staged next to the install and swapped in only once it is
-//! complete, so a failed or interrupted install leaves the previous one in
-//! place.
+//! Each file is placed as cheaply as the disk allows: a copy-on-write clone
+//! (Btrfs, XFS), else a hard link on the same filesystem, both instant and
+//! taking no extra space, else a real copy, started only once there is room
+//! for it. The install is staged next to the old one and swapped in only once
+//! it is complete, so a failed or interrupted install leaves the previous one
+//! in place.
+
+// Cloning a file and asking for free space are system calls (FICLONE,
+// statvfs) with no safe standard-library wrapper.
+#![allow(unsafe_code)]
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -74,7 +81,12 @@ fn install_inner(source: &Path, games: &Path, progress: &Progress) -> io::Result
     progress.total.store(size_of(source)?, Ordering::Relaxed);
     let staging = games.join(".installing");
     remove(&staging)?;
-    copy(source, &staging, progress)?;
+    let mut copying = Copying::Unchecked;
+    if let Err(error) = place(source, &staging, progress, &mut copying) {
+        // Leave nothing half-made behind; the previous install stays.
+        let _ = remove(&staging);
+        return Err(error);
+    }
     // Only one game is installed at a time: clear both kinds of install.
     remove(&games.join("dump"))?;
     remove(&games.join("game.nup"))?;
@@ -90,15 +102,107 @@ fn size_of(path: &Path) -> io::Result<u64> {
     fs::read_dir(path)?.try_fold(0, |sum, entry| Ok(sum + size_of(&entry?.path())?))
 }
 
-fn copy(source: &Path, target: &Path, progress: &Progress) -> io::Result<()> {
+/// Whether a real copy has had its free space checked.
+enum Copying {
+    Unchecked,
+    Checked,
+}
+
+/// Places `source` (a file, or a folder of them) at `target`: cloned, else
+/// linked, else copied.
+fn place(
+    source: &Path,
+    target: &Path,
+    progress: &Progress,
+    copying: &mut Copying,
+) -> io::Result<()> {
     if source.is_dir() {
         fs::create_dir_all(target)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
-            copy(&entry.path(), &target.join(entry.file_name()), progress)?;
+            place(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                progress,
+                copying,
+            )?;
         }
         return Ok(());
     }
+    let size = fs::metadata(source)?.len();
+    if clone(source, target).is_ok() || fs::hard_link(source, target).is_ok() {
+        progress.copied.fetch_add(size, Ordering::Relaxed);
+        return Ok(());
+    }
+    if let Copying::Unchecked = copying {
+        let needed =
+            progress.total.load(Ordering::Relaxed) - progress.copied.load(Ordering::Relaxed);
+        check_space(target, needed)?;
+        *copying = Copying::Checked;
+    }
+    copy(source, target, progress)
+}
+
+/// A copy-on-write clone of `source` at `target` (Linux `FICLONE`).
+#[cfg(target_os = "linux")]
+fn clone(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let input = fs::File::open(source)?;
+    let output = fs::File::create(target)?;
+    // SAFETY: both descriptors are open for the duration of the call.
+    let result = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    drop(output);
+    let _ = fs::remove_file(target);
+    Err(error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clone(_source: &Path, _target: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// Fails with a plain message when the disk holding `target` has less than
+/// `needed` bytes free (plus a little headroom).
+fn check_space(target: &Path, needed: u64) -> io::Result<()> {
+    let Some(free) = free_space(target.parent().unwrap_or(target)) else {
+        return Ok(());
+    };
+    const HEADROOM: u64 = 512 << 20;
+    if free < needed + HEADROOM {
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        return Err(io::Error::other(format!(
+            "there isn't enough free space: the game needs {:.1} GB and the disk has {:.1} GB free",
+            gb(needed),
+            gb(free)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is plain old data, valid when zeroed.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid C string and a buffer of the right type.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    Some(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+fn copy(source: &Path, target: &Path, progress: &Progress) -> io::Result<()> {
     let mut input = fs::File::open(source)?;
     let mut output = fs::File::create(target)?;
     let mut buffer = vec![0; 8 << 20];
@@ -163,6 +267,63 @@ mod tests {
         assert_eq!(fs::read(installed.join("exefs/main")).unwrap(), b"code");
         assert_eq!(fs::read(installed.join("romfs.bin")).unwrap(), b"assets");
         remove(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_install_outlives_its_source() {
+        let dir = scratch("outlives");
+        fs::write(dir.join("source.nup"), b"game data").unwrap();
+        let progress = Progress::default();
+        install(&dir.join("source.nup"), &dir.join("games"), &progress);
+        let installed = progress.take_result().unwrap().unwrap();
+        // Renamed, then deleted: the install keeps its own copy of the data.
+        fs::rename(dir.join("source.nup"), dir.join("renamed.nup")).unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), b"game data");
+        fs::remove_file(dir.join("renamed.nup")).unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), b"game data");
+        remove(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copy_that_cannot_fit_says_so() {
+        let dir = scratch("space");
+        // Without a free-space query (not Unix) the copy just starts.
+        let result = check_space(&dir.join("game.nup"), u64::MAX / 2);
+        if cfg!(unix) {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("free space"), "{error}");
+        }
+        assert!(check_space(&dir.join("game.nup"), 1).is_ok());
+        remove(&dir).unwrap();
+    }
+
+    /// With `ECHORA_TEST_NUP` set: installing the real game next to it (same
+    /// filesystem) is a clone or a link, so it takes moments, not a copy.
+    #[test]
+    #[ignore]
+    fn the_real_game_installs_without_copying() {
+        let Some(nup) = std::env::var_os("ECHORA_TEST_NUP").map(PathBuf::from) else {
+            return;
+        };
+        let games = nup.with_file_name(format!("echora-install-test-{}", std::process::id()));
+        let progress = Progress::default();
+        let start = std::time::Instant::now();
+        install(&nup, &games, &progress);
+        let installed = progress.take_result().unwrap().unwrap();
+        let elapsed = start.elapsed();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let links = fs::metadata(&nup).unwrap().nlink();
+            let how = if links > 1 { "a hard link" } else { "a clone" };
+            eprintln!("installed {} as {how} in {elapsed:?}", installed.display());
+        }
+        assert_eq!(
+            fs::metadata(&installed).unwrap().len(),
+            fs::metadata(&nup).unwrap().len()
+        );
+        remove(&games).unwrap();
+        assert!(elapsed.as_secs() < 5, "installing took {elapsed:?}");
     }
 
     #[test]

@@ -1878,6 +1878,7 @@ dependencies = [
  "echora-content",
  "echora-input",
  "gpui",
+ "libc",
 ]
 
 [[package]]

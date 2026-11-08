@@ -98,6 +98,8 @@ impl SettingsTab {
 /// The game the launcher will start.
 struct Game {
     path: PathBuf,
+    /// Title id and version of the program package.
+    build: Option<(String, u32)>,
     title: SharedString,
     version: SharedString,
     icon: Option<Arc<Image>>,
@@ -497,7 +499,7 @@ impl Launcher {
         if self.running || self.installing.is_some() || self.preparing.is_some() {
             return;
         }
-        let title = match read_game(&source) {
+        let title = match read_game(&source).and_then(supported_build) {
             Ok(game) => game.title,
             Err(message) => return self.notify(message, cx),
         };
@@ -926,6 +928,28 @@ fn watch_controllers(window: &mut Window, cx: &mut Context<Launcher>) {
     .detach();
 }
 
+/// The one game build Echora translates: Ocarina of Time's update 1.1.1.
+const SUPPORTED_TITLE: &str = "0400486024DEC000";
+const SUPPORTED_VERSION: u32 = 131072;
+
+/// `game`, if it is the build Echora supports; other games and versions are
+/// refused before anything is installed.
+fn supported_build(game: Game) -> Result<Game, String> {
+    match &game.build {
+        Some((title, version)) if title == SUPPORTED_TITLE && *version == SUPPORTED_VERSION => {
+            Ok(game)
+        }
+        Some((title, _)) if title == SUPPORTED_TITLE => Err(format!(
+            "This is {} of the game; Echora needs version 1.1.1",
+            game.version.to_lowercase()
+        )),
+        _ => Err(
+            "Echora supports The Legend of Zelda: Ocarina of Time for Nintendo Switch 2 only"
+                .into(),
+        ),
+    }
+}
+
 fn read_game(path: &Path) -> Result<Game, String> {
     let inventory = ContentSource::open(path)
         .and_then(|source| source.inventory())
@@ -953,6 +977,10 @@ fn read_game(path: &Path) -> Result<Game, String> {
     });
     Ok(Game {
         path: path.to_path_buf(),
+        build: package
+            .title_id
+            .clone()
+            .map(|title| (title.to_ascii_uppercase(), package.version)),
         title: package
             .title_name
             .clone()
@@ -2274,7 +2302,29 @@ impl Launcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{game_environment, run_arguments, split_title};
+    use super::{Game, game_environment, run_arguments, split_title, supported_build};
+
+    fn game(build: Option<(&str, u32)>, version: &str) -> Game {
+        Game {
+            path: "game.nup".into(),
+            build: build.map(|(title, version)| (title.to_owned(), version)),
+            title: "The Legend of Zelda: Ocarina of Time".into(),
+            version: version.to_owned().into(),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn only_the_supported_build_installs() {
+        assert!(supported_build(game(Some(("0400486024DEC000", 131072)), "Version 1.1.1")).is_ok());
+        let older = supported_build(game(Some(("0400486024DEC000", 65536)), "Version 1.0.0"));
+        assert_eq!(
+            older.err().unwrap(),
+            "This is version 1.0.0 of the game; Echora needs version 1.1.1"
+        );
+        assert!(supported_build(game(Some(("0100000000010000", 0)), "Version 1.0")).is_err());
+        assert!(supported_build(game(None, "Version 1.0")).is_err());
+    }
 
     #[test]
     fn the_game_runs_without_a_budget() {
