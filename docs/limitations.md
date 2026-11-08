@@ -24,10 +24,12 @@
   confirm the decoded bytes. A ZBIC frame whose re-encoded tables no longer
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
-- The NVN layer does not yet draw mesh and task pipelines (`DrawMeshTasks`),
-  which gameplay scenes need. Of the 6,074 shader stages OoT reached in a
-  test run, 114 do not translate yet (mostly stage-buffer reads outside task
-  and mesh programs, and gather forms); draws that need them are skipped.
+- Mesh and task pipelines (`DrawMeshTasks`) are drawn through
+  `VK_EXT_mesh_shader` but not yet checked against the console's output;
+  after the New Game movie the presented frames are still black. Of the
+  6,074 shader stages OoT reached in a test run, 27 do not translate yet
+  (gather forms, opcode c08 and register shadowing modes); draws that need
+  them are skipped.
   NVN calls the Vulkan backend directly; a backend trait (for Direct3D
   12) is still to be introduced. Gamepads on Windows (gilrs) are untested
   on hardware, and audio output does not resample (the device must accept
