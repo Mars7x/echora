@@ -642,12 +642,11 @@ fn run(workers: usize, mode: u8) {
     if !matches!(trap, Trap::Exit { .. }) {
         failures.insert(0, format!("ended with {trap:?}"));
     }
-    // Printed before panicking: a panic hook may not get to print.
-    if !failures.is_empty() {
-        let text = format!("{workers} workers, mode {mode}: {}", failures.join("; "));
-        eprintln!("{text}");
-        panic!("{text}");
-    }
+    assert!(
+        failures.is_empty(),
+        "{workers} workers, mode {mode}: {}",
+        failures.join("; ")
+    );
 }
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {

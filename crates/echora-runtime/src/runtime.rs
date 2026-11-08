@@ -2588,7 +2588,7 @@ impl Machine {
         if self.layout.workers > 1 || crate::nvn::debug_var_os("ECHORA_PARALLEL_PATH").is_some() {
             return self.run_parallel(&dispatch);
         }
-        crate::fault::watch(&self.core);
+        let _watch = crate::fault::watch(&self.core);
         loop {
             let result = dispatch(&mut self.core);
             if result.is_ok() {
@@ -4769,7 +4769,7 @@ impl Worker {
         dispatch: &(impl Fn(&mut Core) -> Result<(), Trap> + Sync),
     ) -> (Core, Option<Trap>) {
         use std::sync::atomic::Ordering;
-        crate::fault::watch(&self.core);
+        let _watch = crate::fault::watch(&self.core);
         loop {
             if self.active {
                 let ran = std::time::Instant::now();

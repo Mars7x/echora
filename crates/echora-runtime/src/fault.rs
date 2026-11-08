@@ -10,6 +10,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static CORES: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+/// Snapshots reading `CORES` now. A core leaving `CORES` waits for them, so
+/// no snapshot reads a core after its owner frees or moves it.
+static READERS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// The core this host thread runs guest code on (parallel workers each
@@ -17,10 +20,10 @@ thread_local! {
     static CORE: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Reports faults on this thread with `core`'s context until another core
-/// is registered here. The caller keeps `core` in place while guest code
-/// runs on it.
-pub(crate) fn watch(core: &Core) {
+/// Reports faults on this thread with `core`'s context until the returned
+/// guard drops. The caller keeps `core` in place until then.
+#[must_use = "the core is watched only until the guard drops"]
+pub(crate) fn watch(core: &Core) -> Watch {
     CORE.with(|cell| cell.set(core as *const Core as usize));
     // Every watched core, so a fault on one worker also shows what the
     // others were running.
@@ -34,11 +37,35 @@ pub(crate) fn watch(core: &Core) {
     }
     #[cfg(unix)]
     unix::install();
+    Watch { address }
+}
+
+/// A watched core; dropping it stops the watch, after which the core may
+/// move or be freed.
+pub(crate) struct Watch {
+    address: usize,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        CORE.with(|cell| {
+            if cell.get() == self.address {
+                cell.set(0);
+            }
+        });
+        for slot in &CORES {
+            let _ = slot.compare_exchange(self.address, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        // A snapshot that saw the address before it left finishes first.
+        while READERS.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::{CORE, CORES, Core};
+    use super::{CORE, CORES, Core, READERS};
     use std::cell::Cell;
     use std::fmt::Write as _;
     use std::sync::OnceLock;
@@ -114,13 +141,17 @@ mod unix {
     fn snapshot(core: *const Core) {
         {
             let mut text = String::new();
+            // Counted before any slot is read: a watch ending meanwhile
+            // waits for this snapshot (see `Watch::drop`).
+            READERS.fetch_add(1, Ordering::SeqCst);
             for (index, slot) in CORES.iter().enumerate() {
-                let other = slot.load(Ordering::Relaxed) as *const Core;
+                let other = slot.load(Ordering::SeqCst) as *const Core;
                 if other.is_null() {
                     continue;
                 }
-                // SAFETY: as above; another worker's core may be changing,
-                // so this is a best-effort snapshot of a dying process.
+                // SAFETY: still watched (its watch ending waits for
+                // READERS); another worker's core may be changing, so this
+                // is a best-effort snapshot of a dying process.
                 let (thread, pc, recent) = unsafe {
                     (
                         (*other).current_thread_id,
@@ -134,6 +165,7 @@ mod unix {
                     let _ = writeln!(text, "  recent t{} {:#x}", entry.thread_id, entry.pc);
                 }
             }
+            READERS.fetch_sub(1, Ordering::SeqCst);
             // SAFETY: write(2) is async-signal-safe; the buffer is valid.
             unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
         }
