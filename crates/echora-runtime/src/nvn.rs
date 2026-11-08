@@ -2519,8 +2519,9 @@ impl Nvn {
                 });
             }
         }
+        let pc = core.cpu.pc;
         let stop = |message: String| Trap::UnsupportedService {
-            pc: core.cpu.pc,
+            pc,
             service: "nvn".into(),
             command_id: None,
             message: format!("executing {}: {message}", command.name),
@@ -2979,6 +2980,23 @@ impl Nvn {
                         *self.skipped_work.entry(rest.into()).or_default() += 1;
                     }
                     return Ok(());
+                }
+                // DispatchComputeIndirect(cmd, NVNbufferAddress): the group
+                // counts are three u32 at the address when the GPU reaches
+                // the command (a dispatch before it may have written them,
+                // so its results are resolved first); it runs as
+                // DispatchCompute with them.
+                if rest == "DispatchComputeIndirect" {
+                    if let Err(message) = self.resolve_storage(core, None) {
+                        return Err(stop(format!("dispatch results: {message}")));
+                    }
+                    let at = self.gpu_to_guest(command.x[1], 12).map_err(stop)?;
+                    let mut direct = command.clone();
+                    direct.name = "nvnCommandBufferDispatchCompute".into();
+                    for (index, slot) in direct.x[1..4].iter_mut().enumerate() {
+                        *slot = u64::from(core.memory.read_u32(at + index as u64 * 4)?);
+                    }
+                    return self.execute_command(&direct, core);
                 }
                 if rest == "DispatchCompute" && self.gpu().is_some() {
                     let start = std::time::Instant::now();
