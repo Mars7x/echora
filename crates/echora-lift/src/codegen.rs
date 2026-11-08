@@ -713,8 +713,10 @@ fn jump_table(
 }
 
 /// The distinct addresses that `adrp reg; add reg, reg, #imm` pairs in the
-/// HOISTED_TABLE_WINDOW instructions after `pc` compute, in program order;
-/// none when an adrp of the register is not followed by such an add.
+/// HOISTED_TABLE_WINDOW instructions after `pc` compute, in program order.
+/// An adrp of the register not followed by such an add (`adrp x8, page;
+/// ldr x9, [x8, #lo]` for some other data) is no table address and is
+/// skipped.
 fn hoisted_addresses(
     pc: u64,
     register: u8,
@@ -729,11 +731,13 @@ fn hoisted_addresses(
         if word & 0x9f00_0000 != 0x9000_0000 || (word & 31) as u8 != register {
             continue;
         }
-        let next = read_word(at + 4)?;
+        let Some(next) = read_word(at + 4) else {
+            break;
+        };
         let rd = (next & 31) as u8;
         let rn = ((next >> 5) & 31) as u8;
         if next & 0xffc0_0000 != 0x9100_0000 || rd != register || rn != register {
-            return None;
+            continue;
         }
         let address = adr_target(word, at, true) + u64::from((next >> 10) & 0xfff);
         if !found.contains(&address) {
@@ -4422,6 +4426,44 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
         assert!(translation.instructions.contains_key(&0x1028));
+    }
+
+    #[test]
+    fn hoisted_table_addresses_are_found_past_other_uses_of_the_register() {
+        // As above, with `adrp x30, 0x2000; ldr x9, [x30]` (another datum
+        // through the same register, no table address) before the table's
+        // adrp/add pair.
+        let words = [
+            0x7100_083f, // cmp w1, #2
+            0x5400_0128, // b.hi 0x1028
+            0x1000_0100, // adr x0, 0x1028
+            0x7861_7bc2, // ldrh w2, [x30, x1, lsl #1]
+            0x8b02_0800, // add x0, x0, x2, lsl #2
+            0xd61f_0000, // br x0
+            0xb000_001e, // adrp x30, 0x2000
+            0xf940_03c9, // ldr x9, [x30]
+            0xb000_001e, // adrp x30, 0x2000
+            0x9100_03de, // add x30, x30, #0
+            0xd65f_03c0, // 0x1028: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 1, 0, 2, 0],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
+        assert!(translation.instructions.contains_key(&0x1030));
     }
 
     #[test]
