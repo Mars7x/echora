@@ -382,9 +382,9 @@ enum ReadableEventKind {
     FriendInvitationStorageChannel,
     /// Signaled after the server refreshes the syncpoint cache.
     SyncpointCacheCompleted,
-    /// An account async context's completion event; the contexts finish at
-    /// creation, so it starts signaled.
-    AccountAsyncDone,
+    /// An async context's completion event (account, play report); the
+    /// contexts finish at creation, so it starts signaled.
+    AsyncContextDone,
     /// DisplaySession notification event (GetNotificationEvent, 11). No
     /// producer exists yet, so it is never signaled.
     DisplayNotification,
@@ -753,6 +753,9 @@ enum ServiceObject {
     StreamplayShim,
     /// prepo:u nn::prepo::detail::ipc::IPrepoService (play reports).
     PlayReport,
+    /// nn::prepo::detail::ipc::IAsyncContext, from a report sent with
+    /// command 10500 (SDK 22's PlayReport::Send).
+    PlayReportContext,
     /// IHardwareOpusDecoder: decodes packets to silence of the right length.
     OpusDecoder {
         sample_rate: u32,
@@ -837,6 +840,7 @@ impl ServiceObject {
             Self::BcatProgress => "bcat:u:progress",
             Self::StreamplayUser => "stpl:u",
             Self::PlayReport => "prepo:u",
+            Self::PlayReportContext => "prepo:u:async_context",
             Self::HidServer => "hid",
             Self::HidAppletResource => "hid:applet_resource",
             Self::HidVibrationDeviceList => "hid:vibration_device_list",
@@ -2221,6 +2225,43 @@ impl Services {
         Ok(())
     }
 
+    /// Reply with a copy of a new, signaled completion event for an async
+    /// context that finished when it was created.
+    fn reply_done_event(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        let application = self
+            .main_application
+            .clone()
+            .ok_or_else(|| invalid("async context requires the bootstrap main application"))?;
+        if self.readable_events.len() >= MAX_READABLE_EVENTS {
+            return Err(invalid("readable event backing capacity exhausted"));
+        }
+        let id = ReadableEventId(
+            self.readable_events
+                .keys()
+                .map(|id| id.0)
+                .max()
+                .unwrap_or(0)
+                + 1,
+        );
+        let handle = self.next_available_handle()?;
+        let reply = call.prepare_copy_handle_reply(handle, AOC_INTERFACE_ID)?;
+        call.write_reply(&reply)?;
+        self.readable_events.insert(
+            id,
+            ReadableEvent {
+                owner: application,
+                kind: ReadableEventKind::AsyncContextDone,
+                signaled: true,
+            },
+        );
+        self.readable_event_handles.insert(handle, id);
+        self.next_handle = handle + 1;
+        Ok(Outcome {
+            output_copy_handle_count: 1,
+            ..Outcome::success()
+        })
+    }
+
     fn reply_new_object(
         &mut self,
         call: &mut Call<'_>,
@@ -2721,6 +2762,7 @@ impl Services {
                 self.streamplay(&object.clone(), call)
             }
             ServiceObject::PlayReport => self.play_report(call),
+            ServiceObject::PlayReportContext => self.play_report_context(call),
             ServiceObject::GpuWorker => self.gpu_worker(call),
             ServiceObject::NvidiaDriver { application }
                 if call.request.protocol == Protocol::Cmif =>
@@ -3569,38 +3611,7 @@ impl Services {
             // IAsyncContext GetSystemEvent (0) -> copied event, signaled.
             (ServiceObject::AccountLicenseContext, 0) => {
                 call.shape(0, false, false)?;
-                let application = self
-                    .main_application
-                    .clone()
-                    .ok_or_else(|| invalid("account requires the bootstrap main application"))?;
-                if self.readable_events.len() >= MAX_READABLE_EVENTS {
-                    return Err(invalid("readable event backing capacity exhausted"));
-                }
-                let id = ReadableEventId(
-                    self.readable_events
-                        .keys()
-                        .map(|id| id.0)
-                        .max()
-                        .unwrap_or(0)
-                        + 1,
-                );
-                let handle = self.next_available_handle()?;
-                let reply = call.prepare_copy_handle_reply(handle, AOC_INTERFACE_ID)?;
-                call.write_reply(&reply)?;
-                self.readable_events.insert(
-                    id,
-                    ReadableEvent {
-                        owner: application,
-                        kind: ReadableEventKind::AccountAsyncDone,
-                        signaled: true,
-                    },
-                );
-                self.readable_event_handles.insert(handle, id);
-                self.next_handle = handle + 1;
-                Ok(Outcome {
-                    output_copy_handle_count: 1,
-                    ..Outcome::success()
-                })
+                self.reply_done_event(call)
             }
             // Cancel (1): nothing is in flight.
             (ServiceObject::AccountLicenseContext, 1) => {
@@ -5137,6 +5148,31 @@ impl Services {
         }
     }
 
+    /// IAsyncContext of a play report sent with 10500: the report was
+    /// discarded, so the context is done from the start.
+    fn play_report_context(&mut self, call: &mut Call<'_>) -> Result<Outcome, Trap> {
+        match call.request.command_id {
+            // GetSystemEvent (0; PlayReport's AsyncContext::GetCompletionEvent)
+            // -> copied event, signaled.
+            0 => {
+                call.shape(0, false, false)?;
+                self.reply_done_event(call)
+            }
+            // Cancel (1; inferred from the SDK's method order, between the
+            // event and the result): nothing is in flight. GetResult (2):
+            // the discarded report succeeded.
+            1 | 2 => {
+                call.shape(0, false, false)?;
+                call.reply(0, None, AOC_INTERFACE_ID, &[])?;
+                Ok(Outcome::success())
+            }
+            _ => Err(call.unsupported(
+                "prepo:u:async_context",
+                "play report async context command is not implemented",
+            )),
+        }
+    }
+
     /// stpl:u (GameShare streaming). Only command 0 is documented; the
     /// shim's commands are added as the game uses them.
     /// prepo:u (Switchbrew "Play Report services"). Native-PC policy: play
@@ -5168,6 +5204,14 @@ impl Services {
                 call.shape(0, false, false)?;
                 call.reply(0, None, AOC_INTERFACE_ID, &0u64.to_le_bytes())?;
                 Ok(Outcome::success())
+            }
+            // 10500 (SDK 22's PlayReport::Send(Uid): PID, the user and
+            // event in the arguments, the report data through a copied
+            // handle, the event name in a pointer buffer) -> IAsyncContext.
+            // Discarded like the reports above; the context's commands are
+            // added as the game uses them.
+            10500 => {
+                self.reply_new_object(call, ServiceObject::PlayReportContext, AOC_INTERFACE_ID)
             }
             // IsUserAgreementCheckEnabled -> bool (no agreement to check).
             10600 => {
@@ -8554,7 +8598,7 @@ impl Services {
             }
             ReadableEventKind::SyncpointCacheRequest
             | ReadableEventKind::SyncpointCacheCompleted
-            | ReadableEventKind::AccountAsyncDone
+            | ReadableEventKind::AsyncContextDone
             | ReadableEventKind::GpuNotification { .. }
             | ReadableEventKind::AudioDeviceOutput
             | ReadableEventKind::AudioOutBuffer
