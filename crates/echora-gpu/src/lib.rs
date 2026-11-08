@@ -14,5 +14,6 @@ pub mod loop_guard;
 pub mod present;
 pub mod renderer;
 pub mod shader;
+mod shader_cache;
 mod timing;
 pub mod vulkan;

@@ -236,6 +236,9 @@ pub struct Renderer {
     pub hazard_barriers: u64,
     /// GPU time per submission (ECHORA_GPU_TIME=1).
     timer: Option<crate::timing::GpuTimer>,
+    /// Where linked shader objects' driver binaries are kept between runs
+    /// (see `crate::shader_cache`), if anywhere.
+    pub(crate) shader_cache: Option<std::path::PathBuf>,
 }
 
 type SamplerKey = (i32, i32, i32, bool, [i32; 3], [u32; 3]);
@@ -394,6 +397,7 @@ impl Renderer {
             crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
         let mut renderer = Self {
             timer,
+            shader_cache: None,
             gpu,
             pool,
             commands,
@@ -1939,6 +1943,12 @@ impl Renderer {
     /// Chooses the render target scale. Call before any target exists.
     pub fn set_resolution_scale(&mut self, scale: Scale) {
         self.scale = scale;
+    }
+
+    /// Keep compiled shader binaries in `directory` and load them from
+    /// there in later runs instead of compiling the same SPIR-V again.
+    pub fn set_shader_cache(&mut self, directory: std::path::PathBuf) {
+        self.shader_cache = Some(directory);
     }
 
     pub fn resolution_scale(&self) -> Scale {

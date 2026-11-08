@@ -116,6 +116,11 @@ impl Backend {
         }
         let gpu = echora_gpu::vulkan::Gpu::new()?;
         let mut renderer = Renderer::new(gpu)?;
+        // ECHORA_SHADER_CACHE=DIR (set by `echora run`): compiled shaders
+        // are kept there for the next run.
+        if let Some(directory) = super::debug_var_os("ECHORA_SHADER_CACHE") {
+            renderer.set_shader_cache(directory.into());
+        }
         if echora_gpu::renderer::Scale::env_override().is_none()
             && let Some((numerator, denominator)) = crate::settings::render_scale()
         {

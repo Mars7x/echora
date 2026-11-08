@@ -394,6 +394,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if std::env::var_os("EDEN_NX2_TENSOR").is_none() {
                 command.env("EDEN_NX2_TENSOR", "1");
             }
+            // Compiled shaders are kept beside the translation, for the
+            // same program's next run.
+            if std::env::var_os("ECHORA_SHADER_CACHE").is_none() {
+                command.env("ECHORA_SHADER_CACHE", translation.join("shader-cache"));
+            }
             // Saves go under the per-user data directory unless the
             // environment chooses a save or work directory.
             if std::env::var_os("ECHORA_SAVE_DIR").is_none()

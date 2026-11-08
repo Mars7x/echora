@@ -34,6 +34,9 @@ pub struct Gpu {
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
+    /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
+    /// binaries it wrote load again only while both are unchanged.
+    pub shader_binary_version: ([u8; 16], u32),
     pub name: String,
 }
 
@@ -133,9 +136,16 @@ impl Gpu {
         // Guest programs assume 32-lane warps: compute shaders require that
         // width where the driver allows it (RADV runs 64 by default).
         let mut size_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut size_control);
+        let mut object_properties = vk::PhysicalDeviceShaderObjectPropertiesEXT::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut size_control)
+            .push_next(&mut object_properties);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+        let shader_binary_version = (
+            object_properties.shader_binary_uuid,
+            object_properties.shader_binary_version,
+        );
         let compute_subgroup_32 = supported13.subgroup_size_control != 0
             && (size_control.min_subgroup_size..=size_control.max_subgroup_size).contains(&32)
             && size_control
@@ -303,6 +313,7 @@ impl Gpu {
             compute_subgroup_32,
             host_import,
             mesh_shader,
+            shader_binary_version,
             name,
         })
     }
