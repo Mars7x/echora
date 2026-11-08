@@ -301,6 +301,10 @@ pub struct Machine {
     /// turn. It keeps its core: nothing else runs there, and it resumes on
     /// no other, until it ends a slice with dispatch enabled.
     core_hold: [Option<u64>; 64],
+    /// The thread the worker holding the machine goes on running after a
+    /// boundary (set by `request_preemptions`, cleared when the worker
+    /// idles): `parked_workers_with_work` wakes no one for it.
+    keeps_running: Option<u64>,
     /// Step count of the last scan of parked waits.
     last_wake_check: u64,
     /// With several workers: the threads other workers are running now
@@ -422,6 +426,7 @@ impl Machine {
             spin_backoff: Default::default(),
             core_last_thread: [0; 64],
             core_hold: [None; 64],
+            keeps_running: None,
             last_wake_check: 0,
             running: Default::default(),
             worker_core: None,
@@ -820,6 +825,9 @@ impl Machine {
     /// runnable thread and returns true, or false when nothing can ever wake
     /// (no deadline and no signal source outside the guest).
     fn idle_until_runnable(&mut self) -> Result<bool, Trap> {
+        // This worker runs nothing now: its last thread, if runnable, is
+        // anyone's (it may have moved to another worker's core).
+        self.keeps_running = None;
         loop {
             self.wake_ready_waiters()?;
             let current = self.core.current_thread_id;
@@ -1682,6 +1690,41 @@ impl Machine {
         Ok(0)
     }
 
+    /// The scheduling diagnostics: ECHORA_ANY_CORE, ECHORA_FLAT_PRIORITY,
+    /// ECHORA_ONE_CORE and ECHORA_PARALLEL_THREADS (see
+    /// `next_runnable_thread`). Read once: they apply at every scheduling
+    /// decision.
+    fn scheduler_flags() -> &'static (bool, bool, bool, Option<Vec<u64>>) {
+        static FLAGS: std::sync::LazyLock<(bool, bool, bool, Option<Vec<u64>>)> =
+            std::sync::LazyLock::new(|| {
+                let set = |name| std::env::var_os(name).is_some();
+                let split = std::env::var("ECHORA_PARALLEL_THREADS").ok().map(|list| {
+                    list.split(',')
+                        .filter_map(|item| item.trim().parse().ok())
+                        .collect()
+                });
+                (
+                    set("ECHORA_ANY_CORE"),
+                    set("ECHORA_FLAT_PRIORITY"),
+                    set("ECHORA_ONE_CORE"),
+                    split,
+                )
+            });
+        &FLAGS
+    }
+
+    /// The guest cores this worker schedules one by one: its cores, unless
+    /// there is no worker or a diagnostic merges them into one group.
+    fn scheduled_guest_cores(&self) -> u64 {
+        let (any_core, _, one_core, split) = Self::scheduler_flags();
+        match self.worker_core {
+            Some(core) if !any_core && !one_core && split.is_none() => {
+                self.worker_guest_cores(core)
+            }
+            _ => 0,
+        }
+    }
+
     /// The runnable thread after `after` in id order (wrapping). Threads
     /// backing off from a spin-wait are passed over while any other
     /// thread is runnable.
@@ -1699,22 +1742,7 @@ impl Machine {
         // ECHORA_PARALLEL_THREADS=ID,... (diagnostic): only those threads run
         // on worker 1, all others on worker 0. Read once: this runs at
         // every scheduling decision.
-        static FLAGS: std::sync::LazyLock<(bool, bool, bool, Option<Vec<u64>>)> =
-            std::sync::LazyLock::new(|| {
-                let set = |name| std::env::var_os(name).is_some();
-                let split = std::env::var("ECHORA_PARALLEL_THREADS").ok().map(|list| {
-                    list.split(',')
-                        .filter_map(|item| item.trim().parse().ok())
-                        .collect()
-                });
-                (
-                    set("ECHORA_ANY_CORE"),
-                    set("ECHORA_FLAT_PRIORITY"),
-                    set("ECHORA_ONE_CORE"),
-                    split,
-                )
-            });
-        let (any_core, flat_priority, one_core, split) = &*FLAGS;
+        let (any_core, flat_priority, one_core, split) = Self::scheduler_flags();
         let (any_core, flat_priority, one_core) = (*any_core, *flat_priority, *one_core);
         let allowed = |id: u64| -> bool {
             if one_core {
@@ -1751,12 +1779,7 @@ impl Machine {
         // the next core with work after `after`'s. With one core per worker
         // (W=6) every thread shares the worker's core and this is strict
         // priority as before; the diagnostics above keep one group.
-        let cores = match self.worker_core {
-            Some(core) if !any_core && !one_core && split.is_none() => {
-                self.worker_guest_cores(core)
-            }
-            _ => 0,
-        };
+        let cores = self.scheduled_guest_cores();
         // A thread holding a core (dispatch disabled) runs only there.
         let held_at = |id: u64| -> Option<u8> {
             (0..64u8).find(|&core| self.core_hold[usize::from(core)] == Some(id))
@@ -1779,7 +1802,7 @@ impl Machine {
                 return true;
             }
             if let Some(held) = held_at(id) {
-                return cores & 1 << held != 0 && held == core;
+                return cores & 1 << held != 0;
             }
             !self.core_hold[usize::from(core) % 64].is_some_and(|holder| holding(holder))
         };
@@ -1787,7 +1810,13 @@ impl Machine {
         let candidates: Vec<(u64, u8, u8, bool)> = main
             .into_iter()
             .chain(self.threads.runnable_ids())
-            .filter(|&id| exclude != Some(id) && !self.running.contains(&id) && allowed(id))
+            // A core's holder runs there even if its mask has moved on
+            // since: it migrates once it ends a slice with dispatch enabled.
+            .filter(|&id| {
+                exclude != Some(id)
+                    && !self.running.contains(&id)
+                    && (allowed(id) || held_at(id).is_some_and(|held| cores & 1 << held != 0))
+            })
             .map(|id| {
                 let spinning = self
                     .spin_backoff
@@ -1849,6 +1878,7 @@ impl Machine {
     /// thread it wakes runs before the waker's core goes on).
     fn request_preemptions(&mut self) {
         self.note_core_thread();
+        self.keeps_running = Some(self.core.current_thread_id);
         let priority = |machine: &Machine, id: u64| -> u8 {
             if id == machine.layout.main_thread_id {
                 machine.main_thread_effective_priority
@@ -1903,9 +1933,14 @@ impl Machine {
             return;
         };
         let current = self.core.current_thread_id;
-        if self.worker_guest_cores(worker).count_ones() > 1 {
+        let cores = self.worker_guest_cores(worker);
+        if cores.count_ones() > 1 {
+            // Not a core of another worker's (a mask moved while dispatch
+            // is disabled leaves the thread here, on the core it ran on).
             let core = self.guest_core_on_worker(current, worker);
-            self.core_last_thread[usize::from(core) % 64] = current;
+            if cores & 1 << core != 0 {
+                self.core_last_thread[usize::from(core) % 64] = current;
+            }
         }
     }
 
@@ -1915,13 +1950,25 @@ impl Machine {
     /// one core per worker (or one worker) there is no other turn: None.
     fn dispatch_disabled_turn(&mut self) -> Option<u64> {
         let worker = self.worker_core?;
-        if self.worker_guest_cores(worker).count_ones() < 2 {
+        if self.scheduled_guest_cores().count_ones() < 2 {
             return None;
         }
         let current = self.core.current_thread_id;
-        let core = (0..64)
+        // The core it runs on: one it already holds, else its home here,
+        // else (its mask has moved to another worker's cores since it was
+        // dispatched) the core of this worker it last ran on.
+        let cores = self.worker_guest_cores(worker);
+        let home = usize::from(self.guest_core_on_worker(current, worker)) % 64;
+        let Some(core) = (0..64)
             .find(|&core| self.core_hold[core] == Some(current))
-            .unwrap_or_else(|| usize::from(self.guest_core_on_worker(current, worker)) % 64);
+            .or_else(|| (cores & 1 << home != 0).then_some(home))
+            .or_else(|| {
+                (0..64)
+                    .find(|&core| cores & 1 << core != 0 && self.core_last_thread[core] == current)
+            })
+        else {
+            return None;
+        };
         self.core_hold[core] = Some(current);
         let next = self.next_runnable_thread(current, None);
         if next.is_none_or(|next| next == current) {
@@ -1999,7 +2046,8 @@ impl Machine {
                 continue;
             }
             self.worker_core = Some(worker as u8);
-            if self.next_runnable_thread(current, Some(current)).is_some() {
+            let exclude = self.keeps_running.filter(|&id| id == current);
+            if self.next_runnable_thread(current, exclude).is_some() {
                 workers |= 1 << worker;
             }
         }
