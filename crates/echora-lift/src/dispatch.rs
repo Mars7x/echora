@@ -16,6 +16,10 @@
 //! - [`Target::Computed`], an `add` of a shifted or extended register, the
 //!   shape of a table dispatch, without a recovered table. These are the
 //!   ones to look at;
+//! - [`Target::ComputedCall`], a BLR through such an address: an indirect
+//!   call, not a dispatch;
+//! - [`Target::TailCall`], a BR right after a frame-restoring epilogue
+//!   (`ldp x29, x30`, AUTIASP/AUTIBSP, `add sp`): a tail call;
 //! - [`Target::Constant`], an address from ADR, or ADRP and ADD;
 //! - [`Target::Parameter`], no write of the register in the
 //!   [`WINDOW`] instructions before the branch (an argument, such as a
@@ -48,6 +52,12 @@ pub enum Target {
     Return,
     Loaded,
     Computed,
+    /// A BLR through a computed address (a call through a function pointer
+    /// computed from a table or an object): no table dispatch.
+    ComputedCall,
+    /// A BR right after a frame-restoring epilogue: a tail call through a
+    /// register, whatever set it.
+    TailCall,
     Constant,
     Parameter,
     /// Any other instruction wrote the register.
@@ -90,7 +100,18 @@ pub fn audit(translation: &Translation) -> Vec<Dispatch> {
                     definition: None,
                 });
             }
-            let (target, definition) = classify(translation, record.pc, rn);
+            if !link && follows_epilogue(translation, record.pc) {
+                return Some(Dispatch {
+                    pc: record.pc,
+                    link,
+                    target: Target::TailCall,
+                    definition: None,
+                });
+            }
+            let (mut target, definition) = classify(translation, record.pc, rn);
+            if link && target == Target::Computed {
+                target = Target::ComputedCall;
+            }
             Some(Dispatch {
                 pc: record.pc,
                 link,
@@ -99,6 +120,30 @@ pub fn audit(translation: &Translation) -> Vec<Dispatch> {
             })
         })
         .collect()
+}
+
+/// Instructions before a BR searched for a frame-restoring epilogue.
+const EPILOGUE: u64 = 4;
+
+/// Whether one of the few instructions before `pc` restores the caller's
+/// frame: `ldp x29, x30, [sp...]` (any addressing form), AUTIASP or
+/// AUTIBSP, or `add sp, sp, #imm`. A BR after that leaves the function: a
+/// tail call.
+fn follows_epilogue(translation: &Translation, pc: u64) -> bool {
+    (1..=EPILOGUE).any(|step| {
+        let Some(record) = pc
+            .checked_sub(step * 4)
+            .and_then(|at| translation.instructions.get(&at))
+        else {
+            return false;
+        };
+        let word = record.word;
+        let frame_pair = matches!(word & 0xffc0_0000, 0xa8c0_0000 | 0xa940_0000 | 0xa9c0_0000)
+            && word & 0x7fff == (30 << 10) | (31 << 5) | 29;
+        let authenticate = matches!(word, 0xd503_23bf | 0xd503_23ff);
+        let release_frame = word & 0xff00_03ff == 0x9100_03ff;
+        frame_pair || authenticate || release_frame
+    })
 }
 
 /// How register `register` got its value before `pc`.
@@ -171,11 +216,14 @@ pub fn report(translation: &Translation, dispatches: &[Dispatch]) -> String {
     let _ = writeln!(
         text,
         "indirect branches: {} jump tables, {} returns, {} loaded pointers, {} computed \
-         without a table, {} constants, {} parameters, {} other",
+         without a table, {} computed calls, {} tail calls, {} constants, {} parameters, \
+         {} other",
         count(|t| matches!(t, Target::JumpTable { .. })),
         count(|t| *t == Target::Return),
         count(|t| *t == Target::Loaded),
         count(|t| *t == Target::Computed),
+        count(|t| *t == Target::ComputedCall),
+        count(|t| *t == Target::TailCall),
         count(|t| *t == Target::Constant),
         count(|t| *t == Target::Parameter),
         count(|t| *t == Target::Other),
@@ -248,6 +296,32 @@ mod tests {
         let text = report(&translation, &dispatches);
         assert!(text.contains("computed br at 0x1008"), "{text}");
         assert!(text.contains("0x1004: 8b080928"), "{text}");
+    }
+
+    #[test]
+    fn computed_calls_are_not_dispatch_candidates() {
+        // ldrsw x8, [x9, w0, uxtw #2]; add x8, x9, x8, lsl #2; blr x8; ret
+        let dispatches = audit(&translation(&[
+            0xb8a0_5928,
+            0x8b08_0928,
+            0xd63f_0100,
+            0xd65f_03c0,
+        ]));
+        assert_eq!(dispatches[0].target, Target::ComputedCall);
+        assert_eq!(unrecovered(&dispatches).count(), 0);
+    }
+
+    #[test]
+    fn branches_after_an_epilogue_are_tail_calls() {
+        // add x1, x2, x3, lsl #3 (computed); ldp x29, x30, [sp], #16;
+        // autibsp; br x1, as at main+0x556308.
+        let words = [0x8b03_0c41, 0xa8c1_7bfd, 0xd503_23ff, 0xd61f_0020];
+        let dispatches = audit(&translation(&words));
+        assert_eq!(dispatches[0].target, Target::TailCall);
+        assert_eq!(unrecovered(&dispatches).count(), 0);
+        // add sp, sp, #32; br x1
+        let dispatches = audit(&translation(&[0x9100_83ff, 0xd61f_0020]));
+        assert_eq!(dispatches[0].target, Target::TailCall);
     }
 
     #[test]
