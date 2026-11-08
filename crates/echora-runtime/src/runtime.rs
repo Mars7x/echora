@@ -2751,6 +2751,24 @@ impl Machine {
                     self.process_exit_requested = true;
                     self.process_exit_reason = Some("host_stop_request");
                 }
+                // ECHORA_PROFILE_FROM=N: the lock, boundary, thread, IPC and
+                // NVN timings restart at present N, so the report profiles
+                // one phase of a long run (such as after the opening movie).
+                if crate::nvn::debug_var("ECHORA_PROFILE_FROM")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|from| self.nvn.presented_frames == from)
+                {
+                    self.lock_stats = [0; 3];
+                    self.lock_free_nvn_calls = 0;
+                    self.boundary_kinds.fill(0);
+                    self.boundary_held.fill(0);
+                    self.thread_time.clear();
+                    self.pc_samples.clear();
+                    self.services.reset_profile();
+                    self.nvn.calls.clear();
+                    self.nvn.call_microseconds.clear();
+                }
             }
             return Ok(());
         }

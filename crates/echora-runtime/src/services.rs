@@ -1045,6 +1045,9 @@ pub struct Services {
     readable_events: BTreeMap<ReadableEventId, ReadableEvent>,
     trace: std::collections::VecDeque<IpcEvent>,
     trace_omitted: u64,
+    /// ECHORA_IPC_PROFILE: host microseconds handling requests, by service
+    /// and command.
+    ipc_microseconds: BTreeMap<String, u64>,
     private_parse_failures: Vec<PrivateIpcParseFailure>,
     session_close_requests: u64,
     parse_failures_omitted: u64,
@@ -1222,6 +1225,7 @@ impl Default for Services {
             readable_events: BTreeMap::new(),
             trace: Default::default(),
             trace_omitted: 0,
+            ipc_microseconds: BTreeMap::new(),
             private_parse_failures: Vec::new(),
             session_close_requests: 0,
             parse_failures_omitted: 0,
@@ -2214,7 +2218,16 @@ impl Services {
             request: &request,
             original_bytes: &bytes,
         };
+        let profile = crate::nvn::debug_var_os("ECHORA_IPC_PROFILE")
+            .is_some()
+            .then(std::time::Instant::now);
         let outcome = self.dispatch(&session, &mut call)?;
+        if let Some(started) = profile {
+            *self
+                .ipc_microseconds
+                .entry(format!("{service}:{}", request.command_id))
+                .or_default() += started.elapsed().as_micros() as u64;
+        }
         if let Some(index) = event_index {
             self.trace[index].completed = true;
             self.trace[index].service_result = outcome.result;
@@ -2223,6 +2236,11 @@ impl Services {
             self.trace[index].output_copy_handle_count = outcome.output_copy_handle_count;
         }
         Ok(())
+    }
+
+    /// Restart the request timings (ECHORA_PROFILE_FROM).
+    pub(crate) fn reset_profile(&mut self) {
+        self.ipc_microseconds.clear();
     }
 
     /// Reply with a copy of a new, signaled completion event for an async
@@ -8921,6 +8939,7 @@ impl Services {
             "available_named_ports":["sm:"], "process_model":"single_local_process",
             "sessions":self.sessions, "trace":self.trace,
             "trace_limit":MAX_TRACE, "trace_omitted":self.trace_omitted,
+            "ipc_microseconds":self.ipc_microseconds,
             "supported_sm_commands":[0,1], "service_lookup_decoding_only":false,
             "cmif_reply_profile":"generic_sf", "live_sm_cmif_compatibility_verified":false,
             "service_backends":["lm","appletOE"], "filesystem_services_implemented":false,
