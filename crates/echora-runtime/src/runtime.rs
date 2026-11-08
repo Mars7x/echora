@@ -1233,7 +1233,7 @@ impl Machine {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         for (target, value) in [(key, 1), (address, plan.next_word)] {
             match self.memory.check_write(target, 4) {
-                Ok(()) => self.memory.write_u32(target, value)?,
+                Ok(()) => self.guest_store_u32(target, value)?,
                 Err(Trap::MemoryFault { .. }) => return Ok(Some(0xd401)),
                 Err(trap) => return Err(trap),
             }
@@ -1354,6 +1354,21 @@ impl Machine {
             true,
         )?;
         Ok(seen as u32)
+    }
+
+    /// Store a guest word atomically: with several workers, guest code on
+    /// other cores may compare-and-swap it at the same time.
+    fn guest_store_u32(&mut self, address: u64, value: u32) -> Result<(), Trap> {
+        self.memory.check_write(address, 4)?;
+        self.core.memory.atomic_rmw_single_thread(
+            address,
+            4,
+            echora_guest::memory::AtomicOp::Swap,
+            u64::from(value),
+            false,
+            true,
+        )?;
+        Ok(())
     }
 
     /// Atmosphere UpdateLockAtomic: take the mutex word for `tag` if it is

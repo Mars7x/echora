@@ -101,13 +101,17 @@ fn atomics_and_ordered_accesses() {
     assert_eq!(m.memory.read_u32(0x8000).unwrap(), 0);
     assert_eq!(m.core.cpu.regs[1], 0x1234);
     assert_eq!(m.core.cpu.sp, 0x8000);
-    for address in [0x8002] {
+    // FEAT_LSE2: an unaligned CAS faults only when it crosses a 16-byte
+    // boundary.
+    for address in [0x800e] {
         let mut m = machine();
         m.core.cpu.regs[0] = address;
         m.core.cpu.regs[8] = 0xabcdef1200001234;
         m.core.cpu.regs[20] = 0x5678;
         m.core.cpu.nzcv = 0xd;
         m.memory.write_u64(0x8000, u64::MAX).unwrap();
+        m.memory.write_u64(0x8008, u64::MAX).unwrap();
+        m.memory.write_u64(0x8010, u64::MAX).unwrap();
         let before = m.core.cpu.clone();
         assert!(matches!(
             cas_word::run(&mut m),
@@ -115,7 +119,8 @@ fn atomics_and_ordered_accesses() {
         ));
         assert_eq!(m.core.cpu, before);
         assert_eq!(m.core.steps, 1);
-        assert_eq!(m.memory.read_u64(0x8000).unwrap(), u64::MAX);
+        assert_eq!(m.memory.read_u64(0x8008).unwrap(), u64::MAX);
+        assert_eq!(m.memory.read_u64(0x8010).unwrap(), u64::MAX);
     }
     let mut m = machine();
     m.core.cpu.sp = 0x8004;
@@ -219,12 +224,14 @@ fn atomics_and_ordered_accesses() {
     assert_eq!(m.core.cpu.sp, 0x8000);
     assert_eq!(m.core.cpu.nzcv, 9);
     assert_eq!(m.memory.read_u64(0x8000).unwrap(), 0);
-    for address in [0x8002] {
+    // FEAT_LSE2: an unaligned LDADD faults only across a 16-byte boundary.
+    for address in [0x800e] {
         let mut m = machine();
         m.core.cpu.regs[0] = address;
         m.core.cpu.regs[8] = 0xabcdef1200000001;
         m.core.cpu.nzcv = 0xf;
-        m.memory.write_u64(0x8000, u64::MAX).unwrap();
+        m.memory.write_u64(0x8008, u64::MAX).unwrap();
+        m.memory.write_u64(0x8010, u64::MAX).unwrap();
         let before = m.core.cpu.clone();
         assert!(matches!(
             ldadd_word_alias::run(&mut m),
@@ -232,7 +239,8 @@ fn atomics_and_ordered_accesses() {
         ));
         assert_eq!(m.core.cpu, before);
         assert_eq!(m.core.steps, 1);
-        assert_eq!(m.memory.read_u64(0x8000).unwrap(), u64::MAX);
+        assert_eq!(m.memory.read_u64(0x8008).unwrap(), u64::MAX);
+        assert_eq!(m.memory.read_u64(0x8010).unwrap(), u64::MAX);
     }
     let mut m = machine();
     m.core.cpu.sp = 0x8008;

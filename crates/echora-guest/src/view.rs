@@ -14,6 +14,7 @@
 use crate::Trap;
 use crate::host_memory::GuestAccess;
 use crate::memory::AtomicOp;
+use portable_atomic::AtomicU128;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 /// The local exclusive monitor in Exclusive Access state: the marked address
@@ -66,6 +67,21 @@ fn aligned(address: u64, bytes: u8, what: &str) -> Result<(), Trap> {
         Err(Trap::MemoryFault {
             address,
             access: format!("unaligned {bytes}-byte {what}"),
+        })
+    }
+}
+
+/// FEAT_LSE2: an LSE atomic (CAS, LD<op>, SWP) at an unaligned address is
+/// single-copy atomic, and does not fault, when it stays within one aligned
+/// 16-byte block; one that crosses a block boundary faults. OoT updates
+/// reference counts in subobjects at odd offsets this way.
+fn within_block(address: u64, bytes: u8, what: &str) -> Result<(), Trap> {
+    if (address & 15) + u64::from(bytes) <= 16 {
+        Ok(())
+    } else {
+        Err(Trap::MemoryFault {
+            address,
+            access: format!("{bytes}-byte {what} crossing a 16-byte boundary"),
         })
     }
 }
@@ -205,7 +221,24 @@ impl GuestView {
         self.write(address, &value.to_le_bytes())
     }
 
+    /// The 16-byte block holding an unaligned `bytes`-byte element at
+    /// `address` (see `within_block`), and the element's bit offset and mask
+    /// in it.
+    fn block(&self, address: u64, bytes: u8, write: bool) -> (&AtomicU128, u32, u128) {
+        let pointer = self.access.atomic(address & !15, write);
+        // SAFETY: 16-byte aligned and inside the reservation; the guest
+        // view's protections fault on anything the guest may not access, as
+        // in `atomic_load`.
+        let block = unsafe { AtomicU128::from_ptr(pointer.cast()) };
+        let mask = u128::from(u64::MAX >> (64 - u32::from(bytes) * 8));
+        (block, (address & 15) as u32 * 8, mask)
+    }
+
     fn atomic_load(&self, address: u64, bytes: u8, order: Ordering) -> u64 {
+        if !address.is_multiple_of(u64::from(bytes)) {
+            let (block, shift, mask) = self.block(address, bytes, false);
+            return ((block.load(order) >> shift) & mask) as u64;
+        }
         let pointer = self.access.atomic(address, false);
         // SAFETY: aligned (checked by callers) and inside the reservation.
         unsafe {
@@ -219,6 +252,14 @@ impl GuestView {
     }
 
     fn atomic_store(&self, address: u64, bytes: u8, value: u64, order: Ordering) {
+        if !address.is_multiple_of(u64::from(bytes)) {
+            let (block, shift, mask) = self.block(address, bytes, true);
+            let lane = (u128::from(value) & mask) << shift;
+            let _ = block.fetch_update(order, Ordering::Relaxed, |old| {
+                Some(old & !(mask << shift) | lane)
+            });
+            return;
+        }
         let pointer = self.access.atomic(address, true);
         // SAFETY: as in `atomic_load`.
         unsafe {
@@ -241,6 +282,21 @@ impl GuestView {
         new: u64,
         orders: (Ordering, Ordering),
     ) -> u64 {
+        if !address.is_multiple_of(u64::from(bytes)) {
+            let (block, shift, mask) = self.block(address, bytes, true);
+            let mut current = block.load(Ordering::Relaxed);
+            loop {
+                let observed = ((current >> shift) & mask) as u64;
+                if observed != expected {
+                    return observed;
+                }
+                let next = current & !(mask << shift) | (u128::from(new) & mask) << shift;
+                match block.compare_exchange_weak(current, next, orders.0, orders.1) {
+                    Ok(_) => return observed,
+                    Err(seen) => current = seen,
+                }
+            }
+        }
         let pointer = self.access.atomic(address, true);
         let (success, failure) = orders;
         // SAFETY: as in `atomic_load`.
@@ -293,7 +349,7 @@ impl GuestView {
         release: bool,
     ) -> Result<u64, Trap> {
         element_size(bytes, "CAS")?;
-        aligned(address, bytes, "atomic compare-and-swap")?;
+        within_block(address, bytes, "atomic compare-and-swap")?;
         let mask = u64::MAX >> (64 - u32::from(bytes) * 8);
         Ok(self.atomic_cas(
             address,
@@ -333,7 +389,7 @@ impl GuestView {
                 // SAFETY: 16-byte aligned (checked above) and inside the
                 // reservation; the guest view's protections fault on
                 // anything the guest may not access, as in `atomic_load`.
-                let atomic = unsafe { portable_atomic::AtomicU128::from_ptr(pointer.cast()) };
+                let atomic = unsafe { AtomicU128::from_ptr(pointer.cast()) };
                 let old = atomic
                     .compare_exchange(join(expected), join(desired), orders.0, orders.1)
                     .unwrap_or_else(|observed| observed);
@@ -355,7 +411,7 @@ impl GuestView {
         release: bool,
     ) -> Result<u64, Trap> {
         element_size(bytes, "LDADD")?;
-        aligned(address, bytes, "atomic fetch-add")?;
+        within_block(address, bytes, "atomic fetch-add")?;
         Ok(
             self.atomic_update(address, bytes, orderings(acquire, release), |old| {
                 old.wrapping_add(addend)
@@ -374,7 +430,7 @@ impl GuestView {
         release: bool,
     ) -> Result<u64, Trap> {
         element_size(bytes, "atomic")?;
-        aligned(address, bytes, "atomic read-modify-write")?;
+        within_block(address, bytes, "atomic read-modify-write")?;
         let bits = u32::from(bytes) * 8;
         let mask = u64::MAX >> (64 - bits);
         let signed = |value: u64| ((value << (64 - bits)) as i64) >> (64 - bits);
@@ -540,6 +596,48 @@ mod tests {
     }
 
     #[test]
+    fn unaligned_atomics_within_a_16_byte_block_update_only_their_bytes() {
+        let memory = memory();
+        let mut view = memory.view();
+        view.write(0x1000, &[0xaa; 16]).unwrap();
+        // A reference count at an odd offset, as in OoT's subobjects.
+        view.write_u32(0x1001, 5).unwrap();
+        assert_eq!(
+            view.fetch_add_single_thread(0x1001, 4, 1, true, true)
+                .unwrap(),
+            5
+        );
+        assert_eq!(memory.read_u32(0x1001).unwrap(), 6);
+        assert_eq!(memory.read_u8(0x1000).unwrap(), 0xaa);
+        assert_eq!(memory.read_u8(0x1005).unwrap(), 0xaa);
+        assert_eq!(
+            view.compare_exchange_single_thread(0x1009, 2, 0xaaaa, 0x1234, false, false)
+                .unwrap(),
+            0xaaaa
+        );
+        assert_eq!(memory.read_u16(0x1009).unwrap(), 0x1234);
+        assert_eq!(
+            view.compare_exchange_single_thread(0x1009, 2, 0, 7, false, false)
+                .unwrap(),
+            0x1234
+        );
+        assert_eq!(
+            view.atomic_rmw_single_thread(0x1009, 2, AtomicOp::Swap, 9, false, true)
+                .unwrap(),
+            0x1234
+        );
+        assert_eq!(memory.read_u16(0x1009).unwrap(), 9);
+        assert_eq!(memory.read_u8(0x1008).unwrap(), 0xaa);
+        assert_eq!(memory.read_u8(0x100b).unwrap(), 0xaa);
+        // Crossing a block boundary still faults, changing nothing.
+        assert!(
+            view.fetch_add_single_thread(0x100e, 4, 1, false, false)
+                .is_err()
+        );
+        assert_eq!(memory.read_u16(0x100e).unwrap(), 0xaaaa);
+    }
+
+    #[test]
     fn atomics_see_and_change_the_bytes_memory_holds() {
         let memory = memory();
         let mut view = memory.view();
@@ -567,7 +665,7 @@ mod tests {
             .unwrap();
         assert_eq!((old, view.load_u8(0x1008)), (0xf0, 0x10));
         assert!(
-            view.fetch_add_single_thread(0x1001, 4, 1, false, false)
+            view.fetch_add_single_thread(0x100d, 4, 1, false, false)
                 .is_err()
         );
     }
