@@ -1,0 +1,32 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -172,6 +172,13 @@
+             }
+             current_block = node.data.block;
+             ctx.AddLabel(label);
++            // A block RemoveUnreachableBlocks took out of program.blocks
++            // (dead code after an endless loop, say) keeps its place in the
++            // structure, but no pass ran over its instructions: it is
++            // emitted empty and falls through as the syntax list says.
++            if (std::ranges::find(program.blocks, node.data.block) == program.blocks.end()) {
++                break;
++            }
+             for (IR::Inst& inst : node.data.block->Instructions()) {
+                 EmitInst(ctx, &inst);
+             }
+@@ -245,6 +252,14 @@
+     for (IR::Block* const block : program.blocks) {
+         block->SetDefinition(ctx.OpLabel());
+     }
++    // Blocks of the syntax list that are no longer in program.blocks still
++    // get labels: the structure around them branches to them.
++    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
++        if (node.type == IR::AbstractSyntaxNode::Type::Block &&
++            std::ranges::find(program.blocks, node.data.block) == program.blocks.end()) {
++            node.data.block->SetDefinition(ctx.OpLabel());
++        }
++    }
+     Traverse(ctx, program);
+     ctx.OpFunctionEnd();
+     return main;
