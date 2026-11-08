@@ -363,15 +363,17 @@ fn written_register(word: u32) -> Option<u8> {
         }
         let load = if word & 0x3800_0000 == 0x3800_0000 {
             // Single register (immediate, register offset, pre/post-index):
-            // opc 00 is a store.
-            (word >> 22) & 3 != 0
+            // opc 00 is a store, and size 11 with opc 10 is PRFM, whose Rt
+            // names a prefetch operation (PLDL1KEEP is 0), not a register.
+            let opc = (word >> 22) & 3;
+            opc != 0 && !(word >> 30 == 3 && opc == 2)
         } else if word & 0x3800_0000 == 0x2800_0000 || word & 0x3800_0000 == 0x0800_0000 {
             // Pairs and exclusives: L bit. Only the first destination is
             // reported; a jump-table scan never tracks a pair's second one.
             (word >> 22) & 1 == 1
         } else {
-            // Literal loads.
-            word & 0x3b00_0000 == 0x1800_0000
+            // Literal loads; opc 11 is PRFM (literal).
+            word & 0x3b00_0000 == 0x1800_0000 && word >> 30 != 3
         };
         return load.then_some(rd);
     }
@@ -4038,6 +4040,46 @@ mod tests {
         .unwrap();
         let first_case = 0x1020 + 300 * 4;
         for case in [first_case, first_case + 4, first_case + 8] {
+            assert!(translation.instructions.contains_key(&case), "{case:#x}");
+        }
+    }
+
+    #[test]
+    fn jump_tables_look_past_prefetches_of_operation_zero() {
+        // As `jump_tables_seed_every_case` with the table in x0, and a
+        // `prfm pldl1keep, [x1]` (Rt 0) between its address and the
+        // dispatch, as in the loop at main+0x1da0660.
+        let words = [
+            0xb000_0000,
+            0x9100_4000,
+            0xf980_0020,
+            0x7100_0a3f,
+            0x5400_00e8,
+            0x7871_7800,
+            0x1000_0063,
+            0x8b00_0863,
+            0xd61f_0060,
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+        ];
+        let mut table = vec![0u8; 16];
+        table.extend([0, 0, 1, 0, 2, 0]);
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        for case in [0x1024, 0x1028, 0x102c] {
             assert!(translation.instructions.contains_key(&case), "{case:#x}");
         }
     }
