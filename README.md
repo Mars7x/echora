@@ -21,6 +21,9 @@ Echora is a personal project that I build for my own enjoyment. It doesn't
 include any game code, assets or keys, so you'll need your own copy of the
 game.
 
+> [!IMPORTANT]
+> Echora is made with the help of AI.
+
 ## Status
 
 The game boots, shows the title screen and plays the opening movie in colour
