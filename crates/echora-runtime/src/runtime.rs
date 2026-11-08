@@ -1677,22 +1677,32 @@ impl Machine {
         // mask naming no application core is allowed anywhere.
         // ECHORA_ANY_CORE / ECHORA_FLAT_PRIORITY (diagnostics): schedule as
         // one worker does, ignoring affinity or priority.
-        let any_core = crate::nvn::debug_var_os("ECHORA_ANY_CORE").is_some();
-        let flat_priority = crate::nvn::debug_var_os("ECHORA_FLAT_PRIORITY").is_some();
-        let one_core = crate::nvn::debug_var_os("ECHORA_ONE_CORE").is_some();
         // ECHORA_PARALLEL_THREADS=ID,... (diagnostic): only those threads run
-        // on worker 1, all others on worker 0.
-        let split = crate::nvn::debug_var_os("ECHORA_PARALLEL_THREADS");
+        // on worker 1, all others on worker 0. Read once: this runs at
+        // every scheduling decision.
+        static FLAGS: std::sync::LazyLock<(bool, bool, bool, Option<Vec<u64>>)> =
+            std::sync::LazyLock::new(|| {
+                let set = |name| std::env::var_os(name).is_some();
+                let split = std::env::var("ECHORA_PARALLEL_THREADS").ok().map(|list| {
+                    list.split(',')
+                        .filter_map(|item| item.trim().parse().ok())
+                        .collect()
+                });
+                (
+                    set("ECHORA_ANY_CORE"),
+                    set("ECHORA_FLAT_PRIORITY"),
+                    set("ECHORA_ONE_CORE"),
+                    split,
+                )
+            });
+        let (any_core, flat_priority, one_core, split) = &*FLAGS;
+        let (any_core, flat_priority, one_core) = (*any_core, *flat_priority, *one_core);
         let allowed = |id: u64| -> bool {
             if one_core {
                 return self.worker_core.is_none_or(|core| core == 0);
             }
             if let (Some(list), Some(worker)) = (split, self.worker_core) {
-                let listed = list
-                    .to_string_lossy()
-                    .split(',')
-                    .any(|item| item.trim().parse() == Ok(id));
-                return listed == (worker == 1);
+                return list.contains(&id) == (worker == 1);
             }
             let Some(core) = self.worker_core.filter(|_| !any_core) else {
                 return true;
