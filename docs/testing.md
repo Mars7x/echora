@@ -109,19 +109,21 @@ cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --compare /tmp/befor
 The second run prints each kernel's best and median rate before and after,
 with the change. Single runs vary by several percent, so use several runs.
 
-The cost of the runtime's one machine lock across workers is modelled by a
+The cost of the runtime's machine lock across workers is modelled by a
 third benchmark, without the runtime or the game:
 
 ```
-cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6] [--slice N] [--hold US] [--fast F]]
+cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6] [--hold US] [--nvn-lock global|own|none] [--fast F]]
 ```
 
-W workers on host threads run the arith kernel in `--slice`-instruction
-slices and take one shared mutex for `--hold` microseconds at each slice
-end, except on a `--fast` share of them (part 3 of
-`docs/multicore-review.md`). It prints the aggregate guest rate, the
-speedup over one worker and the shares of time running, waiting for the
-lock and holding it.
+W workers on host threads run the arith kernel in slices, and after each
+slice do `--hold` microseconds of host work, split as the game's is
+measured: 62% NVN, 1.3% slice-end scheduling, the rest SVCs and IPC.
+NVN work runs under the global lock, under its own lock or under none
+(`--nvn-lock`), and `--fast` makes a share of the scheduling lock-free.
+The benchmark prints the aggregate guest rate, the speedup over one
+worker and the shares of time running, waiting and holding the global
+lock.
 
 Codegen choices that are off by default have features on `echora-aot-tests`
 that lift with them on: `inline-vector` (common vector operations as native

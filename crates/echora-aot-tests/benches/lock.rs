@@ -1,27 +1,32 @@
 //! The multi-core cost of one global lock, without the game.
 //!
 //! The runtime's workers run guest code unlocked and take one machine mutex
-//! for all host work: slice ends, SVCs, NVN calls
-//! (docs/multicore-review.md, part 3). This models that. W workers, each
-//! on its own host thread with its own machine, run the arith kernel in
-//! slices of `--slice` guest instructions. At each slice end a worker takes
-//! one shared mutex and does `--hold` microseconds of host work under it,
-//! except on a `--fast` share of slice ends, which skip the lock, as part
-//! 3's lock-free slice-end path would. For each worker count it reports the
-//! aggregate guest rate, the speedup over one worker, and the shares of
-//! wall time spent running guest code, waiting for the lock and holding it.
+//! for host work (docs/multicore-review.md, part 3). This models that. W
+//! workers, each on its own host thread with its own machine, run the
+//! arith kernel in slices of `--slice` guest instructions. After each
+//! slice a worker does `--hold` microseconds of host work, split by kind
+//! with the game's measured shares (main session, W=6, 90 s: 78.3 s held,
+//! 62% NVN host calls, 1.3% slice ends, the rest SVCs and IPC):
+//!
+//! - NVN work (`--nvn`, default 0.62), under the global lock, under an NVN
+//!   lock of its own, or under none (`--nvn-lock global|own|none`;
+//!   dea1c7f moved NVN to its own lock);
+//! - slice-end scheduling (`--sched`, default 0.013), under the global lock
+//!   except on a `--fast` share of slice ends (part 3's lock-free path);
+//! - everything else, under the global lock.
+//!
+//! For each worker count it reports the aggregate guest rate, the speedup
+//! over one worker, and the shares of time running guest code, waiting for
+//! a lock and holding the global one.
 //!
 //! ```text
 //! cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6]
-//!     [--slice N] [--hold US] [--fast F] [--millis MS]]
+//!     [--slice N] [--hold US] [--nvn F] [--nvn-lock global|own|none]
+//!     [--sched F] [--fast F] [--millis MS]]
 //! ```
 //!
-//! The defaults (50,000-instruction slices, 10 us of host work per slice
-//! end) put about 40% of a single worker's time under the lock, as in the
-//! game at six workers. The lock then saturates once W times the hold share
-//! reaches 1: on four host CPUs the model levels off at about 1.5x from
-//! three workers on, as the game's intro does (1.4-1.5x at six). With 80%
-//! of slice ends lock-free (`--fast 0.8`), four workers reach about 3.5x.
+//! The defaults (50,000-instruction slices, 10 us of host work after each)
+//! put about 40% of a single worker's time in host work, as in the game.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,10 +36,20 @@ use echora_aot_tests::{Machine, Trap, kernel_code};
 
 const DATA_BASE: u64 = 0x20_0000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NvnLock {
+    Global,
+    Own,
+    None,
+}
+
 struct Options {
     workers: Vec<usize>,
     slice: u64,
     hold: Duration,
+    nvn: f64,
+    nvn_lock: NvnLock,
+    sched: f64,
     fast: f64,
     run_for: Duration,
 }
@@ -44,6 +59,9 @@ fn options() -> Options {
         workers: vec![1, 2, 3, 4, 6],
         slice: 50_000,
         hold: Duration::from_micros(10),
+        nvn: 0.62,
+        nvn_lock: NvnLock::Global,
+        sched: 0.013,
         fast: 0.0,
         run_for: Duration::from_millis(1500),
     };
@@ -62,6 +80,16 @@ fn options() -> Options {
                 options.hold = Duration::from_micros(value().parse().expect("microseconds"))
             }
             "--fast" => options.fast = value().parse().expect("share 0..1"),
+            "--nvn" => options.nvn = value().parse().expect("share 0..1"),
+            "--sched" => options.sched = value().parse().expect("share 0..1"),
+            "--nvn-lock" => {
+                options.nvn_lock = match value().as_str() {
+                    "global" => NvnLock::Global,
+                    "own" => NvnLock::Own,
+                    "none" => NvnLock::None,
+                    other => panic!("--nvn-lock takes global, own or none, not {other}"),
+                }
+            }
             "--millis" => options.run_for = Duration::from_millis(value().parse().expect("ms")),
             "--bench" => {}
             other => panic!("unknown option {other}"),
@@ -86,7 +114,13 @@ fn spin_for(duration: Duration) {
     }
 }
 
-fn worker(index: usize, options: &Options, lock: &Mutex<()>, start: Instant) -> Totals {
+fn worker(
+    index: usize,
+    options: &Options,
+    lock: &Mutex<()>,
+    nvn_lock: &Mutex<()>,
+    start: Instant,
+) -> Totals {
     let image = kernels::image();
     let mut m = Machine::with_layout(
         KERNEL_BASE,
@@ -117,20 +151,45 @@ fn worker(index: usize, options: &Options, lock: &Mutex<()>, start: Instant) -> 
         };
         totals.running += ran.elapsed();
         assert!(matches!(trap, Trap::HostBoundary), "{trap:?}");
-        fast_credit += options.fast;
-        if fast_credit >= 1.0 {
-            fast_credit -= 1.0;
-        } else {
+        let part = |share: f64| options.hold.mul_f64(share);
+        let nvn = part(options.nvn);
+        let sched = part(options.sched);
+        let other = options.hold.saturating_sub(nvn + sched);
+        // Work under `lock`: the wait and the hold are counted; `global`
+        // says whether the hold counts as holding the global lock.
+        let mut locked = |lock: &Mutex<()>, work: Duration, global: bool| {
             let waited = Instant::now();
             let guard = lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let held = Instant::now();
             totals.waiting += held - waited;
-            spin_for(options.hold);
+            spin_for(work);
             drop(guard);
-            totals.holding += held.elapsed();
+            if global {
+                totals.holding += held.elapsed();
+            }
+        };
+        fast_credit += options.fast;
+        let sched_locked = if fast_credit >= 1.0 {
+            fast_credit -= 1.0;
+            false
+        } else {
+            true
+        };
+        // The global lock's work in one hold, as the runtime's boundary.
+        let mut global = other;
+        if sched_locked {
+            global += sched;
+        } else {
+            spin_for(sched);
         }
+        match options.nvn_lock {
+            NvnLock::Global => global += nvn,
+            NvnLock::Own => locked(nvn_lock, nvn, false),
+            NvnLock::None => spin_for(nvn),
+        }
+        locked(lock, global, true);
         m.core.spin_polls = 0;
         m.core.host_check_at = m.core.steps + options.slice;
     }
@@ -142,9 +201,17 @@ fn main() {
     let options = options();
     kernel_code::install();
     println!(
-        "slice {} instructions, {:?} under the lock per slice end, {:.0}% of slice ends lock-free",
+        "slice {} instructions, {:?} of host work after each: NVN {:.0}% ({}), scheduling {:.1}% \
+         ({:.0}% lock-free), the rest under the global lock",
         options.slice,
         options.hold,
+        options.nvn * 100.0,
+        match options.nvn_lock {
+            NvnLock::Global => "global lock",
+            NvnLock::Own => "own lock",
+            NvnLock::None => "unlocked",
+        },
+        options.sched * 100.0,
         options.fast * 100.0
     );
     println!(
@@ -154,12 +221,13 @@ fn main() {
     let mut single = None;
     for &workers in &options.workers {
         let lock = Arc::new(Mutex::new(()));
+        let nvn_lock = Arc::new(Mutex::new(()));
         let start = Instant::now();
         let totals: Vec<Totals> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|index| {
-                    let (options, lock) = (&options, &lock);
-                    scope.spawn(move || worker(index, options, lock, start))
+                    let (options, lock, nvn_lock) = (&options, &lock, &nvn_lock);
+                    scope.spawn(move || worker(index, options, lock, nvn_lock, start))
                 })
                 .collect();
             handles

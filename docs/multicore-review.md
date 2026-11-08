@@ -364,12 +364,24 @@ memory layout (read). Memory layout writes take nothing else while held.
 ### A model of the effect
 
 `cargo bench -p echora-aot-tests --bench lock` models this without the
-game: workers on host threads run the arith kernel and hold one mutex for
-10 us at each 50,000-instruction slice end, about 40% of a single
-worker's time. On four host CPUs it saturates at 1.5x from three workers
-on, as the game's intro does at six (1.4-1.5x). Making 80% of slice ends
-lock-free (`--fast 0.8`, item 2) gives 3.5x at four workers. Shorter holds
-(`--hold`) model items 1, 3 and 4.
+game. Workers on host threads run the arith kernel and, after each
+50,000-instruction slice, do 10 us of host work (about 40% of one
+worker's time), split by the main session's measurements at W=6: NVN
+62%, slice ends 1.3%, the rest SVCs and IPC. On four host CPUs:
+
+| workers | NVN under the global lock | NVN under its own lock |
+|---|---|---|
+| 1 | 1.00x, 43% holding | 1.00x, 17% holding |
+| 2 | 1.34x | 1.69x |
+| 4 | 1.47x | 1.77x |
+| 6 | 1.45x | 1.92x |
+
+Moving NVN to its own lock cuts global hold time to 0.40 of what it was,
+as measured in the game (78.3 s to 32.5 s, 0.42 of it, with dea1c7f).
+The model then shows the next limit: workers wait on the NVN lock itself
+(56% of their time at six). So the next gain is NVN work that does not
+serialise all workers: per-object locks, or recording that only takes a
+lock at submit. Slice ends (`--fast`) matter little at 1.3%.
 
 ### Expected effect
 
