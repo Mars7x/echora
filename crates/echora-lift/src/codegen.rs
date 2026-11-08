@@ -782,15 +782,17 @@ fn adr_target(word: u32, pc: u64, page: bool) -> u64 {
 }
 
 /// Number of in-range indices for `cmp idx, #limit` at `pc`, from the
-/// conditional branch to the default case that follows it within a few
-/// instructions: b.hi (idx > limit) leaves limit + 1 cases, b.hs leaves limit.
+/// conditional branch that follows it within a few instructions: to the
+/// default case, b.hi (idx > limit) leaves limit + 1 cases and b.hs leaves
+/// limit; to the dispatch, b.ls (idx <= limit) gives limit + 1 cases and
+/// b.lo limit. A wrong bound only adds or drops roots of this table.
 fn conditional_bound(read_word: &dyn Fn(u64) -> Option<u32>, pc: u64, limit: u64) -> Option<u64> {
     for step in 1..=4 {
         let word = read_word(pc + step * 4)?;
         if word & 0xff00_0010 == 0x5400_0000 {
             return match word & 15 {
-                8 => Some(limit + 1),
-                2 => Some(limit),
+                8 | 9 => Some(limit + 1),
+                2 | 3 => Some(limit),
                 _ => None,
             };
         }
@@ -4456,6 +4458,44 @@ mod tests {
         for case in [0x1020, 0x1024, 0x1028] {
             assert!(translation.instructions.contains_key(&case), "{case:#x}");
         }
+    }
+
+    #[test]
+    fn jump_table_bounds_come_from_a_branch_to_the_dispatch_too() {
+        // cmp w0, #2; b.ls 0x100c (the dispatch); b 0x1024 (default);
+        // then the signed-word table dispatch.
+        let words = [
+            0x7100_081f, // cmp w0, #2
+            0x5400_0049, // b.ls 0x100c
+            0x1400_0008, // b 0x1028
+            0xb000_0009, // 0x100c: adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            0xd65f_03c0, // 0x1020: case 0
+            0xd65f_03c0, // 0x1024: case 1
+            0xd65f_03c0, // 0x1028: case 2, and the default
+        ];
+        let mut table = vec![0u8; 16];
+        for target in [0x1020i64, 0x1024, 0x1028] {
+            table.extend(((target - 0x2010) as i32).to_le_bytes());
+        }
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
     }
 
     #[test]
