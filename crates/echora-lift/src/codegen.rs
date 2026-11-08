@@ -3152,10 +3152,93 @@ pub fn emit_rust_split_to_with<E>(
 fn unindent(source: &str) -> String {
     let mut text = String::with_capacity(source.len());
     for line in source.lines() {
-        text.push_str(line.trim_start());
+        text.push_str(&without_unused_parens(line.trim_start()));
         text.push('\n');
     }
     text
+}
+
+/// `line` without the parentheses rustc's `unused_parens` lint flags in
+/// generated code: around a whole initializer or assigned value
+/// (`= (...);`), a whole call argument (`f((...), ...)`) or a whole block
+/// tail (`{ (...) }`), where removing them cannot change the parse. That
+/// lint runs even where it is allowed, and for each pair it copies all the
+/// source before it, so in a large generated file the pairs cost time
+/// quadratic in its size: on the aot-tests programs it was half of
+/// rustc's front-end time. Lines with string literals are left alone.
+fn without_unused_parens(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('(') || line.contains('"') || line.contains('\'') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let before = |at: usize| bytes[..at].iter().rposition(|c| *c != b' ');
+    let after = |at: usize| {
+        bytes[at + 1..]
+            .iter()
+            .position(|c| *c != b' ')
+            .map(|i| at + 1 + i)
+    };
+    let mut open: Vec<usize> = Vec::new();
+    let mut remove = vec![false; bytes.len()];
+    for (at, &c) in bytes.iter().enumerate() {
+        match c {
+            b'(' => open.push(at),
+            b')' => {
+                let Some(start) = open.pop() else {
+                    return std::borrow::Cow::Borrowed(line);
+                };
+                let Some(previous) = before(start) else {
+                    continue;
+                };
+                let prev = bytes[previous];
+                // A call's or a tuple's parentheses are not grouping.
+                if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b')' | b']' | b'>' | b'!')
+                {
+                    continue;
+                }
+                let next = after(at).map(|i| bytes[i]);
+                let whole = match prev {
+                    // `= (...);`, not `==`, `!=`, `<=` or `>=`.
+                    b'=' => {
+                        next == Some(b';')
+                            && !(previous > 0
+                                && matches!(bytes[previous - 1], b'=' | b'!' | b'<' | b'>'))
+                    }
+                    b'(' | b',' => matches!(next, Some(b',' | b')')),
+                    b'{' => next == Some(b'}'),
+                    _ => false,
+                };
+                // Not a tuple: a top-level comma inside means more than one
+                // element.
+                let tuple = {
+                    let mut depth = 0i32;
+                    bytes[start + 1..at].iter().any(|c| {
+                        match c {
+                            b'(' | b'[' | b'{' => depth += 1,
+                            b')' | b']' | b'}' => depth -= 1,
+                            b',' if depth == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    })
+                };
+                if whole && !tuple && at > start + 1 {
+                    remove[start] = true;
+                    remove[at] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !open.is_empty() || !remove.contains(&true) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    std::borrow::Cow::Owned(
+        line.char_indices()
+            .filter(|(at, _)| !remove[*at])
+            .map(|(_, c)| c)
+            .collect(),
+    )
 }
 
 pub fn emit_rust(translation: &Translation) -> String {
@@ -3720,6 +3803,36 @@ mod tests {
         )
         .unwrap();
         assert!(!inlined_blocks(&translation).contains(&0x1004));
+    }
+
+    #[test]
+    fn unused_parens_go_only_where_the_parse_stays_the_same() {
+        let cases = [
+            (
+                "let lhs = (r.x1 & 0xffffffff);",
+                "let lhs = r.x1 & 0xffffffff;",
+            ),
+            ("let value = (lhs) | (rhs);", "let value = (lhs) | (rhs);"),
+            (
+                "r.x8 = (u64::from(f(((r.x15 & 0xffffffff)) as u32, (r.x1 & 0xff), 2))) & 0xffffffff;",
+                "r.x8 = (u64::from(f((r.x15 & 0xffffffff) as u32, r.x1 & 0xff, 2))) & 0xffffffff;",
+            ),
+            (
+                "let value = if c { (r.x1 & 0xff) } else { !(r.x2 & 0xff) };",
+                "let value = if c { r.x1 & 0xff } else { !(r.x2 & 0xff) };",
+            ),
+            ("let same = (a == b);", "let same = a == b;"),
+            ("if x == (a) { y }", "if x == (a) { y }"),
+            ("let pair = (a, b);", "let pair = (a, b);"),
+            ("f(-(a), (b));", "f(-(a), b);"),
+            (
+                "let m = format!(\"({})\", (a));",
+                "let m = format!(\"({})\", (a));",
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(without_unused_parens(line), expected, "{line}");
+        }
     }
 
     #[test]
