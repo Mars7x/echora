@@ -459,6 +459,9 @@ fn jump_table(
     let mut base_low: Option<u64> = None;
     let mut compares: Vec<(u8, u64)> = Vec::new();
     let mut index_copies: Vec<u8> = Vec::new();
+    // Registers a select clamps into range against an earlier compare,
+    // and whether the compare's limit is itself in range (ls/hi).
+    let mut clamps: Vec<(u8, bool)> = Vec::new();
     // The tightest bound on the index or any copy of it.
     let bound = |compares: &[(u8, u64)], copies: &[u8]| {
         compares
@@ -585,6 +588,10 @@ fn jump_table(
                     let limit = u64::from((word >> 10) & 0xfff);
                     if let Some(cases) = conditional_bound(read_word, cursor, limit) {
                         compares.push((rn, cases));
+                    } else if let Some(&(_, inclusive)) =
+                        clamps.iter().find(|(register, _)| *register == rn)
+                    {
+                        compares.push((rn, if inclusive { limit + 1 } else { limit }));
                     }
                     continue;
                 }
@@ -612,6 +619,22 @@ fn jump_table(
                     if let Some(cases) = low_mask_cases(word) {
                         compares.push((rd, cases));
                         index_copies.push(rn);
+                    }
+                    // A clamp instead of a branch to the default case:
+                    // `cmp wN, #imm; csel wIdx, wN, wzr, ls` (or lo, or the
+                    // operands swapped with hi/hs) keeps wN when it is in
+                    // range and takes case 0 otherwise.
+                    if word & 0x7fe0_0c00 == 0x1a80_0000 {
+                        let condition = (word >> 12) & 15;
+                        let clamp = match (condition, rn, rm) {
+                            (0b1001, source, 31) | (0b1000, 31, source) => Some((source, true)),
+                            (0b0011, source, 31) | (0b0010, 31, source) => Some((source, false)),
+                            _ => None,
+                        };
+                        if let Some((source, inclusive)) = clamp {
+                            clamps.push((source, inclusive));
+                            index_copies.push(source);
+                        }
                     }
                     // Other rewrites (zero-extending `and`) keep the value.
                     continue;
@@ -4390,6 +4413,95 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
         assert!(translation.instructions.contains_key(&0x102c));
+    }
+
+    #[test]
+    fn jump_tables_of_signed_words_reach_back_from_the_table() {
+        // clang's 32-bit form: cmp w0, #2; b.hi; adrp x9, 0x2000; add x9,
+        // x9, #0x10; ldrsw x8, [x9, w0, uxtw #2]; add x8, x9, x8; br x8,
+        // with offsets relative to the table (negative: the cases sit in
+        // the code below it).
+        let words = [
+            0x7100_081f, // cmp w0, #2
+            0x5400_00e8, // b.hi 0x1020
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            0xd65f_03c0, // 0x101c
+            0xd65f_03c0, // 0x1020: case 0
+            0xd65f_03c0, // 0x1024: case 1
+            0xd65f_03c0, // 0x1028: case 2
+        ];
+        let mut table = vec![0u8; 16];
+        for target in [0x1020i64, 0x1024, 0x1028] {
+            table.extend(((target - 0x2010) as i32).to_le_bytes());
+        }
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1018), Some(&3));
+        for case in [0x1020, 0x1024, 0x1028] {
+            assert!(translation.instructions.contains_key(&case), "{case:#x}");
+        }
+    }
+
+    #[test]
+    fn jump_table_indices_clamped_by_a_select_are_bounded() {
+        // A clamp instead of a branch: cmp w0, #2; csel w0, w0, wzr, ls
+        // (out-of-range indices become case 0); then a word table as
+        // above.
+        let words = [
+            0x7100_081f, // cmp w0, #2
+            0x1a9f_9000, // csel w0, w0, wzr, ls
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            0xd65f_03c0, // 0x101c
+            0xd65f_03c0, // 0x1020: case 0
+            0xd65f_03c0, // 0x1024: case 1
+            0xd65f_03c0, // 0x1028: case 2
+        ];
+        let mut table = vec![0u8; 16];
+        for target in [0x1020i64, 0x1024, 0x1028] {
+            table.extend(((target - 0x2010) as i32).to_le_bytes());
+        }
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        assert!(matches!(
+            crate::aarch64::decode(words[1], 0x1004),
+            Instruction::Select { .. }
+        ));
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1018), Some(&3));
+        for case in [0x1020, 0x1024, 0x1028] {
+            assert!(translation.instructions.contains_key(&case), "{case:#x}");
+        }
     }
 
     #[test]
