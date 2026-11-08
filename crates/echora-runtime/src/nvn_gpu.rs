@@ -389,6 +389,13 @@ fn blend_op(value: u64) -> vk::BlendOp {
 }
 
 impl Nvn {
+    /// Restart the GPU statistics ("stat: " notes; ECHORA_PROFILE_FROM).
+    pub(crate) fn reset_gpu_stats(&mut self) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.notes.retain(|name, _| !name.starts_with("stat: "));
+        }
+    }
+
     /// The GPU backend, created on first use when enabled.
     pub(super) fn gpu(&mut self) -> Option<&mut Backend> {
         if !self.gpu_checked {
@@ -3456,7 +3463,6 @@ impl Nvn {
                         let base = gpu & !15;
                         let length = gpu - base + size;
                         let guest = self.gpu_to_guest(base, length)?;
-                        self.resolve_storage(core, Some(guest..guest + length))?;
                         if descriptor.flags & 1 != 0 {
                             self.gpu
                                 .as_mut()
@@ -3464,6 +3470,11 @@ impl Nvn {
                                 .note("graphics-stage storage buffer writes are not returned");
                         }
                         storage_entries.push((index, descriptor.cbuf_offset, gpu, size));
+                        self.resolve_storage(core, Some(guest..guest + length))?;
+                        self.gpu
+                            .as_mut()
+                            .unwrap()
+                            .stat("stat: draw storage bytes", length);
                         storage.insert(
                             (index, descriptor.binding),
                             self.gpu_bytes(core, base, length)?,

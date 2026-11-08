@@ -995,6 +995,10 @@ impl Nvn {
                 }
                 let start = base + x[1];
                 if name == "nvnMemoryPoolFlushMappedRange" {
+                    if let Some(backend) = self.gpu() {
+                        backend.stat("stat: pool flushes", 1);
+                        backend.stat("stat: pool flush bytes", x[2]);
+                    }
                     self.gpu_invalidate(start..start + x[2], None);
                 } else if let Err(message) = self.resolve_storage(core, Some(start..start + x[2])) {
                     // The CPU is about to read the range: GPU results in it

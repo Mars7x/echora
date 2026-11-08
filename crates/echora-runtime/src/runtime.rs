@@ -2752,7 +2752,8 @@ impl Machine {
                     self.process_exit_reason = Some("host_stop_request");
                 }
                 // ECHORA_PROFILE_FROM=N: the lock, boundary, thread, IPC and
-                // NVN timings restart at present N, so the report profiles
+                // NVN timings and the host sampler (ECHORA_HOST_PROFILE)
+                // restart at present N, so the report profiles
                 // one phase of a long run (such as after the opening movie).
                 if crate::nvn::debug_var("ECHORA_PROFILE_FROM")
                     .ok()
@@ -2768,6 +2769,8 @@ impl Machine {
                     self.services.reset_profile();
                     self.nvn.calls.clear();
                     self.nvn.call_microseconds.clear();
+                    self.nvn.reset_gpu_stats();
+                    crate::host_profile::restart();
                 }
             }
             return Ok(());

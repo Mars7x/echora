@@ -48,6 +48,12 @@ mod imp {
         path: std::ffi::OsString,
     }
 
+    /// Drop the samples taken so far (ECHORA_PROFILE_FROM: profile one
+    /// phase of a run).
+    pub fn restart() {
+        NEXT.store(0, Ordering::Relaxed);
+    }
+
     pub fn start() -> Option<Profile> {
         let path = std::env::var_os("ECHORA_HOST_PROFILE")?;
         // SAFETY: installs a handler that only touches atomics, then arms
@@ -107,6 +113,8 @@ mod imp {
     pub fn start() -> Option<Profile> {
         None
     }
+
+    pub fn restart() {}
 }
 
-pub use imp::{Profile, start};
+pub use imp::{Profile, restart, start};
