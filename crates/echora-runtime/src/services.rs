@@ -2519,7 +2519,12 @@ impl Services {
                 reply.extend_from_slice(&1u32.to_le_bytes());
                 reply.extend_from_slice(&threshold.to_le_bytes());
                 call.reply(0, None, 0, &reply)?;
-                self.decoder_slots.push_back(slot);
+                // The decoder holds each slot once: a slot handed back while
+                // it already waits for a frame (after Stop the SDK keeps
+                // returning its slots) stays in its place.
+                if !self.decoder_slots.contains(&slot) {
+                    self.decoder_slots.push_back(slot);
+                }
                 self.decode_video_frames();
                 if !register {
                     self.returned_frames += 1;
