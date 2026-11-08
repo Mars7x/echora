@@ -21,6 +21,9 @@ PROGRAMS = [
     "seqlock",
     "pass_acquire",
     "pass_dmb",
+    "casp_stack",
+    "pair_halves",
+    "vector_halves",
 ]
 
 

@@ -55,8 +55,20 @@ impl Random {
 /// (rounded to blocks), and each end clears the monitor and yields.
 /// Returns each thread's x10 and x11 and the machine, for its memory.
 fn run(program: &str, threads: u64, count: u64, preempt: bool) -> (Vec<(u64, u64)>, Machine) {
+    run_after(program, threads, count, preempt, |_| {})
+}
+
+/// As `run`, after `setup` has prepared the data.
+fn run_after(
+    program: &str,
+    threads: u64,
+    count: u64,
+    preempt: bool,
+    setup: impl FnOnce(&mut Machine),
+) -> (Vec<(u64, u64)>, Machine) {
     let image: Vec<u8> = STRESS_WORDS.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let m = Machine::with_layout(STRESS_BASE, &image, image.len() as u64, DATA, DATA_SIZE);
+    let mut m = Machine::with_layout(STRESS_BASE, &image, image.len() as u64, DATA, DATA_SIZE);
+    setup(&mut m);
     stress_code::install();
     let pc = entry(program);
     let (done, results) = mpsc::channel();
@@ -181,6 +193,65 @@ fn check_passing(program: &str, preempt: bool) {
     );
 }
 
+/// Nodes of the CASP stack: few, so that threads contend for them.
+const STACK_NODES: u64 = 16;
+
+fn node(index: u64) -> u64 {
+    DATA + 0x1000 + index * 64
+}
+
+fn write_u64(m: &mut Machine, address: u64, value: u64) {
+    m.memory.write(address, &value.to_le_bytes()).unwrap();
+}
+
+fn check_stack(threads: u64, preempt: bool) {
+    let rounds = 20_000 * scale();
+    let (results, m) = run_after("casp_stack", threads, rounds, preempt, |m| {
+        for index in 0..STACK_NODES {
+            let next = if index + 1 < STACK_NODES {
+                node(index + 1)
+            } else {
+                0
+            };
+            write_u64(m, node(index), next);
+        }
+        write_u64(m, DATA, node(0));
+    });
+    let busy: u64 = results.iter().map(|(busy, _)| busy).sum();
+    // Every node on the stack exactly once, none still marked.
+    let mut seen = Vec::new();
+    let mut at = read_u64(&m, DATA);
+    while at != 0 && seen.len() <= STACK_NODES as usize {
+        seen.push(at);
+        at = read_u64(&m, at);
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let expected: Vec<u64> = (0..STACK_NODES).map(node).collect();
+    let marked: Vec<u64> = expected
+        .iter()
+        .filter(|&&node| read_u64(&m, node + 8) != 0)
+        .copied()
+        .collect();
+    assert!(
+        busy == 0 && sorted == expected && seen.len() == expected.len() && marked.is_empty(),
+        "casp_stack ({threads} threads, preempt {preempt}): {busy} pops of a busy node, \
+         stack {seen:#x?}, still marked {marked:#x?}"
+    );
+}
+
+fn check_halves(program: &str, threads: u64, preempt: bool) {
+    let writes = 200_000 * scale();
+    let (results, _) = run(program, threads, writes, preempt);
+    let torn: u64 = results.iter().skip(1).map(|(torn, _)| torn).sum();
+    let reads: u64 = results.iter().skip(1).map(|(_, reads)| reads).sum();
+    assert!(
+        torn == 0 && reads > 0,
+        "{program} ({threads} threads, preempt {preempt}): {torn} torn 64-bit halves in {reads} reads"
+    );
+}
+
 macro_rules! both {
     ($name:ident, $check:expr) => {
         mod $name {
@@ -231,3 +302,15 @@ both!(messages_by_release_and_acquire, |p| super::check_passing(
     p
 ));
 both!(messages_by_dmb, |p| super::check_passing("pass_dmb", p));
+both!(casp_stack_on_four_cores, |p| super::check_stack(4, p));
+both!(casp_stack_on_two_cores, |p| super::check_stack(2, p));
+both!(pair_halves_with_three_readers, |p| super::check_halves(
+    "pair_halves",
+    4,
+    p
+));
+both!(vector_halves_with_three_readers, |p| super::check_halves(
+    "vector_halves",
+    4,
+    p
+));

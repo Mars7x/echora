@@ -240,3 +240,119 @@ pass_dmb:
     b 5b
 9:  svc #7
     udf #0
+
+.p2align 10
+// A Treiber stack of nodes (x0 + 0x1000 + 64 * i: next at 0, busy at
+// 8) under a {pointer, tag} head at x0, pushed and popped with CASPAL;
+// the tag makes it ABA-safe. Each thread pops a node, marks it busy
+// with LDADDAL (it must have been 0), clears the mark and pushes it
+// back, x3 times. x10 = nodes seen busy when popped.
+casp_stack:
+    mov x10, #0
+    mov x12, #1
+    mov x14, #-1
+1:  cbz x3, 9f
+2:  ldp x4, x5, [x0]
+    cbnz x4, 3f
+    yield
+    b 2b
+3:  ldr x6, [x4]
+    add x7, x5, #1
+    mov x8, x4
+    mov x9, x5
+    caspal x8, x9, x6, x7, [x0]
+    cmp x8, x4
+    ccmp x9, x5, #0, eq
+    b.ne 2b
+    add x11, x4, #8
+    ldaddal x12, x13, [x11]
+    cbz x13, 4f
+    add x10, x10, #1
+4:  ldaddal x14, x13, [x11]
+5:  ldp x8, x9, [x0]
+    str x8, [x4]
+    mov x16, x8
+    mov x17, x9
+    mov x6, x4
+    add x7, x9, #1
+    caspal x8, x9, x6, x7, [x0]
+    cmp x8, x16
+    ccmp x9, x17, #0, eq
+    b.ne 5b
+    sub x3, x3, #1
+    b 1b
+9:  svc #7
+    udf #0
+
+.p2align 10
+// 64-bit halves of pair stores. Thread 0 stores x3 pairs with STP to
+// x0 + 0x40: (k:k, !k:!k), each half two equal 32-bit words. The others
+// read with LDP until thread 0 sets x0 + 0x80, and count halves whose
+// 32-bit words differ (a torn 64-bit half). x10 = torn halves, x11 =
+// reads.
+pair_halves:
+    add x12, x0, #0x40
+    add x13, x0, #0x80
+    cbnz x1, 5f
+    mov x4, #0
+1:  cmp x4, x3
+    b.hs 4f
+    add x4, x4, #1
+    orr x5, x4, x4, lsl #32
+    mvn x6, x5
+    stp x5, x6, [x12]
+    b 1b
+4:  mov x5, #1
+    stlr x5, [x13]
+    svc #7
+5:  mov x10, #0
+    mov x11, #0
+6:  ldar x9, [x13]
+    ldp x5, x6, [x12]
+    eor x7, x5, x5, ror #32
+    cmp x7, #0
+    cinc x10, x10, ne
+    eor x7, x6, x6, ror #32
+    cmp x7, #0
+    cinc x10, x10, ne
+    add x11, x11, #1
+    cbz x9, 6b
+    svc #7
+    udf #0
+
+.p2align 10
+// As pair_halves with a Q register: STR Q / LDR Q, whose two 64-bit
+// halves are each single-copy atomic.
+vector_halves:
+    add x12, x0, #0x40
+    add x13, x0, #0x80
+    cbnz x1, 5f
+    mov x4, #0
+1:  cmp x4, x3
+    b.hs 4f
+    add x4, x4, #1
+    orr x5, x4, x4, lsl #32
+    mvn x6, x5
+    fmov d0, x5
+    mov v0.d[1], x6
+    str q0, [x12]
+    b 1b
+4:  mov x5, #1
+    stlr x5, [x13]
+    svc #7
+5:  mov x10, #0
+    mov x11, #0
+6:  ldar x9, [x13]
+    ldr q1, [x12]
+    fmov x5, d1
+    mov x6, v1.d[1]
+    eor x7, x5, x5, ror #32
+    cmp x7, #0
+    cinc x10, x10, ne
+    eor x7, x6, x6, ror #32
+    cmp x7, #0
+    cinc x10, x10, ne
+    add x11, x11, #1
+    cbz x9, 6b
+    svc #7
+    udf #0
