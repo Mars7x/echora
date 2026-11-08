@@ -40,6 +40,7 @@ pub struct Settings {
     pub frame: FrameSettings,
     pub audio: AudioSettings,
     pub input: InputSettings,
+    pub cpu: CpuSettings,
     pub launcher: LauncherSettings,
 }
 
@@ -52,6 +53,7 @@ impl Default for Settings {
             frame: FrameSettings::default(),
             audio: AudioSettings::default(),
             input: InputSettings::default(),
+            cpu: CpuSettings::default(),
             launcher: LauncherSettings::default(),
         }
     }
@@ -234,6 +236,116 @@ impl Default for InputSettings {
     }
 }
 
+/// How many host threads run guest code: `"auto"` (one per host CPU, at
+/// most six, the console's application cores) or a count from 1 to 6. In
+/// TOML, `workers = "auto"` or `workers = 2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workers {
+    Auto,
+    Count(u8),
+}
+
+/// The worker setting when the settings leave it out. Running several
+/// workers by default waits for the long-run check; then this becomes
+/// `Workers::Auto`.
+pub const DEFAULT_WORKERS: Workers = Workers::Count(1);
+
+/// The most workers a setting may ask for: one per application core.
+pub const MAX_WORKERS: u8 = 6;
+
+impl Workers {
+    /// The number of workers on a host with `available` CPUs.
+    pub fn count(self, available: usize) -> usize {
+        match self {
+            Self::Auto => available.clamp(1, usize::from(MAX_WORKERS)),
+            Self::Count(count) => usize::from(count).max(1),
+        }
+    }
+}
+
+impl fmt::Display for Workers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Count(count) => write!(f, "{count}"),
+        }
+    }
+}
+
+/// `"auto"` or a positive count (not limited to six: the environment
+/// switch may ask for more, for experiments).
+impl std::str::FromStr for Workers {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match text.parse::<u8>() {
+            Ok(count) if count >= 1 => Ok(Self::Count(count)),
+            _ => Err(format!("workers {text:?} (\"auto\" or 1-{MAX_WORKERS})")),
+        }
+    }
+}
+
+impl Serialize for Workers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Count(count) => serializer.serialize_u8(*count),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Workers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Workers;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "\"auto\" or a worker count from 1 to {MAX_WORKERS}")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Workers, E> {
+                if text == "auto" {
+                    Ok(Workers::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(text), &self))
+                }
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Workers, E> {
+                u8::try_from(value)
+                    .ok()
+                    .filter(|count| (1..=MAX_WORKERS).contains(count))
+                    .map(Workers::Count)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Signed(value), &self))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Workers, E> {
+                self.visit_i64(i64::try_from(value).unwrap_or(-1))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CpuSettings {
+    pub workers: Workers,
+}
+
+impl Default for CpuSettings {
+    fn default() -> Self {
+        Self {
+            workers: DEFAULT_WORKERS,
+        }
+    }
+}
+
 /// Launcher behaviour. These never affect a running game, so they have no
 /// [`SettingKey`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +382,7 @@ pub enum SettingKey {
     AudioDevice,
     Volume,
     Vibration,
+    Workers,
 }
 
 impl SettingKey {
@@ -287,6 +400,8 @@ impl SettingKey {
             // Guest GPU objects live in the backend; rebuilding them under a
             // different device is not supported, so these wait for a restart.
             Self::Backend | Self::GraphicsDevice => GameRestart,
+            // Workers are set up when the game starts.
+            Self::Workers => GameRestart,
         }
     }
 }
@@ -409,6 +524,11 @@ impl Settings {
         if self.audio.volume > 100 {
             return bad(format!("volume {} (0-100)", self.audio.volume));
         }
+        if let Workers::Count(count) = self.cpu.workers
+            && !(1..=MAX_WORKERS).contains(&count)
+        {
+            return bad(format!("workers {count} (\"auto\" or 1-{MAX_WORKERS})"));
+        }
         Ok(())
     }
 
@@ -452,6 +572,7 @@ impl Settings {
             a.input.vibration != b.input.vibration,
             SettingKey::Vibration,
         );
+        diff(a.cpu.workers != b.cpu.workers, SettingKey::Workers);
         out
     }
 
@@ -558,6 +679,78 @@ fn migrate(value: &mut toml::Table, from: u32) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_round_trip_as_auto_or_a_count() {
+        assert_eq!(Settings::default().cpu.workers, DEFAULT_WORKERS);
+        for workers in [
+            Workers::Auto,
+            Workers::Count(1),
+            Workers::Count(MAX_WORKERS),
+        ] {
+            let mut settings = Settings::default();
+            settings.cpu.workers = workers;
+            let text = settings.to_toml();
+            assert_eq!(Settings::from_toml(&text).unwrap(), settings, "{text}");
+        }
+        let auto = Settings::from_toml("[cpu]\nworkers = \"auto\"\n").unwrap();
+        assert_eq!(auto.cpu.workers, Workers::Auto);
+        let three = Settings::from_toml("[cpu]\nworkers = 3\n").unwrap();
+        assert_eq!(three.cpu.workers, Workers::Count(3));
+        // Left out: the default.
+        assert_eq!(
+            Settings::from_toml("").unwrap().cpu.workers,
+            DEFAULT_WORKERS
+        );
+        for bad in ["0", "7", "-1", "\"two\"", "\"Auto\"", "2.5"] {
+            assert!(
+                Settings::from_toml(&format!("[cpu]\nworkers = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn workers_save_and_load() {
+        let dir =
+            std::env::temp_dir().join(format!("echora-config-workers-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.cpu.workers = Workers::Auto;
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+        settings.cpu.workers = Workers::Count(4);
+        settings.save(&path).unwrap();
+        assert_eq!(
+            Settings::load(&path).unwrap().cpu.workers,
+            Workers::Count(4)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // A count past six cannot be saved.
+        settings.cpu.workers = Workers::Count(7);
+        assert!(settings.save(&path).is_err());
+    }
+
+    #[test]
+    fn workers_count_on_a_host_and_parse_from_the_environment() {
+        assert_eq!(Workers::Auto.count(4), 4);
+        assert_eq!(Workers::Auto.count(16), 6);
+        assert_eq!(Workers::Auto.count(0), 1);
+        assert_eq!(Workers::Count(2).count(16), 2);
+        assert_eq!("auto".parse::<Workers>(), Ok(Workers::Auto));
+        assert_eq!(" AUTO ".parse::<Workers>(), Ok(Workers::Auto));
+        assert_eq!("3".parse::<Workers>(), Ok(Workers::Count(3)));
+        // The environment may ask for more than six, for experiments.
+        assert_eq!("8".parse::<Workers>(), Ok(Workers::Count(8)));
+        assert!("0".parse::<Workers>().is_err());
+        assert!("x".parse::<Workers>().is_err());
+        let mut next = Settings::default();
+        next.cpu.workers = Workers::Auto;
+        assert_eq!(
+            Settings::default().changes(&next),
+            vec![(SettingKey::Workers, ApplyClass::GameRestart)]
+        );
+    }
 
     fn linux_caps() -> HostCapabilities {
         HostCapabilities {

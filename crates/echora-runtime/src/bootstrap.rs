@@ -63,6 +63,21 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Host threads that run guest code: `ECHORA_WORKERS` ("auto" or a count)
+/// if set, else the settings' `cpu.workers`, else its default
+/// (`echora_config::DEFAULT_WORKERS`). "auto" is one per host CPU, at most
+/// six.
+fn worker_count() -> usize {
+    let from_env = std::env::var("ECHORA_WORKERS").ok().and_then(|text| {
+        text.parse::<echora_config::Workers>()
+            .map_err(|error| eprintln!("ECHORA_WORKERS: {error}; using the settings"))
+            .ok()
+    });
+    let workers = from_env.unwrap_or(crate::settings::get().cpu.workers);
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    workers.count(available)
+}
+
 /// Loads the ExeFS in `exefs` into a new process with an instruction budget
 /// of `max_steps`.
 /// Addresses of the exports the runtime replaces with host functions
@@ -167,7 +182,7 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     // preemption flag, not through slice ends. At 50,000, six workers
     // rendered the intro about 1.4x as fast as one.
     layout.parallel_slice = env_number("ECHORA_PARALLEL_SLICE").unwrap_or(50_000);
-    layout.workers = env_number::<usize>("ECHORA_WORKERS").unwrap_or(1).max(1);
+    layout.workers = worker_count();
 
     let mut machine = Machine::new(layout, max_steps);
     // ECHORA_VIRTUAL_CLOCK=N: the guest counter advances by executed
