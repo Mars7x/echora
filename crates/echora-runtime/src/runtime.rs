@@ -831,12 +831,9 @@ impl Machine {
                     message: "a timed-out mutex waiter is not parked".into(),
                 });
             }
-            let plan = self
-                .mutex_waits
-                .prepare_timeout(id, &self.thread_priorities()?)?;
-            self.validate_thread_priorities(&plan.priorities)?;
-            self.apply_thread_priorities(&plan.priorities)?;
-            self.mutex_waits = plan.state;
+            let priorities = self.with_mutex_waits(|waits, lookup| waits.time_out(id, lookup))?;
+            self.validate_thread_priorities(&priorities)?;
+            self.apply_thread_priorities(&priorities)?;
             if id == self.layout.main_thread_id {
                 let cpu = self
                     .main_saved_cpu
@@ -989,17 +986,15 @@ impl Machine {
         let Some(id) = self.thread_id_for_handle(handle) else {
             return Ok(0xe401);
         };
-        let plan =
-            self.mutex_waits
-                .prepare_base_priority(id, priority, &self.thread_priorities()?)?;
+        let priorities =
+            self.with_mutex_waits(|waits, lookup| waits.set_base_priority(id, priority, lookup))?;
         if id == self.layout.main_thread_id {
             self.main_thread_base_priority = priority;
         } else {
             self.threads.set_base_priority(id, priority)?;
         }
-        self.validate_thread_priorities(&plan.priorities)?;
-        self.apply_thread_priorities(&plan.priorities)?;
-        self.mutex_waits = plan.state;
+        self.validate_thread_priorities(&priorities)?;
+        self.apply_thread_priorities(&priorities)?;
         Ok(0)
     }
 
@@ -1059,32 +1054,34 @@ impl Machine {
         Ok(0)
     }
 
-    fn thread_priorities(&self) -> Result<BTreeMap<u64, ThreadPriority>, Trap> {
-        let mut priorities = BTreeMap::new();
-        if self.main_thread_alive() {
-            priorities.insert(
-                self.layout.main_thread_id,
-                ThreadPriority {
-                    base: self.main_thread_base_priority,
-                    effective: self.main_thread_effective_priority,
-                },
-            );
+    /// One thread's base and effective priority (none for a thread that is
+    /// gone): what mutex planning looks up, thread by thread.
+    fn thread_priority(&self, id: u64) -> Option<ThreadPriority> {
+        if id == self.layout.main_thread_id {
+            return self.main_thread_alive().then_some(ThreadPriority {
+                base: self.main_thread_base_priority,
+                effective: self.main_thread_effective_priority,
+            });
         }
-        for id in self.threads.ids() {
-            let base = self.threads.base_priority(id);
-            let effective = self.threads.priority(id);
-            match (base, effective) {
-                (Some(base), Some(effective)) => {
-                    priorities.insert(id, ThreadPriority { base, effective });
-                }
-                _ => {
-                    return Err(Trap::InvalidState {
-                        message: "owned thread has no priority backing".into(),
-                    });
-                }
-            }
-        }
-        Ok(priorities)
+        Some(ThreadPriority {
+            base: self.threads.base_priority(id)?,
+            effective: self.threads.priority(id)?,
+        })
+    }
+
+    /// Run `change` on the mutex queue with each thread's priority looked
+    /// up as needed (the queue is moved out for the call, then back).
+    fn with_mutex_waits<T>(
+        &mut self,
+        change: impl FnOnce(
+            &mut crate::synchronization::MutexWaits,
+            &dyn Fn(u64) -> Option<ThreadPriority>,
+        ) -> Result<T, Trap>,
+    ) -> Result<T, Trap> {
+        let mut waits = std::mem::take(&mut self.mutex_waits);
+        let result = change(&mut waits, &|id| self.thread_priority(id));
+        self.mutex_waits = waits;
+        result
     }
 
     fn validate_thread_priorities(&self, priorities: &BTreeMap<u64, u8>) -> Result<(), Trap> {
@@ -1207,17 +1204,12 @@ impl Machine {
         let Some(owner) = self.real_thread_id_for_handle(owner_handle) else {
             return Ok(Some(0xe401));
         };
-        let plan = self.mutex_waits.prepare_wait(
-            self.core.current_thread_id,
-            owner,
-            address,
-            tag,
-            &self.thread_priorities()?,
-        )?;
-        self.validate_thread_priorities(&plan.priorities)?;
+        let current = self.core.current_thread_id;
+        let priorities = self
+            .with_mutex_waits(|waits, lookup| waits.wait(current, owner, address, tag, lookup))?;
+        self.validate_thread_priorities(&priorities)?;
         self.retain_mutex_owner(owner)?;
-        self.apply_thread_priorities(&plan.priorities)?;
-        self.mutex_waits = plan.state;
+        self.apply_thread_priorities(&priorities)?;
         self.pending_mutex_wait = Some(self.core.current_thread_id);
         // Lock never writes or CASes the userspace word and does not write a
         // provisional success Result into the parked continuation.
@@ -1273,9 +1265,7 @@ impl Machine {
                         .into(),
             });
         }
-        let plan = self
-            .mutex_waits
-            .prepare_unlock(current, address, &self.thread_priorities()?)?;
+        let plan = self.with_mutex_waits(|waits, lookup| waits.unlock(current, address, lookup))?;
         self.validate_thread_priorities(&plan.priorities)?;
         if let Some(id) = plan.selected {
             if self.thread_state(id) != Some(ThreadState::Waiting) {
@@ -1285,7 +1275,6 @@ impl Machine {
             }
         }
         self.apply_thread_priorities(&plan.priorities)?;
-        self.mutex_waits = plan.state;
         if let Some(id) = plan.selected {
             self.mutex_waits.set_wait_result(id, 0)?;
             self.complete_w0_wait(id, 0)?;
@@ -1317,12 +1306,11 @@ impl Machine {
     /// its mutex if free, or becomes a waiter of the current owner. Once no
     /// waiter remains on `key`, the key word is cleared.
     fn signal_condition(&mut self, key: u64, count: i32) -> Result<(), Trap> {
-        let priorities = self.thread_priorities()?;
+        // Only this key's waiters are looked up and sorted.
         let mut waiters = self.synchronization_waits.condition_waiters(key);
-        waiters.sort_by_key(|(id, wait)| {
+        waiters.sort_by_cached_key(|(id, wait)| {
             (
-                priorities
-                    .get(id)
+                self.thread_priority(*id)
                     .map_or(u8::MAX, |priority| priority.effective),
                 wait.order,
             )
@@ -1359,17 +1347,12 @@ impl Machine {
                         self.complete_w0_wait(id, 0xfa01)?;
                         continue;
                     };
-                    let plan = self.mutex_waits.prepare_wait(
-                        id,
-                        owner,
-                        wait.mutex,
-                        wait.tag,
-                        &self.thread_priorities()?,
-                    )?;
-                    self.validate_thread_priorities(&plan.priorities)?;
+                    let priorities = self.with_mutex_waits(|waits, lookup| {
+                        waits.wait(id, owner, wait.mutex, wait.tag, lookup)
+                    })?;
+                    self.validate_thread_priorities(&priorities)?;
                     self.retain_mutex_owner(owner)?;
-                    self.apply_thread_priorities(&plan.priorities)?;
-                    self.mutex_waits = plan.state;
+                    self.apply_thread_priorities(&priorities)?;
                     // Its timeout still runs while it waits for the mutex.
                     let deadline = self.synchronization_waits.transfer_condition(id)?;
                     self.mutex_waits.set_deadline(id, deadline)?;
@@ -1571,12 +1554,11 @@ impl Machine {
         if kind > 2 {
             return Ok(0xf001);
         }
-        let priorities = self.thread_priorities()?;
+        // Only this address's waiters are looked up and sorted.
         let mut waiters = self.synchronization_waits.arbiter_waiters(address);
-        waiters.sort_by_key(|(id, wait)| {
+        waiters.sort_by_cached_key(|(id, wait)| {
             (
-                priorities
-                    .get(id)
+                self.thread_priority(*id)
                     .map_or(u8::MAX, |priority| priority.effective),
                 wait.order,
             )
@@ -1640,11 +1622,16 @@ impl Machine {
                 message: "ArbitrateUnlock requires the active runnable context".into(),
             });
         }
-        let plan = self.mutex_waits.prepare_unlock(
-            self.core.current_thread_id,
-            address,
-            &self.thread_priorities()?,
-        )?;
+        // A real userspace write fault must still transfer the queue and wake
+        // the selected waiter. A prototype-only self-modifying-code trap is
+        // rejected before mutation. This preflight does not read the word.
+        let writable = match self.memory.check_write(address, 4) {
+            Ok(()) => true,
+            Err(Trap::MemoryFault { .. }) => false,
+            Err(trap) => return Err(trap),
+        };
+        let current = self.core.current_thread_id;
+        let plan = self.with_mutex_waits(|waits, lookup| waits.unlock(current, address, lookup))?;
         self.validate_thread_priorities(&plan.priorities)?;
         if let Some(id) = plan.selected {
             if self.thread_state(id) != Some(ThreadState::Waiting)
@@ -1655,16 +1642,7 @@ impl Machine {
                 });
             }
         }
-        // A real userspace write fault must still transfer the queue and wake
-        // the selected waiter. A prototype-only self-modifying-code trap is
-        // rejected before mutation. This preflight does not read the word.
-        let writable = match self.memory.check_write(address, 4) {
-            Ok(()) => true,
-            Err(Trap::MemoryFault { .. }) => false,
-            Err(trap) => return Err(trap),
-        };
         self.apply_thread_priorities(&plan.priorities)?;
-        self.mutex_waits = plan.state;
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let result = if writable {
             self.memory.write_u32(address, plan.next_word)?;

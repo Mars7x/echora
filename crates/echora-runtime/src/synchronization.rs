@@ -42,17 +42,15 @@ pub(crate) struct MutexWaits {
     waiting: BTreeMap<u64, Waiter>,
     returns: BTreeMap<u64, MutexReturn>,
     next_order: u64,
+    /// Waiters with a deadline: while zero the deadline scans return at
+    /// once.
+    timed: usize,
 }
 
+/// What an unlock changed: the effective priorities, the waiter given the
+/// mutex and the word to store.
 #[derive(Debug)]
-pub(crate) struct WaitPlan {
-    pub state: MutexWaits,
-    pub priorities: BTreeMap<u64, u8>,
-}
-
-#[derive(Debug)]
-pub(crate) struct UnlockPlan {
-    pub state: MutexWaits,
+pub(crate) struct Unlock {
     pub priorities: BTreeMap<u64, u8>,
     pub selected: Option<u64>,
     pub next_word: u32,
@@ -64,52 +62,55 @@ fn invalid(message: impl Into<String>) -> Trap {
     }
 }
 
-/// The effective priorities `staged` changes from `before`: plans list only
-/// those (every other thread keeps its priority), so applying one costs
-/// nothing when inheritance moved nothing.
-fn changed_priorities(
-    before: &BTreeMap<u64, ThreadPriority>,
-    staged: &BTreeMap<u64, ThreadPriority>,
-) -> BTreeMap<u64, u8> {
-    staged
-        .iter()
-        .filter(|&(id, priority)| {
-            before.get(id).map(|old| old.effective) != Some(priority.effective)
-        })
-        .map(|(&id, priority)| (id, priority.effective))
-        .collect()
+/// Thread priorities as a plan sees them: the runtime's own (`lookup`, one
+/// thread at a time) with the plan's changes over them. Only the threads a
+/// plan touches are ever looked up.
+struct Staged<'a> {
+    lookup: &'a dyn Fn(u64) -> Option<ThreadPriority>,
+    changes: BTreeMap<u64, ThreadPriority>,
+}
+
+impl Staged<'_> {
+    fn get(&self, id: u64) -> Result<ThreadPriority, Trap> {
+        match self.changes.get(&id) {
+            Some(&priority) => Ok(priority),
+            None => {
+                let priority = (self.lookup)(id).filter(|_| id != 0).ok_or_else(|| {
+                    invalid("mutex graph requires a live nonzero thread identity")
+                })?;
+                if priority.base > 63 || priority.effective > priority.base {
+                    return Err(invalid(
+                        "mutex priority metadata is outside the modeled 0..63 range",
+                    ));
+                }
+                Ok(priority)
+            }
+        }
+    }
+
+    fn set_effective(&mut self, id: u64, effective: u8) -> Result<(), Trap> {
+        let mut priority = self.get(id)?;
+        priority.effective = effective;
+        self.changes.insert(id, priority);
+        Ok(())
+    }
+
+    /// The effective priorities that differ from the runtime's: every other
+    /// thread keeps its priority, so applying them costs nothing when
+    /// inheritance moved nothing.
+    fn changed(self) -> BTreeMap<u64, u8> {
+        let lookup = self.lookup;
+        self.changes
+            .into_iter()
+            .filter(|&(id, priority)| {
+                lookup(id).map(|old| old.effective) != Some(priority.effective)
+            })
+            .map(|(id, priority)| (id, priority.effective))
+            .collect()
+    }
 }
 
 impl MutexWaits {
-    fn require_thread(priorities: &BTreeMap<u64, ThreadPriority>, id: u64) -> Result<(), Trap> {
-        if id == 0 || !priorities.contains_key(&id) {
-            return Err(invalid(
-                "mutex graph requires a live nonzero thread identity",
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_priorities(&self, priorities: &BTreeMap<u64, ThreadPriority>) -> Result<(), Trap> {
-        for (&id, priority) in priorities {
-            if id == 0 || priority.base > 63 || priority.effective > priority.base {
-                return Err(invalid(
-                    "mutex priority metadata is outside the modeled 0..63 range",
-                ));
-            }
-        }
-        for (&id, waiter) in &self.waiting {
-            Self::require_thread(priorities, id)?;
-            Self::require_thread(priorities, waiter.owner)?;
-            Self::require_thread(priorities, waiter.original_owner)?;
-        }
-        for (&id, pending) in &self.returns {
-            Self::require_thread(priorities, id)?;
-            Self::require_thread(priorities, pending.original_owner)?;
-        }
-        Ok(())
-    }
-
     fn take_order(&mut self) -> Result<u64, Trap> {
         let order = self.next_order;
         self.next_order = order
@@ -121,24 +122,20 @@ impl MutexWaits {
     // Mirror RestorePriority's owner-chain order. A waiting thread whose
     // effective priority changes is removed/reinserted at its new priority's
     // tail. Unchanged priorities stop propagation and do not consume an order.
-    fn restore_priority(
-        &mut self,
-        start: u64,
-        priorities: &mut BTreeMap<u64, ThreadPriority>,
-    ) -> Result<(), Trap> {
+    fn restore_priority(&mut self, start: u64, staged: &mut Staged) -> Result<(), Trap> {
         let mut current = Some(start);
         let mut visited = BTreeSet::new();
         while let Some(id) = current {
             if !visited.insert(id) {
                 return Err(invalid("prototype mutex priority graph contains a cycle"));
             }
-            let mut next_priority = priorities[&id].base;
+            let mut next_priority = staged.get(id)?.base;
             for (&waiter_id, waiter) in &self.waiting {
                 if waiter.owner == id {
-                    next_priority = next_priority.min(priorities[&waiter_id].effective);
+                    next_priority = next_priority.min(staged.get(waiter_id)?.effective);
                 }
             }
-            if next_priority == priorities[&id].effective {
+            if next_priority == staged.get(id)?.effective {
                 break;
             }
             current = self.waiting.get(&id).map(|waiter| waiter.owner);
@@ -149,52 +146,49 @@ impl MutexWaits {
                     .expect("id is a current waiter")
                     .order = order;
             }
-            priorities
-                .get_mut(&id)
-                .expect("every waiter has a priority entry")
-                .effective = next_priority;
+            staged.set_effective(id, next_priority)?;
         }
         Ok(())
     }
 
-    /// SetBasePriority then RestorePriority from `thread` up its owner chain.
-    /// Returns the staged queue (waiter orders may change) and every
-    /// resulting effective priority.
-    pub(crate) fn prepare_base_priority(
-        &self,
+    /// SetBasePriority then RestorePriority from `thread` up its owner chain,
+    /// in place. Returns the effective priorities that change.
+    pub(crate) fn set_base_priority(
+        &mut self,
         thread: u64,
         base: u8,
-        priorities: &BTreeMap<u64, ThreadPriority>,
-    ) -> Result<WaitPlan, Trap> {
-        self.validate_priorities(priorities)?;
-        Self::require_thread(priorities, thread)?;
+        lookup: &dyn Fn(u64) -> Option<ThreadPriority>,
+    ) -> Result<BTreeMap<u64, u8>, Trap> {
         if base > 63 {
             return Err(invalid("base priority is outside the modeled 0..63 range"));
         }
-        let mut state = self.clone();
-        let mut staged_priorities = priorities.clone();
-        staged_priorities
-            .get_mut(&thread)
-            .expect("require_thread checked the entry")
-            .base = base;
-        state.restore_priority(thread, &mut staged_priorities)?;
-        Ok(WaitPlan {
-            state,
-            priorities: changed_priorities(priorities, &staged_priorities),
-        })
+        let mut staged = Staged {
+            lookup,
+            changes: BTreeMap::new(),
+        };
+        let mut priority = staged.get(thread)?;
+        priority.base = base;
+        staged.changes.insert(thread, priority);
+        self.restore_priority(thread, &mut staged)?;
+        Ok(staged.changed())
     }
 
-    pub(crate) fn prepare_wait(
-        &self,
+    /// `waiter` waits for `owner`'s mutex at `address`, in place. Returns the
+    /// effective priorities that change (`owner`'s chain inherits).
+    pub(crate) fn wait(
+        &mut self,
         waiter: u64,
         owner: u64,
         address: u64,
         tag: u32,
-        priorities: &BTreeMap<u64, ThreadPriority>,
-    ) -> Result<WaitPlan, Trap> {
-        self.validate_priorities(priorities)?;
-        Self::require_thread(priorities, waiter)?;
-        Self::require_thread(priorities, owner)?;
+        lookup: &dyn Fn(u64) -> Option<ThreadPriority>,
+    ) -> Result<BTreeMap<u64, u8>, Trap> {
+        let mut staged = Staged {
+            lookup,
+            changes: BTreeMap::new(),
+        };
+        staged.get(waiter)?;
+        staged.get(owner)?;
         if self.waiting.contains_key(&waiter) || self.returns.contains_key(&waiter) {
             return Err(invalid("thread already has a mutex wait or pending return"));
         }
@@ -211,10 +205,8 @@ impl MutexWaits {
             }
             cursor = self.waiting.get(&id).map(|entry| entry.owner);
         }
-
-        let mut state = self.clone();
-        let order = state.take_order()?;
-        state.waiting.insert(
+        let order = self.take_order()?;
+        self.waiting.insert(
             waiter,
             Waiter {
                 owner,
@@ -225,31 +217,34 @@ impl MutexWaits {
                 deadline: None,
             },
         );
-        let mut staged_priorities = priorities.clone();
-        state.restore_priority(owner, &mut staged_priorities)?;
-        Ok(WaitPlan {
-            state,
-            priorities: changed_priorities(priorities, &staged_priorities),
-        })
+        self.restore_priority(owner, &mut staged)?;
+        Ok(staged.changed())
     }
 
-    pub(crate) fn prepare_unlock(
-        &self,
+    /// `owner` releases its mutex at `address`, in place: the best waiter
+    /// (effective priority, then FIFO) is selected and inherits the rest.
+    pub(crate) fn unlock(
+        &mut self,
         owner: u64,
         address: u64,
-        priorities: &BTreeMap<u64, ThreadPriority>,
-    ) -> Result<UnlockPlan, Trap> {
-        self.validate_priorities(priorities)?;
-        Self::require_thread(priorities, owner)?;
-        let selected = self
-            .waiting
-            .iter()
-            .filter(|(_, waiter)| waiter.owner == owner && waiter.address == address)
-            .min_by_key(|&(id, waiter)| (priorities[id].effective, waiter.order))
-            .map(|(&id, _)| id);
-        let Some(selected) = selected else {
-            return Ok(UnlockPlan {
-                state: self.clone(),
+        lookup: &dyn Fn(u64) -> Option<ThreadPriority>,
+    ) -> Result<Unlock, Trap> {
+        let mut staged = Staged {
+            lookup,
+            changes: BTreeMap::new(),
+        };
+        staged.get(owner)?;
+        let mut selected: Option<(u8, u64, u64)> = None;
+        for (&id, waiter) in &self.waiting {
+            if waiter.owner == owner && waiter.address == address {
+                let key = (staged.get(id)?.effective, waiter.order, id);
+                if selected.is_none_or(|best| key < best) {
+                    selected = Some(key);
+                }
+            }
+        }
+        let Some((_, _, selected)) = selected else {
+            return Ok(Unlock {
                 priorities: BTreeMap::new(),
                 selected: None,
                 next_word: 0,
@@ -268,13 +263,14 @@ impl MutexWaits {
                 "prototype cannot transfer a second lock record for the same owner/address",
             ));
         }
-
-        let mut state = self.clone();
-        let selected_waiter = state
+        let selected_waiter = self
             .waiting
             .remove(&selected)
             .expect("the selected thread is waiting");
-        state.returns.insert(
+        if selected_waiter.deadline.is_some() {
+            self.timed -= 1;
+        }
+        self.returns.insert(
             selected,
             MutexReturn {
                 original_owner: selected_waiter.original_owner,
@@ -282,7 +278,7 @@ impl MutexWaits {
             },
         );
         let mut has_waiters = false;
-        for waiter in state.waiting.values_mut() {
+        for waiter in self.waiting.values_mut() {
             if waiter.owner == owner && waiter.address == address {
                 waiter.owner = selected;
                 // RemoveWaiterByKey transfers the existing tree unchanged.
@@ -290,12 +286,10 @@ impl MutexWaits {
                 has_waiters = true;
             }
         }
-        let mut staged_priorities = priorities.clone();
-        state.restore_priority(owner, &mut staged_priorities)?;
-        state.restore_priority(selected, &mut staged_priorities)?;
-        Ok(UnlockPlan {
-            state,
-            priorities: changed_priorities(priorities, &staged_priorities),
+        self.restore_priority(owner, &mut staged)?;
+        self.restore_priority(selected, &mut staged)?;
+        Ok(Unlock {
+            priorities: staged.changed(),
             selected: Some(selected),
             next_word: selected_waiter.tag | if has_waiters { HAS_WAITERS } else { 0 },
         })
@@ -308,14 +302,24 @@ impl MutexWaits {
         id: u64,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), Trap> {
-        self.waiting
+        let waiter = self
+            .waiting
             .get_mut(&id)
-            .ok_or_else(|| invalid("a mutex deadline requires a mutex waiter"))?
-            .deadline = deadline;
+            .ok_or_else(|| invalid("a mutex deadline requires a mutex waiter"))?;
+        let had = waiter.deadline.is_some();
+        waiter.deadline = deadline;
+        match (had, deadline.is_some()) {
+            (false, true) => self.timed += 1,
+            (true, false) => self.timed -= 1,
+            _ => {}
+        }
         Ok(())
     }
 
     pub(crate) fn earliest_deadline(&self) -> Option<std::time::Instant> {
+        if self.timed == 0 {
+            return None;
+        }
         self.waiting
             .values()
             .filter_map(|waiter| waiter.deadline)
@@ -324,6 +328,9 @@ impl MutexWaits {
 
     /// Waiters whose deadline has passed at `now`, in id order.
     pub(crate) fn expired(&self, now: std::time::Instant) -> Vec<u64> {
+        if self.timed == 0 {
+            return Vec::new();
+        }
         self.waiting
             .iter()
             .filter(|(_, waiter)| waiter.deadline.is_some_and(|deadline| now >= deadline))
@@ -332,38 +339,39 @@ impl MutexWaits {
     }
 
     /// A waiter's deadline passed (Atmosphere: a signaled condition waiter
-    /// still waiting for its mutex when its timer fires). It leaves its
-    /// owner's waiters, whose inherited priority is restored without it, and
-    /// returns TimedOut without the mutex; the mutex word is left as it is.
-    /// The owner reference it holds is released when it resumes, as for a
-    /// waiter an unlock selected.
-    pub(crate) fn prepare_timeout(
-        &self,
+    /// still waiting for its mutex when its timer fires), in place. It
+    /// leaves its owner's waiters, whose inherited priority is restored
+    /// without it, and returns TimedOut without the mutex; the mutex word
+    /// is left as it is. The owner reference it holds is released when it
+    /// resumes, as for a waiter an unlock selected. Returns the effective
+    /// priorities that change.
+    pub(crate) fn time_out(
+        &mut self,
         id: u64,
-        priorities: &BTreeMap<u64, ThreadPriority>,
-    ) -> Result<WaitPlan, Trap> {
-        self.validate_priorities(priorities)?;
-        let mut state = self.clone();
-        let waiter = state
+        lookup: &dyn Fn(u64) -> Option<ThreadPriority>,
+    ) -> Result<BTreeMap<u64, u8>, Trap> {
+        if self
             .waiting
-            .remove(&id)
-            .ok_or_else(|| invalid("a mutex timeout requires a mutex waiter"))?;
-        if waiter.deadline.is_none() {
-            return Err(invalid("a mutex waiter without a deadline cannot time out"));
+            .get(&id)
+            .is_none_or(|waiter| waiter.deadline.is_none())
+        {
+            return Err(invalid("only a mutex waiter with a deadline can time out"));
         }
-        state.returns.insert(
+        let mut staged = Staged {
+            lookup,
+            changes: BTreeMap::new(),
+        };
+        let waiter = self.waiting.remove(&id).expect("checked above");
+        self.timed -= 1;
+        self.returns.insert(
             id,
             MutexReturn {
                 original_owner: waiter.original_owner,
                 result: Some(0xea01),
             },
         );
-        let mut staged_priorities = priorities.clone();
-        state.restore_priority(waiter.owner, &mut staged_priorities)?;
-        Ok(WaitPlan {
-            state,
-            priorities: changed_priorities(priorities, &staged_priorities),
-        })
+        self.restore_priority(waiter.owner, &mut staged)?;
+        Ok(staged.changed())
     }
 
     pub(crate) fn has_waiters(&self, owner: u64) -> bool {
@@ -852,6 +860,77 @@ impl ZeroHandleWaits {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    /// The in-place changes as plans on a copy, for checking that a failed
+    /// change leaves the graph as it was.
+    struct Plan {
+        state: MutexWaits,
+        priorities: BTreeMap<u64, u8>,
+        selected: Option<u64>,
+        next_word: u32,
+    }
+
+    impl MutexWaits {
+        fn plan(
+            &self,
+            change: impl FnOnce(&mut MutexWaits) -> Result<Unlock, Trap>,
+        ) -> Result<Plan, Trap> {
+            let mut state = self.clone();
+            let unlock = change(&mut state)?;
+            Ok(Plan {
+                state,
+                priorities: unlock.priorities,
+                selected: unlock.selected,
+                next_word: unlock.next_word,
+            })
+        }
+
+        fn prepare_wait(
+            &self,
+            waiter: u64,
+            owner: u64,
+            address: u64,
+            tag: u32,
+            priorities: &BTreeMap<u64, ThreadPriority>,
+        ) -> Result<Plan, Trap> {
+            self.plan(|state| {
+                state
+                    .wait(waiter, owner, address, tag, &|id| {
+                        priorities.get(&id).copied()
+                    })
+                    .map(only_priorities)
+            })
+        }
+
+        fn prepare_unlock(
+            &self,
+            owner: u64,
+            address: u64,
+            priorities: &BTreeMap<u64, ThreadPriority>,
+        ) -> Result<Plan, Trap> {
+            self.plan(|state| state.unlock(owner, address, &|id| priorities.get(&id).copied()))
+        }
+
+        fn prepare_timeout(
+            &self,
+            id: u64,
+            priorities: &BTreeMap<u64, ThreadPriority>,
+        ) -> Result<Plan, Trap> {
+            self.plan(|state| {
+                state
+                    .time_out(id, &|id| priorities.get(&id).copied())
+                    .map(only_priorities)
+            })
+        }
+    }
+
+    fn only_priorities(priorities: BTreeMap<u64, u8>) -> Unlock {
+        Unlock {
+            priorities,
+            selected: None,
+            next_word: 0,
+        }
+    }
 
     fn priorities(values: &[(u64, u8)]) -> BTreeMap<u64, ThreadPriority> {
         values
