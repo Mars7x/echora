@@ -5,7 +5,7 @@
 - **Echora is not ready for stable gameplay.** Runs can hang, crash or
   render incorrectly, and saves are untested.
 - Runs are far below full speed: the game runs at 60 frames per second on
-  the console, and the intro movie decodes here at about 17 pictures per
+  the console, and the intro movie decodes here at about 20 pictures per
   second. By default every guest thread runs on one host thread, which does
   most of the work. `ECHORA_WORKERS` runs
   them on up to six host threads, one per application core, but those runs

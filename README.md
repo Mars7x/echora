@@ -53,7 +53,7 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
   gameplay has not been reached. The mesh and task shaders that gameplay
   scenes need have no draw path in the runtime yet.
 - **Far below full speed.** The game runs at 60 frames per second on the
-  console; here the intro movie decodes about 17 pictures per second once
+  console; here the intro movie decodes about 20 pictures per second once
   it is playing. Every guest thread runs on one host thread by default,
   and that thread does most of the work, so faster translated code alone
   cannot reach full speed. Running guest threads on several host threads
@@ -62,7 +62,7 @@ display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
   within half a minute, so it stays off by default.
 - **Shaders.** The console's GPU programs are translated to SPIR-V by the
   Lichii shader recompiler with Echora's patches. Of the 6,074 shader stages
-  OoT reached in a test run, 5,960 translate and compile on the driver.
+  OoT reached in a test run, 6,047 translate and compile on the driver.
 - **Content input works.** Echora opens the game's NUP container directly,
   validates its whole table of contents, and identifies the executable set.
   A full content check of the 25 GB package (186,592 files, 23.5 GiB after
@@ -117,14 +117,14 @@ The game runs only on Linux for now. You need:
 - your own dump of the game: the Switch 2 update 1.1.1, as a NUP file or
   an extracted dump;
 - a Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk;
-- Rust 1.88 or newer, `git`, C and C++ compilers, and the system
+- Rust 1.88 or newer, `git`, C and C++ compilers, NASM, and the system
   libraries:
 
 ```sh
 # Ubuntu
-sudo apt install build-essential libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
+sudo apt install build-essential nasm libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
 # Fedora
-sudo dnf install gcc gcc-c++ alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel libxcb-devel vulkan-loader-devel
+sudo dnf install gcc gcc-c++ nasm alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel libxcb-devel vulkan-loader-devel
 ```
 
 Then build Echora and open the launcher:
