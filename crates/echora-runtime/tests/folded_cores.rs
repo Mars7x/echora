@@ -45,11 +45,28 @@ const WAITER: u64 = CODE + 0x300;
 const WAITER_SET: u64 = CODE + 0x310;
 /// The second setter: set `FLAG_B` and exit.
 const SETTER_B: u64 = CODE + 0x400;
+/// The dispatch-disabled program: main (core 0) sets its DisableCount,
+/// creates a better-priority thread on its own core and a setter on another
+/// core of worker 0, and spins until the setter's flag; the better thread
+/// must not have run on core 0 meanwhile.
+const DISABLED_ENTRY: u64 = CODE + 0x500;
+const DISABLED_CREATE_BETTER: u64 = CODE + 0x510;
+const DISABLED_START_BETTER: u64 = CODE + 0x520;
+const DISABLED_CREATE_SETTER: u64 = CODE + 0x530;
+const DISABLED_START_SETTER: u64 = CODE + 0x540;
+const DISABLED_SPIN: u64 = CODE + 0x550;
+/// The better thread (priority 28, core 0): set `FLAG_BETTER` and exit.
+const BETTER: u64 = CODE + 0x600;
 const DATA: u64 = 0x8000;
 /// The flag, in a page of its own (the stack alias makes `DATA`
 /// inaccessible at its own address).
 const FLAG: u64 = 0x10000;
 const FLAG_B: u64 = FLAG + 4;
+const FLAG_BETTER: u64 = FLAG + 8;
+/// What main saw of `FLAG_BETTER` when the setter's flag arrived, plus one.
+const SEEN_BETTER: u64 = FLAG + 12;
+/// Main's TLS DisableCount (Horizon's thread-local preemption counter).
+const TLS_DISABLE_COUNT: u64 = 0x100;
 
 /// The guest core the threads main creates are pinned to: one worker 0
 /// serves besides core 0.
@@ -97,11 +114,22 @@ fn machine(workers: usize, max_steps: u64, entry: u64) -> Machine {
 
 /// CreateThread(entry, arg 0, a stack top, priority 50, `SETTER_CORE`).
 fn create_thread(core: &mut Core, entry: u64, stack: u64) -> Result<(), Trap> {
+    let setter_core = SETTER_CORE.load(std::sync::atomic::Ordering::Relaxed);
+    create_thread_on(core, entry, stack, 50, setter_core)
+}
+
+fn create_thread_on(
+    core: &mut Core,
+    entry: u64,
+    stack: u64,
+    priority: u64,
+    guest_core: u64,
+) -> Result<(), Trap> {
     core.cpu.regs[1] = entry;
     core.cpu.regs[2] = 0;
     core.cpu.regs[3] = 0x7ff0000000 - 0x200000 + stack;
-    core.cpu.regs[4] = 50;
-    core.cpu.regs[5] = SETTER_CORE.load(std::sync::atomic::Ordering::Relaxed);
+    core.cpu.regs[4] = priority;
+    core.cpu.regs[5] = guest_core;
     Err(Trap::SupervisorCall { number: 0x08 })
 }
 
@@ -118,7 +146,35 @@ fn block(core: &mut Core) -> Result<(), Trap> {
     core.tick_block_at(pc, 1)?;
     match pc {
         MAIN_CREATE => return create_thread(core, SETTER, 0x400),
-        MAIN_START | TURNS_START_WAITER | TURNS_START_SETTER => return start_thread(core),
+        MAIN_START
+        | TURNS_START_WAITER
+        | TURNS_START_SETTER
+        | DISABLED_START_BETTER
+        | DISABLED_START_SETTER => return start_thread(core),
+        DISABLED_ENTRY => {
+            let tls = core.cpu.tpidrro_el0;
+            core.memory.store_u16(tls + TLS_DISABLE_COUNT, 1);
+            core.cpu.pc = DISABLED_CREATE_BETTER;
+        }
+        DISABLED_CREATE_BETTER => return create_thread_on(core, BETTER, 0xc00, 28, 0),
+        DISABLED_CREATE_SETTER => return create_thread(core, SETTER, 0x400),
+        DISABLED_SPIN => {
+            // No spin hint, and dispatch disabled: only the turns of
+            // worker 0's other core let the setter run.
+            if core.memory.load_u32(FLAG) == 0 {
+                core.cpu.pc = DISABLED_SPIN;
+            } else {
+                let better = core.memory.load_u32(FLAG_BETTER);
+                core.memory.store_u32(SEEN_BETTER, better + 1);
+                let tls = core.cpu.tpidrro_el0;
+                core.memory.store_u16(tls + TLS_DISABLE_COUNT, 0);
+                core.cpu.pc = MAIN_EXIT;
+            }
+        }
+        BETTER => {
+            core.memory.store_u32(FLAG_BETTER, 1);
+            core.cpu.pc = SETTER_EXIT;
+        }
         TURNS_CREATE_WAITER => return create_thread(core, WAITER, 0x400),
         TURNS_CREATE_SETTER => return create_thread(core, SETTER_B, 0x800),
         WAITER => {
@@ -168,27 +224,32 @@ fn dispatch(core: &mut Core) -> Result<(), Trap> {
     block(core)
 }
 
-fn run(workers: usize, entry: u64) -> Trap {
+/// The tests share `SETTER_CORE`: one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn ends(workers: usize, entry: u64) -> Machine {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Worker 0 serves cores 0 and `workers` below six workers; with six,
     // core 1 is worker 1's alone.
     let core = if workers < 6 { workers as u64 } else { 1 };
     SETTER_CORE.store(core, std::sync::atomic::Ordering::Relaxed);
     let mut m = machine(workers, 20_000_000, entry);
-    m.run_generated(dispatch).unwrap_err()
-}
-
-/// The tests share `SETTER_CORE`: one at a time.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn ends(workers: usize, entry: u64) {
-    let _serial = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let trap = run(workers, entry);
+    let trap = m.run_generated(dispatch).unwrap_err();
     assert!(
         matches!(trap, Trap::Exit { .. }),
         "{workers} workers: {trap:?}"
     );
+    m
+}
+
+/// The dispatch-disabled program ends, and the better-priority thread on
+/// main's core did not run while main had dispatch disabled.
+fn disabled_ends(workers: usize) {
+    let m = ends(workers, DISABLED_ENTRY);
+    let seen = m.memory.read_u32(SEEN_BETTER).unwrap();
+    assert_eq!(seen, 1, "{workers} workers: core 0 ran another thread");
 }
 
 #[test]
@@ -216,9 +277,20 @@ fn equal_priorities_on_a_folded_core_take_turns() {
     }
 }
 
+/// A thread with dispatch disabled holds its own guest core, not the
+/// whole worker: worker 0's other core still takes its turns, and nothing
+/// else (not even a better priority) runs on the thread's core.
+#[test]
+fn dispatch_disabled_holds_only_its_own_folded_core() {
+    for workers in 2..=5 {
+        disabled_ends(workers);
+    }
+}
+
 /// One core per worker: no folding, scheduling as before.
 #[test]
-fn six_workers_run_both_programs() {
+fn six_workers_run_every_program() {
     ends(6, MAIN_CREATE);
     ends(6, TURNS_CREATE_WAITER);
+    disabled_ends(6);
 }

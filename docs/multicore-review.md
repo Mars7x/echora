@@ -78,9 +78,10 @@ equal priorities rotate by id after the thread that core last ran
 (`core_last_thread`, recorded at each parallel boundary). With six workers
 each worker has one core and the choice is the same as before.
 `crates/echora-runtime/tests/folded_cores.rs` checks it at two to five
-workers. Still open: a DisableCount thread holds its whole worker, not
-only its core's slice, since the slice end that skips the switch is
-outside the scheduler.
+workers. A thread with DisableCount set holds only its own core
+(`core_hold`): at its slice end the worker still passes the turn to its
+other cores, nothing else runs on the held core, and the thread resumes
+there and nowhere else until it ends a slice with dispatch enabled.
 
 ### 2. Per-core data collisions are guarded; keep them so
 

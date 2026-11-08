@@ -296,6 +296,11 @@ pub struct Machine {
     /// cores folded onto a worker: equal priorities on a core take turns
     /// after it (see `next_runnable_thread`).
     core_last_thread: [u64; 64],
+    /// By guest core folded onto a worker: the thread with dispatch
+    /// disabled (TLS DisableCount) that gave the worker to another core's
+    /// turn. It keeps its core: nothing else runs there, and it resumes on
+    /// no other, until it ends a slice with dispatch enabled.
+    core_hold: [Option<u64>; 64],
     /// Step count of the last scan of parked waits.
     last_wake_check: u64,
     /// With several workers: the threads other workers are running now
@@ -416,6 +421,7 @@ impl Machine {
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
             core_last_thread: [0; 64],
+            core_hold: [None; 64],
             last_wake_check: 0,
             running: Default::default(),
             worker_core: None,
@@ -1751,11 +1757,31 @@ impl Machine {
             }
             _ => 0,
         };
+        // A thread holding a core (dispatch disabled) runs only there.
+        let held_at = |id: u64| -> Option<u8> {
+            (0..64u8).find(|&core| self.core_hold[usize::from(core)] == Some(id))
+        };
         let home = |id: u64| -> u8 {
             match self.worker_core {
-                Some(core) if cores.count_ones() > 1 => self.guest_core_on_worker(id, core),
+                Some(core) if cores.count_ones() > 1 => {
+                    held_at(id).unwrap_or_else(|| self.guest_core_on_worker(id, core))
+                }
                 _ => 0,
             }
+        };
+        let holding = |id: u64| -> bool {
+            self.thread_state(id) == Some(ThreadState::Runnable) && !self.running.contains(&id)
+        };
+        // Whether `id` may run here as far as holds go: a holder only on its
+        // core, and nothing else on a core held by a runnable holder.
+        let hold_allows = |id: u64, core: u8| -> bool {
+            if self.core_hold.iter().all(Option::is_none) {
+                return true;
+            }
+            if let Some(held) = held_at(id) {
+                return cores & 1 << held != 0 && held == core;
+            }
+            !self.core_hold[usize::from(core) % 64].is_some_and(|holder| holding(holder))
         };
         // (id, home core, priority, backing off from a spin)
         let candidates: Vec<(u64, u8, u8, bool)> = main
@@ -1769,6 +1795,7 @@ impl Machine {
                     .is_some_and(|until| *until > self.core.steps);
                 (id, home(id), priority(id), spinning)
             })
+            .filter(|&(id, core, _, _)| hold_allows(id, core))
             .collect();
         let mut best = [u8::MAX; 64];
         for &(_, core, priority, _) in &candidates {
@@ -1879,6 +1906,39 @@ impl Machine {
         if self.worker_guest_cores(worker).count_ones() > 1 {
             let core = self.guest_core_on_worker(current, worker);
             self.core_last_thread[usize::from(core) % 64] = current;
+        }
+    }
+
+    /// At a slice end with dispatch disabled: with several guest cores on
+    /// this worker, hold the current thread's core and return the thread
+    /// of the worker's next core in turn, if another core has one. With
+    /// one core per worker (or one worker) there is no other turn: None.
+    fn dispatch_disabled_turn(&mut self) -> Option<u64> {
+        let worker = self.worker_core?;
+        if self.worker_guest_cores(worker).count_ones() < 2 {
+            return None;
+        }
+        let current = self.core.current_thread_id;
+        let core = (0..64)
+            .find(|&core| self.core_hold[core] == Some(current))
+            .unwrap_or_else(|| usize::from(self.guest_core_on_worker(current, worker)) % 64);
+        self.core_hold[core] = Some(current);
+        let next = self.next_runnable_thread(current, None);
+        if next.is_none_or(|next| next == current) {
+            self.core_hold[core] = None;
+            return None;
+        }
+        next
+    }
+
+    /// The current thread ended a slice with dispatch enabled: it holds no
+    /// core any more.
+    fn release_core_hold(&mut self) {
+        let current = self.core.current_thread_id;
+        for hold in &mut self.core_hold {
+            if *hold == Some(current) {
+                *hold = None;
+            }
         }
     }
 
@@ -2200,9 +2260,16 @@ impl Machine {
         // thread calls SynchronizePreemptionState once it re-enables. The
         // game's per-core data (indexed by GetCurrentProcessorNumber) relies
         // on it.
+        // With several guest cores folded onto this worker the thread holds
+        // only its own core: the others still take their turns, and the
+        // thread resumes on its core with nothing run there in between.
         if self.user_preemption_disabled() {
-            return Ok(());
+            let Some(next) = self.dispatch_disabled_turn() else {
+                return Ok(());
+            };
+            return self.switch_at_slice_end(next, "dispatch_disabled_turn");
         }
+        self.release_core_hold();
         // A thread that ended its slice spin-polling waits for memory other
         // threads must change: let them run first for a while. Only dense
         // polling counts (a poll per SPIN_DENSITY_INSTRUCTIONS or more):
@@ -2260,6 +2327,11 @@ impl Machine {
                 return Ok(());
             }
         }
+        self.switch_at_slice_end(next, "completed_block_round_robin")
+    }
+
+    /// Save the current thread's context and dispatch `next`.
+    fn switch_at_slice_end(&mut self, next: u64, reason: &'static str) -> Result<(), Trap> {
         let cpu = self.prepare_dispatch_cpu(next)?;
         if self.core.current_thread_id == self.layout.main_thread_id {
             self.main_saved_cpu = Some(self.core.cpu.clone());
@@ -2269,7 +2341,7 @@ impl Machine {
                 .save_cpu(self.core.current_thread_id, &self.core.cpu)?;
             self.note_context_saved(self.core.current_thread_id);
         }
-        self.commit_context_switch(next, cpu, "completed_block_round_robin");
+        self.commit_context_switch(next, cpu, reason);
         Ok(())
     }
 
