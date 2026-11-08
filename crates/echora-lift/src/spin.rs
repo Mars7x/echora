@@ -39,6 +39,9 @@
 //! detector does not see where they go. Branches to undiscovered code within
 //! the window reject the loop.
 //!
+//! Loops containing YIELD or WFE are not reported: generated code already
+//! counts every such instruction as a poll (`Core::spin_hint`).
+//!
 //! A wrong answer costs only speed, never correctness: generated code can
 //! hand the core on at any block boundary.
 
@@ -1268,6 +1271,65 @@ mod tests {
             0xd65f_03c0, // 6: done: ret
         ];
         assert_eq!(spin_loops(&words), vec![]);
+    }
+
+    #[test]
+    fn finds_an_exclusive_lock_acquire_at_its_head() {
+        // lock: ldaxr w8, [x0]; cbnz w8, lock; stxr w9, w1, [x0];
+        // cbnz w9, lock; ret. The poll edge makes it a spin; the hint goes
+        // at the head, whichever edge returns there.
+        let words = [
+            0x885f_fc08,
+            0x35ff_ffe8,
+            0x8809_7c01,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let loops = spin_loops(&words);
+        assert_eq!(loops.len(), 1, "{loops:?}");
+        assert_eq!(loops[0].head, at(0));
+    }
+
+    #[test]
+    fn rejects_an_exclusive_increment_retry() {
+        // retry: ldaxr w8, [x0]; add w8, w8, #1; stlxr w9, w8, [x0];
+        // cbnz w9, retry: the thread can finish it alone (the next STLXR
+        // may succeed), so it is not a wait.
+        let words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        assert_eq!(spin_loops(&words), vec![]);
+    }
+
+    #[test]
+    fn leaves_wfe_and_yield_waits_to_their_own_hints() {
+        // Generated code already counts every WFE and YIELD as a poll
+        // (codegen's SpinHint), so loops containing one are not reported
+        // again: sevl; wait: wfe; ldaxr w8, [x0]; cbnz w8, wait; ...
+        let wfe_first = [
+            0xd503_20bf,
+            0xd503_205f,
+            0x885f_fc08,
+            0x35ff_ffc8,
+            0xd65f_03c0,
+        ];
+        // ... loop: ldaxr w8, [x0]; cbz w8, done; wfe; b loop; done: ret
+        let wfe_after = [
+            0x885f_fc08,
+            0x3400_0068,
+            0xd503_205f,
+            0x17ff_fffd,
+            0xd65f_03c0,
+        ];
+        // ... wait: yield; ldr w8, [x0]; cbz w8, wait
+        let yield_poll = [0xd503_203f, 0xb940_0008, 0x34ff_ffc8, 0xd65f_03c0];
+        for words in [&wfe_first[..], &wfe_after, &yield_poll] {
+            assert_eq!(spin_loops(words), vec![], "{words:x?}");
+        }
     }
 
     #[test]
