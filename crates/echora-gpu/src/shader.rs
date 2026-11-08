@@ -95,7 +95,7 @@ pub trait Environment {
 pub struct NoEnvironment;
 impl Environment for NoEnvironment {}
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Parameters {
     pub workgroup_size: [u32; 3],
     pub shared_memory_size: u32,

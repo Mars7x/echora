@@ -946,6 +946,19 @@ impl Nvn {
                     // recompiler drops stores at constant offsets.
                     local_memory_size: compute[4],
                 };
+                // ECHORA_SHADER_TRACE=FILE (debugging): each translation's
+                // stage key and parameters, appended before it runs, so the
+                // last line names a translation that aborts the process.
+                if let Some(path) = super::debug_var_os("ECHORA_SHADER_TRACE") {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(file, "{key:016x} {parameters:?}");
+                    }
+                }
                 shader::translate(&code, parameters, &mut shader::NoEnvironment)
                     .map(Arc::new)
                     .map_err(|error| format!("stage {key:016x}: {error}"))
@@ -1081,7 +1094,7 @@ impl Nvn {
     /// section gives its largest vertex and primitive counts at +0x60 (low
     /// and high half) and its threads at +0x58; a task program has nothing
     /// at +0x60, and its +0x58 is laid out as SET_MESH_INIT_SHADER (threads
-    /// 5:0, payload lines 30:22). Without a task the mesh program sits in
+    /// 5:0, payload lines 30:22); a vertex program has neither. Without a task the mesh program sits in
     /// the vertex slot (its header names a vertex program), after one in the
     /// tessellation slot; a pass-through geometry program bound with it
     /// lists the per-primitive outputs.
@@ -1156,7 +1169,12 @@ impl Nvn {
                     geometry = Some(header);
                 }
                 1 | 3 if control(stage, 0x60) != 0 => mesh = Some((*stage, kind)),
-                1 => task = Some(*stage),
+                // A task program's threads (+0x58 bits 5:0) are never 0; a
+                // vertex program has 0 there. One is still bound from the
+                // draws before when a mesh program replaces only other
+                // stages (the game's first mesh draws after the opening
+                // movie): it takes no part in the mesh draw.
+                1 if control(stage, 0x58) & 0x3f != 0 => task = Some(*stage),
                 _ => {}
             }
         }
