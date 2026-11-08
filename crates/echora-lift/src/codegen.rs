@@ -894,6 +894,30 @@ fn emit_call(output: &mut String, next: u64) {
     .unwrap();
 }
 
+/// A BL to `target`, whose window `window` is in the same region source as
+/// the caller: `Core::call_window` runs that window's function first,
+/// without looking it up in the window table, and then goes on as
+/// `Core::call` does. Its traps and early returns are `Core::call`'s.
+fn emit_direct_call(output: &mut String, next: u64, window: u64) {
+    writeln!(
+        output,
+        "                if let Err(trap) = m.call_window({next:#x}, run_window_{window:x}) {{ return Err(trap); }}"
+    )
+    .unwrap();
+}
+
+/// The window function a BL to `target` can call directly, under
+/// `EmitOptions::direct_calls`: a block start in the caller's region (the
+/// same generated source, so the function is in scope).
+fn direct_call_window(pc: u64, target: u64) -> Option<u64> {
+    DIRECT_CALLS.with_borrow(|direct| {
+        let direct = direct.as_ref()?;
+        (direct.starts.contains(&target)
+            && target >> direct.region_bits == pc >> direct.region_bits)
+            .then_some(target >> SPLIT_WINDOW_BITS)
+    })
+}
+
 /// Guest registers as locals of a split window function: the registers its
 /// blocks use are read into locals on entry and the ones they write are
 /// stored back when it returns, so the host compiler keeps them in host
@@ -934,7 +958,12 @@ const WRITES_REGISTERS: &[&str] = &[
     "::fp_to_fixed(",
 ];
 
-const CALL_PREFIX: &str = "if let Err(trap) = m.call(";
+/// Calls into other windows as emitted (`emit_call`, `emit_direct_call`),
+/// with the `Core` method each makes.
+const CALL_PREFIXES: &[(&str, &str)] = &[
+    ("if let Err(trap) = m.call(", "call"),
+    ("if let Err(trap) = m.call_window(", "call_window"),
+];
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[&str] = &[
@@ -1066,14 +1095,16 @@ impl RegisterLocals {
                 }
             }
             let indent = &line[..line.len() - line.trim_start().len()];
-            if let Some(rest) = line.trim_start().strip_prefix(CALL_PREFIX) {
+            if let Some((rest, method)) = CALL_PREFIXES.iter().find_map(|(prefix, method)| {
+                Some((line.trim_start().strip_prefix(prefix)?, method))
+            }) {
                 // The callee runs on the Core: store before, reload after
                 // (also on its error path, so the final store keeps what
                 // the callee left).
-                let target = &rest[..rest.find(')').expect("call target")];
+                let arguments = &rest[..rest.find(')').expect("call target")];
                 writeln!(
                     text,
-                    "{indent}{store}let called = m.call({target}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                    "{indent}{store}let called = m.{method}({arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
                 )
                 .unwrap();
                 continue;
@@ -1209,7 +1240,10 @@ fn emit_instruction_body(
             }
             if *link {
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
-                emit_call(output, next);
+                match direct_call_window(pc, *target) {
+                    Some(window) => emit_direct_call(output, next, window),
+                    None => emit_call(output, next),
+                }
                 output.push_str(after_call);
             } else {
                 writeln!(output, "                {successor} = {target:#x};").unwrap();
@@ -2667,6 +2701,40 @@ pub struct EmitOptions {
     /// code instead of helper calls (`crate::simd::emit_inline`), with the
     /// exact helper still taking every float case its fast path would not.
     pub inline_vector: bool,
+    /// Make a BL whose target starts a block in the caller's region call
+    /// that window's function directly (`Core::call_window`) instead of
+    /// looking it up through `Core::call`. Registers are stored and
+    /// reloaded around it as around any call, and a call that comes back
+    /// early or traps behaves as through `Core::call`.
+    pub direct_calls: bool,
+}
+
+/// What `EmitOptions::direct_calls` needs where a BL is written.
+struct DirectCalls {
+    region_bits: u32,
+    starts: BTreeSet<u64>,
+}
+
+thread_local! {
+    /// Set while a split emission with `EmitOptions::direct_calls` runs on
+    /// this thread.
+    static DIRECT_CALLS: std::cell::RefCell<Option<DirectCalls>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets [`DIRECT_CALLS`] for as long as it lives.
+struct DirectCallsSet(Option<DirectCalls>);
+
+impl DirectCallsSet {
+    fn set(direct: Option<DirectCalls>) -> Self {
+        Self(DIRECT_CALLS.replace(direct))
+    }
+}
+
+impl Drop for DirectCallsSet {
+    fn drop(&mut self) {
+        DIRECT_CALLS.set(self.0.take());
+    }
 }
 
 thread_local! {
@@ -2739,6 +2807,10 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _direct_calls = DirectCallsSet::set(options.direct_calls.then(|| DirectCalls {
+        region_bits,
+        starts: translation.blocks.iter().map(|block| block.start).collect(),
+    }));
     let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
         // Loop heads are entries too: a loop resumed after a host boundary
         // comes back into the tree at its next iteration.
@@ -3414,6 +3486,25 @@ mod tests {
         )
         .unwrap();
         assert!(!inlined_blocks(&translation).contains(&0x1004));
+    }
+
+    #[test]
+    fn direct_calls_call_the_window_function_of_a_target_in_the_region() {
+        // BL +8 (to the RET at 0x1008, window 4); BL to 0x10_0000, outside
+        // the 64 KiB region; ADD; RET.
+        let words = [0x9400_0002, 0x9403_fbff, 0x9100_0421, 0xd65f_03c0];
+        let translation = discover(&[region(&words)], &[0x1000], 8).unwrap();
+        let options = EmitOptions {
+            direct_calls: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        // Registers are stored before and reloaded after, as around m.call.
+        assert!(source.contains("let called = m.call_window(0x1004, run_window_4);"));
+        assert!(source.contains("let called = m.call(0x1008);"));
+        let (_, plain) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        assert!(!plain[0].1.contains("call_window"));
     }
 
     #[test]

@@ -29,6 +29,38 @@ pub mod kernels {
     include!("kernels.rs");
 }
 
+/// A stand-in for `Core::call_window` until echora-guest has it, so direct
+/// calls (`--features direct-calls`) can be run: the callee's window
+/// function, then on as `Core::call` goes. It nests at most as deep as
+/// `Core::call` does; deeper, the window is left to `Core::call` (its
+/// table finds the same function). An inherent `call_window` takes
+/// precedence over this trait's.
+pub trait CallWindow {
+    fn call_window(&mut self, return_to: u64, function: echora_guest::WindowFn)
+    -> Result<(), Trap>;
+}
+
+thread_local! {
+    static SHIM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl CallWindow for Core {
+    fn call_window(
+        &mut self,
+        return_to: u64,
+        function: echora_guest::WindowFn,
+    ) -> Result<(), Trap> {
+        let depth = SHIM_DEPTH.get();
+        if depth < 48 && self.cpu.pc != return_to {
+            SHIM_DEPTH.set(depth + 1);
+            let result = function(self);
+            SHIM_DEPTH.set(depth);
+            result?;
+        }
+        self.call(return_to)
+    }
+}
+
 pub struct Machine {
     pub memory: Memory,
     pub core: Core,

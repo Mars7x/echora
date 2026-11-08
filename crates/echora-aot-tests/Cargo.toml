@@ -19,6 +19,9 @@ inline-vector = []
 structured = ["structured-kernels"]
 # Only the benchmark kernels, for measuring.
 structured-kernels = []
+# Lift every program with direct BL calls (EmitOptions::direct_calls) and
+# 64 KiB regions. Needs Core::call_window in echora-guest.
+direct-calls = []
 
 [dependencies]
 echora-guest.workspace = true
