@@ -2309,6 +2309,134 @@ fn unary_path(op: FpUnaryOp) -> String {
     }
 }
 
+/// Bit tests on one float format for inlined code: the host float and
+/// integer types, the lane width, and closures `normal`, `zero` and
+/// `usable` (normal or zero) on raw lanes.
+fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
+    let (float, int, width, exponent, sign) = match size {
+        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+        FpSize::D => (
+            "f64",
+            "u64",
+            64,
+            "0x7ff0_0000_0000_0000u64",
+            "0x8000_0000_0000_0000u64",
+        ),
+    };
+    let closures = format!(
+        "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+         let zero = |value: {int}| value & !{sign} == 0; \
+         let usable = |value: {int}| normal(value) | zero(value); \
+         let sign = {sign}; let _ = sign;"
+    );
+    (float, int, width, closures)
+}
+
+/// The FPCR the float helpers accept (round to nearest, no AH or FZ16):
+/// under it, an inlined float operation traps exactly when its helper
+/// would, that is never.
+const FP_MODE: &str = "m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH | echora_guest::simd::FPCR_FZ16) == 0";
+
+/// FMAX/FMIN/FMAXNM/FMINNM of two normal-or-zero lanes `x` and `y`: the
+/// larger or smaller, +0 above -0. With neither a NaN nor a denormal, the
+/// NaN-handling forms agree and nothing is raised.
+fn min_max(op_max: bool, float: &str) -> String {
+    if op_max {
+        format!(
+            "if zero(x) && zero(y) {{ x & y }} else if {float}::from_bits(x) > {float}::from_bits(y) {{ x }} else {{ y }}"
+        )
+    } else {
+        format!(
+            "if zero(x) && zero(y) {{ x | y }} else if {float}::from_bits(x) < {float}::from_bits(y) {{ x }} else {{ y }}"
+        )
+    }
+}
+
+/// Inlined lanewise FADD/FSUB/FMUL/FMLA/FMLS under the helpers' fast-path
+/// guard (see [`emit_inline`]); `element` takes the second operand from
+/// lane `index` of `rm` in every lane (the by-element forms).
+#[allow(clippy::too_many_arguments)]
+fn vec_fp_arith(
+    fp_op: VecFpOp,
+    size: FpSize,
+    lanes: u32,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+    element: Option<u8>,
+    call: &str,
+) -> String {
+    let p = "echora_guest::simd";
+    let (float, int, width, exponent, sign) = match size {
+        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+        FpSize::D => (
+            "f64",
+            "u64",
+            64,
+            "0x7ff0_0000_0000_0000u64",
+            "0x8000_0000_0000_0000u64",
+        ),
+    };
+    let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+    let (second, lane_y) = match element {
+        Some(index) => (
+            format!("let element = (m.cpu.vectors[{rm}] >> ({index} * {width})) as {int};"),
+            "element".to_owned(),
+        ),
+        None => (
+            format!("let v = m.cpu.vectors[{rm}];"),
+            format!("(v >> (lane * {width})) as {int}"),
+        ),
+    };
+    let (value, exact) = match fp_op {
+        VecFpOp::Add => (
+            format!("{float}::from_bits(x) + {float}::from_bits(y)"),
+            "true",
+        ),
+        VecFpOp::Sub => (
+            format!("{float}::from_bits(x) - {float}::from_bits(y)"),
+            "true",
+        ),
+        VecFpOp::Mul => (
+            format!("{float}::from_bits(x) * {float}::from_bits(y)"),
+            "zero(x) | zero(y)",
+        ),
+        // FMLS is the fused (-n) * m + d.
+        VecFpOp::MulAdd => (
+            format!("{float}::from_bits(x).mul_add({float}::from_bits(y), {float}::from_bits(z))"),
+            "(zero(x) | zero(y)) & zero(z)",
+        ),
+        _ => (
+            format!(
+                "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
+            ),
+            "(zero(x) | zero(y)) & zero(z)",
+        ),
+    };
+    let operand_d = if fused {
+        format!("let z = (d >> (lane * {width})) as {int}; fast &= usable(z);")
+    } else {
+        String::new()
+    };
+    format!(
+        "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
+                 let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+                 let zero = |value: {int}| value & !{sign} == 0; \
+                 let usable = |value: {int}| normal(value) | zero(value); \
+                 let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+                 && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
+                 let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; \
+                 fast &= usable(x) & usable(y); {operand_d} \
+                 let raw = ({value}).to_bits(); \
+                 fast &= normal(raw) | (zero(raw) & ({exact})); \
+                 out |= u128::from(raw) << (lane * {width}); }} \
+                 let _ = d; \
+                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+    )
+}
+
 /// Native code for the common vector operations, in place of their helper
 /// calls ([`emit_call`]), or `None` for an operation without one. Float
 /// add, subtract, multiply and fused multiply-add or -subtract on whole
@@ -2322,6 +2450,177 @@ fn unary_path(op: FpUnaryOp) -> String {
 pub fn emit_inline(op: &SimdOp) -> Option<String> {
     let p = "echora_guest::simd";
     match *op {
+        SimdOp::FpUnary {
+            op: unary @ (FpUnaryOp::Abs | FpUnaryOp::Neg | FpUnaryOp::Mov),
+            size,
+            rd,
+            rn,
+        } => {
+            // Bitwise: never a trap, a flag or a flush.
+            let (_, int, _, _) = float_kit(size);
+            let sign = match size {
+                FpSize::S => "0x8000_0000u32",
+                FpSize::D => "0x8000_0000_0000_0000u64",
+            };
+            let value = match unary {
+                FpUnaryOp::Abs => format!("x & !{sign}"),
+                FpUnaryOp::Neg => format!("x ^ {sign}"),
+                _ => "x".to_owned(),
+            };
+            Some(format!(
+                "{{ let x = m.cpu.vectors[{rn}] as {int}; m.cpu.vectors[{rd}] = u128::from({value}); }}"
+            ))
+        }
+        SimdOp::FpMoveImmediate { size, rd, bits } => {
+            let (_, int, _, _) = float_kit(size);
+            Some(format!("m.cpu.vectors[{rd}] = u128::from({bits:#x}{int});"))
+        }
+        SimdOp::FpSelect {
+            size,
+            rd,
+            rn,
+            rm,
+            condition,
+        } => {
+            let (_, int, _, _) = float_kit(size);
+            Some(format!(
+                "m.cpu.vectors[{rd}] = u128::from((if m.cpu.condition({condition}) {{ m.cpu.vectors[{rn}] }} else {{ m.cpu.vectors[{rm}] }}) as {int});"
+            ))
+        }
+        // With FPCR exactly 0 the helpers' own inlined fast path is
+        // quicker, so these defer to them then.
+        SimdOp::FpBinary {
+            op: binary,
+            size,
+            rd,
+            rn,
+            rm,
+        } => {
+            let (float, int, _, kit) = float_kit(size);
+            let call = emit_call(op)?;
+            let (guard, value) = match binary {
+                FpBinaryOp::Add
+                | FpBinaryOp::Sub
+                | FpBinaryOp::Mul
+                | FpBinaryOp::NegMul
+                | FpBinaryOp::Div => {
+                    // Arithmetic: as the vector fast path, with IXC set.
+                    let (expression, exact, divisor) = match binary {
+                        FpBinaryOp::Add => ("+", "true", "usable(y)"),
+                        FpBinaryOp::Sub => ("-", "true", "usable(y)"),
+                        FpBinaryOp::Div => ("/", "zero(x)", "normal(y)"),
+                        _ => ("*", "zero(x) | zero(y)", "usable(y)"),
+                    };
+                    let negate = if binary == FpBinaryOp::NegMul {
+                        " ^ sign"
+                    } else {
+                        ""
+                    };
+                    (
+                        format!(
+                            "{FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable(x) && {divisor} \
+                             && {{ let raw = ({float}::from_bits(x) {expression} {float}::from_bits(y)).to_bits(); \
+                             result = raw{negate}; normal(raw) | (zero(raw) & ({exact})) }}"
+                        ),
+                        String::new(),
+                    )
+                }
+                FpBinaryOp::Max | FpBinaryOp::MaxNum | FpBinaryOp::Min | FpBinaryOp::MinNum => {
+                    let max = matches!(binary, FpBinaryOp::Max | FpBinaryOp::MaxNum);
+                    (
+                        format!("{FP_MODE} && usable(x) && usable(y)"),
+                        format!("result = {};", min_max(max, float)),
+                    )
+                }
+            };
+            Some(format!(
+                "{{ let x = m.cpu.vectors[{rn}] as {int}; let y = m.cpu.vectors[{rm}] as {int}; {kit} \
+                 let mut result: {int} = 0; \
+                 if m.cpu.fpcr != 0 && {guard} {{ {value} m.cpu.vectors[{rd}] = u128::from(result); }} else {{ {call} }} }}"
+            ))
+        }
+        SimdOp::FpTernary {
+            op: ternary,
+            size,
+            rd,
+            rn,
+            rm,
+            ra,
+        } => {
+            let (float, int, _, kit) = float_kit(size);
+            let call = emit_call(op)?;
+            // FMSUB negates op1; FNMADD negates the addend and op1; FNMSUB
+            // the addend: then one fused multiply-add.
+            let (negate_addend, negate_product) = match ternary {
+                FpTernaryOp::MulAdd => (false, false),
+                FpTernaryOp::MulSub => (false, true),
+                FpTernaryOp::NegMulAdd => (true, true),
+                FpTernaryOp::NegMulSub => (true, false),
+            };
+            let n = if negate_product { "(x ^ sign)" } else { "x" };
+            let a = if negate_addend { "(z ^ sign)" } else { "z" };
+            Some(format!(
+                "{{ let x = m.cpu.vectors[{rn}] as {int}; let y = m.cpu.vectors[{rm}] as {int}; let z = m.cpu.vectors[{ra}] as {int}; {kit} \
+                 let mut result: {int} = 0; \
+                 if m.cpu.fpcr != 0 && {FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable(x) && usable(y) && usable(z) \
+                 && {{ result = {float}::from_bits({n}).mul_add({float}::from_bits(y), {float}::from_bits({a})).to_bits(); \
+                 normal(result) | (zero(result) & (zero(x) | zero(y)) & zero(z)) }} \
+                 {{ m.cpu.vectors[{rd}] = u128::from(result); }} else {{ {call} }} }}"
+            ))
+        }
+        SimdOp::FpCompare {
+            size,
+            rn,
+            rm,
+            signaling: _,
+        } => {
+            // Neither operand a NaN (nothing to signal) nor a denormal (no
+            // flush): ordered, and the flags are those of the comparison.
+            // The helper call goes on a line of its own: register locals
+            // store and reload the flags around the line that calls it.
+            let (float, int, _, kit) = float_kit(size);
+            let call = emit_call(op)?;
+            let y = match rm {
+                Some(rm) => format!("m.cpu.vectors[{rm}] as {int}"),
+                None => "0".to_owned(),
+            };
+            Some(format!(
+                "{{ let x = m.cpu.vectors[{rn}] as {int}; let y: {int} = {y}; {kit} \
+                 let plain = |value: {int}| usable(value) || {float}::from_bits(value).is_infinite(); \
+                 if {FP_MODE} && plain(x) && plain(y) {{ \
+                 let (a, b) = ({float}::from_bits(x), {float}::from_bits(y)); \
+                 m.cpu.nzcv = if a == b {{ 0b0110 }} else if a < b {{ 0b1000 }} else {{ 0b0010 }}; \
+                 }} else {{\n{call}\n}} }}"
+            ))
+        }
+        SimdOp::VecFp {
+            op: fp_op,
+            size,
+            q,
+            scalar: false,
+            rd,
+            rn,
+            rm,
+        } if matches!(
+            fp_op,
+            VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum
+        ) && (q || size == FpSize::S) =>
+        {
+            let (float, int, width, kit) = float_kit(size);
+            let lanes = if q { 128 / width } else { 64 / width };
+            let max = matches!(fp_op, VecFpOp::Max | VecFpOp::MaxNum);
+            let value = min_max(max, float);
+            let call = emit_call(op)?;
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
+                 let mut fast = {FP_MODE}; let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
+                 fast &= usable(x) & usable(y); \
+                 out |= u128::from({value}) << (lane * {width}); }} \
+                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            ))
+        }
         SimdOp::VecFp {
             op: fp_op,
             size,
@@ -2335,67 +2634,50 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
             VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
         ) && (q || size == FpSize::S) =>
         {
-            let (float, int, width, exponent, sign) = match size {
-                FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
-                FpSize::D => (
-                    "f64",
-                    "u64",
-                    64,
-                    "0x7ff0_0000_0000_0000u64",
-                    "0x8000_0000_0000_0000u64",
-                ),
-            };
+            let width = if size == FpSize::S { 32 } else { 64 };
             let lanes = if q { 128 / width } else { 64 / width };
-            let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
-            let (value, exact) = match fp_op {
-                VecFpOp::Add => (
-                    format!("{float}::from_bits(x) + {float}::from_bits(y)"),
-                    "true",
-                ),
-                VecFpOp::Sub => (
-                    format!("{float}::from_bits(x) - {float}::from_bits(y)"),
-                    "true",
-                ),
-                VecFpOp::Mul => (
-                    format!("{float}::from_bits(x) * {float}::from_bits(y)"),
-                    "zero(x) | zero(y)",
-                ),
-                // FMLS is the fused (-n) * m + d.
-                VecFpOp::MulAdd => (
-                    format!(
-                        "{float}::from_bits(x).mul_add({float}::from_bits(y), {float}::from_bits(z))"
-                    ),
-                    "(zero(x) | zero(y)) & zero(z)",
-                ),
-                _ => (
-                    format!(
-                        "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
-                    ),
-                    "(zero(x) | zero(y)) & zero(z)",
-                ),
-            };
-            let operand_d = if fused {
-                format!("let z = (d >> (lane * {width})) as {int}; fast &= usable(z);")
+            Some(vec_fp_arith(
+                fp_op,
+                size,
+                lanes,
+                rd,
+                rn,
+                rm,
+                None,
+                &emit_call(op)?,
+            ))
+        }
+        SimdOp::VecFpElement {
+            op: fp_op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+            index,
+        } if matches!(
+            fp_op,
+            VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+        ) && (scalar || q || size == FpSize::S) =>
+        {
+            let width = if size == FpSize::S { 32 } else { 64 };
+            let lanes = if scalar {
+                1
+            } else if q {
+                128 / width
             } else {
-                String::new()
+                64 / width
             };
-            let call = emit_call(op)?;
-            Some(format!(
-                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let d = m.cpu.vectors[{rd}]; \
-                 let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-                 let zero = |value: {int}| value & !{sign} == 0; \
-                 let usable = |value: {int}| normal(value) | zero(value); \
-                 let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
-                 && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
-                 let mut out = 0u128; \
-                 for lane in 0..{lanes} {{ \
-                 let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
-                 fast &= usable(x) & usable(y); {operand_d} \
-                 let raw = ({value}).to_bits(); \
-                 fast &= normal(raw) | (zero(raw) & ({exact})); \
-                 out |= u128::from(raw) << (lane * {width}); }} \
-                 let _ = d; \
-                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            Some(vec_fp_arith(
+                fp_op,
+                size,
+                lanes,
+                rd,
+                rn,
+                rm,
+                Some(index),
+                &emit_call(op)?,
             ))
         }
         SimdOp::VectorLogical { op, rd, rn, rm, q } => {

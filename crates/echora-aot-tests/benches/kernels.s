@@ -130,3 +130,25 @@ poll:
     cbz w8, 1b
     svc #7
     udf #0
+
+.p2align 10
+// x0 = repetitions, x1 = source, x2 = destination, x3 = floats (n).
+// Scalar single precision as games use it: loads, a multiply, a fused
+// multiply-add, a compare and a select, and a store.
+scalar:
+1:  mov x6, x1
+    mov x7, x2
+    mov x8, x3
+    fmov s2, #1.0
+2:  ldr s0, [x6], #4
+    fmul s1, s0, s0
+    fmadd s2, s0, s1, s2
+    fcmp s2, s0
+    fcsel s3, s2, s0, gt
+    str s3, [x7], #4
+    subs x8, x8, #1
+    b.ne 2b
+    subs x0, x0, #1
+    b.ne 1b
+    svc #7
+    udf #0

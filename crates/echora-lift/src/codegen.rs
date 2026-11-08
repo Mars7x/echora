@@ -957,6 +957,90 @@ fn emit_slot_call(output: &mut String, next: u64, slot: usize) {
 const CALL_SLOT_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn call_slot(m: &mut Machine, return_to: u64, slot: &std::sync::OnceLock<echora_guest::WindowFn>) -> Result<(), Trap> {\n\
 match slot.get() { Some(&function) => m.call_window(return_to, function), None => m.call(return_to) }\n}\n";
 
+/// An LDR of a SIMD&FP register: with `EmitOptions::inline_vector`, the
+/// same direct guest-memory loads as an integer LDR (a fault ends the run
+/// as one does), zero-extended into the register; otherwise the helper.
+fn vector_load(address: &str, rt: u8, bytes: u8) -> String {
+    let inline = INLINE_VECTOR.get();
+    match bytes {
+        1 | 2 | 4 | 8 if inline => {
+            let bits = u32::from(bytes) * 8;
+            format!(
+                "                m.cpu.vectors[{rt}] = u128::from(m.memory.load_u{bits}({address}));\n"
+            )
+        }
+        16 if inline => format!(
+            "                m.cpu.vectors[{rt}] = u128::from(m.memory.load_u64({address})) | (u128::from(m.memory.load_u64(({address}).wrapping_add(8))) << 64);\n"
+        ),
+        _ => format!(
+            "                echora_guest::simd::load(&mut m.cpu, &m.memory, {address}, {rt}, {bytes})?;\n"
+        ),
+    }
+}
+
+/// An STR of a SIMD&FP register (see [`vector_load`]).
+fn vector_store(address: &str, rt: u8, bytes: u8) -> String {
+    let inline = INLINE_VECTOR.get();
+    match bytes {
+        1 | 2 | 4 | 8 if inline => {
+            let bits = u32::from(bytes) * 8;
+            format!(
+                "                m.memory.store_u{bits}({address}, m.cpu.vectors[{rt}] as u{bits});\n"
+            )
+        }
+        16 if inline => format!(
+            "                {{ let value = m.cpu.vectors[{rt}]; m.memory.store_u64({address}, value as u64); m.memory.store_u64(({address}).wrapping_add(8), (value >> 64) as u64); }}\n"
+        ),
+        _ => format!(
+            "                echora_guest::simd::store(&m.cpu, &mut m.memory, {address}, {rt}, {bytes})?;\n"
+        ),
+    }
+}
+
+/// An LDP of SIMD&FP registers: both loaded before either is written, as
+/// in the helper (Rt and Rt2 may name one register).
+fn vector_load_pair(rt: u8, rt2: u8, bytes: u8) -> String {
+    if !INLINE_VECTOR.get() || !matches!(bytes, 4 | 8 | 16) {
+        return format!(
+            "                echora_guest::simd::load_pair(&mut m.cpu, &m.memory, address, {rt}, {rt2}, {bytes})?;\n"
+        );
+    }
+    let one = |at: &str| match bytes {
+        16 => format!(
+            "u128::from(m.memory.load_u64({at})) | (u128::from(m.memory.load_u64(({at}).wrapping_add(8))) << 64)"
+        ),
+        _ => format!("u128::from(m.memory.load_u{}({at}))", u32::from(bytes) * 8),
+    };
+    format!(
+        "                {{ let first = {}; let second = {}; m.cpu.vectors[{rt}] = first; m.cpu.vectors[{rt2}] = second; }}\n",
+        one("address"),
+        one(&format!("address.wrapping_add({bytes})"))
+    )
+}
+
+/// An STP of SIMD&FP registers (see [`vector_load_pair`]).
+fn vector_store_pair(rt: u8, rt2: u8, bytes: u8) -> String {
+    if !INLINE_VECTOR.get() || !matches!(bytes, 4 | 8 | 16) {
+        return format!(
+            "                echora_guest::simd::store_pair(&m.cpu, &mut m.memory, address, {rt}, {rt2}, {bytes})?;\n"
+        );
+    }
+    let one = |at: &str, register: u8| match bytes {
+        16 => format!(
+            "{{ let value = m.cpu.vectors[{register}]; m.memory.store_u64({at}, value as u64); m.memory.store_u64(({at}).wrapping_add(8), (value >> 64) as u64); }}"
+        ),
+        _ => {
+            let bits = u32::from(bytes) * 8;
+            format!("m.memory.store_u{bits}({at}, m.cpu.vectors[{register}] as u{bits});")
+        }
+    };
+    format!(
+        "                {} {}\n",
+        one("address", rt),
+        one(&format!("address.wrapping_add({bytes})"), rt2)
+    )
+}
+
 /// Guest registers as locals of a split window function: the registers its
 /// blocks use are read into locals on entry and the ones they write are
 /// stored back when it returns, so the host compiler keeps them in host
@@ -2136,9 +2220,9 @@ fn emit_instruction_body(
             } => {
                 let writeback = address(output, *rn, *mode);
                 if *load {
-                    writeln!(output, "                echora_guest::simd::load(&mut m.cpu, &m.memory, address, {rt}, {bytes})?;").unwrap();
+                    output.push_str(&vector_load("address", *rt, *bytes));
                 } else {
-                    writeln!(output, "                echora_guest::simd::store(&m.cpu, &mut m.memory, address, {rt}, {bytes})?;").unwrap();
+                    output.push_str(&vector_store("address", *rt, *bytes));
                 }
                 if let Some(value) = writeback {
                     put(output, *rn, 64, true, &value);
@@ -2162,9 +2246,9 @@ fn emit_instruction_body(
                     },
                 );
                 if *load {
-                    writeln!(output, "                echora_guest::simd::load_pair(&mut m.cpu, &m.memory, address, {rt}, {rt2}, {bytes})?;").unwrap();
+                    output.push_str(&vector_load_pair(*rt, *rt2, *bytes));
                 } else {
-                    writeln!(output, "                echora_guest::simd::store_pair(&m.cpu, &mut m.memory, address, {rt}, {rt2}, {bytes})?;").unwrap();
+                    output.push_str(&vector_store_pair(*rt, *rt2, *bytes));
                 }
                 if let Some(value) = update {
                     put(output, *rn, 64, true, &value);
@@ -2225,7 +2309,14 @@ fn emit_instruction_body(
                 );
             }
             SimdOp::LoadLiteral { rt, bytes, address } => {
-                writeln!(output, "                echora_guest::simd::load(&mut m.cpu, &m.memory, {address:#x}, {rt}, {bytes})?;").unwrap();
+                // A typed literal where inlined code calls methods on it;
+                // the helper call stays as it was.
+                let literal = if INLINE_VECTOR.get() {
+                    format!("{address:#x}u64")
+                } else {
+                    format!("{address:#x}")
+                };
+                output.push_str(&vector_load(&literal, *rt, *bytes));
             }
             other => {
                 let inline = INLINE_VECTOR

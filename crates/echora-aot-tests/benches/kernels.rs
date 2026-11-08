@@ -103,6 +103,16 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             // the float helpers' fast paths need it.
             m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
         }
+        "scalar" => {
+            regs[0] = 200 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 4;
+            // Sticky inexact, as for the vector kernel, and flush-to-zero,
+            // which the game runs with (FPCR 0x0100_0000).
+            m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
+            m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
+        }
         "poll" => {
             regs[0] = FLAG;
             return Some(POLL_SLICES * scale);
@@ -115,7 +125,13 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
 /// One run: guest instructions retired and the time taken.
 fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
     let image = kernels::image();
-    let mut m = Machine::with_layout(KERNEL_BASE, &image, KERNEL_SIZE, DATA_BASE, DATA_SIZE);
+    let mut m = Machine::with_layout(
+        KERNEL_BASE,
+        &image,
+        KERNEL_SIZE.next_multiple_of(0x1000),
+        DATA_BASE,
+        DATA_SIZE,
+    );
     // A float pattern for the vector kernel: 1.0 in every lane.
     let ones: Vec<u8> = std::iter::repeat_n(1.0_f32.to_le_bytes(), (2 * BUFFER / 4) as usize)
         .flatten()

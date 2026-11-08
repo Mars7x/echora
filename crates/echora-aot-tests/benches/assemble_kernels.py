@@ -53,7 +53,7 @@ def main():
     for offset in range(table, table + 16, 4):
         comments[offset] = "jump table halfwords"
 
-    kernels = ["arith", "memcpy", "memset", "calls", "switch", "vector", "poll"]
+    kernels = ["arith", "memcpy", "memset", "calls", "switch", "vector", "poll", "scalar"]
     runs = sorted(
         [(labels[name], name) for name in kernels] + [(labels["leaf_add"], "leaves")]
     )

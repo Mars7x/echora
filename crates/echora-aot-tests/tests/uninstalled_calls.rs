@@ -13,7 +13,13 @@ use echora_aot_tests::{Machine, Trap, kernel_code};
 fn calls_run_before_install() {
     const ITERATIONS: u64 = 1000;
     let image = kernels::image();
-    let mut m = Machine::with_layout(KERNEL_BASE, &image, KERNEL_SIZE, 0x20_0000, 0x1_0000);
+    let mut m = Machine::with_layout(
+        KERNEL_BASE,
+        &image,
+        KERNEL_SIZE.next_multiple_of(0x1000),
+        0x20_0000,
+        0x1_0000,
+    );
     let entry = KERNEL_ENTRIES
         .iter()
         .find(|(name, _)| *name == "calls")
