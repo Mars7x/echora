@@ -2929,8 +2929,15 @@ impl Nvn {
                 if rest.starts_with("Draw") || rest.starts_with("Dispatch") {
                     // Opt-in only: a line per draw grew to gigabytes and
                     // took most of the run time in long runs.
+                    // ECHORA_DRAW_LOG_FROM=N starts at present N.
                     if let Some(path) = debug_var_os("ECHORA_DRAW_LOG") {
-                        self.log_draw(core, command, path);
+                        let from = debug_var("ECHORA_DRAW_LOG_FROM")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if self.presented_frames >= from {
+                            self.log_draw(core, command, path);
+                        }
                     }
                 }
                 if rest == "CopyTextureToTexture" && self.gpu().is_some() {
@@ -3317,6 +3324,9 @@ impl Nvn {
             })
             .collect();
         let line = serde_json::json!({
+            "present": self.presented_frames,
+            "colors": self.render.colors.iter().map(|texture| format!("{texture:x}")).collect::<Vec<_>>(),
+            "depth": format!("{:x}", self.render.depth),
             "draw": command.name,
             "args": command.x[1..6],
             "stages": stages,
