@@ -17,15 +17,14 @@ Each phase completes only on the evidence named here, not when code exists.
 | 10. In-game settings | Dropped: settings are changed in the launcher, with no in-game interface. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | — |
 | 12. High frame rates | No timing, physics or animation regressions. | — |
-| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. Speed is measured by movie pictures decoded per second (`ECHORA_MOVIE_RATE`), about 17 once the movie plays, with frames checked against baseline captures. Done so far: contiguous texture swizzling, compute storage on the GPU, guest memory imported into Vulkan, unwaited frame submits, host zstd, shorter scheduler slices, spin-wait handoff, vector FP fast paths. Code-generation benchmarks without the game: `cargo bench -p echora-aot-tests --bench kernels`. `ECHORA_GPU_TIME=1` prints GPU busy time against wall time: during the movie the GPU is busy about 40% of the time and the CPU's main thread is the limit. Several workers are not yet stable. |
+| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. Speed is measured by movie pictures decoded per second (`ECHORA_MOVIE_RATE`), about 20 once the movie plays, with frames checked against baseline captures. Done so far: contiguous texture swizzling, compute storage on the GPU, guest memory imported into Vulkan, unwaited frame submits, host zstd, shorter scheduler slices, spin-wait handoff, vector FP fast paths, rav1d's assembly kernels. Code-generation benchmarks without the game: `cargo bench -p echora-aot-tests --bench kernels`. `ECHORA_GPU_TIME=1` prints GPU busy time against wall time: during the movie the GPU is busy about 40% of the time and the CPU's main thread is the limit. Several workers are not yet stable. |
 | 14. Other platforms | Real game code on another OS or CPU without core rewrites. | — |
 | 15. Release quality | Clean build, configure, launch with user-supplied data. | — |
 
 ## Next steps
 
-1. Find why every frame is black after the New Game movie. The game keeps
-   running there and issues mesh and task draws, so some pass loses the
-   image.
+1. Reach the first gameplay scene after the New Game movie and check what
+   it draws, mesh and task pipelines included.
 2. Translate the last 27 failing shader stages.
 3. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
    game's per-core job threads run in parallel, which looks like one job

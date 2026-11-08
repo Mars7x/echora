@@ -1,6 +1,7 @@
 # Known limitations
 
-- The game runs as far as the intro movie; gameplay has not been reached.
+- The game runs through the New Game movie and on into the first scene's
+  code; no gameplay scene has been shown yet.
   Each unimplemented operation still stops the run with a report.
 - **Echora is not ready for stable gameplay.** Runs can hang, crash or
   render incorrectly, and saves are untested.
@@ -25,8 +26,7 @@
   fit their size fields is rejected rather than decoded; this has not occurred
   with the real modules.
 - Mesh and task pipelines (`DrawMeshTasks`) are drawn through
-  `VK_EXT_mesh_shader` but not yet checked against the console's output;
-  after the New Game movie the presented frames are still black. Of the
+  `VK_EXT_mesh_shader` but not yet checked against the console's output. Of the
   6,074 shader stages OoT reached in a test run, 27 do not translate yet
   (gather forms, opcode c08 and register shadowing modes); draws that need
   them are skipped.
