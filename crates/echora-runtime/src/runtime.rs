@@ -322,7 +322,7 @@ pub struct Machine {
     boundary_kinds: Vec<u64>,
     /// A worker runs a queue submission without the machine lock: `nvn`
     /// is a placeholder holding only the entry-point table until it
-    /// returns (see `Worker::submit_unlocked`).
+    /// returns (see `Worker::call_nvn_unlocked`).
     nvn_away: bool,
     /// Parallel runs: host microseconds per guest thread running guest
     /// code, waiting for the machine lock and holding it (for finding the
@@ -4491,6 +4491,12 @@ struct Worker {
     index: u8,
 }
 
+/// NVN entry points a worker runs without the machine lock, with the NVN
+/// state taken along (see `Worker::call_nvn_unlocked`): submitting command
+/// buffers executes them, and a CPU event signal executes the submitted
+/// work that waited for it.
+const UNLOCKED_NVN_CALLS: [&str; 2] = ["nvnQueueSubmitCommands", "nvnEventSignal"];
+
 /// Parked workers recheck waits and deadlines at least this often.
 const PARKED_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -4582,17 +4588,22 @@ impl Worker {
                         .wait_while(machine, |machine| machine.nvn_away)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                let submit =
-                    host_call.is_some_and(|pc| machine.nvn.entry_is(pc, "nvnQueueSubmitCommands"));
-                let outcome =
-                    if submit && crate::nvn::debug_var_os("ECHORA_LOCKED_SUBMIT").is_none() {
-                        let (back, outcome) = self.submit_unlocked(shared, machine);
+                let unlocked = host_call.and_then(|pc| {
+                    UNLOCKED_NVN_CALLS
+                        .into_iter()
+                        .find(|name| machine.nvn.entry_is(pc, name))
+                });
+                let outcome = match unlocked {
+                    Some(name) if crate::nvn::debug_var_os("ECHORA_LOCKED_SUBMIT").is_none() => {
+                        let (back, outcome) = self.call_nvn_unlocked(shared, machine, name);
                         machine = back;
                         outcome
-                    } else {
+                    }
+                    _ => {
                         self.swap_in(&mut machine);
                         machine.boundary(result)
-                    };
+                    }
+                };
                 machine.lock_stats[2] += held.elapsed().as_micros() as u64;
                 machine.thread_time.entry(thread).or_default()[2] +=
                     held.elapsed().as_micros() as u64;
@@ -4712,26 +4723,26 @@ impl Worker {
 
     /// Put this worker's core into the machine for host work, crediting
     /// the steps it ran since it last left to the machine's count.
-    /// Run nvnQueueSubmitCommands without the machine lock: executing the
-    /// recorded work takes most of the host's NVN time, and other guest
-    /// threads need the lock meanwhile. The NVN state goes with this
+    /// Run an `UNLOCKED_NVN_CALLS` entry point without the machine lock:
+    /// executing recorded work takes most of the host's NVN time, and other
+    /// guest threads need the lock meanwhile. The NVN state goes with this
     /// worker (other workers wait for it at their next NVN call); guest
     /// memory is reached through this core's flat view, as guest code
     /// reaches it. The thread stays marked running, so no other worker
     /// takes it. Returns the reacquired lock with the core swapped in.
-    fn submit_unlocked<'s, 'm>(
+    fn call_nvn_unlocked<'s, 'm>(
         &mut self,
         shared: &'s Shared<'m>,
         mut machine: std::sync::MutexGuard<'s, &'m mut Machine>,
+        name: &str,
     ) -> (std::sync::MutexGuard<'s, &'m mut Machine>, Result<(), Trap>) {
-        const NAME: &str = "nvnQueueSubmitCommands";
         self.swap_in(&mut machine);
         machine.core.settle_block_trap();
         machine.boundary_kinds[0x80] += 1;
         if let Err(trap) = machine.flush_core_counts() {
             return (machine, Err(trap));
         }
-        *machine.nvn.calls.entry(NAME.into()).or_default() += 1;
+        *machine.nvn.calls.entry(name.into()).or_default() += 1;
         let counter = machine.core.physical_counter_ticks();
         let placeholder = machine.nvn.entries_only();
         let mut nvn = std::mem::replace(&mut machine.nvn, placeholder);
@@ -4745,10 +4756,10 @@ impl Worker {
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
                 counter,
             };
-            nvn.call(NAME, &mut guest)
+            nvn.call(name, &mut guest)
         };
         if crate::nvn::debug_var_os("ECHORA_NVN_PROFILE").is_some() {
-            *nvn.call_microseconds.entry(NAME.into()).or_default() +=
+            *nvn.call_microseconds.entry(name.into()).or_default() +=
                 started.elapsed().as_micros() as u64;
         }
         let mut machine = shared
@@ -4765,7 +4776,7 @@ impl Worker {
                 pc: machine.core.cpu.pc,
                 service: "nvn".into(),
                 command_id: None,
-                message: format!("{NAME} is not implemented"),
+                message: format!("{name} is not implemented"),
             }),
             Err(trap) => Err(trap),
         };
