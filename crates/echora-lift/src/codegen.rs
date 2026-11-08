@@ -355,27 +355,71 @@ fn jump_table_targets(
 /// stores, branches, compares and other instructions without a destination.
 fn written_register(word: u32) -> Option<u8> {
     let rd = (word & 31) as u8;
+    let rs = ((word >> 16) & 31) as u8;
     let class = (word >> 25) & 0xf;
+    // MRS writes Rt.
+    if word & 0xfff0_0000 == 0xd530_0000 {
+        return Some(rd);
+    }
     // Loads and stores. SIMD&FP transfers (bit 26) write no general register.
     if class & 0b0101 == 0b0100 {
         if (word >> 26) & 1 == 1 {
             return None;
         }
-        let load = if word & 0x3800_0000 == 0x3800_0000 {
+        if word & 0x3800_0000 == 0x3800_0000 {
+            // Atomic memory operations (LDADD, SWP, ...: bit 21 set, bits
+            // 11:10 clear) load into Rt whatever their acquire and release
+            // bits (22, 23), which the plain forms' opc field would read
+            // as a store. LDRAA and LDRAB (bits 21 and 10 set, size 11)
+            // load into Rt too.
+            if (word >> 24) & 3 == 0 && (word >> 21) & 1 == 1 {
+                match (word >> 10) & 3 {
+                    0b00 => return Some(rd),
+                    0b01 | 0b11 if word >> 30 == 3 => return Some(rd),
+                    _ => {}
+                }
+            }
             // Single register (immediate, register offset, pre/post-index):
             // opc 00 is a store, and size 11 with opc 10 is PRFM, whose Rt
             // names a prefetch operation (PLDL1KEEP is 0), not a register.
             let opc = (word >> 22) & 3;
-            opc != 0 && !(word >> 30 == 3 && opc == 2)
-        } else if word & 0x3800_0000 == 0x2800_0000 || word & 0x3800_0000 == 0x0800_0000 {
-            // Pairs and exclusives: L bit. Only the first destination is
-            // reported; a jump-table scan never tracks a pair's second one.
+            return (opc != 0 && !(word >> 30 == 3 && opc == 2)).then_some(rd);
+        }
+        if word & 0x3f00_0000 == 0x0800_0000 {
+            // Exclusives and compare-and-swap. CAS{A,L,AL}{B,H} and CASP
+            // (bit 23 and 21 set) write the compare register Rs; STXR and
+            // STLXR (o2 and L clear) write their status register Rs; the
+            // other loads (L set) write Rt.
+            let (o2, load, o1) = ((word >> 23) & 1, (word >> 22) & 1, (word >> 21) & 1);
+            // CASP{A,L,AL} (o2 clear, o1 set, Rt2 all ones) writes Rs too.
+            let casp = o2 == 0 && o1 == 1 && (word >> 10) & 31 == 31 && word >> 31 == 0;
+            return match (o2, load, o1) {
+                (1, _, 1) => Some(rs),
+                _ if casp => Some(rs),
+                (0, 0, _) => Some(rs),
+                (_, 1, _) => Some(rd),
+                _ => None,
+            };
+        }
+        let load = if word & 0x3800_0000 == 0x2800_0000 {
+            // Pairs: L bit. Only the first destination is reported; a
+            // jump-table scan never tracks a pair's second one.
             (word >> 22) & 1 == 1
         } else {
             // Literal loads; opc 11 is PRFM (literal).
             word & 0x3b00_0000 == 0x1800_0000 && word >> 30 != 3
         };
         return load.then_some(rd);
+    }
+    // CCMP and CCMN (register and immediate) set only the flags: their Rd
+    // field is the NZCV immediate, not a register.
+    if word & 0x3fe0_0000 == 0x3a40_0000 {
+        return None;
+    }
+    // PAC*, AUT* and XPAC* (data processing, one source, 0xdac1_xxxx) leave
+    // their register unchanged with every key disabled, as the guest runs.
+    if word & 0xffff_0000 == 0xdac1_0000 {
+        return None;
     }
     // Data processing (immediate and register): every form writes Rd except
     // flag-setting compares that target the zero register.
@@ -385,8 +429,11 @@ fn written_register(word: u32) -> Option<u8> {
         }
         return Some(rd);
     }
-    // BL/BLR write the link register.
-    if word & 0xfc00_0000 == 0x9400_0000 || word & 0xffff_fc1f == 0xd63f_0000 {
+    // BL, BLR, BLRAA, BLRAB, BLRAAZ and BLRABZ write the link register.
+    if word & 0xfc00_0000 == 0x9400_0000
+        || word & 0xffff_fc1f == 0xd63f_0000
+        || word & 0xfeff_f800 == 0xd63f_0800
+    {
         return Some(30);
     }
     None
@@ -3899,6 +3946,52 @@ mod tests {
     }
 
     #[test]
+    fn written_register_agrees_with_the_decoders_writes() {
+        // The jump-table walk classifies raw words with written_register;
+        // the decoder and defuse are tested against the Arm reference.
+        // Every register it reports must be one the instruction writes.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        let mut problems = Vec::new();
+        let mut checked = 0;
+        for round in 0..400_000 {
+            let word = match round % 4 {
+                // Loads and stores, data processing, branches and system.
+                0 => (next() & !0x0a00_0000) | 0x0800_0000,
+                1 => (next() & !0x0e00_0000) | 0x1000_0000 | (next() & 0x0200_0000) << 2,
+                2 => (next() & !0x0e00_0000) | 0x0a00_0000,
+                _ => next(),
+            };
+            let instruction = crate::aarch64::decode(word, 0x1000);
+            if matches!(
+                instruction,
+                Instruction::Unsupported | Instruction::Undefined
+            ) {
+                continue;
+            }
+            checked += 1;
+            let writes = crate::defuse::effects(&instruction).writes.gpr;
+            let reported = written_register(word);
+            // Only false writes matter: one makes the walk stop or give up
+            // and lose a table, while a missed write at worst lets it use
+            // a stale definition, which only adds roots.
+            let wrong = matches!(reported, Some(register) if register < 31 && writes & (1 << register) == 0);
+            if wrong && problems.len() < 20 {
+                problems.push(format!(
+                    "{word:#010x} {instruction:?}: reported {reported:?}, writes {writes:#x}"
+                ));
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
     fn unused_parens_go_only_where_the_parse_stays_the_same() {
         let cases = [
             (
@@ -4154,6 +4247,51 @@ mod tests {
             0xd65f_03c0,
             0xd65f_03c0,
         ];
+        let mut table = vec![0u8; 16];
+        table.extend([0, 0, 1, 0, 2, 0]);
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        for case in [0x1024, 0x1028, 0x102c] {
+            assert!(translation.instructions.contains_key(&case), "{case:#x}");
+        }
+    }
+
+    #[test]
+    fn jump_tables_look_past_conditional_compares() {
+        // As above without the prefetch, and a `ccmp w21, #9, #0, ne`
+        // between the entry load (into w0) and the dispatch: CCMP's Rd
+        // field is its NZCV immediate (0 here), not a written register.
+        let words = [
+            0xb000_0000,
+            0x9100_4000,
+            0x7100_0a3f,
+            0x5400_00e8,
+            0x7871_7800,
+            0x7a49_1aa0,
+            0x1000_0063,
+            0x8b00_0863,
+            0xd61f_0060,
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+        ];
+        assert!(matches!(
+            crate::aarch64::decode(words[5], 0x1014),
+            Instruction::ConditionalCompare { .. }
+        ));
         let mut table = vec![0u8; 16];
         table.extend([0, 0, 1, 0, 2, 0]);
         let data = CodeRegion {
