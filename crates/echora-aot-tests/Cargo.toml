@@ -22,6 +22,8 @@ structured-kernels = []
 # Lift every program with direct BL calls (EmitOptions::direct_calls) and
 # 64 KiB regions. Needs Core::call_window in echora-guest.
 direct-calls = []
+# Write the split programs per emission mode for `benches/codesize.rs`.
+codesize = []
 
 [dependencies]
 echora-guest.workspace = true
@@ -46,3 +48,8 @@ workspace = true
 [[bench]]
 name = "kernels"
 harness = false
+
+[[bench]]
+name = "codesize"
+harness = false
+required-features = ["codesize"]

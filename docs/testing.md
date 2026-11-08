@@ -121,6 +121,20 @@ cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --save /tmp/flat.txt
 cargo bench -p echora-aot-tests --bench kernels --features structured-kernels -- --runs 5 --compare /tmp/flat.txt
 ```
 
+The size of the generated Rust and its compile time, per emission mode
+(flat, structured, inline_vector), come from a second benchmark:
+
+```
+cargo bench -p echora-aot-tests --features codesize --bench codesize [-- [MODE] [--opt N] [--runs N]]
+```
+
+With the `codesize` feature, `build.rs` also writes every program it lifts
+through split emission once per mode, each as a crate of its own. The
+benchmark compiles each with rustc as cargo compiles a region of the game
+build (an rlib at `opt-level` 1 with 16 codegen units) and prints the
+bytes of Rust per guest instruction and the compile time. Compiling every
+mode takes several minutes, so pass a mode to measure only that one.
+
 CI runs formatting, clippy with warnings denied, and the tests on Linux
 x86-64 and Windows x86-64. Passing CI means the code compiles
 and the tests pass on that host; it says nothing about running the game.

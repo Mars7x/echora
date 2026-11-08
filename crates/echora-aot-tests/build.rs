@@ -7,9 +7,19 @@ use echora_lift::codegen::{
     CodeRegion, EmitOptions, discover, discover_with_tables, emit_rust, emit_rust_split_with,
 };
 
+thread_local! {
+    /// The options of a `codesize` pass, which override the features.
+    static MODE: std::cell::Cell<Option<EmitOptions>> = const { std::cell::Cell::new(None) };
+    /// Guest instructions lifted through split emission so far.
+    static LIFTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Codegen options: common vector operations as native code with the
 /// `inline-vector` feature, structured emission with `structured`.
 fn options() -> EmitOptions {
+    if let Some(mode) = MODE.get() {
+        return mode;
+    }
     EmitOptions {
         inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
@@ -37,10 +47,78 @@ fn region_bits() -> u32 {
 /// The benchmark kernels' options: structured also with
 /// `structured-kernels`, which builds far faster than `structured`.
 fn kernel_options() -> EmitOptions {
+    if let Some(mode) = MODE.get() {
+        return mode;
+    }
     EmitOptions {
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED_KERNELS").is_some(),
         ..options()
     }
+}
+
+/// Split emission of `translation`, counting its instructions.
+fn split(
+    translation: &echora_lift::codegen::Translation,
+    options: EmitOptions,
+) -> (String, Vec<(u64, String)>) {
+    LIFTED.set(LIFTED.get() + translation.instructions.len());
+    emit_rust_split_with(translation, region_bits(), options)
+}
+
+/// Every program lifted through split emission (what real builds use).
+fn split_programs(out: &mut String) {
+    kernel_code(out);
+    semantic_code(out);
+    simd_semantic_code(out);
+    fp_semantic_code(out);
+    simd_memory_code(out);
+    sequence_code(out);
+    call_code(out);
+    loop_code(out);
+    exclusive_code(out);
+    switch_code(out);
+    spin_candidates(out);
+    irreducible_candidates(out);
+}
+
+/// With the `codesize` feature: the split programs once per emission mode,
+/// each a crate of its own for `benches/codesize.rs` to compile, and a
+/// list of `mode instructions bytes`.
+fn codesize(out_dir: &std::path::Path) {
+    let modes = [
+        ("flat", EmitOptions::default()),
+        (
+            "structured",
+            EmitOptions {
+                structured: true,
+                ..EmitOptions::default()
+            },
+        ),
+        (
+            "inline_vector",
+            EmitOptions {
+                inline_vector: true,
+                ..EmitOptions::default()
+            },
+        ),
+    ];
+    let dir = out_dir.join("codesize");
+    std::fs::create_dir_all(&dir).expect("codesize directory");
+    let mut list = String::new();
+    for (name, mode) in modes {
+        MODE.set(Some(mode));
+        LIFTED.set(0);
+        let mut text = String::new();
+        split_programs(&mut text);
+        writeln!(list, "{name} {} {}", LIFTED.get(), text.len()).expect("write");
+        // The stand-in the region modules import (see `SHIM`).
+        let source = format!(
+            "#[allow(unused_imports)]\nuse echora_guest::{{Core as Machine, Trap}};\npub trait CallWindow {{}}\n{text}"
+        );
+        std::fs::write(dir.join(format!("{name}.rs")), source).expect("write");
+    }
+    MODE.set(None);
+    std::fs::write(dir.join("modes.txt"), list).expect("write");
 }
 
 include!("src/programs.rs");
@@ -88,7 +166,7 @@ fn main() {
 
     // The same program through split emission (the layout real builds use):
     // region sources become child modules named as the root expects.
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod split_call_return {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
@@ -108,21 +186,13 @@ fn main() {
     let translation = discover(&[region(&words)], &entries, 400).expect("sharded_hole");
     module(&mut out, "sharded_hole", &emit_rust(&translation));
 
-    kernel_code(&mut out);
-    semantic_code(&mut out);
-    simd_semantic_code(&mut out);
-    fp_semantic_code(&mut out);
-    simd_memory_code(&mut out);
-    sequence_code(&mut out);
-    call_code(&mut out);
-    loop_code(&mut out);
-    exclusive_code(&mut out);
-    switch_code(&mut out);
-    spin_candidates(&mut out);
-    irreducible_candidates(&mut out);
+    split_programs(&mut out);
 
-    let path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("programs.rs");
-    std::fs::write(path, out).expect("write generated programs");
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
+    if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
+        codesize(&out_dir);
+    }
 }
 
 /// The benchmark kernels, lifted together through split emission (as real
@@ -154,7 +224,7 @@ fn kernel_code(out: &mut String) {
         report.unresolved_targets
     );
     assert_eq!(report.jump_tables, 1, "the switch kernel's jump table");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), kernel_options());
+    let (root, regions) = split(&translation, kernel_options());
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{SHIM}{source}\n}}").expect("write");
@@ -296,7 +366,7 @@ fn semantic_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() * 3 + 16).expect("semantic");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod semantic_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -474,7 +544,7 @@ fn sampled_simd_program(
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() * 3 + 16).expect(name);
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod {name} {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {base:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -586,7 +656,7 @@ fn sequence_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &entries, words.len() + 16).expect("sequences");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod sequence_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -801,7 +871,7 @@ fn call_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod call_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -924,7 +994,7 @@ fn loop_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &entries, image.len() + 16).expect("loops");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod loop_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{image:#x?};").expect("write");
@@ -1018,7 +1088,7 @@ fn exclusive_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &entries, words.len() + 16).expect("exclusives");
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod exclusive_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
@@ -1147,7 +1217,7 @@ fn switch_code(out: &mut String) {
         PROGRAMS,
         "every switch's table must be recovered"
     );
-    let (root, regions) = emit_rust_split_with(&translation, region_bits(), options());
+    let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod switch_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
