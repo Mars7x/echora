@@ -38,14 +38,15 @@ fn main() {
             resolution_scale: echora_gpu::renderer::Scale::from_env().terms(),
             ..Default::default()
         };
-        // As at run time: a vertex-slot or tess-eval-slot program whose
-        // control section gives mesh output sizes (+0x60) is a mesh program. Without a capture of its draw, a
+        // As at run time: a vertex-slot or tess-eval-slot program (header
+        // types 1 and 3) whose control section gives mesh output sizes
+        // (+0x60) is a mesh program. Without a capture of its draw, a
         // program that reads the stage buffer otherwise is taken as a task
         // program (its control +0x58 is then SET_MESH_INIT_SHADER).
-        // Header types 1 (vertex slot) and 3 (tess-eval slot) only.
-        let kind = bytes.get(..4).map_or(0, |word| {
-            u32::from_le_bytes(word.try_into().unwrap()) >> 10 & 0xf
-        });
+        let kind = match bytes.first_chunk::<4>() {
+            Some(word) => u32::from_le_bytes(*word) >> 10 & 0xf,
+            None => 0,
+        };
         let sizes = if matches!(kind, 1 | 3) {
             control_word(path, 0x60).unwrap_or(0)
         } else {
