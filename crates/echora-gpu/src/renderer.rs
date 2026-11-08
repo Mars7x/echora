@@ -139,6 +139,12 @@ impl Scale {
     }
 }
 
+/// Allocations at least this large are logged with their caller.
+const LARGE_ALLOCATION: u64 = 512 << 20;
+/// The largest texture upload: 1.5 GiB, above the largest the game makes
+/// (a 1365x1365, 90-layer ASTC array with 11 levels, 852 MiB as RGBA8).
+const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
+
 pub struct Renderer {
     pub gpu: Gpu,
     pool: vk::CommandPool,
@@ -236,6 +242,10 @@ pub struct Renderer {
     pub hazard_barriers: u64,
     /// GPU time per submission (ECHORA_GPU_TIME=1).
     timer: Option<crate::timing::GpuTimer>,
+    /// A failure that must end the run rather than skip one draw (an upload
+    /// over MAX_UPLOAD_BYTES): the runtime takes it after each draw and
+    /// dispatch and stops with it.
+    pub fatal: Option<String>,
     /// Where linked shader objects' driver binaries are kept between runs
     /// (see `crate::shader_cache`), if anywhere.
     pub(crate) shader_cache: Option<std::path::PathBuf>,
@@ -398,6 +408,7 @@ impl Renderer {
         let mut renderer = Self {
             timer,
             shader_cache: None,
+            fatal: None,
             gpu,
             pool,
             commands,
@@ -516,6 +527,7 @@ impl Renderer {
     /// A device-local storage buffer of `size` bytes kept under `key`
     /// across dispatches (created, or recreated at another size, as
     /// needed), and whether it is new (its contents undefined).
+    #[track_caller]
     pub fn resident_buffer(&mut self, key: u64, size: u64) -> Result<(vk::Buffer, bool), String> {
         let size = size.max(16).next_multiple_of(16);
         if let Some(&(buffer, _, held)) = self.resident.get(&key) {
@@ -1131,6 +1143,33 @@ impl Renderer {
             .map(|region| region.level + 1)
             .max()
             .unwrap_or(1);
+        // A guest texture's upload never needs more than this: a larger one
+        // means a misread size, shape or format, which stops the run with
+        // the texture's description instead of exhausting memory.
+        if texels.len() as u64 > MAX_UPLOAD_BYTES {
+            let message = format!(
+                "upload {key:#x}: {width}x{height} {shape:?} {format:?}, {level_count} levels, is {} MiB, over the {} MiB limit",
+                texels.len() >> 20,
+                MAX_UPLOAD_BYTES >> 20
+            );
+            self.fatal = Some(message.clone());
+            return Err(message);
+        }
+        // The texels are staged before the image exists, so a failure
+        // leaves nothing behind. Uploads larger than the ring (a big ASTC
+        // array decoded to RGBA8) get a staging buffer of their own,
+        // destroyed with the submission's retired buffers.
+        let (buffer, offset) = if texels.len() as u64 > RING_SIZE {
+            let staging =
+                self.host_buffer(texels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            staging.write(0, texels);
+            let buffer = staging.buffer;
+            self.retired_texel_buffers
+                .push((staging, vk::BufferView::null()));
+            (buffer, 0)
+        } else {
+            self.ring_upload(texels, 16)?
+        };
         let mut target = self.create_shaped_image(
             *width,
             *height,
@@ -1141,8 +1180,13 @@ impl Renderer {
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             level_count,
         )?;
-        let (buffer, offset) = self.ring_upload(texels, 16)?;
-        let commands = self.commands()?;
+        let commands = match self.commands() {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.destroy_target(target);
+                return Err(error);
+            }
+        };
         let barrier = vk::ImageMemoryBarrier::default()
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1535,6 +1579,9 @@ impl Renderer {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle)
             .host_pointer(start as *mut std::ffi::c_void);
+        if span >= LARGE_ALLOCATION {
+            eprintln!("gpu: {} MiB host import at {start:#x}", span >> 20);
+        }
         let allocate = vk::MemoryAllocateInfo::default()
             .allocation_size(span)
             .memory_type_index(index)
@@ -1557,11 +1604,21 @@ impl Renderer {
         Ok(Some((buffer, offset)))
     }
 
+    #[track_caller]
     pub(crate) fn allocate(
         &self,
         requirements: vk::MemoryRequirements,
         flags: vk::MemoryPropertyFlags,
     ) -> Result<vk::DeviceMemory, String> {
+        // Allocations this large are unusual for guest-sized resources:
+        // named with their caller, so a runaway size can be traced.
+        if requirements.size >= LARGE_ALLOCATION {
+            eprintln!(
+                "gpu: {} MiB {flags:?} allocation at {}",
+                requirements.size >> 20,
+                std::panic::Location::caller()
+            );
+        }
         let index = (0..self.memory_types.memory_type_count)
             .find(|index| {
                 requirements.memory_type_bits & (1 << index) != 0
@@ -2301,6 +2358,7 @@ impl Renderer {
         Ok(view)
     }
 
+    #[track_caller]
     fn create_shaped_image(
         &self,
         width: u32,
@@ -3232,6 +3290,7 @@ impl Renderer {
     }
 
     /// A host-visible, coherent buffer.
+    #[track_caller]
     pub(crate) fn host_buffer(
         &self,
         size: u64,

@@ -3007,6 +3007,11 @@ impl Nvn {
                         "stat: dispatch microseconds",
                         start.elapsed().as_micros() as u64,
                     );
+                    if let Some(fatal) =
+                        self.gpu().and_then(|backend| backend.renderer.fatal.take())
+                    {
+                        return Err(stop(fatal));
+                    }
                     if let Err(error) = result {
                         self.gpu_note(format!("dispatch skipped: {error}"));
                     }
@@ -3023,6 +3028,11 @@ impl Nvn {
                         "stat: draw microseconds",
                         start.elapsed().as_micros() as u64,
                     );
+                    if let Some(fatal) =
+                        self.gpu().and_then(|backend| backend.renderer.fatal.take())
+                    {
+                        return Err(stop(fatal));
+                    }
                     if let Err(error) = result {
                         self.gpu_note(format!("draw skipped: {error}"));
                     }
