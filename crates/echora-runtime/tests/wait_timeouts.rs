@@ -220,7 +220,9 @@ fn machine(workers: usize) -> Machine {
         scheduler_slice: 37,
         ..Layout::default()
     };
-    let mut m = Machine::new(layout, 50_000_000);
+    // Spin-waits run while others sleep in host time: a budget for a slow
+    // (loaded) host, not only for the guest work.
+    let mut m = Machine::new(layout, 200_000_000);
     m.memory
         .map(CODE, 2 * PAGE_SIZE, READ | EXECUTE, STATE_CODE, "code")
         .unwrap();
@@ -374,9 +376,15 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             roles()[i as usize]
         }
 
-        // T: exit when told.
-        T => after(core, T_EXIT, T + 0x10),
-        p if p == T + 0x10 => return svc(0x0a),
+        // T: exit when told, sleeping in between (it may wait out the
+        // whole run, so it must not spend the step budget spinning).
+        T => {
+            if load(core, T_EXIT) != 0 {
+                return svc(0x0a);
+            }
+            return call(core, 0x0b, &[TIMEOUT_NS]);
+        }
+        p if p == T + 0x10 => T,
 
         // A, phase 1: time out on the address.
         A => return call(core, 0x34, &[ADDRESS, 2, 0, TIMEOUT_NS]),
@@ -710,14 +718,24 @@ fn block(core: &mut Core) -> Result<(), Trap> {
 
         // The cancel program's waiter. Phase 1: cancelled out of
         // WaitSynchronization.
+        // Attempt n (in TEMP) is announced as READY1 = n + 1.
         CANCEL_WAITER => {
             let t = load(core, HANDLES);
             store(core, CANCEL_LIST, t);
-            store(core, READY1, 1);
+            let attempt = core.cpu.regs[TEMP];
+            store(core, READY1, attempt + 1);
             return call(core, 0x18, &[0, CANCEL_LIST, 1, FOREVER]);
         }
         p if p == CANCEL_WAITER + 0x10 => {
             let (result, index) = (core.cpu.regs[0], core.cpu.regs[1]);
+            // Cancelled with index 0: the cancel came before the wait
+            // parked (the latched cancel's early return), so it did not
+            // test a parked wait. Wait again for another cancel.
+            if result == CANCELLED && index == 0 && core.cpu.regs[TEMP] < 20 {
+                core.cpu.regs[TEMP] += 1;
+                core.cpu.pc = CANCEL_WAITER;
+                return core.finish_block();
+            }
             store(core, WAIT_RESULT1, result);
             store(core, WAIT_INDEX1, index);
             store(core, DONE1, 1);
@@ -825,7 +843,18 @@ fn block(core: &mut Core) -> Result<(), Trap> {
         }
 
         // The canceler.
-        CANCELER => after(core, READY1, CANCELER + 0x10),
+        // Cancel each attempt the waiter announces, until one cancelled
+        // its parked wait.
+        CANCELER => {
+            if load(core, DONE1) != 0 {
+                CANCELER + 0x50
+            } else if load(core, READY1) > core.cpu.regs[TEMP] {
+                CANCELER + 0x10
+            } else {
+                core.spin_hint();
+                CANCELER
+            }
+        }
         p if p == CANCELER + 0x10 => return call(core, 0x0b, &[TIMEOUT_NS]),
         p if p == CANCELER + 0x20 => {
             let waiter = load(core, HANDLES + 4);
@@ -834,9 +863,9 @@ fn block(core: &mut Core) -> Result<(), Trap> {
         p if p == CANCELER + 0x30 => {
             let result = core.cpu.regs[0];
             store(core, CANCEL_RESULT1, result);
-            CANCELER + 0x40
+            core.cpu.regs[TEMP] += 1;
+            CANCELER
         }
-        p if p == CANCELER + 0x40 => after(core, DONE1, CANCELER + 0x50),
         // The waiter is running (spinning on GO2).
         p if p == CANCELER + 0x50 => {
             let waiter = load(core, HANDLES + 4);
