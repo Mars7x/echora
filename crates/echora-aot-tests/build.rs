@@ -76,6 +76,7 @@ fn split_programs(out: &mut String) {
     switch_code(out);
     spin_candidates(out);
     irreducible_candidates(out);
+    concurrency_code(out);
 }
 
 /// With the `codesize` feature: the split programs once per emission mode,
@@ -1357,4 +1358,51 @@ fn irreducible_candidates(out: &mut String) {
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
     writeln!(out, "}}").expect("write");
+}
+
+/// Concurrency-sensitive patterns for `tests/concurrency.rs`, each at the
+/// start of its own window: plain loads and stores that another host
+/// thread changes or watches. X0 and X1 hold data addresses.
+fn concurrency_code(out: &mut String) {
+    const BASE: u64 = 0x100_0000;
+    const WINDOW: usize = 0x400 / 4;
+    const LDR_W1_X0: u32 = 0xb940_0001;
+    const LDR_W2_X0: u32 = 0xb940_0002;
+    const LDR_W3_X1: u32 = 0xb940_0023;
+    const STR_W2_X0: u32 = 0xb900_0002;
+    const ADD_X2_1: u32 = 0x9100_0442;
+    const SVC_7: u32 = 0xd400_00e1;
+    let programs: [&[u32]; 4] = [
+        // poll: LDR W1, [X0]; CBZ W1, back to the LDR.
+        &[LDR_W1_X0, 0x34ff_ffe1, SVC_7],
+        // counted poll: LDR W1, [X0]; ADD X2, X2, #1; CBZ W1, back to the
+        // LDR. The count makes it no pure poll (no spin hint).
+        &[LDR_W1_X0, ADD_X2_1, 0x34ff_ffc1, SVC_7],
+        // store then load: STR W2, [X0]; LDR W3, [X1].
+        &[STR_W2_X0, LDR_W3_X1, SVC_7],
+        // two loads of one address: LDR W1, [X0]; LDR W2, [X0].
+        &[LDR_W1_X0, LDR_W2_X0, SVC_7],
+    ];
+    let mut words = vec![0u32; WINDOW * programs.len()];
+    let mut entries = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        words[index * WINDOW..index * WINDOW + program.len()].copy_from_slice(program);
+        entries.push(BASE + (index * WINDOW * 4) as u64);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "concurrency".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &entries, words.len()).expect("concurrency");
+    let (root, regions) = split(&translation, options());
+    writeln!(out, "pub mod concurrency_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
 }
