@@ -324,10 +324,76 @@ pub fn block_linear_offset_in(
     block * block_size + gob_in_block * GOB_SIZE + within
 }
 
+/// The 16-byte runs of row `y` (in blocks) of slice `z`, as
+/// (byte offset in the row, byte offset in the level), for formats whose
+/// block size divides 16: the same offsets as `block_linear_offset_in` at
+/// every 16th byte, with the row's block and GOB worked out once. Within a
+/// GOB a row's four runs are 64 and 256 bytes apart (see
+/// `block_linear_offset`).
+pub fn block_linear_row_runs(
+    format: FormatInfo,
+    width: u32,
+    height: u32,
+    shape: BlockShape,
+    y: u32,
+    z: u32,
+) -> impl Iterator<Item = (u64, u64)> {
+    let rows = u64::from(height.max(1).div_ceil(format.block_height));
+    let (gobs_y, gobs_z) = (1u64 << shape.y, 1u64 << shape.z);
+    let block_size = GOB_SIZE * gobs_y * gobs_z;
+    let used =
+        u64::from(width.max(1).div_ceil(format.block_width)) * u64::from(format.bytes_per_block);
+    let blocks_x = align(used, GOB_WIDTH) / GOB_WIDTH;
+    let blocks_y = rows.div_ceil(GOB_HEIGHT * gobs_y);
+    let (y, z) = (u64::from(y), u64::from(z));
+    let gob_y = y / GOB_HEIGHT;
+    let first_block = (z / gobs_z * blocks_y + gob_y / gobs_y) * blocks_x;
+    let gob_in_block = (z % gobs_z) * gobs_y + gob_y % gobs_y;
+    let by = y % GOB_HEIGHT;
+    let row_in_gob = (by / 4) * 128 + ((by % 4) / 2) * 32 + (by % 2) * 16;
+    let start = first_block * block_size + gob_in_block * GOB_SIZE + row_in_gob;
+    (0..used.div_ceil(16)).map(move |run| {
+        let gob = start + run / 4 * block_size;
+        let within = (run % 4 / 2) * 256 + (run % 2) * 64;
+        (run * 16, gob + within)
+    })
+}
+
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_runs_match_block_offsets() {
+        // 1-, 4-, 8- and 16-byte blocks, uneven sizes, deep and tall blocks.
+        for format in [1, 37, 46, 66].into_iter().filter_map(info) {
+            for (width, height, depth) in [(100, 37, 1), (300, 200, 1), (64, 64, 9), (5, 3, 1)] {
+                for level in 0..3 {
+                    let (w, h, d) = (
+                        (width >> level).max(1),
+                        (height >> level).max(1),
+                        (depth >> level).max(1),
+                    );
+                    let shape = level_block_shape(format, height, depth, level);
+                    let rows = h.div_ceil(format.block_height);
+                    for z in 0..d {
+                        for y in 0..rows {
+                            for (byte, offset) in block_linear_row_runs(format, w, h, shape, y, z) {
+                                let x = (byte / u64::from(format.bytes_per_block)) as u32;
+                                assert_eq!(
+                                    offset,
+                                    block_linear_offset_in(format, w, h, shape, x, y, z),
+                                    "format {} {w}x{h}x{d} block ({x}, {y}, {z})",
+                                    format.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn runs_are_contiguous_to_the_next_16_bytes() {

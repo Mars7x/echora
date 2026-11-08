@@ -2096,6 +2096,22 @@ impl Nvn {
                             copy_block(line, u64::from(row) * stride);
                             continue;
                         }
+                        // Blocks dividing 16 bytes: the row's 16-byte runs.
+                        if 16 % block == 0 {
+                            for (start, offset) in crate::nvn_format::block_linear_row_runs(
+                                info,
+                                level_width,
+                                level_height,
+                                level_shape,
+                                row,
+                                z,
+                            ) {
+                                let start = start as usize;
+                                let end = (start + 16).min(row_bytes);
+                                copy_block(&mut line[start..end], layer_base + offset);
+                            }
+                            continue;
+                        }
                         // A run of blocks at consecutive addresses at a time.
                         let mut column = 0;
                         while column < columns {
