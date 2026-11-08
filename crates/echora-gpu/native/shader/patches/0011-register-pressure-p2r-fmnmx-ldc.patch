@@ -1,0 +1,26 @@
+diff --git a/src/shader_recompiler/frontend/ampere/register_pressure.h b/src/shader_recompiler/frontend/ampere/register_pressure.h
+index d3ec0be..f24c9c4 100644
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -50,8 +50,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         operand(24);
+         operand(32);
+         break;
++    case 0x803: // P2R: destination, merge source
+     case 0x807:
+     case 0x808:
++    case 0x809: // FMNMX with an immediate
+     case 0x923:
+     case 0x820:
+     case 0xa20:
+@@ -71,6 +73,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x805:
+         operand(16, 2);
+         break;
++    case 0xb82: // LDC indexed: destination (a pair for 64-bit), address
++        operand(16, input.Bits(73, 3) == 5 ? 2 : 1);
++        operand(24);
++        break;
+     case 0xc17:
+     case 0x817:
+         operand(16);

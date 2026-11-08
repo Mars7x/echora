@@ -25,7 +25,8 @@ Each phase completes only on the evidence named here, not when code exists.
 
 1. Reach the first gameplay scene after the New Game movie and check what
    it draws, mesh and task pipelines included.
-2. Translate the last 27 failing shader stages.
+2. Translate the last 16 failing shader stages (per-tap gathers with
+   offsets that are not provably constant, one return linkage mode).
 3. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
    game's per-core job threads run in parallel, which looks like one job
    claimed by two threads. This is the largest speed gain available.

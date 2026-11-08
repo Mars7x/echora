@@ -27,9 +27,9 @@
   with the real modules.
 - Mesh and task pipelines (`DrawMeshTasks`) are drawn through
   `VK_EXT_mesh_shader` but not yet checked against the console's output. Of the
-  6,074 shader stages OoT reached in a test run, 27 do not translate yet
-  (gather forms, opcode c08 and register shadowing modes); draws that need
-  them are skipped.
+  6,074 shader stages OoT reached in a test run, 16 do not translate yet
+  (15 per-tap gathers whose offsets are not provably constant, one return
+  linkage mode); draws that need them are skipped.
   NVN calls the Vulkan backend directly; a backend trait (for Direct3D
   12) is still to be introduced. Gamepads on Windows (gilrs) are untested
   on hardware, and audio output does not resample (the device must accept

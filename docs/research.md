@@ -205,8 +205,10 @@ foldable to IMNMX through any UPn, as PokeDinner did; Lichii accepted only
 UP0, so indirect-branch tables guarded through another UPn failed to track.
 The 87 stage-buffer reads were mesh (81) and task (6) programs translated
 as vertex programs: classified as at draw time (`translate-dump` does), all
-translate. The remaining 27 failures are gather forms (op b63, 15), op c08
-(6) and register shadowing modes (6).
+translate. Patches `0011` (register shadowing for P2R, FMNMX with an
+immediate and indexed LDC) and `0012` (FSEL with a uniform source) fix 11
+more; the remaining 16 are per-tap gathers whose offsets are not provably
+constant (op b63, 15) and one return linkage mode (op 950).
 
 ## Licensing decision
 
