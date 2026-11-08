@@ -37,3 +37,8 @@ when the code for it does.
 5. Shorten the first build from about an hour: leaner generated code (about
    a third smaller in tests so far), full optimisation only for the hot code a
    profile finds, and more parallel compiler jobs.
+6. Keep compressed textures compressed on the GPU. The game's ASTC textures
+   are unpacked to plain RGBA8 because PC GPUs mostly can't sample ASTC, which
+   uses four to eight times the video memory (one 90-layer array after the
+   opening movie becomes 852 MiB). Re-encoding them as BC7, cached on disk like
+   the shader binaries, would bring that close to the console's footprint.
