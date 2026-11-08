@@ -268,21 +268,28 @@ impl Core {
     /// table lookup and the indirect call. Same depth limit, traps and
     /// return: Ok can still mean the callee left early (a host function,
     /// the depth limit), and the caller checks the PC as after `call`.
+    /// Only this fast path is inlined at each call site; continuing
+    /// through the window table is out of line.
     #[inline]
     pub fn call_window(&mut self, return_to: u64, function: WindowFn) -> Result<(), Trap> {
-        if WINDOWS.get().is_none() || self.call_depth >= MAX_CALL_DEPTH {
-            return Ok(());
-        }
-        if self.cpu.pc == return_to {
+        if self.call_depth >= MAX_CALL_DEPTH || self.cpu.pc == return_to {
             return Ok(());
         }
         self.call_depth += 1;
         let result = function(self);
         self.call_depth -= 1;
         match result {
-            Ok(()) if self.cpu.pc != return_to => self.call(return_to),
+            Ok(()) if self.cpu.pc != return_to => self.continue_call(return_to),
             other => other,
         }
+    }
+
+    /// The rest of a `call_window` whose callee left its window before
+    /// returning: as `call`, through the window table.
+    #[cold]
+    #[inline(never)]
+    fn continue_call(&mut self, return_to: u64) -> Result<(), Trap> {
+        self.call(return_to)
     }
 
     /// Per-instruction accounting. Thread-state checks happen in the host at
