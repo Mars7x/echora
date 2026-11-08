@@ -64,13 +64,26 @@ impl HostMemory {
             "guest memory needs 4 KiB host pages; this host uses {page_size}-byte pages"
         );
         // SAFETY: the name is a valid C string; the descriptor is owned here.
-        let fd = unsafe { libc::memfd_create(c"echora-guest".as_ptr(), libc::MFD_CLOEXEC) };
+        // Sealing is allowed so the file can be shared with the GPU: a
+        // udmabuf (see `shared_file`) needs a file that cannot shrink.
+        let fd = unsafe {
+            libc::memfd_create(
+                c"echora-guest".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
         assert!(fd >= 0, "memfd_create failed");
         // SAFETY: `fd` is our file; the size is sparse until written.
         assert_eq!(
             unsafe { libc::ftruncate(fd, size as libc::off_t) },
             0,
             "ftruncate failed"
+        );
+        // SAFETY: `fd` is our file; the size never changes after this.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+            0,
+            "sealing the guest memory file failed"
         );
         let physical = reserve(
             size,
@@ -157,6 +170,12 @@ impl HostMemory {
     /// Host address of the physical view's page at file offset `page`.
     pub(crate) fn page_address(&self, page: u64) -> usize {
         self.physical.as_ptr() as usize + page as usize
+    }
+
+    /// The file backing guest memory (sealed against shrinking), which a
+    /// device can share by file offset (`Memory::shared_span`).
+    pub(crate) fn shared_file(&self) -> Option<i32> {
+        Some(self.fd)
     }
 
     /// Zero file range `[start, end)` and return its storage to the host.

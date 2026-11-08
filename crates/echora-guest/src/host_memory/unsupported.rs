@@ -40,6 +40,11 @@ impl HostMemory {
         match self.never {}
     }
 
+    /// No file a device can share by offset here.
+    pub(crate) fn shared_file(&self) -> Option<i32> {
+        None
+    }
+
     pub(crate) fn release(&mut self, _start: u64, _end: u64) {
         match self.never {}
     }

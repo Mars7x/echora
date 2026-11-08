@@ -476,6 +476,11 @@ impl HostMemory {
         self.physical.base.as_ptr() as usize + page as usize
     }
 
+    /// No file a device can share by offset here.
+    pub(crate) fn shared_file(&self) -> Option<i32> {
+        None
+    }
+
     /// Zero file range `[start, end)`. Whole chunks return their storage
     /// to the host; partial chunks are zeroed in place.
     pub(crate) fn release(&mut self, start: u64, end: u64) {

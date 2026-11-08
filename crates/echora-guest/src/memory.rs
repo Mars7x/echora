@@ -777,6 +777,29 @@ impl Memory {
         }
     }
 
+    /// The file backing guest range `[address, address + length)` and the
+    /// range's offset in it, when every page of it is mapped and their
+    /// backing pages are contiguous: a device can then share the range
+    /// in place (on Linux, through a udmabuf of the file). None otherwise,
+    /// or on hosts without such a file.
+    pub fn shared_span(&self, address: u64, length: u64) -> Option<(i32, u64)> {
+        let file = self.pages.host.shared_file()?;
+        let start = address & !(PAGE_SIZE - 1);
+        let end = address
+            .checked_add(length.max(1))?
+            .next_multiple_of(PAGE_SIZE);
+        let (first, _) = self.guest_view_page(start)?;
+        let mut page = start + PAGE_SIZE;
+        while page < end {
+            let (backing, _) = self.guest_view_page(page)?;
+            if backing != first + (page - start) {
+                return None;
+            }
+            page += PAGE_SIZE;
+        }
+        Some((file, first + (address - start)))
+    }
+
     fn backing_page(&self, page: u64) -> u64 {
         if let Some((&destination, alias)) = self.stack_aliases.range(..=page).next_back()
             && page < destination + alias.size
@@ -1769,6 +1792,25 @@ impl Memory {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_spans_follow_contiguous_backing() {
+        let mut memory = Memory::new(0x80_0000_0000);
+        memory
+            .map(0x10000, 0x4000, READ | WRITE, STATE_NORMAL, "heap")
+            .unwrap();
+        // A plain mapping is backed at its own address.
+        let (file, offset) = memory.shared_span(0x10010, 0x3000).unwrap();
+        assert!(file >= 0);
+        assert_eq!(offset, 0x10010);
+        // Past the mapping, or unmapped: not shareable.
+        assert!(memory.shared_span(0x13000, 0x2000).is_none());
+        assert!(memory.shared_span(0x20000, 0x10).is_none());
+        // An alias is backed by its source pages.
+        memory.map_stack_alias(0x40000, 0x11000, 0x1000).unwrap();
+        assert_eq!(memory.shared_span(0x40008, 8).unwrap().1, 0x11008);
+    }
 
     #[test]
     fn guest_view_follows_host_writes_aliases_and_unmaps() {
