@@ -140,3 +140,109 @@ Rust's model.
 - echora-guest's process globals: the `MONITOR` buckets are atomic
   (spurious STXR failures only), `WINDOWS` is a `OnceLock`, and the
   fault handler's view globals are set once.
+
+## Part 2: what differs from one worker when guest code is serialised
+
+The main session's runs crash the same way with `ECHORA_SERIAL_GUEST=1`
+(only one worker runs guest code at a time), also with
+`ECHORA_FLAT_PRIORITY` and `ECHORA_ANY_CORE`, so simultaneous execution
+is not needed. The aot-tests stress suite, now with a CASPAL Treiber
+stack and torn-half checks of 128-bit LDP/STP and LDR/STR Q, also rules
+out the 128-bit forms: CASP is a real 128-bit atomic
+(`GuestView::compare_exchange_pair_single_thread`, portable-atomic's
+cmpxchg16b). LDXP and STXP are not decoded at all, so they would stop the
+run instead of tearing.
+
+Line numbers below are for `runtime.rs` at the commit that adds this
+part.
+
+### What is the same as with one worker (checked)
+
+- The context save and restore covers the whole `Cpu`: general and
+  vector registers, SP, PC, NZCV, TPIDR_EL0/TPIDRRO_EL0, FPCR and FPSR.
+  It is saved at every switch away (round robin 2129-2134, waits
+  1938-1943 and 1969-1973, an ineligible current thread before its
+  worker parks 2069-2081), and `next == current` never rewinds (2085).
+  Split-window register locals are stored back into the `Core` before
+  any trap leaves generated code, so the saved `Cpu` is complete.
+- SVC results reach the right thread. `boundary` (2341-2344) runs the
+  SVC and sets PC + 4 on the core that issued it. Context switches only
+  happen afterwards, in `finish_block` and `idle_until_runnable`
+  (`commit_context_switch` is called only at 801, 1948, 1978, 2043 and
+  2125). Wake-ups write results into saved contexts only (`complete_wait`
+  in threads.rs:361, `wake_ready_waiters` 720), never into a worker's
+  live core, even when a parked worker's stale core is swapped in.
+- `host_call_continue` is set and taken within one boundary under the
+  lock (2573, 2384).
+- The exclusive monitor is cleared at every switch (`commit_context_switch`
+  1896), on whichever worker's core is swapped in.
+- The physical counter: every worker's copy has the same epoch and
+  clamps to its own maximum, so host-time CNTVCT stays monotonic when a
+  thread moves between workers. (With `ECHORA_VIRTUAL_CLOCK` it follows
+  each worker's step count, which `swap_in` keeps in step.)
+
+### What still differs, most likely first
+
+**A. Unlocked NVN submission (W>1 only, unaffected by the serial
+switches).** With more than one worker every `nvnQueueSubmitCommands`
+runs in `submit_unlocked` (4603), not in `call_nvn`. That means:
+- through the worker's flat guest view, `GuestMemory::View`
+  (4697), instead of `GuestMemory::Checked(&mut self.memory)` (2650). The
+  view bypasses `Memory`'s permission checks and its resident-page
+  bookkeeping, so a submission reading or writing memory the game has
+  just unmapped or reprotected does not fail cleanly; it faults or writes
+  freed pages;
+- with the machine unlocked and the serial guest lock not held. Other
+  threads run guest code and SVCs (unmap, heap, transfer memory) during
+  the submission, which `ECHORA_SERIAL_GUEST` does not prevent;
+- with the NVN state moved out (4617). Guest threads that don't call NVN
+  but read what a submission writes (semaphore releases, query results,
+  fence values in guest memory) see it written at a different point than
+  with one worker.
+A submission that writes a semaphore or query result through a stale
+address, or into memory another thread has reused, corrupts objects the
+way the crash looks: a pointer with a wrong high half in an object being
+destroyed.
+Test: `ECHORA_LOCKED_SUBMIT=1` with `ECHORA_SERIAL_GUEST=1` and long
+slices.
+
+**B. GetCurrentProcessorNumber depends on the worker, even with
+`ECHORA_ANY_CORE`.** SVC 0x10 (3412) answers `guest_core_on_worker` as
+soon as there are workers. `ECHORA_ANY_CORE` only changes which threads
+a worker may pick (1671); it doesn't change this answer. With one worker
+it is `thread_processor_id` (1606), the thread's own fixed logical core.
+So with several workers, one thread's core number changes as it moves
+between workers, and threads that would each always report their own
+core now report the worker's. Per-core data the game indexes by this
+number (thread-local caches, per-core free lists and job queues, which
+it touches without locks because "only the thread on core c uses slot
+c") then gets used by different threads in a different order. It also
+gets used by one thread under two indices across a migration. A per-core
+free list or object pool with an entry pushed to one core's slot and
+popped from another's, interleaved by a slice end, gives exactly
+double-freed or half-initialised objects in a destructor path.
+Test: answer SVC 0x10 with `thread_processor_id` also when parallel
+(add a diagnostic switch), with `ECHORA_SERIAL_GUEST=1`. A cleaner fix
+keeps a thread on the worker that owns its recorded core.
+
+**C. One `Core` per worker.** Some state lives in the worker's Core, not
+the thread's `Cpu`, and stays with the worker when the thread moves:
+`spin_polls`, `slice_start`, `host_check_at`, `attention`, `call_depth`
+and `block_tag`. All of them are reset or recomputed at each boundary
+(`finish_block` 2222-2228; `call_depth` unwinds with its frames, and
+`block_tag` is settled at every boundary). None of it is guest-visible.
+Listed for completeness; unlikely.
+
+### A bisection ladder
+
+Each step removes one W>1-only difference. The first step at which the
+crash stops names the cause:
+
+1. `ECHORA_WORKERS=2 ECHORA_SERIAL_GUEST=1 ECHORA_ONE_CORE=1`: every
+   thread on worker 0 (1661), so the processor numbers are worker 0's,
+   and worker 1 only parks. What still differs from W=1: unlocked submit
+   and per-worker cores.
+2. Add `ECHORA_LOCKED_SUBMIT=1`: removes A.
+3. If 1 already passes, remove `ECHORA_ONE_CORE` and keep
+   `ECHORA_LOCKED_SUBMIT=1`. If it then crashes, B (the processor
+   numbers) or migration is the cause.
