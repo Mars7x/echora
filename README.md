@@ -1,123 +1,90 @@
 # Echora
 
-An experimental native recompilation of the Nintendo Switch 2 release of
-*The Legend of Zelda: Ocarina of Time*. The goal is to translate the game's
-AArch64 code ahead of time into native host code and run it on a portable
-reimplementation of the console services it uses, with native graphics,
-display, input and audio, rather than emulating the console.
+[![CI](https://img.shields.io/github/actions/workflow/status/Mars7x/echora/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Mars7x/echora/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square)](https://www.rust-lang.org)
+![Status: experimental](https://img.shields.io/badge/status-experimental-red?style=flat-square)
+
+Echora is a native recompilation of the Nintendo Switch 2 release of *The
+Legend of Zelda: Ocarina of Time*. Rather than emulating the console, it
+translates the game's ARM code into Rust ahead of time, compiles it to native
+code, and runs it on a reimplementation of the Switch's operating system and
+graphics.
 
 > [!CAUTION]
-> **Echora is NOT ready for stable gameplay, and it is not a way to play
-> Ocarina of Time today.** It does not reach gameplay, runs far below full
-> speed, is missing large parts of the graphics path, and can hang, crash
-> or render incorrectly at any point. Saves are untested and may be lost
-> or corrupted. It needs much more work, with no timeline, so do not report
-> gameplay problems as bugs yet.
+> Echora cannot be used to play Ocarina of Time yet. It does not reach
+> gameplay, runs well below full speed, and can hang, crash or render
+> incorrectly at any point. Saves are untested. Please do not report gameplay
+> problems as bugs for now.
 
-> Echora contains no game code, assets or keys, and it cannot run anything
-> without a legally obtained copy of the game that you dump and supply
-> yourself.
-
-> **Note:** Echora is a personal project, made for my own enjoyment. AI
-> tools were used in developing it.
-
-## Principles
-
-- Written in Rust, apart from the C++ shader recompiler and a few C
-  libraries.
-- The Switch's kernel, system services and NVN graphics API are
-  reimplemented; the core never modifies the game's own code.
-- Unimplemented instructions, system calls and services stop the run with
-  a report instead of returning invented success.
-- Translated code is checked against a reference interpreter written from
-  Arm's pseudocode.
-- The game is read straight from its NUP file or a dump, without
-  unpacking it.
-- The core is portable, and is built and tested on Linux and Windows.
-- Anything beyond the console's own behaviour, such as frame rates above
-  60 or ultrawide, lives in a separate layer of enhancements, each of which
-  can be switched off.
+Echora is a personal project that I build for my own enjoyment. It doesn't
+include any game code, assets or keys, so you'll need your own copy of the
+game.
 
 ## Status
 
-Latest measured state (2026-11-07, update `0400486024DEC000` v131072,
-display version 1.1.1, Linux x86-64 with an AMD RX 9070 XT):
+The game boots, shows the title screen and plays the opening movie in colour
+with sound. After New Game it now gets past the opening movie and into new
+code, but no gameplay scene is drawn yet, so that is what I am working on next.
+Shader support is nearly complete, with 6,058 of the 6,074 shader stages seen
+so far translating, and the launcher works with a mouse, keyboard or
+controller.
 
-- **The game runs.** The whole of the game's code is translated ahead of
-  time (17.3 million instructions, 4.2 GiB of generated Rust in 1,111
-  crates), compiled natively, and run on Echora's runtime. It boots, draws
-  on the host GPU through Vulkan and presents frames: test runs go through
-  3,000 presented frames, show the title logo and play the intro movie
-  (AV1, decoded on the host). The movie renders in colour.
-- **Not playable yet.** Runs have been seen as far as the intro movie;
-  gameplay has not been reached. The mesh and task shaders that gameplay
-  scenes need have no draw path in the runtime yet.
-- **Far below full speed.** The game runs at 60 frames per second on the
-  console; here the intro movie decodes about 20 pictures per second once
-  it is playing. Every guest thread runs on one host thread by default,
-  and that thread does most of the work, so faster translated code alone
-  cannot reach full speed. Running guest threads on several host threads
-  (`ECHORA_WORKERS`, up to the console's six application cores) was 1.9
-  times faster in a partial test, but full parallel runs still crash
-  within half a minute, so it stays off by default.
-- **Shaders.** The console's GPU programs are translated to SPIR-V by the
-  Lichii shader recompiler with Echora's patches. Of the 6,074 shader stages
-  OoT reached in a test run, 6,047 translate and compile on the driver.
-- **Content input works.** Echora opens the game's NUP container directly,
-  validates its whole table of contents, and identifies the executable set.
-  A full content check of the 25 GB package (186,592 files, 23.5 GiB after
-  deduplication) passes in 12.6 s on a Ryzen 7 5800X3D. NUP and
-  extracted-directory input produce the same cache key.
-- **Executable loading works.** All four modules (`rtld`, `main`,
-  `subsdk0`, `sdk`) are decompressed and every segment matches the SHA-256
-  stored in its NSO header. `main` uses ZBIC, a Zstandard variant from
-  Switch firmware 22, which Echora decodes by transcoding to standard
-  Zstandard.
-- **Launcher.** A GPUI launcher installs the game, edits the settings the
-  runtime applies and starts it. It works with the mouse, the keyboard and
-  controllers.
-- **Platforms:** the workspace builds and its tests pass in CI on Linux
-  x86-64 and Windows x86-64. The game's translation has only been built
-  and run on Linux. macOS is not supported.
+Speed is the other big gap. The opening movie decodes at about 20 pictures per
+second, while the console runs the game at 60 fps, and nearly all of the work
+still happens on one CPU core. Spreading the game's threads across several
+cores was almost twice as fast in a partial test, but it still crashes, so it
+stays off for now.
 
-See the [roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md).
+The game only runs on Linux at the moment. The rest of the project builds and
+passes its tests on Windows too. These figures come from update 1.1.1
+(`0400486024DEC000` v131072) on an AMD RX 9070 XT. The
+[roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md) go
+into more detail.
+
+## Approach
+
+Echora is not an emulator. The game's ARM code is translated into native code
+before it runs, so nothing interprets or recompiles instructions while you
+play. The console's hardware is not simulated either: Echora implements the
+operating system and graphics API the game calls, and draws with your PC's own
+GPU through Vulkan.
+
+I want Echora to behave like the console rather than work around it. It
+reimplements the Switch's kernel, system services and NVN graphics API and
+leaves the game's own code alone. When the game asks for something that is not
+supported yet, the run stops and reports exactly what was missing instead of
+pretending it worked. The translated code is tested against a reference
+interpreter written from Arm's specification, and the game is read straight
+from your NUP file or dump without unpacking it.
+
+The project is written in Rust, apart from the C++ shader recompiler and a few
+C libraries. Anything that goes beyond what the console does, such as frame
+rates above 60 or ultrawide, will be kept in a separate layer of enhancements
+that can be turned off.
 
 ## How it works
 
-1. **Content.** `echora-nup` reads [NUP](https://github.com/a55uka/nup)
-   containers in place: it verifies the TOC hash and UUID, bounds-checks every
-   record, rejects unsafe names, and streams zstd extents with per-file SHA-256
-   checks. `echora-content` turns a NUP or an extracted `exefs/`+`romfs/`
-   dump into one inventory (packages, versions, build IDs, module hashes) and
-   materializes the program's ExeFS in a cache keyed by its content.
-   `echora-loader` decompresses NSO modules (LZ4 or ZBIC) and verifies each
-   segment hash.
-2. **Translation.** `echora-lift` discovers the game's code from its entry
-   points, function prologues, relocation targets and jump tables, and emits
-   it as Rust that the host toolchain compiles to native code. Each 64 KiB
-   guest region becomes its own crate; the crates link into shared-library
-   bundles.
-3. **Runtime.** `echora-runtime` provides guest memory, threads and
-   scheduling, synchronization, kernel SVCs, IPC and the system services the
-   game reaches, implemented as the executable requires them. An operation
-   that is not implemented stops the run with a report rather than
-   returning invented success.
-4. **Graphics.** NVN calls are handled on the host and executed on Vulkan
-   (`echora-gpu`); shader programs are translated to SPIR-V. Movies are
-   decoded on the host.
-5. **Host integration.** Windowing, keyboard and gamepad input, audio, and a
-   GPUI launcher on Linux and Windows, where all settings are changed.
+1. Echora reads your NUP file or dump, verifies it and loads the game's
+   executables.
+2. It discovers the game's ARM code and emits it as Rust, one crate per 64 KiB
+   region, which is then compiled to native code.
+3. The running game talks to Echora's implementation of the Switch kernel and
+   system services.
+4. NVN graphics calls are replayed on Vulkan, with the console's shaders
+   translated to SPIR-V, and movies are decoded on the PC.
 
-See [architecture](docs/architecture.md) for the crate boundaries.
+See the [architecture notes](docs/architecture.md) for how the crates fit
+together.
 
 ## Building
 
-The game runs only on Linux for now. You need:
+### Requirements
 
-- your own dump of the game: the Switch 2 update 1.1.1, as a NUP file or
-  an extracted dump;
-- a Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk;
-- Rust 1.88 or newer, `git`, C and C++ compilers, NASM, and the system
+- Linux
+- Your own dump of the game (update 1.1.1), as a NUP file or a folder
+- A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
+- Rust 1.88 or newer, `git`, C and C++ compilers, NASM and these system
   libraries:
 
 ```sh
@@ -127,7 +94,7 @@ sudo apt install build-essential nasm libasound2-dev libudev-dev libxkbcommon-x1
 sudo dnf install gcc gcc-c++ nasm alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel libxcb-devel vulkan-loader-devel
 ```
 
-Then build Echora and open the launcher:
+### Getting started
 
 ```sh
 git clone https://github.com/Mars7x/echora.git
@@ -136,26 +103,26 @@ cargo build --release
 target/release/echora-launcher
 ```
 
-Choose your game, then press Play. The first start translates and builds
-the game, which takes about an hour; later starts are immediate.
+Choose your game and press Play. The first start translates and builds the
+whole game, which takes about an hour. After that it starts straight away.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Development](docs/development.md)
-- [Content input](docs/content.md)
-- [Roadmap](docs/roadmap.md)
-- [Research notes and reuse audit](docs/research.md)
-- [Testing](docs/testing.md)
-- [Known limitations](docs/limitations.md)
+- [Architecture](docs/architecture.md): the crates and how they fit together
+- [Development](docs/development.md): command-line tools and test runs
+- [Content input](docs/content.md): NUP files and dumps
+- [Roadmap](docs/roadmap.md): milestones and next steps
+- [Research notes](docs/research.md): prior work Echora builds on
+- [Testing](docs/testing.md): the test suites
+- [Known limitations](docs/limitations.md): what does not work yet
 
 ## Legal
 
-This is an independent project, not affiliated with or endorsed by Nintendo
-or NVIDIA. The repository contains only original source code, tests and
-documentation. It does not include or download game files, keys or firmware.
-Do not open issues or pull requests containing game files, keys, or code
-generated from them; generated translations stay on your machine.
+Echora is an independent project and is not affiliated with or endorsed by
+Nintendo or NVIDIA. This repository contains only original source code, tests
+and documentation. It does not include or download game files, keys or
+firmware, so please do not open issues or pull requests that contain them or
+code generated from them. Translated game code stays on your machine.
 
-Licensed under GPL-3.0-or-later. See [LICENSE](LICENSE) and
-[NOTICE.md](NOTICE.md).
+Echora is licensed under the GNU General Public License, version 3 or later.
+See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
