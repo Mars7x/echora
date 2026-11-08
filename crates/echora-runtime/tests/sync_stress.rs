@@ -228,7 +228,7 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             core.cpu.regs[TEMP] = u64::from(core.memory.load_u32(COUNTER));
             // Every other round yields between the read and the write, so
             // others contend for the held mutex.
-            if core.cpu.regs[LEFT] % 2 == 0 {
+            if core.cpu.regs[LEFT].is_multiple_of(2) {
                 HOLD_YIELD
             } else {
                 WRITE_COUNTER
