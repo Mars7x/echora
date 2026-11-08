@@ -2851,6 +2851,7 @@ fn emit_structured_cases(
             .collect(),
         labels: Vec::new(),
         next_label: 0,
+        loop_heads: Vec::new(),
     };
     let entries: Vec<String> = analysis
         .control_entries()
@@ -2859,14 +2860,19 @@ fn emit_structured_cases(
     if entries.is_empty() {
         return;
     }
+    // `break 'tree` re-dispatches `next_pc` without a boundary; `break
+    // 'latch` goes through the window loop's own PC store and boundary
+    // check (as every flat block does) and then re-dispatches.
     writeln!(
         output,
-        "            {} => {{\n                'tree: {{",
+        "            {} => {{\n                let through = 'latch: {{\n                'tree: {{",
         entries.join(" | ")
     )
     .unwrap();
     emitter.emit(output, tree);
-    output.push_str("                }\n                continue;\n            }\n");
+    output.push_str(
+        "                }\n                false\n                };\n                if !through {\n                continue;\n                }\n            }\n",
+    );
 }
 
 /// Writes a structured tree as Rust (see [`emit_structured_cases`]).
@@ -2881,44 +2887,72 @@ struct TreeEmitter {
     /// Enclosing labels, innermost last: (is a loop, number).
     labels: Vec<(bool, usize)>,
     next_label: usize,
+    /// Heads of the enclosing loops: edges to them stay in the tree, with
+    /// their boundary in place.
+    loop_heads: Vec<u64>,
+}
+
+/// The block a tree starts with, when it starts with one.
+fn first_block(tree: &crate::structure::Structured) -> Option<u64> {
+    use crate::structure::Structured::*;
+    match tree {
+        Code(start) => Some(*start),
+        Seq(parts) => parts.first().and_then(first_block),
+        Block(body) | Loop(body) => first_block(body),
+        _ => None,
+    }
 }
 
 impl TreeEmitter {
-    /// A block's body and its boundary, then leaving the tree unless
-    /// `next_pc` is one of the block's successors in the window.
-    fn block(&self, output: &mut String, start: u64, guard: bool) {
+    /// A block's body, then where it goes. A successor no boundary comes
+    /// before (not an entry) runs next in the tree; so does the head of an
+    /// enclosing loop, after the boundary in place. Any other next PC (an
+    /// entry, a PC outside the window, an indirect target) leaves through
+    /// the window loop's shared boundary (`break 'latch`) and comes back
+    /// through the tree's dispatch.
+    fn block(&self, output: &mut String, start: u64, _guard: bool) {
         output.push_str(&self.bodies[&start]);
-        output.push_str("                m.cpu.pc = next_pc;\n");
-        // No boundary before a successor that is not an entry: it runs as
-        // part of this block, and no host resumes there.
-        let skip: Vec<String> = self.successors[&start]
+        let successors = &self.successors[&start];
+        let heads: Vec<u64> = successors
             .iter()
-            .filter(|pc| self.inlined.contains(pc))
+            .copied()
+            .filter(|pc| !self.inlined.contains(pc) && self.loop_heads.contains(pc))
+            .collect();
+        let stay: Vec<u64> = successors
+            .iter()
+            .copied()
+            .filter(|pc| self.inlined.contains(pc) || heads.contains(pc))
+            .collect();
+        if stay.is_empty() {
+            output.push_str("                break 'latch true;\n");
+            return;
+        }
+        // A call's return or a branch out of the window can still go
+        // elsewhere; the compiler folds the test where `next_pc` is known.
+        let test: Vec<String> = stay
+            .iter()
             .map(|pc| format!("next_pc != {pc:#x}"))
             .collect();
-        if skip.is_empty() {
-            output.push_str("                m.finish_block()?;\n");
-        } else {
-            writeln!(
-                output,
-                "                if {} {{ m.finish_block()?; }}",
-                skip.join(" && ")
-            )
-            .unwrap();
-        }
-        if guard {
-            let successors = &self.successors[&start];
-            if successors.is_empty() {
-                output.push_str("                break 'tree;\n");
+        writeln!(
+            output,
+            "                if {} {{ break 'latch true; }}",
+            test.join(" && ")
+        )
+        .unwrap();
+        // The next block's code expects its PC in `m.cpu.pc`.
+        output.push_str("                m.cpu.pc = next_pc;\n");
+        if !heads.is_empty() {
+            if heads.len() == stay.len() {
+                output.push_str("                m.finish_block()?;\n");
             } else {
-                let test: Vec<String> = successors
+                let test: Vec<String> = heads
                     .iter()
-                    .map(|pc| format!("next_pc != {pc:#x}"))
+                    .map(|pc| format!("next_pc == {pc:#x}"))
                     .collect();
                 writeln!(
                     output,
-                    "                if {} {{ break 'tree; }}",
-                    test.join(" && ")
+                    "                if {} {{ m.finish_block()?; }}",
+                    test.join(" || ")
                 )
                 .unwrap();
             }
@@ -2926,15 +2960,19 @@ impl TreeEmitter {
     }
 
     /// One side of a block's conditional branch: its constant next PC,
-    /// the boundary, then the tree's code for that side.
+    /// then the tree's code for that side, or the shared boundary when
+    /// it leaves the tree (see `block`).
     fn side(&mut self, output: &mut String, next: u64, tree: &crate::structure::Structured) {
-        writeln!(
-            output,
-            "                next_pc = {next:#x};\n                m.cpu.pc = next_pc;"
-        )
-        .unwrap();
-        if !self.inlined.contains(&next) {
-            output.push_str("                m.finish_block()?;\n");
+        writeln!(output, "                next_pc = {next:#x};").unwrap();
+        if self.inlined.contains(&next) {
+            output.push_str("                m.cpu.pc = next_pc;\n");
+        } else if self.loop_heads.contains(&next) {
+            output.push_str(
+                "                m.cpu.pc = next_pc;\n                m.finish_block()?;\n",
+            );
+        } else {
+            output.push_str("                break 'latch true;\n");
+            return;
         }
         self.emit(output, tree);
     }
@@ -2992,8 +3030,15 @@ impl TreeEmitter {
             }
             Loop(body) => {
                 let number = self.label(true);
+                let head = first_block(body);
+                if let Some(head) = head {
+                    self.loop_heads.push(head);
+                }
                 writeln!(output, "                'l{number}: loop {{").unwrap();
                 self.emit(output, body);
+                if head.is_some() {
+                    self.loop_heads.pop();
+                }
                 writeln!(
                     output,
                     "                break 'l{number};\n                }}"
@@ -3424,7 +3469,13 @@ pub fn emit_rust_split_to_with<E>(
         // stays inside one window still yields to the host scheduler.
         cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
         let locals = RegisterLocals::of(&cases);
-        writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+        // Structured trees leave dead code after their `break`s.
+        let dead = if structured.is_some() {
+            ", unreachable_code"
+        } else {
+            ""
+        };
+        writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
         output.push_str(&locals.load());
         // The blocks run in a nested function so their early returns still
         // pass the final store; it is always inlined, as a closure is not,
