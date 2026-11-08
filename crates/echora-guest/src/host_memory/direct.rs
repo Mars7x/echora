@@ -35,17 +35,84 @@ impl GuestAccess {
         (self.base + address as usize) as *mut T
     }
 
+    /// A guest load. Naturally aligned accesses of up to 8 bytes are
+    /// single-copy atomic on AArch64, and other guest threads (workers) may
+    /// write the same memory: they are relaxed host atomics, the same
+    /// instruction as a plain access, which the compiler may not merge,
+    /// split or keep in a register across other code. Misaligned and wider
+    /// accesses are plain.
     #[inline(always)]
     pub(crate) fn load<T: Copy>(&self, address: u64) -> T {
-        // SAFETY: inside the guest reservation; the guest view's protections
-        // fault on anything the guest may not read.
-        unsafe { std::ptr::read_unaligned(self.at::<T>(address)) }
+        use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
+        let pointer = self.at::<T>(address);
+        let size = size_of::<T>();
+        if size <= 8 && address & (size as u64 - 1) == 0 {
+            // SAFETY: inside the guest reservation (the view's protections
+            // fault on anything the guest may not read), aligned to `size`
+            // (the view's base is page-aligned), and T is `size` bytes.
+            unsafe {
+                match size {
+                    1 => {
+                        return std::mem::transmute_copy(
+                            &AtomicU8::from_ptr(pointer.cast()).load(Relaxed),
+                        );
+                    }
+                    2 => {
+                        return std::mem::transmute_copy(
+                            &AtomicU16::from_ptr(pointer.cast()).load(Relaxed),
+                        );
+                    }
+                    4 => {
+                        return std::mem::transmute_copy(
+                            &AtomicU32::from_ptr(pointer.cast()).load(Relaxed),
+                        );
+                    }
+                    8 => {
+                        return std::mem::transmute_copy(
+                            &AtomicU64::from_ptr(pointer.cast()).load(Relaxed),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // SAFETY: inside the guest reservation, as above.
+        unsafe { std::ptr::read_unaligned(pointer) }
     }
 
+    /// A guest store: relaxed host atomics for aligned accesses of up to 8
+    /// bytes, as in `load`.
     #[inline(always)]
     pub(crate) fn store<T: Copy>(&self, address: u64, value: T) {
+        use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
+        let pointer = self.at::<T>(address);
+        let size = size_of::<T>();
+        if size <= 8 && address & (size as u64 - 1) == 0 {
+            // SAFETY: as in `load`, for writes.
+            unsafe {
+                match size {
+                    1 => {
+                        return AtomicU8::from_ptr(pointer.cast())
+                            .store(std::mem::transmute_copy(&value), Relaxed);
+                    }
+                    2 => {
+                        return AtomicU16::from_ptr(pointer.cast())
+                            .store(std::mem::transmute_copy(&value), Relaxed);
+                    }
+                    4 => {
+                        return AtomicU32::from_ptr(pointer.cast())
+                            .store(std::mem::transmute_copy(&value), Relaxed);
+                    }
+                    8 => {
+                        return AtomicU64::from_ptr(pointer.cast())
+                            .store(std::mem::transmute_copy(&value), Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // SAFETY: as in `load`, for writes.
-        unsafe { std::ptr::write_unaligned(self.at::<T>(address), value) }
+        unsafe { std::ptr::write_unaligned(pointer, value) }
     }
 
     /// Host address of an aligned atomic access of up to 16 bytes. The
