@@ -522,7 +522,10 @@ fn jump_table(
                         table = Some(adr_target(word, cursor, true).checked_add(table_low?)?);
                         continue;
                     }
-                    return None;
+                    // Any other write (a call's link register, a reload):
+                    // the table address comes later in program order, if
+                    // anywhere (`hoisted_addresses` below).
+                    break;
                 }
                 // Bound: `cmp wN/xN, #imm` followed by b.hi / b.hs, on the
                 // index register or a register it was copied from. Copies
@@ -4035,6 +4038,43 @@ mod tests {
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x1014), Some(&3));
         assert!(translation.instructions.contains_key(&0x1028));
+    }
+
+    #[test]
+    fn hoisted_table_addresses_are_found_past_an_earlier_call() {
+        // As above, after a BL that writes x30 (the table register) before
+        // the dispatch: the backward walk stops there, and the address set
+        // after the dispatch is still found.
+        let words = [
+            0x9400_0001, // bl 0x1004
+            0x7100_083f, // cmp w1, #2
+            0x5400_00e8, // b.hi 0x1024
+            0x1000_00c0, // adr x0, 0x1024
+            0x7861_7bc2, // ldrh w2, [x30, x1, lsl #1]
+            0x8b02_0800, // add x0, x0, x2, lsl #2
+            0xd61f_0000, // br x0
+            0xb000_001e, // adrp x30, 0x2000
+            0x9100_03de, // add x30, x30, #0
+            0xd65f_03c0, // 0x1024: case 0
+            0xd65f_03c0, // case 1
+            0xd65f_03c0, // case 2
+        ];
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: vec![0, 0, 1, 0, 2, 0],
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap();
+        assert_eq!(translation.jump_tables.get(&0x1018), Some(&3));
+        assert!(translation.instructions.contains_key(&0x102c));
     }
 
     #[test]
