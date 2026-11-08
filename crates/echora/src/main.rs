@@ -653,7 +653,7 @@ fn shader_sources(cache: &std::path::Path) -> PathBuf {
 }
 
 fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<PathBuf> {
-    use echora_lift::codegen::emit_rust_split_to;
+    use echora_lift::codegen::{EmitOptions, emit_rust_split_to_with};
 
     if !(10..=24).contains(&region_bits) {
         bail!("region-bits must be between 10 and 24");
@@ -685,21 +685,43 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         .context("locate the echora-simd crate")?;
     let simd = simd.to_string_lossy().into_owned();
 
+    // ECHORA_LIFT_OPTIONS: code generation options, comma-separated
+    // (structured, inline-vector, direct-calls); all off by default.
+    let mut options = EmitOptions::default();
+    for option in std::env::var("ECHORA_LIFT_OPTIONS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|option| !option.is_empty())
+    {
+        match option {
+            "structured" => options.structured = true,
+            "inline-vector" => options.inline_vector = true,
+            "direct-calls" => options.direct_calls = true,
+            other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
+        }
+    }
+
     let start = Instant::now();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
-    let root = emit_rust_split_to(&d.translation, region_bits, &mut |region, source| {
-        let dir = out.join("regions").join(format!("{region:x}"));
-        let manifest = format!(
-            "[package]\nname = \"gen-r-{region:x}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+    let root = emit_rust_split_to_with(
+        &d.translation,
+        region_bits,
+        options,
+        &mut |region, source| {
+            let dir = out.join("regions").join(format!("{region:x}"));
+            let manifest = format!(
+                "[package]\nname = \"gen-r-{region:x}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
              [dependencies]\nechora-guest = {{ path = {guest:?} }}\n"
-        );
-        write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
-        source_bytes += source.len() as u64;
-        written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
-        regions.push(region);
-        Ok::<(), std::io::Error>(())
-    })?;
+            );
+            write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
+            source_bytes += source.len() as u64;
+            written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
+            regions.push(region);
+            Ok::<(), std::io::Error>(())
+        },
+    )?;
     let emit_time = start.elapsed();
 
     // Remove regions that no longer exist.
