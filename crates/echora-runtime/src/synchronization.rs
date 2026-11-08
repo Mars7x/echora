@@ -32,6 +32,9 @@ struct Waiter {
     tag: u32,
     original_owner: u64,
     order: u64,
+    /// A signaled condition-variable waiter's own deadline: it may still
+    /// time out while it waits for the mutex (none for ArbitrateLock).
+    deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -219,6 +222,7 @@ impl MutexWaits {
                 tag,
                 original_owner: owner,
                 order,
+                deadline: None,
             },
         );
         let mut staged_priorities = priorities.clone();
@@ -294,6 +298,71 @@ impl MutexWaits {
             priorities: changed_priorities(priorities, &staged_priorities),
             selected: Some(selected),
             next_word: selected_waiter.tag | if has_waiters { HAS_WAITERS } else { 0 },
+        })
+    }
+
+    /// Give a waiter (a condition-variable waiter moved here when signaled)
+    /// the deadline of its condition wait.
+    pub(crate) fn set_deadline(
+        &mut self,
+        id: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), Trap> {
+        self.waiting
+            .get_mut(&id)
+            .ok_or_else(|| invalid("a mutex deadline requires a mutex waiter"))?
+            .deadline = deadline;
+        Ok(())
+    }
+
+    pub(crate) fn earliest_deadline(&self) -> Option<std::time::Instant> {
+        self.waiting
+            .values()
+            .filter_map(|waiter| waiter.deadline)
+            .min()
+    }
+
+    /// Waiters whose deadline has passed at `now`, in id order.
+    pub(crate) fn expired(&self, now: std::time::Instant) -> Vec<u64> {
+        self.waiting
+            .iter()
+            .filter(|(_, waiter)| waiter.deadline.is_some_and(|deadline| now >= deadline))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// A waiter's deadline passed (Atmosphere: a signaled condition waiter
+    /// still waiting for its mutex when its timer fires). It leaves its
+    /// owner's waiters, whose inherited priority is restored without it, and
+    /// returns TimedOut without the mutex; the mutex word is left as it is.
+    /// The owner reference it holds is released when it resumes, as for a
+    /// waiter an unlock selected.
+    pub(crate) fn prepare_timeout(
+        &self,
+        id: u64,
+        priorities: &BTreeMap<u64, ThreadPriority>,
+    ) -> Result<WaitPlan, Trap> {
+        self.validate_priorities(priorities)?;
+        let mut state = self.clone();
+        let waiter = state
+            .waiting
+            .remove(&id)
+            .ok_or_else(|| invalid("a mutex timeout requires a mutex waiter"))?;
+        if waiter.deadline.is_none() {
+            return Err(invalid("a mutex waiter without a deadline cannot time out"));
+        }
+        state.returns.insert(
+            id,
+            MutexReturn {
+                original_owner: waiter.original_owner,
+                result: Some(0xea01),
+            },
+        );
+        let mut staged_priorities = priorities.clone();
+        state.restore_priority(waiter.owner, &mut staged_priorities)?;
+        Ok(WaitPlan {
+            state,
+            priorities: changed_priorities(priorities, &staged_priorities),
         })
     }
 
@@ -573,11 +642,17 @@ impl ZeroHandleWaits {
     }
 
     /// Remove a signaled condition waiter that now waits on its mutex instead.
-    pub(crate) fn transfer_condition(&mut self, id: u64) -> Result<(), Trap> {
+    /// A signaled condition waiter becomes a mutex waiter: it leaves here,
+    /// and its deadline (returned) goes with it.
+    pub(crate) fn transfer_condition(
+        &mut self,
+        id: u64,
+    ) -> Result<Option<std::time::Instant>, Trap> {
         match self.waiting.get(&id) {
             Some(record) if record.condition.is_some() => {
+                let deadline = record.deadline;
                 self.remove_waiting(id);
-                Ok(())
+                Ok(deadline)
             }
             _ => Err(invalid(
                 "condition transfer requires a parked condition wait",
@@ -824,6 +899,45 @@ mod tests {
         apply_priorities(current, &plan.priorities);
         *state = plan.state;
         (plan.selected, plan.next_word)
+    }
+
+    #[test]
+    fn a_timed_out_mutex_waiter_leaves_and_its_donation_ends() {
+        // 3 (priority 20) and 2 (40) wait on owner 1 (50); 3 is a signaled
+        // condition waiter with a deadline.
+        let mut state = MutexWaits::default();
+        let mut current = priorities(&[(1, 50), (2, 40), (3, 20)]);
+        wait(&mut state, &mut current, 2, 1, 0x8000, 0x202);
+        wait(&mut state, &mut current, 3, 1, 0x8000, 0x203);
+        let deadline = std::time::Instant::now();
+        state.set_deadline(3, Some(deadline)).unwrap();
+        assert_eq!(current[&1].effective, 20);
+        assert_eq!(state.earliest_deadline(), Some(deadline));
+        assert_eq!(state.expired(deadline), vec![3]);
+        // A waiter without a deadline (ArbitrateLock) never times out.
+        assert!(state.prepare_timeout(2, &current).is_err());
+
+        let plan = state.prepare_timeout(3, &current).unwrap();
+        apply_priorities(&mut current, &plan.priorities);
+        state = plan.state;
+        // The owner keeps only 2's donation; 3 returns TimedOut without
+        // the mutex, still holding its owner reference until it resumes.
+        assert_eq!(current[&1].effective, 40);
+        assert!(state.expired(deadline).is_empty());
+        assert_eq!(state.earliest_deadline(), None);
+        assert_eq!(
+            state.pending_return(3),
+            Some(MutexReturn {
+                original_owner: 1,
+                result: Some(0xea01)
+            })
+        );
+        // The unlock then hands the mutex to 2, the one waiter left.
+        assert_eq!(
+            unlock(&mut state, &mut current, 1, 0x8000),
+            (Some(2), 0x202)
+        );
+        assert_eq!(current[&1].effective, 50);
     }
 
     #[test]

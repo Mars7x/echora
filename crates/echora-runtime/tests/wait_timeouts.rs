@@ -13,6 +13,10 @@
 //! - WaitSynchronization on a thread's handle times out with index -1; when
 //!   the thread exits B wakes with index 0, and nothing writes A's
 //!   registers again.
+//! - A condition waiter signaled while another thread holds the mutex
+//!   still times out at its deadline while it waits for the mutex (as on
+//!   the console): TimedOut, without the mutex, which its holder still
+//!   owns, and whose unlock then finds no waiter.
 //!
 //! A second program races signals against timeouts: a waiter waits with a
 //! short timeout, round after round, while a signaler on another core
@@ -22,7 +26,8 @@
 //!   exactly when the wait returned 0, never also when it timed out.
 //! - On a condition variable (the signaler holding the mutex for a varying
 //!   while after signaling), a wait returns 0 owning the mutex or TimedOut
-//!   without it, nothing else.
+//!   without it, nothing else, and 0 only once the signaler releases the
+//!   mutex.
 //!
 //! A third program cancels waits (CancelSynchronization), as Atmosphere's
 //! KThread::WaitCancel does: a thread in WaitSynchronization returns
@@ -55,6 +60,8 @@ const A: u64 = CODE + 0x300;
 const B: u64 = CODE + 0x400;
 /// The signaler, which runs the phases in turn.
 const S: u64 = CODE + 0x500;
+/// The end of A's phase 4 (past S's blocks).
+const A_TAIL: u64 = CODE + 0x6c0;
 // The race program: a waiter and a signaler on an address, and on a
 // condition variable.
 const ADDRESS_WAITER: u64 = CODE + 0x800;
@@ -115,13 +122,16 @@ const READY: u64 = 0;
 const WAITED: u64 = 4;
 const SIGNALED: u64 = 8;
 const RESULT: u64 = 0xc;
+/// The condition signaler is about to release the mutex in this round.
+const RELEASING: u64 = 0x10;
 /// The race's address.
 const RACE_ADDRESS: u64 = SHARED + 0x380;
 /// Address rounds by (signal outcome: none, woke, more) x (wait result:
 /// 0, TimedOut, InvalidState, other).
 const ADDRESS_OUTCOMES: u64 = SHARED + 0x400;
 /// Condition rounds by wait outcome: 0 owning the mutex, 0 without it,
-/// TimedOut without it, TimedOut owning it, other.
+/// TimedOut without it, TimedOut owning it, other, 0 before the signaler
+/// released the mutex.
 const CONDITION_OUTCOMES: u64 = SHARED + 0x440;
 
 // The cancel program's flags and results.
@@ -193,6 +203,16 @@ const A_INDEX3: u64 = SHARED + 0xa4;
 const B_RES3: u64 = SHARED + 0xa8;
 const B_INDEX3: u64 = SHARED + 0xac;
 const A_CLOBBERED: u64 = SHARED + 0xb0;
+const GO_A4: u64 = SHARED + 0xb4;
+const A_READY4: u64 = SHARED + 0xb8;
+const A_DONE4: u64 = SHARED + 0xbc;
+const A_RES4: u64 = SHARED + 0xc0;
+const A_OWNED4: u64 = SHARED + 0xc4;
+const MUTEX_AT_TIMEOUT4: u64 = SHARED + 0xc8;
+const TIMED_OUT_WHILE_HELD4: u64 = SHARED + 0xcc;
+const S_TAG: u64 = SHARED + 0xd0;
+/// A has released the mutex again after its phase-4 timeout.
+const A_FINISHED4: u64 = SHARED + 0xd4;
 const HANDLES: u64 = SHARED + 0x100;
 
 const WAIT_MASK: u32 = 0x4000_0000;
@@ -438,9 +458,34 @@ fn block(core: &mut Core) -> Result<(), Trap> {
                 store(core, A_CLOBBERED, 1);
                 core.cpu.regs[..2].copy_from_slice(&CANARY);
             }
-            after(core, ALL_DONE, A + 0xc0)
+            after(core, GO_A4, A + 0xd0)
         }
         p if p == A + 0xc0 => return svc(0x0a),
+        // Phase 4: signaled while S holds the mutex, then time out waiting
+        // for it.
+        p if p == A + 0xd0 => lock(core, A + 0xe0),
+        p if p == A + 0xe0 => {
+            store(core, A_READY4, 1);
+            let tag = core.cpu.regs[TAG];
+            // Long enough for S to take the mutex and signal first, even on
+            // a loaded host.
+            return call(core, 0x1c, &[MUTEX, KEY, tag, 50 * TIMEOUT_NS]);
+        }
+        p if p == A + 0xf0 => {
+            let (result, owned) = (core.cpu.regs[0], owns_mutex(core));
+            store(core, A_RES4, result);
+            store(core, A_OWNED4, u64::from(owned));
+            let word = load(core, MUTEX);
+            store(core, MUTEX_AT_TIMEOUT4, word);
+            store(core, A_DONE4, 1);
+            if owned { A_TAIL } else { lock(core, A_TAIL) }
+        }
+        A_TAIL => unlock(core, A_TAIL + 0x10),
+        p if p == A_TAIL + 0x10 => {
+            store(core, A_FINISHED4, 1);
+            A_TAIL + 0x20
+        }
+        p if p == A_TAIL + 0x20 => after(core, ALL_DONE, A + 0xc0),
 
         // B, phase 1: wait on the address until woken.
         B => after(core, GO_B1, B + 0x10),
@@ -494,8 +539,14 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             store(core, B_DONE3, 1);
             B + 0xc0
         }
-        p if p == B + 0xc0 => after(core, ALL_DONE, B + 0xd0),
-        p if p == B + 0xd0 => return svc(0x0a),
+        // Sleep, not spin, until the end (phase 4 takes a while).
+        p if p == B + 0xc0 => {
+            if load(core, ALL_DONE) != 0 {
+                return svc(0x0a);
+            }
+            return call(core, 0x0b, &[TIMEOUT_NS]);
+        }
+        p if p == B + 0xd0 => B + 0xc0,
 
         // S, phase 1: once A has timed out, signal one waiter, B, with the
         // signal that counts the waiters.
@@ -557,7 +608,25 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             S + 0x120
         }
         p if p == S + 0x120 => after(core, B_DONE3, S + 0x130),
+        // Phase 4: take the mutex once A's condition wait released it,
+        // signal A, and hold the mutex past A's deadline.
         p if p == S + 0x130 => {
+            store(core, GO_A4, 1);
+            let tag = core.cpu.regs[TAG];
+            store(core, S_TAG, tag);
+            S + 0x140
+        }
+        p if p == S + 0x140 => after(core, A_READY4, S + 0x150),
+        p if p == S + 0x150 => lock(core, S + 0x160),
+        p if p == S + 0x160 => return call(core, 0x1d, &[KEY, 1]),
+        p if p == S + 0x170 => return call(core, 0x0b, &[200 * TIMEOUT_NS]),
+        p if p == S + 0x180 => {
+            let done = load(core, A_DONE4);
+            store(core, TIMED_OUT_WHILE_HELD4, done);
+            unlock(core, S + 0x190)
+        }
+        p if p == S + 0x190 => after(core, A_FINISHED4, S + 0x1a0),
+        p if p == S + 0x1a0 => {
             store(core, ALL_DONE, 1);
             return svc(0x0a);
         }
@@ -649,7 +718,9 @@ fn block(core: &mut Core) -> Result<(), Trap> {
         }
         p if p == CONDITION_WAITER + 0x30 => {
             let (result, owned) = (core.cpu.regs[0], owns_mutex(core));
+            let released = load(core, CONDITION_PAIR + RELEASING) > core.cpu.regs[ROUND];
             let outcome = match (result, owned) {
+                (0, true) if !released => 5,
                 (0, true) => 0,
                 (0, false) => 1,
                 (TIMED_OUT, false) => 2,
@@ -701,6 +772,8 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             if core.cpu.regs[TEMP] != 0 {
                 CONDITION_SIGNALER + 0x50
             } else {
+                let round = core.cpu.regs[ROUND];
+                store(core, CONDITION_PAIR + RELEASING, round + 1);
                 unlock(core, CONDITION_SIGNALER + 0x60)
             }
         }
@@ -1020,6 +1093,22 @@ fn run(workers: usize) {
         ("handles: B's result", read(B_RES3), 0),
         ("handles: B's index", read(B_INDEX3), 0),
         ("A's registers written after its wait", read(A_CLOBBERED), 0),
+        ("condition, mutex held: A's result", read(A_RES4), TIMED_OUT),
+        (
+            "condition, mutex held: A returned owning the mutex",
+            read(A_OWNED4),
+            0,
+        ),
+        (
+            "condition, mutex held: the word at A's timeout",
+            read(MUTEX_AT_TIMEOUT4),
+            read(S_TAG) | u64::from(WAIT_MASK),
+        ),
+        (
+            "condition, mutex held: A timed out before S released it",
+            read(TIMED_OUT_WHILE_HELD4),
+            1,
+        ),
         ("mutex left held", read(MUTEX), 0),
     ];
     let mut failures: Vec<String> = checks
@@ -1058,7 +1147,7 @@ fn race(workers: usize) {
     let trap = m.run_generated(dispatch).unwrap_err();
     let read = |address: u64| u64::from(m.memory.read_u32(address).unwrap());
     let address: Vec<u64> = (0..12).map(|i| read(ADDRESS_OUTCOMES + 4 * i)).collect();
-    let condition: Vec<u64> = (0..5).map(|i| read(CONDITION_OUTCOMES + 4 * i)).collect();
+    let condition: Vec<u64> = (0..6).map(|i| read(CONDITION_OUTCOMES + 4 * i)).collect();
     let mut failures = Vec::new();
     if !matches!(trap, Trap::Exit { .. }) {
         failures.push(format!("ended with {trap:?}"));
@@ -1074,7 +1163,7 @@ fn race(workers: usize) {
     if condition[0] + condition[2] != ROUNDS || condition.iter().sum::<u64>() != ROUNDS {
         failures.push(format!(
             "condition rounds (0 owning, 0 not owning, TimedOut not owning, TimedOut \
-             owning, other): {condition:?}"
+             owning, other, 0 before the release): {condition:?}"
         ));
     }
     assert!(

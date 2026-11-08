@@ -758,7 +758,7 @@ impl Machine {
         self.services.refresh_syncpoint_cache(&mut self.memory)?;
         let now = std::time::Instant::now();
         self.services.advance_audio(now);
-        let mut woke = false;
+        let mut woke = self.time_out_mutex_waits(now)?;
         for (id, record) in self.synchronization_waits.waiters() {
             let mut completion = None;
             for (index, &handle) in record.handles.iter().enumerate() {
@@ -820,6 +820,39 @@ impl Machine {
         Ok(woke)
     }
 
+    /// Signaled condition waiters still waiting for their mutex whose
+    /// deadline has passed: TimedOut, without the mutex (see
+    /// `MutexWaits::prepare_timeout`). Returns whether any timed out.
+    fn time_out_mutex_waits(&mut self, now: std::time::Instant) -> Result<bool, Trap> {
+        let expired = self.mutex_waits.expired(now);
+        for &id in &expired {
+            if self.thread_state(id) != Some(ThreadState::Waiting) {
+                return Err(Trap::InvalidState {
+                    message: "a timed-out mutex waiter is not parked".into(),
+                });
+            }
+            let plan = self
+                .mutex_waits
+                .prepare_timeout(id, &self.thread_priorities()?)?;
+            self.validate_thread_priorities(&plan.priorities)?;
+            self.apply_thread_priorities(&plan.priorities)?;
+            self.mutex_waits = plan.state;
+            if id == self.layout.main_thread_id {
+                let cpu = self
+                    .main_saved_cpu
+                    .as_mut()
+                    .ok_or_else(|| Trap::InvalidState {
+                        message: "waiting main context disappeared at its mutex timeout".into(),
+                    })?;
+                cpu.regs[0] = 0xea01;
+                self.main_thread_state = ThreadState::Runnable;
+            } else {
+                self.threads.complete_wait(id, 0xea01)?;
+            }
+        }
+        Ok(!expired.is_empty())
+    }
+
     /// No thread can run: wake ready waits, sleeping on the host until the
     /// earliest wait deadline when nothing is ready yet. Dispatches the next
     /// runnable thread and returns true, or false when nothing can ever wake
@@ -841,6 +874,7 @@ impl Machine {
             }
             let deadline = [
                 self.synchronization_waits.earliest_deadline(),
+                self.mutex_waits.earliest_deadline(),
                 self.services.next_audio_deadline(),
             ]
             .into_iter()
@@ -1336,7 +1370,9 @@ impl Machine {
                     self.retain_mutex_owner(owner)?;
                     self.apply_thread_priorities(&plan.priorities)?;
                     self.mutex_waits = plan.state;
-                    self.synchronization_waits.transfer_condition(id)?;
+                    // Its timeout still runs while it waits for the mutex.
+                    let deadline = self.synchronization_waits.transfer_condition(id)?;
+                    self.mutex_waits.set_deadline(id, deadline)?;
                 }
             }
             self.condition_signals = self.condition_signals.saturating_add(1);
@@ -2480,6 +2516,7 @@ impl Machine {
         // and another runnable thread takes the processor after a slice.
         let mut check_at = u64::MAX;
         if self.synchronization_waits.has_deadline()
+            || self.mutex_waits.earliest_deadline().is_some()
             || self.services.next_audio_deadline().is_some()
         {
             check_at = self
@@ -2776,6 +2813,7 @@ impl Machine {
     fn next_wait_deadline(&self) -> Option<std::time::Instant> {
         [
             self.synchronization_waits.earliest_deadline(),
+            self.mutex_waits.earliest_deadline(),
             self.services.next_audio_deadline(),
         ]
         .into_iter()
