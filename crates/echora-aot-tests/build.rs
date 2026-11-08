@@ -101,6 +101,45 @@ fn split_programs(out: &mut String) {
     stress_code(out);
 }
 
+/// Hashes of the split programs' emitted Rust with the default options and
+/// with inline_vector alone (what game builds use), whatever this build's
+/// features: `tests/golden.rs` checks them against the checked-in values,
+/// so a change to default output is a deliberate one.
+fn golden(out_dir: &std::path::Path) {
+    let fnv = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let mut hashes = Vec::new();
+    for mode in [
+        EmitOptions::default(),
+        EmitOptions {
+            inline_vector: true,
+            ..EmitOptions::default()
+        },
+    ] {
+        MODE.set(Some(mode));
+        let lifted = LIFTED.get();
+        let mut text = String::new();
+        split_programs(&mut text);
+        LIFTED.set(lifted);
+        hashes.push(fnv(&text));
+    }
+    MODE.set(None);
+    std::fs::write(
+        out_dir.join("golden.rs"),
+        format!(
+            "/// Hash of the default emission of the split programs.\n\
+             pub const DEFAULT_OUTPUT: u64 = {:#018x};\n\
+             /// Hash of their emission with inline_vector alone.\n\
+             pub const INLINE_VECTOR_OUTPUT: u64 = {:#018x};\n",
+            hashes[0], hashes[1]
+        ),
+    )
+    .expect("write golden hashes");
+}
+
 /// With the `codesize` feature: the split programs once per emission mode,
 /// each a crate of its own for `benches/codesize.rs` to compile, and a
 /// list of `mode instructions bytes`.
@@ -231,6 +270,7 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
+    golden(&out_dir);
     if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
         codesize(&out_dir);
     }

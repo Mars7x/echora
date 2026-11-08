@@ -31,6 +31,12 @@ pub mod kernels {
 
 /// The concurrency stress programs (`tests/stress.rs`), lifted as
 /// `stress_code`.
+/// Hashes of the default and inline_vector emission of every split program
+/// (`build.rs`, `tests/golden.rs`).
+pub mod golden {
+    include!(concat!(env!("OUT_DIR"), "/golden.rs"));
+}
+
 pub mod stress {
     include!("stress.rs");
 }
