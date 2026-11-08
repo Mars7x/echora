@@ -45,6 +45,11 @@ enum NvnLock {
     /// Recording without a lock (each worker records into its own command
     /// buffers); only the submit share takes the NVN lock.
     Recording,
+    /// The planned NVN split: recording unlocked (per command buffer), the
+    /// `--exec` share of NVN work (execution and the GPU backend) serial:
+    /// under one execution lock, or with `--exec-async` on one execution
+    /// thread that workers hand it to through a short queue.
+    Split,
     None,
 }
 
@@ -56,6 +61,12 @@ struct Options {
     nvn_lock: NvnLock,
     /// With `NvnLock::Recording`: the share of NVN work that is submission.
     submit: f64,
+    /// With `NvnLock::Split`: the share of NVN work that is execution.
+    exec: f64,
+    /// With `NvnLock::Split`: execution on its own thread, not the worker's.
+    exec_async: bool,
+    /// SVC and IPC work off the global lock (`--svc-lock none`).
+    svc_unlocked: bool,
     sched: f64,
     fast: f64,
     run_for: Duration,
@@ -69,6 +80,9 @@ fn options() -> Options {
         nvn: 0.62,
         nvn_lock: NvnLock::Global,
         submit: 0.2,
+        exec: 0.8,
+        exec_async: false,
+        svc_unlocked: false,
         sched: 0.013,
         fast: 0.0,
         run_for: Duration::from_millis(1500),
@@ -91,11 +105,21 @@ fn options() -> Options {
             "--nvn" => options.nvn = value().parse().expect("share 0..1"),
             "--sched" => options.sched = value().parse().expect("share 0..1"),
             "--submit" => options.submit = value().parse().expect("share 0..1"),
+            "--exec" => options.exec = value().parse().expect("share 0..1"),
+            "--exec-async" => options.exec_async = true,
+            "--svc-lock" => {
+                options.svc_unlocked = match value().as_str() {
+                    "global" => false,
+                    "none" => true,
+                    other => panic!("--svc-lock takes global or none, not {other}"),
+                }
+            }
             "--nvn-lock" => {
                 options.nvn_lock = match value().as_str() {
                     "global" => NvnLock::Global,
                     "own" => NvnLock::Own,
                     "recording" => NvnLock::Recording,
+                    "split" => NvnLock::Split,
                     "none" => NvnLock::None,
                     other => panic!("--nvn-lock takes global, own, recording or none, not {other}"),
                 }
@@ -129,6 +153,7 @@ fn worker(
     options: &Options,
     lock: &Mutex<()>,
     nvn_lock: &Mutex<()>,
+    executor: &std::sync::mpsc::SyncSender<Duration>,
     start: Instant,
 ) -> Totals {
     let image = kernels::image();
@@ -167,6 +192,7 @@ fn worker(
         let other = options.hold.saturating_sub(nvn + sched);
         // Work under `lock`: the wait and the hold are counted; `global`
         // says whether the hold counts as holding the global lock.
+        let mut queue_wait = Duration::ZERO;
         let mut locked = |lock: &Mutex<()>, work: Duration, global: bool| {
             let waited = Instant::now();
             let guard = lock
@@ -188,7 +214,12 @@ fn worker(
             true
         };
         // The global lock's work in one hold, as the runtime's boundary.
-        let mut global = other;
+        let mut global = if options.svc_unlocked {
+            spin_for(other);
+            Duration::ZERO
+        } else {
+            other
+        };
         if sched_locked {
             global += sched;
         } else {
@@ -202,9 +233,24 @@ fn worker(
                 spin_for(nvn.saturating_sub(submit));
                 locked(nvn_lock, submit, false);
             }
+            NvnLock::Split => {
+                let execution = nvn.mul_f64(options.exec);
+                spin_for(nvn.saturating_sub(execution));
+                if options.exec_async {
+                    // Waits only while the execution queue is full.
+                    let waited = Instant::now();
+                    let _ = executor.send(execution);
+                    queue_wait += waited.elapsed();
+                } else {
+                    locked(nvn_lock, execution, false);
+                }
+            }
             NvnLock::None => spin_for(nvn),
         }
-        locked(lock, global, true);
+        if !global.is_zero() {
+            locked(lock, global, true);
+        }
+        totals.waiting += queue_wait;
         m.core.spin_polls = 0;
         m.core.host_check_at = m.core.steps + options.slice;
     }
@@ -225,6 +271,9 @@ fn main() {
             NvnLock::Global => "global lock",
             NvnLock::Own => "own lock",
             NvnLock::Recording => "recording unlocked, submit under its lock",
+            NvnLock::Split if options.exec_async =>
+                "split: recording unlocked, execution on one thread",
+            NvnLock::Split => "split: recording unlocked, execution under its lock",
             NvnLock::None => "unlocked",
         },
         options.sched * 100.0,
@@ -238,12 +287,20 @@ fn main() {
     for &workers in &options.workers {
         let lock = Arc::new(Mutex::new(()));
         let nvn_lock = Arc::new(Mutex::new(()));
+        // The execution thread of `--exec-async`: runs handed-over work.
+        let (executor, work) = std::sync::mpsc::sync_channel::<Duration>(4);
+        let execution = std::thread::spawn(move || {
+            while let Ok(duration) = work.recv() {
+                spin_for(duration);
+            }
+        });
         let start = Instant::now();
         let totals: Vec<Totals> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|index| {
                     let (options, lock, nvn_lock) = (&options, &lock, &nvn_lock);
-                    scope.spawn(move || worker(index, options, lock, nvn_lock, start))
+                    let executor = executor.clone();
+                    scope.spawn(move || worker(index, options, lock, nvn_lock, &executor, start))
                 })
                 .collect();
             handles
@@ -252,6 +309,8 @@ fn main() {
                 .collect()
         });
         let wall = start.elapsed().as_secs_f64();
+        drop(executor);
+        let _ = execution.join();
         let instructions: u64 = totals.iter().map(|t| t.instructions).sum();
         let rate = instructions as f64 / wall / 1e6;
         let share = |field: fn(&Totals) -> Duration| {

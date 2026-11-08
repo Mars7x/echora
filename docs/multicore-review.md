@@ -400,6 +400,30 @@ global lock around the remaining third of host work (SVCs and IPC),
 which at four workers is held about three quarters of the time. That is
 the next lock to split (items 3 and 4).
 
+The planned NVN split (`--nvn-lock split`: recording unlocked per
+command buffer, the `--exec` share of NVN work serial). It is calibrated
+from the post-movie measurements: NVN held 84.9 s, mostly execution,
+and the machine lock 22.6 s, so `--nvn 0.79 --exec 0.8`. Two runs on
+four host CPUs:
+
+| W | today (NVN own lock) | split, execution locked | split + SVC/IPC unlocked | split, execution on one thread |
+|---|---|---|---|---|
+| 2 | 1.91x | 1.93-1.94x | 1.93-2.06x | 1.61-1.64x |
+| 4 | 1.72-1.87x | 1.72-1.90x | 1.93-2.03x | 1.66-1.82x |
+| 6 | 1.75-1.80x | 2.01-2.04x | 2.05-2.09x | 1.90-1.92x |
+
+Serial execution is about 28% of a worker's time here, so no lock layout
+takes throughput past about 3.5x. On four CPUs the model reaches about
+2x:
+- the split alone adds 5-15% at W=6;
+- taking SVC and IPC off the machine lock adds little on top, since it
+  is held 4-9% of the time by then;
+- a separate execution thread (`--exec-async`) is worse, because it takes
+  a host CPU from the workers.
+Workers still wait 55% of their time at W=6, on execution. So the next
+gain is in making execution cheaper or parallel (fewer or smaller
+submissions, a cheaper backend path), not in further lock splitting.
+
 ### Expected effect
 
 If step 0 confirms the estimates, items 1 and 2 remove roughly half to
