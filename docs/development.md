@@ -112,7 +112,8 @@ read.
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_WORKERS=N` | Run guest threads on N host threads, up to 6 (default 1). Each worker owns the application cores `c` with `c % N` equal to its index. Not yet stable: runs crash within about half a minute. |
+| `ECHORA_WORKERS=N` | Run guest threads on N host threads, up to 6 (default 1). Each worker owns the application cores `c` with `c % N` equal to its index. Works in testing, but is off by default until longer runs are checked. |
+| `ECHORA_PARALLEL_SLICE=N` | Guest instructions per slice when several workers run (default 50,000). Each slice end takes the global machine lock, so short slices make workers wait for each other. |
 | `ECHORA_SCHEDULER_SLICE=N` | Guest instructions per scheduling slice (default 1,000). |
 | `ECHORA_SERIAL_GUEST`, `ECHORA_ONE_CORE`, `ECHORA_ANY_CORE`, `ECHORA_FLAT_PRIORITY`, `ECHORA_PARALLEL_THREADS`, `ECHORA_EXCLUSIVE_THREADS`, `ECHORA_NO_TIMESLICE`, `ECHORA_TRACE_WORKERS`, `ECHORA_CORE_MAP` | Diagnostics for narrowing down multi-worker faults. |
 | `ECHORA_VIRTUAL_CLOCK` | A timing experiment. |

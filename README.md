@@ -33,11 +33,11 @@ Shader support is nearly complete, with 6,058 of the 6,074 shader stages seen
 so far translating, and the launcher works with a mouse, keyboard or
 controller.
 
-Speed is the other big gap. The opening movie decodes at about 20 pictures per
-second, while the console runs the game at 60 fps, and nearly all of the work
-still happens on one CPU core. Spreading the game's threads across several
-cores was almost twice as fast in a partial test, but it still crashes, so it
-stays off for now.
+Speed is the other big gap. The opening movie plays at about 20 pictures per
+second, against the console's 60, limited by video decoding. Running the
+game's threads on several CPU cores now works in testing and gets through the
+boot about 1.4 to 1.5 times as fast as one core, but it stays off by default
+until longer runs have been checked against single-core ones.
 
 The game only runs on Linux at the moment. The rest of the project builds and
 passes its tests on Windows too. These figures come from update 1.1.1

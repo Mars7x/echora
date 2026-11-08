@@ -27,9 +27,10 @@ when the code for it does.
 1. Reach the first gameplay scene after the New Game movie and check what it
    draws, including the mesh and task pipelines.
 2. Translate the last 16 failing shader stages.
-3. Make multi-core runs stable (`ECHORA_WORKERS`). They crash once the game's
-   per-core job threads run in parallel, which looks like one job claimed by
-   two threads. This is the largest speed gain available.
+3. Finish multi-core (`ECHORA_WORKERS`): runs no longer crash, so check long
+   runs against single-core ones, cut the time workers spend waiting for the
+   global machine lock, and give each guest core its own run queue inside a
+   worker. Then make it the default.
 4. Turn on the faster code generation in game builds once it is checked in
    game: inline vector arithmetic first, then structured control flow and
    direct calls once they measure faster.
