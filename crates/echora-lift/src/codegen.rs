@@ -1157,11 +1157,18 @@ fn pc_on_error_paths(body: &str, pc: u64) -> Option<String> {
     }
     let check =
         SP_ALIGNMENT_CHECK.replacen("{ return", &format!("{{ m.cpu.pc = {pc:#x}; return"), 1);
-    Some(body.replace(SP_ALIGNMENT_CHECK, &check).replace(
-        ")?",
-        &format!(").map_err(|trap| {{ m.cpu.pc = {pc:#x}; trap }})?"),
-    ))
+    Some(
+        body.replace(SP_ALIGNMENT_CHECK, &check)
+            .replace(")?", &format!(").at(m, {pc:#x})?")),
+    )
 }
+
+/// Written once into every generated source: `.at(m, pc)` on a fallible
+/// call's result stores the instruction's PC on its error path only. A
+/// generic helper rather than a `map_err` closure per call site, which the
+/// compiler would type-check, borrow-check and compile as a function each.
+const AT_HELPER: &str = "#[allow(dead_code)]\ntrait At<T> { fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap>; }\n\
+impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap> { if self.is_err() { m.cpu.pc = pc; } self } }\n";
 
 /// Whether an instruction's emitted code might observe `m.cpu.pc`: it can
 /// trap or return early, reads the PC, or calls a CPU or SIMD helper other
@@ -2911,7 +2918,9 @@ pub fn emit_rust_split_to_with<E>(
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
          pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
     );
-    let header = "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{Core as Machine, Trap};\n";
+    let header = format!(
+        "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{{Core as Machine, Trap}};\n{AT_HELPER}"
+    );
     let mut current: Option<(u64, String)> = None;
     for (window, blocks) in &windows {
         let region = window >> shift;
@@ -2922,9 +2931,9 @@ pub fn emit_rust_split_to_with<E>(
         .unwrap();
         if current.as_ref().map(|(index, _)| *index) != Some(region) {
             if let Some((index, source)) = current.take() {
-                sink(index, source)?;
+                sink(index, unindent(&source))?;
             }
-            current = Some((region, String::from(header)));
+            current = Some((region, header.clone()));
         }
         let output = &mut current.as_mut().expect("region set above").1;
         // A window lies within one page, and page permissions change only in
@@ -2965,12 +2974,14 @@ pub fn emit_rust_split_to_with<E>(
             "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    loop {\n        match next_pc {\n",
         );
         output.push_str(&locals.rewrite(&cases));
-        output.push_str("        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    }\n    let result = body(m, &mut r);\n");
+        output.push_str(
+            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
+        );
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }
     if let Some((index, source)) = current.take() {
-        sink(index, source)?;
+        sink(index, unindent(&source))?;
     }
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
     // The window table for direct calls between windows (`Core::call`).
@@ -2987,9 +2998,25 @@ pub fn emit_rust_split_to_with<E>(
     Ok(root)
 }
 
+/// `source` without the indentation at the start of its lines. Nobody reads
+/// the generated code, and rustc compiles it a fifth faster without: on
+/// the aot-tests programs, flat split emission takes 86 s instead of 108.
+fn unindent(source: &str) -> String {
+    let mut text = String::with_capacity(source.len());
+    for line in source.lines() {
+        text.push_str(line.trim_start());
+        text.push('\n');
+    }
+    text
+}
+
 pub fn emit_rust(translation: &Translation) -> String {
     let mut output = String::from(
-        "// Generated from user-provided executable bytes. Keep this file local.\n// Guest opcodes were decoded before Rust compilation.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{Core, Trap};\n\n/// Runs translated code from `m.cpu.pc` until it traps or leaves a window.\n#[allow(unused_parens)]\npub fn dispatch(m: &mut Core) -> Result<(), Trap> {\n    loop {\n        match m.cpu.pc {\n",
+        "// Generated from user-provided executable bytes. Keep this file local.\n// Guest opcodes were decoded before Rust compilation.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{Core, Trap};\n",
+    );
+    output.push_str(AT_HELPER);
+    output.push_str(
+        "\n/// Runs translated code from `m.cpu.pc` until it traps or leaves a window.\n#[allow(unused_parens)]\npub fn dispatch(m: &mut Core) -> Result<(), Trap> {\n    loop {\n        match m.cpu.pc {\n",
     );
     if translation.blocks.len() <= MAX_BLOCKS_PER_FUNCTION {
         emit_block_cases(&mut output, &translation.blocks, true);
@@ -3139,7 +3166,7 @@ mod tests {
                     "m.cpu.write_reg({rt}, 64, false, counter);"
                 )))
                 .unwrap();
-            let next_pc = output.find("m.cpu.pc = 0x1004;").unwrap();
+            let next_pc = output.find(".at(m, 0x1004)").unwrap();
             assert!(current_pc < tick && tick < sample && sample < commit && commit < next_pc);
             assert_eq!(output.matches("m.physical_counter_ticks()").count(), 1);
             let write = resolved(&format!("m.cpu.write_reg({rt}, 64, false, counter);"));
@@ -3420,7 +3447,7 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
         assert!(window.contains(
-            "        }\n        m.cpu.pc = next_pc;\n        m.finish_block()?;\n    }\n    }\n    let result = body(m, &mut r);\n"
+            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n"
         ));
         // The loop's successor is a local constant the host compiler sees.
         assert!(window.contains("match next_pc {"));
@@ -3443,9 +3470,9 @@ mod tests {
         let stored = window[..call].rfind("m.cpu.regs[1] = r.x1;").unwrap();
         assert!(window[call..].find("r.x1 = m.cpu.regs[1];").unwrap() > 0);
         assert!(stored < call);
-        assert!(
-            window.ends_with("    m.cpu.regs[1] = r.x1;\n    m.cpu.regs[30] = r.x30;\n    m.cpu.nzcv = r.fl.nzcv;\n    result\n}\n")
-        );
+        assert!(window.ends_with(
+            "m.cpu.regs[1] = r.x1;\nm.cpu.regs[30] = r.x30;\nm.cpu.nzcv = r.fl.nzcv;\nresult\n}\n"
+        ));
     }
 
     #[test]
@@ -3461,14 +3488,14 @@ mod tests {
         let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
         assert!(window.contains("fl: cpu::Flags { nzcv: m.cpu.nzcv }, };\n"));
-        assert!(window.contains("#[inline(always)]\n    fn body(m: &mut Machine, r: &mut R)"));
+        assert!(window.contains("#[inline(always)]\nfn body(m: &mut Machine, r: &mut R)"));
         assert!(window.contains("r.fl.add_sub("));
         assert!(window.contains("r.fl.condition(0)"));
         assert!(!window.contains("m.cpu.add_sub(") && !window.contains("m.cpu.condition("));
         let call = window.find("let called = m.call(").unwrap();
         assert!(window[..call].rfind("m.cpu.nzcv = r.fl.nzcv;").is_some());
         assert!(window[call..].contains("r.fl.nzcv = m.cpu.nzcv;"));
-        assert!(window.ends_with("    m.cpu.nzcv = r.fl.nzcv;\n    result\n}\n"));
+        assert!(window.ends_with("m.cpu.nzcv = r.fl.nzcv;\nresult\n}\n"));
     }
 
     #[test]
@@ -3511,7 +3538,7 @@ mod tests {
         .unwrap();
         let (_, regions) = emit_rust_split(&translation, SPLIT_WINDOW_BITS);
         let window = regions[0].1.split("fn run_window_").nth(1).unwrap();
-        assert!(window.contains("0x1000 => {\n                m.spin_hint();\n"));
+        assert!(window.contains("0x1000 => {\nm.spin_hint();\n"));
         assert_eq!(window.matches("m.spin_hint();").count(), 1);
     }
 
@@ -4022,7 +4049,7 @@ mod tests {
         let output = emit_rust(&translation);
         assert!(output.contains("m.memory.load_u64(address)"));
         assert!(!output.contains("m.cpu.pc = 0x1004"));
-        assert!(output.contains(".map_err(|trap| { m.cpu.pc = 0x1008; trap })?"));
+        assert!(output.contains(".at(m, 0x1008)?"));
     }
 
     #[test]
