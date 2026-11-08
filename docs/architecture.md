@@ -71,6 +71,78 @@ The model has four parts, all in use with the real game on Linux:
 4. Each unimplemented instruction, SVC or service stops the run with a
    precise report rather than returning invented success.
 
+### Calls between windows
+
+Split emission puts each 1 KiB guest window in a function `run_window_W`.
+Windows are grouped into regions of `1 << region_bits` guest bytes, one
+crate each (`gen_r_R`), so an unchanged region does not recompile. The
+build links the regions into a few shared libraries ("bundles"), and only
+the dispatcher crate sees every region. A guest BL runs its callee in
+nested host frames:
+
+- `Core::call(return_to)` looks the callee's window up in the
+  process-wide window table (`install_windows`): a shift, a subtraction, a
+  bounds check, a load of an `Option<WindowFn>` and an indirect call. Then
+  it loops the same way until the PC is back at `return_to`.
+- With `EmitOptions::direct_calls`, a BL whose target is in the caller's
+  own region calls `Core::call_window(return_to, run_window_W)` instead.
+  The first window is a direct call to a function the crate can name, and
+  the rest is as in `Core::call`. Other BLs keep `Core::call`, because a
+  region crate cannot name a function in another region crate.
+
+What a direct call avoids is the table lookup for the callee's first
+window, plus an indirect call whose target the compiler cannot see. The
+table holds 8 bytes per window: for tens of megabytes of guest code, that
+is hundreds of kilobytes indexed by callee address, so a cold call is
+likely to miss L1 there. On the benchmark's calls kernel (two BLs to
+two-instruction leaves per four-instruction iteration, all in one region),
+direct calls give +7% through a stand-in for `call_window`. In real code,
+the gain scales with the share of BLs that cross a window boundary and
+reach a cold table entry. A count of `echora_lift::structure::call_sites`
+over a translation, split by whether the target shares the caller's
+region, would size what cross-region direct calls could add before any
+build work. Calls within a window need no lookup in either case.
+
+Calling across regions directly could be done four ways. Each changes the
+build in `crates/echora/src/main.rs`, and none is implemented:
+
+1. **Exported window symbols.** Each window function gets a stable
+   unmangled name (`#[unsafe(no_mangle)]`, e.g. `echora_window_7105_75cc`
+   from its window index), and a calling region declares the callees it
+   needs in an `unsafe extern "Rust"` block. Names come from guest
+   addresses, so they stay stable across rebuilds: a caller region does
+   not recompile when the callee's region changes. Every BL target is a
+   block of the same translation, so the symbol exists. The cost is in
+   linking. Bundles would reference one another, possibly in both
+   directions, so there is no Cargo dependency order. On Linux an ELF
+   shared library may keep undefined symbols, which the loader resolves
+   from libraries already loaded (they must load with global visibility,
+   and lazy binding must not leave a missing name to fail at first call).
+   On Windows a DLL must import each symbol from a named DLL at link time,
+   which needs import libraries made from `.def` files before the bundles
+   link, or one image per process.
+2. **A slot table per region.** Each region crate holds a static array of
+   function pointers, one per distinct out-of-region callee, which the
+   dispatcher fills when it installs the window table. A call loads its
+   slot (a constant offset in the caller's own crate, close to its code)
+   and calls through it. It needs no cross-library symbols and works the
+   same on every host. The call stays indirect, but the lookup is one
+   load from a small, local table instead of a computed index into the
+   process-wide one, and each call site's branch target is stable.
+3. **Regions grouped by the call graph.** Assign windows to regions so
+   that hot callers and callees share one, and direct calls stay within a
+   region. This keeps today's linking, but region contents then depend on
+   the call graph, not only on addresses. One changed function can move
+   windows between regions and rebuild more than its own region.
+4. **One crate per bundle.** Make each bundle a single crate with the
+   regions as modules, so any window in the bundle can be named. Calls
+   between bundles still go through the table. This gives up the
+   per-region crate that makes rebuilds after a small change cheap.
+
+Option 2 is the smallest change with a portable result. Option 1 gives
+true direct calls but depends on the host's loader. Either should first
+be sized by the call-site count above.
+
 ## Guest memory backends
 
 Generated code loads and stores through a host view of guest memory, so the
