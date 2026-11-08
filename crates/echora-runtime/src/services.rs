@@ -1113,16 +1113,16 @@ pub struct Services {
     decoded_frames: u64,
     /// Submissions refused while the decoder's input was full.
     refused_video_submissions: u64,
-    /// Decoded frames waiting for GetFrame: (slot, timestamp, picture).
-    decoded_video_frames: std::collections::VecDeque<(u32, u64, Option<Box<crate::av1::Picture>>)>,
+    /// Decoded frames waiting for GetFrame, with the slot each fills.
+    decoded_video_frames: std::collections::VecDeque<(u32, VideoFrame)>,
     /// The decoder's input event (GetInputEvent), for back-pressure.
     video_input_event: Option<ReadableEventId>,
     /// GetFrame calls answered "no output" (213).
     empty_frame_requests: u64,
-    /// Video decoder submissions so far and the queued input (id,
-    /// timestamp argument, the picture the submission decoded to).
+    /// Video decoder submissions so far and the queued input, by
+    /// submission id.
     video_submissions: u64,
-    video_input: Vec<(u64, u64, Option<Box<crate::av1::Picture>>)>,
+    video_input: Vec<(u64, VideoFrame)>,
     /// The host AV1 decoder of the current decoder session (created by
     /// 201, dropped by 115), and its failures.
     av1_decoder: Option<crate::av1::Decoder>,
@@ -1635,6 +1635,18 @@ fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
 
 /// Submissions the host video decoder holds before its input event clears.
 const VIDEO_INPUT_DEPTH: usize = 8;
+
+/// A video decoder submission, and the frame it becomes.
+#[derive(Debug, Default)]
+struct VideoFrame {
+    /// The submission's presentation time (microseconds).
+    timestamp: u64,
+    /// The stream's last submission: its frame reports the end of the
+    /// stream (the SDK's output property `last`).
+    last: bool,
+    /// The picture the submission decoded to.
+    picture: Option<Box<crate::av1::Picture>>,
+}
 
 /// The syncpoint token of a decoder output slot's fence: a range no
 /// syncpoint the SDK opens reaches (its tokens are small inverted ids).
@@ -2479,17 +2491,19 @@ impl Services {
             // SDK's GetAv1DecoderOutputBufferProperties, sdk+0x331a24): the
             // next decoded frame: u32 slot handle, four u32 sizes the SDK
             // keeps as u16 (width, height, then two more; answered as the
-            // configured size twice), a u32, the u64 timestamp and a flag
-            // byte. Frames fill slots in the order they were handed to the
-            // decoder, each taking the oldest submission's timestamp. No
-            // pixels are written (no host decoder yet). With no slot or no
+            // configured size twice), a u32, the u64 timestamp and a u32
+            // whose bit 0 is the SDK's `last` output property: the frame of
+            // the stream's last submission, which ends a movie. Frames fill
+            // slots in the order they were handed to the decoder, each
+            // taking the oldest submission's timestamp and picture. With no
+            // slot or no
             // submission waiting there is no frame: the result is
             // 0x1c286f, which the SDK's AcquireAv1DecoderOutputBuffer itself
             // returns when no output is ready (sdk+0x330c80). Provisional.
             ServiceObject::VideoDecoder if call.request.command_id == 213 => {
                 call.shape(0, false, false)?;
                 self.decode_video_frames();
-                let Some((slot, timestamp, picture)) = self.decoded_video_frames.pop_front() else {
+                let Some((slot, frame)) = self.decoded_video_frames.pop_front() else {
                     const NO_OUTPUT: u32 = 0x1c_286f;
                     call.reply(NO_OUTPUT, None, 0, &[])?;
                     self.empty_frame_requests += 1;
@@ -2505,10 +2519,10 @@ impl Services {
                 for value in [slot, width, height, width, height, 0] {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
-                data.extend_from_slice(&timestamp.to_le_bytes());
-                data.extend_from_slice(&0u32.to_le_bytes());
+                data.extend_from_slice(&frame.timestamp.to_le_bytes());
+                data.extend_from_slice(&u32::from(frame.last).to_le_bytes());
                 call.reply(0, None, 0, &data)?;
-                match picture {
+                match frame.picture {
                     Some(picture) => {
                         self.slot_pictures.insert(slot, picture);
                     }
@@ -2521,12 +2535,11 @@ impl Services {
                 Ok(Outcome::success())
             }
             // VideoDecoderSession 109 (Decode; the SDK's
-            // SubmitAv1DecoderInputBuffer, client sdk+0x330b00): u32 and u64
-            // arguments (the presentation time is among them) and the AV1
+            // SubmitAv1DecoderInputBuffer, client sdk+0x330b00): the u64
+            // presentation time and u32 flags (bit 0: `last`), and the AV1
             // bitstream (low-overhead OBUs) in a mapped buffer -> u64
-            // submission id (sdk+0x330b44). Submissions are queued with
-            // their arguments for a host decoder; none decodes them yet, so
-            // no frame is produced. Ids count from 1. Provisional.
+            // submission id (sdk+0x330b44). Each is decoded on the host and
+            // queued for a slot. Ids count from 1. Provisional.
             ServiceObject::VideoDecoder if call.request.command_id == 109 => {
                 let Some(input) = call
                     .request
@@ -2553,7 +2566,11 @@ impl Services {
                 }
                 let mut bytes = vec![0u8; input.1 as usize];
                 call.memory.read(input.0, &mut bytes)?;
-                let timestamp = crate::bytes::le_u64(&call.request.arguments[4..12]);
+                // u64 presentation time (microseconds), then u32 flags whose
+                // bit 0 marks the stream's last submission (an empty one
+                // with time -1 at the end of a movie).
+                let timestamp = crate::bytes::le_u64(&call.request.arguments[..8]);
+                let last = call.request.arguments[8] & 1 != 0;
                 self.video_submissions += 1;
                 let id = self.video_submissions;
                 // GetFrame (213) consumes submissions in order.
@@ -2578,7 +2595,14 @@ impl Services {
                     }
                 }
                 let picture = self.decode_av1(&bytes);
-                self.video_input.push((id, timestamp, picture));
+                self.video_input.push((
+                    id,
+                    VideoFrame {
+                        timestamp,
+                        last,
+                        picture,
+                    },
+                ));
                 self.decode_video_frames();
                 call.reply(0, None, 0, &id.to_le_bytes())?;
                 self.provisional_commands
@@ -4406,9 +4430,8 @@ impl Services {
     fn decode_video_frames(&mut self) {
         while !self.decoder_slots.is_empty() && !self.video_input.is_empty() {
             let slot = self.decoder_slots.pop_front().unwrap_or_default();
-            let (_, timestamp, picture) = self.video_input.remove(0);
-            self.decoded_video_frames
-                .push_back((slot, timestamp, picture));
+            let (_, frame) = self.video_input.remove(0);
+            self.decoded_video_frames.push_back((slot, frame));
             self.decoded_frames += 1;
             *self
                 .decoder_fences
@@ -9233,7 +9256,13 @@ mod tests {
         );
         services.video_input_event = Some(ReadableEventId(1));
         for id in 0..VIDEO_INPUT_DEPTH as u64 {
-            services.video_input.push((id, id * 100, None));
+            services.video_input.push((
+                id,
+                VideoFrame {
+                    timestamp: id * 100,
+                    ..Default::default()
+                },
+            ));
         }
         services.decode_video_frames();
         // No slot yet: nothing decodes and the full input clears the event.
@@ -9245,12 +9274,36 @@ mod tests {
             services
                 .decoded_video_frames
                 .iter()
-                .map(|&(slot, timestamp, _)| (slot, timestamp))
+                .map(|(slot, frame)| (*slot, frame.timestamp))
                 .collect::<Vec<_>>(),
             [(7, 0), (9, 100)]
         );
         assert_eq!(services.video_input.len(), VIDEO_INPUT_DEPTH - 2);
         assert!(services.readable_events[&ReadableEventId(1)].signaled);
+    }
+
+    #[test]
+    fn the_last_submission_reaches_its_slot_marked_last() {
+        let mut services = Services::default();
+        services.video_input.push((1, VideoFrame::default()));
+        services.video_input.push((
+            2,
+            VideoFrame {
+                timestamp: u64::MAX,
+                last: true,
+                picture: None,
+            },
+        ));
+        services.decoder_slots.extend([3, 4]);
+        services.decode_video_frames();
+        assert_eq!(
+            services
+                .decoded_video_frames
+                .iter()
+                .map(|(slot, frame)| (*slot, frame.last))
+                .collect::<Vec<_>>(),
+            [(3, false), (4, true)]
+        );
     }
 
     #[test]
@@ -9276,7 +9329,7 @@ mod tests {
         services.decoder_fence_waits.insert(0, (token, 1));
         assert!(!services.decoder_fence_reached(token, 1));
         services.decoder_slots.push_back(1);
-        services.video_input.push((1, 0, None));
+        services.video_input.push((1, VideoFrame::default()));
         services.decode_video_frames();
         assert_eq!(services.decoder_fence_value(token), Some(1));
         assert!(services.decoder_fence_waits.is_empty());
