@@ -4115,26 +4115,8 @@ impl Machine {
             "saved_cpu_context":self.main_saved_cpu.as_ref().map(crate::threads::cpu_report),
             "instructions_started":self.main_instructions_started,
         });
-        // Debug aid: return addresses from each saved context's frame-pointer
-        // chain (x29 -> {previous x29, x30}), up to 24 frames. A frame that
-        // cannot be read ends the chain.
         let backtrace = |context: &serde_json::Value| -> Vec<u64> {
-            let mut frames = Vec::new();
-            let mut frame = context["registers"][29].as_u64().unwrap_or(0);
-            while frame != 0 && frames.len() < 24 {
-                let (Ok(previous), Ok(lr)) = (
-                    self.memory.read_u64(frame),
-                    self.memory.read_u64(frame.wrapping_add(8)),
-                ) else {
-                    break;
-                };
-                frames.push(lr);
-                if previous <= frame {
-                    break;
-                }
-                frame = previous;
-            }
-            frames
+            self.frame_chain(context["registers"][29].as_u64().unwrap_or(0))
         };
         let main_frames = backtrace(&model["main_thread_record"]["saved_cpu_context"]);
         model["main_thread_record"]["backtrace"] = main_frames.into();
@@ -4318,6 +4300,27 @@ impl Machine {
         samples
     }
 
+    /// Debug aid: return addresses from a frame-pointer chain starting at
+    /// `frame` (x29 -> {previous x29, x30}), up to 24 frames. A frame that
+    /// cannot be read ends the chain.
+    fn frame_chain(&self, mut frame: u64) -> Vec<u64> {
+        let mut frames = Vec::new();
+        while frame != 0 && frames.len() < 24 {
+            let (Ok(previous), Ok(lr)) = (
+                self.memory.read_u64(frame),
+                self.memory.read_u64(frame.wrapping_add(8)),
+            ) else {
+                break;
+            };
+            frames.push(lr);
+            if previous <= frame {
+                break;
+            }
+            frame = previous;
+        }
+        frames
+    }
+
     pub fn report(&self, stop: &Trap) -> serde_json::Value {
         serde_json::json!({
             "stop":stop,"guest_instructions":self.core.steps,"pc":self.core.cpu.pc,
@@ -4325,6 +4328,7 @@ impl Machine {
             "current_thread_id":self.core.current_thread_id,
             "current_processor_id":self.thread_processor_id(self.core.current_thread_id).ok(),
             "registers":self.core.cpu.regs,"sp":self.core.cpu.sp,"nzcv":self.core.cpu.nzcv,
+            "backtrace":self.frame_chain(self.core.cpu.regs[29]),
             "fpcr":self.core.cpu.fpcr,"fpsr":self.core.cpu.fpsr,
             "vector_registers_hex":self.core.cpu.vectors.iter().map(|value|format!("{value:032x}")).collect::<Vec<_>>(),
             "svc_trace":self.svc_trace,"recent_svcs":self.recent_svcs,"nvn":self.nvn.report(),"debug_messages":self.debug_messages,
