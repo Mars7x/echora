@@ -681,9 +681,26 @@ fn jump_table(
     // loops of the same function may hoist other tables into the same
     // register (main 0x7101862928 and 0x7101863a28 both use x4), so every
     // candidate's targets are taken; extra targets only add block entries.
+    // The table register may also have been set long before the dispatch
+    // and spilled and reloaded around a loop in between (main+0x1b6ca58:
+    // adrp/add x17 591 instructions above its `br`, an `ldp x9, x17,
+    // [sp, #0x38]` reload on a sibling path). The adrp/add pairs writing it
+    // further up, in PRECEDING_TABLE_WINDOW instructions, are candidates
+    // too.
     let tables = match table {
         Some(table) => vec![table],
-        None if entry_size != 0 => hoisted_addresses(pc, table_reg, read_word)?,
+        None if entry_size != 0 => {
+            let mut tables = hoisted_addresses(pc, table_reg, read_word).unwrap_or_default();
+            for address in preceding_addresses(pc, table_reg, read_word) {
+                if !tables.contains(&address) {
+                    tables.push(address);
+                }
+            }
+            if tables.is_empty() {
+                return None;
+            }
+            tables
+        }
         None => return None,
     };
     let candidates = tables.len();
@@ -874,6 +891,41 @@ fn register_constant(read_word: &dyn Fn(u64) -> Option<u32>, pc: u64, register: 
         };
     }
     None
+}
+
+/// Instructions before a dispatch searched for adrp/add pairs that set its
+/// table register (see `preceding_addresses`).
+const PRECEDING_TABLE_WINDOW: u64 = 4096;
+
+/// The distinct addresses that `adrp reg; add reg, reg, #imm` pairs in the
+/// PRECEDING_TABLE_WINDOW instructions before `pc` compute, nearest first.
+/// Candidates only: a table whose entries leave the code is dropped later.
+fn preceding_addresses(pc: u64, register: u8, read_word: &dyn Fn(u64) -> Option<u32>) -> Vec<u64> {
+    let mut found = Vec::new();
+    for index in 1..PRECEDING_TABLE_WINDOW {
+        let Some(at) = pc.checked_sub(index * 4) else {
+            break;
+        };
+        let Some(word) = read_word(at) else {
+            break;
+        };
+        if word & 0x9f00_0000 != 0x9000_0000 || (word & 31) as u8 != register {
+            continue;
+        }
+        let Some(next) = read_word(at + 4) else {
+            continue;
+        };
+        let rd = (next & 31) as u8;
+        let rn = ((next >> 5) & 31) as u8;
+        if next & 0xffc0_0000 != 0x9100_0000 || rd != register || rn != register {
+            continue;
+        }
+        let address = adr_target(word, at, true) + u64::from((next >> 10) & 0xfff);
+        if !found.contains(&address) {
+            found.push(address);
+        }
+    }
+    found
 }
 
 fn adr_target(word: u32, pc: u64, page: bool) -> u64 {
@@ -4633,6 +4685,95 @@ mod tests {
     }
 
     const RET: u32 = 0xd65f_03c0;
+
+    #[test]
+    fn jump_tables_set_up_far_above_and_reloaded_are_recovered() {
+        // As at main+0x1b6ca58: the table base set by adrp/add 600
+        // instructions above the dispatch (beyond JUMP_TABLE_WINDOW), and
+        // reloaded on a sibling path (`ldp x9, x17, [sp, #0x38]`); then
+        // `sub w19, w19, #1; cmp w19, #0xe; b.hi; adr x22, cases; ldrh w23,
+        // [x17, x19, lsl #1]; add x22, x22, x23, lsl #2; br x22`. Two more
+        // dispatches of the same function read halfword tables through x14,
+        // which two adrp/add pairs set further up.
+        const DATA: u64 = 0x10_0000;
+        let adrp = |pc: u64, rd: u32, target: u64| {
+            let pages = ((target >> 12) as i64 - (pc >> 12) as i64) as u32;
+            0x9000_0000 | (pages & 3) << 29 | ((pages >> 2) & 0x7ffff) << 5 | rd
+        };
+        let add = |rd: u32, low: u32| 0x9100_0000 | low << 10 | rd << 5 | rd;
+        let adr = |pc: u64, rd: u32, target: u64| {
+            let offset = (target as i64 - pc as i64) as u32;
+            0x1000_0000 | (offset & 3) << 29 | ((offset >> 2) & 0x7ffff) << 5 | rd
+        };
+        let b_hi = |pc: u64, target: u64| {
+            0x5400_0008 | ((((target as i64 - pc as i64) / 4) as u32) & 0x7ffff) << 5
+        };
+        let mut words: Vec<u32> = Vec::new();
+        let at = |words: &Vec<u32>| 0x1000 + words.len() as u64 * 4;
+        // Table addresses: x17 -> DATA + 0x10, x14 -> DATA + 0x100 and + 0x200.
+        for (rd, low) in [(17, 0x10), (14, 0x100), (14, 0x200)] {
+            words.push(adrp(at(&words), rd, DATA));
+            words.push(add(rd, low));
+        }
+        words.push(0xb500_0041); // cbnz x1, +8
+        words.push(0xa943_c7e9); // ldp x9, x17, [sp, #0x38]
+        words.extend(std::iter::repeat_n(0xd503_201f, 600)); // a long loop body
+        // Dispatches: (index bound, table register, case count).
+        let mut dispatches = Vec::new();
+        for (cmp, load, cases) in [
+            (0x7100_3a7f, 0x7873_7a37, 15),
+            (0x7100_0a7f, 0x7873_79d7, 3),
+            (0x7100_0a7f, 0x7873_79d7, 3),
+        ] {
+            let start = at(&words);
+            words.push(0x5100_0673); // sub w19, w19, #1
+            words.push(cmp);
+            let default = start + (8 + cases) * 4;
+            words.push(b_hi(at(&words), default));
+            let first_case = start + 8 * 4;
+            words.push(adr(at(&words), 22, first_case));
+            words.push(load);
+            words.push(0x8b17_0ad6); // add x22, x22, x23, lsl #2
+            words.push(0xd61f_02c0); // br x22
+            words.push(0xd503_201f);
+            words.extend(std::iter::repeat_n(RET, cases as usize));
+            dispatches.push((start + 6 * 4, first_case, cases));
+        }
+        words.push(RET);
+        // Halfword tables: case k at first_case + 4 * k, in reverse order.
+        let mut data = vec![0u8; 0x300];
+        for (index, &(_, _, cases)) in dispatches.iter().enumerate() {
+            let table = [0x10usize, 0x100, 0x200][index];
+            for case in 0..cases as usize {
+                let entry = (cases as usize - 1 - case) as u16;
+                data[table + case * 2..table + case * 2 + 2].copy_from_slice(&entry.to_le_bytes());
+            }
+        }
+        let rodata = CodeRegion {
+            name: "rodata".into(),
+            base: DATA,
+            bytes: data,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[rodata],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            4096,
+        )
+        .unwrap();
+        for (br, first_case, cases) in dispatches {
+            assert!(translation.jump_tables.contains_key(&br), "{br:#x}");
+            for case in 0..cases {
+                let target = first_case + case * 4;
+                assert!(
+                    translation.instructions.contains_key(&target),
+                    "{br:#x}: {target:#x}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn jump_table_bounds_come_from_a_register_compare() {
