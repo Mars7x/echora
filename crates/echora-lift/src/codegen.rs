@@ -2377,9 +2377,11 @@ fn emit_structured_cases(
     analysis: &crate::structure::WindowAnalysis,
     tree: &crate::structure::Structured,
     spin_heads: &BTreeSet<u64>,
+    inlined: &BTreeSet<u64>,
 ) {
     let window = blocks[0].start >> SPLIT_WINDOW_BITS;
     let mut emitter = TreeEmitter {
+        inlined: inlined.clone(),
         bodies: blocks
             .iter()
             .map(|block| {
@@ -2426,8 +2428,43 @@ fn emit_structured_cases(
     output.push_str("                }\n                continue;\n            }\n");
 }
 
+/// The inlined blocks (`inlined_blocks`) a structured window keeps
+/// inlined: all but those in an irreducible region, whose local dispatch
+/// ends every block in a boundary. The tree skips the boundary on every
+/// edge into the rest, so no host resumes at them and they need no arm.
+fn structured_inlined(
+    inlined: &BTreeSet<u64>,
+    tree: &crate::structure::Structured,
+) -> BTreeSet<u64> {
+    fn regions(tree: &crate::structure::Structured, out: &mut BTreeSet<u64>) {
+        use crate::structure::Structured::*;
+        match tree {
+            Region(blocks) => out.extend(blocks.iter().copied()),
+            Seq(parts) => parts.iter().for_each(|part| regions(part, out)),
+            Block(body) | Loop(body) => regions(body, out),
+            If {
+                taken, fallthrough, ..
+            } => {
+                regions(taken, out);
+                regions(fallthrough, out);
+            }
+            Dispatch(cases) => cases.iter().for_each(|(_, body)| regions(body, out)),
+            Switch { cases, default } => {
+                cases.iter().for_each(|(_, body)| regions(body, out));
+                regions(default, out);
+            }
+            Code(_) | Br(_) | Leave(_) => {}
+        }
+    }
+    let mut in_regions = BTreeSet::new();
+    regions(tree, &mut in_regions);
+    inlined.difference(&in_regions).copied().collect()
+}
+
 /// Writes a structured tree as Rust (see [`emit_structured_cases`]).
 struct TreeEmitter {
+    /// Blocks no boundary comes before (see [`structured_inlined`]).
+    inlined: BTreeSet<u64>,
     bodies: BTreeMap<u64, String>,
     /// Each block's successors inside the window.
     successors: BTreeMap<u64, Vec<u64>>,
@@ -2443,8 +2480,24 @@ impl TreeEmitter {
     /// `next_pc` is one of the block's successors in the window.
     fn block(&self, output: &mut String, start: u64, guard: bool) {
         output.push_str(&self.bodies[&start]);
-        output
-            .push_str("                m.cpu.pc = next_pc;\n                m.finish_block()?;\n");
+        output.push_str("                m.cpu.pc = next_pc;\n");
+        // No boundary before an inlined successor, as in the flat arms:
+        // it runs as part of this block, and no host resumes there.
+        let skip: Vec<String> = self.successors[&start]
+            .iter()
+            .filter(|pc| self.inlined.contains(pc))
+            .map(|pc| format!("next_pc != {pc:#x}"))
+            .collect();
+        if skip.is_empty() {
+            output.push_str("                m.finish_block()?;\n");
+        } else {
+            writeln!(
+                output,
+                "                if {} {{ m.finish_block()?; }}",
+                skip.join(" && ")
+            )
+            .unwrap();
+        }
         if guard {
             let successors = &self.successors[&start];
             if successors.is_empty() {
@@ -2469,9 +2522,12 @@ impl TreeEmitter {
     fn side(&mut self, output: &mut String, next: u64, tree: &crate::structure::Structured) {
         writeln!(
             output,
-            "                next_pc = {next:#x};\n                m.cpu.pc = next_pc;\n                m.finish_block()?;"
+            "                next_pc = {next:#x};\n                m.cpu.pc = next_pc;"
         )
         .unwrap();
+        if !self.inlined.contains(&next) {
+            output.push_str("                m.finish_block()?;\n");
+        }
         self.emit(output, tree);
     }
 
@@ -2878,10 +2934,11 @@ pub fn emit_rust_split_to_with<E>(
             Some((analysis, tree))
         });
         if let Some((analysis, tree)) = structured {
-            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads);
-            // The tree ends every block in a boundary, so a host boundary
-            // can resume at any block: each keeps its own arm.
-            emit_split_cases(&mut cases, blocks, &BTreeSet::new(), &spin_heads);
+            let inlined = structured_inlined(&inlined, tree);
+            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads, &inlined);
+            // A host boundary can resume at any other block: each keeps
+            // its own arm, with the inlined ones in it as in the flat arms.
+            emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
         } else {
             emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
         }
