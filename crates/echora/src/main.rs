@@ -551,6 +551,16 @@ fn discover_game(
     let start = Instant::now();
     let translation =
         discover_with_tables(&regions, &rodata, &roots, &deferred, &host_entries, limit)?;
+    // ECHORA_DISPATCH_AUDIT=FILE: how discovery resolved every indirect
+    // branch of the game (echora_lift::dispatch), written to FILE.
+    if let Some(path) = std::env::var_os("ECHORA_DISPATCH_AUDIT") {
+        let dispatches = echora_lift::dispatch::audit(&translation);
+        std::fs::write(
+            &path,
+            echora_lift::dispatch::report(&translation, &dispatches),
+        )
+        .with_context(|| format!("write {}", std::path::Path::new(&path).display()))?;
+    }
     Ok(Discovered {
         cache,
         exefs_key,
