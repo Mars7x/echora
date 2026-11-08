@@ -23,12 +23,15 @@ Each phase completes only on the evidence named here, not when code exists.
 
 ## Next steps
 
-1. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
+1. Find why every frame is black after the New Game movie. The game keeps
+   running there and issues mesh and task draws, so some pass loses the
+   image.
+2. Translate the last 27 failing shader stages.
+3. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
    game's per-core job threads run in parallel, which looks like one job
    claimed by two threads. This is the largest speed gain available.
-2. Add the mesh and task draw path (`DrawMeshTasks`, `VK_EXT_mesh_shader`)
-   that gameplay scenes need, and advance to gameplay.
-3. Translate the remaining failing shader stages (stage-buffer reads
-   outside task and mesh programs, gather forms).
-4. Reduce the cost of dispatching between translated blocks (structured
-   code generation), the largest remaining single-thread cost.
+4. Turn on the faster code generation in game builds once it is checked in
+   game: inline vector arithmetic, structured control flow and direct calls.
+5. Cut the first build from about an hour: full optimisation only for the
+   hot code a profile finds, leaner generated code, and more parallel
+   compiler jobs.
