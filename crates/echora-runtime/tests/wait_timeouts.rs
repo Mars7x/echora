@@ -1,4 +1,5 @@
-//! Wait timeouts under the real scheduler, at one to six workers.
+//! Wait timeouts and cancellation under the real scheduler, at one to six
+//! workers.
 //!
 //! For each wait kind (WaitForAddress, WaitProcessWideKeyAtomic and
 //! WaitSynchronization) one thread, A, times out and then another, B,
@@ -22,6 +23,14 @@
 //! - On a condition variable (the signaler holding the mutex for a varying
 //!   while after signaling), a wait returns 0 owning the mutex or TimedOut
 //!   without it, nothing else.
+//!
+//! A third program cancels waits (CancelSynchronization), as Atmosphere's
+//! KThread::WaitCancel does: a thread in WaitSynchronization returns
+//! Cancelled (index -1); any other thread, running or in an address or
+//! condition-variable wait, is not woken, and its next WaitSynchronization
+//! returns Cancelled at once, once. Then cancels race timeouts for 120
+//! rounds: each cancel ends exactly one WaitSynchronization, the raced one
+//! or the next.
 //!
 //! As in `sync_stress.rs`, "guest code" is a dispatch function, one block
 //! per call, with thread state in guest registers and shared state in
@@ -52,6 +61,9 @@ const ADDRESS_WAITER: u64 = CODE + 0x800;
 const ADDRESS_SIGNALER: u64 = CODE + 0x900;
 const CONDITION_WAITER: u64 = CODE + 0xa00;
 const CONDITION_SIGNALER: u64 = CODE + 0xb00;
+// The cancel program: a waiter and a canceler (and T to wait on).
+const CANCEL_WAITER: u64 = CODE + 0x1000;
+const CANCELER: u64 = CODE + 0x1200;
 const LOCK: u64 = CODE + 0x700;
 const UNLOCK: u64 = CODE + 0x730;
 
@@ -62,16 +74,24 @@ const RACE_ROLES: [u64; 4] = [
     CONDITION_WAITER,
     CONDITION_SIGNALER,
 ];
-/// Which program the threads run: false for the queue program.
-static RACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The tests share `RACE`: one at a time.
+const CANCEL_ROLES: [u64; 3] = [T, CANCEL_WAITER, CANCELER];
+const QUEUES: u8 = 0;
+const RACES: u8 = 1;
+const CANCELS: u8 = 2;
+/// Which program the threads run.
+static PROGRAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(QUEUES);
+/// The tests share `PROGRAM`: one at a time.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn roles() -> [u64; 4] {
-    if RACE.load(std::sync::atomic::Ordering::Relaxed) {
-        RACE_ROLES
-    } else {
-        QUEUE_ROLES
+fn program() -> u8 {
+    PROGRAM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn roles() -> &'static [u64] {
+    match program() {
+        RACES => &RACE_ROLES,
+        CANCELS => &CANCEL_ROLES,
+        _ => &QUEUE_ROLES,
     }
 }
 
@@ -103,6 +123,41 @@ const ADDRESS_OUTCOMES: u64 = SHARED + 0x400;
 /// Condition rounds by wait outcome: 0 owning the mutex, 0 without it,
 /// TimedOut without it, TimedOut owning it, other.
 const CONDITION_OUTCOMES: u64 = SHARED + 0x440;
+
+// The cancel program's flags and results.
+const CANCEL_LIST: u64 = SHARED + 0x500;
+const CANCELER_LIST: u64 = SHARED + 0x504;
+const READY1: u64 = SHARED + 0x508;
+const DONE1: u64 = SHARED + 0x50c;
+const GO2: u64 = SHARED + 0x510;
+const DONE2: u64 = SHARED + 0x514;
+const GO3: u64 = SHARED + 0x518;
+const READY3: u64 = SHARED + 0x51c;
+const DONE3: u64 = SHARED + 0x520;
+const GO4: u64 = SHARED + 0x524;
+const READY4: u64 = SHARED + 0x528;
+const DONE4: u64 = SHARED + 0x52c;
+const DONE4B: u64 = SHARED + 0x530;
+const CANCEL_PAIR: u64 = SHARED + 0x540;
+const WAIT_RESULT1: u64 = SHARED + 0x580;
+const WAIT_INDEX1: u64 = SHARED + 0x584;
+const CANCEL_RESULT1: u64 = SHARED + 0x588;
+const CANCEL_RESULT2: u64 = SHARED + 0x58c;
+const WAIT_RESULT2: u64 = SHARED + 0x590;
+const WAIT_RESULT2_AGAIN: u64 = SHARED + 0x594;
+const CANCEL_RESULT3: u64 = SHARED + 0x598;
+const WOKEN_BY_CANCEL3: u64 = SHARED + 0x59c;
+const WAIT_RESULT3: u64 = SHARED + 0x5a0;
+const WAIT_RESULT3_AFTER: u64 = SHARED + 0x5a4;
+const CANCEL_RESULT4: u64 = SHARED + 0x5a8;
+const WOKEN_BY_CANCEL4: u64 = SHARED + 0x5ac;
+const WAIT_RESULT4: u64 = SHARED + 0x5b0;
+const OWNED4: u64 = SHARED + 0x5b4;
+const WAIT_RESULT4_AFTER: u64 = SHARED + 0x5b8;
+/// Race rounds by (raced wait, next wait): (Cancelled, TimedOut),
+/// (TimedOut, Cancelled), both Cancelled, both TimedOut, other.
+const CANCEL_OUTCOMES: u64 = SHARED + 0x600;
+const CANCELLED: u64 = 0xec01;
 
 const DATA: u64 = 0x8000;
 const SHARED: u64 = 0x10000;
@@ -167,7 +222,7 @@ fn machine(workers: usize) -> Machine {
     };
     let mut m = Machine::new(layout, 50_000_000);
     m.memory
-        .map(CODE, PAGE_SIZE, READ | EXECUTE, STATE_CODE, "code")
+        .map(CODE, 2 * PAGE_SIZE, READ | EXECUTE, STATE_CODE, "code")
         .unwrap();
     m.memory
         .map(m.layout.tls_base, PAGE_SIZE, READ | WRITE, STATE_TLS, "TLS")
@@ -302,11 +357,7 @@ fn block(core: &mut Core) -> Result<(), Trap> {
         }
         MAIN_SLEEP => {
             // The race ends when both signalers have finished.
-            let needed = if RACE.load(std::sync::atomic::Ordering::Relaxed) {
-                2
-            } else {
-                1
-            };
+            let needed = if program() == RACES { 2 } else { 1 };
             if load(core, ALL_DONE) >= needed {
                 MAIN_EXIT
             } else {
@@ -657,6 +708,219 @@ fn block(core: &mut Core) -> Result<(), Trap> {
             CONDITION_SIGNALER
         }
 
+        // The cancel program's waiter. Phase 1: cancelled out of
+        // WaitSynchronization.
+        CANCEL_WAITER => {
+            let t = load(core, HANDLES);
+            store(core, CANCEL_LIST, t);
+            store(core, READY1, 1);
+            return call(core, 0x18, &[0, CANCEL_LIST, 1, FOREVER]);
+        }
+        p if p == CANCEL_WAITER + 0x10 => {
+            let (result, index) = (core.cpu.regs[0], core.cpu.regs[1]);
+            store(core, WAIT_RESULT1, result);
+            store(core, WAIT_INDEX1, index);
+            store(core, DONE1, 1);
+            CANCEL_WAITER + 0x20
+        }
+        // Phase 2: cancelled while running; the next wait returns
+        // Cancelled, the one after times out.
+        p if p == CANCEL_WAITER + 0x20 => after(core, GO2, CANCEL_WAITER + 0x30),
+        p if p == CANCEL_WAITER + 0x30 => {
+            return call(core, 0x18, &[0, CANCEL_LIST, 1, TIMEOUT_NS]);
+        }
+        p if p == CANCEL_WAITER + 0x40 => {
+            let result = core.cpu.regs[0];
+            store(core, WAIT_RESULT2, result);
+            return call(core, 0x18, &[0, CANCEL_LIST, 1, TIMEOUT_NS]);
+        }
+        p if p == CANCEL_WAITER + 0x50 => {
+            let result = core.cpu.regs[0];
+            store(core, WAIT_RESULT2_AGAIN, result);
+            store(core, DONE2, 1);
+            CANCEL_WAITER + 0x60
+        }
+        // Phase 3: cancelled in an address wait, which goes on until
+        // signaled; the next WaitSynchronization returns Cancelled.
+        p if p == CANCEL_WAITER + 0x60 => after(core, GO3, CANCEL_WAITER + 0x70),
+        p if p == CANCEL_WAITER + 0x70 => {
+            store(core, READY3, 1);
+            return call(core, 0x34, &[ADDRESS, 2, 0, FOREVER]);
+        }
+        p if p == CANCEL_WAITER + 0x80 => {
+            let result = core.cpu.regs[0];
+            store(core, WAIT_RESULT3, result);
+            store(core, DONE3, 1);
+            return call(core, 0x18, &[0, CANCEL_LIST, 1, TIMEOUT_NS]);
+        }
+        p if p == CANCEL_WAITER + 0x90 => {
+            let result = core.cpu.regs[0];
+            store(core, WAIT_RESULT3_AFTER, result);
+            CANCEL_WAITER + 0xa0
+        }
+        // Phase 4: the same in a condition-variable wait.
+        p if p == CANCEL_WAITER + 0xa0 => after(core, GO4, CANCEL_WAITER + 0xb0),
+        p if p == CANCEL_WAITER + 0xb0 => lock(core, CANCEL_WAITER + 0xc0),
+        p if p == CANCEL_WAITER + 0xc0 => {
+            store(core, READY4, 1);
+            let tag = core.cpu.regs[TAG];
+            return call(core, 0x1c, &[MUTEX, KEY, tag, FOREVER]);
+        }
+        p if p == CANCEL_WAITER + 0xd0 => {
+            let (result, owned) = (core.cpu.regs[0], owns_mutex(core));
+            store(core, WAIT_RESULT4, result);
+            store(core, OWNED4, u64::from(owned));
+            store(core, DONE4, 1);
+            if owned {
+                CANCEL_WAITER + 0xe0
+            } else {
+                lock(core, CANCEL_WAITER + 0xe0)
+            }
+        }
+        p if p == CANCEL_WAITER + 0xe0 => unlock(core, CANCEL_WAITER + 0xf0),
+        p if p == CANCEL_WAITER + 0xf0 => {
+            return call(core, 0x18, &[0, CANCEL_LIST, 1, TIMEOUT_NS]);
+        }
+        p if p == CANCEL_WAITER + 0x100 => {
+            let result = core.cpu.regs[0];
+            store(core, WAIT_RESULT4_AFTER, result);
+            store(core, DONE4B, 1);
+            let canceler = load(core, HANDLES + 8);
+            store(core, CANCELER_LIST, canceler);
+            CANCEL_WAITER + 0x110
+        }
+        // The race: wait on the (running) canceler with a short timeout,
+        // then once more after the round's cancel.
+        p if p == CANCEL_WAITER + 0x110 => {
+            let round = core.cpu.regs[ROUND];
+            if round == ROUNDS {
+                return svc(0x0a);
+            }
+            store(core, CANCEL_PAIR + READY, round + 1);
+            return call(core, 0x18, &[0, CANCELER_LIST, 1, race_timeout(round)]);
+        }
+        p if p == CANCEL_WAITER + 0x120 => {
+            core.cpu.regs[SEEN] = core.cpu.regs[0];
+            CANCEL_WAITER + 0x130
+        }
+        p if p == CANCEL_WAITER + 0x130 => {
+            until(core, CANCEL_PAIR + SIGNALED, CANCEL_WAITER + 0x140)
+        }
+        p if p == CANCEL_WAITER + 0x140 => {
+            return call(core, 0x18, &[0, CANCELER_LIST, 1, TIMEOUT_NS]);
+        }
+        p if p == CANCEL_WAITER + 0x150 => {
+            let outcome = match (core.cpu.regs[SEEN], core.cpu.regs[0]) {
+                (CANCELLED, TIMED_OUT) => 0,
+                (TIMED_OUT, CANCELLED) => 1,
+                (CANCELLED, CANCELLED) => 2,
+                (TIMED_OUT, TIMED_OUT) => 3,
+                _ => 4,
+            };
+            add(core, CANCEL_OUTCOMES + 4 * outcome, 1);
+            let round = core.cpu.regs[ROUND];
+            store(core, CANCEL_PAIR + WAITED, round + 1);
+            core.cpu.regs[ROUND] += 1;
+            CANCEL_WAITER + 0x110
+        }
+
+        // The canceler.
+        CANCELER => after(core, READY1, CANCELER + 0x10),
+        p if p == CANCELER + 0x10 => return call(core, 0x0b, &[TIMEOUT_NS]),
+        p if p == CANCELER + 0x20 => {
+            let waiter = load(core, HANDLES + 4);
+            return call(core, 0x19, &[waiter]);
+        }
+        p if p == CANCELER + 0x30 => {
+            let result = core.cpu.regs[0];
+            store(core, CANCEL_RESULT1, result);
+            CANCELER + 0x40
+        }
+        p if p == CANCELER + 0x40 => after(core, DONE1, CANCELER + 0x50),
+        // The waiter is running (spinning on GO2).
+        p if p == CANCELER + 0x50 => {
+            let waiter = load(core, HANDLES + 4);
+            return call(core, 0x19, &[waiter]);
+        }
+        p if p == CANCELER + 0x60 => {
+            let result = core.cpu.regs[0];
+            store(core, CANCEL_RESULT2, result);
+            store(core, GO2, 1);
+            CANCELER + 0x70
+        }
+        p if p == CANCELER + 0x70 => after(core, DONE2, CANCELER + 0x80),
+        p if p == CANCELER + 0x80 => {
+            store(core, GO3, 1);
+            CANCELER + 0x90
+        }
+        p if p == CANCELER + 0x90 => after(core, READY3, CANCELER + 0xa0),
+        p if p == CANCELER + 0xa0 => return call(core, 0x0b, &[TIMEOUT_NS]),
+        p if p == CANCELER + 0xb0 => {
+            let waiter = load(core, HANDLES + 4);
+            return call(core, 0x19, &[waiter]);
+        }
+        p if p == CANCELER + 0xc0 => {
+            let result = core.cpu.regs[0];
+            store(core, CANCEL_RESULT3, result);
+            return call(core, 0x0b, &[TIMEOUT_NS]);
+        }
+        p if p == CANCELER + 0xd0 => {
+            // Still waiting: the cancel did not end the address wait.
+            let woken = load(core, DONE3);
+            store(core, WOKEN_BY_CANCEL3, woken);
+            return call(core, 0x35, &[ADDRESS, 0, 0, 1]);
+        }
+        p if p == CANCELER + 0xe0 => after(core, DONE3, CANCELER + 0xf0),
+        p if p == CANCELER + 0xf0 => {
+            store(core, GO4, 1);
+            CANCELER + 0x100
+        }
+        p if p == CANCELER + 0x100 => after(core, READY4, CANCELER + 0x110),
+        // Taken once the waiter's condition wait released the mutex.
+        p if p == CANCELER + 0x110 => lock(core, CANCELER + 0x120),
+        p if p == CANCELER + 0x120 => {
+            let waiter = load(core, HANDLES + 4);
+            return call(core, 0x19, &[waiter]);
+        }
+        p if p == CANCELER + 0x130 => {
+            let result = core.cpu.regs[0];
+            store(core, CANCEL_RESULT4, result);
+            return call(core, 0x0b, &[TIMEOUT_NS]);
+        }
+        p if p == CANCELER + 0x140 => {
+            let woken = load(core, DONE4);
+            store(core, WOKEN_BY_CANCEL4, woken);
+            return call(core, 0x1d, &[KEY, 1]);
+        }
+        p if p == CANCELER + 0x150 => unlock(core, CANCELER + 0x160),
+        p if p == CANCELER + 0x160 => after(core, DONE4B, CANCELER + 0x170),
+        // The race: cancel the waiter after a delay, round after round.
+        p if p == CANCELER + 0x170 => {
+            if core.cpu.regs[ROUND] == ROUNDS {
+                add(core, ALL_DONE, 1);
+                return svc(0x0a);
+            }
+            until(core, CANCEL_PAIR + READY, CANCELER + 0x180)
+        }
+        p if p == CANCELER + 0x180 => {
+            let delay = race_delay(core.cpu.regs[ROUND]);
+            return call(core, 0x0b, &[delay]);
+        }
+        p if p == CANCELER + 0x190 => {
+            let waiter = load(core, HANDLES + 4);
+            return call(core, 0x19, &[waiter]);
+        }
+        p if p == CANCELER + 0x1a0 => {
+            let round = core.cpu.regs[ROUND];
+            store(core, CANCEL_PAIR + SIGNALED, round + 1);
+            CANCELER + 0x1b0
+        }
+        p if p == CANCELER + 0x1b0 => until(core, CANCEL_PAIR + WAITED, CANCELER + 0x1c0),
+        p if p == CANCELER + 0x1c0 => {
+            core.cpu.regs[ROUND] += 1;
+            CANCELER + 0x170
+        }
+
         // The user mutex: its address in x25, the return PC in x26.
         LOCK => {
             let (address, tag) = (core.cpu.regs[MUTEX_REG], core.cpu.regs[TAG] as u32);
@@ -744,17 +1008,17 @@ fn run(workers: usize) {
     );
 }
 
-fn serial(race: bool) -> std::sync::MutexGuard<'static, ()> {
+fn serial(program: u8) -> std::sync::MutexGuard<'static, ()> {
     let guard = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    RACE.store(race, std::sync::atomic::Ordering::Relaxed);
+    PROGRAM.store(program, std::sync::atomic::Ordering::Relaxed);
     guard
 }
 
 #[test]
 fn timed_out_waiters_leave_their_queues() {
-    let _serial = serial(false);
+    let _serial = serial(QUEUES);
     for workers in 1..=6 {
         run(workers);
     }
@@ -798,8 +1062,97 @@ fn race(workers: usize) {
 
 #[test]
 fn signals_racing_timeouts_have_one_outcome() {
-    let _serial = serial(true);
+    let _serial = serial(RACES);
     for workers in 1..=6 {
         race(workers);
+    }
+}
+
+fn cancels(workers: usize) {
+    let mut m = machine(workers);
+    let trap = m.run_generated(dispatch).unwrap_err();
+    let read = |address: u64| u64::from(m.memory.read_u32(address).unwrap());
+    let minus_one = u64::from(u32::MAX);
+    let checks = [
+        (
+            "in WaitSynchronization: the wait",
+            read(WAIT_RESULT1),
+            CANCELLED,
+        ),
+        (
+            "in WaitSynchronization: the index",
+            read(WAIT_INDEX1),
+            minus_one,
+        ),
+        (
+            "in WaitSynchronization: the cancel",
+            read(CANCEL_RESULT1),
+            0,
+        ),
+        ("running: the cancel", read(CANCEL_RESULT2), 0),
+        ("running: the next wait", read(WAIT_RESULT2), CANCELLED),
+        (
+            "running: the wait after",
+            read(WAIT_RESULT2_AGAIN),
+            TIMED_OUT,
+        ),
+        ("address wait: the cancel", read(CANCEL_RESULT3), 0),
+        (
+            "address wait: ended by the cancel",
+            read(WOKEN_BY_CANCEL3),
+            0,
+        ),
+        ("address wait: the wait", read(WAIT_RESULT3), 0),
+        (
+            "address wait: the next wait",
+            read(WAIT_RESULT3_AFTER),
+            CANCELLED,
+        ),
+        ("condition wait: the cancel", read(CANCEL_RESULT4), 0),
+        (
+            "condition wait: ended by the cancel",
+            read(WOKEN_BY_CANCEL4),
+            0,
+        ),
+        ("condition wait: the wait", read(WAIT_RESULT4), 0),
+        ("condition wait: owning the mutex", read(OWNED4), 1),
+        (
+            "condition wait: the next wait",
+            read(WAIT_RESULT4_AFTER),
+            CANCELLED,
+        ),
+        ("mutex left held", read(MUTEX), 0),
+    ];
+    let mut failures: Vec<String> = checks
+        .into_iter()
+        .filter(|&(_, seen, expected)| seen != expected)
+        .map(|(what, seen, expected)| format!("{what}: {seen:#x}, not {expected:#x}"))
+        .collect();
+    if !matches!(trap, Trap::Exit { .. }) {
+        failures.insert(0, format!("ended with {trap:?}"));
+    }
+    let outcomes: Vec<u64> = (0..5).map(|i| read(CANCEL_OUTCOMES + 4 * i)).collect();
+    if outcomes[0] + outcomes[1] != ROUNDS || outcomes.iter().sum::<u64>() != ROUNDS {
+        failures.push(format!(
+            "race rounds (Cancelled then TimedOut, TimedOut then Cancelled, both Cancelled, \
+             both TimedOut, other): {outcomes:?}"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "{workers} workers: {}",
+        failures.join("; ")
+    );
+    eprintln!(
+        "{workers} workers: cancel ended the raced wait {} / the next {}",
+        outcomes[0], outcomes[1]
+    );
+}
+
+#[test]
+fn cancels_end_exactly_one_wait_synchronization() {
+    let _serial = serial(CANCELS);
+    for workers in 1..=6 {
+        cancels(workers);
     }
 }
