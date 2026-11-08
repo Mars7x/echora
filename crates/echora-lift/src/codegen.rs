@@ -2330,6 +2330,261 @@ fn emit_split_cases(
     }
 }
 
+/// The match arms that run a structured window's entries through its tree.
+/// Each arm runs blocks as the per-block arms do (the same bodies and the
+/// same `m.cpu.pc` store and boundary check after each), but goes from one
+/// to the next as the tree says: `loop`, `if` and labelled blocks, local
+/// dispatch for irreducible regions. Whenever `next_pc` is not where the
+/// tree goes next (a call that came back early, an indirect branch, a
+/// leave), the arm ends and the window's loop dispatches `next_pc` afresh.
+fn emit_structured_cases(
+    output: &mut String,
+    blocks: &[BasicBlock],
+    analysis: &crate::structure::WindowAnalysis,
+    tree: &crate::structure::Structured,
+    spin_heads: &BTreeSet<u64>,
+) {
+    let window = blocks[0].start >> SPLIT_WINDOW_BITS;
+    let mut emitter = TreeEmitter {
+        bodies: blocks
+            .iter()
+            .map(|block| {
+                let mut body = String::new();
+                emit_block_body(&mut body, block, false, spin_heads.contains(&block.start));
+                (block.start, body)
+            })
+            .collect(),
+        successors: blocks
+            .iter()
+            .map(|block| {
+                let (targets, _) = crate::structure::block_successors(block);
+                let inside = targets
+                    .into_iter()
+                    .filter(|target| target >> SPLIT_WINDOW_BITS == window)
+                    .collect();
+                (block.start, inside)
+            })
+            .collect(),
+        taken: blocks
+            .iter()
+            .filter_map(|block| {
+                let (targets, _) = crate::structure::block_successors(block);
+                Some((block.start, *targets.first()?))
+            })
+            .collect(),
+        labels: Vec::new(),
+        next_label: 0,
+    };
+    let entries: Vec<String> = analysis
+        .control_entries()
+        .map(|pc| format!("{pc:#x}"))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    writeln!(
+        output,
+        "            {} => {{\n                'tree: {{",
+        entries.join(" | ")
+    )
+    .unwrap();
+    emitter.emit(output, tree);
+    output.push_str("                }\n                continue;\n            }\n");
+}
+
+/// Writes a structured tree as Rust (see [`emit_structured_cases`]).
+struct TreeEmitter {
+    bodies: BTreeMap<u64, String>,
+    /// Each block's successors inside the window.
+    successors: BTreeMap<u64, Vec<u64>>,
+    /// Each block's taken (first) successor.
+    taken: BTreeMap<u64, u64>,
+    /// Enclosing labels, innermost last: (is a loop, number).
+    labels: Vec<(bool, usize)>,
+    next_label: usize,
+}
+
+impl TreeEmitter {
+    /// A block's body and its boundary, then leaving the tree unless
+    /// `next_pc` is one of the block's successors in the window.
+    fn block(&self, output: &mut String, start: u64, guard: bool) {
+        output.push_str(&self.bodies[&start]);
+        output
+            .push_str("                m.cpu.pc = next_pc;\n                m.finish_block()?;\n");
+        if guard {
+            let successors = &self.successors[&start];
+            if successors.is_empty() {
+                output.push_str("                break 'tree;\n");
+            } else {
+                let test: Vec<String> = successors
+                    .iter()
+                    .map(|pc| format!("next_pc != {pc:#x}"))
+                    .collect();
+                writeln!(
+                    output,
+                    "                if {} {{ break 'tree; }}",
+                    test.join(" && ")
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// One side of a block's conditional branch: its constant next PC,
+    /// the boundary, then the tree's code for that side.
+    fn side(&mut self, output: &mut String, next: u64, tree: &crate::structure::Structured) {
+        writeln!(
+            output,
+            "                next_pc = {next:#x};\n                m.cpu.pc = next_pc;\n                m.finish_block()?;"
+        )
+        .unwrap();
+        self.emit(output, tree);
+    }
+
+    fn label(&mut self, is_loop: bool) -> usize {
+        let number = self.next_label;
+        self.next_label += 1;
+        self.labels.push((is_loop, number));
+        number
+    }
+
+    fn emit(&mut self, output: &mut String, tree: &crate::structure::Structured) {
+        use crate::structure::Structured::*;
+        match tree {
+            Code(start) => self.block(output, *start, true),
+            Seq(parts) => {
+                let mut index = 0;
+                while index < parts.len() {
+                    // A block ending in a conditional branch, then the `If`
+                    // it decides: branch on the condition itself, so each
+                    // side knows its next PC (a `next_pc` select tested
+                    // again is what the compiler would otherwise see).
+                    if let (
+                        Code(start),
+                        Some(If {
+                            block,
+                            taken,
+                            fallthrough,
+                        }),
+                    ) = (&parts[index], parts.get(index + 1))
+                        && block == start
+                        && let Some((head, condition, to_taken, to_other)) =
+                            split_conditional(&self.bodies[start])
+                        && self.taken.get(start) == Some(&to_taken)
+                    {
+                        output.push_str(head);
+                        writeln!(output, "                if {condition} {{").unwrap();
+                        self.side(output, to_taken, taken);
+                        output.push_str("                } else {\n");
+                        self.side(output, to_other, fallthrough);
+                        output.push_str("                }\n");
+                        index += 2;
+                        continue;
+                    }
+                    self.emit(output, &parts[index]);
+                    index += 1;
+                }
+            }
+            Block(body) => {
+                let number = self.label(false);
+                writeln!(output, "                'b{number}: {{").unwrap();
+                self.emit(output, body);
+                output.push_str("                }\n");
+                self.labels.pop();
+            }
+            Loop(body) => {
+                let number = self.label(true);
+                writeln!(output, "                'l{number}: loop {{").unwrap();
+                self.emit(output, body);
+                writeln!(
+                    output,
+                    "                break 'l{number};\n                }}"
+                )
+                .unwrap();
+                self.labels.pop();
+            }
+            If {
+                block,
+                taken,
+                fallthrough,
+            } => {
+                writeln!(
+                    output,
+                    "                if next_pc == {:#x} {{",
+                    self.taken[block]
+                )
+                .unwrap();
+                self.emit(output, taken);
+                output.push_str("                } else {\n");
+                self.emit(output, fallthrough);
+                output.push_str("                }\n");
+            }
+            Dispatch(cases) => {
+                output.push_str("                match next_pc {\n");
+                for (pc, body) in cases {
+                    writeln!(output, "                {pc:#x} => {{").unwrap();
+                    self.emit(output, body);
+                    output.push_str("                }\n");
+                }
+                output.push_str("                _ => break 'tree,\n                }\n");
+            }
+            Region(blocks) => {
+                output.push_str("                loop {\n                match next_pc {\n");
+                for &start in blocks {
+                    writeln!(output, "                {start:#x} => {{").unwrap();
+                    self.block(output, start, false);
+                    output.push_str("                }\n");
+                }
+                output.push_str(
+                    "                _ => break,\n                }\n                }\n",
+                );
+                // Leave the tree unless the region left by one of its
+                // exits in the window.
+                let exits: BTreeSet<u64> = blocks
+                    .iter()
+                    .flat_map(|start| self.successors[start].iter().copied())
+                    .filter(|pc| !blocks.contains(pc))
+                    .collect();
+                if exits.is_empty() {
+                    output.push_str("                break 'tree;\n");
+                } else {
+                    let test: Vec<String> = exits
+                        .iter()
+                        .map(|pc| format!("next_pc != {pc:#x}"))
+                        .collect();
+                    writeln!(
+                        output,
+                        "                if {} {{ break 'tree; }}",
+                        test.join(" && ")
+                    )
+                    .unwrap();
+                }
+            }
+            Switch { cases, default } => {
+                output.push_str("                match next_pc {\n");
+                for (pcs, body) in cases {
+                    let pattern: Vec<String> = pcs.iter().map(|pc| format!("{pc:#x}")).collect();
+                    writeln!(output, "                {} => {{", pattern.join(" | ")).unwrap();
+                    self.emit(output, body);
+                    output.push_str("                }\n");
+                }
+                output.push_str("                _ => {\n");
+                self.emit(output, default);
+                output.push_str("                }\n                }\n");
+            }
+            Br(depth) => {
+                let (is_loop, number) = self.labels[self.labels.len() - 1 - depth];
+                if is_loop {
+                    writeln!(output, "                continue 'l{number};").unwrap();
+                } else {
+                    writeln!(output, "                break 'b{number};").unwrap();
+                }
+            }
+            Leave(_) => output.push_str("                break 'tree;\n"),
+        }
+    }
+}
+
 /// A block body ending in `next_pc = if CONDITION { A } else { B };` with
 /// constant targets: the body before that line, the condition, A and B.
 fn split_conditional(body: &str) -> Option<(&str, &str, u64, u64)> {
@@ -2401,6 +2656,13 @@ fn expand_block(
 /// Code generation choices. The defaults are what the game build uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EmitOptions {
+    /// Emit each split window's entries from its structured tree
+    /// (`crate::structure`): plain loops, ifs and labelled blocks, with
+    /// irreducible parts as local dispatch loops. Every other PC (a block
+    /// resumed after a host boundary, say) still runs through the window's
+    /// per-block dispatch, and every block still ends in the same boundary
+    /// check, so traps, slices and exclusive reservations behave as before.
+    pub structured: bool,
     /// Run common vector float, logic and integer operations as native
     /// code instead of helper calls (`crate::simd::emit_inline`), with the
     /// exact helper still taking every float case its fast path would not.
@@ -2477,6 +2739,23 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
+        // Loop heads are entries too: a loop resumed after a host boundary
+        // comes back into the tree at its next iteration.
+        crate::structure::analyze_windows_with(
+            translation,
+            SPLIT_WINDOW_BITS,
+            crate::structure::StructureOptions {
+                resume_at_loop_heads: true,
+                ..Default::default()
+            },
+        )
+        .into_iter()
+        .map(|analysis| (analysis.window, analysis))
+        .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut windows: Vec<(u64, &[BasicBlock])> = Vec::new();
     let mut first = 0;
     for index in 1..=translation.blocks.len() {
@@ -2522,7 +2801,18 @@ pub fn emit_rust_split_to_with<E>(
         // SVCs, which leave the window: one execute check on entry covers
         // every block run before it returns.
         let mut cases = String::new();
-        emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
+        let structured = trees.get(window).and_then(|analysis| {
+            let tree = analysis.structure.as_ref()?;
+            Some((analysis, tree))
+        });
+        if let Some((analysis, tree)) = structured {
+            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads);
+            // The tree ends every block in a boundary, so a host boundary
+            // can resume at any block: each keeps its own arm.
+            emit_split_cases(&mut cases, blocks, &BTreeSet::new(), &spin_heads);
+        } else {
+            emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
+        }
         writeln!(
             cases,
             "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
@@ -2532,7 +2822,7 @@ pub fn emit_rust_split_to_with<E>(
         // stays inside one window still yields to the host scheduler.
         cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
         let locals = RegisterLocals::of(&cases);
-        writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+        writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
         output.push_str(&locals.load());
         // The blocks run in a nested function so their early returns still
         // pass the final store; it is always inlined, as a closure is not,

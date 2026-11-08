@@ -288,6 +288,14 @@ pub struct StructureOptions {
     /// Make every block an entry, so structured code can resume anywhere
     /// after a host boundary (each becomes a `Dispatch` case at the top).
     pub resume_at_every_block: bool,
+    /// Make the head of every outermost loop in a window an entry, so
+    /// structured code that resumes after a host boundary comes back into
+    /// its loop at the next iteration instead of running the rest of it
+    /// block by block. A loop here is the address span of a backward
+    /// branch inside the window, from its target to the branch; outermost
+    /// means no other such span contains it. Inner loop heads stay out,
+    /// since a second way into an outer loop would make it irreducible.
+    pub resume_at_loop_heads: bool,
 }
 
 impl WindowAnalysis {
@@ -312,7 +320,7 @@ impl WindowAnalysis {
 /// whether the first is a jump rather than a fall-through. Calls continue
 /// at the next instruction; an empty list leaves the window (return,
 /// indirect branch, trap).
-fn block_successors(block: &BasicBlock) -> (Vec<u64>, bool) {
+pub(crate) fn block_successors(block: &BasicBlock) -> (Vec<u64>, bool) {
     let last = block
         .instructions
         .last()
@@ -362,6 +370,8 @@ pub fn analyze_windows_with(
 
     let mut kinds: BTreeMap<u64, EntryKinds> = BTreeMap::new();
     let mut referenced = BTreeSet::new();
+    // Backward branches inside a window: (target, branching block).
+    let mut back_edges: Vec<(u64, u64)> = Vec::new();
     for &entry in &translation.entries {
         if starts.contains_key(&entry) {
             kinds.entry(entry).or_default().translation_entry = true;
@@ -391,6 +401,9 @@ pub fn analyze_windows_with(
             }
             if window_of(successor) == window_of(block.start) {
                 referenced.insert(successor);
+                if successor <= block.start {
+                    back_edges.push((successor, block.start));
+                }
             } else if jumps && index == 0 {
                 kinds.entry(successor).or_default().branch_from_outside = true;
             } else {
@@ -399,6 +412,18 @@ pub fn analyze_windows_with(
         }
     }
     kinds.retain(|pc, _| starts.contains_key(pc));
+    let loop_heads: BTreeSet<u64> = back_edges
+        .iter()
+        .filter(|&&(head, end)| {
+            !back_edges.iter().any(|&(other_head, other_end)| {
+                (other_head, other_end) != (head, end)
+                    && window_of(other_head) == window_of(head)
+                    && other_head <= head
+                    && end <= other_end
+            })
+        })
+        .map(|&(head, _)| head)
+        .collect();
 
     let mut windows: BTreeMap<u64, Vec<&BasicBlock>> = BTreeMap::new();
     for block in &translation.blocks {
@@ -417,7 +442,8 @@ pub fn analyze_windows_with(
                     if !entry.is_control() && !referenced.contains(&block.start) {
                         entry.unreferenced = true;
                     }
-                    entry.resume = options.resume_at_every_block;
+                    entry.resume = options.resume_at_every_block
+                        || (options.resume_at_loop_heads && loop_heads.contains(&block.start));
                     entry.any().then_some((block.start, entry))
                 })
                 .collect();

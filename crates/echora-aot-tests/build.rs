@@ -8,10 +8,20 @@ use echora_lift::codegen::{
 };
 
 /// Codegen options: common vector operations as native code with the
-/// `inline-vector` feature.
+/// `inline-vector` feature, structured emission with `structured`.
 fn options() -> EmitOptions {
     EmitOptions {
         inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
+        structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
+    }
+}
+
+/// The benchmark kernels' options: structured also with
+/// `structured-kernels`, which builds far faster than `structured`.
+fn kernel_options() -> EmitOptions {
+    EmitOptions {
+        structured: std::env::var_os("CARGO_FEATURE_STRUCTURED_KERNELS").is_some(),
+        ..options()
     }
 }
 
@@ -126,7 +136,7 @@ fn kernel_code(out: &mut String) {
         report.unresolved_targets
     );
     assert_eq!(report.jump_tables, 1, "the switch kernel's jump table");
-    let (root, regions) = emit_rust_split_with(&translation, 10, options());
+    let (root, regions) = emit_rust_split_with(&translation, 10, kernel_options());
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");

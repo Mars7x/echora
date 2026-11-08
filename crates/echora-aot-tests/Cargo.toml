@@ -13,6 +13,12 @@ publish.workspace = true
 # (codegen's EmitOptions::inline_vector):
 # `cargo test -p echora-aot-tests --features inline-vector`.
 inline-vector = []
+# Lift every program with structured emission (EmitOptions::structured):
+# `cargo test -p echora-aot-tests --release --features structured`. The
+# generated code is about twice the size, so this build is slow.
+structured = ["structured-kernels"]
+# Only the benchmark kernels, for measuring.
+structured-kernels = []
 
 [dependencies]
 echora-guest.workspace = true

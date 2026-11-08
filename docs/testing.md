@@ -107,6 +107,20 @@ cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --compare /tmp/befor
 The second run prints each kernel's best and median rate before and after,
 with the change. Single runs vary by several percent, so use several runs.
 
+Codegen choices that are off by default have features on `echora-aot-tests`
+that lift with them on: `inline-vector` (common vector operations as native
+code) and `structured` (each window's entries from its structured tree).
+Run the semantic suites with the feature to check a choice
+(`cargo test -p echora-aot-tests --release --features structured`; this one
+builds slowly, as the generated code doubles), and the benchmark with it to
+measure it. `structured-kernels` structures only the benchmark kernels and
+builds quickly:
+
+```
+cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --save /tmp/flat.txt
+cargo bench -p echora-aot-tests --bench kernels --features structured-kernels -- --runs 5 --compare /tmp/flat.txt
+```
+
 CI runs formatting, clippy with warnings denied, and the tests on Linux
 x86-64 and Windows x86-64. Passing CI means the code compiles
 and the tests pass on that host; it says nothing about running the game.
