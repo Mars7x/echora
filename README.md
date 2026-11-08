@@ -33,8 +33,8 @@ Shader support is nearly complete, with 6,058 of the 6,074 shader stages seen
 so far translating, and the launcher works with a mouse, keyboard or
 controller.
 
-Speed is the other big gap. The opening movie plays at about 20 pictures per
-second, against the console's 60, limited by video decoding. Running the
+Speed is the other big gap. The opening movie plays at about 22 to 24 pictures
+per second, against the console's 60, limited by video decoding. Running the
 game's threads on several CPU cores now works in testing and gets through the
 boot about 1.4 to 1.5 times as fast as one core, but it stays off by default
 until longer runs have been checked against single-core ones.

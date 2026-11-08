@@ -24,12 +24,12 @@ to be missing or incomplete.
 ## Performance
 
 - Runs are far below full speed. The console runs the game at 60 frames per
-  second; here the opening movie decodes at about 20 pictures per second.
+  second; here the opening movie decodes at about 22 to 24 pictures per second.
 - By default every guest thread runs on one host thread, which does most of
   the work. `ECHORA_WORKERS` spreads them over up to six host threads, one per
   application core. Those runs no longer crash in testing and get through the
-  boot about 1.4 to 1.5 times as fast, but they are not yet checked through the
-  movie and beyond, so they stay off by default. With fewer than six workers,
+  boot about 1.4 to 1.5 times as fast, but long runs are not yet checked
+  against single-core ones, so they stay off by default. With fewer than six workers,
   threads of different guest cores on one worker compete by strict priority,
   which can starve some of them.
 - The faster code-generation options (`inline-vector`, `direct-calls`,

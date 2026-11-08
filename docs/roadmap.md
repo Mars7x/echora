@@ -18,7 +18,7 @@ when the code for it does.
 | 10. In-game settings | Dropped: settings are changed in the launcher only. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 12. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 13. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie decodes at about 20 pictures per second (`ECHORA_MOVIE_RATE`), with the main CPU thread as the limit. |
+| 13. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie decodes at about 22 to 24 pictures per second (`ECHORA_MOVIE_RATE`), with the main CPU thread as the limit. |
 | 14. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 15. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
