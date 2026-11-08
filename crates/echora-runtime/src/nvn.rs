@@ -1034,6 +1034,24 @@ impl Nvn {
                 };
                 return Ok(true);
             }
+            // nvnTextureGetTextureAddress -> the GPU address of the
+            // texture's storage: its pool's GPU address plus the offset its
+            // builder's SetStorage gave, as for buffers.
+            "nvnTextureGetTextureAddress" => {
+                let texture = self.object(this, "Texture").map_err(invalid)?;
+                let storage = *texture
+                    .builder
+                    .get("Storage")
+                    .ok_or_else(|| stop("Texture has no storage".into()))?;
+                let pool = self.object(storage.x[0], "MemoryPool").map_err(invalid)?;
+                let base = pool
+                    .state
+                    .get("GpuAddress")
+                    .ok_or_else(|| invalid("memory pool has no GPU address".into()))?
+                    .x[0];
+                core.cpu.regs[0] = base + storage.x[1];
+                return Ok(true);
+            }
             // nvn{Buffer,Texture}GetMemoryPool / GetMemoryOffset: the pool and
             // offset given to the builder's SetStorage(pool, offset[, size]).
             "nvnBufferGetMemoryPool"
@@ -1357,6 +1375,17 @@ impl Nvn {
                     self.object(this, "Texture").map_err(invalid)?;
                 }
                 core.cpu.regs[0] = 1;
+                return Ok(true);
+            }
+            // nvnTextureBuilderGetZCullStorageSize (builder) -> size: the
+            // memory that saves and restores the described depth target's
+            // culling state; the application keeps it beside device
+            // integer 54, the alignment of that memory (main+0x244db4).
+            // The host renderer keeps no depth culling state: 0 bytes.
+            // Provisional.
+            "nvnTextureBuilderGetZCullStorageSize" => {
+                self.bag(this, "TextureBuilder").map_err(invalid)?;
+                core.cpu.regs[0] = 0;
                 return Ok(true);
             }
             // nvnTextureBuilderGetStorageSize / GetStorageAlignment (builder)
@@ -3954,6 +3983,11 @@ fn crc32(bytes: &[u8]) -> u32 {
 ///   39 at 0 a flushed range falls outside its buffer, so both act as
 ///   alignments: 256, like the other alignments. 78 showed no effect: 0.
 ///   Provisional.
+/// - 54: queried when the application creates a render target after the
+///   opening movie (main+0x244bdc) and kept with it (+0xe4) as the
+///   alignment of the memory that saves and restores the target's depth
+///   culling state. The host keeps no such state: 256, like the other
+///   alignments. Provisional.
 fn device_integer(property: u32) -> Option<i32> {
     match property {
         39 => Some(256),
@@ -3966,7 +4000,7 @@ fn device_integer(property: u32) -> Option<i32> {
         36 | 37 => Some(0),
         56 | 57 => Some(256),
         42 | 90 => Some(0),
-        4 | 10 | 11 | 12 | 13 | 53 | 111 | 124 | 17 | 18 => Some(256),
+        4 | 10 | 11 | 12 | 13 | 53 | 54 | 111 | 124 | 17 | 18 => Some(256),
         15 | 16 => Some(32),
         19 | 20 => Some(0),
         _ => None,
