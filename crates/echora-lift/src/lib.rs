@@ -30,6 +30,7 @@ pub mod aarch64;
 pub mod codegen;
 pub mod defuse;
 pub mod dispatch;
+pub mod liveness;
 pub mod simd;
 pub mod spin;
 pub mod structure;

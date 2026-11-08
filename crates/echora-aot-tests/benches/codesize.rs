@@ -124,4 +124,7 @@ fn main() {
         );
     }
     let _ = std::fs::remove_dir_all(&scratch);
+    if let Ok(text) = std::fs::read_to_string(Path::new(SOURCES).join("liveness.txt")) {
+        print!("dead writes (echora_lift::liveness): {text}");
+    }
 }

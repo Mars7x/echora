@@ -12,6 +12,16 @@ thread_local! {
     static MODE: std::cell::Cell<Option<EmitOptions>> = const { std::cell::Cell::new(None) };
     /// Guest instructions lifted through split emission so far.
     static LIFTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Dead writes over the programs lifted so far (`echora_lift::liveness`).
+    static DEAD: std::cell::Cell<echora_lift::liveness::DeadWrites> =
+        const { std::cell::Cell::new(echora_lift::liveness::DeadWrites {
+            instructions: 0,
+            flag_writes: 0,
+            dead_flag_writes: 0,
+            register_writes: 0,
+            dead_register_writes: 0,
+            dead_instructions: 0,
+        }) };
 }
 
 /// Codegen options: common vector operations as native code with the
@@ -59,6 +69,17 @@ fn split(
     options: EmitOptions,
 ) -> (String, Vec<(u64, String)>) {
     LIFTED.set(LIFTED.get() + translation.instructions.len());
+    if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
+        let add = echora_lift::liveness::dead_writes(translation);
+        let mut dead = DEAD.get();
+        dead.instructions += add.instructions;
+        dead.flag_writes += add.flag_writes;
+        dead.dead_flag_writes += add.dead_flag_writes;
+        dead.register_writes += add.register_writes;
+        dead.dead_register_writes += add.dead_register_writes;
+        dead.dead_instructions += add.dead_instructions;
+        DEAD.set(dead);
+    }
     emit_rust_split_with(translation, region_bits(), options)
 }
 
@@ -117,6 +138,23 @@ fn codesize(out_dir: &std::path::Path) {
     }
     MODE.set(None);
     std::fs::write(dir.join("modes.txt"), list).expect("write");
+    // Each mode lifted the same programs: one mode's share.
+    let dead = DEAD.get();
+    let per_mode = |count: usize| count / modes.len();
+    std::fs::write(
+        dir.join("liveness.txt"),
+        format!(
+            "{} instructions: {} of {} NZCV writes dead, {} of {} register writes dead, \
+             {} instructions with nothing but dead writes\n",
+            per_mode(dead.instructions),
+            per_mode(dead.dead_flag_writes),
+            per_mode(dead.flag_writes),
+            per_mode(dead.dead_register_writes),
+            per_mode(dead.register_writes),
+            per_mode(dead.dead_instructions),
+        ),
+    )
+    .expect("write");
 }
 
 include!("src/programs.rs");
