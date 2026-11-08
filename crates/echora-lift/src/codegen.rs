@@ -461,7 +461,10 @@ fn jump_table(
     let mut index_copies: Vec<u8> = Vec::new();
     // Registers a select clamps into range against an earlier compare,
     // and whether the compare's limit is itself in range (ls/hi).
-    let mut clamps: Vec<(u8, bool)> = Vec::new();
+    // Registers a select clamps into range against an earlier compare:
+    // (source, whether the compare's limit is itself in range (ls/hi), the
+    // case the out-of-range indices take).
+    let mut clamps: Vec<(u8, bool, u64)> = Vec::new();
     // The tightest bound on the index or any copy of it.
     let bound = |compares: &[(u8, u64)], copies: &[u8]| {
         compares
@@ -584,14 +587,26 @@ fn jump_table(
                 // (`mov wIdx, wN`) often sit above the loop head, after the
                 // compare in this backwards walk, so compares are collected
                 // and matched against the copies at the end.
-                if entry_size != 0 && word & 0x7f80_001f == 0x7100_001f && (word >> 22) & 1 == 0 {
-                    let limit = u64::from((word >> 10) & 0xfff);
+                // The same with the limit in a register (`mov w9, #N; cmp
+                // w0, w9`, the constant from MOVZ/MOVN and MOVKs, ORR with an
+                // immediate or a literal load; see `register_constant`).
+                let limit = if word & 0x7f80_001f == 0x7100_001f && (word >> 22) & 1 == 0 {
+                    Some(u64::from((word >> 10) & 0xfff))
+                } else if word & 0x7f20_fc1f == 0x6b00_001f {
+                    register_constant(read_word, cursor, rm)
+                } else {
+                    None
+                };
+                if entry_size != 0
+                    && let Some(limit) = limit
+                {
                     if let Some(cases) = conditional_bound(read_word, cursor, limit) {
                         compares.push((rn, cases));
-                    } else if let Some(&(_, inclusive)) =
-                        clamps.iter().find(|(register, _)| *register == rn)
+                    } else if let Some(&(_, inclusive, default)) =
+                        clamps.iter().find(|(register, _, _)| *register == rn)
                     {
-                        compares.push((rn, if inclusive { limit + 1 } else { limit }));
+                        let cases = if inclusive { limit + 1 } else { limit };
+                        compares.push((rn, cases.max(default + 1)));
                     }
                     continue;
                 }
@@ -624,15 +639,30 @@ fn jump_table(
                     // `cmp wN, #imm; csel wIdx, wN, wzr, ls` (or lo, or the
                     // operands swapped with hi/hs) keeps wN when it is in
                     // range and takes case 0 otherwise.
+                    // The default case may also be a constant in a register
+                    // (`mov w8, #K; csel wIdx, wN, w8, ls`): then K is one of
+                    // the cases too.
                     if word & 0x7fe0_0c00 == 0x1a80_0000 {
                         let condition = (word >> 12) & 15;
-                        let clamp = match (condition, rn, rm) {
-                            (0b1001, source, 31) | (0b1000, 31, source) => Some((source, true)),
-                            (0b0011, source, 31) | (0b0010, 31, source) => Some((source, false)),
+                        let clamp = match condition {
+                            0b1001 => Some((rn, rm, true)),
+                            0b1000 => Some((rm, rn, true)),
+                            0b0011 => Some((rn, rm, false)),
+                            0b0010 => Some((rm, rn, false)),
                             _ => None,
                         };
-                        if let Some((source, inclusive)) = clamp {
-                            clamps.push((source, inclusive));
+                        let default = |register: u8| {
+                            if register == 31 {
+                                Some(0)
+                            } else {
+                                register_constant(read_word, cursor, register)
+                                    .filter(|&value| value < MAX_JUMP_TABLE_ENTRIES)
+                            }
+                        };
+                        if let Some((source, other, inclusive)) = clamp
+                            && let Some(default) = default(other)
+                        {
+                            clamps.push((source, inclusive, default));
                             index_copies.push(source);
                         }
                     }
@@ -768,6 +798,82 @@ fn hoisted_addresses(
         }
     }
     (!found.is_empty()).then_some(found)
+}
+
+/// The constant register `register` holds at `pc`, from the instruction
+/// before it that last wrote it, within a few dozen instructions: MOVZ or
+/// MOVN with the MOVKs that follow it, ORR with an immediate from the zero
+/// register, or LDR (literal). None for anything else. A wrong value only
+/// misbounds a jump table, which adds or drops roots of that table.
+fn register_constant(read_word: &dyn Fn(u64) -> Option<u32>, pc: u64, register: u8) -> Option<u64> {
+    use crate::aarch64::{LogicalOp, WideOp};
+    // MOVK fields seen so far (in reverse program order): (shift, value).
+    let mut kept: Vec<(u8, u16)> = Vec::new();
+    let finish = |value: u64, bits: u8, kept: &[(u8, u16)]| {
+        let mut value = value;
+        // The earliest MOVK in program order is applied first.
+        for &(shift, field) in kept.iter().rev() {
+            value = (value & !(0xffff << shift)) | (u64::from(field) << shift);
+        }
+        Some(if bits == 32 {
+            value & 0xffff_ffff
+        } else {
+            value
+        })
+    };
+    for step in 1..=32u64 {
+        let at = pc.checked_sub(step * 4)?;
+        let word = read_word(at)?;
+        if written_register(word) != Some(register) {
+            continue;
+        }
+        return match crate::aarch64::decode(word, at) {
+            Instruction::MoveWide {
+                op: WideOp::Keep,
+                immediate,
+                shift,
+                ..
+            } => {
+                kept.push((shift, immediate));
+                continue;
+            }
+            Instruction::MoveWide {
+                op: WideOp::Zero,
+                immediate,
+                shift,
+                bits,
+                ..
+            } => finish(u64::from(immediate) << shift, bits, &kept),
+            Instruction::MoveWide {
+                op: WideOp::Not,
+                immediate,
+                shift,
+                bits,
+                ..
+            } => finish(!(u64::from(immediate) << shift), bits, &kept),
+            Instruction::LogicalImmediate {
+                op: LogicalOp::Orr,
+                rn: 31,
+                bits,
+                mask,
+                ..
+            } => finish(mask, bits, &kept),
+            Instruction::LoadLiteral {
+                bytes,
+                address,
+                signed: false,
+                ..
+            } if kept.is_empty() => match bytes {
+                4 => read_word(address).map(u64::from),
+                8 => {
+                    Some(u64::from(read_word(address)?) | u64::from(read_word(address + 4)?) << 32)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+    None
 }
 
 fn adr_target(word: u32, pc: u64, page: bool) -> u64 {
@@ -4496,6 +4602,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
+    }
+
+    /// Discovers `words` at 0x1000 with `entries` as the table data at
+    /// 0x2010 (signed words relative to 0x2010 when `words_relative`,
+    /// else bytes).
+    fn discover_switch(words: &[u32], entries: &[i64], words_relative: bool) -> Translation {
+        let mut table = vec![0u8; 16];
+        for &entry in entries {
+            if words_relative {
+                table.extend(((entry - 0x2010) as i32).to_le_bytes());
+            } else {
+                table.push(entry as u8);
+            }
+        }
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        discover_with_tables(
+            &[region(words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            64,
+        )
+        .unwrap()
+    }
+
+    const RET: u32 = 0xd65f_03c0;
+
+    #[test]
+    fn jump_table_bounds_come_from_a_register_compare() {
+        let words = [
+            0x5280_0049, // movz w9, #2
+            0x72a0_0009, // movk w9, #0, lsl #16
+            0x6b09_001f, // cmp w0, w9
+            0x5400_0108, // b.hi 0x102c
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            RET,         // 0x1024: case 0
+            RET,         // case 1
+            RET,         // case 2, and the default
+        ];
+        let translation = discover_switch(&words, &[0x1024, 0x1028, 0x102c], true);
+        assert_eq!(translation.jump_tables.get(&0x1020), Some(&3));
+    }
+
+    #[test]
+    fn jump_table_bounds_come_from_a_literal_pool() {
+        let words = [
+            0x1800_0189, // ldr w9, 0x1030 (= 2)
+            0x6b09_001f, // cmp w0, w9
+            0x5400_0108, // b.hi 0x1028
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            RET,         // 0x1020: case 0
+            RET,         // case 1
+            RET,         // case 2, and the default
+            RET,
+            2, // 0x1030: the bound
+        ];
+        let translation = discover_switch(&words, &[0x1020, 0x1024, 0x1028], true);
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
+    }
+
+    #[test]
+    fn jump_table_clamps_to_a_constant_case_include_it() {
+        // cmp w0, #2; mov w8, #3; csel w0, w0, w8, ls: out-of-range indices
+        // take case 3, so the table has four cases.
+        let words = [
+            0x7100_081f, // cmp w0, #2
+            0x5280_0068, // mov w8, #3
+            0x1a88_9000, // csel w0, w0, w8, ls
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a0_5928, // ldrsw x8, [x9, w0, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            RET,         // 0x1020: case 0
+            RET,
+            RET,
+            RET, // 0x102c: case 3, the default
+        ];
+        let translation = discover_switch(&words, &[0x1020, 0x1024, 0x1028, 0x102c], true);
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&4));
+        assert!(translation.instructions.contains_key(&0x102c));
+    }
+
+    #[test]
+    fn jump_tables_of_biased_cases_are_bounded_after_the_bias() {
+        // switch (x) { case 5: case 6: case 7: }: sub w8, w0, #5 before the
+        // compare, and the table indexed by w8.
+        let words = [
+            0x5100_1408, // sub w8, w0, #5
+            0x7100_091f, // cmp w8, #2
+            0x5400_0108, // b.hi 0x1028
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0xb8a8_5928, // ldrsw x8, [x9, w8, uxtw #2]
+            0x8b08_0128, // add x8, x9, x8
+            0xd61f_0100, // br x8
+            RET,         // 0x1020: case 5
+            RET,
+            RET,
+        ];
+        let translation = discover_switch(&words, &[0x1020, 0x1024, 0x1028], true);
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
+    }
+
+    #[test]
+    fn jump_tables_of_bytes_scaled_by_four_reach_their_cases() {
+        let words = [
+            0x7100_081f, // cmp w0, #2
+            0x5400_00e8, // b.hi 0x1020
+            0xb000_0009, // adrp x9, 0x2000
+            0x9100_4129, // add x9, x9, #0x10
+            0x3860_6928, // ldrb w8, [x9, x0]
+            0x1000_008a, // adr x10, 0x1024
+            0x8b08_0948, // add x8, x10, x8, lsl #2
+            0xd61f_0100, // br x8
+            RET,         // 0x1020: the default
+            RET,         // 0x1024: case 0
+            RET,
+            RET,
+        ];
+        let translation = discover_switch(&words, &[0, 1, 2], false);
+        assert_eq!(translation.jump_tables.get(&0x101c), Some(&3));
+        assert!(translation.instructions.contains_key(&0x102c));
     }
 
     #[test]
