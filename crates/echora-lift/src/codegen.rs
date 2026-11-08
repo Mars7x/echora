@@ -321,7 +321,9 @@ const UNBOUNDED_BYTE_TABLE_ENTRIES: u64 = 64;
 /// Entries read from an unsigned halfword table whose bound is not found.
 const UNBOUNDED_HALFWORD_TABLE_ENTRIES: u64 = 128;
 /// How far back from the BR the table setup is searched, in instructions.
-const JUMP_TABLE_WINDOW: u64 = 160;
+/// OoT's vertex-format decoder (main+0x191e3d0) sets its table base 184
+/// instructions before the dispatch, above a long loop body.
+const JUMP_TABLE_WINDOW: u64 = 512;
 
 /// Case targets of a compiler-generated jump table ending in `br` at `pc`:
 ///
@@ -3686,6 +3688,45 @@ mod tests {
         // Without the table only the bound check's default case is reached.
         let without = discover(&[region(&words)], &[0x1000], 64).unwrap();
         assert!(!without.instructions.contains_key(&0x1024));
+    }
+
+    #[test]
+    fn jump_tables_find_setup_hoisted_far_above_the_dispatch() {
+        // As `jump_tables_seed_every_case`, with 300 instructions between
+        // the table address and the bound check.
+        let mut words = vec![0xb000_0010, 0x9100_4210];
+        words.extend([0xd503_201f; 300]);
+        words.extend([
+            0x7100_0a3f,
+            0x5400_00e8,
+            0x7871_7a00,
+            0x1000_0063,
+            0x8b00_0863,
+            0xd61f_0060,
+            0xd65f_03c0,
+            0xd65f_03c0,
+            0xd65f_03c0,
+        ]);
+        let mut table = vec![0u8; 16];
+        table.extend([0, 0, 1, 0, 2, 0]);
+        let data = CodeRegion {
+            name: "rodata".into(),
+            base: 0x2000,
+            bytes: table,
+        };
+        let translation = discover_with_tables(
+            &[region(&words)],
+            &[data],
+            &[0x1000],
+            &[],
+            &BTreeSet::new(),
+            1024,
+        )
+        .unwrap();
+        let first_case = 0x1020 + 300 * 4;
+        for case in [first_case, first_case + 4, first_case + 8] {
+            assert!(translation.instructions.contains_key(&case), "{case:#x}");
+        }
     }
 
     #[test]
