@@ -626,8 +626,13 @@ impl Nvn {
             .map(String::as_str)
     }
 
-    /// A stand-in holding only the entry-point table, while a submission
-    /// running without the machine lock has the real state.
+    /// How many entry point thunks exist (lookups add them).
+    pub fn thunk_count(&self) -> usize {
+        self.thunks.len()
+    }
+
+    /// A stand-in holding only the entry-point table, while workers keep
+    /// the real state behind its own lock (see `Worker::held_nvn_call`).
     pub fn entries_only(&self) -> Self {
         Self {
             hooks: self.hooks.clone(),
