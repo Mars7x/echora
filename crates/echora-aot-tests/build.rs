@@ -77,6 +77,7 @@ fn split_programs(out: &mut String) {
     spin_candidates(out);
     irreducible_candidates(out);
     concurrency_code(out);
+    stress_code(out);
 }
 
 /// With the `codesize` feature: the split programs once per emission mode,
@@ -124,6 +125,10 @@ mod kernels {
     include!("src/kernels.rs");
 }
 
+mod stress {
+    include!("src/stress.rs");
+}
+
 fn region(words: &[u32]) -> CodeRegion {
     CodeRegion {
         name: "synthetic".into(),
@@ -144,6 +149,7 @@ fn module(out: &mut String, name: &str, generated: &str) {
 fn main() {
     println!("cargo::rerun-if-changed=src/programs.rs");
     println!("cargo::rerun-if-changed=src/kernels.rs");
+    println!("cargo::rerun-if-changed=src/stress.rs");
     let mut out = String::new();
     for (name, words) in PROGRAMS {
         let translation = discover(&[region(words)], &[CODE_BASE], 100)
@@ -1401,6 +1407,36 @@ fn concurrency_code(out: &mut String) {
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// The concurrency stress programs of `tests/stress.rs` (`src/stress.rs`).
+fn stress_code(out: &mut String) {
+    let bytes: Vec<u8> = stress::STRESS_WORDS
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let region = CodeRegion {
+        name: "stress".into(),
+        base: stress::STRESS_BASE,
+        bytes,
+    };
+    let entries: Vec<u64> = stress::STRESS_ENTRIES
+        .iter()
+        .map(|(_, offset)| stress::STRESS_BASE + offset)
+        .collect();
+    let translation = discover(&[region], &entries, stress::STRESS_WORDS.len()).expect("stress");
+    let report = translation.report();
+    assert!(
+        report.unsupported.is_empty(),
+        "stress programs must lift completely: {:?}",
+        report.unsupported
+    );
+    let (root, regions) = split(&translation, options());
+    writeln!(out, "pub mod stress_code {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }

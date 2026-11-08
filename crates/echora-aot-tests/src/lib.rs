@@ -29,6 +29,12 @@ pub mod kernels {
     include!("kernels.rs");
 }
 
+/// The concurrency stress programs (`tests/stress.rs`), lifted as
+/// `stress_code`.
+pub mod stress {
+    include!("stress.rs");
+}
+
 pub struct Machine {
     pub memory: Memory,
     pub core: Core,
