@@ -816,18 +816,7 @@ impl Machine {
                 return Ok(false);
             }
             let now = std::time::Instant::now();
-            // ECHORA_WALL_SECONDS=N: an idle guest (every thread waiting,
-            // only timers left) ends the run as a budget stop after N host
-            // seconds, so the report shows what it waits on.
-            static WALL_LIMIT: std::sync::OnceLock<Option<std::time::Instant>> =
-                std::sync::OnceLock::new();
-            let limit = WALL_LIMIT.get_or_init(|| {
-                std::env::var("ECHORA_WALL_SECONDS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(|seconds| now + std::time::Duration::from_secs(seconds))
-            });
-            if limit.is_some_and(|limit| now >= limit) {
+            if idle_wall_limit_passed() {
                 return Err(Trap::Budget {
                     pc: self.core.cpu.pc,
                     steps: self.core.steps,
@@ -4363,6 +4352,22 @@ impl Machine {
     }
 }
 
+/// ECHORA_WALL_SECONDS=N: an idle guest (every thread waiting, only timers
+/// left) ends the run as a budget stop once N host seconds have passed since
+/// the guest first went idle, so the report shows what it waits on.
+fn idle_wall_limit_passed() -> bool {
+    static WALL_LIMIT: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    WALL_LIMIT
+        .get_or_init(|| {
+            std::env::var("ECHORA_WALL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| now + std::time::Duration::from_secs(seconds))
+        })
+        .is_some_and(|limit| now >= limit)
+}
+
 /// What the workers of a parallel run share.
 struct Shared<'a> {
     machine: std::sync::Mutex<&'a mut Machine>,
@@ -4557,6 +4562,14 @@ impl Worker {
                                 machine,
                                 Trap::NoRunnableThreads { waiting_threads },
                             );
+                        }
+                        if everyone_parked && !elsewhere && idle_wall_limit_passed() {
+                            machine.parked_workers -= 1;
+                            let trap = Trap::Budget {
+                                pc: machine.core.cpu.pc,
+                                steps: machine.core.steps,
+                            };
+                            return self.stop(shared, machine, trap);
                         }
                         self.swap_out(&mut machine, false);
                         let wait = deadline
