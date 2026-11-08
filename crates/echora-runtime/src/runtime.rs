@@ -1739,45 +1739,114 @@ impl Machine {
         }
     }
 
-    /// The runnable thread after `after` in id order (wrapping). Threads
-    /// backing off from a spin-wait are passed over while any other
-    /// thread is runnable.
-    fn next_runnable_thread(&self, after: u64, exclude: Option<u64>) -> Option<u64> {
-        let main =
-            (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
+    /// Each runnable thread this worker may run now (not `exclude`, not
+    /// running elsewhere), with its home core here: `visit(id, home)` until
+    /// it returns false. The worker, its cores and the holds are worked out
+    /// once per call, not per thread.
+    fn for_each_schedulable(&self, exclude: Option<u64>, visit: &mut dyn FnMut(u64, u8) -> bool) {
         // With several workers each runs a fixed set of the application
         // cores (see `worker_guest_cores`), as on Horizon: only threads
-        // whose affinity mask names one of them, the best (lowest) priority
-        // first. A thread pinned to one core then always runs on one worker
-        // and never migrates, which the game's per-core data relies on. A
-        // mask naming no application core is allowed anywhere.
-        // ECHORA_ANY_CORE / ECHORA_FLAT_PRIORITY (diagnostics): schedule as
-        // one worker does, ignoring affinity or priority.
-        // ECHORA_PARALLEL_THREADS=ID,... (diagnostic): only those threads run
-        // on worker 1, all others on worker 0. Read once: this runs at
-        // every scheduling decision.
-        let (any_core, flat_priority, one_core, split) = Self::scheduler_flags();
-        let (any_core, flat_priority, one_core) = (*any_core, *flat_priority, *one_core);
+        // whose affinity mask names one of them. A thread pinned to one
+        // core then always runs on one worker and never migrates, which the
+        // game's per-core data relies on. A mask naming no application core
+        // is allowed anywhere.
+        // ECHORA_ANY_CORE (diagnostic): schedule as one worker does,
+        // ignoring affinity. ECHORA_ONE_CORE: every thread on worker 0.
+        // ECHORA_PARALLEL_THREADS=ID,... (diagnostic): only those threads
+        // run on worker 1, all others on worker 0.
+        let (any_core, _, one_core, split) = Self::scheduler_flags();
+        let worker_cores = self.worker_core.map(|core| self.worker_guest_cores(core));
+        let mask_of = |id: u64| -> u64 {
+            if id == self.layout.main_thread_id {
+                Some(self.main_thread_affinity.1)
+            } else {
+                self.threads.affinity(id).map(|(_, mask)| mask)
+            }
+            .unwrap_or(u64::MAX)
+        };
         let allowed = |id: u64| -> bool {
-            if one_core {
+            if *one_core {
                 return self.worker_core.is_none_or(|core| core == 0);
             }
             if let (Some(list), Some(worker)) = (split, self.worker_core) {
                 return list.contains(&id) == (worker == 1);
             }
-            let Some(core) = self.worker_core.filter(|_| !any_core) else {
+            let Some(cores) = worker_cores.filter(|_| !any_core) else {
                 return true;
             };
-            let mask = if id == self.layout.main_thread_id {
-                Some(self.main_thread_affinity.1)
-            } else {
-                self.threads.affinity(id).map(|(_, mask)| mask)
-            }
-            .unwrap_or(u64::MAX);
-            mask & APPLICATION_CORES == 0 || mask & self.worker_guest_cores(core) != 0
+            let mask = mask_of(id);
+            mask & APPLICATION_CORES == 0 || mask & cores != 0
         };
+        // A worker serving several guest cores runs each core's best
+        // priority in turn (see `next_runnable_thread`); the diagnostics
+        // above keep one group.
+        let cores = self.scheduled_guest_cores();
+        let folded = cores.count_ones() > 1;
+        // A thread holding a core (dispatch disabled) runs only there, and
+        // nothing else runs on a core held by a runnable holder.
+        let any_hold = self.core_hold.iter().any(Option::is_some);
+        let held_at = |id: u64| -> Option<u8> {
+            if !any_hold {
+                return None;
+            }
+            (0..64u8).find(|&core| self.core_hold[usize::from(core)] == Some(id))
+        };
+        // As `guest_core_on_worker`, with this worker's cores worked out.
+        let home = |id: u64, held: Option<u8>| -> u8 {
+            if !folded {
+                return 0;
+            }
+            held.unwrap_or_else(|| {
+                let mask = mask_of(id);
+                let usable = if mask & cores != 0 {
+                    mask & cores
+                } else if mask & APPLICATION_CORES != 0 {
+                    mask & APPLICATION_CORES
+                } else {
+                    cores
+                };
+                usable.trailing_zeros() as u8
+            })
+        };
+        let holding = |id: u64| -> bool {
+            self.thread_state(id) == Some(ThreadState::Runnable) && !self.running.contains(&id)
+        };
+        let main =
+            (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
+        for id in main.into_iter().chain(self.threads.runnable_ids()) {
+            if exclude == Some(id) || self.running.contains(&id) {
+                continue;
+            }
+            let held = held_at(id);
+            // A core's holder runs there even if its mask has moved on
+            // since: it migrates once it ends a slice with dispatch enabled.
+            let held_here = held.is_some_and(|held| cores & 1 << held != 0);
+            if !(allowed(id) || held_here) {
+                continue;
+            }
+            let core = home(id, held);
+            let hold_allows = !any_hold
+                || if held.is_some() {
+                    held_here
+                } else {
+                    !self.core_hold[usize::from(core) % 64].is_some_and(|holder| holding(holder))
+                };
+            if hold_allows && !visit(id, core) {
+                return;
+            }
+        }
+    }
+
+    /// The runnable thread after `after` in id order (wrapping). Threads
+    /// backing off from a spin-wait are passed over while any other
+    /// thread is runnable.
+    fn next_runnable_thread(&self, after: u64, exclude: Option<u64>) -> Option<u64> {
+        // The best (lowest) priority first, per guest core.
+        // ECHORA_FLAT_PRIORITY (diagnostic): schedule as one worker does,
+        // ignoring priority.
+        let (_, flat_priority, _, _) = Self::scheduler_flags();
         let priority = |id: u64| -> u8 {
-            if self.worker_core.is_none() || flat_priority {
+            if self.worker_core.is_none() || *flat_priority {
                 return 0;
             }
             if id == self.layout.main_thread_id {
@@ -1792,54 +1861,31 @@ impl Machine {
         // a worse-priority thread on another forever. Slice ends rotate to
         // the next core with work after `after`'s. With one core per worker
         // (W=6) every thread shares the worker's core and this is strict
-        // priority as before; the diagnostics above keep one group.
+        // priority as before.
+        // (id, home core, priority, backing off from a spin)
+        let mut candidates: Vec<(u64, u8, u8, bool)> = Vec::new();
+        self.for_each_schedulable(exclude, &mut |id, core| {
+            let spinning = self
+                .spin_backoff
+                .get(&id)
+                .is_some_and(|until| *until > self.core.steps);
+            candidates.push((id, core, priority(id), spinning));
+            true
+        });
+        if candidates.is_empty() {
+            return None;
+        }
         let cores = self.scheduled_guest_cores();
-        // A thread holding a core (dispatch disabled) runs only there.
-        let held_at = |id: u64| -> Option<u8> {
-            (0..64u8).find(|&core| self.core_hold[usize::from(core)] == Some(id))
-        };
         let home = |id: u64| -> u8 {
             match self.worker_core {
-                Some(core) if cores.count_ones() > 1 => {
-                    held_at(id).unwrap_or_else(|| self.guest_core_on_worker(id, core))
-                }
+                Some(core) if cores.count_ones() > 1 => self
+                    .core_hold
+                    .iter()
+                    .position(|hold| *hold == Some(id))
+                    .map_or_else(|| self.guest_core_on_worker(id, core), |held| held as u8),
                 _ => 0,
             }
         };
-        let holding = |id: u64| -> bool {
-            self.thread_state(id) == Some(ThreadState::Runnable) && !self.running.contains(&id)
-        };
-        // Whether `id` may run here as far as holds go: a holder only on its
-        // core, and nothing else on a core held by a runnable holder.
-        let hold_allows = |id: u64, core: u8| -> bool {
-            if self.core_hold.iter().all(Option::is_none) {
-                return true;
-            }
-            if let Some(held) = held_at(id) {
-                return cores & 1 << held != 0;
-            }
-            !self.core_hold[usize::from(core) % 64].is_some_and(|holder| holding(holder))
-        };
-        // (id, home core, priority, backing off from a spin)
-        let candidates: Vec<(u64, u8, u8, bool)> = main
-            .into_iter()
-            .chain(self.threads.runnable_ids())
-            // A core's holder runs there even if its mask has moved on
-            // since: it migrates once it ends a slice with dispatch enabled.
-            .filter(|&id| {
-                exclude != Some(id)
-                    && !self.running.contains(&id)
-                    && (allowed(id) || held_at(id).is_some_and(|held| cores & 1 << held != 0))
-            })
-            .map(|id| {
-                let spinning = self
-                    .spin_backoff
-                    .get(&id)
-                    .is_some_and(|until| *until > self.core.steps);
-                (id, home(id), priority(id), spinning)
-            })
-            .filter(|&(id, core, _, _)| hold_allows(id, core))
-            .collect();
         let mut best = [u8::MAX; 64];
         for &(_, core, priority, _) in &candidates {
             let slot = &mut best[usize::from(core) % 64];
@@ -1912,24 +1958,44 @@ impl Machine {
         };
         let main =
             (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
-        let waiting: Vec<(u8, u64)> = main
-            .into_iter()
-            .chain(self.threads.runnable_ids())
-            .filter(|id| !self.running.contains(id) && *id != self.core.current_thread_id)
-            .map(|id| (priority(self, id), mask(self, id)))
-            .collect();
-        for (core, thread) in self.core_threads.clone().into_iter().enumerate() {
+        // The best priority waiting for each application core, in one pass
+        // over the threads no worker runs (a mask naming no application core
+        // waits for every one of them).
+        let mut best = [u8::MAX; 64];
+        for id in main.into_iter().chain(self.threads.runnable_ids()) {
+            if self.running.contains(&id) || id == self.core.current_thread_id {
+                continue;
+            }
+            let (waiting, mask) = (priority(self, id), mask(self, id));
+            let cores = if mask & APPLICATION_CORES == 0 {
+                APPLICATION_CORES
+            } else {
+                mask & APPLICATION_CORES
+            };
+            let mut bits = cores;
+            while bits != 0 {
+                let core = bits.trailing_zeros() as usize;
+                best[core] = best[core].min(waiting);
+                bits &= bits - 1;
+            }
+        }
+        for core in 0..self.core_threads.len() {
             // This worker's own core was just scheduled.
             if self.worker_core == Some(core as u8) {
                 continue;
             }
-            let Some(thread) = thread else { continue };
+            let Some(thread) = self.core_threads[core] else {
+                continue;
+            };
             let running = priority(self, thread);
-            let wanted = waiting.iter().any(|&(waiting, mask)| {
-                waiting < running
-                    && (mask & APPLICATION_CORES == 0
-                        || mask & self.worker_guest_cores(core as u8) != 0)
-            });
+            // A better priority waits for one of the worker's cores.
+            let mut bits = self.worker_guest_cores(core as u8);
+            let mut wanted = false;
+            while bits != 0 {
+                let guest = bits.trailing_zeros() as usize;
+                wanted |= best[guest] < running;
+                bits &= bits - 1;
+            }
             if wanted {
                 if let Some(flag) = self.preempt_flags.get(core) {
                     if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2061,7 +2127,13 @@ impl Machine {
             }
             self.worker_core = Some(worker as u8);
             let exclude = self.keeps_running.filter(|&id| id == current);
-            if self.next_runnable_thread(current, exclude).is_some() {
+            // Whether next_runnable_thread would find one: any will do.
+            let mut found = false;
+            self.for_each_schedulable(exclude, &mut |_, _| {
+                found = true;
+                false
+            });
+            if found {
                 workers |= 1 << worker;
             }
         }
