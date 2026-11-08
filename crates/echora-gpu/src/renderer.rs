@@ -190,6 +190,7 @@ pub struct Renderer {
     /// Bytes `shared` pins in host memory (udmabuf pins its pages).
     pub shared_bytes: u64,
     /// /dev/udmabuf, opened on first use; None after it failed to open.
+    #[cfg(target_os = "linux")]
     udmabuf: Option<Option<std::fs::File>>,
     /// Spans that could not be shared: not tried again.
     shared_refused: std::collections::HashSet<(u64, u64)>,
@@ -447,6 +448,7 @@ impl Renderer {
             import_refused: Default::default(),
             shared: Vec::new(),
             shared_bytes: 0,
+            #[cfg(target_os = "linux")]
             udmabuf: None,
             shared_refused: Default::default(),
             retired_shared: Vec::new(),
