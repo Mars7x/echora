@@ -1,37 +1,38 @@
 # Roadmap
 
-Each phase completes only on the evidence named here, not when code exists.
+Each phase counts as done only when the evidence named for it exists, not
+when the code for it does.
 
-| Phase | Completion evidence | State |
+| Phase | Done when | State |
 |---|---|---|
-| 0. Reuse audit | Reuse matrix and architecture decision ([research](research.md)). | Done 2026-11-06. |
-| 1. Repository and portable foundation | Workspace builds; tests pass on Linux and Windows CI. | Done 2026-11-06. |
-| 2. Content processing | The supplied NUP is validated, inventoried and its ExeFS cached without manual extraction; NUP and directory input normalize identically. | Done for the checked input. RomFS base/update overlay not yet needed. |
-| 3. Compiler foundation | Synthetic guest functions translated and executed natively with verified semantics; missing-block reports. | Done 2026-11-06. Synthetic programs run natively on Linux and Windows; the whole game (17.3M instructions, 96.6% of `main`'s text discovered) is translated and runs on Linux. |
-| 4. Guest runtime | Translated startup reaches a recorded runtime milestone. | Done 2026-11-06. Translated startup runs through boot, the system services and GPU setup to presented frames; runs end with a JSON report. |
-| 5. Graphics and resolution foundations | Synthetic workloads at arbitrary sizes; safe resizes. | In progress. NVN runs on Vulkan with shaders translated to SPIR-V; the internal render scale from the settings is applied. The resolution planner is not yet connected to the renderer. |
-| 6. First real game frame | A correct game-generated frame. | In progress. The title logo and the intro movie render; frames are checked from captures (`ECHORA_CAPTURE_EVERY`). |
-| 7. Input, audio, interactive gameplay | Interactive scene with graphics, input and audio. | In progress. Keyboard and gamepad input reach the game and its audio plays (`ECHORA_AUDIO=1`); gameplay has not been reached. |
-| 8. Native resolution support | Internal render size verified at several arbitrary resolutions. | — |
-| 9. Launcher (GPUI) | Launcher configures and starts Echora; exposed settings work. | In progress. Installs the game, edits and saves the settings, starts the game, and works with mouse, keyboard and controllers. Play starts the game with its window and sound. |
-| 10. In-game settings | Dropped: settings are changed in the launcher, with no in-game interface. | — |
-| 11. Full-game compatibility | The game can be completed without known major failures. | — |
-| 12. High frame rates | No timing, physics or animation regressions. | — |
-| 13. Performance | Reproducible benchmarks show gains without regressions. | In progress. Speed is measured by movie pictures decoded per second (`ECHORA_MOVIE_RATE`), about 20 once the movie plays, with frames checked against baseline captures. Done so far: contiguous texture swizzling, compute storage on the GPU, guest memory imported into Vulkan, unwaited frame submits, host zstd, shorter scheduler slices, spin-wait handoff, vector FP fast paths, rav1d's assembly kernels. Code-generation benchmarks without the game: `cargo bench -p echora-aot-tests --bench kernels`. `ECHORA_GPU_TIME=1` prints GPU busy time against wall time: during the movie the GPU is busy about 40% of the time and the CPU's main thread is the limit. Several workers are not yet stable. |
-| 14. Other platforms | Real game code on another OS or CPU without core rewrites. | — |
-| 15. Release quality | Clean build, configure, launch with user-supplied data. | — |
+| 0. Reuse audit | The reuse matrix and architecture decision are written ([research](research.md)). | Done 2026-11-06. |
+| 1. Portable foundation | The workspace builds and its tests pass in CI on Linux and Windows. | Done 2026-11-06. |
+| 2. Content processing | The NUP is validated and inventoried, and its ExeFS cached, without manual extraction; NUP and folder input give the same result. | Done for the supported input. Overlaying update RomFS on a base is not needed yet. |
+| 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.3 million instructions) is translated and runs on Linux. |
+| 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
+| 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with translated shaders, and the internal render scale is applied; the resolution planner is not connected yet. |
+| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06. The title screen and the opening movie render correctly. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie, but no scene is drawn yet. |
+| 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
+| 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
+| 10. In-game settings | Dropped: settings are changed in the launcher only. | — |
+| 11. Full-game compatibility | The game can be completed without known major failures. | Not started. |
+| 12. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
+| 13. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie decodes at about 20 pictures per second (`ECHORA_MOVIE_RATE`), with the main CPU thread as the limit. |
+| 14. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
+| 15. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
 ## Next steps
 
-1. Reach the first gameplay scene after the New Game movie and check what
-   it draws, mesh and task pipelines included.
-2. Translate the last 16 failing shader stages (per-tap gathers with
-   offsets that are not provably constant, one return linkage mode).
-3. Make several workers stable (`ECHORA_WORKERS`): runs crash once the
-   game's per-core job threads run in parallel, which looks like one job
-   claimed by two threads. This is the largest speed gain available.
+1. Reach the first gameplay scene after the New Game movie and check what it
+   draws, including the mesh and task pipelines.
+2. Translate the last 16 failing shader stages.
+3. Make multi-core runs stable (`ECHORA_WORKERS`). They crash once the game's
+   per-core job threads run in parallel, which looks like one job claimed by
+   two threads. This is the largest speed gain available.
 4. Turn on the faster code generation in game builds once it is checked in
-   game: inline vector arithmetic, structured control flow and direct calls.
-5. Cut the first build from about an hour: full optimisation only for the
-   hot code a profile finds, leaner generated code, and more parallel
-   compiler jobs.
+   game: inline vector arithmetic first, then structured control flow and
+   direct calls once they measure faster.
+5. Shorten the first build from about an hour: leaner generated code (about
+   a third smaller in tests so far), full optimisation only for the hot code a
+   profile finds, and more parallel compiler jobs.

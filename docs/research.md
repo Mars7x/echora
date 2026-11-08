@@ -56,7 +56,8 @@ confirmed against Echora's own runs rather than assumed:
 Confirmed in Echora so far: ZBIC segments in `main` (see below), symbol
 tables reached only through `DT_GNU_HASH`, and AV1 for the intro movie
 (decoded with rav1d). The mesh and task pipelines are translated by the
-shader recompiler but not yet drawn.
+shader recompiler and drawn through `VK_EXT_mesh_shader`, not yet checked
+against the console's output.
 
 ## ZBIC format
 

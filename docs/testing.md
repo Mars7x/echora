@@ -13,7 +13,7 @@
 | `echora-aot-tests` | Programs lifted at build time and executed natively: CRC32/CRC32C against zlib-derived values, MRS/MSR NZCV, FP across-lane reductions with NaNs and signed zeros, CASP (X and W forms, aliasing, misalignment), SABAL/UABDL, UDOT/SDOT against independently computed results, integer and flag results, call/return with and without PAuth hints, step budget, unsupported system registers, undiscovered indirect targets, calls across dispatch windows and holes inside them, CAS/LDADD at every width including register aliasing and SP forms, load/store-exclusive loops and monitor clearing, LDAR/LDAPR/STLR, alignment faults, and a store to an unmapped page ending the process with the guest address (in a child process with core dumps disabled). Also the semantic differential tests below. |
 | `echora-resolution` | Non-integer scales, internal resolution independent of output, exact-size aspect checks, ultrawide pillarboxing and view expansion (21:9, 32:9), 16:10, seamless viewport tiling at 1366x768, fixed versus screen-relative targets, change impact, degenerate sizes. |
 | `echora-config` | Round trip, partial files, unknown-field and range rejection, future schema rejection, change classification, requested-versus-effective resolution, atomic save. |
-| `echora-runtime` | 265 tests: IPC framing and the system services, threads, scheduling and synchronization, NPDM capabilities, content metadata and RomFS, file systems, display and HID, the NVIDIA driver, NVN formats and SASS program lengths, the audio renderer, AV1 decoding, logging. |
+| `echora-runtime` | IPC framing and the system services, threads, scheduling and synchronization, NPDM capabilities, content metadata and RomFS, file systems, display and HID, the NVIDIA driver, NVN formats and SASS program lengths, the audio renderer, AV1 decoding, logging. |
 | `echora-gpu` | Vulkan on the host's driver: a triangle draw, a compute dispatch into a storage buffer, whole and partial clears read back; the shader library's ABI layout and short-program rejection; loop guards on SPIR-V; rational resolution scales and aspect-preserving presentation. |
 | `echora-launcher` | Installing a file or dump and reinstalling in place; an install that outlives its renamed and deleted source; the free-space message; accepting only the supported build; (ignored, with `ECHORA_TEST_NUP`) installing the real game without copying; reading `echora prepare`'s progress lines and the progress bar's weighting; GNOME button layouts; resize edges; directional focus (in-line preference, returning where a move came from); the spring curve; series titles. |
 | `echora` | `prepare`: counting built region crates from cargo's messages, when a translation counts as prepared (its runner, and no other build's stamp), build jobs. |
@@ -112,7 +112,7 @@ that lift with them on: `inline-vector` (common vector operations as native
 code) and `structured` (each window's entries from its structured tree).
 Run the semantic suites with the feature to check a choice
 (`cargo test -p echora-aot-tests --release --features structured`; this one
-builds slowly, as the generated code doubles), and the benchmark with it to
+builds more slowly than the flat default), and the benchmark with it to
 measure it. `structured-kernels` structures only the benchmark kernels and
 builds quickly:
 
@@ -135,6 +135,6 @@ build (an rlib at `opt-level` 1 with 16 codegen units) and prints the
 bytes of Rust per guest instruction and the compile time. Compiling every
 mode takes several minutes, so pass a mode to measure only that one.
 
-CI runs formatting, clippy with warnings denied, and the tests on Linux
-x86-64 and Windows x86-64. Passing CI means the code compiles
-and the tests pass on that host; it says nothing about running the game.
+CI runs formatting, Clippy with warnings denied, and the tests on Linux
+x86-64 and Windows x86-64. Passing CI means the code compiles and the tests
+pass on those hosts; it says nothing about running the game.
