@@ -1220,6 +1220,14 @@ fn switch_code(out: &mut String) {
         PROGRAMS,
         "every switch's table must be recovered"
     );
+    // No indirect branch looks like a table dispatch that was missed.
+    let dispatches = echora_lift::dispatch::audit(&translation);
+    assert_eq!(
+        echora_lift::dispatch::unrecovered(&dispatches).count(),
+        0,
+        "{}",
+        echora_lift::dispatch::report(&translation, &dispatches)
+    );
     let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod switch_code {{").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
