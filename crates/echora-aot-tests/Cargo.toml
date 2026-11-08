@@ -53,6 +53,10 @@ name = "kernels"
 harness = false
 
 [[bench]]
+name = "lock"
+harness = false
+
+[[bench]]
 name = "codesize"
 harness = false
 required-features = ["codesize"]

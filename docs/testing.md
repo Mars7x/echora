@@ -109,6 +109,20 @@ cargo bench -p echora-aot-tests --bench kernels -- --runs 5 --compare /tmp/befor
 The second run prints each kernel's best and median rate before and after,
 with the change. Single runs vary by several percent, so use several runs.
 
+The cost of the runtime's one machine lock across workers is modelled by a
+third benchmark, without the runtime or the game:
+
+```
+cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6] [--slice N] [--hold US] [--fast F]]
+```
+
+W workers on host threads run the arith kernel in `--slice`-instruction
+slices and take one shared mutex for `--hold` microseconds at each slice
+end, except on a `--fast` share of them (part 3 of
+`docs/multicore-review.md`). It prints the aggregate guest rate, the
+speedup over one worker and the shares of time running, waiting for the
+lock and holding it.
+
 Codegen choices that are off by default have features on `echora-aot-tests`
 that lift with them on: `inline-vector` (common vector operations as native
 code) and `structured` (each window's entries from its structured tree).

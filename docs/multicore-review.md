@@ -361,6 +361,16 @@ RwLock read, without the machine lock.
 Lock order, to avoid deadlocks: scheduler → handles → services → NVN →
 memory layout (read). Memory layout writes take nothing else while held.
 
+### A model of the effect
+
+`cargo bench -p echora-aot-tests --bench lock` models this without the
+game: workers on host threads run the arith kernel and hold one mutex for
+10 us at each 50,000-instruction slice end, about 40% of a single
+worker's time. On four host CPUs it saturates at 1.5x from three workers
+on, as the game's intro does at six (1.4-1.5x). Making 80% of slice ends
+lock-free (`--fast 0.8`, item 2) gives 3.5x at four workers. Shorter holds
+(`--hold`) model items 1, 3 and 4.
+
 ### Expected effect
 
 If step 0 confirms the estimates, items 1 and 2 remove roughly half to
