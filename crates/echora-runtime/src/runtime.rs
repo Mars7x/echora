@@ -256,6 +256,11 @@ pub struct Machine {
     process_exit_requested: bool,
     process_exit_reason: Option<&'static str>,
     context_switches: u64,
+    /// ECHORA_CHECK_CONTEXTS (diagnostic): per thread, the sequence numbers
+    /// of its last context save and last dispatch. A dispatch whose saved
+    /// context is older than its previous dispatch resumes a stale snapshot.
+    context_sequence: std::collections::HashMap<u64, (u64, u64)>,
+    context_counter: u64,
     thread_exits: u64,
     last_context_switch: Option<ContextSwitch>,
     random_entropy: Option<[u64; 4]>,
@@ -381,6 +386,8 @@ impl Machine {
             process_exit_requested: false,
             process_exit_reason: None,
             context_switches: 0,
+            context_sequence: Default::default(),
+            context_counter: 0,
             thread_exits: 0,
             last_context_switch: None,
             random_entropy: None,
@@ -1856,8 +1863,37 @@ impl Machine {
         }
     }
 
+    fn note_context_saved(&mut self, id: u64) {
+        if crate::nvn::debug_var_os("ECHORA_CHECK_CONTEXTS").is_some() {
+            self.context_counter += 1;
+            self.context_sequence.entry(id).or_default().0 = self.context_counter;
+        }
+    }
+
+    fn note_context_dispatched(&mut self, id: u64) {
+        if crate::nvn::debug_var_os("ECHORA_CHECK_CONTEXTS").is_none() {
+            return;
+        }
+        self.context_counter += 1;
+        let counter = self.context_counter;
+        let entry = self.context_sequence.entry(id).or_default();
+        if entry.1 > entry.0 {
+            eprintln!(
+                "stale dispatch: thread {id} saved at {} but last dispatched at {} (worker {:?}, from thread {}, pc {:#x}, steps {})",
+                entry.0,
+                entry.1,
+                self.worker_core,
+                self.core.current_thread_id,
+                self.core.cpu.pc,
+                self.core.steps
+            );
+        }
+        entry.1 = counter;
+    }
+
     fn prepare_dispatch_cpu(&mut self, id: u64) -> Result<Cpu, Trap> {
         let cpu = self.saved_thread_cpu(id)?;
+        self.note_context_dispatched(id);
         let synchronization_return = self.synchronization_waits.pending_return(id);
         if let Some(completed) = synchronization_return {
             if self.mutex_waits.pending_return(id).is_some()
@@ -1937,9 +1973,11 @@ impl Machine {
                 .transpose()?;
             if waiting == self.layout.main_thread_id {
                 self.main_saved_cpu = Some(self.core.cpu.clone());
+                self.note_context_saved(self.layout.main_thread_id);
                 self.main_thread_state = ThreadState::Waiting;
             } else {
                 self.threads.block_wait(waiting, &self.core.cpu)?;
+                self.note_context_saved(waiting);
             }
             self.pending_synchronization_wait = None;
             self.synchronization_waits_started =
@@ -1968,9 +2006,11 @@ impl Machine {
                 .transpose()?;
             if waiting == self.layout.main_thread_id {
                 self.main_saved_cpu = Some(self.core.cpu.clone());
+                self.note_context_saved(self.layout.main_thread_id);
                 self.main_thread_state = ThreadState::Waiting;
             } else {
                 self.threads.block_wait(waiting, &self.core.cpu)?;
+                self.note_context_saved(waiting);
             }
             self.pending_mutex_wait = None;
             self.mutex_waits_started = self.mutex_waits_started.saturating_add(1);
@@ -2032,6 +2072,7 @@ impl Machine {
                     self.release_main_thread_tls()?;
                 }
                 self.main_saved_cpu = Some(self.core.cpu.clone());
+                self.note_context_saved(self.layout.main_thread_id);
                 self.main_thread_state = ThreadState::Terminated;
             } else {
                 self.threads
@@ -2084,9 +2125,11 @@ impl Machine {
             if self.thread_state(self.core.current_thread_id) == Some(ThreadState::Runnable) {
                 if self.core.current_thread_id == self.layout.main_thread_id {
                     self.main_saved_cpu = Some(self.core.cpu.clone());
+                    self.note_context_saved(self.layout.main_thread_id);
                 } else {
                     self.threads
                         .save_cpu(self.core.current_thread_id, &self.core.cpu)?;
+                    self.note_context_saved(self.core.current_thread_id);
                 }
             }
             return Err(Trap::NoRunnableThreads {
@@ -2118,9 +2161,11 @@ impl Machine {
         let cpu = self.prepare_dispatch_cpu(next)?;
         if self.core.current_thread_id == self.layout.main_thread_id {
             self.main_saved_cpu = Some(self.core.cpu.clone());
+            self.note_context_saved(self.layout.main_thread_id);
         } else {
             self.threads
                 .save_cpu(self.core.current_thread_id, &self.core.cpu)?;
+            self.note_context_saved(self.core.current_thread_id);
         }
         self.commit_context_switch(next, cpu, "completed_block_round_robin");
         Ok(())
@@ -3994,35 +4039,18 @@ impl Machine {
                         ),
                     });
                 }
-                // The memory model unmaps whole mappings: the parts outside
-                // the range are copied out, the mapping is unmapped, and those
-                // parts are mapped again with their contents.
-                let kept: Vec<(u64, u64)> = [
-                    (mapping.base, address.saturating_sub(mapping.base)),
-                    (end, next.saturating_sub(end)),
-                ]
-                .into_iter()
-                .filter(|&(base, size)| size != 0 && base >= mapping.base)
-                .collect();
-                let mut saved = Vec::new();
-                for &(base, size) in &kept {
-                    let mut bytes = vec![0u8; size as usize];
-                    self.memory.read(base, &mut bytes)?;
-                    saved.push(bytes);
+                // Only the covered part goes. Changing its permissions splits
+                // it from the parts outside the range without touching their
+                // host mappings: other threads keep using those while this
+                // runs (copying them out and mapping them again lost their
+                // writes and faulted their reads meanwhile).
+                let start = mapping.base.max(address);
+                let stop = next.min(end);
+                if start != mapping.base || stop != next {
+                    self.memory.set_permissions(start, stop - start, READ)?;
                 }
-                self.memory.unmap_exact(mapping.base, mapping.size)?;
-                self.physical_size -= mapping.size;
-                for (&(base, size), bytes) in kept.iter().zip(&saved) {
-                    self.memory
-                        .map(base, size, READ | WRITE, STATE_NORMAL, PHYSICAL_LABEL)?;
-                    self.physical_size += size;
-                    // All-zero pages stay untouched (and non-resident).
-                    for (index, page) in bytes.chunks(PAGE_SIZE as usize).enumerate() {
-                        if page.iter().any(|&byte| byte != 0) {
-                            self.memory.write(base + index as u64 * PAGE_SIZE, page)?;
-                        }
-                    }
-                }
+                self.memory.unmap_exact(start, stop - start)?;
+                self.physical_size -= stop - start;
             }
             cursor = next.min(end);
         }
@@ -7333,6 +7361,10 @@ mod tests {
             m.memory.read_u64(alias + 2 * PAGE_SIZE).unwrap(),
             0x0909090909090909
         );
+        // The neighbours stay read/write: only the covered page is split off.
+        for page in [alias, alias + 2 * PAGE_SIZE] {
+            assert_eq!(m.memory.query(page).permissions, READ | WRITE);
+        }
         assert_eq!(used(&mut m), before + 2 * PAGE_SIZE);
         assert_eq!(call(&mut m, 0x2d, alias, 3 * PAGE_SIZE), 0);
         assert!(m.memory.read_u64(alias).is_err());
