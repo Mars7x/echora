@@ -305,6 +305,11 @@ pub struct Machine {
     /// boundary (set by `request_preemptions`, cleared when the worker
     /// idles): `parked_workers_with_work` wakes no one for it.
     keeps_running: Option<u64>,
+    /// SignalToAddress calls of type 0 or 1 that found no waiter.
+    signal_to_address_without_waiters: u64,
+    /// WaitForAddress calls that returned at once (the value did not match,
+    /// or timeout 0).
+    wait_for_address_immediate_returns: u64,
     /// Step count of the last scan of parked waits.
     last_wake_check: u64,
     /// With several workers: the threads other workers are running now
@@ -427,6 +432,8 @@ impl Machine {
             core_last_thread: [0; 64],
             core_hold: [None; 64],
             keeps_running: None,
+            signal_to_address_without_waiters: 0,
+            wait_for_address_immediate_returns: 0,
             last_wake_check: 0,
             running: Default::default(),
             worker_core: None,
@@ -1504,6 +1511,7 @@ impl Machine {
             _ => current_raw == raw_value,
         };
         if !waits {
+            self.wait_for_address_immediate_returns += 1;
             return Ok(Some(0xfa01));
         }
         if kind == 1 {
@@ -1514,13 +1522,17 @@ impl Machine {
                 match self.guest_cas_u32(address, seen, decremented) {
                     Ok(now) if now == seen => break,
                     Ok(now) if (now as i32) < value => seen = now,
-                    Ok(_) => return Ok(Some(0xfa01)),
+                    Ok(_) => {
+                        self.wait_for_address_immediate_returns += 1;
+                        return Ok(Some(0xfa01));
+                    }
                     Err(Trap::MemoryFault { .. }) => return Ok(Some(0xd401)),
                     Err(trap) => return Err(trap),
                 }
             }
         }
         if timeout_ns == 0 {
+            self.wait_for_address_immediate_returns += 1;
             return Ok(Some(0xea01));
         }
         let deadline = (timeout_ns > 0).then(|| {
@@ -1556,6 +1568,11 @@ impl Machine {
         }
         // Only this address's waiters are looked up and sorted.
         let mut waiters = self.synchronization_waits.arbiter_waiters(address);
+        // A signal (or increment) nobody waits for changes no thread: the
+        // case a lock-free path could take.
+        if waiters.is_empty() && kind < 2 {
+            self.signal_to_address_without_waiters += 1;
+        }
         waiters.sort_by_cached_key(|(id, wait)| {
             (
                 self.thread_priority(*id)
@@ -4458,6 +4475,7 @@ impl Machine {
         model["thread_pinning_implemented"] = false.into();
         model["scheduler_affinity_notifications_implemented"] = false.into();
         model["preemptions"] = serde_json::json!(self.preemptions);
+        model["lock_free_sync_candidates"] = serde_json::json!({"signal_to_address_without_waiters": self.signal_to_address_without_waiters, "wait_for_address_immediate_returns": self.wait_for_address_immediate_returns});
         model["double_dispatches"] = serde_json::json!(self.double_dispatches);
         model["main_thread_affinity"] = serde_json::json!({
             "thread_id": self.layout.main_thread_id,
