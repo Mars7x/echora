@@ -10,7 +10,9 @@
 //!
 //! - NVN work (`--nvn`, default 0.62), under the global lock, under an NVN
 //!   lock of its own, or under none (`--nvn-lock global|own|none`;
-//!   dea1c7f moved NVN to its own lock);
+//!   dea1c7f moved NVN to its own lock), or with recording unlocked and
+//!   only the `--submit` share of it (default 0.2) under the NVN lock
+//!   (`--nvn-lock recording`);
 //! - slice-end scheduling (`--sched`, default 0.013), under the global lock
 //!   except on a `--fast` share of slice ends (part 3's lock-free path);
 //! - everything else, under the global lock.
@@ -21,7 +23,7 @@
 //!
 //! ```text
 //! cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6]
-//!     [--slice N] [--hold US] [--nvn F] [--nvn-lock global|own|none]
+//!     [--slice N] [--hold US] [--nvn F] [--nvn-lock global|own|recording|none] [--submit F]
 //!     [--sched F] [--fast F] [--millis MS]]
 //! ```
 //!
@@ -40,6 +42,9 @@ const DATA_BASE: u64 = 0x20_0000;
 enum NvnLock {
     Global,
     Own,
+    /// Recording without a lock (each worker records into its own command
+    /// buffers); only the submit share takes the NVN lock.
+    Recording,
     None,
 }
 
@@ -49,6 +54,8 @@ struct Options {
     hold: Duration,
     nvn: f64,
     nvn_lock: NvnLock,
+    /// With `NvnLock::Recording`: the share of NVN work that is submission.
+    submit: f64,
     sched: f64,
     fast: f64,
     run_for: Duration,
@@ -61,6 +68,7 @@ fn options() -> Options {
         hold: Duration::from_micros(10),
         nvn: 0.62,
         nvn_lock: NvnLock::Global,
+        submit: 0.2,
         sched: 0.013,
         fast: 0.0,
         run_for: Duration::from_millis(1500),
@@ -82,12 +90,14 @@ fn options() -> Options {
             "--fast" => options.fast = value().parse().expect("share 0..1"),
             "--nvn" => options.nvn = value().parse().expect("share 0..1"),
             "--sched" => options.sched = value().parse().expect("share 0..1"),
+            "--submit" => options.submit = value().parse().expect("share 0..1"),
             "--nvn-lock" => {
                 options.nvn_lock = match value().as_str() {
                     "global" => NvnLock::Global,
                     "own" => NvnLock::Own,
+                    "recording" => NvnLock::Recording,
                     "none" => NvnLock::None,
-                    other => panic!("--nvn-lock takes global, own or none, not {other}"),
+                    other => panic!("--nvn-lock takes global, own, recording or none, not {other}"),
                 }
             }
             "--millis" => options.run_for = Duration::from_millis(value().parse().expect("ms")),
@@ -187,6 +197,11 @@ fn worker(
         match options.nvn_lock {
             NvnLock::Global => global += nvn,
             NvnLock::Own => locked(nvn_lock, nvn, false),
+            NvnLock::Recording => {
+                let submit = nvn.mul_f64(options.submit);
+                spin_for(nvn.saturating_sub(submit));
+                locked(nvn_lock, submit, false);
+            }
             NvnLock::None => spin_for(nvn),
         }
         locked(lock, global, true);
@@ -209,6 +224,7 @@ fn main() {
         match options.nvn_lock {
             NvnLock::Global => "global lock",
             NvnLock::Own => "own lock",
+            NvnLock::Recording => "recording unlocked, submit under its lock",
             NvnLock::None => "unlocked",
         },
         options.sched * 100.0,

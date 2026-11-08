@@ -383,6 +383,23 @@ The model then shows the next limit: workers wait on the NVN lock itself
 serialise all workers: per-object locks, or recording that only takes a
 lock at submit. Slice ends (`--fast`) matter little at 1.3%.
 
+Recording without the NVN lock, locking it only at submit
+(`--nvn-lock recording`, with submission 20% of NVN work), predicts the
+following. These are two runs each on four host CPUs, so six workers
+oversubscribe them:
+
+| workers | NVN under its own lock | recording unlocked, submit locked | NVN with no lock |
+|---|---|---|---|
+| 2 | 1.84-1.91x, 3-5% waiting | 1.90-1.98x, 2-3% waiting | 1.83-2.02x |
+| 4 | 1.76x, 40-43% waiting | 2.05-2.20x, 31-37% waiting | 2.13-2.24x |
+| 6 | 1.89-1.92x, 56-58% waiting | 2.67-2.72x, 43% waiting | 2.62-2.73x |
+
+Unlocked recording does as well as taking NVN off the locks altogether,
+for submit shares from 10% to 40%. What workers still wait for is the
+global lock around the remaining third of host work (SVCs and IPC),
+which at four workers is held about three quarters of the time. That is
+the next lock to split (items 3 and 4).
+
 ### Expected effect
 
 If step 0 confirms the estimates, items 1 and 2 remove roughly half to
