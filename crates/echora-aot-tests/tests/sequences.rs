@@ -188,10 +188,15 @@ fn check_sequences(slices: Option<u64>) {
     assert!(branches > 0 && memory_instructions > 0);
     // Inlined single-predecessor blocks run without a boundary check
     // between them, so short slices end at fewer places than one per block.
-    assert!(
-        slices.is_none() || boundaries * 2 > runs as u64,
-        "slices must end often"
-    );
+    // Structured emission checks only before blocks it can resume at
+    // (entries, the blocks after calls and SVCs, backward-branch targets),
+    // and these sequences branch only forward: there, slices end rarely.
+    let often = if cfg!(feature = "structured") {
+        boundaries > 0
+    } else {
+        boundaries * 2 > runs as u64
+    };
+    assert!(slices.is_none() || often, "slices must end often");
     assert!(
         failures.is_empty(),
         "{} mismatches:\n{}",

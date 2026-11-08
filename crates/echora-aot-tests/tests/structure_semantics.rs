@@ -320,8 +320,8 @@ fn check(
         .collect();
     let code = Code { base, words };
     let (mut windows, mut runs, mut loops) = (0, 0, 0);
-    // Unsliced, the trees structured emission uses: outermost loop heads
-    // are entries too.
+    // Unsliced, with outermost loop heads as entries too
+    // (StructureOptions::resume_at_loop_heads).
     let options = StructureOptions {
         resume_at_every_block: sliced,
         resume_at_loop_heads: !sliced,

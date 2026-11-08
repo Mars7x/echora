@@ -361,6 +361,17 @@ pub fn analyze_windows_with(
     window_bits: u32,
     options: StructureOptions,
 ) -> Vec<WindowAnalysis> {
+    analyze_windows_resuming(translation, window_bits, options, &BTreeSet::new())
+}
+
+/// [`analyze_windows_with`], also making each block in `resume` an entry
+/// (`EntryKinds::resume`): the blocks a caller lets execution resume at.
+pub fn analyze_windows_resuming(
+    translation: &Translation,
+    window_bits: u32,
+    options: StructureOptions,
+    resume: &BTreeSet<u64>,
+) -> Vec<WindowAnalysis> {
     let starts: BTreeMap<u64, &BasicBlock> = translation
         .blocks
         .iter()
@@ -443,7 +454,8 @@ pub fn analyze_windows_with(
                         entry.unreferenced = true;
                     }
                     entry.resume = options.resume_at_every_block
-                        || (options.resume_at_loop_heads && loop_heads.contains(&block.start));
+                        || (options.resume_at_loop_heads && loop_heads.contains(&block.start))
+                        || resume.contains(&block.start);
                     entry.any().then_some((block.start, entry))
                 })
                 .collect();

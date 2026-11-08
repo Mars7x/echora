@@ -2259,6 +2259,73 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
     }
 }
 
+/// The blocks structured emission lets execution resume at, so the only
+/// blocks that keep a boundary before them: where the host resumes after
+/// a call, an SVC or another instruction that continues through the
+/// dispatcher; translation entries, call, indirect and ADR targets; blocks
+/// with or after an exclusive access (another thread can take the
+/// reservation at their boundaries); and the target of every backward
+/// branch. Every cycle in the address space contains a backward branch,
+/// so every loop still ends an iteration in a boundary.
+fn resume_blocks(translation: &Translation) -> BTreeSet<u64> {
+    use Instruction::*;
+    let starts: BTreeSet<u64> = translation.blocks.iter().map(|block| block.start).collect();
+    let mut resume: BTreeSet<u64> = translation.entries.iter().copied().collect();
+    resume.extend(translation.indirect_targets.iter().copied());
+    for record in translation.instructions.values() {
+        match &record.instruction {
+            Branch { target, link: true } => {
+                resume.insert(*target);
+            }
+            Adr { address, .. } => {
+                resume.insert(*address);
+            }
+            _ => {}
+        }
+    }
+    for block in &translation.blocks {
+        let last = block
+            .instructions
+            .last()
+            .expect("blocks have an instruction");
+        let next = last.pc.wrapping_add(4);
+        let constant = match &last.instruction {
+            Branch {
+                target,
+                link: false,
+            } => vec![*target],
+            BranchCond { target, .. }
+            | CompareBranch { target, .. }
+            | TestBranch { target, .. } => vec![*target, next],
+            instruction if instruction.ends_block() => {
+                resume.insert(next);
+                Vec::new()
+            }
+            Branch { link: true, .. } => {
+                resume.insert(next);
+                Vec::new()
+            }
+            _ => vec![next],
+        };
+        let exclusive = block.instructions.iter().any(|record| {
+            matches!(
+                record.instruction,
+                LoadExclusive { .. } | StoreExclusive { .. }
+            )
+        });
+        if exclusive {
+            resume.insert(block.start);
+        }
+        for target in constant {
+            if exclusive || target <= block.start {
+                resume.insert(target);
+            }
+        }
+    }
+    resume.retain(|pc| starts.contains(pc));
+    resume
+}
+
 /// Blocks a split window runs inside their predecessor's arm instead of
 /// coming back through its dispatch loop: those with exactly one constant
 /// predecessor, in the same window, that nothing else can enter. Entries
@@ -2437,42 +2504,9 @@ fn emit_structured_cases(
     output.push_str("                }\n                continue;\n            }\n");
 }
 
-/// The inlined blocks (`inlined_blocks`) a structured window keeps
-/// inlined: all but those in an irreducible region, whose local dispatch
-/// ends every block in a boundary. The tree skips the boundary on every
-/// edge into the rest, so no host resumes at them and they need no arm.
-fn structured_inlined(
-    inlined: &BTreeSet<u64>,
-    tree: &crate::structure::Structured,
-) -> BTreeSet<u64> {
-    fn regions(tree: &crate::structure::Structured, out: &mut BTreeSet<u64>) {
-        use crate::structure::Structured::*;
-        match tree {
-            Region(blocks) => out.extend(blocks.iter().copied()),
-            Seq(parts) => parts.iter().for_each(|part| regions(part, out)),
-            Block(body) | Loop(body) => regions(body, out),
-            If {
-                taken, fallthrough, ..
-            } => {
-                regions(taken, out);
-                regions(fallthrough, out);
-            }
-            Dispatch(cases) => cases.iter().for_each(|(_, body)| regions(body, out)),
-            Switch { cases, default } => {
-                cases.iter().for_each(|(_, body)| regions(body, out));
-                regions(default, out);
-            }
-            Code(_) | Br(_) | Leave(_) => {}
-        }
-    }
-    let mut in_regions = BTreeSet::new();
-    regions(tree, &mut in_regions);
-    inlined.difference(&in_regions).copied().collect()
-}
-
 /// Writes a structured tree as Rust (see [`emit_structured_cases`]).
 struct TreeEmitter {
-    /// Blocks no boundary comes before (see [`structured_inlined`]).
+    /// Blocks no boundary comes before: every block but the tree's entries.
     inlined: BTreeSet<u64>,
     bodies: BTreeMap<u64, String>,
     /// Each block's successors inside the window.
@@ -2490,8 +2524,8 @@ impl TreeEmitter {
     fn block(&self, output: &mut String, start: u64, guard: bool) {
         output.push_str(&self.bodies[&start]);
         output.push_str("                m.cpu.pc = next_pc;\n");
-        // No boundary before an inlined successor, as in the flat arms:
-        // it runs as part of this block, and no host resumes there.
+        // No boundary before a successor that is not an entry: it runs as
+        // part of this block, and no host resumes there.
         let skip: Vec<String> = self.successors[&start]
             .iter()
             .filter(|pc| self.inlined.contains(pc))
@@ -2628,15 +2662,37 @@ impl TreeEmitter {
                 output.push_str("                _ => break 'tree,\n                }\n");
             }
             Region(blocks) => {
+                // As the flat arms: the bodies in a match, then one PC
+                // store and boundary for whichever ran (none before a
+                // successor that is not an entry), so the compiler sees
+                // the same loop as for flat emission.
                 output.push_str("                loop {\n                match next_pc {\n");
                 for &start in blocks {
                     writeln!(output, "                {start:#x} => {{").unwrap();
-                    self.block(output, start, false);
+                    output.push_str(&self.bodies[&start]);
                     output.push_str("                }\n");
                 }
-                output.push_str(
-                    "                _ => break,\n                }\n                }\n",
-                );
+                output.push_str("                _ => break,\n                }\n                m.cpu.pc = next_pc;\n");
+                let skip: BTreeSet<u64> = blocks
+                    .iter()
+                    .flat_map(|start| self.successors[start].iter().copied())
+                    .filter(|pc| self.inlined.contains(pc))
+                    .collect();
+                if skip.is_empty() {
+                    output.push_str("                m.finish_block()?;\n");
+                } else {
+                    let test: Vec<String> = skip
+                        .iter()
+                        .map(|pc| format!("next_pc != {pc:#x}"))
+                        .collect();
+                    writeln!(
+                        output,
+                        "                if {} {{ m.finish_block()?; }}",
+                        test.join(" && ")
+                    )
+                    .unwrap();
+                }
+                output.push_str("                }\n");
                 // Leave the tree unless the region left by one of its
                 // exits in the window.
                 let exits: BTreeSet<u64> = blocks
@@ -2757,10 +2813,11 @@ fn expand_block(
 pub struct EmitOptions {
     /// Emit each split window's entries from its structured tree
     /// (`crate::structure`): plain loops, ifs and labelled blocks, with
-    /// irreducible parts as local dispatch loops. Every other PC (a block
-    /// resumed after a host boundary, say) still runs through the window's
-    /// per-block dispatch, and every block still ends in the same boundary
-    /// check, so traps, slices and exclusive reservations behave as before.
+    /// irreducible parts as local dispatch loops. Every block execution can
+    /// resume at (`resume_blocks`: after calls and SVCs, entries, targets
+    /// of indirect and backward branches, around exclusive accesses) is an
+    /// entry of its tree and keeps the boundary check before it; no other
+    /// block has one, so the tree is the window's only copy of its code.
     pub structured: bool,
     /// Run common vector float, logic and integer operations as native
     /// code instead of helper calls (`crate::simd::emit_inline`), with the
@@ -2877,15 +2934,13 @@ pub fn emit_rust_split_to_with<E>(
         starts: translation.blocks.iter().map(|block| block.start).collect(),
     }));
     let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
-        // Loop heads are entries too: a loop resumed after a host boundary
-        // comes back into the tree at its next iteration.
-        crate::structure::analyze_windows_with(
+        // Every block execution can resume at is an entry of its tree, so
+        // the tree is the window's only copy of its code.
+        crate::structure::analyze_windows_resuming(
             translation,
             SPLIT_WINDOW_BITS,
-            crate::structure::StructureOptions {
-                resume_at_loop_heads: true,
-                ..Default::default()
-            },
+            Default::default(),
+            &resume_blocks(translation),
         )
         .into_iter()
         .map(|analysis| (analysis.window, analysis))
@@ -2942,14 +2997,20 @@ pub fn emit_rust_split_to_with<E>(
         let mut cases = String::new();
         let structured = trees.get(window).and_then(|analysis| {
             let tree = analysis.structure.as_ref()?;
+            analysis.control_entries().next()?;
             Some((analysis, tree))
         });
         if let Some((analysis, tree)) = structured {
-            let inlined = structured_inlined(&inlined, tree);
-            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads, &inlined);
-            // A host boundary can resume at any other block: each keeps
-            // its own arm, with the inlined ones in it as in the flat arms.
-            emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
+            // No boundary comes before a block that is not an entry, so
+            // execution never resumes there and the tree needs no other
+            // arms.
+            let entries: BTreeSet<u64> = analysis.control_entries().collect();
+            let skip: BTreeSet<u64> = blocks
+                .iter()
+                .map(|block| block.start)
+                .filter(|start| !entries.contains(start))
+                .collect();
+            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads, &skip);
         } else {
             emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
         }
