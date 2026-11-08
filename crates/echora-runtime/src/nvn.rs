@@ -2891,6 +2891,10 @@ impl Nvn {
                 core.memory.write(to, &report)?;
                 Ok(())
             }
+            // ResetCounter(cmd, NVNcounterType): sets that counter to 0. The
+            // counts ReportCounter writes are not modeled and always 0, so
+            // there is nothing to reset.
+            "nvnCommandBufferResetCounter" => Ok(()),
             // ClearBuffer(cmd, NVNbufferAddress, size, u32 value): fills with
             // the 32-bit value (size is a multiple of 4).
             "nvnCommandBufferClearBuffer" => {
