@@ -278,7 +278,9 @@ pub struct Nvn {
     /// Property bags of builders and builder-like structures (anything set up
     /// with `nvn<Kind>SetDefaults`), keyed by guest address. Their layout is
     /// host-private: the application touches them only through NVN calls.
-    bags: BTreeMap<u64, Bag>,
+    /// Shared with workers recording command buffers (see `Recorder`).
+    #[serde(skip)]
+    bags: Bags,
     /// Initialized objects by guest address.
     objects: BTreeMap<u64, Object>,
     /// Next free host GPU virtual address for memory pools.
@@ -291,9 +293,9 @@ pub struct Nvn {
     /// pool. Rebuilt when a lookup misses (see `pool_for`).
     #[serde(skip)]
     pool_ranges: std::cell::RefCell<Vec<[u64; 5]>>,
-    /// Commands recorded by each command buffer that is recording.
+    /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
-    recording: BTreeMap<u64, Vec<Command>>,
+    recording: Recordings,
     /// Finished command lists by NVNcommandHandle, with the order of their
     /// last recording or submission.
     #[serde(skip)]
@@ -330,6 +332,15 @@ pub struct Nvn {
     /// changes that (see `pump_queues`).
     #[serde(skip)]
     pending: BTreeMap<u64, std::collections::VecDeque<QueueItem>>,
+    /// Each queue's GPU state (render targets, viewports, bound programs and
+    /// resources) while another queue's runs: a queue's commands see only
+    /// the state its own commands set, as on the console, however the host
+    /// interleaves queues (`render` holds the running queue's).
+    #[serde(skip)]
+    queue_render: HashMap<u64, RenderState>,
+    /// The queue whose state `render` holds.
+    #[serde(skip)]
+    render_queue: Option<u64>,
     /// Waits that never held when work had to run anyway (a present,
     /// Finish or blocking CPU wait drained the queue), by kind.
     pub forced_waits: BTreeMap<String, u64>,
@@ -514,6 +525,94 @@ pub struct Bag {
     pub props: BTreeMap<String, Args>,
 }
 
+/// Builder and state bags by guest address, shared with workers that
+/// record command buffers without the NVN state's lock (see `Recorder`).
+type Bags = std::sync::Arc<std::sync::RwLock<BTreeMap<u64, Bag>>>;
+
+/// A recording command buffer's commands, and the command memory they use
+/// that its object does not count yet (its management calls fold it in).
+#[derive(Debug, Default)]
+pub struct Recording {
+    commands: Vec<Command>,
+    command_memory: u64,
+}
+
+/// Recordings by command buffer.
+type Recordings =
+    std::sync::Arc<std::sync::RwLock<BTreeMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>>;
+
+fn read_shared<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_shared<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_shared<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records calls on recording command buffers without the NVN state's
+/// lock: the game records command buffers on several cores at once, and
+/// recording needs only the buffer's own recording and the bags it reads.
+/// Everything else (management calls, submission) takes the NVN state.
+#[derive(Clone, Debug)]
+pub struct Recorder {
+    bags: Bags,
+    recordings: Recordings,
+}
+
+impl Recorder {
+    /// Record NVN call `name` when it is a call on a recording command
+    /// buffer (X0) other than its management: Ok(true) once recorded,
+    /// Ok(false) when it is not (the caller makes it with the NVN state).
+    pub fn record(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        let Some(rest) = name.strip_prefix("nvnCommandBuffer") else {
+            return Ok(false);
+        };
+        if COMMAND_BUFFER_MANAGEMENT.contains(&rest) {
+            return Ok(false);
+        }
+        let this = core.cpu.regs[0];
+        let recording = read_shared(&self.recordings).get(&this).cloned();
+        let Some(recording) = recording else {
+            return Ok(false);
+        };
+        let mut recording = lock_shared(&recording);
+        let bags = read_shared(&self.bags);
+        record_command(name, rest, core, &bags, &mut recording, None)?;
+        Ok(true)
+    }
+}
+
+/// The entry point whose thunk is at `pc`, in a table of thunk names
+/// (`Nvn::thunk_names`).
+pub fn thunk_in(names: &[String], pc: u64) -> Option<&str> {
+    let offset = pc.checked_sub(THUNK_BASE)?;
+    if offset >= THUNK_SIZE || !offset.is_multiple_of(THUNK_STRIDE) {
+        return None;
+    }
+    names
+        .get((offset / THUNK_STRIDE) as usize)
+        .map(String::as_str)
+}
+
+/// A bag's properties, when the bag at `address` is a `kind`.
+fn bag_in(
+    bags: &BTreeMap<u64, Bag>,
+    address: u64,
+    kind: &str,
+) -> Result<BTreeMap<String, Args>, String> {
+    bags.get(&address)
+        .filter(|bag| bag.kind == kind)
+        .map(|bag| bag.props.clone())
+        .ok_or_else(|| format!("no {kind} at {address:#x}"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Object {
     pub kind: String,
@@ -628,13 +727,12 @@ impl Nvn {
     }
 
     fn thunk_name(&self, pc: u64) -> Option<&str> {
-        let offset = pc.checked_sub(THUNK_BASE)?;
-        if offset >= THUNK_SIZE || !offset.is_multiple_of(THUNK_STRIDE) {
-            return None;
-        }
-        self.thunks
-            .get((offset / THUNK_STRIDE) as usize)
-            .map(String::as_str)
+        thunk_in(&self.thunks, pc)
+    }
+
+    /// The entry point name of each thunk, in thunk order (see `thunk_in`).
+    pub fn thunk_names(&self) -> Vec<String> {
+        self.thunks.clone()
     }
 
     /// How many entry point thunks exist (lookups add them).
@@ -710,6 +808,14 @@ impl Nvn {
         if this == 0 {
             return Err(invalid("null object".into()));
         }
+        // A management call on a command buffer sees the command memory its
+        // recording used so far (recording itself counts it apart).
+        if name
+            .strip_prefix("nvnCommandBuffer")
+            .is_some_and(|rest| COMMAND_BUFFER_MANAGEMENT.contains(&rest))
+        {
+            self.fold_command_memory(this);
+        }
         match name {
             // nvnDeviceInitialize(NVNdevice*, const NVNdeviceBuilder*) ->
             // NVNboolean. Builder flags (debug-layer levels) are recorded; no
@@ -769,8 +875,8 @@ impl Nvn {
             // The host queue keeps nothing there; the answer is the sum of
             // the command, compute and control sizes the builder set.
             "nvnQueueBuilderGetQueueMemorySize" => {
-                let bag = self
-                    .bags
+                let bags = read_shared(&self.bags);
+                let bag = bags
                     .get(&this)
                     .filter(|bag| bag.kind == "QueueBuilder")
                     .ok_or_else(|| invalid(format!("no QueueBuilder at {this:#x}")))?;
@@ -1215,22 +1321,23 @@ impl Nvn {
             }
             "nvnCommandBufferBeginRecording" => {
                 self.object(this, "CommandBuffer").map_err(invalid)?;
-                if self.recording.insert(this, Vec::new()).is_some() {
+                let fresh = std::sync::Arc::new(std::sync::Mutex::new(Recording::default()));
+                if write_shared(&self.recording).insert(this, fresh).is_some() {
                     return Err(invalid("command buffer is already recording".into()));
                 }
                 return Ok(true);
             }
             "nvnCommandBufferIsRecording" => {
                 self.object(this, "CommandBuffer").map_err(invalid)?;
-                core.cpu.regs[0] = u64::from(self.recording.contains_key(&this));
+                core.cpu.regs[0] = u64::from(read_shared(&self.recording).contains_key(&this));
                 return Ok(true);
             }
             // EndRecording(cmd) -> NVNcommandHandle: a nonzero host handle.
             "nvnCommandBufferEndRecording" => {
-                let commands = self
-                    .recording
+                let recording = write_shared(&self.recording)
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
+                let commands = std::mem::take(&mut lock_shared(&recording).commands);
                 if !commands.is_empty() {
                     self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
                 }
@@ -1531,7 +1638,7 @@ impl Nvn {
                         self.object(x[2], "Texture").map_err(invalid)?;
                         if x[3] != 0 {
                             self.bag(x[3], "TextureView").map_err(invalid)?;
-                            let view = self.bags[&x[3]].clone();
+                            let view = read_shared(&self.bags)[&x[3]].clone();
                             self.views.insert((this, id), view);
                         } else {
                             self.views.remove(&(this, id));
@@ -1753,7 +1860,7 @@ impl Nvn {
                 }
                 self.objects.remove(&this);
                 self.images.remove(&this);
-                self.recording.remove(&this);
+                write_shared(&self.recording).remove(&this);
                 return Ok(true);
             }
             // nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*) ->
@@ -2049,89 +2156,27 @@ impl Nvn {
         // Calls on a recording command buffer are recorded for execution at
         // submission, with any data NVN reads through pointers captured now.
         if let Some(rest) = name.strip_prefix("nvnCommandBuffer") {
-            if !COMMAND_BUFFER_MANAGEMENT.contains(&rest) && self.recording.contains_key(&this) {
-                let mut command = Command {
-                    name: name.into(),
-                    x: std::array::from_fn(|index| x[index]),
-                    v: std::array::from_fn(|index| core.cpu.vectors[index] as u64),
-                    captured: Vec::new(),
-                    states: Default::default(),
-                };
-                capture(&mut command, core)?;
-                // CallCommands / CopyCommands(cmd, int count, const
-                // NVNcommandHandle* handles): the handles are read now.
-                if matches!(rest, "CallCommands" | "CopyCommands") {
-                    let count = x[1] as u32;
-                    if count > 4096 {
-                        return Err(invalid(format!("{count} called command handles")));
-                    }
-                    for index in 0..u64::from(count) {
-                        command
-                            .captured
-                            .push(core.memory.read_u64(x[2] + index * 8)?);
-                    }
+            let recording = (!COMMAND_BUFFER_MANAGEMENT.contains(&rest))
+                .then(|| read_shared(&self.recording).get(&this).cloned())
+                .flatten();
+            if let Some(recording) = recording {
+                let mut notes = Vec::new();
+                let flow = debug_var_os("ECHORA_GPU_FLOW").is_some();
+                {
+                    let mut recording = lock_shared(&recording);
+                    let bags = read_shared(&self.bags);
+                    record_command(
+                        name,
+                        rest,
+                        core,
+                        &bags,
+                        &mut recording,
+                        flow.then_some(&mut notes),
+                    )?;
                 }
-                self.snapshot_states(&mut command);
-                if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
-                    let view = self.bag(command.x[3], "TextureView").map_err(invalid)?;
-                    for (index, key) in ["Levels", "Layers"].iter().enumerate() {
-                        command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
-                    }
+                for note in notes {
+                    self.gpu_note(note);
                 }
-                if command.name == "nvnCommandBufferClearTexture" {
-                    let bases = if command.x[2] == 0 {
-                        [0, 0]
-                    } else {
-                        let view = self.bag(command.x[2], "TextureView").map_err(invalid)?;
-                        ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
-                    };
-                    command.captured.extend(bases);
-                }
-                if command.name == "nvnCommandBufferCopyTextureToTexture" {
-                    // After both regions: each view's level and layer base
-                    // (0 without a view), read now as NVN does.
-                    for view in [command.x[2], command.x[5]] {
-                        let bases = if view == 0 {
-                            [0, 0]
-                        } else {
-                            let view = self.bag(view, "TextureView").map_err(invalid)?;
-                            ["Levels", "Layers"]
-                                .map(|key| view.get(key).map_or(0, |value| value.x[0]))
-                        };
-                        command.captured.extend(bases);
-                    }
-                }
-                if command.name == "nvnCommandBufferSetRenderTargets" {
-                    // Views are resolved now (NVN reads them at record time)
-                    // to the mip level (low 32 bits) and base layer (high
-                    // 32 bits) they select (0 without a view). The depth
-                    // view (X5) is appended after the color views.
-                    let count = command.x[1] as usize;
-                    let mut views: Vec<u64> = command.captured[count..].to_vec();
-                    views.push(command.x[5]);
-                    for (index, view) in views.iter_mut().enumerate() {
-                        if *view != 0 {
-                            let bag = self.bag(*view, "TextureView").map_err(invalid)?;
-                            if let (Some(format), true) =
-                                (bag.get("Format"), debug_var_os("ECHORA_GPU_FLOW").is_some())
-                            {
-                                let texture = command.captured.get(index).copied().unwrap_or(0);
-                                let note = format!(
-                                    "flow target view format {} on {texture:x}",
-                                    format.x[0]
-                                );
-                                self.gpu_note(note);
-                            }
-                            let level = bag.get("Levels").map_or(0, |value| value.x[0]);
-                            let layer = bag.get("Layers").map_or(0, |value| value.x[0]);
-                            *view = level & 0xffff_ffff | layer << 32;
-                        }
-                    }
-                    command.captured.truncate(count);
-                    command.captured.extend(views);
-                }
-                self.recording.get_mut(&this).unwrap().push(command);
-                self.use_command_memory(this, "CommandMemory", COMMAND_MEMORY_PER_COMMAND);
                 return Ok(true);
             }
         }
@@ -2160,7 +2205,8 @@ impl Nvn {
                 for (index, word) in words.iter_mut().enumerate() {
                     *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
                 }
-                let bag = self.bags.entry(this).or_insert_with(|| Bag {
+                let mut bags = write_shared(&self.bags);
+                let bag = bags.entry(this).or_insert_with(|| Bag {
                     kind: kind.into(),
                     props: BTreeMap::new(),
                 });
@@ -2236,8 +2282,7 @@ impl Nvn {
         if bag_like && rest == "SetDefaults" {
             // Builders keep their device across SetDefaults: the application
             // sets the device first for some kinds (QueueBuilder).
-            let device = self
-                .bags
+            let device = read_shared(&self.bags)
                 .get(&this)
                 .and_then(|bag| bag.props.get("Device").copied());
             let mut bag = Bag {
@@ -2247,7 +2292,7 @@ impl Nvn {
             if let Some(device) = device {
                 bag.props.insert("Device".into(), device);
             }
-            self.bags.insert(this, bag);
+            write_shared(&self.bags).insert(this, bag);
             return Ok(true);
         }
         if bag_like {
@@ -2255,8 +2300,8 @@ impl Nvn {
                 // Structures live in application memory (often the stack):
                 // a setter of another kind at the same address means the old
                 // structure's lifetime ended, so a new one starts there.
-                let bag = self
-                    .bags
+                let mut bags = write_shared(&self.bags);
+                let bag = bags
                     .entry(this)
                     .and_modify(|bag| {
                         if bag.kind != kind {
@@ -2306,8 +2351,8 @@ impl Nvn {
                 return Ok(true);
             }
             if let Some(property) = rest.strip_prefix("Get") {
-                let bag = self
-                    .bags
+                let bags = read_shared(&self.bags);
+                let bag = bags
                     .get(&this)
                     .filter(|bag| bag.kind == kind)
                     .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?;
@@ -2409,8 +2454,23 @@ impl Nvn {
     }
 
     /// Run `queue`'s work in order until it is done or blocked (`force`
-    /// runs through waits). Returns whether anything ran.
+    /// runs through waits), with that queue's own GPU state. Returns
+    /// whether anything ran.
     fn run_queue(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
+        if self.render_queue != Some(queue) {
+            let incoming = self.queue_render.remove(&queue).unwrap_or_default();
+            let outgoing = std::mem::replace(&mut self.render, incoming);
+            if let Some(previous) = self.render_queue {
+                self.queue_render.insert(previous, outgoing);
+            }
+            self.render_queue = Some(queue);
+            // Resolved texture bindings came from the other queue's state.
+            self.binding_serial += 1;
+        }
+        self.run_queue_work(queue, core, force)
+    }
+
+    fn run_queue_work(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
         let mut progressed = false;
         loop {
             let Some(item) = self
@@ -3289,46 +3349,6 @@ impl Nvn {
         Ok(())
     }
 
-    /// Fill `command.states` for the Bind*State commands. Single states are
-    /// passed by pointer (X1); vertex attribute and stream states as
-    /// (count X1, array X2). Array elements are the bags of that kind at or
-    /// above the array, in address order (the element size is NVN-private).
-    fn snapshot_states(&self, command: &mut Command) {
-        let Some(kind) = command
-            .name
-            .strip_prefix("nvnCommandBufferBind")
-            .filter(|kind| kind.ends_with("State"))
-        else {
-            return;
-        };
-        let (count, base) = match kind {
-            "VertexAttribState" | "VertexStreamState" => (command.x[1] as usize, command.x[2]),
-            _ => (1, command.x[1]),
-        };
-        if count > 32 || base == 0 {
-            return;
-        }
-        command.states = std::sync::Arc::new(
-            self.bags
-                .range(base..)
-                .filter(|(_, bag)| bag.kind == kind)
-                .take(count)
-                .map(|(address, bag)| {
-                    let mut props = bag.props.clone();
-                    // Element offset from the array start, as evidence of the layout.
-                    props.insert(
-                        "@Offset".into(),
-                        Args {
-                            x: [address - base, 0, 0, 0],
-                            v: [0; 2],
-                        },
-                    );
-                    props
-                })
-                .collect(),
-        );
-    }
-
     /// The code window of the stage at GPU address `gpu` (up to 256 KiB:
     /// two gameplay programs run past 64 KiB; clipped to its memory pool
     /// and to readable memory) and its key: an
@@ -3541,11 +3561,28 @@ impl Nvn {
     }
 
     fn bag(&self, address: u64, kind: &str) -> Result<BTreeMap<String, Args>, String> {
-        self.bags
-            .get(&address)
-            .filter(|bag| bag.kind == kind)
-            .map(|bag| bag.props.clone())
-            .ok_or_else(|| format!("no {kind} at {address:#x}"))
+        bag_in(&read_shared(&self.bags), address, kind)
+    }
+
+    /// The handle workers record command buffers through without the NVN
+    /// state's lock (see `Recorder`).
+    pub fn recorder(&self) -> Recorder {
+        Recorder {
+            bags: self.bags.clone(),
+            recordings: self.recording.clone(),
+        }
+    }
+
+    /// Count the command memory a recording command buffer used since its
+    /// object last counted it (before a management call reads or resets it).
+    fn fold_command_memory(&mut self, buffer: u64) {
+        let recording = read_shared(&self.recording).get(&buffer).cloned();
+        if let Some(recording) = recording {
+            let used = std::mem::take(&mut lock_shared(&recording).command_memory);
+            if used != 0 {
+                self.use_command_memory(buffer, "CommandMemory", used);
+            }
+        }
     }
 
     fn object(&self, address: u64, kind: &str) -> Result<&Object, String> {
@@ -3804,6 +3841,140 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
         *value = core.memory.read_u32(address + index as u64 * 4)?;
     }
     Ok(region)
+}
+
+/// Fill `command.states` for the Bind*State commands. Single states are
+/// passed by pointer (X1); vertex attribute and stream states as
+/// (count X1, array X2). Array elements are the bags of that kind at or
+/// above the array, in address order (the element size is NVN-private).
+fn snapshot_states(bags: &BTreeMap<u64, Bag>, command: &mut Command) {
+    let Some(kind) = command
+        .name
+        .strip_prefix("nvnCommandBufferBind")
+        .filter(|kind| kind.ends_with("State"))
+    else {
+        return;
+    };
+    let (count, base) = match kind {
+        "VertexAttribState" | "VertexStreamState" => (command.x[1] as usize, command.x[2]),
+        _ => (1, command.x[1]),
+    };
+    if count > 32 || base == 0 {
+        return;
+    }
+    command.states = std::sync::Arc::new(
+        bags.range(base..)
+            .filter(|(_, bag)| bag.kind == kind)
+            .take(count)
+            .map(|(address, bag)| {
+                let mut props = bag.props.clone();
+                // Element offset from the array start, as evidence of the layout.
+                props.insert(
+                    "@Offset".into(),
+                    Args {
+                        x: [address - base, 0, 0, 0],
+                        v: [0; 2],
+                    },
+                );
+                props
+            })
+            .collect(),
+    );
+}
+
+/// Record NVN call `name` (`nvnCommandBuffer` + `rest`) on a recording
+/// command buffer, with any data NVN reads through pointers captured now.
+fn record_command(
+    name: &str,
+    rest: &str,
+    core: &mut Guest,
+    bags: &BTreeMap<u64, Bag>,
+    recording: &mut Recording,
+    mut notes: Option<&mut Vec<String>>,
+) -> Result<(), Trap> {
+    let invalid = |message: String| Trap::InvalidState {
+        message: format!("{name}: {message}"),
+    };
+    let x = core.cpu.regs;
+    let mut command = Command {
+        name: name.into(),
+        x: std::array::from_fn(|index| x[index]),
+        v: std::array::from_fn(|index| core.cpu.vectors[index] as u64),
+        captured: Vec::new(),
+        states: Default::default(),
+    };
+    capture(&mut command, core)?;
+    // CallCommands / CopyCommands(cmd, int count, const
+    // NVNcommandHandle* handles): the handles are read now.
+    if matches!(rest, "CallCommands" | "CopyCommands") {
+        let count = x[1] as u32;
+        if count > 4096 {
+            return Err(invalid(format!("{count} called command handles")));
+        }
+        for index in 0..u64::from(count) {
+            command
+                .captured
+                .push(core.memory.read_u64(x[2] + index * 8)?);
+        }
+    }
+    snapshot_states(bags, &mut command);
+    if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
+        let view = bag_in(bags, command.x[3], "TextureView").map_err(invalid)?;
+        for (index, key) in ["Levels", "Layers"].iter().enumerate() {
+            command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
+        }
+    }
+    if command.name == "nvnCommandBufferClearTexture" {
+        let bases = if command.x[2] == 0 {
+            [0, 0]
+        } else {
+            let view = bag_in(bags, command.x[2], "TextureView").map_err(invalid)?;
+            ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
+        };
+        command.captured.extend(bases);
+    }
+    if command.name == "nvnCommandBufferCopyTextureToTexture" {
+        // After both regions: each view's level and layer base
+        // (0 without a view), read now as NVN does.
+        for view in [command.x[2], command.x[5]] {
+            let bases = if view == 0 {
+                [0, 0]
+            } else {
+                let view = bag_in(bags, view, "TextureView").map_err(invalid)?;
+                ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
+            };
+            command.captured.extend(bases);
+        }
+    }
+    if command.name == "nvnCommandBufferSetRenderTargets" {
+        // Views are resolved now (NVN reads them at record time)
+        // to the mip level (low 32 bits) and base layer (high
+        // 32 bits) they select (0 without a view). The depth
+        // view (X5) is appended after the color views.
+        let count = command.x[1] as usize;
+        let mut views: Vec<u64> = command.captured[count..].to_vec();
+        views.push(command.x[5]);
+        for (index, view) in views.iter_mut().enumerate() {
+            if *view != 0 {
+                let bag = bag_in(bags, *view, "TextureView").map_err(invalid)?;
+                if let (Some(format), Some(notes)) = (bag.get("Format"), notes.as_mut()) {
+                    let texture = command.captured.get(index).copied().unwrap_or(0);
+                    notes.push(format!(
+                        "flow target view format {} on {texture:x}",
+                        format.x[0]
+                    ));
+                }
+                let level = bag.get("Levels").map_or(0, |value| value.x[0]);
+                let layer = bag.get("Layers").map_or(0, |value| value.x[0]);
+                *view = level & 0xffff_ffff | layer << 32;
+            }
+        }
+        command.captured.truncate(count);
+        command.captured.extend(views);
+    }
+    recording.commands.push(command);
+    recording.command_memory += COMMAND_MEMORY_PER_COMMAND;
+    Ok(())
 }
 
 /// Data NVN reads through pointer arguments when a command is recorded.

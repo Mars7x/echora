@@ -718,13 +718,16 @@ impl Nvn {
             "present {} objects {} bags {} views {} finalized {} images {} lists {} commands {commands} captured~{}MB recording {}",
             self.presented_frames,
             self.objects.len(),
-            self.bags.len(),
+            super::read_shared(&self.bags).len(),
             self.views.len(),
             self.finalized_storage.len(),
             self.images.len(),
             self.command_lists.len(),
             captured >> 20,
-            self.recording.values().map(Vec::len).sum::<usize>(),
+            super::read_shared(&self.recording)
+                .values()
+                .map(|recording| super::lock_shared(recording).commands.len())
+                .sum::<usize>(),
         );
         if let Some(backend) = self.gpu.as_ref() {
             let mut seen = std::collections::HashSet::new();

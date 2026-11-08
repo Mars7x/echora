@@ -345,9 +345,14 @@ pub struct Machine {
     /// NVN calls workers made without the machine lock (see
     /// `Worker::held_nvn_call`).
     lock_free_nvn_calls: u64,
+    /// Of those, calls recorded on command buffers without even the NVN
+    /// state's lock (see `Worker::recorded_nvn_call`).
+    recorded_nvn_calls: u64,
     /// Microseconds those calls waited for the NVN state's own lock, and
     /// held it.
     nvn_lock_stats: [u64; 2],
+    /// Microseconds each guest thread's NVN calls waited for that lock.
+    nvn_thread_wait: BTreeMap<u64, u64>,
     /// Parallel runs: host microseconds per guest thread running guest
     /// code, waiting for the machine lock and holding it (for finding the
     /// thread that bounds the frame rate).
@@ -447,7 +452,9 @@ impl Machine {
             boundary_kinds: vec![0; 0x84],
             boundary_held: vec![0; 0x84],
             lock_free_nvn_calls: 0,
+            recorded_nvn_calls: 0,
             nvn_lock_stats: [0; 2],
+            nvn_thread_wait: BTreeMap::new(),
             thread_time: BTreeMap::new(),
             stop_check_tick: 0,
         }
@@ -2803,11 +2810,15 @@ impl Machine {
         self.running.insert(cores[0].current_thread_id);
         self.parallel = true;
         let placeholder = self.nvn.entries_only();
+        let recorder = self.nvn.recorder();
+        let thunks = std::sync::RwLock::new(self.nvn.thunk_names());
         let nvn = std::sync::Mutex::new(std::mem::replace(&mut self.nvn, placeholder));
         let shared = Shared {
             machine: std::sync::Mutex::new(&mut *self),
             wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
             nvn,
+            recorder,
+            thunks,
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
                 .map(|_| std::sync::Mutex::new(())),
@@ -2835,6 +2846,7 @@ impl Machine {
                         index: index as u8,
                         held_failed: None,
                         lock_free_calls: 0,
+                        recorded_calls: 0,
                         nvn_lock_micros: [0; 2],
                     };
                     std::thread::Builder::new()
@@ -3057,7 +3069,9 @@ impl Machine {
                 {
                     self.lock_stats = [0; 3];
                     self.lock_free_nvn_calls = 0;
+                    self.recorded_nvn_calls = 0;
                     self.nvn_lock_stats = [0; 2];
+                    self.nvn_thread_wait.clear();
                     self.boundary_kinds.fill(0);
                     self.boundary_held.fill(0);
                     self.thread_time.clear();
@@ -4590,7 +4604,7 @@ impl Machine {
             "steps":self.core.steps,
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
-            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1]},
+            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
                 (boundary_kind_name(kind), *count)
@@ -4784,6 +4798,13 @@ struct Shared<'a> {
     /// machine, whose `nvn` holds only the entry points meanwhile. Taken
     /// after the machine lock, never before it.
     nvn: std::sync::Mutex<crate::nvn::Nvn>,
+    /// Records calls on recording command buffers without the NVN state's
+    /// lock (see `Worker::recorded_nvn_call`).
+    recorder: crate::nvn::Recorder,
+    /// The NVN thunks' entry point names, for recognizing those calls
+    /// without the NVN state's lock; refreshed with the machine's table when
+    /// lookups add thunks.
+    thunks: std::sync::RwLock<Vec<String>>,
     /// ECHORA_EXCLUSIVE_THREADS=ID,... (diagnostic): those guest threads run
     /// only while no other worker runs guest code.
     exclusive: Option<(std::sync::RwLock<()>, Vec<u64>)>,
@@ -4826,6 +4847,8 @@ struct Worker {
     held_failed: Option<Option<Trap>>,
     /// Held calls since this worker last took the machine lock.
     lock_free_calls: u64,
+    /// Of those, calls recorded without the NVN state's lock.
+    recorded_calls: u64,
     /// Their microseconds waiting for the NVN state's lock and holding it.
     nvn_lock_micros: [u64; 2],
 }
@@ -4910,7 +4933,9 @@ impl Worker {
                 let result = loop {
                     match dispatch(&mut self.core) {
                         Ok(()) => {}
-                        Err(Trap::MissingBlock { pc }) if self.held_nvn_call(shared, pc) => {}
+                        Err(Trap::MissingBlock { pc })
+                            if self.recorded_nvn_call(shared, pc)
+                                || self.held_nvn_call(shared, pc) => {}
                         result => break result,
                     }
                 };
@@ -4928,8 +4953,12 @@ impl Worker {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let held = std::time::Instant::now();
                 machine.lock_free_nvn_calls += std::mem::take(&mut self.lock_free_calls);
+                machine.recorded_nvn_calls += std::mem::take(&mut self.recorded_calls);
                 let [nvn_waited, nvn_held] = std::mem::take(&mut self.nvn_lock_micros);
                 machine.nvn_lock_stats[0] += nvn_waited;
+                if nvn_waited != 0 {
+                    *machine.nvn_thread_wait.entry(thread).or_default() += nvn_waited;
+                }
                 machine.nvn_lock_stats[1] += nvn_held;
                 if shared.stop.load(Ordering::Relaxed) {
                     return (self.core, None);
@@ -4977,6 +5006,10 @@ impl Worker {
                     // know their thunks are host calls.
                     if nvn.thunk_count() != machine.nvn.thunk_count() {
                         machine.nvn = nvn.entries_only();
+                        *shared
+                            .thunks
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = nvn.thunk_names();
                     }
                     outcome
                 } else {
@@ -5096,6 +5129,56 @@ impl Worker {
                         return self.stop(shared, machine, trap);
                     }
                 }
+            }
+        }
+    }
+
+    /// Record NVN call `pc` on a recording command buffer without any lock
+    /// but that buffer's own (see `nvn::Recorder`): the game records command
+    /// buffers on several cores at once, and through the NVN state's lock
+    /// they waited for one another and for submitted work. The call returns
+    /// to the link register as `held_nvn_call`'s do. False when `pc` is no
+    /// such call (it is then made with the NVN state) or recording failed
+    /// (reported at the next boundary, `held_failed`).
+    fn recorded_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
+        if self.held_failed.is_some()
+            || crate::nvn::debug_var_os("ECHORA_LOCKED_NVN").is_some()
+            || crate::nvn::debug_var_os("ECHORA_LOCKED_SUBMIT").is_some()
+            || crate::nvn::debug_var_os("ECHORA_GPU_FLOW").is_some()
+        {
+            return false;
+        }
+        let name = {
+            let thunks = shared
+                .thunks
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match crate::nvn::thunk_in(&thunks, pc) {
+                Some(name) if name.starts_with("nvnCommandBuffer") => name.to_owned(),
+                _ => return false,
+            }
+        };
+        self.core.settle_block_trap();
+        let counter = self.core.physical_counter_ticks();
+        let recorded = {
+            let mut guest = crate::nvn::Guest {
+                cpu: &mut self.core.cpu,
+                memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
+                counter,
+            };
+            shared.recorder.record(&name, &mut guest)
+        };
+        match recorded {
+            Ok(true) => {
+                self.core.cpu.pc = self.core.cpu.regs[30];
+                self.lock_free_calls += 1;
+                self.recorded_calls += 1;
+                true
+            }
+            Ok(false) => false,
+            Err(trap) => {
+                self.held_failed = Some(Some(trap));
+                false
             }
         }
     }
