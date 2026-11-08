@@ -28,7 +28,39 @@ fn main() {
             *failures.entry("unreadable".into()).or_default() += 1;
             continue;
         };
-        let program = match shader::translate(&bytes, compute, &mut NoEnvironment) {
+        // ECHORA_CHECK_MESH=1: a stage whose control section (the .control
+        // file beside it) gives mesh output sizes at +0x60 is translated as
+        // a mesh program with no task, with the registers the runtime
+        // derives from that section (see `bound_mesh_program`).
+        let mut parameters = compute;
+        if std::env::var_os("ECHORA_CHECK_MESH").is_some() {
+            let control = std::fs::read(std::path::Path::new(&path).with_extension("control"))
+                .unwrap_or_default();
+            let word = |offset: usize| {
+                control
+                    .get(offset..offset + 4)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            };
+            let kind = bytes.get(..4).map_or(0, |b| {
+                (u32::from_le_bytes(b.try_into().unwrap()) >> 10) & 0xf
+            });
+            let sizes = word(0x60);
+            if matches!(kind, 1 | 3) && sizes != 0 {
+                let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
+                parameters.mesh = Some(shader::MeshParameters {
+                    task: false,
+                    registers: [
+                        4 | (vertices & 0x1ff) << 4 | (primitives & 0x3ff) << 13,
+                        (word(0x58) & 0x3f) << 20,
+                        word(0x58) & !0x3f,
+                    ],
+                    primitive_header: None,
+                });
+            } else {
+                continue;
+            }
+        }
+        let program = match shader::translate(&bytes, parameters, &mut NoEnvironment) {
             Ok(program) => program,
             Err(error) => {
                 // Group by message without addresses.
