@@ -158,13 +158,24 @@ On x86-64, `mul_add` (FMLA, FMADD) is a call to `compiler_builtins`'
 with `-C target-feature=+fma` inlines it (`scalar` +12-15%), but needs a
 host CPU with FMA (x86-64-v3); a decision for the game build's flags.
 
+## FPCR and FPSR in window locals (opt-in)
+
+`EmitOptions::fp_status_locals` keeps FPCR and FPSR in the window's
+locals, stored and reloaded only around helpers and calls, instead of
+reloading them after every guest store (the inline float paths test them
+on every operation). Three alternating runs on top of `inline-vector` and
+whole-vector checks: `scalar` 552/556/561 to 573/569/574 Minstr/s (+2-4%,
+every round), `vector` 217/220/219 to 220/222/220. Small but consistent,
+so it stays opt-in for the rebuild. `tests/fp_status.rs` compares it with
+the plain path around MSR, MRS and float helpers.
+
 ## Order for the rebuild
 
 1. Land the `echora-guest` API and runtime changes with today's emission
    (the generated code still calls `tick_block_at` / `finish_block`, now
    cheaper).
 2. Turn on, in `ECHORA_LIFT_OPTIONS`: `inline-vector`, `fused-flags`,
-   `whole-vector-checks`, `window-memory`, and the block bookkeeping
-   emission.
+   `whole-vector-checks`, `fp-status-locals`, `window-memory`, and the
+   block bookkeeping emission.
 3. One full rebuild of the game's translation; compare frames and speed
    with the previous build.
