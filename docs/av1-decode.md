@@ -148,3 +148,9 @@ Notes on values:
   film grain. The AOM conformance vectors in `tests/vectors` are checked
   in (see NOTICE.md); `tests/fetch-vectors.sh DIR` downloads more, and
   `ECHORA_AV1_VECTORS=DIR` adds them to the run.
+
+Unoptimised rav1d takes seconds per picture, so a debug `cargo test`
+decodes only the smallest vectors with it (the parser still reads every
+stream). Run the full cross-check with
+`cargo test --release -p echora-av1`; it takes under a second and, with
+the downloaded vectors, compares about 180 pictures from 31 streams.
