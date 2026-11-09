@@ -135,6 +135,9 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
 | IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
 | IABS | 0x013 | the source in the second slot |
+| POPC, FLO, BREV | 0x109, 0x100, 0x101 | invert 63 (form 1); FLO signed 73, shift amount 74 |
+| SHFL | 0x389, 0x589, 0x989, 0xf89 | lane register 32 or immediate 53-57, clamp and segment mask register 64 or immediate 40-52, mode 58-59, in-range predicate 81-83 |
+| VOTE | 0x806 | mode 72-73 (ALL, ANY, EQ), condition 87-90, vote predicate 81-83, ballot in the destination |
 | P2R, R2P | 0x803, 0x804 | immediate mask 32-63 (P0-P6), byte 76-77 |
 | LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
 | SHF | 0x019 in forms 1-7 | type 73-74 (S64, U64, S32, U32), wrap 75, right 76, high word 80 |

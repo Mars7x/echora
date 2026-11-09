@@ -165,6 +165,46 @@ pub enum Op {
         high: bool,
         carry_out: u8,
     },
+    /// POPC / FLO / BREV d, src (inverted first with `invert`, bit 63):
+    /// the set-bit count, the most significant set bit (`signed`: the most
+    /// significant bit unlike the sign; `shift_amount`: as 31 minus the
+    /// position), or the bits reversed.
+    BitCount {
+        d: Reg,
+        src: Operand,
+        invert: bool,
+    },
+    Flo {
+        d: Reg,
+        src: Operand,
+        invert: bool,
+        signed: bool,
+        shift_amount: bool,
+    },
+    Brev {
+        d: Reg,
+        src: Operand,
+    },
+    /// SHFL d, p, a, lane, c: a from another lane of the subgroup: `mode`
+    /// (bits 58-59) 0 index, 1 up, 2 down, 3 xor; c holds the clamp
+    /// (bits 0-4) and segment mask (8-12); `p` receives whether the lane
+    /// was in range.
+    Shfl {
+        d: Reg,
+        p: u8,
+        a: Reg,
+        lane: Src,
+        c: Src,
+        mode: u8,
+    },
+    /// VOTE d, p, condition: `mode` (bits 72-73) 0 all, 1 any, 2 all
+    /// equal into p; d receives the ballot of the condition.
+    Vote {
+        d: Reg,
+        p: u8,
+        condition: Pred,
+        mode: u8,
+    },
     /// IABS d, src: the absolute value of a signed word.
     Iabs {
         d: Reg,
@@ -717,6 +757,34 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
     let form = word.form();
     // Operations whose bits 9-11 are not an ALU form match all 12 bits.
     match opcode {
+        0x389 | 0x589 | 0x989 | 0xf89 => {
+            let lane = if opcode & 0x800 != 0 {
+                Src::Imm(word.bits(53, 5) as u32)
+            } else {
+                Src::Reg(word.reg(32))
+            };
+            let c = if matches!(opcode, 0x589 | 0xf89) {
+                Src::Imm(word.bits(40, 13) as u32)
+            } else {
+                Src::Reg(word.reg(64))
+            };
+            return Some(Op::Shfl {
+                d,
+                p: word.bits(81, 3) as u8,
+                a: word.reg(24),
+                lane,
+                c,
+                mode: word.bits(58, 2) as u8,
+            });
+        }
+        0x806 => {
+            return Some(Op::Vote {
+                d,
+                p: word.bits(81, 3) as u8,
+                condition: word.pred(87, 90),
+                mode: word.bits(72, 2) as u8,
+            });
+        }
         0x803 => {
             return Some(Op::P2r {
                 d,
@@ -985,6 +1053,22 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             signed: word.bit(73),
             high: opcode & 0x1ff == 0x027,
             carry_out: word.bits(81, 3) as u8,
+        },
+        0x109 if matches!(form, 1 | 4 | 5 | 6) => Op::BitCount {
+            d,
+            src: word.source(1)?,
+            invert: form == 1 && word.bit(63),
+        },
+        0x100 if matches!(form, 1 | 4 | 5 | 6) => Op::Flo {
+            d,
+            src: word.source(1)?,
+            invert: form == 1 && word.bit(63),
+            signed: word.bit(73),
+            shift_amount: word.bit(74),
+        },
+        0x101 if matches!(form, 1 | 4 | 5 | 6) => Op::Brev {
+            d,
+            src: word.source(1)?,
         },
         0x013 if matches!(form, 1 | 4 | 5 | 6) => Op::Iabs {
             d,

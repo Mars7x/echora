@@ -96,6 +96,8 @@ pub mod op {
     pub const NOT: u16 = 200;
     pub const BIT_FIELD_S_EXTRACT: u16 = 202;
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
+    pub const BIT_REVERSE: u16 = 204;
+    pub const BIT_COUNT: u16 = 205;
     pub const CONTROL_BARRIER: u16 = 224;
     pub const ATOMIC_EXCHANGE: u16 = 229;
     pub const ATOMIC_COMPARE_EXCHANGE: u16 = 230;
@@ -109,6 +111,11 @@ pub mod op {
     pub const ATOMIC_XOR: u16 = 242;
     pub const ATOMIC_F_ADD: u16 = 6035;
     pub const READ_CLOCK: u16 = 5056;
+    pub const GROUP_NON_UNIFORM_ALL: u16 = 334;
+    pub const GROUP_NON_UNIFORM_ANY: u16 = 335;
+    pub const GROUP_NON_UNIFORM_ALL_EQUAL: u16 = 336;
+    pub const GROUP_NON_UNIFORM_BALLOT: u16 = 339;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -139,7 +146,9 @@ pub mod capability {
     pub const SHADER: u32 = 1;
     pub const INT64: u32 = 11;
     pub const GROUP_NON_UNIFORM: u32 = 61;
+    pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
     pub const SHADER_CLOCK: u32 = 5055;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
@@ -192,6 +201,8 @@ pub mod glsl {
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
     pub const FMA: u32 = 50;
+    pub const FIND_S_MSB: u32 = 74;
+    pub const FIND_U_MSB: u32 = 75;
     pub const N_MIN: u32 = 79;
     pub const N_MAX: u32 = 80;
 }

@@ -175,6 +175,9 @@ const BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
 /// SubgroupEqMask; Ge, Gt, Le and Lt follow, as S2R's 0x38-0x3c do.
 const BUILTIN_SUBGROUP_EQ_MASK: u32 = 4416;
 
+/// The subgroup scope, for subgroup operations.
+const SCOPE_SUBGROUP: u32 = 3;
+
 /// Bytes of a constant bank.
 const BANK_SIZE: u32 = 0x10000;
 
@@ -1066,6 +1069,138 @@ impl Emitter {
                     self.write_register(d.0, high_word);
                 } else {
                     self.write_pair(d.0, sum);
+                }
+            }
+            Op::BitCount { d, src, invert } => {
+                let mut x = self.integer(index, src)?;
+                if invert {
+                    x = self.value(op::NOT, self.u32, &[x]);
+                }
+                let value = self.value(op::BIT_COUNT, self.u32, &[x]);
+                self.write_register(d.0, value);
+            }
+            Op::Flo {
+                d,
+                src,
+                invert,
+                signed,
+                shift_amount,
+            } => {
+                let mut x = self.integer(index, src)?;
+                if invert {
+                    x = self.value(op::NOT, self.u32, &[x]);
+                }
+                // Both give -1 (all ones) where no bit is found.
+                let f = if signed {
+                    glsl::FIND_S_MSB
+                } else {
+                    glsl::FIND_U_MSB
+                };
+                let mut value = self.glsl(self.u32, f, &[x]);
+                if shift_amount {
+                    let (none, thirty_one) = (self.constant(u32::MAX), self.constant(31));
+                    let missing = self.value(op::I_EQUAL, self.bool, &[value, none]);
+                    let distance = self.value(op::I_SUB, self.u32, &[thirty_one, value]);
+                    value = self.value(op::SELECT, self.u32, &[missing, none, distance]);
+                }
+                self.write_register(d.0, value);
+            }
+            Op::Brev { d, src } => {
+                let x = self.integer(index, src)?;
+                let value = self.value(op::BIT_REVERSE, self.u32, &[x]);
+                self.write_register(d.0, value);
+            }
+            Op::Shfl {
+                d,
+                p,
+                a,
+                lane,
+                c,
+                mode,
+            } => {
+                self.module
+                    .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
+                let value = self.read_register(a.0);
+                let b = self.source(index, lane)?;
+                let c = self.source(index, c)?;
+                let me = self.special_register(index, 0)?;
+                let (mask5, eight) = (self.constant(0x1f), self.constant(8));
+                let b = self.value(op::BITWISE_AND, self.u32, &[b, mask5]);
+                let clamp = self.value(op::BITWISE_AND, self.u32, &[c, mask5]);
+                let segment = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[c, eight]);
+                let segment = self.value(op::BITWISE_AND, self.u32, &[segment, mask5]);
+                let outside = self.value(op::NOT, self.u32, &[segment]);
+                let min_lane = self.value(op::BITWISE_AND, self.u32, &[me, segment]);
+                let high = self.value(op::BITWISE_AND, self.u32, &[clamp, outside]);
+                let max_lane = self.value(op::BITWISE_OR, self.u32, &[min_lane, high]);
+                let (source, in_range) = match mode {
+                    0 => {
+                        let free = self.value(op::BITWISE_AND, self.u32, &[b, outside]);
+                        let j = self.value(op::BITWISE_OR, self.u32, &[min_lane, free]);
+                        (
+                            j,
+                            self.value(op::U_LESS_THAN_EQUAL, self.bool, &[j, max_lane]),
+                        )
+                    }
+                    1 => {
+                        let j = self.value(op::I_SUB, self.u32, &[me, b]);
+                        (
+                            j,
+                            self.value(op::S_GREATER_THAN_EQUAL, self.bool, &[j, max_lane]),
+                        )
+                    }
+                    2 => {
+                        let j = self.value(op::I_ADD, self.u32, &[me, b]);
+                        (
+                            j,
+                            self.value(op::U_LESS_THAN_EQUAL, self.bool, &[j, max_lane]),
+                        )
+                    }
+                    _ => {
+                        let j = self.value(op::BITWISE_XOR, self.u32, &[me, b]);
+                        (
+                            j,
+                            self.value(op::U_LESS_THAN_EQUAL, self.bool, &[j, max_lane]),
+                        )
+                    }
+                };
+                let source = self.value(op::SELECT, self.u32, &[in_range, source, me]);
+                let subgroup = self.constant(SCOPE_SUBGROUP);
+                let shuffled = self.value(
+                    op::GROUP_NON_UNIFORM_SHUFFLE,
+                    self.u32,
+                    &[subgroup, value, source],
+                );
+                self.write_register(d.0, shuffled);
+                self.write_predicate(p, in_range);
+            }
+            Op::Vote {
+                d,
+                p,
+                condition,
+                mode,
+            } => {
+                self.module.capability(capability::GROUP_NON_UNIFORM_VOTE);
+                self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
+                let condition = self.read_predicate(condition);
+                let subgroup = self.constant(SCOPE_SUBGROUP);
+                let uvec4 = self.module.ty(Type::Vector {
+                    component: self.u32,
+                    count: 4,
+                });
+                let ballot =
+                    self.value(op::GROUP_NON_UNIFORM_BALLOT, uvec4, &[subgroup, condition]);
+                let ballot = self.value(op::COMPOSITE_EXTRACT, self.u32, &[ballot, 0]);
+                self.write_register(d.0, ballot);
+                let opcode = match mode {
+                    0 => op::GROUP_NON_UNIFORM_ALL,
+                    1 => op::GROUP_NON_UNIFORM_ANY,
+                    2 => op::GROUP_NON_UNIFORM_ALL_EQUAL,
+                    _ => return Err(unsupported(index, "VOTE mode 3")),
+                };
+                if p != 7 {
+                    let vote = self.value(opcode, self.bool, &[subgroup, condition]);
+                    self.write_predicate(p, vote);
                 }
             }
             Op::Iabs { d, src } => {
@@ -2768,6 +2903,71 @@ mod tests {
                 assert_eq!(got.to_bits(), want.to_bits(), "{a} * {b} by {rounding}");
             }
         }
+    }
+
+    #[test]
+    fn warp_and_bit_operations_validate() {
+        valid(&[
+            // SHFL.BFLY PT, R2, R1, 0x1, 0x1f; SHFL.IDX P0, R3, R1, R4, R5
+            word(&[
+                (0, 12, 0xf89),
+                (16, 8, 2),
+                (24, 8, 1),
+                (40, 13, 0x1f),
+                (53, 5, 1),
+                (58, 2, 3),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x389),
+                (16, 8, 3),
+                (24, 8, 1),
+                (32, 8, 4),
+                (64, 8, 5),
+                (81, 3, 0),
+            ]),
+            // SHFL.UP R6, R1, 0x2, RZ; SHFL.DOWN R7, R1, R4, 0x1f
+            word(&[
+                (0, 12, 0x989),
+                (16, 8, 6),
+                (24, 8, 1),
+                (53, 5, 2),
+                (58, 2, 1),
+                (64, 8, 255),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x589),
+                (16, 8, 7),
+                (24, 8, 1),
+                (32, 8, 4),
+                (40, 13, 0x1f),
+                (58, 2, 2),
+                (81, 3, 7),
+            ]),
+            // VOTE.ANY R8, P1, P0; VOTE.EQ RZ, P2, !P0
+            word(&[
+                (0, 12, 0x806),
+                (16, 8, 8),
+                (72, 2, 1),
+                (81, 3, 1),
+                (87, 3, 0),
+            ]),
+            word(&[
+                (0, 12, 0x806),
+                (16, 8, 255),
+                (72, 2, 2),
+                (81, 3, 2),
+                (87, 3, 0),
+                (90, 1, 1),
+            ]),
+            // POPC R9, ~R1; FLO.U32.SH R10, R1; FLO.S32 R11, R1; BREV R12, R1
+            word(&[(0, 12, 0x309), (16, 8, 9), (32, 8, 1), (63, 1, 1)]),
+            word(&[(0, 12, 0x300), (16, 8, 10), (32, 8, 1), (74, 1, 1)]),
+            word(&[(0, 12, 0x300), (16, 8, 11), (32, 8, 1), (73, 1, 1)]),
+            word(&[(0, 12, 0x301), (16, 8, 12), (32, 8, 1)]),
+            EXIT,
+        ]);
     }
 
     #[test]
