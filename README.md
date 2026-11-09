@@ -3,6 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/Mars7x/echora/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Mars7x/echora/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square)](https://www.rust-lang.org)
+![Written in pure Rust](https://img.shields.io/badge/written%20in-pure%20Rust-orange?style=flat-square)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-red?style=flat-square)
 
 Echora is a native recompilation of the Nintendo Switch 2 release of *The
@@ -95,9 +96,11 @@ pretending it worked. The translated code is tested against a reference
 interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
-The project is written in Rust, apart from a few C libraries. Anything that goes beyond what the console does, such as frame
-rates above 60 or ultrawide, will be kept in a separate layer of enhancements
-that can be turned off.
+Echora is written in pure Rust. Like any PC program it uses the system's own
+libraries for graphics, sound, input and windows, and its AV1 video decoder
+keeps hand-written assembly for speed. Anything that goes beyond what the
+console does, such as frame rates above 60 or ultrawide, will be kept in a
+separate layer of enhancements that can be turned off.
 
 ## How it works
 
