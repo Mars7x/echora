@@ -1049,6 +1049,7 @@ pub(crate) mod tests {
             abi_version: crate::shader::ABI_VERSION,
             spec_constants: Vec::new(),
             push_fields: 0,
+            texture_pool_bindings: 0,
         })
     }
 

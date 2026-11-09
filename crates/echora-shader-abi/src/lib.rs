@@ -8,7 +8,7 @@
 /// Changes whenever anything a translated program relies on changes (the
 /// push-constant layout, the page-table format, descriptor numbering). It
 /// is stored in every `Translated` and is part of every shader cache key.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// A program's pipeline stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +157,10 @@ pub struct Translated {
     pub spec_constants: Vec<SpecConstant>,
     /// `PushConstants` fields the program reads (`PUSH_*` bits).
     pub push_fields: u32,
+    /// The texture pool bindings (descriptor set `TEXTURE_POOL_SET`) the
+    /// program reads, bit n for binding n (`texture_pool::*`); 0 when it
+    /// uses only set 0.
+    pub texture_pool_bindings: u32,
 }
 
 /// The push-constant block every translated program shares, 128 bytes at
@@ -242,6 +246,49 @@ pub struct PageTable {
     pub first_page: u32,
     /// Pages in the table.
     pub page_count: u32,
+}
+
+/// Bindless textures: a texture or image whose handle a program computes
+/// at run time is read from the bound NVN texture and sampler pools,
+/// which every program sees as arrays in descriptor set 1, indexed by the
+/// handle: bits 0..20 the texture's index in the texture pool
+/// (`TEXTURE_INDEX_MASK`), bits 20..32 the sampler's in the sampler pool
+/// (`handle >> SAMPLER_INDEX_SHIFT`), as NVN forms handles.
+///
+/// Each binding is an unsized array (runtimeDescriptorArray, partially
+/// bound, indexed with NonUniform); its entries are the pool's descriptors
+/// in that view type. An entry the runtime has not written, or a texture
+/// of another view type, reads as a null descriptor (zeros). Sampling
+/// combines `texture_pool::SAMPLERS[sampler index]` with the image; a
+/// sampler with depth compare comes from the guest's sampler state, so
+/// depth-compare reads need no other binding. Integer textures are read
+/// from the `UINT_*` arrays (a uint view of the same entry).
+pub const TEXTURE_POOL_SET: u32 = 1;
+pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
+pub const SAMPLER_INDEX_SHIFT: u32 = 20;
+
+/// Set-1 bindings (`TEXTURE_POOL_SET`).
+pub mod texture_pool {
+    /// VkSampler array (`OpTypeSampler`).
+    pub const SAMPLERS: u32 = 0;
+    /// Sampled-image arrays, float results, by view type.
+    pub const SAMPLED_1D: u32 = 1;
+    pub const SAMPLED_1D_ARRAY: u32 = 2;
+    pub const SAMPLED_2D: u32 = 3;
+    pub const SAMPLED_2D_ARRAY: u32 = 4;
+    pub const SAMPLED_3D: u32 = 5;
+    pub const SAMPLED_CUBE: u32 = 6;
+    pub const SAMPLED_CUBE_ARRAY: u32 = 7;
+    /// Uniform texel buffers.
+    pub const SAMPLED_BUFFER: u32 = 8;
+    /// Storage images, format Unknown (typeless).
+    pub const STORAGE_2D: u32 = 9;
+    pub const STORAGE_3D: u32 = 10;
+    /// Sampled-image arrays, uint results.
+    pub const UINT_2D: u32 = 11;
+    pub const UINT_2D_ARRAY: u32 = 12;
+    pub const UINT_3D: u32 = 13;
+    pub const COUNT: u32 = 14;
 }
 
 /// Vertex pulling: a vertex program reads its generic inputs from guest

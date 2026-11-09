@@ -458,6 +458,7 @@ impl Emitter {
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: self.spec_constants,
             push_fields: self.push_fields,
+            texture_pool_bindings: 0,
         }
     }
 

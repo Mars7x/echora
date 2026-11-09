@@ -403,6 +403,7 @@ pub fn translate<E: Environment>(
         // may push texture rescaling words.
         spec_constants: Vec::new(),
         push_fields: PUSH_TRANSLATOR,
+        texture_pool_bindings: 0,
     };
     free(&mut output);
     Ok(result)
