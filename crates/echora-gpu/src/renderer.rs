@@ -649,7 +649,7 @@ impl Renderer {
 
     /// Record a copy of `length` bytes of resident buffer `key` for the
     /// host: its token completes with the next flush (see
-    /// `take_completed_reads`).
+    /// `take_reads`).
     pub fn read_resident(&mut self, key: u64, at: u64, length: u64) -> Result<u64, String> {
         let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
         let length = length.min(size.saturating_sub(at));
@@ -755,7 +755,7 @@ impl Renderer {
     /// `length` bytes of the ring at `offset`, after the work writing them
     /// completed (flushed) and before the ring is reused.
     /// Read `length` ring bytes at `offset` once the recorded work has
-    /// completed: returns a token `take_completed_reads` answers after
+    /// completed: returns a token `take_reads` answers after
     /// the next flush.
     pub(crate) fn defer_ring_read(&mut self, offset: u64, length: usize) -> u64 {
         let token = self.next_read_token;
@@ -770,10 +770,14 @@ impl Renderer {
         !self.pending_reads.is_empty() || !self.spare.pending_reads.is_empty()
     }
 
-    /// Deferred reads the flushes since the last call completed, oldest
-    /// first.
-    pub fn take_completed_reads(&mut self) -> Vec<(u64, Vec<u8>)> {
-        std::mem::take(&mut self.completed_reads)
+    /// The completed deferred reads among `tokens`, by token; other
+    /// readers' results stay for them.
+    pub fn take_reads(&mut self, tokens: &[u64]) -> HashMap<u64, Vec<u8>> {
+        let (mine, others) = std::mem::take(&mut self.completed_reads)
+            .into_iter()
+            .partition(|(token, _)| tokens.contains(token));
+        self.completed_reads = others;
+        mine.into_iter().collect()
     }
 
     pub(crate) fn ring_read(&self, offset: u64, length: usize) -> Vec<u8> {
@@ -2176,6 +2180,24 @@ impl Renderer {
         srgb_twin(format).filter(|twin| srgb && self.supports_storage(*twin))
     }
 
+    /// The format a storage image binding views `format` as: the format
+    /// the program declares (an unsigned or signed word format of the same
+    /// texel size), else `format` itself or its storage twin.
+    pub(crate) fn storage_view_format(
+        &self,
+        format: vk::Format,
+        declared: Option<vk::Format>,
+    ) -> Option<vk::Format> {
+        if let Some(declared) = declared.filter(|declared| *declared != format) {
+            return (uint_alias(format) == uint_alias(declared)).then_some(declared);
+        }
+        if self.supports_storage(format) {
+            Some(format)
+        } else {
+            self.storage_twin(format)
+        }
+    }
+
     pub fn supports_storage(&self, format: vk::Format) -> bool {
         // SAFETY: the instance and physical device are live.
         unsafe {
@@ -2631,8 +2653,30 @@ impl Renderer {
         let store_twin = self.storage_twin(format);
         let twin = srgb_twin(format)
             .filter(|_| !usage.contains(vk::ImageUsageFlags::STORAGE) || store_twin.is_some());
-        let listed = [format, twin.unwrap_or(format)];
+        // A storage target may also be written as unsigned words of its
+        // texel size (a shader's R32UI view of an R11G11B10 or RGBA8
+        // target): that alias is listed too.
+        let alias = uint_alias(format)
+            .filter(|alias| *alias != format && usage.contains(vk::ImageUsageFlags::STORAGE));
+        let mut listed = vec![format];
+        listed.extend(twin);
+        listed.extend(alias);
+        // R8 and R16 words may also be declared signed.
+        listed.extend(alias.and_then(|alias| match alias {
+            vk::Format::R8_UINT => Some(vk::Format::R8_SINT),
+            vk::Format::R16_UINT => Some(vk::Format::R16_SINT),
+            _ => None,
+        }));
+        listed.retain({
+            let mut seen = Vec::new();
+            move |format| {
+                let new = !seen.contains(format);
+                seen.push(*format);
+                new
+            }
+        });
         let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&listed);
+        let twin = twin.or(alias);
         let flags = if twin.is_some() {
             flags | vk::ImageCreateFlags::MUTABLE_FORMAT
         } else {
@@ -3980,4 +4024,50 @@ mod fit_tests {
         );
         assert_eq!(fit_rect((1920, 1080), (0, 0)), [0, 0, 0, 0]);
     }
+}
+
+/// The unsigned word format with `format`'s texel size, which a storage
+/// image of it can be viewed as (None: no such size, or compressed).
+pub(crate) fn uint_alias(format: vk::Format) -> Option<vk::Format> {
+    use vk::Format as F;
+    let bytes = match format {
+        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT => 1,
+        F::R16_SFLOAT | F::R16_UNORM | F::R16_SNORM | F::R16_UINT | F::R16_SINT => 2,
+        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT => 2,
+        F::R32_SFLOAT | F::R32_UINT | F::R32_SINT => 4,
+        F::R16G16_SFLOAT | F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT => 4,
+        F::R16G16_SINT => 4,
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT => 4,
+        F::R8G8B8A8_SRGB | F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB => 4,
+        F::A2B10G10R10_UNORM_PACK32 | F::A2B10G10R10_UINT_PACK32 => 4,
+        F::B10G11R11_UFLOAT_PACK32 | F::E5B9G9R9_UFLOAT_PACK32 => 4,
+        F::R32G32_SFLOAT | F::R32G32_UINT | F::R32G32_SINT => 8,
+        F::R16G16B16A16_SFLOAT | F::R16G16B16A16_UNORM | F::R16G16B16A16_SNORM => 8,
+        F::R16G16B16A16_UINT | F::R16G16B16A16_SINT => 8,
+        F::R32G32B32A32_SFLOAT | F::R32G32B32A32_UINT | F::R32G32B32A32_SINT => 16,
+        _ => return None,
+    };
+    Some(match bytes {
+        1 => F::R8_UINT,
+        2 => F::R16_UINT,
+        4 => F::R32_UINT,
+        8 => F::R32G32_UINT,
+        _ => F::R32G32B32A32_UINT,
+    })
+}
+
+/// The format a storage image descriptor declares (`Descriptor::flags` bits
+/// 8-11: the recompiler's ImageFormat), None when typeless.
+pub(crate) fn declared_image_format(flags: u32) -> Option<vk::Format> {
+    use vk::Format as F;
+    Some(match flags >> 8 & 0xf {
+        1 => F::R8_UINT,
+        2 => F::R8_SINT,
+        3 => F::R16_UINT,
+        4 => F::R16_SINT,
+        5 => F::R32_UINT,
+        6 => F::R32G32_UINT,
+        7 => F::R32G32B32A32_UINT,
+        _ => return None,
+    })
 }

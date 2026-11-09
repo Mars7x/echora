@@ -122,7 +122,8 @@ struct EchoraShaderDescriptor {
     uint32_t texture_type;
     /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample, 5 a
     /// storage buffer whose address is a raw 8-byte pointer (no size word:
-    /// the binding gives the bounds).
+    /// the binding gives the bounds). Images: bits 8-11 the declared
+    /// format (Shader::ImageFormat; 0 typeless).
     uint32_t flags;
     /// Storage buffers: the pointer is read from memory this many bytes
     /// past the constant buffer pointer (~0: the constant buffer word is

@@ -424,7 +424,7 @@ impl Renderer {
     /// Record one draw.
     /// Record `draw`. Returns, for each copied storage buffer a stage
     /// writes, its (stage index, binding) and the token of its contents
-    /// after the next flush (`take_completed_reads`).
+    /// after the next flush (`take_reads`).
     pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).

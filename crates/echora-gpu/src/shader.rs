@@ -64,7 +64,8 @@ pub struct Descriptor {
     pub texture_type: u32,
     /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample, 5 a
     /// storage buffer at a raw 8-byte pointer (no size word: the binding
-    /// gives the bounds).
+    /// gives the bounds). Images: bits 8-11 the declared format
+    /// (Shader::ImageFormat; 0 typeless).
     pub flags: u32,
     /// Storage buffers: the pointer is read from memory this many bytes
     /// past the constant buffer pointer (`u32::MAX`: the constant buffer

@@ -87,7 +87,8 @@ fn main() {
             }
         }
         if std::env::var_os("ECHORA_SHADER_TRACE").is_some() {
-            // path stage, then kind:binding:count:index:cbuf:offset per binding.
+            // path stage, then kind:binding:count:index:cbuf:offset:texture type
+            // per binding.
             let bindings: Vec<String> = program
                 .descriptors
                 .iter()
@@ -99,6 +100,7 @@ fn main() {
                         d.index,
                         d.cbuf_index,
                         d.cbuf_offset,
+                        d.texture_type,
                     ];
                     fields.map(|field| field.to_string()).join(":")
                 })

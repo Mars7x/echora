@@ -233,7 +233,7 @@ u32 DescribeBindings(const Shader::Info& info, u32 base, EchoraShaderOutput* out
              .cbuf_index = desc.cbuf_index, .cbuf_offset = desc.cbuf_offset,
              .size_shift = desc.size_shift, .texture_type = static_cast<u32>(desc.type),
              .flags = (desc.is_written ? 1u : 0u) | (desc.is_read ? 2u : 0u) |
-                      (desc.is_integer ? 4u : 0u)},
+                      (desc.is_integer ? 4u : 0u) | (static_cast<u32>(desc.format) << 8)},
             1);
     }
     for (u32 index = 0; index < 32; ++index) {

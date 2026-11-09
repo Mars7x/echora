@@ -32,7 +32,7 @@ pub struct Dispatch<'a> {
 impl Renderer {
     /// Record `dispatch` without waiting: returns, for each storage
     /// buffer it writes, the token of its contents after the next flush
-    /// (`take_completed_reads`).
+    /// (`take_reads`).
     pub fn dispatch_deferred(&mut self, dispatch: &Dispatch) -> Result<Vec<(u32, u64)>, String> {
         // Storage images are written at the guest's coordinates: their
         // targets stay unscaled (before recording: that may flush).
@@ -103,13 +103,12 @@ impl Renderer {
                     .existing_target(key)
                     .ok_or("compute image is not a target")?
                     .format;
-                let view_format = if self.supports_storage(format) {
-                    format
-                } else {
-                    self.storage_twin(format).ok_or_else(|| {
-                        format!("storage image format {format:?} is not supported")
-                    })?
-                };
+                let declared = crate::renderer::declared_image_format(descriptor.flags);
+                let view_format = self.storage_view_format(format, declared).ok_or_else(|| {
+                    format!(
+                        "storage image format {format:?} (declared {declared:?}) is not supported"
+                    )
+                })?;
                 self.transition(key, vk::ImageLayout::GENERAL)?;
                 // Storage image views name one mip level.
                 let image_view = self.level_view_as(key, level, view_format)?;
@@ -304,8 +303,8 @@ impl Renderer {
             return Ok(HashMap::new());
         }
         self.flush()?;
-        let mut completed: HashMap<u64, Vec<u8>> =
-            self.take_completed_reads().into_iter().collect();
+        let ids: Vec<u64> = tokens.iter().map(|(_, token)| *token).collect();
+        let mut completed = self.take_reads(&ids);
         Ok(tokens
             .into_iter()
             .map(|(binding, token)| (binding, completed.remove(&token).unwrap_or_default()))

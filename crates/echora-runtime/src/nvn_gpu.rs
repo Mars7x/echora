@@ -3189,8 +3189,12 @@ impl Nvn {
             .collect();
         if echora_gpu::renderer::Renderer::labelling() {
             let label = format!(
-                "present {} dispatch {:016x} groups {:?}",
-                self.presented_frames, key.0, dispatch.groups
+                "present {} dispatch {:016x} groups {:?} reads [{}] writes {:x?}",
+                self.presented_frames,
+                key.0,
+                dispatch.groups,
+                label_sources(dispatch.textures.values().map(|(source, _)| source)),
+                dispatch.images.values().collect::<Vec<_>>()
             );
             backend.renderer.label(label);
         }
@@ -3307,11 +3311,10 @@ impl Nvn {
             tokens.push((token, *base, piece.clone()));
         }
         backend.renderer.flush()?;
-        let mut completed: HashMap<u64, Vec<u8>> = backend
-            .renderer
-            .take_completed_reads()
-            .into_iter()
-            .collect();
+        // Only these: pending dispatch and draw results stay for
+        // `resolve_copies`.
+        let ids: Vec<u64> = tokens.iter().map(|(token, ..)| *token).collect();
+        let mut completed = backend.renderer.take_reads(&ids);
         backend.stat("stat: resident ranges copied back", wanted.len() as u64);
         for (token, base, piece) in tokens {
             let bytes = completed
@@ -3496,12 +3499,9 @@ impl Nvn {
         if backend.renderer.reads_pending() {
             backend.renderer.flush()?;
         }
-        let mut completed: HashMap<u64, Vec<u8>> = backend
-            .renderer
-            .take_completed_reads()
-            .into_iter()
-            .collect();
         let pending = std::mem::take(&mut backend.pending_storage);
+        let ids: Vec<u64> = pending.iter().map(|(token, ..)| *token).collect();
+        let mut completed = backend.renderer.take_reads(&ids);
         for (token, guest, binding, program, base) in pending {
             let Some(bytes) = completed.remove(&token) else {
                 return Err(format!("dispatch result {token} never completed"));
@@ -4513,14 +4513,15 @@ impl Nvn {
         let setup_end = std::time::Instant::now();
         if echora_gpu::renderer::Renderer::labelling() {
             let label = format!(
-                "present {} draw {:016x}/{:016x} count {} instances {} colors {:x?} depth {:x?}",
+                "present {} draw {:016x}/{:016x} count {} instances {} colors {:x?} depth {:x?} reads [{}]",
                 self.presented_frames,
                 keys.0,
                 keys.1,
                 draw.count,
                 draw.instances,
                 draw.colors,
-                draw.depth
+                draw.depth,
+                label_sources(draw.textures.values().map(|(source, _)| source))
             );
             backend.renderer.label(label);
         }
@@ -4973,4 +4974,18 @@ fn constant_pointer(descriptor: &shader::Descriptor, c0: &[u8]) -> Option<(u64, 
     let gpu = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     let size = u64::from(u32::from_le_bytes(bytes[8..].try_into().unwrap()));
     Some((gpu, size))
+}
+
+/// Texture sources for a submission label: targets as `t<key>`, uploads
+/// as `u<key>`.
+fn label_sources<'a>(sources: impl Iterator<Item = &'a TextureSource>) -> String {
+    sources
+        .map(|source| match source {
+            TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                format!("t{key:x}")
+            }
+            TextureSource::Upload { key, .. } => format!("u{key:x}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -1,0 +1,15 @@
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -1323,7 +1323,11 @@
+                 const IR::U32 y{ir.CompositeExtract(coords, 1)};
+                 inst->SetArg(1, ir.CompositeConstruct(ir.ShiftRightArithmetic(x, ir.Imm32(2)), y));
+             }
++            // A typed access (R32UI and the other word formats) reads and
++            // writes unsigned or signed words whatever the bound texture's
++            // format: the image is integer, viewed in the declared format.
+             const bool is_integer{flags.image_byte_address != 0 ||
++                                  flags.image_format != ImageFormat::Typeless ||
+                                   is_texture_pixel_format_integer(cbuf)};
+             if (flags.type == TextureType::Buffer) {
+                 index = descriptors.Add(ImageBufferDescriptor{
