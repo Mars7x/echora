@@ -77,6 +77,22 @@ goals first-class, next to correctness:
 4. **Graphics stages** and textures.
 5. **HMMA**: a subgroup path, and VK_KHR_cooperative_matrix.
 
+**Emission quality.** The driver's optimiser (NIR, ACO) does best on
+plain structured code, so the output aims for that:
+
+- a structurizer that emits real if/else, loops and merges, with the
+  block dispatcher (a switch inside one loop, the first translation's
+  form) kept only for irreducible regions;
+- native subgroup operations for SHFL, VOTE and friends;
+- fp16 types where the source works on halves;
+- PhysicalStorageBuffer pointers through the page table;
+- cooperative matrices for HMMA, with a subgroup fallback;
+- specialization constants for run-time settings.
+
+An optional spirv-opt pass (its performance recipe) sits behind a switch
+and is measured against the unoptimised output before it becomes a
+default.
+
 **Verification.** Unit tests per form (words built from known fields,
 decoded and compared); on the user's machine, nvdisasm (CUDA toolkit) as a
 decode oracle, and a differential translation of the ~6,200 dumped game
