@@ -125,6 +125,9 @@ pub enum TextureOp {
     /// TMML: the level of detail a sample would use, and the unclamped
     /// one, as 8.8 fixed point.
     LevelQuery,
+    /// TXD: a sample with explicit derivatives: coordinates (x, y, then the
+    /// layer) in a.., the gradients in b.. as d/dx and d/dy of x, then of y.
+    Gradient,
 }
 
 /// A texture instruction's operands. The handle is the word at byte
@@ -1262,7 +1265,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 kind: word.bits(73, 3) as u8,
             });
         }
-        0xb60 | 0xb66 | 0xb63 | 0xb6f | 0xb69 | 0xf60 | 0xf66 | 0xf63 | 0xf6f | 0xf69 => {
+        0xb60 | 0xb66 | 0xb63 | 0xb6f | 0xb69 | 0xb6c | 0xf60 | 0xf66 | 0xf63 | 0xf6f | 0xf69 => {
             let bindless = opcode & 0x400 != 0;
             if bindless && (word.bits(46, 13) != 0 || !word.bit(91)) {
                 return None;
@@ -1271,6 +1274,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 0x160 => TextureOp::Sample,
                 0x166 => TextureOp::Fetch,
                 0x169 => TextureOp::LevelQuery,
+                0x16c => TextureOp::Gradient,
                 0x163 => TextureOp::Gather {
                     component: word.bits(87, 2) as u8,
                 },

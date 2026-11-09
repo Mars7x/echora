@@ -15,6 +15,7 @@ use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 /// SPIR-V image operand bits.
 const OPERAND_BIAS: u32 = 0x1;
 const OPERAND_LOD: u32 = 0x2;
+const OPERAND_GRAD: u32 = 0x4;
 const OPERAND_OFFSET: u32 = 0x10;
 
 /// A view type: SPIR-V's dimension and arrayed flag, the runtime's
@@ -282,6 +283,7 @@ impl Emitter {
         let results = match texture.op {
             TextureOp::Query => self.texture_query(index, texture)?,
             TextureOp::LevelQuery => self.texture_level_query(index, texture, &view)?,
+            TextureOp::Gradient => self.texture_gradient(index, texture, &view)?,
             _ => self.texture_read(index, texture, &view)?,
         };
         // The written components, in mask order.
@@ -579,7 +581,7 @@ impl Emitter {
                 vec4,
                 &image_operands(vec![sampled, coordinate, reference]),
             ),
-            (TextureOp::Query | TextureOp::LevelQuery, _) => {
+            (TextureOp::Query | TextureOp::LevelQuery | TextureOp::Gradient, _) => {
                 unreachable!("queries are not reads")
             }
         };
@@ -634,6 +636,56 @@ impl Emitter {
         let raw = self.value(op::CONVERT_F_TO_S, self.u32, &[raw]);
         let zero = self.constant(0);
         Ok(vec![clamped, raw, zero, zero])
+    }
+
+    /// TXD: a 2D or 2D-array sample at the derivatives given.
+    fn texture_gradient(
+        &mut self,
+        index: usize,
+        texture: &Texture,
+        view: &View,
+    ) -> Result<Vec<u32>, Unsupported> {
+        if view.dim != 1 {
+            return Err(unsupported(index, "TXD other than 2D"));
+        }
+        let read = |e: &mut Self, base: u8, n: u8| {
+            if base == 255 {
+                e.float_constant(0.0)
+            } else {
+                let bits = e.read_register(base.saturating_add(n));
+                e.value(op::BITCAST, e.f32, &[bits])
+            }
+        };
+        let (x, y) = (read(self, texture.a.0, 0), read(self, texture.a.0, 1));
+        let mut coordinates = vec![x, y];
+        if view.arrayed {
+            let layer = if texture.a.0 == 255 {
+                self.constant(0)
+            } else {
+                self.read_register(texture.a.0.saturating_add(2))
+            };
+            coordinates.push(self.value(op::CONVERT_U_TO_F, self.f32, &[layer]));
+        }
+        let coordinate = self.vector(self.f32, &coordinates);
+        let d: Vec<u32> = (0..4).map(|n| read(self, texture.b.0, n)).collect();
+        let dx = self.vector(self.f32, &[d[0], d[2]]);
+        let dy = self.vector(self.f32, &[d[1], d[3]]);
+        let (sampled, _) = self.sampled_image(index, texture, view, false, None)?;
+        let vec4 = self.module.ty(Type::Vector {
+            component: self.f32,
+            count: 4,
+        });
+        let result = self.value(
+            op::IMAGE_SAMPLE_EXPLICIT_LOD,
+            vec4,
+            &[sampled, coordinate, OPERAND_GRAD, dx, dy],
+        );
+        Ok((0..4)
+            .map(|n| {
+                let component = self.value(op::COMPOSITE_EXTRACT, self.f32, &[result, n]);
+                self.value(op::BITCAST, self.u32, &[component])
+            })
+            .collect())
     }
 
     /// TXQ: width, height, depth or layers, and the level count. The

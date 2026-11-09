@@ -3736,6 +3736,20 @@ mod tests {
                     (72, 24, 0x009eaf),
                 ],
             ),
+            // TXD R32, R0 (x, y), R8 (gradients), 2D, 0xf, second
+            // destination R36
+            tex(
+                0xb6c,
+                &[
+                    (16, 8, 32),
+                    (24, 8, 0),
+                    (32, 8, 8),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 36),
+                    (72, 4, 0xf),
+                ],
+            ),
             // TXQ R24, R1 (level), 0xf, c[0][0x50]
             tex(
                 0xb6f,
