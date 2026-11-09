@@ -2168,6 +2168,7 @@ impl Emitter {
                 k16,
                 single,
             } => self.matrix_multiply(index, d.0, a.0, b.0, c.0, k16, single)?,
+            Op::Movm { d, a } => self.matrix_transpose(index, d.0, a.0)?,
             Op::Ldsm {
                 d,
                 a,
@@ -4111,6 +4112,21 @@ mod tests {
             matrices: MatrixPath::Subgroup,
         };
         valid_with(&words, &layout);
+    }
+
+    #[test]
+    fn matrix_transposes_validate() {
+        // MOVM.16.MT88 R2, R5; MOVM.16.MT88 RZ, R1
+        valid(&[
+            word(&[(0, 12, 0x23a), (16, 8, 2), (24, 8, 5)]),
+            word(&[(0, 12, 0x23a), (16, 8, 255), (24, 8, 1)]),
+            EXIT,
+        ]);
+        // Another mode bit is refused.
+        assert!(matches!(
+            crate::decode::decode(word(&[(0, 12, 0x23a), (24, 8, 5), (72, 1, 1)])).op,
+            crate::decode::Op::Unknown { .. }
+        ));
     }
 
     #[test]

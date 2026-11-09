@@ -609,6 +609,13 @@ pub enum Op {
         count: u8,
         transpose: bool,
     },
+    /// MOVM.16.MT88 d, a: the warp's 8x8 matrix of halves, lane t holding
+    /// row t/4, columns 2(t%4) and 2(t%4)+1 in a, transposed into d in the
+    /// same layout. Only the plain form (bits 32-95 zero) is accepted.
+    Movm {
+        d: Reg,
+        a: Reg,
+    },
     /// HMMA.16816 / HMMA.1688 d, a, b, c: the warp's 16x8 matrix
     /// a (16xK halves) x b (Kx8 halves) + c, K 16 (`k16`, bit 75) or 8,
     /// in 32-bit floats (`single`, bit 76: four registers of c and d per
@@ -1407,6 +1414,12 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 k16: word.bit(75),
                 single: word.bit(76),
             });
+        }
+        0x23a => {
+            if word.bits(32, 32) != 0 || word.bits(64, 32) != 0 {
+                return None;
+            }
+            return Some(Op::Movm { d, a: word.reg(24) });
         }
         0x83b => {
             if word.bits(72, 2) == 3 || word.bit(79) {

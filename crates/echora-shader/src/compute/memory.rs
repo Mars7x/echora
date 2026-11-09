@@ -403,6 +403,49 @@ impl Emitter {
         Ok(())
     }
 
+    /// MOVM.16.MT88: transpose the warp's 8x8 half matrix. Lane t holds row
+    /// t/4, columns 2(t%4) and 2(t%4)+1; its transposed halves are column
+    /// t/4 of rows 2(t%4) and 2(t%4)+1, held by lanes 8(t%4) + t/8 and
+    /// 8(t%4) + t/8 + 4, at half (t/4)%2 of each.
+    pub(super) fn matrix_transpose(
+        &mut self,
+        index: usize,
+        d: u8,
+        a: u8,
+    ) -> Result<(), Unsupported> {
+        self.module
+            .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
+        let value = self.read_register(a);
+        let lane = self.special_register(index, 0)?;
+        let c = |e: &mut Self, v: u32| e.constant(v);
+        let (one, two, three, four, sixteen) =
+            (c(self, 1), c(self, 2), c(self, 3), c(self, 4), c(self, 16));
+        let within = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+        let row_pair = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[within, three]);
+        let eighth = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, three]);
+        let low_lane = self.value(op::I_ADD, self.u32, &[row_pair, eighth]);
+        let high_lane = self.value(op::I_ADD, self.u32, &[low_lane, four]);
+        let quarter = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
+        let odd = self.value(op::BITWISE_AND, self.u32, &[quarter, one]);
+        let shift = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[odd, four]);
+        let subgroup = self.constant(super::SCOPE_SUBGROUP);
+        let mut halves = Vec::new();
+        for source in [low_lane, high_lane] {
+            let word = self.value(
+                op::GROUP_NON_UNIFORM_SHUFFLE,
+                self.u32,
+                &[subgroup, value, source],
+            );
+            halves.push(self.value(op::BIT_FIELD_U_EXTRACT, self.u32, &[word, shift, sixteen]));
+        }
+        let high = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[halves[1], sixteen]);
+        let result = self.value(op::BITWISE_OR, self.u32, &[high, halves[0]]);
+        if d != 255 {
+            self.write_register(d, result);
+        }
+        Ok(())
+    }
+
     /// The `size`-typed value at byte `low_bits` (0-3) of `word`.
     pub(super) fn sub_word(&mut self, word: u32, low_bits: u32, size: u8) -> u32 {
         let eight = self.constant(8);
