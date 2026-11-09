@@ -121,6 +121,11 @@ fn main() {
             } else {
                 "compute"
             };
+            // ECHORA_CHECK_OUTCOMES: each stage's outcome, for finding
+            // examples of one.
+            if std::env::var_os("ECHORA_CHECK_OUTCOMES").is_some() {
+                eprintln!("outcome {path} {kind} {outcome}");
+            }
             *rust.entry(format!("{kind:8} {outcome}")).or_default() += 1;
         }
         let program = match shader::translate(&bytes, parameters, &mut NoEnvironment) {
