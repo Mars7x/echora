@@ -88,6 +88,29 @@ pub enum Combine {
     Xor,
 }
 
+/// Where a load or store goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Space {
+    /// Global memory, through the GPU page table.
+    Global,
+    /// The workgroup's shared memory.
+    Shared,
+    /// The invocation's local memory.
+    Local,
+}
+
+/// A memory address: a register (a pair when `wide`), scaled by `scale`
+/// (shared memory only), plus a uniform register (a pair when its flag is
+/// set) and a signed byte offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Address {
+    pub reg: Reg,
+    pub wide: bool,
+    pub scale: u8,
+    pub uniform: Option<(UniformReg, bool)>,
+    pub offset: i32,
+}
+
 /// A decoded instruction: its guard and operation, and the word it came
 /// from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +305,27 @@ pub enum Op {
         d: UniformReg,
         src: Src,
         size: u8,
+    },
+    /// LDG / LDS / LDL d, [address]: `size` the memory type (bits 73-75: 0
+    /// U8, 1 S8, 2 U16, 3 S16, 4 a word, 5 a pair, 6 four words); a global
+    /// load reads zero where `condition` fails.
+    Load {
+        d: Reg,
+        space: Space,
+        address: Address,
+        size: u8,
+        condition: Pred,
+    },
+    /// STG / STS / STL [address], data.
+    Store {
+        data: Reg,
+        space: Space,
+        address: Address,
+        size: u8,
+    },
+    /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
+    Bar {
+        mode: u8,
     },
     /// BSSY and BSYNC (convergence barriers) and DEPBAR (scoreboard
     /// waits): nothing for a translation that runs each invocation on its
@@ -519,6 +563,36 @@ impl Word {
         })
     }
 
+    /// A load or store's address. Global accesses with uniform registers
+    /// (0x9xx) flag a register pair at bit 90 and the uniform pair at 72;
+    /// without (0x3xx), the register pair at 72. Bit 91 adds the uniform
+    /// register at `uniform_at`. Shared accesses scale the register by
+    /// bits 78-79 (1, 4, 8 or 16).
+    fn address(self, opcode: u16, uniform_at: u32) -> Address {
+        let global = matches!(opcode & 0xff, 0x81 | 0x86);
+        let with_uniform = opcode & 0x800 != 0;
+        let wide = global && self.bit(if with_uniform { 90 } else { 72 });
+        let uniform = (with_uniform && self.bit(91)).then(|| {
+            (
+                UniformReg(self.bits(uniform_at, 6) as u8),
+                global && self.bit(72),
+            )
+        });
+        let shared = matches!(opcode & 0xff, 0x84 | 0x88);
+        let scale = if shared {
+            [1, 4, 8, 16][self.bits(78, 2) as usize]
+        } else {
+            1
+        };
+        Address {
+            reg: self.reg(24),
+            wide,
+            scale,
+            uniform,
+            offset: ((self.bits(40, 24) as u32) << 8) as i32 >> 8,
+        }
+    }
+
     fn float_modes(self) -> FloatModes {
         FloatModes {
             saturate: self.bit(77),
@@ -604,6 +678,47 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 d,
                 special: word.bits(72, 8) as u8,
                 wide: word.bit(80),
+            });
+        }
+        0x381 | 0x981 | 0x984 | 0x983 => {
+            let space = match opcode {
+                0x381 | 0x981 => Space::Global,
+                0x984 => Space::Shared,
+                _ => Space::Local,
+            };
+            let condition = if opcode == 0x981 {
+                // Stored reversed: 7 - the predicate.
+                Pred {
+                    index: 7 - word.bits(64, 3) as u8,
+                    negated: word.bit(67),
+                }
+            } else {
+                Pred::TRUE
+            };
+            return Some(Op::Load {
+                d,
+                space,
+                address: word.address(opcode, 32),
+                size: word.bits(73, 3) as u8,
+                condition,
+            });
+        }
+        0x386 | 0x986 | 0x388 | 0x988 | 0x387 | 0x987 => {
+            let space = match opcode & 0xff {
+                0x86 => Space::Global,
+                0x88 => Space::Shared,
+                _ => Space::Local,
+            };
+            return Some(Op::Store {
+                data: word.reg(32),
+                space,
+                address: word.address(opcode, 64),
+                size: word.bits(73, 3) as u8,
+            });
+        }
+        0xb1d => {
+            return Some(Op::Bar {
+                mode: word.bits(77, 2) as u8,
             });
         }
         0xb82 => {

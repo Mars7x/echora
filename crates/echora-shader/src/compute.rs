@@ -135,14 +135,37 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
 
 /// Translates a compute program (its instructions from the first one) with
 /// workgroup size `workgroup`.
-pub fn translate(code: &[Instruction], workgroup: [u32; 3]) -> Result<Translated, Unsupported> {
+pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Unsupported> {
     if code.is_empty() {
         return Err(unsupported(0, "empty program"));
     }
     let blocks = blocks(code)?;
-    let mut emitter = Emitter::new(workgroup);
+    let mut emitter = Emitter::new(layout);
     emitter.program(code, &blocks)?;
     Ok(emitter.finish())
+}
+
+mod memory;
+
+/// What a compute program needs beyond its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub workgroup: [u32; 3],
+    /// Bytes of shared memory, when known.
+    pub shared_bytes: Option<u32>,
+    /// Bytes of local memory per invocation, when known.
+    pub local_bytes: Option<u32>,
+}
+
+impl Layout {
+    /// A layout with only a workgroup size.
+    pub fn workgroup(workgroup: [u32; 3]) -> Self {
+        Self {
+            workgroup,
+            shared_bytes: None,
+            local_bytes: None,
+        }
+    }
 }
 
 /// Bytes of a constant bank.
@@ -167,6 +190,9 @@ struct Emitter {
     /// The 64-bit integer type, declared (with the Int64 capability) on
     /// first use.
     u64: Option<u32>,
+    layout: Layout,
+    memory: memory::Memory,
+    push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
     banks: BTreeMap<u8, u32>,
     /// The block type every bank's buffer shares, once declared.
@@ -179,10 +205,10 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn new(workgroup: [u32; 3]) -> Self {
+    fn new(layout: &Layout) -> Self {
+        let workgroup = layout.workgroup;
         let mut module = Module::new();
         module.capability(capability::SHADER);
-        module.memory_model(0, 1); // Logical, GLSL450
         let void = module.void();
         let bool = module.bool();
         let u32 = module.u32();
@@ -210,6 +236,9 @@ impl Emitter {
             predicates: BTreeMap::new(),
             uniform_registers: BTreeMap::new(),
             u64: None,
+            layout: *layout,
+            memory: memory::Memory::default(),
+            push_fields: 0,
             banks: BTreeMap::new(),
             bank_block: None,
             builtins: BTreeMap::new(),
@@ -221,6 +250,14 @@ impl Emitter {
 
     fn finish(mut self) -> Translated {
         let _ = self.void;
+        // GLSL450 memory model, with physical pointers when global memory
+        // is used.
+        let addressing = if self.memory.physical {
+            capability::ADDRESSING_PHYSICAL_STORAGE_BUFFER64
+        } else {
+            0
+        };
+        self.module.memory_model(addressing, 1);
         self.function.finish(&mut self.module);
         self.module
             .entry_point(execution::GL_COMPUTE, self.entry, "main", &self.interface);
@@ -235,7 +272,7 @@ impl Emitter {
             frag_colors: 0,
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: Vec::new(),
-            push_fields: 0,
+            push_fields: self.push_fields,
         }
     }
 
@@ -1206,6 +1243,25 @@ impl Emitter {
                     }
                 }
             }
+            Op::Load {
+                d,
+                space,
+                address,
+                size,
+                condition,
+            } => self.load(index, d.0, space, address, size, condition)?,
+            Op::Store {
+                data,
+                space,
+                address,
+                size,
+            } => self.store(index, data.0, space, address, size)?,
+            Op::Bar { mode } => {
+                if mode != 0 {
+                    return Err(unsupported(index, format!("BAR mode {mode}")));
+                }
+                self.barrier();
+            }
             Op::Bssy | Op::Bsync | Op::Depbar => {}
             Op::Bra { .. } | Op::Exit => {
                 return Err(unsupported(index, "control flow inside a block"));
@@ -1521,7 +1577,7 @@ mod tests {
 
     fn translated(words: &[u128]) -> Result<Translated, Unsupported> {
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
-        translate(&code, [64, 1, 1])
+        translate(&code, &Layout::workgroup([64, 1, 1]))
     }
 
     fn translated_err(words: &[u128]) -> Unsupported {
@@ -1927,6 +1983,134 @@ mod tests {
         // An indexed load may read anywhere in its bank.
         assert_eq!(translated.cbuf_used_sizes[3], 0x10000);
         assert_eq!(translated.cbuf_used_sizes[0], 0x120);
+    }
+
+    fn valid_with(words: &[u128], layout: &Layout) -> Translated {
+        let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
+        let translated = translate(&code, layout).unwrap();
+        if let Some(problem) = validate(&translated.spirv) {
+            panic!("{problem}");
+        }
+        translated
+    }
+
+    #[test]
+    fn global_memory_goes_through_the_page_table() {
+        let translated = valid(&[
+            // LDG.E.64 R2, [R4.64+0x10] (no uniform form)
+            word(&[
+                (0, 12, 0x381),
+                (16, 8, 2),
+                (24, 8, 4),
+                (40, 24, 0x10),
+                (72, 1, 1),
+                (73, 3, 5),
+            ]),
+            // @P0-gated LDG.E.S8 R6, [R1+UR4.64-0x4] (P0 stored reversed)
+            word(&[
+                (0, 12, 0x981),
+                (16, 8, 6),
+                (24, 8, 1),
+                (32, 6, 4),
+                (40, 24, 0xff_fffc),
+                (64, 3, 7),
+                (72, 1, 1),
+                (73, 3, 1),
+                (91, 1, 1),
+            ]),
+            // LDG.E.128 R8, [R4.64]; STG.E.128 [R4.64+0x20], R8
+            word(&[
+                (0, 12, 0x981),
+                (16, 8, 8),
+                (24, 8, 4),
+                (32, 6, 63),
+                (72, 1, 1),
+                (73, 3, 6),
+                (90, 1, 1),
+                (91, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x986),
+                (24, 8, 4),
+                (32, 8, 8),
+                (40, 24, 0x20),
+                (64, 6, 63),
+                (72, 1, 1),
+                (73, 3, 6),
+                (90, 1, 1),
+                (91, 1, 1),
+            ]),
+            // STG.E [R4.64], R2
+            word(&[
+                (0, 12, 0x386),
+                (24, 8, 4),
+                (32, 8, 2),
+                (72, 1, 1),
+                (73, 3, 4),
+            ]),
+            EXIT,
+        ]);
+        assert_eq!(translated.push_fields, echora_shader_abi::PUSH_PAGE_TABLE);
+    }
+
+    #[test]
+    fn shared_and_local_memory_are_arrays() {
+        let words = [
+            // STS [R1.X4+0x8], R2; BAR.SYNC; LDS.64 R4, [R1+UR5+0x4];
+            // LDS.U16 R6, [R1+0x2]
+            word(&[
+                (0, 12, 0x388),
+                (24, 8, 1),
+                (32, 8, 2),
+                (40, 24, 8),
+                (73, 3, 4),
+                (78, 2, 1),
+            ]),
+            word(&[(0, 12, 0xb1d)]),
+            word(&[
+                (0, 12, 0x984),
+                (16, 8, 4),
+                (24, 8, 1),
+                (32, 6, 5),
+                (40, 24, 4),
+                (73, 3, 5),
+                (91, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x984),
+                (16, 8, 6),
+                (24, 8, 1),
+                (40, 24, 2),
+                (73, 3, 2),
+            ]),
+            // STL [R1+0x10], R6; LDL R7, [R1+0x10]
+            word(&[
+                (0, 12, 0x387),
+                (24, 8, 1),
+                (32, 8, 6),
+                (40, 24, 0x10),
+                (73, 3, 4),
+            ]),
+            word(&[
+                (0, 12, 0x983),
+                (16, 8, 7),
+                (24, 8, 1),
+                (40, 24, 0x10),
+                (73, 3, 4),
+            ]),
+            EXIT,
+        ];
+        let layout = Layout {
+            workgroup: [64, 1, 1],
+            shared_bytes: Some(0x1000),
+            local_bytes: Some(0x40),
+        };
+        let translated = valid_with(&words, &layout);
+        assert_eq!(translated.push_fields, 0);
+        // Without sizes, the accesses are unsupported.
+        let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
+        let missing = translate(&code, &Layout::workgroup([64, 1, 1])).unwrap_err();
+        assert!(missing.reason.contains("shared memory size"));
     }
 
     #[test]

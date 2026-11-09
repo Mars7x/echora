@@ -37,6 +37,7 @@ pub mod op {
     pub const ACCESS_CHAIN: u16 = 65;
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
+    pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
     pub const CONVERT_F_TO_U: u16 = 109;
     pub const CONVERT_F_TO_S: u16 = 110;
@@ -94,6 +95,7 @@ pub mod op {
     pub const NOT: u16 = 200;
     pub const BIT_FIELD_S_EXTRACT: u16 = 202;
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
+    pub const CONTROL_BARRIER: u16 = 224;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -124,6 +126,8 @@ pub mod capability {
     pub const SHADER: u32 = 1;
     pub const INT64: u32 = 11;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
+    /// The addressing model with physical storage buffer pointers.
+    pub const ADDRESSING_PHYSICAL_STORAGE_BUFFER64: u32 = 5348;
 }
 
 /// Decorations.

@@ -136,4 +136,7 @@ instead of a bank. The layouts were cross-checked against NAK's encoder.
 | PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71; tables 64-66 with 72-76, and 16-23 |
 | CS2R | 0x805 | special register 72-79 (255 SRZ), pair 80 |
 | LDC, ULDC | 0xb82, 0xab9 | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
+| LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
+| LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
+| BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | BSSY, BSYNC, DEPBAR | 0x945, 0x941, 0x91a | no effect per invocation |

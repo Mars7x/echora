@@ -33,7 +33,12 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         .workgroup_size
         .ok_or_else(|| whole("compute program without a workgroup size".into()))?;
     let code = program_code(program)?;
-    compute::translate(&code, workgroup)
+    let layout = compute::Layout {
+        workgroup,
+        shared_bytes: parameters.shared_memory_size,
+        local_bytes: parameters.local_memory_size,
+    };
+    compute::translate(&code, &layout)
 }
 
 /// `translate` is the runtime's translator signature.
