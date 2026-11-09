@@ -199,10 +199,8 @@ pub fn string(text: &str) -> Vec<u32> {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(0);
     bytes.resize(bytes.len().next_multiple_of(4), 0);
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|word| u32::from_le_bytes(*word)).collect()
 }
 
 impl Module {
