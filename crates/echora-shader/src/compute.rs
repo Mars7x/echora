@@ -364,8 +364,8 @@ struct Emitter {
     pool_bindings: u32,
     /// Storage images by handle bank, offset and dimension.
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
-    /// R32ui-formatted views for image atomics (by descriptor index).
-    atomic_images: BTreeMap<usize, (u32, u32)>,
+    /// R32_UINT image descriptors for SURED (by handle and dimension).
+    atomic_images: BTreeMap<(u8, u16, u8), u32>,
     /// More variables at a descriptor's binding (by descriptor index).
     descriptor_aliases: Vec<(usize, u32)>,
     /// Each image descriptor's integer-format spec constant id.
@@ -4078,8 +4078,9 @@ mod tests {
         // SURED.D.ADD.U32 into a 2D image twice (one R32ui view), and
         // SURED.D.MAX.U32 into a buffer.
         let translated = valid(&[sured(3, 0), sured(3, 6), sured(1, 2), EXIT]);
-        assert_eq!(translated.descriptors.len(), 2);
-        assert!(translated.descriptors.iter().all(|d| d.flags == 3));
+        let flags: Vec<u32> = translated.descriptors.iter().map(|d| d.flags).collect();
+        assert_eq!(flags, [0x503, 0x503]);
+        assert!(translated.spec_constants.is_empty());
         // The wrapping increment is refused, as is an unknown mode bit.
         translated_err(&[sured(3, 3), EXIT]);
         assert!(matches!(

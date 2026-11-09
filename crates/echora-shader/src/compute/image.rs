@@ -4,7 +4,8 @@
 //! run-time state, so each image has a float and an unsigned view at one
 //! binding and a specialization constant (`SpecMeaning::IntegerFormat`)
 //! picks the view, one translation serving both. SURED reduces through
-//! a third, R32ui-formatted view, since image atomics need a format.
+//! a descriptor of its own, declared R32_UINT (image atomics need a
+//! format, and the runtime makes one view per binding).
 
 use echora_shader_abi::{Descriptor, Unsupported};
 
@@ -20,8 +21,10 @@ const KIND_IMAGE: u32 = 5;
 const FLAG_WRITTEN: u32 = 1;
 const FLAG_READ: u32 = 2;
 
-/// SPIR-V's R32ui image format.
+/// SPIR-V's R32ui image format, and the runtime's (descriptor flags bits
+/// 8-11, `Shader::ImageFormat`).
 const FORMAT_R32UI: u32 = 33;
+const FLAG_FORMAT_R32_UINT: u32 = 5 << 8;
 
 /// SPIR-V's device scope.
 const SCOPE_DEVICE: u32 = 1;
@@ -239,7 +242,7 @@ impl Emitter {
             7 => op::ATOMIC_XOR,
             _ => return Err(unsupported(index, format!("surface reduction {operation}"))),
         };
-        let (dim, arrayed, _, _, count) = surface(dimension)
+        let (dim, arrayed, texture_type, kind, count) = surface(dimension)
             .filter(|_| matches!(dimension, 1 | 3))
             .ok_or_else(|| {
                 unsupported(index, format!("surface reduction dimension {dimension}"))
@@ -247,11 +250,9 @@ impl Emitter {
         if usize::from(bank) >= self.cbuf_used_sizes.len() {
             return Err(unsupported(index, "surface handle in an unbound bank"));
         }
-        let views = self
-            .image_views(bank, offset, dimension, FLAG_READ | FLAG_WRITTEN)
-            .ok_or_else(|| unsupported(index, "surface dimension"))?;
-        let variable = match self.atomic_images.get(&views.descriptor) {
-            Some(&(variable, _)) => variable,
+        let key = (bank, offset, dimension);
+        let variable = match self.atomic_images.get(&key) {
+            Some(&variable) => variable,
             None => {
                 let ty = self.module.ty(Type::Image {
                     sampled_type: self.u32,
@@ -266,9 +267,22 @@ impl Emitter {
                 let variable = self
                     .module
                     .global_variable(pointer, storage::UNIFORM_CONSTANT);
-                self.descriptor_aliases.push((views.descriptor, variable));
-                self.interface.push(variable);
-                self.atomic_images.insert(views.descriptor, (variable, ty));
+                self.add_descriptor(
+                    variable,
+                    Descriptor {
+                        kind,
+                        count: 1,
+                        cbuf_index: u32::from(bank),
+                        cbuf_offset: u32::from(offset),
+                        texture_type,
+                        flags: FLAG_READ | FLAG_WRITTEN | FLAG_FORMAT_R32_UINT,
+                        ..Descriptor::default()
+                    },
+                );
+                if dim == 5 {
+                    self.module.capability(capability::IMAGE_BUFFER);
+                }
+                self.atomic_images.insert(key, variable);
                 variable
             }
         };

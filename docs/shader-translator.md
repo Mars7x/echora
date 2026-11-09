@@ -143,9 +143,10 @@ integer is run-time state, so each image has a float and an unsigned view
 at one binding, and a boolean specialization constant
 (`SpecMeaning::IntegerFormat(binding)`, ids from 32) picks the view the
 access uses; the runtime precompiles both values. SURED reduces into a texel
-through a third view at the same binding with the R32ui format, as
-Vulkan's image atomics require a format; the bound image must then be
-R32_UINT. The operation numbering is inferred from a Maxwell lowering,
+through a descriptor and binding of its own (even for a handle SULD or
+SUST also uses), an R32ui image declared R32_UINT in the descriptor's
+format bits (flags 8-11 = 5): Vulkan's image atomics require a format,
+and the runtime views a 4-byte-texel image as R32_UINT for it. The operation numbering is inferred from a Maxwell lowering,
 not measured.
 
 **Matrix multiply.** HMMA runs on the subgroup: each lane gathers its A
@@ -254,7 +255,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | TXD | 0xb6c | 2D and 2D array; coordinates (x, y, then the layer) from Ra, gradients from Rb as d/dx and d/dy of x, then of y; results as TEX |
 | TEX, TLD.SCR, TLD4, TXQ, TMML | 0xb60, 0xb66, 0xb63, 0xb6f, 0xb69 (bindless 0xf6x) | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76 (TLD4 per-tap with 76-77 = 2: signed 6-bit x, y per tap in the bytes of two registers, one gather per tap), TXQ and TMML have no fault predicate at 81-83, depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
 | SULD.P, SUST.P | 0xb97, 0xb9b | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, buffer, -, 2D, 2D array, 3D), component mask 72-75, coordinates from register 24, SULD destination 16, SUST data 32 |
-| SURED | 0x59f | `.D.U32` (bits 64-95 other than the operation exactly `0x0010e000`), buffer or 2D; handle and coordinates as SULD, data 32, operation 87-89 (0 add, 1 min, 2 max, 5 and, 6 or, 7 xor; 3 and 4 refused); an atomic on an R32ui view |
+| SURED | 0x59f | `.D.U32` (bits 64-95 other than the operation exactly `0x0010e000`), buffer or 2D; handle and coordinates as SULD, data 32, operation 87-89 (0 add, 1 min, 2 max, 5 and, 6 or, 7 xor; 3 and 4 refused); an atomic on its own R32_UINT descriptor |
 | ALD, AST | 0x321, 0x322 | address 40-49, words 74-75 (plus one), index register 24, vertex register 32 (ALD) or 64 (AST), patch 76, ALD output 79; AST data 32 |
 | IPA | 0x326, 0x526 (address plus the uniform register at 24: a select over the generic components the SPH uses) | address 64-71 (× 4), location 76-77 (default, centroid, offset), mode 78-79 (interpolated, constant), offset register 32 |
 | KILL | 0x95b | condition 87-90 |
