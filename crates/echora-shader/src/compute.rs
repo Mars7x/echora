@@ -974,11 +974,16 @@ impl Emitter {
                 scale,
                 ..
             } => {
-                if scale != 4 {
-                    return Err(unsupported(index, "FMUL with a result scale"));
+                // The scale: 1-3 divide by 8, 4, 2; 5-7 multiply by 2, 4, 8.
+                if scale == 0 || (scale != 4 && modes.rounding != 0) {
+                    return Err(unsupported(index, format!("FMUL scale {scale}")));
                 }
                 let (a, b) = (self.float(index, a)?, self.float(index, b)?);
-                let value = self.exact(op::F_MUL, &[a, b]);
+                let mut value = self.exact(op::F_MUL, &[a, b]);
+                if scale != 4 {
+                    let factor = self.float_constant(2f32.powi(i32::from(scale) - 4));
+                    value = self.exact(op::F_MUL, &[value, factor]);
+                }
                 // The product's error, exactly: a*b - value.
                 let residual = (modes.rounding != 0).then(|| {
                     let negated = self.value(op::F_NEGATE, self.f32, &[value]);
@@ -1174,11 +1179,37 @@ impl Emitter {
                 self.write_register(d.0, shuffled);
                 self.write_predicate(p, in_range);
             }
+            Op::Redux {
+                d,
+                src,
+                operation,
+                signed,
+            } => {
+                self.module
+                    .capability(capability::GROUP_NON_UNIFORM_ARITHMETIC);
+                let opcode = match (operation, signed) {
+                    (0, _) => op::GROUP_NON_UNIFORM_BITWISE_AND,
+                    (1, _) => op::GROUP_NON_UNIFORM_BITWISE_OR,
+                    (2, _) => op::GROUP_NON_UNIFORM_BITWISE_XOR,
+                    (3, _) => op::GROUP_NON_UNIFORM_I_ADD,
+                    (4, false) => op::GROUP_NON_UNIFORM_U_MIN,
+                    (4, true) => op::GROUP_NON_UNIFORM_S_MIN,
+                    (5, false) => op::GROUP_NON_UNIFORM_U_MAX,
+                    (5, true) => op::GROUP_NON_UNIFORM_S_MAX,
+                    _ => return Err(unsupported(index, format!("REDUX operation {operation}"))),
+                };
+                let value = self.read_register(src.0);
+                let subgroup = self.constant(SCOPE_SUBGROUP);
+                // Group operation 0: reduce.
+                let reduced = self.value(opcode, self.u32, &[subgroup, 0, value]);
+                self.write_uniform(d.0.min(63), reduced);
+            }
             Op::Vote {
                 d,
                 p,
                 condition,
                 mode,
+                uniform_out,
             } => {
                 self.module.capability(capability::GROUP_NON_UNIFORM_VOTE);
                 self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
@@ -1191,7 +1222,11 @@ impl Emitter {
                 let ballot =
                     self.value(op::GROUP_NON_UNIFORM_BALLOT, uvec4, &[subgroup, condition]);
                 let ballot = self.value(op::COMPOSITE_EXTRACT, self.u32, &[ballot, 0]);
-                self.write_register(d.0, ballot);
+                if uniform_out {
+                    self.write_uniform(d.0.min(63), ballot);
+                } else {
+                    self.write_register(d.0, ballot);
+                }
                 let opcode = match mode {
                     0 => op::GROUP_NON_UNIFORM_ALL,
                     1 => op::GROUP_NON_UNIFORM_ANY,
@@ -1200,7 +1235,10 @@ impl Emitter {
                 };
                 if p != 7 {
                     let vote = self.value(opcode, self.bool, &[subgroup, condition]);
+                    // VOTEU's vote goes to the uniform predicates.
+                    self.uniform = uniform_out;
                     self.write_predicate(p, vote);
+                    self.uniform = false;
                 }
             }
             Op::Iabs { d, src } => {
@@ -1468,13 +1506,31 @@ impl Emitter {
                 src_size,
                 rounding,
             } => {
-                if (dst_size, src_size) != (2, 2) {
-                    return Err(unsupported(index, "F2I other than 32-bit"));
-                }
-                let x = self.float(index, src)?;
+                let x = match src_size {
+                    2 => self.float(index, src)?,
+                    // A half in the source's low bits.
+                    1 => {
+                        if src.abs || src.neg {
+                            return Err(unsupported(index, "F2I.F16 with modifiers"));
+                        }
+                        let bits = self.integer(index, src)?;
+                        let vec2 = self.module.ty(Type::Vector {
+                            component: self.f32,
+                            count: 2,
+                        });
+                        let pair = self.glsl(vec2, glsl::UNPACK_HALF_2X16, &[bits]);
+                        self.value(op::COMPOSITE_EXTRACT, self.f32, &[pair, 0])
+                    }
+                    _ => return Err(unsupported(index, "F2I from 64-bit")),
+                };
                 let rounded = self.rounded(x, rounding);
-                let value = self.saturating_integer(rounded, signed);
-                self.write_register(d.0, value);
+                if dst_size == 3 {
+                    let value = self.saturating_integer64(rounded, signed);
+                    self.write_pair(d.0, value);
+                } else {
+                    let value = self.saturating_integer(rounded, signed, 8 << dst_size);
+                    self.write_register(d.0, value);
+                }
             }
             Op::I2f {
                 d,
@@ -1771,7 +1827,29 @@ impl Emitter {
 
     /// An integral float converted as the hardware does: saturated to the
     /// integer's range, NaN to zero.
-    fn saturating_integer(&mut self, x: u32, signed: bool) -> u32 {
+    fn saturating_integer(&mut self, x: u32, signed: bool, bits: u32) -> u32 {
+        if bits < 32 {
+            // Narrow ranges are exact in a float: clamp, then convert.
+            let (low, high) = if signed {
+                (
+                    -(2f32.powi(bits as i32 - 1)),
+                    2f32.powi(bits as i32 - 1) - 1.0,
+                )
+            } else {
+                (0.0, 2f32.powi(bits as i32) - 1.0)
+            };
+            let (low, high) = (self.float_constant(low), self.float_constant(high));
+            let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+            let opcode = if signed {
+                op::CONVERT_F_TO_S
+            } else {
+                op::CONVERT_F_TO_U
+            };
+            let value = self.value(opcode, self.u32, &[clamped]);
+            let nan = self.value(op::IS_NAN, self.bool, &[x]);
+            let zero = self.constant(0);
+            return self.value(op::SELECT, self.u32, &[nan, zero, value]);
+        }
         // The largest float below the range's end, and the end itself.
         let (low, high, end, top) = if signed {
             (
@@ -1801,6 +1879,39 @@ impl Emitter {
         let nan = self.value(op::IS_NAN, self.bool, &[x]);
         let zero = self.constant(0);
         self.value(op::SELECT, self.u32, &[nan, zero, value])
+    }
+
+    /// As `saturating_integer`, to a 64-bit integer.
+    fn saturating_integer64(&mut self, x: u32, signed: bool) -> u32 {
+        let ty = self.u64();
+        let (low, high, end, top) = if signed {
+            (
+                -(2f32.powi(63)),
+                2f32.powi(63) - 2f32.powi(39),
+                2f32.powi(63),
+                i64::MAX as u64,
+            )
+        } else {
+            (0.0, 2f32.powi(64) - 2f32.powi(40), 2f32.powi(64), u64::MAX)
+        };
+        let (low, high, end) = (
+            self.float_constant(low),
+            self.float_constant(high),
+            self.float_constant(end),
+        );
+        let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+        let opcode = if signed {
+            op::CONVERT_F_TO_S
+        } else {
+            op::CONVERT_F_TO_U
+        };
+        let value = self.value(opcode, ty, &[clamped]);
+        let over = self.value(op::F_ORD_GREATER_THAN_EQUAL, self.bool, &[x, end]);
+        let top = self.constant64(top);
+        let value = self.value(op::SELECT, ty, &[over, top, value]);
+        let nan = self.value(op::IS_NAN, self.bool, &[x]);
+        let zero = self.constant64(0);
+        self.value(op::SELECT, ty, &[nan, zero, value])
     }
 
     /// LOP3's function of `a`, `b`, `c` by truth table: bit `4a + 2b + c`
@@ -2971,6 +3082,73 @@ mod tests {
     }
 
     #[test]
+    fn scales_wide_conversions_and_subgroup_reductions_validate() {
+        valid(&[
+            // FMUL.FTZ.D2 R2, R0, R1; FMUL.M8 R3, R0, 0.5
+            word(&[
+                (0, 12, 0x220),
+                (16, 8, 2),
+                (24, 8, 0),
+                (32, 8, 1),
+                (80, 1, 1),
+                (84, 3, 3),
+            ]),
+            word(&[
+                (0, 12, 0x820),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 32, 0x3f00_0000),
+                (84, 3, 7),
+            ]),
+            // F2I.S64.TRUNC R4, R0; F2I.U16 R6, R0; F2I.S32.F16 R7, R1
+            word(&[
+                (0, 12, 0x305),
+                (16, 8, 4),
+                (32, 8, 0),
+                (72, 1, 1),
+                (75, 2, 3),
+                (78, 2, 3),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x305),
+                (16, 8, 6),
+                (32, 8, 0),
+                (75, 2, 1),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x305),
+                (16, 8, 7),
+                (32, 8, 1),
+                (72, 1, 1),
+                (75, 2, 2),
+                (84, 2, 1),
+            ]),
+            // REDUX.SUM UR4, R1; REDUX.MAX.S32 UR5, R1
+            word(&[(0, 12, 0x3c4), (16, 6, 4), (24, 8, 1), (78, 3, 3)]),
+            word(&[
+                (0, 12, 0x3c4),
+                (16, 6, 5),
+                (24, 8, 1),
+                (73, 1, 1),
+                (78, 3, 5),
+            ]),
+            // VOTEU.ANY UR6, UP1, P0; BREAK; WARPSYNC
+            word(&[
+                (0, 12, 0x886),
+                (16, 8, 6),
+                (72, 2, 1),
+                (81, 3, 1),
+                (87, 3, 0),
+            ]),
+            word(&[(0, 12, 0x942)]),
+            word(&[(0, 12, 0x948)]),
+            EXIT,
+        ]);
+    }
+
+    #[test]
     fn float_families_validate() {
         valid(&[
             // FFMA.SAT R0, -|R1|, R2, R3; FMUL R4, R0, 2.0; FADD R5, R4, R0
@@ -3057,8 +3235,8 @@ mod tests {
         let unknown = translated(&[word(&[(0, 12, 0x1ff)]), EXIT]).unwrap_err();
         assert_eq!(unknown.offset, Some(0));
         assert!(unknown.reason.contains("0x1ff"), "{}", unknown.reason);
-        // FMUL's result scale (other than 4, none) is not translated.
-        let scaled = translated(&[EXIT, word(&[(0, 12, 0x220), (84, 3, 5)]), EXIT]).unwrap_err();
+        // FMUL's result scale 0 is invalid.
+        let scaled = translated(&[EXIT, word(&[(0, 12, 0x220), (84, 3, 0)]), EXIT]).unwrap_err();
         assert_eq!(scaled.offset, Some(16));
         let outside = translated(&[bra(0, 50, 7), EXIT]).unwrap_err();
         assert!(outside.reason.contains("outside"), "{}", outside.reason);

@@ -116,6 +116,14 @@ pub mod op {
     pub const GROUP_NON_UNIFORM_ALL_EQUAL: u16 = 336;
     pub const GROUP_NON_UNIFORM_BALLOT: u16 = 339;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+    pub const GROUP_NON_UNIFORM_I_ADD: u16 = 349;
+    pub const GROUP_NON_UNIFORM_S_MIN: u16 = 353;
+    pub const GROUP_NON_UNIFORM_U_MIN: u16 = 354;
+    pub const GROUP_NON_UNIFORM_S_MAX: u16 = 356;
+    pub const GROUP_NON_UNIFORM_U_MAX: u16 = 357;
+    pub const GROUP_NON_UNIFORM_BITWISE_AND: u16 = 359;
+    pub const GROUP_NON_UNIFORM_BITWISE_OR: u16 = 360;
+    pub const GROUP_NON_UNIFORM_BITWISE_XOR: u16 = 361;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -147,6 +155,7 @@ pub mod capability {
     pub const INT64: u32 = 11;
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
+    pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
     pub const SHADER_CLOCK: u32 = 5055;
@@ -201,6 +210,7 @@ pub mod glsl {
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
     pub const FMA: u32 = 50;
+    pub const UNPACK_HALF_2X16: u32 = 62;
     pub const FIND_S_MSB: u32 = 74;
     pub const FIND_U_MSB: u32 = 75;
     pub const N_MIN: u32 = 79;

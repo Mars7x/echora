@@ -204,6 +204,18 @@ pub enum Op {
         p: u8,
         condition: Pred,
         mode: u8,
+        /// VOTEU: the ballot goes to a uniform register and the vote to a
+        /// uniform predicate.
+        uniform_out: bool,
+    },
+    /// REDUX d, src: the subgroup's and, or, xor, sum, min or max
+    /// (`operation`, bits 78-80; min and max `signed` at 73) of src, into
+    /// a uniform register.
+    Redux {
+        d: UniformReg,
+        src: Reg,
+        operation: u8,
+        signed: bool,
     },
     /// IABS d, src: the absolute value of a signed word.
     Iabs {
@@ -777,14 +789,26 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 mode: word.bits(58, 2) as u8,
             });
         }
-        0x806 => {
+        0x806 | 0x886 => {
             return Some(Op::Vote {
                 d,
                 p: word.bits(81, 3) as u8,
                 condition: word.pred(87, 90),
                 mode: word.bits(72, 2) as u8,
+                uniform_out: opcode == 0x886,
             });
         }
+        0x3c4 => {
+            return Some(Op::Redux {
+                d: UniformReg(word.bits(16, 6) as u8),
+                src: word.reg(24),
+                operation: word.bits(78, 3) as u8,
+                signed: word.bit(73),
+            });
+        }
+        // BREAK (a convergence barrier) and WARPSYNC: nothing per
+        // invocation.
+        0x942 | 0x948 => return Some(Op::Bsync),
         0x803 => {
             return Some(Op::P2r {
                 d,

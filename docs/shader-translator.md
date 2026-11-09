@@ -127,7 +127,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | IADD3 | 0x010 in forms 1-7 | carry outputs 81-86, inputs 87-90 and 77-80 |
 | IMAD | 0x024 in forms 1-7 | low word |
 | LOP3.LUT | 0x012 in forms 1-7 | table 72-79, `.PAND` 80, predicate output 81-83 |
-| FFMA, FMUL, FADD | 0x023, 0x020, 0x021 | saturate 77, rounding 78-79, FTZ 80; FFMA and FMUL `.FMZ` 76; FMUL scale 84-86 |
+| FFMA, FMUL, FADD | 0x023, 0x020, 0x021 | saturate 77, rounding 78-79, FTZ 80; FFMA and FMUL `.FMZ` 76; FMUL scale 84-86 (1-3 divide by 8, 4, 2; 4 none; 5-7 multiply by 2, 4, 8) |
 | FSETP, ISETP | 0x00b, 0x00c in forms 1, 4, 5, 6 | compare 76-79/76-78, outputs 81 and 84, accumulator 87-90, combine 74-75, ISETP signed 73 and `.EX` 72 |
 | S2R | 0x919 | special register 72-79 |
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
@@ -137,6 +137,9 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | IABS | 0x013 | the source in the second slot |
 | POPC, FLO, BREV | 0x109, 0x100, 0x101 | invert 63 (form 1); FLO signed 73, shift amount 74 |
 | SHFL | 0x389, 0x589, 0x989, 0xf89 | lane register 32 or immediate 53-57, clamp and segment mask register 64 or immediate 40-52, mode 58-59, in-range predicate 81-83 |
+| REDUX | 0x3c4 | uniform destination 16-21, register 24, operation 78-80 (AND, OR, XOR, SUM, MIN, MAX), signed 73 |
+| VOTEU | 0x886 | as VOTE, into a uniform register and uniform predicate |
+| BREAK, WARPSYNC | 0x942, 0x948 | no effect per invocation |
 | VOTE | 0x806 | mode 72-73 (ALL, ANY, EQ), condition 87-90, vote predicate 81-83, ballot in the destination |
 | P2R, R2P | 0x803, 0x804 | immediate mask 32-63 (P0-P6), byte 76-77 |
 | LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
