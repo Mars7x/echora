@@ -2995,6 +2995,36 @@ impl Nvn {
             }
             name => {
                 let rest = name.trim_start_matches("nvnCommandBuffer");
+                // Bind{Textures,Images,UniformBuffers,StorageBuffers}[Deferred]
+                // (cmd, stage, first, count, array): one binding per slot,
+                // as the singular command would make it.
+                if let Some((single, words)) = plural_bind(rest) {
+                    let count = (command.x[3] as usize).min(32);
+                    let values = if rest.ends_with("Deferred") {
+                        // Deferred: the array as it is when the work runs.
+                        let mut values = Vec::with_capacity(count * words);
+                        for index in 0..(count * words) as u64 {
+                            values.push(core.memory.read_u64(command.x[4] + index * 8)?);
+                        }
+                        values
+                    } else {
+                        command.captured.clone()
+                    };
+                    for (index, value) in values.chunks(words).take(count).enumerate() {
+                        let slot = command.x[2] + index as u64;
+                        let mut bind = command.clone();
+                        bind.name = format!("nvnCommandBuffer{single}");
+                        bind.captured = Vec::new();
+                        bind.x = [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0];
+                        if words == 2 {
+                            bind.x[4] = value[1];
+                        }
+                        self.render
+                            .state
+                            .insert(format!("{single}/{}/{slot}", command.x[1]), bind);
+                    }
+                    return Ok(());
+                }
                 if is_state_command(rest) {
                     // Per-slot bindings are kept per stage and slot; the
                     // others keep their latest command.
@@ -3977,6 +4007,18 @@ fn record_command(
     Ok(())
 }
 
+/// The singular command a plural bind stands for, and the words of each
+/// array entry (a handle, or a buffer range's address and size).
+fn plural_bind(rest: &str) -> Option<(&'static str, usize)> {
+    match rest.trim_end_matches("Deferred") {
+        "BindTextures" => Some(("BindTexture", 1)),
+        "BindImages" => Some(("BindImage", 1)),
+        "BindUniformBuffers" => Some(("BindUniformBuffer", 2)),
+        "BindStorageBuffers" => Some(("BindStorageBuffer", 2)),
+        _ => None,
+    }
+}
+
 /// Data NVN reads through pointer arguments when a command is recorded.
 fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
     let read_u64s = |address: u64, count: usize| -> Result<Vec<u64>, Trap> {
@@ -3990,6 +4032,14 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
             })
             .collect()
     };
+    // Plural binds read their array at record time (Deferred ones when the
+    // work runs).
+    let rest = command.name.trim_start_matches("nvnCommandBuffer");
+    if let Some((_, words)) = plural_bind(rest).filter(|_| !rest.ends_with("Deferred")) {
+        let count = (command.x[3] as usize).min(32);
+        command.captured = read_u64s(command.x[4], count * words)?;
+        return Ok(());
+    }
     match command.name.as_str() {
         "nvnCommandBufferSetRenderTargets" => {
             let count = command.x[1] as usize;
