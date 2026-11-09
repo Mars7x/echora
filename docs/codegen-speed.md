@@ -17,8 +17,8 @@ The flags are now handled by `EmitOptions::fused_flags` (`ldst` +50%,
 translation. This note designs the two remaining parts. Both need changes in
 `echora-guest`, and any change there rebuilds every region of the game's
 translation (about an hour). So they are to be done together, in one
-rebuild, with `fused-flags`, `inline-vector` and vector register locals
-turned on at the same time.
+rebuild, with `fused-flags` and `inline-vector` turned on at the same
+time.
 
 ## Guest loads and stores
 
@@ -127,13 +127,23 @@ a block charges and refunds nothing; a budget trap at a block start), the
 runtime's `folded_cores`, `sync_stress` and `wait_timeouts` (preemption
 through `stop`), and every aot-tests suite sliced.
 
+## Tried: vector registers in window locals
+
+Keeping the vector registers an inline vector path uses in window locals
+(stored and reloaded only around helpers and calls, as the general
+registers are) passed every suite but measured within noise of
+`inline-vector` alone on the `vector` and `scalar` kernels (three
+alternating runs each), so it was reverted. Their cost is elsewhere: each
+inline FP operation checks every lane for a normal or zero value before its
+fast path, and reloads `m.cpu.fpcr` (and `fpsr`) after every guest store,
+which may alias the `Cpu`.
+
 ## Order for the rebuild
 
 1. Land the `echora-guest` API and runtime changes with today's emission
    (the generated code still calls `tick_block_at` / `finish_block`, now
    cheaper).
 2. Turn on, in `ECHORA_LIFT_OPTIONS`: `inline-vector`, `fused-flags`,
-   vector register locals, `window-memory`, and the block bookkeeping
-   emission.
+   `window-memory`, and the block bookkeeping emission.
 3. One full rebuild of the game's translation; compare frames and speed
    with the previous build.
