@@ -1273,15 +1273,26 @@ impl Renderer {
                 return Ok(());
             }
         }
-        if let Some((_, old)) = self.uploads.remove(key) {
-            self.flush()?;
-            self.destroy_target(old);
-        }
         let level_count = levels
             .iter()
             .map(|region| region.level + 1)
             .max()
             .unwrap_or(1);
+        // A texture whose contents change keeps its image when its shape
+        // does (each movie picture): the new texels are copied over the
+        // old, ordered after the work that read them, with no flush and no
+        // new allocation. Another shape retires the old image, freed once
+        // the work submitted so far has completed.
+        let mut reused = None;
+        if let Some((_, old)) = self.uploads.remove(key) {
+            if (old.width, old.height, old.format, old.shape) == (*width, *height, *format, *shape)
+                && old.levels == level_count
+            {
+                reused = Some(old);
+            } else {
+                self.retired_uploads.push(old);
+            }
+        }
         // A guest texture's upload never needs more than this: a larger one
         // means a misread size, shape or format, which stops the run with
         // the texture's description instead of exhausting memory.
@@ -1309,24 +1320,33 @@ impl Renderer {
         } else {
             self.ring_upload(texels, 16)?
         };
-        let mut target = self.create_shaped_image(
-            *width,
-            *height,
-            *shape,
-            *format,
-            vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::TRANSFER_SRC,
-            level_count,
-        )?;
+        let reusing = reused.is_some();
+        let mut target = match reused {
+            Some(target) => target,
+            None => self.create_shaped_image(
+                *width,
+                *height,
+                *shape,
+                *format,
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                level_count,
+            )?,
+        };
         let commands = match self.commands() {
             Ok(commands) => commands,
             Err(error) => {
-                self.destroy_target(target);
+                self.retired_uploads.push(target);
                 return Err(error);
             }
         };
         let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(if reusing {
+                vk::AccessFlags::SHADER_READ
+            } else {
+                vk::AccessFlags::empty()
+            })
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::GENERAL)
@@ -1368,9 +1388,14 @@ impl Renderer {
         // SAFETY: recording; the image and ring are live.
         unsafe {
             let device = &self.gpu.device;
+            // A reused image: after every earlier read of it.
             device.cmd_pipeline_barrier(
                 commands,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                if reusing {
+                    vk::PipelineStageFlags::ALL_COMMANDS
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1395,7 +1420,9 @@ impl Renderer {
             );
         }
         target.layout = vk::ImageLayout::GENERAL;
-        self.register_views(&target);
+        if !reusing {
+            self.register_views(&target);
+        }
         self.uploads.insert(*key, (*generation, target));
         Ok(())
     }
