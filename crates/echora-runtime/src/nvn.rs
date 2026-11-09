@@ -3122,10 +3122,23 @@ impl Nvn {
                     for (index, slot) in direct.x[1..4].iter_mut().enumerate() {
                         *slot = u64::from(core.memory.read_u32(at + index as u64 * 4)?);
                     }
-                    // Counts past the smallest per-axis limit Vulkan allows
-                    // are not dispatched (an overrun stalls the GPU): noted,
-                    // since they mean the arguments were read wrong.
-                    if direct.x[1..4].iter().any(|count| *count > 65_535) {
+                    // ECHORA_GPU_INDIRECT_LOG (debugging): every indirect
+                    // dispatch's counts and where they were read.
+                    if debug_var_os("ECHORA_GPU_INDIRECT_LOG").is_some() {
+                        eprintln!(
+                            "indirect present {} at {:#x} groups {:?}",
+                            self.presented_frames,
+                            command.x[1],
+                            &direct.x[1..4]
+                        );
+                    }
+                    // Counts past the smallest per-axis limit Vulkan allows,
+                    // or a million groups in all, are not dispatched (an
+                    // overrun stalls the GPU): noted, since they mean the
+                    // arguments were read wrong.
+                    if direct.x[1..4].iter().any(|count| *count > 65_535)
+                        || direct.x[1..4].iter().product::<u64>() > 1 << 20
+                    {
                         let note = format!(
                             "indirect dispatch skipped: groups {:?} at {:#x}",
                             &direct.x[1..4],
