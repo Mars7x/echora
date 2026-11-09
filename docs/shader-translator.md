@@ -140,9 +140,11 @@ warp operations assume 32-lane subgroups, which the runtime requests
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
 plain structured code, so the output aims for that:
 
-- a structurizer that emits real if/else, loops and merges, with the
-  block dispatcher (a switch inside one loop, the first translation's
-  form) kept only for irreducible regions;
+- structured control flow: real if/else, loops and merges, built after
+  Ramsey's "Beyond Relooper" over the dominator tree (exits to outer
+  constructs pass a target through each merge); the block dispatcher (a
+  switch inside one loop) is kept for irreducible graphs and computed
+  branches (BRX, RET);
 - native subgroup operations for SHFL, VOTE and friends;
 - fp16 types where the source works on halves;
 - PhysicalStorageBuffer pointers through the page table;

@@ -2,9 +2,11 @@
 //!
 //! The program's general registers and predicates are function variables
 //! (the driver's compiler promotes them to SSA values); RZ reads zero and
-//! drops writes, PT is true. Control flow runs through one structured
-//! dispatch loop: a `switch` on the index of the block to run next, so any
-//! control-flow graph is valid SPIR-V, irreducible ones included. Every
+//! drops writes, PT is true. Control flow is structured (`structure`):
+//! nested blocks, loops and if/else. A graph that cannot be (irreducible,
+//! or with computed branches) runs through one dispatch loop instead: a
+//! `switch` on the index of the block to run next, so any control-flow
+//! graph is valid SPIR-V. Every
 //! iteration spends one unit of the invocation's loop budget, so no
 //! program can hang the GPU: when the budget runs out the invocation
 //! stops. Constant bank `n` is a uniform buffer (64 KiB of `uvec4`),
@@ -188,13 +190,18 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     let blocks = blocks(code)?;
     let mut emitter = Emitter::new(layout);
     emitter.handle_words = handle_words(code);
-    emitter.program(code, &blocks)?;
+    // Structured control flow where the graph allows, else the dispatch
+    // loop.
+    if !emitter.structured(code, &blocks)? {
+        emitter.program(code, &blocks)?;
+    }
     Ok(emitter.finish())
 }
 
 mod fetch;
 mod io;
 mod memory;
+mod structure;
 mod texture;
 
 /// The uniform registers that only ever hold one constant-bank word (each
@@ -3637,6 +3644,71 @@ mod tests {
         assert!(computed.reason.contains("computed"), "{}", computed.reason);
     }
 
+    /// Whether the module has an OpSwitch (the dispatch loop's).
+    fn dispatches(spirv: &[u32]) -> bool {
+        let mut at = 5;
+        while at < spirv.len() {
+            if spirv[at] & 0xffff == 251 {
+                return true;
+            }
+            at += (spirv[at] >> 16).max(1) as usize;
+        }
+        false
+    }
+
+    /// ISETP.GT/LT.U32 p, PT, R(a), immediate, PT.
+    fn isetp(p: u128, a: u128, compare: u128, immediate: u128) -> u128 {
+        word(&[
+            (0, 12, 0x80c),
+            (81, 3, p),
+            (84, 3, 7),
+            (24, 8, a),
+            (32, 32, immediate),
+            (76, 3, compare),
+            (87, 3, 7),
+        ])
+    }
+
+    #[test]
+    fn reducible_programs_are_structured() {
+        let nop = word(&[(0, 12, 0x918)]);
+        let mov = |d: u128, value: u128| word(&[(0, 12, 0x802), (16, 8, d), (32, 32, value)]);
+        // A diamond: @P0 BRA 3; MOV; BRA 4; MOV; EXIT.
+        let diamond = valid(&[bra(0, 3, 0), mov(1, 1), bra(2, 4, 7), mov(1, 2), EXIT]);
+        assert!(!dispatches(&diamond.spirv));
+        // Nested loops, the inner one leaving both: outer at 1, inner at 2,
+        // @P0 BRA 9 out of both, @P1 BRA 2 (inner), @P2 BRA 9 (the outer
+        // one leaving too, so 9 is a merge outside the inner loop), BRA 1.
+        let iadd = word(&[
+            (0, 12, 0x810),
+            (16, 8, 1),
+            (24, 8, 1),
+            (32, 32, 1),
+            (64, 8, 255),
+            (77, 3, 7),
+            (81, 3, 7),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let nested = valid(&[
+            mov(0, 0),
+            mov(1, 0),
+            iadd,
+            isetp(0, 1, 4, 5),
+            bra(4, 9, 0),
+            isetp(1, 1, 1, 3),
+            bra(6, 2, 1),
+            bra(7, 9, 2),
+            bra(8, 1, 7),
+            mov(2, 7),
+            EXIT,
+        ]);
+        assert!(!dispatches(&nested.spirv));
+        // Two entries into a loop: irreducible, so the dispatch loop.
+        let irreducible = valid(&[bra(0, 2, 0), nop, bra(2, 1, 1), EXIT]);
+        assert!(dispatches(&irreducible.spirv));
+    }
+
     #[test]
     fn float_families_validate() {
         valid(&[
@@ -3725,7 +3797,8 @@ mod tests {
         assert_eq!(unknown.offset, Some(0));
         assert!(unknown.reason.contains("0x1ff"), "{}", unknown.reason);
         // FMUL's result scale 0 is invalid.
-        let scaled = translated(&[EXIT, word(&[(0, 12, 0x220), (84, 3, 0)]), EXIT]).unwrap_err();
+        let nop = word(&[(0, 12, 0x918)]);
+        let scaled = translated(&[nop, word(&[(0, 12, 0x220), (84, 3, 0)]), EXIT]).unwrap_err();
         assert_eq!(scaled.offset, Some(16));
         let outside = translated(&[bra(0, 50, 7), EXIT]).unwrap_err();
         assert!(outside.reason.contains("outside"), "{}", outside.reason);

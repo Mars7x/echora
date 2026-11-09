@@ -149,6 +149,7 @@ pub mod op {
     pub const SWITCH: u16 = 251;
     pub const RETURN: u16 = 253;
     pub const RETURN_VALUE: u16 = 254;
+    pub const UNREACHABLE: u16 = 255;
 }
 
 /// Storage classes.
