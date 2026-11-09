@@ -2747,6 +2747,47 @@ impl Nvn {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
         let key = (self.stage_code(core, address).unwrap().1, u64::MAX);
+        // ECHORA_GPU_C1_PROBE (debugging): for programs translated with raw
+        // pointers, the words c1 could hold (the stage's constants, each
+        // pushed root table, the first bound uniform buffers), every 300th
+        // present.
+        if super::debug_var_os("ECHORA_GPU_C1_PROBE").is_some()
+            && self.presented_frames.is_multiple_of(300)
+            && self.gpu.as_ref().unwrap().native_programs.contains(&key.0)
+        {
+            let words = |bytes: &[u8]| -> Vec<String> {
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .take(4)
+                    .map(|word| format!("{:#x}", u64::from_le_bytes(*word)))
+                    .collect()
+            };
+            let constants = self.stage_constants(core, 5).unwrap_or_default();
+            eprintln!(
+                "c1probe present {} {:016x} constants {:?}",
+                self.presented_frames,
+                key.0,
+                words(&constants)
+            );
+            for (table, root) in self.render.roots[1].iter().enumerate().take(4) {
+                let bytes: Vec<u8> = root[..8]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect();
+                eprintln!("c1probe   root {table} {:?}", words(&bytes));
+            }
+            for slot in 0..4 {
+                if let Some(bind) = self
+                    .render
+                    .state
+                    .get(&format!("BindUniformBuffer/5/{slot}"))
+                {
+                    eprintln!("c1probe   ubo {slot} {:#x}+{:#x}", bind.x[3], bind.x[4]);
+                }
+            }
+        }
         // ECHORA_GPU_SKIP_DISPATCH=<program key>[,...] (debugging): those
         // compute programs are not run.
         if super::debug_var("ECHORA_GPU_SKIP_DISPATCH").is_ok_and(|skipped| {

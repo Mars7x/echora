@@ -13,8 +13,11 @@
 //! out), so the control flow keeps its shape and dominance holds. Loops
 //! without such an exit are left as they are.
 
-/// Executions of one loop header (per invocation) before it exits.
-pub const LIMIT: u32 = 1 << 22;
+/// Executions of one loop header (per invocation) before it exits: low
+/// enough that a loop walking wrong data across hundreds of workgroups ends
+/// well inside the kernel's ten-second job limit (four million per loop
+/// did not, and reset the GPU).
+pub const LIMIT: u32 = 1 << 16;
 
 const OP_FUNCTION: u32 = 54;
 const OP_FUNCTION_PARAMETER: u32 = 55;
