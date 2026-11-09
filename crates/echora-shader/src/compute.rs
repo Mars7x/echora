@@ -145,6 +145,9 @@ pub fn translate(code: &[Instruction], workgroup: [u32; 3]) -> Result<Translated
     Ok(emitter.finish())
 }
 
+/// Bytes of a constant bank.
+const BANK_SIZE: u32 = 0x10000;
+
 /// SPIR-V types and the module-level objects the program uses.
 struct Emitter {
     module: Module,
@@ -161,6 +164,9 @@ struct Emitter {
     registers: BTreeMap<u8, u32>,
     predicates: BTreeMap<u8, u32>,
     /// Uniform buffer of each constant bank used, by bank.
+    banks: BTreeMap<u8, u32>,
+    /// The block type every bank's buffer shares, once declared.
+    bank_block: Option<u32>,
     /// Built-in input variables (local invocation id, workgroup id).
     builtins: BTreeMap<u32, u32>,
     interface: Vec<u32>,
@@ -198,6 +204,8 @@ impl Emitter {
             bool_ptr,
             registers: BTreeMap::new(),
             predicates: BTreeMap::new(),
+            banks: BTreeMap::new(),
+            bank_block: None,
             builtins: BTreeMap::new(),
             interface: Vec::new(),
             descriptors: Vec::new(),
@@ -294,11 +302,76 @@ impl Emitter {
         }
     }
 
-    /// Constant banks become uniform buffers in a later step.
+    /// The uniform buffer of constant bank `bank`: a 64 KiB block of
+    /// `uvec4` (std140), at the next set-0 binding, declared and reported
+    /// as a descriptor on first use.
     fn bank(&mut self, bank: u8) -> Result<u32, String> {
-        Err(format!(
-            "constant bank {bank} (constant banks are not translated yet)"
-        ))
+        if let Some(&variable) = self.banks.get(&bank) {
+            return Ok(variable);
+        }
+        if usize::from(bank) >= self.cbuf_used_sizes.len() {
+            return Err(format!("constant bank {bank}"));
+        }
+        let block = match self.bank_block {
+            Some(block) => block,
+            None => {
+                let uvec4 = self.module.ty(Type::Vector {
+                    component: self.u32,
+                    count: 4,
+                });
+                let length = self.constant(BANK_SIZE / 16);
+                let array = self.module.ty(Type::Array {
+                    element: uvec4,
+                    length,
+                });
+                self.module.decorate(array, decoration::ARRAY_STRIDE, &[16]);
+                let block = self.module.ty(Type::Struct {
+                    members: vec![array],
+                });
+                self.module.decorate(block, decoration::BLOCK, &[]);
+                self.module
+                    .member_decorate(block, 0, decoration::OFFSET, &[0]);
+                self.bank_block = Some(block);
+                block
+            }
+        };
+        let pointer = self.module.pointer(storage::UNIFORM, block);
+        let variable = self.module.global_variable(pointer, storage::UNIFORM);
+        let binding = self.descriptors.len() as u32;
+        self.module
+            .decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
+        self.module
+            .decorate(variable, decoration::BINDING, &[binding]);
+        self.descriptors.push(Descriptor {
+            kind: 0,
+            binding,
+            count: 1,
+            index: u32::from(bank),
+            ..Descriptor::default()
+        });
+        self.interface.push(variable);
+        self.banks.insert(bank, variable);
+        Ok(variable)
+    }
+
+    /// The word at byte `offset` of constant bank `bank`.
+    fn constant_word(&mut self, bank: u8, offset: u16) -> Result<u32, String> {
+        if !offset.is_multiple_of(4) {
+            return Err(format!("unaligned constant c[{bank}][{offset:#x}]"));
+        }
+        let variable = self.bank(bank)?;
+        let used = &mut self.cbuf_used_sizes[usize::from(bank)];
+        *used = (*used).max(u32::from(offset) + 4);
+        let pointer = self.module.pointer(storage::UNIFORM, self.u32);
+        let member = self.constant(0);
+        let vector = self.constant(u32::from(offset) / 16);
+        let component = self.constant(u32::from(offset) / 4 % 4);
+        let element = self.value(
+            op::ACCESS_CHAIN,
+            pointer,
+            &[variable, member, vector, component],
+        );
+        Ok(self.value(op::LOAD, self.u32, &[element]))
     }
 
     /// A 32-bit source operand's value (before float modifiers).
@@ -306,12 +379,9 @@ impl Emitter {
         match src {
             Src::Reg(reg) => Ok(self.read_register(reg.0)),
             Src::Imm(value) => Ok(self.constant(value)),
-            Src::Const { bank, offset } => {
-                self.bank(bank)
-                    .map_err(|reason| unsupported(index, reason))?;
-                let _ = offset;
-                Err(unsupported(index, "constant buffer operand"))
-            }
+            Src::Const { bank, offset } => self
+                .constant_word(bank, offset)
+                .map_err(|reason| unsupported(index, reason)),
             Src::Uniform(_) => Err(unsupported(index, "uniform register operand")),
             Src::BindlessConst { .. } => Err(unsupported(index, "bindless constant buffer")),
         }
@@ -803,6 +873,10 @@ mod tests {
         translate(&code, [64, 1, 1])
     }
 
+    fn translated_err(words: &[u128]) -> Unsupported {
+        translated(words).unwrap_err()
+    }
+
     fn valid(words: &[u128]) -> Translated {
         let translated = translated(words).unwrap();
         if let Some(problem) = validate(&translated.spirv) {
@@ -853,6 +927,48 @@ mod tests {
             ]),
             EXIT,
         ]);
+    }
+
+    #[test]
+    fn constant_bank_operands_become_uniform_buffers() {
+        // MOV R1, c[0x3][0x14]; IADD3 R2, R1, c[0x0][0x8], RZ;
+        // FADD R3, R1, c[0x3][0x20]
+        let translated = valid(&[
+            word(&[(0, 12, 0xa02), (16, 8, 1), (54, 5, 3), (38, 16, 0x14)]),
+            word(&[
+                (0, 12, 0xa10),
+                (16, 8, 2),
+                (24, 8, 1),
+                (54, 5, 0),
+                (38, 16, 0x8),
+                (64, 8, 255),
+                (77, 3, 7),
+                (81, 3, 7),
+                (84, 3, 7),
+                (87, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0xa21),
+                (16, 8, 3),
+                (24, 8, 1),
+                (54, 5, 3),
+                (38, 16, 0x20),
+            ]),
+            EXIT,
+        ]);
+        let banks: Vec<(u32, u32)> = translated
+            .descriptors
+            .iter()
+            .map(|descriptor| (descriptor.binding, descriptor.index))
+            .collect();
+        assert_eq!(banks, [(0, 3), (1, 0)]);
+        assert_eq!(translated.cbuf_used_sizes[3], 0x24);
+        assert_eq!(translated.cbuf_used_sizes[0], 0xc);
+        let unaligned = translated_err(&[
+            word(&[(0, 12, 0xa02), (16, 8, 1), (54, 5, 3), (38, 16, 0x2)]),
+            EXIT,
+        ]);
+        assert!(unaligned.reason.contains("unaligned"));
     }
 
     #[test]
