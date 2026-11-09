@@ -311,6 +311,10 @@ pub enum Op {
         /// `.F32` (HADD2 bit 78): the lane-0 values added as one 32-bit
         /// float result (`HADD2.F32 d, -RZ, b.H0_H0` converts a half).
         single: bool,
+        /// HFMA2 `.RELU` (bit 79): where this predicate (87-90) holds, each
+        /// lane's result clamps a negative value to +0 and a NaN to the
+        /// canonical 0x7fff.
+        relu: Option<Pred>,
     },
     /// HSETP2 p, q, a, b, acc: each lane's comparison of the half pairs, p
     /// lane 0's and q lane 1's, each combined with acc.
@@ -1568,6 +1572,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             c: None,
             saturate: word.bit(77),
             single: word.bit(78),
+            relu: None,
         },
         0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 => Op::Half {
             op: HalfOp::Mul,
@@ -1577,24 +1582,19 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             c: None,
             saturate: word.bit(77),
             single: false,
+            relu: None,
         },
-        // HFMA2 without .RELU (79), its mixed-sign form (86) or 85.
-        0x031
-            if (1..=5).contains(&form)
-                && !word.bit(78)
-                && !word.bit(79)
-                && word.bits(85, 2) == 0 =>
-        {
-            Op::Half {
-                op: HalfOp::Fma,
-                d,
-                a: word.half(0)?,
-                b: word.half(1)?,
-                c: Some(word.half(2)?),
-                saturate: word.bit(77),
-                single: false,
-            }
-        }
+        // HFMA2 without its mixed-sign form (86) or 85.
+        0x031 if (1..=5).contains(&form) && !word.bit(78) && word.bits(85, 2) == 0 => Op::Half {
+            op: HalfOp::Fma,
+            d,
+            a: word.half(0)?,
+            b: word.half(1)?,
+            c: Some(word.half(2)?),
+            saturate: word.bit(77),
+            single: false,
+            relu: word.bit(79).then(|| word.pred(87, 90)),
+        },
         0x040 if matches!(form, 1 | 4) && word.bits(76, 11) == 0 => Op::Half {
             op: HalfOp::MinMax {
                 min: word.pred(87, 90),
@@ -1605,6 +1605,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             c: None,
             saturate: false,
             single: false,
+            relu: None,
         },
         // HSETP2 without .H_AND (71).
         0x034 if matches!(form, 1 | 2) && !word.bit(71) => Op::Hsetp2 {

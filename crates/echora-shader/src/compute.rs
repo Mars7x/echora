@@ -1538,8 +1538,9 @@ impl Emitter {
                 b,
                 c,
                 saturate,
+                relu,
                 ..
-            } => self.half(index, op, d, a, b, c, saturate)?,
+            } => self.half(index, op, d, a, b, c, saturate, relu)?,
             Op::Hsetp2 {
                 p,
                 q,
@@ -3931,6 +3932,26 @@ mod tests {
                 (32, 8, 1),
                 (64, 8, 2),
                 (81, 2, 1),
+            ]),
+            // HFMA2.RELU R10, R0, (1.0, 1.0), R2 (immediate B, always) and
+            // with the clamp only where P1 holds
+            word(&[
+                (0, 12, 0x831),
+                (16, 8, 10),
+                (24, 8, 0),
+                (32, 32, 0x3c00_3c00),
+                (64, 8, 2),
+                (79, 1, 1),
+                (87, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x831),
+                (16, 8, 11),
+                (24, 8, 0),
+                (32, 32, 0x3c00_3c00),
+                (64, 8, 2),
+                (79, 1, 1),
+                (87, 3, 1),
             ]),
             // HMNMX2 R6, R0, R1, P0; F2FP.PACK_AB R7, R0, R1;
             // F2FP.MERGE_C R8, R1, R2

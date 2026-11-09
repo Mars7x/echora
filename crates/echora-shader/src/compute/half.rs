@@ -74,6 +74,7 @@ impl Emitter {
         b: HalfOperand,
         c: Option<HalfOperand>,
         saturate: bool,
+        relu: Option<Pred>,
     ) -> Result<(), Unsupported> {
         let pair = self.f16_pair();
         let a = self.half_operand(index, a)?;
@@ -100,9 +101,43 @@ impl Emitter {
             let (zero, one) = (self.half_constant(0), self.half_constant(0x3c00));
             value = self.glsl(pair, glsl::F_CLAMP, &[value, zero, one]);
         }
-        let bits = self.value(op::BITCAST, self.u32, &[value]);
+        let mut bits = self.value(op::BITCAST, self.u32, &[value]);
+        if let Some(condition) = relu {
+            let clamped = self.relu_pair(bits);
+            bits = if condition.is_true() {
+                clamped
+            } else {
+                let holds = self.read_predicate(condition);
+                self.value(op::SELECT, self.u32, &[holds, clamped, bits])
+            };
+        }
         self.write_register(d.0, bits);
         Ok(())
+    }
+
+    /// `.RELU` on a register of halves, lane by lane on the bits: a NaN
+    /// becomes the canonical 0x7fff, a negative value (either zero, or
+    /// minus infinity) +0, anything else stays.
+    fn relu_pair(&mut self, bits: u32) -> u32 {
+        let mut result = self.constant(0);
+        for lane in 0..2u32 {
+            let (shift, sixteen) = (self.constant(lane * 16), self.constant(16));
+            let half = self.value(op::BIT_FIELD_U_EXTRACT, self.u32, &[bits, shift, sixteen]);
+            let magnitude_mask = self.constant(0x7fff);
+            let magnitude = self.value(op::BITWISE_AND, self.u32, &[half, magnitude_mask]);
+            let infinity = self.constant(0x7c00);
+            let nan = self.value(op::U_GREATER_THAN, self.bool, &[magnitude, infinity]);
+            let sign_bit = self.constant(0x8000);
+            let sign = self.value(op::BITWISE_AND, self.u32, &[half, sign_bit]);
+            let zero = self.constant(0);
+            let negative = self.value(op::I_NOT_EQUAL, self.bool, &[sign, zero]);
+            let kept = self.value(op::SELECT, self.u32, &[negative, zero, half]);
+            let canonical = self.constant(0x7fff);
+            let value = self.value(op::SELECT, self.u32, &[nan, canonical, kept]);
+            let placed = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[value, shift]);
+            result = self.value(op::BITWISE_OR, self.u32, &[result, placed]);
+        }
+        result
     }
 
     /// HADD2.F32: the operands' lane-0 halves added as 32-bit floats, one
