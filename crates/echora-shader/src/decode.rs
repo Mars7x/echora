@@ -551,6 +551,8 @@ pub enum Op {
         location: u8,
         mode: u8,
         offset: Reg,
+        /// 0x526: the address plus this uniform register's value.
+        index: Option<UniformReg>,
     },
     /// KILL: where `condition` (87-90) holds, the invocation stops
     /// writing (becomes a helper).
@@ -1265,13 +1267,14 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 patch: word.bit(76),
             });
         }
-        0x326 => {
+        0x326 | 0x526 => {
             return Some(Op::Ipa {
                 d,
                 address: word.bits(64, 8) as u16 * 4,
                 location: word.bits(76, 2) as u8,
                 mode: word.bits(78, 2) as u8,
                 offset: word.reg(32),
+                index: (opcode == 0x526).then(|| UniformReg(word.bits(24, 6) as u8)),
             });
         }
         0x95b => {

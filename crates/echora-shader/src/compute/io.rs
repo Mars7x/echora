@@ -312,6 +312,41 @@ impl Emitter {
         Ok(())
     }
 
+    /// IPA with the address offset by a uniform register: each generic
+    /// component the header's input map uses, read, and the one at the
+    /// address selected (zero where none is).
+    pub(super) fn interpolate_indexed(
+        &mut self,
+        index: usize,
+        d: u8,
+        base: u16,
+        location: u8,
+        register: u8,
+    ) -> Result<(), Unsupported> {
+        let Some(header) = self.header.filter(|_| self.stage == Stage::Fragment) else {
+            return Err(unsupported(index, "indexed IPA outside a fragment program"));
+        };
+        if location > 1 {
+            return Err(unsupported(index, "IPA at an offset"));
+        }
+        let offset = self.read_uniform(register);
+        let base = self.constant(u32::from(base));
+        let address = self.value(op::I_ADD, self.u32, &[base, offset]);
+        let mut value = self.constant(0);
+        for component in 0..128u16 {
+            if header.imap[usize::from(component)] == Interpolation::Unused {
+                continue;
+            }
+            let at = 0x80 + component * 4;
+            let read = self.attribute(index, at, location == 1)?;
+            let here = self.constant(u32::from(at));
+            let matches = self.value(op::I_EQUAL, self.bool, &[address, here]);
+            value = self.value(op::SELECT, self.u32, &[matches, read, value]);
+        }
+        self.write_register(d, value);
+        Ok(())
+    }
+
     /// KILL: demote where `condition` holds.
     pub(super) fn kill(&mut self, condition: Pred) -> Result<(), Unsupported> {
         self.module

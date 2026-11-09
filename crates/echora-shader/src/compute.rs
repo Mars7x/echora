@@ -2032,8 +2032,14 @@ impl Emitter {
                 d,
                 address,
                 location,
+                index: attribute_index,
                 ..
-            } => self.interpolate(index, d.0, address, location)?,
+            } => match attribute_index {
+                Some(register) if register.0 != 63 => {
+                    self.interpolate_indexed(index, d.0, address, location, register.0)?
+                }
+                _ => self.interpolate(index, d.0, address, location)?,
+            },
             Op::Kill { condition } => {
                 if self.stage != Stage::Fragment {
                     return Err(unsupported(index, "KILL outside a fragment program"));
