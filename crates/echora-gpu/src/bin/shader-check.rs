@@ -40,6 +40,29 @@ fn main() {
         // a mesh program with no task, with the registers the runtime
         // derives from that section (see `bound_mesh_program`).
         let mut parameters = compute;
+        // A compute program's control section (the .control file beside
+        // it): workgroup size, shared and local memory at +0x58..+0x68, as
+        // the runtime reads them.
+        let control = std::fs::read(std::path::Path::new(&path).with_extension("control"))
+            .unwrap_or_default();
+        let control_word = |offset: usize| {
+            control
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk::<4>)
+                .map(|b| u32::from_le_bytes(*b))
+        };
+        let graphics = bytes
+            .first_chunk::<4>()
+            .is_some_and(|b| matches!(u32::from_le_bytes(*b) & 0x1f, 1 | 2));
+        if !graphics
+            && let (Some(x), Some(y), Some(z)) =
+                (control_word(0x58), control_word(0x5c), control_word(0x60))
+            && [x, y, z].iter().all(|size| (1..=1024).contains(size))
+        {
+            parameters.workgroup_size = [x, y, z];
+            parameters.shared_memory_size = control_word(0x64).unwrap_or(0xc000);
+            parameters.local_memory_size = control_word(0x68).unwrap_or(0);
+        }
         if std::env::var_os("ECHORA_CHECK_MESH").is_some() {
             let control = std::fs::read(std::path::Path::new(&path).with_extension("control"))
                 .unwrap_or_default();
