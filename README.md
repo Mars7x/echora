@@ -85,6 +85,11 @@ It is a new design, with the details of each instruction checked against
 public references and every translation compared with the old recompiler on
 my own machine. The old recompiler is no longer part of Echora.
 
+Much of this work is general rather than specific to Ocarina of Time. The
+translator handles the Switch 2's GPU instructions on their own terms, and
+once it covers this game it will move to its own repository so other Switch 2
+recompilation projects can use it.
+
 Once the title screen, the movie and the first 3D scene render through the new
 translator, the next steps are getting that scene right, reaching gameplay,
 and making each CPU thread do less work than it does now.
