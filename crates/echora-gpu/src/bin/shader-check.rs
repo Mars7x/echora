@@ -95,9 +95,18 @@ fn main() {
             }
         }
         if compare {
+            let mut compile = None;
             let outcome = match shader::translate_rust(&bytes, &parameters) {
                 Err(unsupported) => format!("unsupported: {}", unsupported.reason),
-                Ok(program) => match gpu.check_stage(&program) {
+                Ok(program) => match {
+                    let started = std::time::Instant::now();
+                    let result = gpu.check_stage(&program);
+                    compile = Some((
+                        started.elapsed().as_secs_f64() * 1e3,
+                        program.texture_pool_bindings != 0,
+                    ));
+                    result
+                } {
                     Err(error) => format!("driver rejects: {error}"),
                     Ok(()) => match shader::translate(&bytes, parameters, &mut NoEnvironment) {
                         Err(_) => "translated (the plugin does not)".into(),
@@ -127,7 +136,12 @@ fn main() {
             // ECHORA_CHECK_OUTCOMES: each stage's outcome, for finding
             // examples of one.
             if std::env::var_os("ECHORA_CHECK_OUTCOMES").is_some() {
-                eprintln!("outcome {path} {kind} {outcome}");
+                // The driver's compile time of the Rust translation, and
+                // whether it reads the texture pool.
+                let compile = compile.map_or(String::new(), |(ms, pool)| {
+                    format!(" [compile {ms:.1} ms{}]", if pool { ", pool" } else { "" })
+                });
+                eprintln!("outcome {path} {kind} {outcome}{compile}");
             }
             *rust.entry(format!("{kind:8} {outcome}")).or_default() += 1;
         }
