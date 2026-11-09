@@ -3277,7 +3277,7 @@ pub fn emit_rust_split_to_with<E>(
         "// Generated from user-provided executable bytes. Keep this file local.\n\
          use echora_guest::{{Core, Trap, WindowFn}};\n\n\
          /// Registers the window table used for direct calls between windows.\n\
-         pub fn install() {{\n    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n    install_call_slots();\n}}\n\n\
+         pub fn install() {{\n    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n}}\n\n\
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
          pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
     );
@@ -3360,12 +3360,6 @@ pub fn emit_rust_split_to_with<E>(
         sink(index, finish_region(index, source))?;
     }
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
-    // Left from the retired direct calls, which filled region call slots
-    // here: an empty function, kept so the root's bytes (and the golden
-    // hashes) stay as they were.
-    root.push_str(
-        "\n/// Points every region's call slots at their window functions.\nfn install_call_slots() {\n}\n",
-    );
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
     for (window, _) in &windows {
