@@ -1384,6 +1384,25 @@ impl Renderer {
     /// End and submit the current slot's command buffer.
     fn submit_current(&mut self) -> Result<(), String> {
         self.end_pass();
+        // Ring bytes the host reads back (storage a draw wrote) are made
+        // visible to it once the submission completes.
+        if !self.pending_reads.is_empty() {
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            // SAFETY: recording, outside rendering (the pass just ended).
+            unsafe {
+                self.gpu.device.cmd_pipeline_barrier(
+                    self.commands,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
         self.recording = false;
         self.flushes += 1;
         self.work_items = 0;

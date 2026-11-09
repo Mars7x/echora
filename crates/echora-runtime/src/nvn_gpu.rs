@@ -3445,6 +3445,9 @@ impl Nvn {
         let mut textures = HashMap::new();
         let mut storage = HashMap::new();
         let mut storage_in_place = HashMap::new();
+        // Copied storage buffers a stage writes: guest address and GPU
+        // address, by (stage index, binding).
+        let mut storage_written = HashMap::new();
         // Driver constant entries of bound storage buffers: (stage index,
         // c0 offset, GPU address, size).
         let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
@@ -3532,10 +3535,7 @@ impl Nvn {
                         let length = gpu - base + size;
                         let guest = self.gpu_to_guest(base, length)?;
                         if descriptor.flags & 1 != 0 {
-                            self.gpu
-                                .as_mut()
-                                .unwrap()
-                                .note("graphics-stage storage buffer writes are not returned");
+                            storage_written.insert((index, descriptor.binding), (guest, base));
                         }
                         storage_entries.push((index, descriptor.cbuf_offset, gpu, size));
                         // What dispatches wrote comes back to guest memory
@@ -3545,7 +3545,8 @@ impl Nvn {
                         // when its pool's file span imports (whole buffers
                         // copied per draw were most of the host's time after
                         // the movie). A buffer the stage writes keeps the
-                        // copy, whose writes are dropped as before.
+                        // copy, whose writes come back like a dispatch's
+                        // (`resolve_storage`).
                         if descriptor.flags & 1 == 0 {
                             if let Some((buffer, offset)) = self.shared_binding(guest, length)? {
                                 storage_in_place
@@ -4373,7 +4374,29 @@ impl Nvn {
             );
             backend.renderer.label(label);
         }
-        backend.renderer.draw(&draw)?;
+        let mut storage_results = 0;
+        for (key, token) in backend.renderer.draw(&draw)? {
+            let (Some(&(guest, base)), Some(bytes)) =
+                (storage_written.get(&key), draw.storage.get(&key))
+            else {
+                continue;
+            };
+            storage_results += 1;
+            backend.pending_storage.push((
+                token,
+                guest..guest + bytes.len() as u64,
+                key.1,
+                keys.1,
+                base,
+            ));
+        }
+        if storage_results > 0 {
+            // (Not `stat`: the draw still borrows the programs.)
+            *backend
+                .notes
+                .entry("stat: draw storage results".into())
+                .or_default() += storage_results;
+        }
         let timings = [
             (setup_end - since).as_micros() as u64,
             setup_end.elapsed().as_micros() as u64,

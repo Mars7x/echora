@@ -269,8 +269,8 @@ pub struct Draw<'a> {
     pub uniforms: HashMap<(usize, u32), Vec<u8>>,
     /// Texture bindings by (stage index, binding).
     pub textures: HashMap<(usize, u32), (TextureSource, Sampler)>,
-    /// Storage buffer contents by (stage index, binding). Graphics stages
-    /// read them; writes are not returned.
+    /// Storage buffer contents by (stage index, binding). What a stage
+    /// writes into them comes back (`Renderer::draw`).
     pub storage: HashMap<(usize, u32), Vec<u8>>,
     /// Storage buffers shared with the GPU in place instead (see
     /// `Renderer::import_file`): buffer, offset and length.
@@ -422,7 +422,10 @@ impl Renderer {
     }
 
     /// Record one draw.
-    pub fn draw(&mut self, draw: &Draw) -> Result<(), String> {
+    /// Record `draw`. Returns, for each copied storage buffer a stage
+    /// writes, its (stage index, binding) and the token of its contents
+    /// after the next flush (`take_completed_reads`).
+    pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
         let scale = self.attachment_scale(&draw.colors, draw.depth)?;
@@ -482,6 +485,7 @@ impl Renderer {
             Option<vk::DescriptorImageInfo>,
         )> = Vec::new();
         let mut texel_views: HashMap<u32, vk::BufferView> = HashMap::new();
+        let mut written = Vec::new();
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
@@ -517,6 +521,11 @@ impl Renderer {
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[0; 16]);
                             let (buffer, offset) = self.ring_upload(bytes, 256)?;
+                            // Only buffers the stage writes come back
+                            // (flags bit 0).
+                            if descriptor.flags & 1 != 0 {
+                                written.push((key, offset, bytes.len()));
+                            }
                             (
                                 buffer,
                                 offset,
@@ -870,7 +879,10 @@ impl Renderer {
             }
             // The pass stays open for the next draw into the same targets.
         }
-        Ok(())
+        Ok(written
+            .into_iter()
+            .map(|(key, offset, length)| (key, self.defer_ring_read(offset, length)))
+            .collect())
     }
 }
 
