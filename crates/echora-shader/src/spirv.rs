@@ -32,6 +32,7 @@ pub mod op {
     pub const CONSTANT_FALSE: u16 = 42;
     pub const CONSTANT: u16 = 43;
     pub const CONSTANT_COMPOSITE: u16 = 44;
+    pub const SPEC_CONSTANT_FALSE: u16 = 49;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
@@ -51,6 +52,8 @@ pub mod op {
     pub const IMAGE_DREF_GATHER: u16 = 97;
     pub const IMAGE: u16 = 100;
     pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_READ: u16 = 98;
+    pub const IMAGE_WRITE: u16 = 99;
     pub const IMAGE_QUERY_LOD: u16 = 105;
     pub const IMAGE_QUERY_LEVELS: u16 = 106;
     pub const CONVERT_F_TO_U: u16 = 109;
@@ -176,6 +179,10 @@ pub mod capability {
     pub const INT64: u32 = 11;
     pub const IMAGE_GATHER_EXTENDED: u32 = 25;
     pub const SAMPLED_1D: u32 = 43;
+    pub const IMAGE_1D: u32 = 44;
+    pub const IMAGE_BUFFER: u32 = 47;
+    pub const STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+    pub const STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
     pub const SAMPLED_CUBE_ARRAY: u32 = 45;
     pub const IMAGE_QUERY: u32 = 50;
     pub const GROUP_NON_UNIFORM: u32 = 61;
@@ -556,6 +563,15 @@ impl Module {
     pub fn u32_constant(&mut self, value: u32) -> u32 {
         let ty = self.u32();
         self.constant(ty, value)
+    }
+
+    /// A boolean specialization constant (false by default); the caller
+    /// decorates it with its SpecId.
+    pub fn bool_spec_constant(&mut self) -> u32 {
+        let ty = self.bool();
+        let id = self.id();
+        instruction(&mut self.globals, op::SPEC_CONSTANT_FALSE, &[ty, id]);
+        id
     }
 
     /// `true` or `false`, declared once each.

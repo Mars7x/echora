@@ -200,6 +200,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
 
 mod fetch;
 mod half;
+mod image;
 mod io;
 mod memory;
 mod structure;
@@ -339,6 +340,13 @@ struct Emitter {
     /// Combined image samplers by handle bank, offset, texture type and
     /// depth comparison.
     textures: BTreeMap<(u8, u16, u32, bool), u32>,
+    /// Storage images by handle bank, offset and dimension.
+    images: BTreeMap<(u8, u16, u8), image::ImageViews>,
+    /// More variables at a descriptor's binding (by descriptor index).
+    descriptor_aliases: Vec<(usize, u32)>,
+    /// Each image descriptor's integer-format spec constant id.
+    image_spec_ids: Vec<(usize, u32)>,
+    spec_constants: Vec<echora_shader_abi::SpecConstant>,
     cbuf_used_sizes: [u32; 18],
 }
 
@@ -400,6 +408,10 @@ impl Emitter {
             descriptors: Vec::new(),
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
+            images: BTreeMap::new(),
+            descriptor_aliases: Vec::new(),
+            image_spec_ids: Vec::new(),
+            spec_constants: Vec::new(),
             cbuf_used_sizes: [0; 18],
         }
     }
@@ -444,7 +456,7 @@ impl Emitter {
             stores: self.io.stores,
             frag_colors: self.frag_colors,
             cbuf_used_sizes: self.cbuf_used_sizes,
-            spec_constants: Vec::new(),
+            spec_constants: self.spec_constants,
             push_fields: self.push_fields,
         }
     }
@@ -801,11 +813,28 @@ impl Emitter {
         for (binding, &n) in order.iter().enumerate() {
             let mut descriptor = self.descriptors[n];
             descriptor.binding = base + binding as u32;
-            let variable = self.descriptor_variables[n];
-            self.module
-                .decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
-            self.module
-                .decorate(variable, decoration::BINDING, &[descriptor.binding]);
+            let aliases = self
+                .descriptor_aliases
+                .iter()
+                .filter(|&&(index, _)| index == n)
+                .map(|&(_, variable)| variable);
+            let variables: Vec<u32> = std::iter::once(self.descriptor_variables[n])
+                .chain(aliases)
+                .collect();
+            for variable in variables {
+                self.module
+                    .decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
+                self.module
+                    .decorate(variable, decoration::BINDING, &[descriptor.binding]);
+            }
+            for &(index, id) in &self.image_spec_ids {
+                if index == n {
+                    self.spec_constants.push(echora_shader_abi::SpecConstant {
+                        id,
+                        meaning: echora_shader_abi::SpecMeaning::IntegerFormat(descriptor.binding),
+                    });
+                }
+            }
             sorted.push(descriptor);
         }
         self.descriptors = sorted;
@@ -2003,6 +2032,26 @@ impl Emitter {
                 kind,
             )?,
             Op::Tex(texture) => self.texture(index, &texture)?,
+            Op::Surface {
+                store,
+                d,
+                a,
+                data,
+                bank,
+                handle_offset,
+                dimension,
+                mask,
+            } => self.surface(
+                index,
+                store,
+                d.0,
+                a.0,
+                data.0,
+                bank,
+                handle_offset,
+                dimension,
+                mask,
+            )?,
             Op::Ald {
                 d,
                 offset,
@@ -3804,6 +3853,60 @@ mod tests {
             ]),
             EXIT,
         ]);
+    }
+
+    #[test]
+    fn storage_images_have_float_and_unsigned_views_picked_by_a_constant() {
+        let translated = valid(&[
+            // SULD.P.2D R4, [R0], 0x3, c[0][0x60]; SUST.P.2D [R0], R4, 0xf
+            word(&[
+                (0, 12, 0xb97),
+                (16, 8, 4),
+                (24, 8, 0),
+                (40, 14, 0x18),
+                (54, 5, 0),
+                (61, 3, 3),
+                (72, 4, 3),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0xb9b),
+                (24, 8, 0),
+                (32, 8, 4),
+                (40, 14, 0x18),
+                (54, 5, 0),
+                (61, 3, 3),
+                (72, 4, 0xf),
+            ]),
+            // SULD.P.BUFFER R8, [R1], 0x1, c[0][0x68]
+            word(&[
+                (0, 12, 0xb97),
+                (16, 8, 8),
+                (24, 8, 1),
+                (40, 14, 0x1a),
+                (54, 5, 0),
+                (61, 3, 1),
+                (72, 4, 1),
+                (81, 3, 7),
+            ]),
+            EXIT,
+        ]);
+        let summary: Vec<(u32, u32, u32, u32, u32)> = translated
+            .descriptors
+            .iter()
+            .map(|d| (d.kind, d.binding, d.cbuf_offset, d.texture_type, d.flags))
+            .collect();
+        // The image buffer (kind 3) numbers before the image (kind 5).
+        assert_eq!(summary, [(3, 0, 0x68, 7, 2), (5, 1, 0x60, 2, 3)]);
+        // The 2D image's constant (id 32) at binding 1, the buffer's (33)
+        // at binding 0.
+        let constants: Vec<_> = translated
+            .spec_constants
+            .iter()
+            .map(|constant| (constant.id, constant.meaning))
+            .collect();
+        use echora_shader_abi::SpecMeaning::IntegerFormat;
+        assert_eq!(constants, [(33, IntegerFormat(0)), (32, IntegerFormat(1))]);
     }
 
     #[test]

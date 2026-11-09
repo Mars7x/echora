@@ -559,6 +559,20 @@ pub enum Op {
     Kill {
         condition: Pred,
     },
+    /// SULD.P d, [a], handle / SUST.P [a], data, handle: a formatted
+    /// storage image access to the components in `mask` (72-75), the
+    /// handle the word at byte `handle_offset` of `bank`; `dimension`
+    /// (61-63) 0 1D, 1 buffer, 3 2D, 4 2D array, 5 3D; coordinates from a.
+    Surface {
+        store: bool,
+        d: Reg,
+        a: Reg,
+        data: Reg,
+        bank: u8,
+        handle_offset: u16,
+        dimension: u8,
+        mask: u8,
+    },
     /// TEX, TLD.SCR, TLD4 and TXQ with a handle in a constant bank.
     Tex(Texture),
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
@@ -1280,6 +1294,21 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         0x95b => {
             return Some(Op::Kill {
                 condition: word.pred(87, 90),
+            });
+        }
+        0xb97 | 0xb9b => {
+            if word.bits(59, 2) != 0 {
+                return None;
+            }
+            return Some(Op::Surface {
+                store: opcode == 0xb9b,
+                d,
+                a: word.reg(24),
+                data: word.reg(32),
+                bank: word.bits(54, 5) as u8,
+                handle_offset: word.bits(40, 14) as u16 * 4,
+                dimension: word.bits(61, 3) as u8,
+                mask: word.bits(72, 4) as u8,
             });
         }
         0xb1d => {
