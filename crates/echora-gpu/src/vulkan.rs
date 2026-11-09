@@ -41,6 +41,9 @@ pub struct Gpu {
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
+    /// AV1 decoding on the GPU's video engine (Vulkan Video): its queue and
+    /// the extensions' functions, where a queue family decodes AV1.
+    pub video_decode: Option<VideoDecodeQueue>,
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
     pub shader_binary_version: ([u8; 16], u32),
@@ -120,6 +123,35 @@ impl Gpu {
                     .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
             })
             .ok_or("no graphics+compute queue")? as u32;
+        // A queue family whose video engine decodes AV1.
+        let video_family = {
+            let count =
+                // SAFETY: a live physical device.
+                unsafe { instance.get_physical_device_queue_family_properties2_len(physical) };
+            let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); count];
+            let mut properties: Vec<_> = video
+                .iter_mut()
+                .map(|video| vk::QueueFamilyProperties2::default().push_next(video))
+                .collect();
+            // SAFETY: `properties` has the reported length, each chained to
+            // its video properties.
+            unsafe {
+                instance.get_physical_device_queue_family_properties2(physical, &mut properties)
+            };
+            let flags: Vec<vk::QueueFlags> = properties
+                .iter()
+                .map(|family| family.queue_family_properties.queue_flags)
+                .collect();
+            drop(properties);
+            (0..count)
+                .find(|&index| {
+                    flags[index].contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+                        && video[index]
+                            .video_codec_operations
+                            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
+                })
+                .map(|index| index as u32)
+        };
 
         // Enable what the driver supports of the features the SPIR-V may use.
         let mut supported11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -289,10 +321,29 @@ impl Gpu {
             .subgroup_size_control(s13.subgroup_size_control != 0);
         let mut enable_objects =
             vk::PhysicalDeviceShaderObjectFeaturesEXT::default().shader_object(use_objects);
+        let video_decode_family = video_family.filter(|_| {
+            has(ash::khr::video_queue::NAME)
+                && has(ash::khr::video_decode_queue::NAME)
+                && has(ash::khr::video_decode_av1::NAME)
+        });
+        if video_decode_family.is_some() {
+            enabled_extensions.push(ash::khr::video_queue::NAME.as_ptr());
+            enabled_extensions.push(ash::khr::video_decode_queue::NAME.as_ptr());
+            enabled_extensions.push(ash::khr::video_decode_av1::NAME.as_ptr());
+        }
         let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
+        let mut queues = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family)
+                .queue_priorities(&priorities),
+        ];
+        if let Some(family) = video_decode_family.filter(|family| *family != queue_family) {
+            queues.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&priorities),
+            );
+        }
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&enabled_extensions)
@@ -344,6 +395,14 @@ impl Gpu {
             dma_buf_import.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let mesh_shader =
             mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
+        let video_decode = video_decode_family.map(|family| VideoDecodeQueue {
+            family,
+            // SAFETY: the family was requested with one queue.
+            queue: unsafe { device.get_device_queue(family, 0) },
+            video: ash::khr::video_queue::Device::new(&instance, &device),
+            video_instance: ash::khr::video_queue::Instance::new(&entry, &instance),
+            decode: ash::khr::video_decode_queue::Device::new(&instance, &device),
+        });
         Ok(Self {
             entry,
             instance,
@@ -360,6 +419,7 @@ impl Gpu {
             host_import,
             dma_buf_import,
             mesh_shader,
+            video_decode,
             shader_binary_version,
             name,
         })
@@ -510,4 +570,14 @@ pub fn stage_flags(stage: Stage) -> vk::ShaderStageFlags {
 fn bytemuck_words(words: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding and u8 has alignment 1.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 4) }
+}
+
+/// The GPU's AV1 decode queue (`Gpu::video_decode`).
+#[derive(Clone)]
+pub struct VideoDecodeQueue {
+    pub family: u32,
+    pub queue: vk::Queue,
+    pub video: ash::khr::video_queue::Device,
+    pub video_instance: ash::khr::video_queue::Instance,
+    pub decode: ash::khr::video_decode_queue::Device,
 }
