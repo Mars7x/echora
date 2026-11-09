@@ -41,3 +41,8 @@ when the code for it does.
    uses four to eight times the video memory (one 90-layer array after the
    opening movie becomes 852 MiB). Re-encoding them as BC7, cached on disk like
    the shader binaries, would bring that close to the console's footprint.
+7. Replace the C++ shader recompiler with a translator written in Rust, a
+   piece at a time. It runs alongside the current one, takes each program it
+   can handle and hands the rest to the current one, and is checked by
+   translating every captured shader with both and comparing the results.
+   The current recompiler goes once the Rust translator handles everything.
