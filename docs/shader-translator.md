@@ -99,8 +99,12 @@ only ever holds one constant-bank word (every write a ULDC of it); a
 handle computed at run time indexes the texture pool instead: set 1, an
 unsized array of sampled images per view type (bindings 1-7) and one of
 samplers (binding 0), by the handle's low 20 bits and high 12, with
-non-uniform indexing; `Translated::texture_pool_bindings` names the
-bindings a program reads. Programs without derivatives sample at an explicit level (a
+non-uniform indexing where the handle can differ across the warp (a
+register; a uniform register's handle is the same for all lanes, so its
+accesses are plain); `Translated::texture_pool_bindings` names the
+bindings a program reads. TEX.B (0x361) has the handle among its values,
+after the coordinates (all coordinates in Ra unless packed, bit 60, with
+four values or fewer), and always reads the pool. Programs without derivatives sample at an explicit level (a
 bias over level zero is that level). Vulkan takes only constant texel
 offsets for a sample, so a sample adds the offsets divided by the
 level's size to its coordinates; a fetch adds them to its integer

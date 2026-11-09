@@ -116,18 +116,28 @@ impl Emitter {
 
     /// The texture as a sampled image: its combined image sampler, or for
     /// a handle computed at run time, the texture pool's entries.
+    ///
+    /// `handle` is the handle's value for the pool, with whether it is the
+    /// same across the warp (a uniform register); otherwise the uniform
+    /// register in `texture.handle` gives it, or the texture is bound.
     fn sampled_image(
         &mut self,
         index: usize,
         texture: &Texture,
         view: &View,
         depth: bool,
+        handle: Option<(u32, bool)>,
     ) -> Result<(u32, Types), Unsupported> {
-        let Some(register) = texture.handle else {
-            let (variable, types) = self.texture_variable(texture, view, depth);
-            let sampled = self.value(op::LOAD, types.sampled, &[variable]);
-            return Ok((sampled, types));
+        let handle = match (handle, texture.handle) {
+            (Some(handle), _) => handle,
+            (None, Some(register)) => (self.read_uniform(register.0), true),
+            (None, None) => {
+                let (variable, types) = self.texture_variable(texture, view, depth);
+                let sampled = self.value(op::LOAD, types.sampled, &[variable]);
+                return Ok((sampled, types));
+            }
         };
+        let (handle, uniform) = handle;
         let binding = match (view.dim, view.arrayed) {
             (0, false) => texture_pool::SAMPLED_1D,
             (0, true) => texture_pool::SAMPLED_1D_ARRAY,
@@ -141,28 +151,31 @@ impl Emitter {
         // The pool's images take no depth flag: the sampler's state
         // decides a comparison.
         let types = self.texture_types(view, false);
-        let handle = self.read_uniform(register.0);
         let (mask, shift) = (
             self.constant(TEXTURE_INDEX_MASK),
             self.constant(SAMPLER_INDEX_SHIFT),
         );
         let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
         let sampler_index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
-        let image = self.pool_entry(binding, types.image, texture_index);
+        let image = self.pool_entry(binding, types.image, texture_index, uniform);
         let sampler_type = self.module.ty(Type::Sampler);
-        let sampler = self.pool_entry(texture_pool::SAMPLERS, sampler_type, sampler_index);
+        let sampler = self.pool_entry(texture_pool::SAMPLERS, sampler_type, sampler_index, uniform);
         let sampled = self.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
-        self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
+        if !uniform {
+            self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
+        }
         Ok((sampled, types))
     }
 
     /// Entry `index` of texture-pool binding `binding` (an unsized array of
-    /// `element`), loaded with a non-uniform index.
-    fn pool_entry(&mut self, binding: u32, element: u32, index: u32) -> u32 {
+    /// `element`); a non-uniform index unless `uniform`.
+    fn pool_entry(&mut self, binding: u32, element: u32, index: u32, uniform: bool) -> u32 {
         self.module.capability(capability::RUNTIME_DESCRIPTOR_ARRAY);
-        self.module.capability(capability::SHADER_NON_UNIFORM);
-        self.module
-            .capability(capability::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING);
+        if !uniform {
+            self.module.capability(capability::SHADER_NON_UNIFORM);
+            self.module
+                .capability(capability::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING);
+        }
         let array_type = self.module.ty(Type::RuntimeArray { element });
         let variable = match self.pool_arrays.get(&binding) {
             Some(&variable) => variable,
@@ -183,15 +196,33 @@ impl Emitter {
         };
         let pointer = self.module.pointer(storage::UNIFORM_CONSTANT, element);
         let entry = self.value(op::ACCESS_CHAIN, pointer, &[variable, index]);
-        self.module.decorate(entry, decoration::NON_UNIFORM, &[]);
         let value = self.value(op::LOAD, element, &[entry]);
-        self.module.decorate(value, decoration::NON_UNIFORM, &[]);
+        if !uniform {
+            self.module.decorate(entry, decoration::NON_UNIFORM, &[]);
+            self.module.decorate(value, decoration::NON_UNIFORM, &[]);
+        }
         value
     }
 
     /// The instruction's operand values, in order (RZ reads zero).
     fn texture_values(&mut self, texture: &Texture, count: u32) -> Vec<u32> {
-        let in_a = if count <= 4 { count.div_ceil(2) } else { 4 };
+        self.texture_values_split(texture, count, None)
+    }
+
+    /// As `texture_values`; TEX.B (`coordinates` given) keeps all its
+    /// coordinates in Ra when unpacked (bit 60 clear) or with five values
+    /// or more.
+    fn texture_values_split(
+        &mut self,
+        texture: &Texture,
+        count: u32,
+        coordinates: Option<u32>,
+    ) -> Vec<u32> {
+        let in_a = match coordinates {
+            Some(coordinates) if !texture.packed || count > 4 => coordinates,
+            _ if count <= 4 => count.div_ceil(2),
+            _ => 4,
+        };
         (0..count)
             .map(|i| {
                 let (base, n) = if i < in_a {
@@ -242,7 +273,10 @@ impl Emitter {
         if texture.mask == 0 {
             return Ok(());
         }
-        if texture.handle.is_none() && usize::from(texture.bank) >= self.cbuf_used_sizes.len() {
+        if texture.handle.is_none()
+            && !texture.handle_value
+            && usize::from(texture.bank) >= self.cbuf_used_sizes.len()
+        {
             return Err(unsupported(index, "texture handle in an unbound bank"));
         }
         let results = match texture.op {
@@ -314,14 +348,24 @@ impl Emitter {
             return Err(unsupported(index, "cube or depth texel fetch"));
         }
         let level_value = texture.lod >= 2;
+        let handle_value = texture.handle_value;
         let count = view.coordinates
+            + u32::from(handle_value)
             + u32::from(level_value)
             + u32::from(texture.offsets)
             + 2 * u32::from(texture.per_tap)
             + u32::from(texture.depth_compare);
-        let values = self.texture_values(texture, count);
-        let (sampled, types) = self.sampled_image(index, texture, view, texture.depth_compare)?;
+        let values =
+            self.texture_values_split(texture, count, handle_value.then_some(view.coordinates));
         let mut next = view.coordinates as usize;
+        // TEX.B: the handle follows the coordinates, a value that may
+        // differ across the warp.
+        let handle = handle_value.then(|| {
+            next += 1;
+            (values[next - 1], false)
+        });
+        let (sampled, types) =
+            self.sampled_image(index, texture, view, texture.depth_compare, handle)?;
         let level_operand = level_value.then(|| {
             next += 1;
             values[next - 1]
@@ -570,7 +614,7 @@ impl Emitter {
         } else {
             self.texture_values(texture, view.coordinates)
         };
-        let (sampled, _) = self.sampled_image(index, texture, view, false)?;
+        let (sampled, _) = self.sampled_image(index, texture, view, false, None)?;
         let floats: Vec<u32> = values
             .iter()
             .map(|&value| self.value(op::BITCAST, self.f32, &[value]))
@@ -602,7 +646,7 @@ impl Emitter {
             texture_type: 2,
             coordinates: 2,
         };
-        let (sampled, types) = self.sampled_image(index, texture, &view, false)?;
+        let (sampled, types) = self.sampled_image(index, texture, &view, false, None)?;
         let level = if texture.a.0 == 255 {
             self.constant(0)
         } else {

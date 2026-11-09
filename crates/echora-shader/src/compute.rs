@@ -4139,6 +4139,37 @@ mod tests {
     }
 
     #[test]
+    fn bindless_textures_with_a_register_handle_index_the_pool_non_uniformly() {
+        // TEX.B R4, R0 (x, y), R2 (handle), 2D, 0xf; unpacked (bit 60 clear)
+        let translated = valid(&[
+            word(&[
+                (0, 12, 0x361),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 2),
+                (59, 1, 1),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 0xf),
+                (81, 3, 7),
+            ]),
+            EXIT,
+        ]);
+        use echora_shader_abi::texture_pool::{SAMPLED_2D, SAMPLERS};
+        assert_eq!(
+            translated.texture_pool_bindings,
+            1 << SAMPLERS | 1 << SAMPLED_2D
+        );
+        // NonUniform (5300) decorates the register handle's accesses.
+        assert!(
+            translated
+                .spirv
+                .windows(3)
+                .any(|w| w[0] == (3 << 16 | 71) && w[2] == 5300)
+        );
+    }
+
+    #[test]
     fn float_families_validate() {
         valid(&[
             // FFMA.SAT R0, -|R1|, R2, R3; FMUL R4, R0, 2.0; FADD R5, R4, R0

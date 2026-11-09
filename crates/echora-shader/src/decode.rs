@@ -146,6 +146,10 @@ pub struct Texture {
     /// The bindless forms (0xf60, 0xf63, 0xf66, 0xf6f): the handle is in
     /// this uniform register instead (`bank` and `handle_offset` unused).
     pub handle: Option<UniformReg>,
+    /// TEX.B (0x361): the handle is a value after the coordinates (which
+    /// are all in Ra unless `packed`, bit 60, with four values or fewer).
+    pub handle_value: bool,
+    pub packed: bool,
     /// Bits 61-63: 0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D array, 7
     /// cube array.
     pub dimension: u8,
@@ -1291,6 +1295,8 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                     word.bits(40, 14) as u16 * 4
                 },
                 handle: bindless.then(|| UniformReg(word.bits(40, 6) as u8)),
+                handle_value: false,
+                packed: word.bit(60),
                 dimension: word.bits(61, 3) as u8,
                 lod: if matches!(op, TextureOp::Gather { .. }) {
                     0
@@ -1299,6 +1305,31 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 },
                 offsets: word.bit(76),
                 per_tap,
+                depth_compare: word.bit(78),
+                mask: word.bits(72, 4) as u8,
+                half: word.bit(79),
+            }));
+        }
+        // TEX.B: the handle among the values (bits 40-58 unused, 59 set).
+        0x361 => {
+            if word.bits(40, 19) != 0 || !word.bit(59) || word.bit(77) || word.bits(81, 3) != 7 {
+                return None;
+            }
+            return Some(Op::Tex(Texture {
+                op: TextureOp::Sample,
+                d,
+                d2: word.reg(64),
+                a: word.reg(24),
+                b: word.reg(32),
+                bank: 0,
+                handle_offset: 0,
+                handle: None,
+                handle_value: true,
+                packed: word.bit(60),
+                dimension: word.bits(61, 3) as u8,
+                lod: word.bits(87, 3) as u8,
+                offsets: word.bit(76),
+                per_tap: false,
                 depth_compare: word.bit(78),
                 mask: word.bits(72, 4) as u8,
                 half: word.bit(79),
