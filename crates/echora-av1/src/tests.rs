@@ -54,6 +54,10 @@ struct FrameSpec {
     skip_mode_present: bool,
     cdef_bits: u32,
     lr_types: [u32; 3],
+    /// Bits written after uniform_tile_spacing_flag (the increments of
+    /// TileColsLog2 and TileRowsLog2, then context_update_tile_id and
+    /// tile_size_bytes_minus_1 when there are several tiles).
+    tile_bits: Vec<(u32, u32)>,
     tile_data: Vec<u8>,
 }
 
@@ -78,6 +82,7 @@ impl Default for FrameSpec {
             skip_mode_present: false,
             cdef_bits: 1,
             lr_types: [0, 0, 0],
+            tile_bits: Vec::new(),
             tile_data: vec![0xaa; 5],
         }
     }
@@ -138,8 +143,11 @@ fn write_header(w: &mut BitWriter, f: &FrameSpec) {
         }
     }
     w.flag(false); // disable_frame_end_update_cdf
-    // tile_info: 64x64 is a single superblock.
+    // tile_info: uniform spacing, then whatever the frame size needs.
     w.flag(true);
+    for &(n, v) in &f.tile_bits {
+        w.put(n, v);
+    }
     // quantization_params
     w.put(8, f.base_q_idx)
         .flag(true) // DeltaQYDc coded
@@ -844,5 +852,325 @@ fn truncated_frames_fail_cleanly() {
         let mut p = Parser::new();
         // Any prefix may fail but must not panic.
         let _ = p.parse_temporal_unit(&tu[..len]);
+    }
+}
+
+// Streams shaped like the game's movies: 1920x1080, 8-bit 4:2:0, long,
+// with hidden frames shown later and periodic key frames.
+
+/// The tile_info bits of a 1920x1080 frame (30x17 superblocks) with
+/// 2^cols_log2 uniform tile columns and one tile row: increments up to
+/// the wanted log2 (stopping with a 0 below the maximum of 5), then the
+/// row increment stop bit.
+fn full_hd_tile_bits(cols_log2: u32, context_update_tile_id: u32) -> Vec<(u32, u32)> {
+    let mut bits = vec![(1, 1); cols_log2 as usize];
+    bits.push((1, 0)); // stop TileColsLog2
+    bits.push((1, 0)); // stop TileRowsLog2
+    if cols_log2 > 0 {
+        bits.push((cols_log2, context_update_tile_id));
+        bits.push((2, 3)); // tile_size_bytes_minus_1: four bytes
+    }
+    bits
+}
+
+#[test]
+fn full_hd_single_tile() {
+    let spec = FrameSpec {
+        tile_bits: full_hd_tile_bits(0, 0),
+        ..FrameSpec::default()
+    };
+    let tu = temporal_unit(&[sequence_obu(1920, 1080), frame_obu(&spec)]);
+    let pics = decode(Parser::new().parse_temporal_unit(&tu).unwrap());
+    let pic = &pics[0];
+    let h = &pic.header;
+    assert_eq!((pic.frame_width, pic.frame_height), (1920, 1080));
+    assert_eq!((pic.render_width, pic.render_height), (1920, 1080));
+    assert_eq!(pic.upscaled_width, 1920);
+    assert!(!pic.use_superres);
+    // 1080 is not a multiple of 8: MiRows rounds up to 8-pixel units.
+    assert_eq!((h.size.mi_cols, h.size.mi_rows), (480, 270));
+    let t = &h.tile_info;
+    assert_eq!((t.tile_cols, t.tile_rows), (1, 1));
+    assert_eq!(t.mi_col_starts, vec![0, 480]);
+    assert_eq!(t.mi_row_starts, vec![0, 270]);
+    assert_eq!(t.width_in_sbs_minus_1, vec![29]);
+    assert_eq!(t.height_in_sbs_minus_1, vec![16]);
+    let std = &pic.std_sequence;
+    assert_eq!(
+        (std.max_frame_width_minus_1, std.max_frame_height_minus_1),
+        (1919, 1079)
+    );
+    assert_eq!(std.color_config.bit_depth, 8);
+    assert_eq!(
+        (
+            std.color_config.subsampling_x,
+            std.color_config.subsampling_y
+        ),
+        (1, 1)
+    );
+}
+
+#[test]
+fn full_hd_four_tile_columns() {
+    // Four uniform columns of 8, 8, 8 and 6 superblocks, coded in one tile
+    // group with four-byte tile sizes.
+    let mut tile_data = vec![0]; // tile_start_and_end_present_flag = 0, aligned
+    let sizes = [11u32, 7, 5, 3];
+    for (i, &size) in sizes.iter().enumerate() {
+        if i + 1 < sizes.len() {
+            tile_data.extend((size - 1).to_le_bytes());
+        }
+        tile_data.extend(std::iter::repeat_n(0x10 + i as u8, size as usize));
+    }
+    let spec = FrameSpec {
+        tile_bits: full_hd_tile_bits(2, 3),
+        tile_data,
+        ..FrameSpec::default()
+    };
+    let tu = temporal_unit(&[sequence_obu(1920, 1080), frame_obu(&spec)]);
+    let pics = decode(Parser::new().parse_temporal_unit(&tu).unwrap());
+    let pic = &pics[0];
+    let t = &pic.header.tile_info;
+    assert_eq!((t.tile_cols, t.tile_rows, t.tile_cols_log2), (4, 1, 2));
+    assert_eq!(t.mi_col_starts, vec![0, 128, 256, 384, 480]);
+    assert_eq!(t.width_in_sbs_minus_1, vec![7, 7, 7, 5]);
+    assert_eq!(
+        (t.context_update_tile_id, t.tile_size_bytes_minus_1),
+        (3, 3)
+    );
+    assert_eq!(pic.tiles.len(), 4);
+    for (i, tile) in pic.tiles.iter().enumerate() {
+        assert_eq!(tile.size, sizes[i]);
+        let bytes = &tu[tile.offset as usize..][..tile.size as usize];
+        assert!(bytes.iter().all(|&b| b == 0x10 + i as u8), "tile {i}");
+    }
+    let std = &pic.std_picture.tile_info;
+    assert_eq!(std.mi_col_starts, vec![0, 128, 256, 384]);
+    assert_eq!(std.width_in_sbs_minus_1, vec![7, 7, 7, 5]);
+    assert_eq!(std.height_in_sbs_minus_1, vec![16]);
+}
+
+#[test]
+fn repeated_sequence_headers_keep_the_generation() {
+    let mut p = Parser::new();
+    let key = frame_obu(&FrameSpec::default());
+    let first = decode(
+        p.parse_temporal_unit(&temporal_unit(&[sequence_obu(64, 64), key.clone()]))
+            .unwrap(),
+    );
+    // Encoders repeat the sequence header at every key frame.
+    let again = decode(
+        p.parse_temporal_unit(&temporal_unit(&[sequence_obu(64, 64), key.clone()]))
+            .unwrap(),
+    );
+    assert_eq!(first[0].sequence_generation, again[0].sequence_generation);
+    // A different sequence header starts a new generation.
+    let other = decode(
+        p.parse_temporal_unit(&temporal_unit(&[sequence_obu(128, 64), key]))
+            .unwrap(),
+    );
+    assert_eq!(
+        other[0].sequence_generation,
+        first[0].sequence_generation + 1
+    );
+    assert_eq!(other[0].frame_width, 128);
+}
+
+/// Writes show_existing_frame of `slot` as a frame header OBU.
+fn show_existing_obu(slot: u32) -> Vec<u8> {
+    let mut w = BitWriter::default();
+    w.flag(true).put(3, slot).align();
+    obu(ObuType::FrameHeader, &w.bytes)
+}
+
+#[test]
+fn hidden_frames_shown_later_over_many_groups() {
+    // libaom's usual pattern: each group codes a hidden alt-ref four frames
+    // ahead into slot 6, three shown frames referencing the past (slot 0)
+    // and the alt-ref, then shows the alt-ref with show_existing_frame.
+    // Seven-bit order hints wrap every 128 frames; 40 groups go round
+    // more than once.
+    let mut p = Parser::new();
+    let key = decode(
+        p.parse_temporal_unit(&temporal_unit(&[
+            sequence_obu(64, 64),
+            frame_obu(&FrameSpec::default()),
+        ]))
+        .unwrap(),
+    );
+    let mut presented = vec![key[0].id];
+    let mut decoded = 1;
+    for group in 0..40u32 {
+        let base = group * 4;
+        let arf = FrameSpec {
+            frame_type: 1,
+            show_frame: false,
+            showable_frame: true,
+            order_hint: (base + 4) % 128,
+            primary_ref_frame: 0,
+            refresh_frame_flags: 1 << 6,
+            ..FrameSpec::default()
+        };
+        let arf_pic = decode(
+            p.parse_temporal_unit(&temporal_unit(&[frame_obu(&arf)]))
+                .unwrap(),
+        );
+        assert!(!arf_pic[0].show_frame);
+        let arf_id = arf_pic[0].id;
+        decoded += 1;
+        for step in 1..4u32 {
+            let mut refs = [0; 7];
+            refs[ALTREF_FRAME - LAST_FRAME] = 6;
+            let frame = FrameSpec {
+                frame_type: 1,
+                order_hint: (base + step) % 128,
+                primary_ref_frame: 0,
+                refresh_frame_flags: 1,
+                ref_frame_idx: refs,
+                ..FrameSpec::default()
+            };
+            let pics = decode(
+                p.parse_temporal_unit(&temporal_unit(&[frame_obu(&frame)]))
+                    .unwrap(),
+            );
+            let h = &pics[0].header;
+            // ALTREF is in the future even across the wrap; LAST in the past.
+            assert_eq!(
+                h.ref_frame_sign_bias,
+                1 << ALTREF_FRAME,
+                "group {group} step {step}"
+            );
+            assert_eq!(
+                pics[0].reference_pictures[ALTREF_FRAME - LAST_FRAME],
+                Some(arf_id)
+            );
+            presented.push(pics[0].id);
+            decoded += 1;
+        }
+        let out = p
+            .parse_temporal_unit(&temporal_unit(&[show_existing_obu(6)]))
+            .unwrap();
+        let [Output::ShowExisting(show)] = &out[..] else {
+            panic!("expected show_existing_frame")
+        };
+        assert_eq!(show.id, arf_id);
+        assert_eq!(show.refresh_frame_flags, 0);
+        presented.push(show.id);
+    }
+    assert_eq!(presented.len(), 1 + 40 * 4);
+    assert_eq!(decoded, 1 + 40 * 4);
+    // Every presented picture was decoded exactly once, in order.
+    let mut sorted = presented.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), presented.len());
+}
+
+#[test]
+fn hidden_key_frame_shown_later_refreshes_every_slot() {
+    let mut p = Parser::new();
+    p.parse_temporal_unit(&temporal_unit(&[
+        sequence_obu(64, 64),
+        frame_obu(&FrameSpec::default()),
+    ]))
+    .unwrap();
+    // A forward key frame: coded hidden into slot 3 while slot 0 is still
+    // in use, then shown with show_existing_frame.
+    let hidden_key = FrameSpec {
+        show_frame: false,
+        showable_frame: true,
+        order_hint: 9,
+        refresh_frame_flags: 1 << 3,
+        ..FrameSpec::default()
+    };
+    let pics = decode(
+        p.parse_temporal_unit(&temporal_unit(&[frame_obu(&hidden_key)]))
+            .unwrap(),
+    );
+    let key_id = pics[0].id;
+    assert_eq!(pics[0].header.frame_type, FrameType::Key);
+    assert!(!pics[0].show_frame && !pics[0].header.error_resilient_mode);
+    let before = p.slot_pictures();
+    assert_eq!(before[3], Some(key_id));
+    assert_ne!(before[0], Some(key_id));
+
+    let out = p
+        .parse_temporal_unit(&temporal_unit(&[show_existing_obu(3)]))
+        .unwrap();
+    let [Output::ShowExisting(show)] = &out[..] else {
+        panic!("expected show_existing_frame")
+    };
+    assert_eq!(show.id, key_id);
+    assert_eq!(show.frame_type, FrameType::Key);
+    assert_eq!(show.refresh_frame_flags, 0xff);
+    assert_eq!(p.slot_pictures(), [Some(key_id); 8]);
+    // The key frame cannot be shown a second time.
+    assert!(!p.refs().slots[5].showable_frame);
+
+    // Inter frames continue from it: every slot has its order hint.
+    let next = FrameSpec {
+        frame_type: 1,
+        order_hint: 10,
+        primary_ref_frame: 0,
+        refresh_frame_flags: 1,
+        ref_frame_idx: [5, 1, 2, 3, 4, 6, 7],
+        ..FrameSpec::default()
+    };
+    let pics = decode(
+        p.parse_temporal_unit(&temporal_unit(&[frame_obu(&next)]))
+            .unwrap(),
+    );
+    assert_eq!(pics[0].reference_pictures, [Some(key_id); 7]);
+    assert_eq!(pics[0].header.order_hints[1..], [9; 7]);
+    assert_eq!(pics[0].header.ref_frame_sign_bias, 0);
+}
+
+#[test]
+fn long_stream_with_periodic_key_frames() {
+    // 60 fps for ten seconds: a shown key frame every 120 frames, P frames
+    // between them refreshing slot 0, order hints wrapping at 128.
+    let mut p = Parser::new();
+    let mut tu = vec![sequence_obu(64, 64)];
+    let mut last_key = None;
+    for n in 0..600u32 {
+        let frame = if n % 120 == 0 {
+            FrameSpec {
+                order_hint: n % 128,
+                ..FrameSpec::default()
+            }
+        } else {
+            FrameSpec {
+                frame_type: 1,
+                order_hint: n % 128,
+                primary_ref_frame: 0,
+                refresh_frame_flags: 1,
+                ..FrameSpec::default()
+            }
+        };
+        tu.push(frame_obu(&frame));
+        let pics = decode(p.parse_temporal_unit(&temporal_unit(&tu)).unwrap());
+        tu.clear();
+        let pic = &pics[0];
+        assert_eq!(pic.id.0, u64::from(n));
+        assert!(pic.show_frame);
+        if n % 120 == 0 {
+            assert_eq!(pic.refresh_frame_flags, 0xff);
+            assert_eq!(
+                pic.reference_infos,
+                std::array::from_fn(|_| None),
+                "frame {n}"
+            );
+            last_key = Some(pic.id);
+        } else {
+            // LAST is the previous frame; the other slots still hold the key frame.
+            assert_eq!(
+                pic.reference_pictures[0],
+                Some(crate::PictureId(u64::from(n - 1)))
+            );
+            assert_eq!(pic.reference_name_slot_indices, [0; 7]);
+            assert_eq!(p.slot_pictures()[1], last_key);
+            assert_eq!(pic.header.ref_frame_sign_bias, 0, "frame {n}");
+            assert_eq!(pic.header.order_hints[LAST_FRAME], ((n - 1) % 128) as u8);
+        }
     }
 }
