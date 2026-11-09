@@ -428,6 +428,17 @@ fn key_frame_header() {
     );
     assert!(lr.uses_lr && lr.uses_chroma_lr);
     assert_eq!(lr.loop_restoration_size, [128, 64, 64]);
+    // The Vulkan mirror carries what drivers take: coded secondary CDEF
+    // strengths, and LoopRestorationSize as log2(size) - 5.
+    let std = &pic.std_picture;
+    assert_eq!(std.cdef.cdef_y_sec_strength[..2], [3, 3]);
+    assert_eq!(std.cdef.cdef_uv_sec_strength[..2], [1, 1]);
+    assert_eq!(std.cdef.cdef_y_pri_strength[..2], [5, 6]);
+    assert_eq!(
+        std.loop_restoration.log2_restoration_size_minus_5,
+        [2, 1, 1]
+    );
+    assert_eq!(std.loop_restoration.frame_restoration_type, [1, 0, 2]);
     assert_eq!(h.tx_mode, TxMode::Select);
     assert!(h.reduced_tx_set);
     // Tiles: one, holding the bytes after the header.

@@ -48,6 +48,9 @@ submission bytes ──► Parser::parse_temporal_unit ──► Vec<Output>
   `StdVideoDecodeAV1*` structures. Bitfield flags are plain bools and
   pointers are owned values; enums carry their Std numeric values.
 - `ivf.rs`: an IVF reader, for the test streams.
+- `examples/av1_headers.rs`: prints every picture's header and what
+  changes from one picture to the next
+  (`cargo run -p echora-av1 --example av1_headers -- FILE.ivf|FILE.obu`).
 
 CDFs, motion vectors and segment maps are decoder state that lives on the
 GPU; the parser never needs them.
@@ -90,9 +93,17 @@ Notes on values:
   The Std headers size them 8 for that reason. Check `expected_frame_id`'s
   indexing against the driver; it only matters with frame ids, which the
   game's movies do not use.
-- CDEF secondary strengths are the spec's values (a coded 3 is 4).
-- `loop_restoration_size` is in samples, zero for every plane when loop
-  restoration is off. `StdVideoAV1LoopRestoration::LoopRestorationSize`
+- `video::Cdef` carries the coded secondary strengths (0..=3), as drivers
+  expect (RADV packs `(pri << 2) + sec`); `frame::Cdef` has the spec's
+  values, where a coded 3 means 4.
+- `video::LoopRestoration::log2_restoration_size_minus_5` is Vulkan's
+  `LoopRestorationSize`: log2 of the unit size minus 5 (0..=3), zero when
+  loop restoration is off. `frame::LoopRestoration` has the size in
+  samples (and `video::LoopRestoration::loop_restoration_size` keeps it
+  until the Vulkan side has moved over).
+- `pMiColStarts` and `pMiRowStarts` are in 4x4 (MI) units, as the Vulkan
+  spec and FFmpeg have them. RADV 25.2 copies them into fields named for
+  superblock units, so multi-tile streams on RADV deserve a check. `StdVideoAV1LoopRestoration::LoopRestorationSize`
   takes log2(size) - 5 instead (`crates/echora-gpu/src/video_av1.rs`
   converts it).
 - `ar_coeffs_*_plus_128` are stored as coded (0..=255); the Std header

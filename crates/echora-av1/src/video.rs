@@ -186,8 +186,10 @@ pub struct LoopFilter {
     pub loop_filter_mode_deltas: [i8; 2],
 }
 
-/// StdVideoAV1CDEF. Secondary strengths are the spec's values (0, 1, 2
-/// or 4).
+/// StdVideoAV1CDEF. Secondary strengths are the coded two-bit values
+/// (0..=3), as drivers expect: RADV packs `(pri << 2) + sec` for the
+/// firmware. The spec's adjusted value (a coded 3 means 4) is in
+/// [`crate::frame::Cdef`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cdef {
     pub cdef_damping_minus_3: u8,
@@ -204,7 +206,13 @@ pub struct LoopRestoration {
     /// StdVideoAV1FrameRestorationType values: 0 none, 1 Wiener,
     /// 2 self-guided, 3 switchable.
     pub frame_restoration_type: [u8; 3],
-    /// Unit size in samples per plane (32..=256); zero when unused.
+    /// LoopRestorationSize as Vulkan takes it: log2 of the unit size
+    /// minus 5 per plane (0..=3 for 32..=256 samples); zero when loop
+    /// restoration is off. The size in samples is in
+    /// [`crate::frame::LoopRestoration`].
+    pub log2_restoration_size_minus_5: [u16; 3],
+    /// The unit size in samples (32..=256), zero when off. Superseded by
+    /// `log2_restoration_size_minus_5`; kept until echora-gpu moves to it.
     pub loop_restoration_size: [u16; 3],
 }
 
@@ -468,12 +476,15 @@ impl PictureInfo {
                 cdef_damping_minus_3: c.damping_minus_3,
                 cdef_bits: c.bits,
                 cdef_y_pri_strength: c.y_pri_strength,
-                cdef_y_sec_strength: c.y_sec_strength,
+                cdef_y_sec_strength: c.y_sec_strength.map(coded_sec_strength),
                 cdef_uv_pri_strength: c.uv_pri_strength,
-                cdef_uv_sec_strength: c.uv_sec_strength,
+                cdef_uv_sec_strength: c.uv_sec_strength.map(coded_sec_strength),
             },
             loop_restoration: LoopRestoration {
                 frame_restoration_type: lr.frame_restoration_type.map(|t| t as u8),
+                log2_restoration_size_minus_5: lr
+                    .loop_restoration_size
+                    .map(|size| size.checked_ilog2().map_or(0, |log2| log2 as u16 - 5)),
                 loop_restoration_size: lr.loop_restoration_size,
             },
             global_motion: GlobalMotion {
@@ -483,6 +494,11 @@ impl PictureInfo {
             film_grain: FilmGrain::new(&h.film_grain),
         }
     }
+}
+
+/// The coded cdef_*_sec_strength for the spec's value (4 was coded as 3).
+fn coded_sec_strength(strength: u8) -> u8 {
+    if strength == 4 { 3 } else { strength }
 }
 
 /// StdVideoDecodeAV1ReferenceInfo: what a DPB slot's picture carries.
