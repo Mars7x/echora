@@ -41,6 +41,9 @@ pub struct Gpu {
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
+    /// VK_KHR_cooperative_matrix is enabled: the shapes and types the
+    /// device multiplies (M, N, K, A, B, C, result, saturating, scope).
+    pub cooperative_matrix: Vec<CooperativeMatrixShape>,
     /// The texture pool's descriptor set layout (`echora_shader_abi`
     /// `TEXTURE_POOL_SET`), when the device has the descriptor indexing it
     /// needs: set 1 of every program that reads the pool.
@@ -135,6 +138,7 @@ impl Gpu {
         let mut supported_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut supported_clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
         let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+        let mut supported_cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported11)
             .push_next(&mut supported12)
@@ -144,7 +148,8 @@ impl Gpu {
             .push_next(&mut supported_robust)
             .push_next(&mut supported_mesh)
             .push_next(&mut supported_clock)
-            .push_next(&mut supported_atomic_float);
+            .push_next(&mut supported_atomic_float)
+            .push_next(&mut supported_cooperative);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_features2(physical, &mut supported) };
         let core = supported.features;
@@ -238,6 +243,12 @@ impl Gpu {
             && has(ash::ext::shader_atomic_float::NAME);
         if float_atomic_add {
             enabled_extensions.push(ash::ext::shader_atomic_float::NAME.as_ptr());
+        }
+        // Matrix multiply-add on the GPU's matrix units (guest HMMA).
+        let cooperative_matrix = supported_cooperative.cooperative_matrix != 0
+            && has(ash::khr::cooperative_matrix::NAME);
+        if cooperative_matrix {
+            enabled_extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
         }
 
         let features = vk::PhysicalDeviceFeatures::default()
@@ -350,6 +361,11 @@ impl Gpu {
         if float_atomic_add {
             device_info = device_info.push_next(&mut enable_atomic_float);
         }
+        let mut enable_cooperative =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        if cooperative_matrix {
+            device_info = device_info.push_next(&mut enable_cooperative);
+        }
         // SAFETY: every enabled feature was reported as supported.
         let device = unsafe { instance.create_device(physical, &device_info, None) }
             .map_err(vk_error("vkCreateDevice"))?;
@@ -371,6 +387,27 @@ impl Gpu {
             && s12.shader_sampled_image_array_non_uniform_indexing != 0)
             .then(|| texture_pool_layout(&device))
             .transpose()?;
+        let cooperative_matrix = if cooperative_matrix {
+            let functions = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            // SAFETY: a live physical device with the extension.
+            unsafe { functions.get_physical_device_cooperative_matrix_properties(physical) }
+                .unwrap_or_default()
+                .iter()
+                .map(|shape| CooperativeMatrixShape {
+                    m: shape.m_size,
+                    n: shape.n_size,
+                    k: shape.k_size,
+                    a: shape.a_type,
+                    b: shape.b_type,
+                    c: shape.c_type,
+                    result: shape.result_type,
+                    saturating: shape.saturating_accumulation != 0,
+                    scope: shape.scope,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             entry,
             instance,
@@ -385,6 +422,7 @@ impl Gpu {
             compute_subgroup_32,
             buffer_device_address,
             texture_pool_layout,
+            cooperative_matrix,
             host_import,
             dma_buf_import,
             mesh_shader,
@@ -519,6 +557,20 @@ impl Gpu {
             }
         }
     }
+}
+
+/// One shape the device's cooperative matrices multiply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CooperativeMatrixShape {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a: vk::ComponentTypeKHR,
+    pub b: vk::ComponentTypeKHR,
+    pub c: vk::ComponentTypeKHR,
+    pub result: vk::ComponentTypeKHR,
+    pub saturating: bool,
+    pub scope: vk::ScopeKHR,
 }
 
 /// Descriptors per texture pool array: NVN texture indices have 20 bits,

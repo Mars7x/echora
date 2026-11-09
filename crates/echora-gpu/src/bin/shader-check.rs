@@ -20,6 +20,9 @@ fn main() {
         }
     };
     println!("device: {}", gpu.name);
+    for shape in &gpu.cooperative_matrix {
+        println!("cooperative matrix: {shape:?}");
+    }
     // Captures carry no dispatch parameters; allow the most shared memory.
     let compute = Parameters {
         shared_memory_size: 0xc000,
