@@ -1234,6 +1234,10 @@ struct RegisterLocals {
     sp_used: bool,
     sp_written: bool,
     flags: bool,
+    /// With `EmitOptions::fp_status_locals`: FPCR and FPSR as locals
+    /// (used, written).
+    fpcr: (bool, bool),
+    fpsr: (bool, bool),
 }
 
 /// Helper calls that read general registers from the `Core`.
@@ -1291,7 +1295,15 @@ impl RegisterLocals {
                 || FLAG_OPERATIONS
                     .iter()
                     .any(|operation| cases.contains(&format!("m.cpu.{operation}"))),
+            fpcr: (false, false),
+            fpsr: (false, false),
         };
+        if FP_STATUS_LOCALS.get() {
+            for (field, place) in [("fpcr", &mut locals.fpcr), ("fpsr", &mut locals.fpsr)] {
+                let name = format!("m.cpu.{field}");
+                *place = (cases.contains(&name), cases.contains(&format!("{name} = ")));
+            }
+        }
         for (at, _) in cases.match_indices("m.cpu.regs[") {
             let rest = &cases[at + "m.cpu.regs[".len()..];
             let Some(end) = rest.find(']') else { continue };
@@ -1335,6 +1347,12 @@ impl RegisterLocals {
             fields.push_str("fl: cpu::Flags, ");
             values.push_str("fl: cpu::Flags { nzcv: m.cpu.nzcv }, ");
         }
+        for (field, (used, _)) in [("fpcr", self.fpcr), ("fpsr", self.fpsr)] {
+            if used {
+                write!(fields, "{field}: u32, ").unwrap();
+                write!(values, "{field}: m.cpu.{field}, ").unwrap();
+            }
+        }
         format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
     }
 
@@ -1348,6 +1366,29 @@ impl RegisterLocals {
         }
         if self.flags {
             text.push_str("    m.cpu.nzcv = r.fl.nzcv;\n");
+        }
+        text.push_str(&self.store_fp_status());
+        text
+    }
+
+    /// FPCR and FPSR stored into the `Cpu` where the window writes them.
+    fn store_fp_status(&self) -> String {
+        let mut text = String::new();
+        for (field, (_, written)) in [("fpcr", self.fpcr), ("fpsr", self.fpsr)] {
+            if written {
+                write!(text, "m.cpu.{field} = r.{field}; ").unwrap();
+            }
+        }
+        text
+    }
+
+    /// FPCR and FPSR reloaded from the `Cpu` where the window uses them.
+    fn reload_fp_status(&self) -> String {
+        let mut text = String::new();
+        for (field, (used, _)) in [("fpcr", self.fpcr), ("fpsr", self.fpsr)] {
+            if used {
+                write!(text, "r.{field} = m.cpu.{field}; ").unwrap();
+            }
         }
         text
     }
@@ -1363,6 +1404,7 @@ impl RegisterLocals {
         if self.flags {
             text.push_str("r.fl.nzcv = m.cpu.nzcv; ");
         }
+        text.push_str(&self.reload_fp_status());
         text
     }
 
@@ -1370,8 +1412,16 @@ impl RegisterLocals {
         let store = self.store().replace('\n', " ");
         let reload = self.reload();
         let mut text = String::with_capacity(cases.len());
+        let fp_status = self.fpcr.0 || self.fpsr.0;
+        let (store_fp, reload_fp) = (self.store_fp_status(), self.reload_fp_status());
         for line in cases.lines() {
             let mut line = line.replace("m.cpu.regs[", "x[");
+            if fp_status {
+                for field in ["fpcr", "fpsr"] {
+                    line = line.replace(&format!("m.cpu.{field}"), &format!("r.{field}"));
+                }
+                line = wrap_cpu_helpers(&line, &store_fp, &reload_fp);
+            }
             for index in &self.used {
                 line = line.replace(&format!("x[{index}]"), &format!("r.x{index}"));
             }
@@ -1420,6 +1470,71 @@ impl RegisterLocals {
             }
         }
         text
+    }
+}
+
+/// Each call in `line` that hands the `Cpu` to a helper (`&mut m.cpu`,
+/// `&m.cpu`), wrapped as a block that stores `store` first and, when the
+/// helper may write, runs `reload` after (also when it fails, so the
+/// window's final store keeps what it left). Only the call is wrapped: an
+/// inline fast path on the same line keeps its locals.
+fn wrap_cpu_helpers(line: &str, store: &str, reload: &str) -> String {
+    let mut text = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        // The earliest helper call left in the line: (start of the call,
+        // index of its opening parenthesis, whether it may write).
+        let found = [("(&mut m.cpu", true), ("(&m.cpu", false)]
+            .iter()
+            .filter_map(|&(pattern, writes)| {
+                let at = rest.find(pattern)?;
+                let (start, open) = if pattern.starts_with('(') {
+                    // Back over the helper's path to the start of its name.
+                    let start = rest[..at]
+                        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                        .map_or(0, |i| i + 1);
+                    (start, at)
+                } else {
+                    (at, at + pattern.len() - 1)
+                };
+                Some((start, open, writes))
+            })
+            .min_by_key(|&(start, _, _)| start);
+        let Some((start, open, writes)) = found else {
+            text.push_str(rest);
+            return text;
+        };
+        // The call's closing parenthesis.
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, c) in rest[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            text.push_str(rest);
+            return text;
+        };
+        let call = &rest[start..=close];
+        let question = rest[close + 1..].starts_with('?');
+        let after = if writes { reload } else { "" };
+        text.push_str(&rest[..start]);
+        if question {
+            write!(text, "{{ {store}let called = {call}; {after}called? }}").unwrap();
+            rest = &rest[close + 2..];
+        } else {
+            write!(text, "{{ {store}let called = {call}; {after}called }}").unwrap();
+            rest = &rest[close + 1..];
+        }
     }
 }
 
@@ -3232,6 +3347,11 @@ pub struct EmitOptions {
     /// operands and results a whole vector at a time
     /// (`crate::simd::set_whole_vector_checks`) instead of lane by lane.
     pub whole_vector_checks: bool,
+    /// Keep FPCR and FPSR in window locals, like the general registers:
+    /// stored and reloaded around each helper or call that takes the `Cpu`
+    /// (helpers read FPCR and raise FPSR flags), not reloaded after every
+    /// guest store.
+    pub fp_status_locals: bool,
 }
 
 thread_local! {
@@ -3267,6 +3387,26 @@ impl InlineVector {
 impl Drop for InlineVector {
     fn drop(&mut self) {
         INLINE_VECTOR.set(self.0);
+    }
+}
+
+thread_local! {
+    /// `EmitOptions::fp_status_locals` of the emission running on this thread.
+    static FP_STATUS_LOCALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FP_STATUS_LOCALS`] for as long as it lives.
+struct FpStatusLocals(bool);
+
+impl FpStatusLocals {
+    fn set(on: bool) -> Self {
+        Self(FP_STATUS_LOCALS.replace(on))
+    }
+}
+
+impl Drop for FpStatusLocals {
+    fn drop(&mut self) {
+        FP_STATUS_LOCALS.set(self.0);
     }
 }
 
@@ -3452,6 +3592,7 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options

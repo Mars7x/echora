@@ -25,6 +25,8 @@ fused-flags = []
 # With inline-vector: check inlined vector float operations a whole
 # vector at a time (EmitOptions::whole_vector_checks).
 whole-vector-checks = []
+# Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
+fp-status-locals = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

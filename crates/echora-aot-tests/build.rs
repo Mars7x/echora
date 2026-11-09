@@ -36,6 +36,7 @@ fn options() -> EmitOptions {
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
         fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
         whole_vector_checks: std::env::var_os("CARGO_FEATURE_WHOLE_VECTOR_CHECKS").is_some(),
+        fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
     }
 }
 
@@ -263,6 +264,7 @@ fn main() {
     // Lifted with fused flags whatever the features, outside the golden
     // hashes of the default emission.
     flag_code(&mut out);
+    fp_status_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -440,6 +442,76 @@ fn flag_code(out: &mut String) {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Programs for `tests/fp_status.rs`: FPCR and FPSR written with MSR, read
+/// with MRS, around float operations whose helpers raise FPSR flags, one
+/// program per window. Lifted twice: with `EmitOptions::fp_status_locals`
+/// (`fp_status_code`) and without (`fp_status_reference`).
+fn fp_status_code(out: &mut String) {
+    const BASE: u64 = 0x180_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let msr_fpcr = |rt: u32| 0xd51b_4400 | rt;
+    let msr_fpsr = |rt: u32| 0xd51b_4420 | rt;
+    let mrs_fpcr = |rt: u32| 0xd53b_4400 | rt;
+    let mrs_fpsr = |rt: u32| 0xd53b_4420 | rt;
+    const FADD_S: u32 = 0x1e22_2820; // FADD S0, S1, S2
+    const FMUL_S: u32 = 0x1e22_0820; // FMUL S0, S1, S2
+    const FADD_4S: u32 = 0x4e22_d420; // FADD V0.4S, V1.4S, V2.4S
+    const FMUL_4S: u32 = 0x6e22_dc20; // FMUL V0.4S, V1.4S, V2.4S
+    let programs: Vec<Vec<u32>> = vec![
+        vec![msr_fpsr(3), FADD_S, mrs_fpsr(4)],
+        vec![msr_fpsr(3), FADD_4S, mrs_fpsr(4)],
+        vec![msr_fpcr(5), FADD_S, mrs_fpcr(6), mrs_fpsr(4)],
+        vec![msr_fpcr(5), FMUL_4S, mrs_fpsr(4)],
+        vec![FADD_S, mrs_fpsr(4), msr_fpsr(3), FMUL_S, mrs_fpsr(7)],
+        vec![
+            msr_fpsr(3),
+            FADD_4S,
+            msr_fpcr(5),
+            FMUL_4S,
+            mrs_fpsr(4),
+            mrs_fpcr(6),
+        ],
+        vec![msr_fpsr(3), FADD_S],
+        vec![msr_fpcr(5), msr_fpsr(3), FMUL_4S],
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for program in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+        words.resize(words.len().next_multiple_of(256), SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "fp_status".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("fp_status");
+    for (name, locals) in [("fp_status_code", true), ("fp_status_reference", false)] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            fp_status_locals: locals,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
 }
 
 /// The benchmark kernels, lifted together through split emission (as real
