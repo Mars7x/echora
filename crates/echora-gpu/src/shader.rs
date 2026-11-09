@@ -53,7 +53,7 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
 }
 
 /// Whether HMMA translates to cooperative matrices: set when the device
-/// has the shapes (`Gpu::new`), unless ECHORA_HMMA=subgroup.
+/// has the shapes (`Gpu::new`) and ECHORA_HMMA=cooperative.
 static COOPERATIVE_MATRIX: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -69,9 +69,11 @@ pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) 
                 && shape.scope == ScopeKHR::SUBGROUP
         })
     };
+    // Opt-in (ECHORA_HMMA=cooperative): the first in-game run of these
+    // programs on RADV 25.2 under 32-lane subgroups lost the device.
     let on = has(T::FLOAT16)
         && has(T::FLOAT32)
-        && std::env::var("ECHORA_HMMA").as_deref() != Ok("subgroup");
+        && std::env::var("ECHORA_HMMA").as_deref() == Ok("cooperative");
     COOPERATIVE_MATRIX.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
