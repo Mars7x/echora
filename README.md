@@ -133,15 +133,18 @@ together.
 - Linux
 - Your own dump of the game (update 1.1.1), as a NUP file or a folder
 - A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
-- Rust 1.88 or newer, `git`, C and C++ compilers, NASM and these system
-  libraries:
+- Rust 1.88 or newer, `git`, a C compiler, NASM, `pkg-config` and these
+  system libraries:
 
 ```sh
 # Ubuntu
-sudo apt install build-essential nasm libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
+sudo apt install build-essential nasm pkg-config libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev
 # Fedora
-sudo dnf install gcc gcc-c++ nasm alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel libxcb-devel vulkan-loader-devel
+sudo dnf install gcc nasm pkgconf-pkg-config alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
 ```
+
+The C compiler and NASM are for the system libraries' bindings and the
+AV1 video decoder; Echora's own code is all Rust.
 
 ### Getting started
 
@@ -154,6 +157,8 @@ target/release/echora-launcher
 
 Choose your game and press Play. The first start translates and builds the
 whole game, which takes about an hour. After that it starts straight away.
+While the shader translator is being replaced, a run stops at the first
+shader it can't translate yet (see [Status](#status)).
 
 ## Documentation
 
