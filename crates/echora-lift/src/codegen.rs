@@ -1554,7 +1554,20 @@ fn emit_instruction_body(
             sets_pc = true;
         }
         BranchCond { target, condition } => {
-            writeln!(output, "                {successor} = if m.cpu.condition({condition}) {{ {target:#x} }} else {{ {next:#x} }};").unwrap();
+            // Fused: the flag setter before it computed the condition.
+            let test = if FUSE
+                .get()
+                .is_some_and(|(setter, _)| setter + 4 == record.pc)
+            {
+                "fused".to_string()
+            } else {
+                format!("m.cpu.condition({condition})")
+            };
+            writeln!(
+                output,
+                "                {successor} = if {test} {{ {target:#x} }} else {{ {next:#x} }};"
+            )
+            .unwrap();
             sets_pc = true;
         }
         CompareBranch {
@@ -1624,7 +1637,11 @@ fn emit_instruction_body(
             subtract,
             flags,
         } => {
-            writeln!(output, "                let lhs = {};\n                let value = m.cpu.add_sub(lhs, {immediate:#x}, {subtract}, {bits}, {flags});", reg(*rn, *bits, true)).unwrap();
+            if let Some((_, condition)) = FUSE.get().filter(|(setter, _)| *setter == record.pc) {
+                writeln!(output, "                let lhs = {};\n                let rhs = {immediate:#x}u64;\n                let value = m.cpu.add_sub(lhs, rhs, {subtract}, {bits}, false);\n                let fused = {};", reg(*rn, *bits, true), fused_condition(Some(*subtract), *bits, condition)).unwrap();
+            } else {
+                writeln!(output, "                let lhs = {};\n                let value = m.cpu.add_sub(lhs, {immediate:#x}, {subtract}, {bits}, {flags});", reg(*rn, *bits, true)).unwrap();
+            }
             put(output, *rd, *bits, !flags, "value");
         }
         AddSubShifted {
@@ -1637,7 +1654,16 @@ fn emit_instruction_body(
             subtract,
             flags,
         } => {
-            writeln!(output, "                let lhs = {};\n                let rhs = {};\n                let value = m.cpu.add_sub(lhs, rhs, {subtract}, {bits}, {flags});", reg(*rn, *bits, false), shifted(reg(*rm, *bits, false), *shift, *amount, *bits)).unwrap();
+            let fused = FUSE.get().filter(|(setter, _)| *setter == record.pc);
+            writeln!(output, "                let lhs = {};\n                let rhs = {};\n                let value = m.cpu.add_sub(lhs, rhs, {subtract}, {bits}, {});", reg(*rn, *bits, false), shifted(reg(*rm, *bits, false), *shift, *amount, *bits), *flags && fused.is_none()).unwrap();
+            if let Some((_, condition)) = fused {
+                writeln!(
+                    output,
+                    "                let fused = {};",
+                    fused_condition(Some(*subtract), *bits, condition)
+                )
+                .unwrap();
+            }
             put(output, *rd, *bits, false, "value");
         }
         AddSubExtended {
@@ -1650,7 +1676,16 @@ fn emit_instruction_body(
             subtract,
             flags,
         } => {
-            writeln!(output, "                let lhs = {};\n                let rhs = cpu::extend({}, {option}, {amount});\n                let value = m.cpu.add_sub(lhs, rhs, {subtract}, {bits}, {flags});", reg(*rn, *bits, true), reg(*rm, 64, false)).unwrap();
+            let fused = FUSE.get().filter(|(setter, _)| *setter == record.pc);
+            writeln!(output, "                let lhs = {};\n                let rhs = cpu::extend({}, {option}, {amount});\n                let value = m.cpu.add_sub(lhs, rhs, {subtract}, {bits}, {});", reg(*rn, *bits, true), reg(*rm, 64, false), *flags && fused.is_none()).unwrap();
+            if let Some((_, condition)) = fused {
+                writeln!(
+                    output,
+                    "                let fused = {};",
+                    fused_condition(Some(*subtract), *bits, condition)
+                )
+                .unwrap();
+            }
             put(output, *rd, *bits, !flags, "value");
         }
         AddCarry {
@@ -1676,11 +1711,19 @@ fn emit_instruction_body(
         } => {
             writeln!(output, "                let lhs = {};\n                let rhs = {}({});\n                let value = {};", reg(*rn, *bits, false), if *invert { "!" } else { "" }, shifted(reg(*rm, *bits, false), *shift, *amount, *bits), logical(*op, "lhs", "rhs")).unwrap();
             if *op == LogicalOp::Ands {
-                writeln!(
-                    output,
-                    "                m.cpu.logical_flags(value, {bits});"
-                )
-                .unwrap();
+                match FUSE.get().filter(|(setter, _)| *setter == record.pc) {
+                    Some((_, condition)) => writeln!(
+                        output,
+                        "                let fused = {};",
+                        fused_condition(None, *bits, condition)
+                    )
+                    .unwrap(),
+                    None => writeln!(
+                        output,
+                        "                m.cpu.logical_flags(value, {bits});"
+                    )
+                    .unwrap(),
+                }
             }
             put(output, *rd, *bits, false, "value");
         }
@@ -1698,11 +1741,19 @@ fn emit_instruction_body(
             )
             .unwrap();
             if *op == LogicalOp::Ands {
-                writeln!(
-                    output,
-                    "                m.cpu.logical_flags(value, {bits});"
-                )
-                .unwrap();
+                match FUSE.get().filter(|(setter, _)| *setter == record.pc) {
+                    Some((_, condition)) => writeln!(
+                        output,
+                        "                let fused = {};",
+                        fused_condition(None, *bits, condition)
+                    )
+                    .unwrap(),
+                    None => writeln!(
+                        output,
+                        "                m.cpu.logical_flags(value, {bits});"
+                    )
+                    .unwrap(),
+                }
             }
             put(output, *rd, *bits, *op != LogicalOp::Ands, "value");
         }
@@ -2548,6 +2599,7 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
         output.push_str("                m.spin_hint();\n");
     }
     let count = block.instructions.len();
+    let fuse = FUSE.replace(fusion(block));
     for (index, instruction) in block.instructions.iter().enumerate() {
         let block_size = (index == 0).then_some(count);
         emit_instruction(
@@ -2558,6 +2610,7 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
             check_entry,
         );
     }
+    FUSE.set(fuse);
 }
 
 /// The blocks structured emission lets execution resume at, so the only
@@ -3169,6 +3222,12 @@ pub struct EmitOptions {
     /// code instead of helper calls (`crate::simd::emit_inline`), with the
     /// exact helper still taking every float case its fast path would not.
     pub inline_vector: bool,
+    /// Fuse a flag-setting ADD/SUB (CMP, CMN) or ANDS (TST) with the B.cond
+    /// right after it when NZCV is dead at the end of their block
+    /// (`crate::liveness`): the branch tests the operands directly and NZCV
+    /// is not computed. Where it is dead, nothing reads it before it is
+    /// written again, so no guest-visible state changes.
+    pub fused_flags: bool,
 }
 
 thread_local! {
@@ -3190,6 +3249,139 @@ impl Drop for InlineVector {
     fn drop(&mut self) {
         INLINE_VECTOR.set(self.0);
     }
+}
+
+thread_local! {
+    /// With `EmitOptions::fused_flags`: the registers and flags live at the
+    /// end of each block (by block start) of the emission on this thread.
+    static FUSED_FLAGS: std::cell::RefCell<Option<BTreeMap<u64, crate::defuse::Regs>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The block being emitted fuses the flag setter at this PC with the
+    /// B.cond after it, which tests this condition.
+    static FUSE: std::cell::Cell<Option<(u64, u8)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets [`FUSED_FLAGS`] for as long as it lives.
+struct FusedFlags(Option<BTreeMap<u64, crate::defuse::Regs>>);
+
+impl FusedFlags {
+    fn set(live_out: Option<BTreeMap<u64, crate::defuse::Regs>>) -> Self {
+        Self(FUSED_FLAGS.replace(live_out))
+    }
+}
+
+impl Drop for FusedFlags {
+    fn drop(&mut self) {
+        FUSED_FLAGS.set(self.0.take());
+    }
+}
+
+/// The flag setter and condition `block` fuses, if any: its last two
+/// instructions are a fusable flag setter and a B.cond, and NZCV is dead
+/// at its end.
+fn fusion(block: &BasicBlock) -> Option<(u64, u8)> {
+    use Instruction::*;
+    let count = block.instructions.len();
+    if count < 2 {
+        return None;
+    }
+    let BranchCond { condition, .. } = block.instructions[count - 1].instruction else {
+        return None;
+    };
+    let setter = &block.instructions[count - 2];
+    let fusable = match setter.instruction {
+        AddSubImmediate { flags, .. }
+        | AddSubShifted { flags, .. }
+        | AddSubExtended { flags, .. } => flags,
+        LogicalShifted { op, .. } | LogicalImmediate { op, .. } => op == LogicalOp::Ands,
+        _ => false,
+    };
+    if !fusable || condition >= 14 {
+        return None;
+    }
+    FUSED_FLAGS.with_borrow(|live| {
+        let live = live.as_ref()?.get(&block.start)?;
+        (!live.nzcv).then_some((setter.pc, condition))
+    })
+}
+
+/// The B.cond condition `condition` as a Rust expression over the flag
+/// setter's `lhs`, `rhs` and `value` (`Some(subtract)` for ADD/SUB) or
+/// over `value` alone (ANDS: C and V are clear).
+fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String {
+    let mask = if bits == 32 {
+        "0xffff_ffffu64"
+    } else {
+        "u64::MAX"
+    };
+    let sign = bits - 1;
+    let signed = |name: &str| {
+        if bits == 32 {
+            format!("({name} as u32 as i32)")
+        } else {
+            format!("({name} as i64)")
+        }
+    };
+    let invert = condition & 1 != 0;
+    let base = condition >> 1;
+    let test = match arithmetic {
+        // SUB (CMP): direct comparisons of the operands.
+        Some(true) => {
+            let compare = |op: &str, signed_compare: bool| {
+                if signed_compare {
+                    format!("{} {op} {}", signed("a"), signed("b"))
+                } else {
+                    format!("a {op} b")
+                }
+            };
+            // (condition, inverted condition)
+            let (taken, not_taken) = match base {
+                0 => (compare("==", false), compare("!=", false)),
+                1 => (compare(">=", false), compare("<", false)),
+                2 => (
+                    format!("(v >> {sign}) & 1 != 0"),
+                    format!("(v >> {sign}) & 1 == 0"),
+                ),
+                3 => (
+                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 != 0"),
+                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 == 0"),
+                ),
+                4 => (compare(">", false), compare("<=", false)),
+                5 => (compare(">=", true), compare("<", true)),
+                _ => (compare(">", true), compare("<=", true)),
+            };
+            let expression = if invert { not_taken } else { taken };
+            return format!(
+                "{{ let a = lhs & {mask}; let b = rhs & {mask}; let v = value & {mask}; let _ = v; {expression} }}"
+            );
+        }
+        // ADD (CMN): the flags as AddWithCarry sets them.
+        Some(false) => format!(
+            "let a = lhs & {mask}; let b = rhs & {mask}; let v = value & {mask}; \
+             let n = (v >> {sign}) & 1 != 0; let z = v == 0; let c = v < a; \
+             let o = (!(a ^ b) & (a ^ v)) >> {sign} & 1 != 0;"
+        ),
+        // ANDS (TST): N and Z from the result, C and V clear.
+        None => format!(
+            "let v = value & {mask}; let n = (v >> {sign}) & 1 != 0; let z = v == 0; \
+             let c = false; let o = false;"
+        ),
+    };
+    let expression = match base {
+        0 => "z",
+        1 => "c",
+        2 => "n",
+        3 => "o",
+        4 => "c && !z",
+        5 => "n == o",
+        _ => "!z && n == o",
+    };
+    let expression = if invert {
+        format!("!({expression})")
+    } else {
+        expression.to_string()
+    };
+    format!("{{ {test} let _ = (n, z, c, o); {expression} }}")
 }
 
 /// Split emission: one library source per region of `1 << region_bits` guest
@@ -3241,6 +3433,11 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _fused_flags = FusedFlags::set(
+        options
+            .fused_flags
+            .then(|| crate::liveness::live_out(translation)),
+    );
     let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
         // Every block execution can resume at is an entry of its tree, so
         // the tree is the window's only copy of its code.

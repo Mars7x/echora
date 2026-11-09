@@ -25,7 +25,8 @@ thread_local! {
 }
 
 /// Codegen options: common vector operations as native code with the
-/// `inline-vector` feature, structured emission with `structured`.
+/// `inline-vector` feature, structured emission with `structured`, flag
+/// setters fused with their B.cond with `fused-flags`.
 fn options() -> EmitOptions {
     if let Some(mode) = MODE.get() {
         return mode;
@@ -33,6 +34,7 @@ fn options() -> EmitOptions {
     EmitOptions {
         inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
+        fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
     }
 }
 
@@ -257,6 +259,9 @@ fn main() {
     module(&mut out, "sharded_hole", &emit_rust(&translation));
 
     split_programs(&mut out);
+    // Lifted with fused flags whatever the features, outside the golden
+    // hashes of the default emission.
+    flag_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -264,6 +269,176 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
         codesize(&out_dir);
     }
+}
+
+/// Programs for `tests/fused_flags.rs`, one per 1 KiB window: a flag setter,
+/// a B.cond, and successors that either overwrite NZCV before reading it
+/// (so the pair fuses with `EmitOptions::fused_flags`) or read it in a way
+/// that must keep it: a CSEL in a successor, the SVC that ends the
+/// program, a CCMP before the branch or in a successor, and an indirect
+/// branch to a block that reads it. Lifted with fused flags on; `FUSED`
+/// says, per program, whether it should fuse and whether it did.
+fn flag_code(out: &mut String) {
+    const BASE: u64 = 0x140_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    // ADDS X12, X12, #0: writes NZCV (and X12, unchanged).
+    const KILL: u32 = 0xb100_018c;
+    const MARK_NOT_TAKEN: u32 = 0xd280_002b; // MOVZ X11, #1
+    const MARK_TAKEN: u32 = 0xd280_004b; // MOVZ X11, #2
+    let setters: &[u32] = &[
+        0xeb02_0023, // SUBS X3, X1, X2
+        0x6b02_0023, // SUBS W3, W1, W2
+        0xf100_143f, // CMP X1, #5
+        0x7100_143f, // CMP W1, #5
+        0xb100_143f, // CMN X1, #5
+        0x3100_143f, // CMN W1, #5
+        0xab02_0023, // ADDS X3, X1, X2
+        0x2b02_0023, // ADDS W3, W1, W2
+        0xeb22_4023, // SUBS X3, X1, W2, UXTW
+        0x6b22_0023, // SUBS W3, W1, W2, UXTB
+        0xea02_0023, // ANDS X3, X1, X2
+        0x6a02_0023, // ANDS W3, W1, W2
+        0xf240_003f, // TST X1, #1
+        0x7201_003f, // TST W1, #0x80000000
+        0xf240_1c3f, // TST X1, #0xff
+    ];
+    let b_cond = |from: u64, to: u64, condition: u32| {
+        0x5400_0000 | ((((to - from) / 4) as u32 & 0x7ffff) << 5) | condition
+    };
+    let b = |from: u64, to: u64| 0x1400_0000 | (((to - from) / 4) as u32 & 0x3ff_ffff);
+    let adr = |from: u64, to: u64, rd: u32| {
+        let offset = to.wrapping_sub(from) as u32;
+        0x1000_0000 | ((offset & 3) << 29) | (((offset >> 2) & 0x7ffff) << 5) | rd
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    // (entry, should fuse)
+    let mut programs: Vec<(u64, bool)> = Vec::new();
+    let mut add = |kind: u32, setter: u32, condition: u32| {
+        let start = BASE + 4 * words.len() as u64;
+        let at = |index: u64| start + 4 * index;
+        let mut program = vec![0u32; 16];
+        // Taken: 9 onwards; the exit at 15.
+        let taken = at(9);
+        let exit = at(15);
+        program[9] = MARK_TAKEN;
+        program[10] = KILL;
+        program[11] = b(at(11), exit);
+        program[15] = SVC_EXIT;
+        let fuses = match kind {
+            // Both successors overwrite NZCV first: fuses.
+            0 => {
+                program[0] = setter;
+                program[1] = b_cond(at(1), taken, condition);
+                program[2] = MARK_NOT_TAKEN;
+                program[3] = KILL;
+                program[4] = b(at(4), exit);
+                true
+            }
+            // A successor reads NZCV (CSEL X11, X1, X2, LT).
+            1 => {
+                program[0] = setter;
+                program[1] = b_cond(at(1), taken, condition);
+                program[2] = 0x9a82_b02b;
+                program[3] = b(at(3), exit);
+                false
+            }
+            // The program ends at a successor: NZCV is what it leaves.
+            2 => {
+                program[0] = setter;
+                program[1] = b_cond(at(1), taken, condition);
+                program[2] = SVC_EXIT;
+                program[9] = SVC_EXIT;
+                false
+            }
+            // A CCMP between the setter and the branch.
+            3 => {
+                program[0] = setter;
+                program[1] = 0xfa44_1065; // CCMP X3, X4, #5, NE
+                program[2] = b_cond(at(2), taken, condition);
+                program[3] = MARK_NOT_TAKEN;
+                program[4] = KILL;
+                program[5] = b(at(5), exit);
+                false
+            }
+            // A CCMP in a successor reads NZCV.
+            4 => {
+                program[0] = setter;
+                program[1] = b_cond(at(1), taken, condition);
+                program[2] = 0xfa44_1065; // CCMP X3, X4, #5, NE
+                program[3] = b(at(3), exit);
+                false
+            }
+            // An indirect branch from a successor to a block that reads
+            // NZCV (CSEL X11, X1, X2, GE): it must stay.
+            _ => {
+                program[0] = setter;
+                program[1] = b_cond(at(1), taken, condition);
+                program[2] = adr(at(2), at(6), 24);
+                program[3] = 0xd61f_0300; // BR X24
+                program[6] = 0x9a82_a02b;
+                program[7] = b(at(7), exit);
+                entries.push(at(6));
+                false
+            }
+        };
+        words.extend_from_slice(&program);
+        // One program per 1 KiB window.
+        words.resize(words.len().next_multiple_of(256), SVC_EXIT);
+        entries.push(start);
+        programs.push((start, fuses));
+    };
+    for condition in 0..14 {
+        for &setter in setters {
+            add(0, setter, condition);
+        }
+    }
+    for kind in 1..6 {
+        for condition in [0, 1, 2, 5, 8, 11, 12] {
+            for &setter in &[setters[0], setters[3], setters[6], setters[11]] {
+                add(kind, setter, condition);
+            }
+        }
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "flags".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &entries, words.len() + 16).expect("flags");
+    let options = EmitOptions {
+        fused_flags: true,
+        ..options()
+    };
+    let (root, regions) = split(&translation, options);
+    // Whether each program's window fused its pair.
+    let fused: Vec<(u64, bool, bool)> = programs
+        .iter()
+        .map(|&(entry, expected)| {
+            let window = entry >> 10;
+            let function = format!("fn run_window_{window:x}(");
+            let source = regions
+                .iter()
+                .map(|(_, source)| source.as_str())
+                .find(|source| source.contains(&function))
+                .expect("the program's window");
+            let start = source.find(&function).expect("found above");
+            let end = source[start + 1..]
+                .find("fn run_window_")
+                .map_or(source.len(), |end| start + 1 + end);
+            (entry, expected, source[start..end].contains("let fused = "))
+        })
+        .collect();
+    writeln!(out, "pub mod flag_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "/// (entry, should fuse, fused)").expect("write");
+    writeln!(out, "pub const FUSED: &[(u64, bool, bool)] = &{fused:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
 }
 
 /// The benchmark kernels, lifted together through split emission (as real

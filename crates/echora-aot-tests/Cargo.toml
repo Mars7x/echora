@@ -19,6 +19,9 @@ inline-vector = []
 structured = ["structured-kernels"]
 # Only the benchmark kernels, for measuring.
 structured-kernels = []
+# Lift every program with flag setters fused with their B.cond where NZCV
+# is dead after the block (EmitOptions::fused_flags).
+fused-flags = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
