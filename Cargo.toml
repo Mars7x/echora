@@ -15,6 +15,7 @@ members = [
     "crates/echora-nup",
     "crates/echora-resolution",
     "crates/echora-runtime",
+    "crates/echora-shader",
     "crates/echora-shader-abi",
     "crates/echora-simd",
 ]

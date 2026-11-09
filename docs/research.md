@@ -33,6 +33,8 @@ NUP reference tool (`a55uka/nup` `d40d9cf`).
 | [seedds/nxnative](https://github.com/seedds/nxnative) | MIT | NSO rewriter, Horizon HLE host, NVN→Metal, AV1 backend; PRs #599 (clock_gettime ifunc), #1283 (socket event counters). | Reference for SDK 22 behavior and the Metal backend. |
 | [LNPANDY/NX2Apple](https://github.com/LNPANDY/NX2Apple) | MIT | Packaging front end for nxnative-style builds. | Not needed now. |
 | [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine), [zortos293/Lichii](https://github.com/zortos293/Lichii) | GPL-3.0 | Switch 2 emulators; OoT issues Lichii #87, #112, Eglantine #567 cover WaitForAddress type 3, mesh/task pipelines, Ampere shader forms (`TLD4.SCR`). | License-compatible; consult for shader and SVC semantics when reached. |
+| [zortos293/Lichii](https://github.com/zortos293/Lichii) `c215653` Ampere front end | GPL-3.0-or-later | Decodes the Ampere forms the game uses (its lowering to Maxwell). | The main reference for `echora-shader`'s decoder: encodings and semantics only; the architecture is Echora's own (see docs/shader-translator.md). |
+| Mesa NAK (`src/nouveau/compiler`) | MIT | Ampere encoder with clean bit layouts. | Second reference for `echora-shader`; gitlab.freedesktop.org is not reachable from the cloud sessions yet. |
 | [kinnay/zbic](https://github.com/kinnay/zbic) `11b08f2` | GPLv2-only | ZBIC compression (zstd variant introduced with Switch firmware 22.0.0), bundling Atmosphère's zstd sources. | Used only to learn the format; no code taken. Echora's decoder is an independent transcoder (see below). |
 | zeldaret/oot, Shipwright, Zelda64Recomp | various | N64 decompilation and ports. | Gameplay knowledge only; no code or execution design transfers. |
 

@@ -54,6 +54,16 @@ When `ECHORA_SHADER_SRC` is set, `echora-gpu` compiles sources fetched by
 | [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) | vulkan-sdk-1.4.341.0 | MIT-style (Khronos) |
 | Boost headers | 1.91.0 | BSL-1.0 |
 
+## Sources of facts
+
+`crates/echora-shader` decodes Ampere instructions with encodings learned
+from these projects; no code is taken from them:
+
+| Source | Used for | License |
+|---|---|---|
+| [Lichii](https://github.com/zortos293/Lichii) `c215653`, `src/shader_recompiler/frontend/ampere` | Ampere instruction encodings and semantics | GPL-3.0-or-later |
+| Mesa's NAK (`src/nouveau/compiler`) | Ampere bit layouts (planned) | MIT |
+
 GPL-3.0 section 13 permits combining with AGPL-3.0 code. A binary built
 with the shader library carries the AGPL terms for the sirit part,
 including its network-interaction clause.
