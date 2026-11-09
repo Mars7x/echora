@@ -118,6 +118,11 @@ pub struct Instruction {
     pub raw: u128,
     pub guard: Pred,
     pub op: Op,
+    /// A uniform-datapath instruction: its registers are uniform
+    /// registers (63 is URZ) and its predicates, guard included, uniform
+    /// predicates (7 is UPT). Its operation is decoded as the per-thread
+    /// form it mirrors.
+    pub uniform: bool,
 }
 
 /// The operations decoded so far. Field names follow the SASS operands:
@@ -401,7 +406,13 @@ pub enum Op {
         accumulate: Pred,
         extended: Option<Pred>,
     },
-    /// S2R d, special register (the Maxwell numbering: 0 lane id, 33-35
+    /// R2UR d, src: a register's value (the first active invocation's)
+    /// into a uniform register.
+    R2ur {
+        d: UniformReg,
+        src: Reg,
+    },
+    /// S2R d, special register (S2UR: into a uniform register) (the Maxwell numbering: 0 lane id, 33-35
     /// thread id x/y/z, 37-39 workgroup id x/y/z, ...).
     S2r {
         d: Reg,
@@ -616,12 +627,38 @@ impl Word {
 pub fn decode(raw: u128) -> Instruction {
     let word = Word(raw);
     let opcode = word.bits(0, 12) as u16;
-    let op = decode_op(word, opcode).unwrap_or(Op::Unknown { opcode });
+    let (op, uniform) = match uniform_mirror(opcode) {
+        Some(mirror) => (decode_op(word, mirror), true),
+        None => (decode_op(word, opcode), matches!(opcode, 0xab9 | 0x9c3)),
+    };
     Instruction {
         raw,
         guard: word.pred(12, 15),
-        op,
+        op: op.unwrap_or(Op::Unknown { opcode }),
+        uniform,
     }
+}
+
+/// The per-thread opcode a uniform-datapath opcode mirrors, for the forms
+/// that operate on uniform registers alone (register, and an immediate in
+/// the second or third source; UMOV also from a uniform register).
+fn uniform_mirror(opcode: u16) -> Option<u16> {
+    let form = opcode >> 9;
+    let operation = opcode & 0x1ff;
+    let mirrored = match operation {
+        0x082 => matches!(form, 4 | 6),
+        0x087 | 0x08c | 0x090 | 0x091 | 0x092 | 0x096 | 0x099 | 0x09a | 0x0a4 | 0x0a5 => {
+            matches!(form, 1 | 2 | 4)
+        }
+        _ => opcode == 0x89c,
+    };
+    mirrored.then(|| {
+        if opcode == 0x89c {
+            0x81c
+        } else {
+            form << 9 | (operation - 0x080)
+        }
+    })
 }
 
 /// Decodes the instructions of a program (16 bytes each; a trailing
@@ -639,7 +676,13 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
     let form = word.form();
     // Operations whose bits 9-11 are not an ALU form match all 12 bits.
     match opcode {
-        0x919 => {
+        0x3c2 => {
+            return Some(Op::R2ur {
+                d: UniformReg(word.bits(16, 6) as u8),
+                src: word.reg(24),
+            });
+        }
+        0x919 | 0x9c3 => {
             return Some(Op::S2r {
                 d,
                 special: word.bits(72, 8) as u8,

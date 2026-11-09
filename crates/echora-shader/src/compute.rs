@@ -187,6 +187,8 @@ struct Emitter {
     registers: BTreeMap<u8, u32>,
     predicates: BTreeMap<u8, u32>,
     uniform_registers: BTreeMap<u8, u32>,
+    /// Whether the instruction being translated is a uniform one.
+    uniform: bool,
     /// The 64-bit integer type, declared (with the Int64 capability) on
     /// first use.
     u64: Option<u32>,
@@ -235,6 +237,7 @@ impl Emitter {
             registers: BTreeMap::new(),
             predicates: BTreeMap::new(),
             uniform_registers: BTreeMap::new(),
+            uniform: false,
             u64: None,
             layout: *layout,
             memory: memory::Memory::default(),
@@ -297,7 +300,10 @@ impl Emitter {
         variable
     }
 
+    /// The variable of predicate `n`, in the uniform file (kept as 8-15)
+    /// for a uniform instruction.
     fn predicate_variable(&mut self, n: u8) -> u32 {
+        let n = if self.uniform { n + 8 } else { n };
         if let Some(&variable) = self.predicates.get(&n) {
             return variable;
         }
@@ -309,7 +315,18 @@ impl Emitter {
         variable
     }
 
+    /// Whether register `n` is the zero register (RZ, or URZ in a uniform
+    /// instruction).
+    fn zero_register(&self, n: u8) -> bool {
+        if self.uniform { n >= 63 } else { n == 255 }
+    }
+
+    /// Register `n`: a general register, or a uniform register in a
+    /// uniform instruction.
     fn read_register(&mut self, n: u8) -> u32 {
+        if self.uniform {
+            return self.read_uniform(n.min(63));
+        }
         if n == 255 {
             return self.constant(0);
         }
@@ -318,7 +335,9 @@ impl Emitter {
     }
 
     fn write_register(&mut self, n: u8, value: u32) {
-        if n != 255 {
+        if self.uniform {
+            self.write_uniform(n.min(63), value);
+        } else if n != 255 {
             let variable = self.register(n);
             self.function.emit(op::STORE, &[variable, value]);
         }
@@ -420,7 +439,7 @@ impl Emitter {
 
     /// Registers n:n+1 as a 64-bit value (RZ reads zero).
     fn read_pair(&mut self, n: u8) -> u32 {
-        if n == 255 {
+        if self.zero_register(n) {
             return self.constant64(0);
         }
         let low = self.read_register(n);
@@ -429,7 +448,7 @@ impl Emitter {
     }
 
     fn write_pair(&mut self, n: u8, value: u32) {
-        if n == 255 {
+        if self.zero_register(n) {
             return;
         }
         let (low, high) = self.split(value);
@@ -598,10 +617,14 @@ impl Emitter {
         Ok(variable)
     }
 
-    /// The word at byte `offset` of constant bank `bank`.
+    /// The word at byte `offset` of constant bank `bank`. Banks past the
+    /// 18 a program can bind are never bound and read zero.
     fn constant_word(&mut self, bank: u8, offset: u16) -> Result<u32, String> {
         if !offset.is_multiple_of(4) {
             return Err(format!("unaligned constant c[{bank}][{offset:#x}]"));
+        }
+        if usize::from(bank) >= self.cbuf_used_sizes.len() {
+            return Ok(self.constant(0));
         }
         let variable = self.bank(bank)?;
         let used = &mut self.cbuf_used_sizes[usize::from(bank)];
@@ -730,7 +753,10 @@ impl Emitter {
 
     fn instruction(&mut self, index: usize, instruction: &Instruction) -> Result<(), Unsupported> {
         let op = instruction.op;
-        self.guarded(instruction.guard, |e| e.operation(index, op))
+        self.uniform = instruction.uniform;
+        let result = self.guarded(instruction.guard, |e| e.operation(index, op));
+        self.uniform = false;
+        result
     }
 
     fn operation(&mut self, index: usize, op: Op) -> Result<(), Unsupported> {
@@ -850,12 +876,22 @@ impl Emitter {
                 accumulate,
                 extended,
             } => {
-                if extended.is_some() {
-                    return Err(unsupported(index, "64-bit ISETP (.EX)"));
-                }
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
-                let result = self.int_compare(compare, signed, a, b);
+                let mut result = self.int_compare(compare, signed, a, b);
+                // .EX: the high words decide unless equal, then the low
+                // words' result does.
+                if let Some(low) = extended
+                    && !matches!(compare, IntCompare::False | IntCompare::True)
+                {
+                    let equal = self.value(op::I_EQUAL, self.bool, &[a, b]);
+                    let low = self.read_predicate(low);
+                    result = self.value(op::SELECT, self.bool, &[equal, low, result]);
+                }
                 self.set_predicates(p, q, result, combine, accumulate);
+            }
+            Op::R2ur { d, src } => {
+                let value = self.read_register(src.0);
+                self.write_uniform(d.0.min(63), value);
             }
             Op::S2r { d, special } => {
                 // Thread id (33-35) and workgroup id (37-39), as on Maxwell.
@@ -1189,7 +1225,7 @@ impl Emitter {
                 }
                 let zero = self.constant(0);
                 self.write_register(d.0, zero);
-                if wide && d.0 != 255 {
+                if wide && !self.zero_register(d.0) {
                     self.write_register(d.0.saturating_add(1), zero);
                 }
             }
@@ -1209,6 +1245,16 @@ impl Emitter {
                     5 => 2,
                     _ => return Err(unsupported(index, format!("LDC size {size}"))),
                 };
+                if usize::from(bank) >= self.cbuf_used_sizes.len() {
+                    // A bank that is never bound reads zero.
+                    let zero = self.constant(0);
+                    for n in 0..words {
+                        if !self.zero_register(d.0) {
+                            self.write_register(d.0.saturating_add(n as u8), zero);
+                        }
+                    }
+                    return Ok(());
+                }
                 let variable = self
                     .bank(bank)
                     .map_err(|reason| unsupported(index, reason))?;
@@ -1220,7 +1266,7 @@ impl Emitter {
                 let address = self.value(op::I_ADD, self.u32, &[base, offset]);
                 let values = self.bank_words(variable, address, words);
                 for (n, value) in values.into_iter().enumerate() {
-                    if d.0 != 255 {
+                    if !self.zero_register(d.0) {
                         self.write_register(d.0.saturating_add(n as u8), value);
                     }
                 }
@@ -2111,6 +2157,71 @@ mod tests {
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
         let missing = translate(&code, &Layout::workgroup([64, 1, 1])).unwrap_err();
         assert!(missing.reason.contains("shared memory size"));
+    }
+
+    #[test]
+    fn uniform_instructions_use_the_uniform_files() {
+        let words = [
+            // S2UR UR4, SR_CTAID.X; UIADD3 UR5, UR4, 0x10, URZ
+            word(&[(0, 12, 0x9c3), (16, 8, 4), (72, 8, 37)]),
+            word(&[
+                (0, 12, 0x890),
+                (16, 8, 5),
+                (24, 8, 4),
+                (32, 32, 0x10),
+                (64, 8, 63),
+                (77, 3, 7),
+                (81, 3, 7),
+                (84, 3, 7),
+                (87, 3, 7),
+                (91, 1, 1),
+            ]),
+            // UISETP.GE.U32.AND UP0, UPT, UR5, 0x20, UPT
+            word(&[
+                (0, 12, 0x88c),
+                (24, 8, 5),
+                (32, 32, 0x20),
+                (76, 3, 6),
+                (81, 3, 0),
+                (84, 3, 7),
+                (87, 3, 7),
+                (91, 1, 1),
+            ]),
+            // @UP0 UMOV UR6, 0x1; USEL UR7, UR6, UR5, UP0
+            word(&[(0, 12, 0x882), (12, 4, 0), (16, 8, 6), (32, 32, 1)]),
+            word(&[
+                (0, 12, 0x287),
+                (16, 8, 7),
+                (24, 8, 6),
+                (32, 8, 5),
+                (87, 3, 0),
+                (91, 1, 1),
+            ]),
+            // R2UR UR8, R1; MOV R2, UR7; MOV R3, UR8
+            word(&[(0, 12, 0x3c2), (16, 8, 8), (24, 8, 1)]),
+            word(&[(0, 12, 0xc02), (16, 8, 2), (32, 6, 7)]),
+            word(&[(0, 12, 0xc02), (16, 8, 3), (32, 6, 8)]),
+            // ISETP.GT.U32.EX P1, PT, R3, R2, PT, P0 (low result in P0)
+            word(&[
+                (0, 12, 0x20c),
+                (24, 8, 3),
+                (32, 8, 2),
+                (68, 3, 0),
+                (72, 1, 1),
+                (76, 3, 4),
+                (81, 3, 1),
+                (84, 3, 7),
+                (87, 3, 7),
+            ]),
+            // MOV R4, c[0x18][0x0]: bank 24 is never bound and reads zero.
+            word(&[(0, 12, 0xa02), (16, 8, 4), (54, 5, 24)]),
+            EXIT,
+        ];
+        let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
+        assert!(code[0].uniform && code[1].uniform && code[3].uniform);
+        assert!(!code[5].uniform && !code[6].uniform);
+        let translated = valid(&words);
+        assert!(translated.descriptors.is_empty());
     }
 
     #[test]

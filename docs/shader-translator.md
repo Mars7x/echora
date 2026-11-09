@@ -110,7 +110,8 @@ put an immediate (bits 32-63), a constant (bank 54-58, byte offset 38-53)
 or a uniform register (32-37, with bit 91) in the second source; forms 2, 3 and 7 in the
 third; register sources sit in 64-71, or the second in 32-39 in form 1. A
 constant form with bit 91 takes its buffer from a uniform register (32-37)
-instead of a bank. The layouts were cross-checked against NAK's encoder.
+instead of a bank. Banks 18 and up are never bound and read zero (fullscreen
+programs read bank 24). The layouts were cross-checked against NAK's encoder.
 
 | Operation | Opcodes (bits 0-11) | Notes |
 |---|---|---|
@@ -139,4 +140,7 @@ instead of a bank. The layouts were cross-checked against NAK's encoder.
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
+| Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
+| R2UR | 0x3c2 | uniform destination 16-21, register 24 |
+| ISETP.EX | 0x00c bit 72 | the low words' result at 68-71 decides when the high words are equal |
 | BSSY, BSYNC, DEPBAR | 0x945, 0x941, 0x91a | no effect per invocation |
