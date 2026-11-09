@@ -48,9 +48,9 @@ input and audio are host crates of their own.
   and task pipelines are drawn with `VK_EXT_mesh_shader`. The
   `translate-dump` and `shader-check` tools translate dumped shader stages
   offline.
-- **Generated code.** Two code-generation options can be turned on for a
-  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `structured`). Both are
-  off by default until they are checked in game.
+- **Generated code.** Three code-generation options can be turned on for a
+  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `structured`,
+  `fused-flags`). All are off by default until they are checked in game.
 
 ## Front ends
 
