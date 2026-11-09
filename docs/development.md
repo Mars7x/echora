@@ -95,7 +95,7 @@ read.
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_VIDEO_DECODE=gpu` | Decode the movies on the GPU's video engine (Vulkan Video) instead of rav1d; a movie the GPU cannot decode continues on rav1d. See [av1-decode.md](av1-decode.md). |
+| `ECHORA_VIDEO_DECODE=cpu` | Decode the movies with rav1d on the CPU (`rav1d` works too). By default they decode on the GPU's video engine (Vulkan Video), and a movie the GPU cannot decode continues on rav1d. See [av1-decode.md](av1-decode.md). |
 | `ECHORA_MOVIE_RATE=1` | Every 60 movie pictures, print how many have been decoded, the rate per second and the time since boot. This is the speed measure to compare runs with; presented frames per second are not comparable, because loading presents black frames at a load-dependent rate. |
 | `ECHORA_GPU_TIME=1` | Every few seconds, print how long the GPU was busy, against wall time and against the time the CPU waited for it. |
 | `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |

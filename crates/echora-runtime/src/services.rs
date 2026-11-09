@@ -1133,9 +1133,9 @@ pub struct Services {
     /// The host AV1 decoder of the current decoder session (created by
     /// 201, dropped by 115), and its failures.
     av1_decoder: Option<crate::av1::Decoder>,
-    /// ECHORA_VIDEO_DECODE=gpu: the session's decoder on the GPU's video
-    /// engine, used instead of `av1_decoder` until it fails (then the
-    /// session goes back to rav1d).
+    /// The session's decoder on the GPU's video engine (the default;
+    /// ECHORA_VIDEO_DECODE=cpu or rav1d turns it off), used instead of
+    /// `av1_decoder` until it fails (then the session goes back to rav1d).
     gpu_movie: Option<echora_gpu::video_av1::MovieDecoder>,
     gpu_movie_failed: bool,
     /// The video engine's device, opened on first use (None inside when
@@ -4564,6 +4564,7 @@ impl Services {
             Some(Ok(pictures)) => Some(Ok(pictures)),
             Some(Err(error)) => {
                 // The session continues on rav1d (from its next key frame).
+                eprintln!("video: GPU decode failed ({error}); this movie continues on rav1d");
                 if self.av1_errors.len() < 16 {
                     self.av1_errors.push(format!("GPU decode: {error}"));
                 }
@@ -4612,12 +4613,16 @@ impl Services {
         }
     }
 
-    /// With ECHORA_VIDEO_DECODE=gpu, decode one submission on the GPU's
-    /// video engine: the pictures it shows, as rav1d gives them. None when
-    /// GPU decoding is off, unavailable, or failed earlier this session.
+    /// Decode one submission on the GPU's video engine: the pictures it
+    /// shows, as rav1d gives them. None when GPU decoding is turned off
+    /// (ECHORA_VIDEO_DECODE=cpu or rav1d), unavailable, or failed earlier
+    /// this session.
     fn decode_av1_gpu(&mut self, bytes: &[u8]) -> Option<Result<Vec<crate::av1::Picture>, String>> {
         if self.gpu_movie_failed
-            || crate::nvn::debug_var("ECHORA_VIDEO_DECODE").as_deref() != Ok("gpu")
+            || matches!(
+                crate::nvn::debug_var("ECHORA_VIDEO_DECODE").as_deref(),
+                Ok("cpu" | "rav1d")
+            )
         {
             return None;
         }

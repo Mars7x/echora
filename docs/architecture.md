@@ -40,7 +40,8 @@ input and audio are host crates of their own.
 - **Runtime.** Guest threads run on one host thread by default, or on up to
   six workers that model the console's application cores (not yet stable).
   The game's zlib and zstd routines run as host code with identical results.
-  Movies are AV1 and decoded with rav1d. Every unimplemented operation stops
+  Movies are AV1, decoded on the GPU's video engine (Vulkan Video) or with
+  rav1d where the GPU cannot. Every unimplemented operation stops
   the run with a JSON report.
 - **GPU.** Guest memory is imported into Vulkan where the driver allows
   (`VK_EXT_external_memory_host`); otherwise the game's memory pools are

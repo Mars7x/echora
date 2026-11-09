@@ -1,8 +1,8 @@
 # AV1 decoding on the GPU
 
-The game's movies are AV1. Echora decodes them on the CPU with rav1d, and is
-moving them to the GPU's video engine through Vulkan Video
-(`VK_KHR_video_decode_av1`), with rav1d kept as the fallback. Vulkan Video
+The game's movies are AV1. Echora decodes them on the GPU's video engine
+through Vulkan Video (`VK_KHR_video_decode_av1`), with rav1d (on the CPU)
+as the fallback. Vulkan Video
 decodes tiles, but the application parses the headers and keeps track of
 references. `crates/echora-av1` is that half: plain Rust, no GPU, no
 `unsafe`.
@@ -129,9 +129,10 @@ Notes on values:
   of `reference_name_slot_indices` to DPB slots, and reads shown pictures
   back as NV12 at the guest's pitch. It refuses film grain and superres,
   so the caller falls back to rav1d.
-- `ECHORA_VIDEO_DECODE=gpu` makes the game's movies decode this way
-  (rav1d stays the default). If the device has no AV1 decode, or a decode
-  fails, that movie continues on rav1d.
+- The game's movies decode this way by default; `ECHORA_VIDEO_DECODE=cpu`
+  (or `rav1d`) decodes them with rav1d instead. If the device has no AV1
+  decode, or a decode fails, that movie continues on rav1d, and the log
+  says so.
 - `av1-gpu-check FILE.obu [PICTURES]` (in `echora-runtime`) decodes a raw
   stream (`ffmpeg -c:v copy -an -f obu`) both ways and compares the NV12
   planes; `AV1_CHECK_HIDDEN=1` compares hidden frames too (rav1d's
