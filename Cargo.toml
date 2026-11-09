@@ -15,6 +15,7 @@ members = [
     "crates/echora-nup",
     "crates/echora-resolution",
     "crates/echora-runtime",
+    "crates/echora-shader-abi",
     "crates/echora-simd",
 ]
 default-members = ["crates/*"]
@@ -32,6 +33,7 @@ echora-audio = { path = "crates/echora-audio" }
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
 echora-gpu = { path = "crates/echora-gpu" }
+echora-shader-abi = { path = "crates/echora-shader-abi" }
 echora-guest = { path = "crates/echora-guest" }
 echora-simd = { path = "crates/echora-simd" }
 echora-input = { path = "crates/echora-input" }

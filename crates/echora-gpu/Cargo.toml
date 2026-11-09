@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 ash = "0.38"
+echora-shader-abi.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

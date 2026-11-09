@@ -930,6 +930,9 @@ pub(crate) mod tests {
             stores: [0; 8],
             frag_colors: 1,
             cbuf_used_sizes: [0; 18],
+            abi_version: crate::shader::ABI_VERSION,
+            spec_constants: Vec::new(),
+            push_fields: 0,
         })
     }
 

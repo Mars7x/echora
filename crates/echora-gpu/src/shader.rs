@@ -3,88 +3,11 @@
 
 use std::ffi::c_void;
 
+pub use echora_shader_abi::{
+    ABI_VERSION, Descriptor, DescriptorKind, PUSH_TRANSLATOR, Stage, Translated,
+};
+
 pub const MAX_DESCRIPTORS: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    Vertex,
-    TessControl,
-    TessEval,
-    Geometry,
-    Fragment,
-    Compute,
-    /// Switch 2 task and mesh programs (VK_EXT_mesh_shader stages).
-    Task,
-    Mesh,
-}
-
-impl Stage {
-    fn from_raw(raw: u32) -> Option<Self> {
-        Some(match raw {
-            0 => Self::Vertex,
-            1 => Self::TessControl,
-            2 => Self::TessEval,
-            3 => Self::Geometry,
-            4 => Self::Fragment,
-            5 => Self::Compute,
-            7 => Self::Task,
-            8 => Self::Mesh,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DescriptorKind {
-    UniformBuffer,
-    StorageBuffer,
-    TextureBuffer,
-    ImageBuffer,
-    Texture,
-    Image,
-}
-
-/// One set-0 binding, in the order the SPIR-V backend assigns them.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Descriptor {
-    pub kind: u32,
-    pub binding: u32,
-    pub count: u32,
-    /// Guest constant buffer index of a uniform buffer.
-    pub index: u32,
-    pub cbuf_index: u32,
-    pub cbuf_offset: u32,
-    pub shift_left: u32,
-    pub has_secondary: u32,
-    pub secondary_cbuf_index: u32,
-    pub secondary_cbuf_offset: u32,
-    pub secondary_shift_left: u32,
-    pub size_shift: u32,
-    pub texture_type: u32,
-    /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample, 5 a
-    /// storage buffer at a raw 8-byte pointer (no size word: the binding
-    /// gives the bounds). Images: bits 8-11 the declared format
-    /// (Shader::ImageFormat; 0 typeless).
-    pub flags: u32,
-    /// Storage buffers: the pointer is read from memory this many bytes
-    /// past the constant buffer pointer (`u32::MAX`: the constant buffer
-    /// word is the pointer).
-    pub indirect_offset: u32,
-}
-
-impl Descriptor {
-    pub fn kind(&self) -> DescriptorKind {
-        match self.kind {
-            0 => DescriptorKind::UniformBuffer,
-            1 => DescriptorKind::StorageBuffer,
-            2 => DescriptorKind::TextureBuffer,
-            3 => DescriptorKind::ImageBuffer,
-            4 => DescriptorKind::Texture,
-            _ => DescriptorKind::Image,
-        }
-    }
-}
 
 /// Answers the recompiler's questions about state outside the program.
 pub trait Environment {
@@ -153,18 +76,6 @@ pub struct MeshParameters {
     pub primitive_header: Option<[u8; 0x50]>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Translated {
-    pub stage: Stage,
-    pub spirv: Vec<u32>,
-    pub descriptors: Vec<Descriptor>,
-    pub loaded_generics: u32,
-    pub stored_generics: u32,
-    /// Every attribute written, as a Shader IR::Attribute bit mask.
-    pub stores: [u64; 8],
-    pub frag_colors: u32,
-    pub cbuf_used_sizes: [u32; 18],
-}
 
 #[repr(C)]
 struct Callbacks {
@@ -316,6 +227,11 @@ pub fn translate<E: Environment>(
         stores: output.stores,
         frag_colors: output.frag_colors,
         cbuf_used_sizes: output.cbuf_used_sizes,
+        abi_version: ABI_VERSION,
+        // The recompiler takes pipeline state as translation parameters
+        // and may push texture rescaling words.
+        spec_constants: Vec::new(),
+        push_fields: PUSH_TRANSLATOR,
     };
     free(&mut output);
     Ok(result)
