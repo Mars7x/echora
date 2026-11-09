@@ -1,6 +1,11 @@
 //! Translate captured NVN programs (ECHORA_SHADER_DIR dumps) and compile each
 //! stage on the Vulkan driver, grouping failures by reason.
 //!   shader-check stage-*.code
+//!   shader-check --compare stage-*.code
+//! With --compare, each stage also goes through the Rust translator
+//! (`echora-shader`): what it does not handle is grouped by reason, and
+//! what it does is compiled on the driver and compared with the C++
+//! recompiler's program (`shader::compare`).
 use std::collections::BTreeMap;
 
 use echora_gpu::shader::{self, NoEnvironment, Parameters};
@@ -22,7 +27,9 @@ fn main() {
     };
     let (mut translated, mut compiled, mut total) = (0, 0, 0);
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
-    for path in std::env::args().skip(1) {
+    let compare = std::env::args().any(|arg| arg == "--compare");
+    let mut rust: BTreeMap<String, usize> = BTreeMap::new();
+    for path in std::env::args().skip(1).filter(|arg| arg != "--compare") {
         total += 1;
         let Ok(bytes) = std::fs::read(&path) else {
             *failures.entry("unreadable".into()).or_default() += 1;
@@ -60,6 +67,22 @@ fn main() {
             } else {
                 continue;
             }
+        }
+        if compare {
+            let outcome = match shader::translate_rust(&bytes, &parameters) {
+                Err(unsupported) => format!("unsupported: {}", unsupported.reason),
+                Ok(program) => match gpu.check_stage(&program) {
+                    Err(error) => format!("driver rejects: {error}"),
+                    Ok(()) => match shader::translate(&bytes, parameters, &mut NoEnvironment) {
+                        Err(_) => "translated (the C++ recompiler does not)".into(),
+                        Ok(lichii) => match shader::compare(&lichii, &program) {
+                            Some(difference) => format!("differs: {difference}"),
+                            None => "alike".into(),
+                        },
+                    },
+                },
+            };
+            *rust.entry(outcome).or_default() += 1;
         }
         let program = match shader::translate(&bytes, parameters, &mut NoEnvironment) {
             Ok(program) => program,
@@ -120,5 +143,13 @@ fn main() {
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (reason, count) in sorted {
         println!("{count:6} {reason}");
+    }
+    if compare {
+        println!("rust translator:");
+        let mut sorted: Vec<_> = rust.into_iter().collect();
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        for (outcome, count) in sorted {
+            println!("{count:6} {outcome}");
+        }
     }
 }

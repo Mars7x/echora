@@ -1849,6 +1849,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "cc",
+ "echora-shader",
  "echora-shader-abi",
  "libc",
  "naga 30.0.1",

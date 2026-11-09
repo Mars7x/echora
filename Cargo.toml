@@ -34,6 +34,7 @@ echora-audio = { path = "crates/echora-audio" }
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
 echora-gpu = { path = "crates/echora-gpu" }
+echora-shader = { path = "crates/echora-shader" }
 echora-shader-abi = { path = "crates/echora-shader-abi" }
 echora-guest = { path = "crates/echora-guest" }
 echora-simd = { path = "crates/echora-simd" }

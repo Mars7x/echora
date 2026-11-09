@@ -9,6 +9,91 @@ pub use echora_shader_abi::{
 
 pub const MAX_DESCRIPTORS: usize = 64;
 
+/// Which translator turns a program into SPIR-V (ECHORA_SHADER_TRANSLATOR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Translator {
+    /// The C++ recompiler (the default).
+    Lichii,
+    /// The Rust translator (`echora-shader`) for each program it handles,
+    /// the C++ recompiler for the rest.
+    Rust,
+    /// Both: the C++ recompiler's program is used; what the Rust
+    /// translator does differently is reported (`compare`).
+    Compare,
+}
+
+impl Translator {
+    /// `lichii`, `rust` or `compare` in ECHORA_SHADER_TRANSLATOR.
+    pub fn from_env() -> Self {
+        match std::env::var("ECHORA_SHADER_TRANSLATOR").as_deref() {
+            Ok("rust") => Self::Rust,
+            Ok("compare") => Self::Compare,
+            _ => Self::Lichii,
+        }
+    }
+}
+
+/// The ahead-of-time parameters the Rust translator takes, from the C++
+/// recompiler's (which also carry pipeline state it gets at run time).
+pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters {
+    let compute = parameters.workgroup_size != [0; 3];
+    echora_shader_abi::Parameters {
+        stage_slot: parameters
+            .mesh
+            .map(|mesh| if mesh.task { Stage::Task } else { Stage::Mesh }),
+        workgroup_size: compute.then_some(parameters.workgroup_size),
+        shared_memory_size: compute.then_some(parameters.shared_memory_size),
+        local_memory_size: compute.then_some(parameters.local_memory_size),
+    }
+}
+
+/// The Rust translator's program, if it handles `program`.
+pub fn translate_rust(
+    program: &[u8],
+    parameters: &Parameters,
+) -> Result<Translated, echora_shader_abi::Unsupported> {
+    let translated = echora_shader::translate(program, &abi_parameters(parameters))?;
+    if translated.abi_version != ABI_VERSION {
+        return Err(echora_shader_abi::Unsupported {
+            reason: format!(
+                "made for shader ABI {}, not {ABI_VERSION}",
+                translated.abi_version
+            ),
+            offset: None,
+        });
+    }
+    Ok(translated)
+}
+
+/// How two translations of one program differ, in the respects the
+/// runtime relies on (None: alike). The SPIR-V itself may differ freely.
+pub fn compare(lichii: &Translated, rust: &Translated) -> Option<String> {
+    if lichii.stage != rust.stage {
+        return Some(format!("stage {:?} vs {:?}", lichii.stage, rust.stage));
+    }
+    let kinds = |translated: &Translated| -> Vec<DescriptorKind> {
+        translated
+            .descriptors
+            .iter()
+            .map(Descriptor::kind)
+            .collect()
+    };
+    if kinds(lichii) != kinds(rust) {
+        return Some(format!(
+            "descriptors {:?} vs {:?}",
+            kinds(lichii),
+            kinds(rust)
+        ));
+    }
+    if lichii.frag_colors != rust.frag_colors {
+        return Some(format!(
+            "fragment colors {:#x} vs {:#x}",
+            lichii.frag_colors, rust.frag_colors
+        ));
+    }
+    None
+}
+
 /// Answers the recompiler's questions about state outside the program.
 pub trait Environment {
     /// Word at byte `offset` of guest constant buffer `index`.

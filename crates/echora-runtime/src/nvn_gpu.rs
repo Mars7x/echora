@@ -963,6 +963,7 @@ impl Nvn {
             .renderer
             .resolution_scale()
             .terms();
+        let mut notes: Vec<String> = Vec::new();
         let translated = {
             let parameters = Parameters {
                 binding_base: base[0],
@@ -997,20 +998,49 @@ impl Nvn {
             // Compute programs see the bindings of the dispatch that
             // first runs them (which constant buffer words are
             // pointers); graphics stages bind every candidate.
-            let result = if compute[0] != 0 {
-                shader::translate(&code, parameters, &mut PointerProbe { nvn: self, core })
-            } else {
-                shader::translate(&code, parameters, &mut shader::NoEnvironment)
+            let lichii = |nvn: &Self| {
+                if compute[0] != 0 {
+                    shader::translate(&code, parameters, &mut PointerProbe { nvn, core })
+                } else {
+                    shader::translate(&code, parameters, &mut shader::NoEnvironment)
+                }
+            };
+            // ECHORA_SHADER_TRANSLATOR: the Rust translator for programs it
+            // handles (`rust`), or beside the C++ one for a report
+            // (`compare`); what it does not handle is noted by reason.
+            let translator = shader::Translator::from_env();
+            let rust = (translator != shader::Translator::Lichii)
+                .then(|| shader::translate_rust(&code, &parameters));
+            let result = match (translator, rust) {
+                (shader::Translator::Rust, Some(Ok(translated))) => {
+                    notes.push("stat: rust translator programs".into());
+                    Ok(translated)
+                }
+                (_, Some(Err(unsupported))) => {
+                    notes.push(format!("rust translator: {}", unsupported.reason));
+                    lichii(self)
+                }
+                (shader::Translator::Compare, Some(Ok(rust))) => {
+                    let lichii = lichii(self);
+                    if let Ok(lichii) = &lichii {
+                        notes.push(match shader::compare(lichii, &rust) {
+                            Some(difference) => format!("rust translator differs: {difference}"),
+                            None => "stat: rust translator alike".into(),
+                        });
+                    }
+                    lichii
+                }
+                _ => lichii(self),
             };
             result
                 .map(Arc::new)
                 .map_err(|error| format!("stage {key:016x}: {error}"))
         };
-        self.gpu
-            .as_mut()
-            .unwrap()
-            .translations
-            .insert(cache_key, translated.clone());
+        let backend = self.gpu.as_mut().unwrap();
+        for note in notes {
+            backend.note(note);
+        }
+        backend.translations.insert(cache_key, translated.clone());
         translated
     }
 
