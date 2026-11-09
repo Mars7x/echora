@@ -19,8 +19,9 @@
 /// before every loop exits: low enough that loops walking wrong data
 /// across hundreds of workgroups end well inside the kernel's ten-second
 /// job limit (four million per loop, multiplied by nesting, did not, and
-/// reset the GPU).
-pub const LIMIT: u32 = 1 << 16;
+/// reset the GPU; 65536 shared still left a submission of eleven list
+/// passes able to reach it).
+pub const LIMIT: u32 = 1 << 12;
 
 const OP_FUNCTION: u32 = 54;
 const OP_VARIABLE: u32 = 59;

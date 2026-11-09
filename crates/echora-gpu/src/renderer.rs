@@ -1493,7 +1493,12 @@ impl Renderer {
         if let Some(timer) = self.timer.as_mut() {
             timer.finished(&self.gpu.device, self.fence, self.flush_wait_microseconds);
         }
-        if wait_start.elapsed() > std::time::Duration::from_secs(1) {
+        // ECHORA_SLOW_SUBMITS_MS: the wait that counts as slow (1000).
+        let slow = std::env::var("ECHORA_SLOW_SUBMITS_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1000);
+        if wait_start.elapsed() > std::time::Duration::from_millis(slow) {
             if let Some(path) = std::env::var_os("ECHORA_SLOW_SUBMITS") {
                 use std::io::Write;
                 if let Ok(mut file) = std::fs::OpenOptions::new()
