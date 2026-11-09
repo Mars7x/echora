@@ -54,6 +54,7 @@ pub mod op {
     pub const IMAGE_DREF_GATHER: u16 = 97;
     pub const IMAGE: u16 = 100;
     pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_TEXEL_POINTER: u16 = 60;
     pub const IMAGE_READ: u16 = 98;
     pub const IMAGE_WRITE: u16 = 99;
     pub const IMAGE_QUERY_LOD: u16 = 105;
@@ -172,6 +173,7 @@ pub mod storage {
     pub const OUTPUT: u32 = 3;
     pub const WORKGROUP: u32 = 4;
     pub const PRIVATE: u32 = 6;
+    pub const IMAGE: u32 = 11;
     pub const FUNCTION: u32 = 7;
     pub const PUSH_CONSTANT: u32 = 9;
     pub const STORAGE_BUFFER: u32 = 12;

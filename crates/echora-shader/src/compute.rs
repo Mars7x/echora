@@ -364,6 +364,8 @@ struct Emitter {
     pool_bindings: u32,
     /// Storage images by handle bank, offset and dimension.
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
+    /// R32ui-formatted views for image atomics (by descriptor index).
+    atomic_images: BTreeMap<usize, (u32, u32)>,
     /// More variables at a descriptor's binding (by descriptor index).
     descriptor_aliases: Vec<(usize, u32)>,
     /// Each image descriptor's integer-format spec constant id.
@@ -431,6 +433,7 @@ impl Emitter {
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
             images: BTreeMap::new(),
+            atomic_images: BTreeMap::new(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
             pool_arrays: BTreeMap::new(),
@@ -2129,6 +2132,22 @@ impl Emitter {
                 handle_offset,
                 dimension,
                 mask,
+            )?,
+            Op::SurfaceReduce {
+                a,
+                data,
+                bank,
+                handle_offset,
+                dimension,
+                operation,
+            } => self.surface_reduce(
+                index,
+                a.0,
+                data.0,
+                bank,
+                handle_offset,
+                dimension,
+                operation,
             )?,
             Op::Ald {
                 d,
@@ -4038,6 +4057,35 @@ mod tests {
             ]),
             EXIT,
         ]);
+    }
+
+    #[test]
+    fn surface_reductions_use_an_r32ui_view() {
+        let sured = |dimension: u128, operation: u128| {
+            word(&[
+                (0, 12, 0x59f),
+                (16, 8, 255),
+                (24, 8, 0),
+                (32, 8, 4),
+                (40, 14, 0x18),
+                (54, 5, 0),
+                (61, 3, dimension),
+                (77, 3, 7),
+                (84, 1, 1),
+                (87, 3, operation),
+            ])
+        };
+        // SURED.D.ADD.U32 into a 2D image twice (one R32ui view), and
+        // SURED.D.MAX.U32 into a buffer.
+        let translated = valid(&[sured(3, 0), sured(3, 6), sured(1, 2), EXIT]);
+        assert_eq!(translated.descriptors.len(), 2);
+        assert!(translated.descriptors.iter().all(|d| d.flags == 3));
+        // The wrapping increment is refused, as is an unknown mode bit.
+        translated_err(&[sured(3, 3), EXIT]);
+        assert!(matches!(
+            crate::decode::decode(sured(3, 0) | 1 << 72).op,
+            crate::decode::Op::Unknown { .. }
+        ));
     }
 
     #[test]

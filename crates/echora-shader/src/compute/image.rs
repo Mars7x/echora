@@ -3,7 +3,8 @@
 //! (typeless, without a format in the SPIR-V); whether it is integer is
 //! run-time state, so each image has a float and an unsigned view at one
 //! binding and a specialization constant (`SpecMeaning::IntegerFormat`)
-//! picks the view, one translation serving both.
+//! picks the view, one translation serving both. SURED reduces through
+//! a third, R32ui-formatted view, since image atomics need a format.
 
 use echora_shader_abi::{Descriptor, Unsupported};
 
@@ -18,6 +19,12 @@ const KIND_IMAGE_BUFFER: u32 = 3;
 const KIND_IMAGE: u32 = 5;
 const FLAG_WRITTEN: u32 = 1;
 const FLAG_READ: u32 = 2;
+
+/// SPIR-V's R32ui image format.
+const FORMAT_R32UI: u32 = 33;
+
+/// SPIR-V's device scope.
+const SCOPE_DEVICE: u32 = 1;
 
 /// An image's views and the constant that picks between them.
 #[derive(Clone, Copy, Debug)]
@@ -207,6 +214,85 @@ impl Emitter {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// SURED: an atomic reduction into a 32-bit unsigned texel, through an
+    /// R32ui view at the image's binding (image atomics need a format).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn surface_reduce(
+        &mut self,
+        index: usize,
+        a: u8,
+        data: u8,
+        bank: u8,
+        offset: u16,
+        dimension: u8,
+        operation: u8,
+    ) -> Result<(), Unsupported> {
+        let opcode = match operation {
+            0 => op::ATOMIC_I_ADD,
+            1 => op::ATOMIC_U_MIN,
+            2 => op::ATOMIC_U_MAX,
+            5 => op::ATOMIC_AND,
+            6 => op::ATOMIC_OR,
+            7 => op::ATOMIC_XOR,
+            _ => return Err(unsupported(index, format!("surface reduction {operation}"))),
+        };
+        let (dim, arrayed, _, _, count) = surface(dimension)
+            .filter(|_| matches!(dimension, 1 | 3))
+            .ok_or_else(|| {
+                unsupported(index, format!("surface reduction dimension {dimension}"))
+            })?;
+        if usize::from(bank) >= self.cbuf_used_sizes.len() {
+            return Err(unsupported(index, "surface handle in an unbound bank"));
+        }
+        let views = self
+            .image_views(bank, offset, dimension, FLAG_READ | FLAG_WRITTEN)
+            .ok_or_else(|| unsupported(index, "surface dimension"))?;
+        let variable = match self.atomic_images.get(&views.descriptor) {
+            Some(&(variable, _)) => variable,
+            None => {
+                let ty = self.module.ty(Type::Image {
+                    sampled_type: self.u32,
+                    dim,
+                    depth: 0,
+                    arrayed,
+                    multisampled: false,
+                    sampled: 2,
+                    format: FORMAT_R32UI,
+                });
+                let pointer = self.module.pointer(storage::UNIFORM_CONSTANT, ty);
+                let variable = self
+                    .module
+                    .global_variable(pointer, storage::UNIFORM_CONSTANT);
+                self.descriptor_aliases.push((views.descriptor, variable));
+                self.interface.push(variable);
+                self.atomic_images.insert(views.descriptor, (variable, ty));
+                variable
+            }
+        };
+        let coordinates: Vec<u32> = (0..count as u8)
+            .map(|n| {
+                if a == 255 {
+                    self.constant(0)
+                } else {
+                    self.read_register(a.saturating_add(n))
+                }
+            })
+            .collect();
+        let coordinate = self.vector(self.u32, &coordinates);
+        let value = self.read_register(data);
+        let texel_pointer = self.module.pointer(storage::IMAGE, self.u32);
+        let sample = self.constant(0);
+        let pointer = self.value(
+            op::IMAGE_TEXEL_POINTER,
+            texel_pointer,
+            &[variable, coordinate, sample],
+        );
+        let scope = self.constant(SCOPE_DEVICE);
+        let relaxed = self.constant(0);
+        self.value(opcode, self.u32, &[pointer, scope, relaxed, value]);
         Ok(())
     }
 

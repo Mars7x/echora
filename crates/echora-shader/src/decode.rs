@@ -603,6 +603,18 @@ pub enum Op {
         dimension: u8,
         mask: u8,
     },
+    /// SURED.D.U32 [a], data, handle: an atomic reduction (`operation`,
+    /// bits 87-89: 0 add, 1 min, 2 max, 5 and, 6 or, 7 xor; 3 and 4 the
+    /// wrapping increment and decrement) of data into the 32-bit texel at
+    /// coordinates a.. of the storage image, handle and dimension as SULD.
+    SurfaceReduce {
+        a: Reg,
+        data: Reg,
+        bank: u8,
+        handle_offset: u16,
+        dimension: u8,
+        operation: u8,
+    },
     /// TEX, TLD.SCR, TLD4 and TXQ with a handle in a constant bank.
     Tex(Texture),
     /// LDSM.16.M88 (ldmatrix): `count` (1 << bits 72-73) 8x8 matrices of
@@ -1394,6 +1406,20 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         0x95b => {
             return Some(Op::Kill {
                 condition: word.pred(87, 90),
+            });
+        }
+        // Only the U32 form with the bits seen (STRONG.GPU, IGN) is accepted.
+        0x59f => {
+            if word.bits(59, 2) != 0 || word.bits(64, 32) & !0x0380_0000 != 0x0010_e000 {
+                return None;
+            }
+            return Some(Op::SurfaceReduce {
+                a: word.reg(24),
+                data: word.reg(32),
+                bank: word.bits(54, 5) as u8,
+                handle_offset: word.bits(40, 14) as u16 * 4,
+                dimension: word.bits(61, 3) as u8,
+                operation: word.bits(87, 3) as u8,
             });
         }
         0xb97 | 0xb9b => {
