@@ -7,7 +7,7 @@ use echora_shader_abi::{Descriptor, Unsupported};
 
 use super::{Emitter, unsupported};
 use crate::decode::{Texture, TextureOp};
-use crate::spirv::{Type, capability, glsl, op, storage};
+use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 
 /// SPIR-V image operand bits.
 const OPERAND_BIAS: u32 = 0x1;
@@ -41,6 +41,21 @@ fn view(dimension: u8) -> Option<View> {
         coordinates,
     })
 }
+
+/// The texture pool for handles computed at run time (ABI version 4): set
+/// 1, an unsized array per view type, indexed by the handle's low 20 bits,
+/// and the samplers by its high 12.
+const POOL_SET: u32 = 1;
+const POOL_TEXTURE_MASK: u32 = 0xf_ffff;
+const POOL_SAMPLER_SHIFT: u32 = 20;
+const POOL_SAMPLERS: u32 = 0;
+const POOL_SAMPLED_1D: u32 = 1;
+const POOL_SAMPLED_1D_ARRAY: u32 = 2;
+const POOL_SAMPLED_2D: u32 = 3;
+const POOL_SAMPLED_2D_ARRAY: u32 = 4;
+const POOL_SAMPLED_3D: u32 = 5;
+const POOL_SAMPLED_CUBE: u32 = 6;
+const POOL_SAMPLED_CUBE_ARRAY: u32 = 7;
 
 /// The runtime's descriptor kind for a texture.
 const KIND_TEXTURE: u32 = 4;
@@ -111,6 +126,81 @@ impl Emitter {
         (variable, types)
     }
 
+    /// The texture as a sampled image: its combined image sampler, or for
+    /// a handle computed at run time, the texture pool's entries.
+    fn sampled_image(
+        &mut self,
+        index: usize,
+        texture: &Texture,
+        view: &View,
+        depth: bool,
+    ) -> Result<(u32, Types), Unsupported> {
+        let Some(register) = texture.handle else {
+            let (variable, types) = self.texture_variable(texture, view, depth);
+            let sampled = self.value(op::LOAD, types.sampled, &[variable]);
+            return Ok((sampled, types));
+        };
+        let binding = match (view.dim, view.arrayed) {
+            (0, false) => POOL_SAMPLED_1D,
+            (0, true) => POOL_SAMPLED_1D_ARRAY,
+            (1, false) => POOL_SAMPLED_2D,
+            (1, true) => POOL_SAMPLED_2D_ARRAY,
+            (2, _) => POOL_SAMPLED_3D,
+            (3, false) => POOL_SAMPLED_CUBE,
+            (3, true) => POOL_SAMPLED_CUBE_ARRAY,
+            _ => return Err(unsupported(index, "texture pool view")),
+        };
+        // The pool's images take no depth flag: the sampler's state
+        // decides a comparison.
+        let types = self.texture_types(view, false);
+        let handle = self.read_uniform(register.0);
+        let (mask, shift) = (
+            self.constant(POOL_TEXTURE_MASK),
+            self.constant(POOL_SAMPLER_SHIFT),
+        );
+        let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
+        let sampler_index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
+        let image = self.pool_entry(binding, types.image, texture_index);
+        let sampler_type = self.module.ty(Type::Sampler);
+        let sampler = self.pool_entry(POOL_SAMPLERS, sampler_type, sampler_index);
+        let sampled = self.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
+        self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
+        Ok((sampled, types))
+    }
+
+    /// Entry `index` of texture-pool binding `binding` (an unsized array of
+    /// `element`), loaded with a non-uniform index.
+    fn pool_entry(&mut self, binding: u32, element: u32, index: u32) -> u32 {
+        self.module.capability(capability::RUNTIME_DESCRIPTOR_ARRAY);
+        self.module.capability(capability::SHADER_NON_UNIFORM);
+        self.module
+            .capability(capability::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING);
+        let array_type = self.module.ty(Type::RuntimeArray { element });
+        let variable = match self.pool_arrays.get(&binding) {
+            Some(&variable) => variable,
+            None => {
+                let pointer = self.module.pointer(storage::UNIFORM_CONSTANT, array_type);
+                let variable = self
+                    .module
+                    .global_variable(pointer, storage::UNIFORM_CONSTANT);
+                self.module
+                    .decorate(variable, decoration::DESCRIPTOR_SET, &[POOL_SET]);
+                self.module
+                    .decorate(variable, decoration::BINDING, &[binding]);
+                self.interface.push(variable);
+                self.pool_arrays.insert(binding, variable);
+                self.pool_bindings |= 1 << binding;
+                variable
+            }
+        };
+        let pointer = self.module.pointer(storage::UNIFORM_CONSTANT, element);
+        let entry = self.value(op::ACCESS_CHAIN, pointer, &[variable, index]);
+        self.module.decorate(entry, decoration::NON_UNIFORM, &[]);
+        let value = self.value(op::LOAD, element, &[entry]);
+        self.module.decorate(value, decoration::NON_UNIFORM, &[]);
+        value
+    }
+
     /// The instruction's operand values, in order (RZ reads zero).
     fn texture_values(&mut self, texture: &Texture, count: u32) -> Vec<u32> {
         let in_a = if count <= 4 { count.div_ceil(2) } else { 4 };
@@ -150,11 +240,9 @@ impl Emitter {
         // A bindless handle binds like a bound one when its uniform
         // register only ever holds one constant-bank word.
         let mut texture = *texture;
-        if let Some(register) = texture.handle {
-            let &(bank, offset) = self
-                .handle_words
-                .get(&register.0)
-                .ok_or_else(|| unsupported(index, "texture handle computed at run time"))?;
+        if let Some(register) = texture.handle
+            && let Some(&(bank, offset)) = self.handle_words.get(&register.0)
+        {
             texture.bank = bank;
             texture.handle_offset = offset;
             texture.handle = None;
@@ -166,11 +254,11 @@ impl Emitter {
         if texture.mask == 0 {
             return Ok(());
         }
-        if usize::from(texture.bank) >= self.cbuf_used_sizes.len() {
+        if texture.handle.is_none() && usize::from(texture.bank) >= self.cbuf_used_sizes.len() {
             return Err(unsupported(index, "texture handle in an unbound bank"));
         }
         let results = match texture.op {
-            TextureOp::Query => self.texture_query(texture)?,
+            TextureOp::Query => self.texture_query(index, texture)?,
             TextureOp::LevelQuery => self.texture_level_query(index, texture, &view)?,
             _ => self.texture_read(index, texture, &view)?,
         };
@@ -244,7 +332,7 @@ impl Emitter {
             + 2 * u32::from(texture.per_tap)
             + u32::from(texture.depth_compare);
         let values = self.texture_values(texture, count);
-        let (variable, types) = self.texture_variable(texture, view, texture.depth_compare);
+        let (sampled, types) = self.sampled_image(index, texture, view, texture.depth_compare)?;
         let mut next = view.coordinates as usize;
         let level_operand = level_value.then(|| {
             next += 1;
@@ -261,7 +349,6 @@ impl Emitter {
         let reference = texture
             .depth_compare
             .then(|| self.value(op::BITCAST, self.f32, &[values[next]]));
-        let sampled = self.value(op::LOAD, types.sampled, &[variable]);
         // The array index comes first; SPIR-V wants it last.
         let mut coordinates: Vec<u32> = values[..view.coordinates as usize].to_vec();
         if view.arrayed {
@@ -495,13 +582,12 @@ impl Emitter {
         } else {
             self.texture_values(texture, view.coordinates)
         };
-        let (variable, types) = self.texture_variable(texture, view, false);
+        let (sampled, _) = self.sampled_image(index, texture, view, false)?;
         let floats: Vec<u32> = values
             .iter()
             .map(|&value| self.value(op::BITCAST, self.f32, &[value]))
             .collect();
         let coordinate = self.vector(self.f32, &floats);
-        let sampled = self.value(op::LOAD, types.sampled, &[variable]);
         let vec2 = self.module.ty(Type::Vector {
             component: self.f32,
             count: 2,
@@ -520,7 +606,7 @@ impl Emitter {
 
     /// TXQ: width, height, depth or layers, and the level count. The
     /// instruction names no view type, so the texture is read as 2D.
-    fn texture_query(&mut self, texture: &Texture) -> Result<Vec<u32>, Unsupported> {
+    fn texture_query(&mut self, index: usize, texture: &Texture) -> Result<Vec<u32>, Unsupported> {
         self.module.capability(capability::IMAGE_QUERY);
         let view = View {
             dim: 1,
@@ -528,13 +614,12 @@ impl Emitter {
             texture_type: 2,
             coordinates: 2,
         };
-        let (variable, types) = self.texture_variable(texture, &view, false);
+        let (sampled, types) = self.sampled_image(index, texture, &view, false)?;
         let level = if texture.a.0 == 255 {
             self.constant(0)
         } else {
             self.read_register(texture.a.0)
         };
-        let sampled = self.value(op::LOAD, types.sampled, &[variable]);
         let image = self.value(op::IMAGE, types.image, &[sampled]);
         let uvec2 = self.module.ty(Type::Vector {
             component: self.u32,

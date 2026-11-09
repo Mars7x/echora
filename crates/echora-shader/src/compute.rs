@@ -340,6 +340,9 @@ struct Emitter {
     /// Combined image samplers by handle bank, offset, texture type and
     /// depth comparison.
     textures: BTreeMap<(u8, u16, u32, bool), u32>,
+    /// Texture pool arrays by binding, and the bindings used (bit n).
+    pool_arrays: BTreeMap<u32, u32>,
+    pool_bindings: u32,
     /// Storage images by handle bank, offset and dimension.
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
     /// More variables at a descriptor's binding (by descriptor index).
@@ -409,6 +412,8 @@ impl Emitter {
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
             images: BTreeMap::new(),
+            pool_arrays: BTreeMap::new(),
+            pool_bindings: 0,
             descriptor_aliases: Vec::new(),
             image_spec_ids: Vec::new(),
             spec_constants: Vec::new(),
@@ -3755,8 +3760,10 @@ mod tests {
             (64, 8, 63),
             (91, 1, 1),
         ]);
-        let computed = translated_err(&[uldc, uiadd3, bindless, EXIT]);
-        assert!(computed.reason.contains("computed"), "{}", computed.reason);
+        // A handle also written by other instructions is computed at run
+        // time: it indexes the texture pool (set 1) instead.
+        let computed = valid(&[uldc, uiadd3, bindless, EXIT]);
+        assert!(computed.descriptors.iter().all(|d| d.kind != 4));
     }
 
     /// Whether the module has an OpSwitch (the dispatch loop's).

@@ -22,6 +22,7 @@ pub mod op {
     pub const TYPE_FLOAT: u16 = 22;
     pub const TYPE_VECTOR: u16 = 23;
     pub const TYPE_IMAGE: u16 = 25;
+    pub const TYPE_SAMPLER: u16 = 26;
     pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const TYPE_ARRAY: u16 = 28;
     pub const TYPE_RUNTIME_ARRAY: u16 = 29;
@@ -45,6 +46,7 @@ pub mod op {
     pub const MEMBER_DECORATE: u16 = 72;
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const SAMPLED_IMAGE: u16 = 86;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
     pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
     pub const IMAGE_FETCH: u16 = 95;
@@ -193,6 +195,9 @@ pub mod capability {
     pub const SHADER_CLOCK: u32 = 5055;
     pub const DRAW_PARAMETERS: u32 = 4427;
     pub const DEMOTE_TO_HELPER_INVOCATION: u32 = 5379;
+    pub const SHADER_NON_UNIFORM: u32 = 5301;
+    pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
+    pub const SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: u32 = 5307;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
@@ -205,6 +210,7 @@ pub mod decoration {
     pub const BLOCK: u32 = 2;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const NO_CONTRACTION: u32 = 42;
+    pub const NON_UNIFORM: u32 = 5300;
     pub const BUILT_IN: u32 = 11;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
@@ -306,6 +312,7 @@ pub enum Type {
     SampledImage {
         image: u32,
     },
+    Sampler,
 }
 
 /// A module being built. Sections are kept apart and joined in the order
@@ -484,6 +491,7 @@ impl Module {
                 ],
             ),
             Type::SampledImage { image } => (op::TYPE_SAMPLED_IMAGE, vec![id, *image]),
+            Type::Sampler => (op::TYPE_SAMPLER, vec![id]),
         };
         instruction(&mut self.globals, opcode, &operands);
         self.types.insert(ty, id);

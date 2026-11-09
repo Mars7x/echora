@@ -96,7 +96,11 @@ the texture and sampler the word names. Bindings follow the uniform
 buffers. A bindless form (0xf60, 0xf63, 0xf66, 0xf6f: the handle in the
 uniform register at bits 40-45) binds the same way when that register
 only ever holds one constant-bank word (every write a ULDC of it); a
-handle computed at run time needs descriptor arrays, not done yet. Programs without derivatives sample at an explicit level (a
+handle computed at run time indexes the texture pool instead: set 1, an
+unsized array of sampled images per view type (bindings 1-7) and one of
+samplers (binding 0), by the handle's low 20 bits and high 12, with
+non-uniform indexing; `Translated::texture_pool_bindings` names the
+bindings a program reads. Programs without derivatives sample at an explicit level (a
 bias over level zero is that level). Vulkan takes only constant texel
 offsets for a sample, so a sample adds the offsets divided by the
 level's size to its coordinates; a fetch adds them to its integer
