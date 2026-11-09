@@ -115,8 +115,9 @@ impl Emitter {
         size: u8,
     ) -> Result<(), Unsupported> {
         let count = match words(size) {
-            Some(count) if size >= 4 => count,
-            _ => return Err(unsupported(index, format!("store size {size}"))),
+            Some(_) if size < 4 => return self.narrow_store(index, data, space, address, size),
+            Some(count) => count,
+            None => return Err(unsupported(index, format!("store size {size}"))),
         };
         let values: Vec<u32> = (0..count)
             .map(|n| {
@@ -130,6 +131,80 @@ impl Emitter {
         match space {
             Space::Global => self.global_store(address, &values),
             Space::Shared | Space::Local => self.array_store(index, space, address, &values),
+        }
+    }
+
+    /// A byte or half-word store (sizes 0-3): into the word that holds it,
+    /// the other bytes kept. Global and shared memory clear and set the
+    /// bytes with two atomics, so other invocations' bytes of the same word
+    /// survive; local memory is the invocation's own.
+    fn narrow_store(
+        &mut self,
+        index: usize,
+        data: u8,
+        space: Space,
+        address: Address,
+        size: u8,
+    ) -> Result<(), Unsupported> {
+        let value = if data == 255 {
+            self.constant(0)
+        } else {
+            self.read_register(data)
+        };
+        let width = self.constant(if size < 2 { 0xff } else { 0xffff });
+        let value = self.value(op::BITWISE_AND, self.u32, &[value, width]);
+        // The bytes' place in their word.
+        let placed = |e: &mut Self, low: u32| {
+            let three = e.constant(3);
+            let lane = e.value(op::BITWISE_AND, e.u32, &[low, three]);
+            let eight = e.constant(8);
+            let shift = e.value(op::I_MUL, e.u32, &[lane, eight]);
+            let mask = e.value(op::SHIFT_LEFT_LOGICAL, e.u32, &[width, shift]);
+            let keep = e.value(op::NOT, e.u32, &[mask]);
+            let bits = e.value(op::SHIFT_LEFT_LOGICAL, e.u32, &[value, shift]);
+            (keep, bits)
+        };
+        let relaxed = self.constant(0);
+        let update = |e: &mut Self, pointer: u32, scope: u32, keep: u32, bits: u32| {
+            e.value(op::ATOMIC_AND, e.u32, &[pointer, scope, relaxed, keep]);
+            e.value(op::ATOMIC_OR, e.u32, &[pointer, scope, relaxed, bits]);
+        };
+        match space {
+            Space::Global => {
+                let u64 = self.u64();
+                let va = self.global_address(address);
+                let low = self.value(op::U_CONVERT, self.u32, &[va]);
+                let (keep, bits) = placed(self, low);
+                let not_three = self.constant64(!3);
+                let aligned = self.value(op::BITWISE_AND, u64, &[va, not_three]);
+                let scope = self.constant(SCOPE_DEVICE);
+                self.mapped(aligned, None, |e, device| {
+                    let (pointer, _) = e.device_pointer(device, 1);
+                    update(e, pointer, scope, keep, bits);
+                    Ok(())
+                })
+            }
+            Space::Shared | Space::Local => {
+                let (variable, bytes) = self.array(index, space)?;
+                let class = storage_class(space);
+                let at = self.array_address(address);
+                let (keep, bits) = placed(self, at);
+                let not_three = self.constant(!3);
+                let aligned = self.value(op::BITWISE_AND, self.u32, &[at, not_three]);
+                let (element, inside) = self.array_word(variable, class, bytes, aligned, 0);
+                let scope = self.constant(SCOPE_WORKGROUP);
+                self.when(inside, |e| {
+                    if space == Space::Shared {
+                        update(e, element, scope, keep, bits);
+                    } else {
+                        let old = e.value(op::LOAD, e.u32, &[element]);
+                        let kept = e.value(op::BITWISE_AND, e.u32, &[old, keep]);
+                        let new = e.value(op::BITWISE_OR, e.u32, &[kept, bits]);
+                        e.function.emit(op::STORE, &[element, new]);
+                    }
+                    Ok(())
+                })
+            }
         }
     }
 

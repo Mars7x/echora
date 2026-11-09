@@ -4191,6 +4191,36 @@ mod tests {
     }
 
     #[test]
+    fn byte_and_half_word_stores_keep_their_neighbours() {
+        let words = [
+            // STG.E.U16 [R4.64+0x2], R2; STS.U8 [R1+0x3], R2; STL.U16 [R1], R2
+            word(&[
+                (0, 12, 0x386),
+                (24, 8, 4),
+                (32, 8, 2),
+                (40, 24, 2),
+                (72, 1, 1),
+                (73, 3, 2),
+            ]),
+            word(&[
+                (0, 12, 0x388),
+                (24, 8, 1),
+                (32, 8, 2),
+                (40, 24, 3),
+                (73, 3, 0),
+            ]),
+            word(&[(0, 12, 0x387), (24, 8, 1), (32, 8, 2), (73, 3, 2)]),
+            EXIT,
+        ];
+        let layout = Layout {
+            shared_bytes: Some(0x100),
+            local_bytes: Some(0x40),
+            ..Layout::workgroup([64, 1, 1])
+        };
+        valid_with(&words, &layout);
+    }
+
+    #[test]
     fn float_families_validate() {
         valid(&[
             // FFMA.SAT R0, -|R1|, R2, R3; FMUL R4, R0, 2.0; FADD R5, R4, R0
