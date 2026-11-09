@@ -4,23 +4,25 @@
 //! walked until an entry's w is not positive, say). When that data is not
 //! what the console holds, the loop never ends, the GPU job runs past the
 //! kernel's limit and amdgpu resets the whole GPU (the user's desktop with
-//! it). Each loop header here counts its executions in a function-local
-//! variable and leaves through the loop's merge block after `LIMIT` of
-//! them: a wrong result for that invocation instead of a reset.
+//! it). Every loop header here counts its executions in one per-invocation
+//! (Private) variable shared by all the module's loops, and each loop
+//! leaves through its merge block once that count passes `LIMIT`: a wrong
+//! result for that invocation instead of a reset. One shared budget, so
+//! nested loops cannot multiply it.
 //!
 //! The bound acts at the loop's existing conditional exits (branches with
 //! one edge leaving the loop, directly or through a block that only breaks
 //! out), so the control flow keeps its shape and dominance holds. Loops
 //! without such an exit are left as they are.
 
-/// Executions of one loop header (per invocation) before it exits: low
-/// enough that a loop walking wrong data across hundreds of workgroups ends
-/// well inside the kernel's ten-second job limit (four million per loop
-/// did not, and reset the GPU).
+/// Loop header executions an invocation may make, all loops together,
+/// before every loop exits: low enough that loops walking wrong data
+/// across hundreds of workgroups end well inside the kernel's ten-second
+/// job limit (four million per loop, multiplied by nesting, did not, and
+/// reset the GPU).
 pub const LIMIT: u32 = 1 << 16;
 
 const OP_FUNCTION: u32 = 54;
-const OP_FUNCTION_PARAMETER: u32 = 55;
 const OP_VARIABLE: u32 = 59;
 const OP_LOAD: u32 = 61;
 const OP_STORE: u32 = 62;
@@ -37,7 +39,8 @@ const OP_LOOP_MERGE: u32 = 246;
 const OP_LABEL: u32 = 248;
 const OP_BRANCH: u32 = 249;
 const OP_BRANCH_CONDITIONAL: u32 = 250;
-const STORAGE_FUNCTION: u32 = 7;
+const STORAGE_PRIVATE: u32 = 6;
+const OP_ENTRY_POINT: u32 = 15;
 
 fn instruction(opcode: u32, operands: &[u32]) -> Vec<u32> {
     let mut words = Vec::with_capacity(operands.len() + 1);
@@ -112,13 +115,13 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
     let pointer = match find(&|words| {
         opcode(words) == OP_TYPE_POINTER
             && words.len() == 4
-            && words[2] == STORAGE_FUNCTION
+            && words[2] == STORAGE_PRIVATE
             && words[3] == uint
     }) {
         Some(id) => id,
         None => {
             let id = fresh();
-            globals.push(instruction(OP_TYPE_POINTER, &[id, STORAGE_FUNCTION, uint]));
+            globals.push(instruction(OP_TYPE_POINTER, &[id, STORAGE_PRIVATE, uint]));
             id
         }
     };
@@ -130,6 +133,12 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
     let zero = constant(0, &mut globals);
     let one = constant(1, &mut globals);
     let limit = constant(LIMIT, &mut globals);
+    // The budget every loop header draws on, per invocation.
+    let counter = fresh();
+    globals.push(instruction(
+        OP_VARIABLE,
+        &[pointer, counter, STORAGE_PRIVATE, zero],
+    ));
 
     // Block boundaries: label index -> (start, end exclusive) in
     // `instructions`, and the label id of each block.
@@ -150,35 +159,10 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
         }
     }
 
-    // Edits: instructions inserted before an index, replaced terminators,
-    // phi operands appended, and counter variables per function.
+    // Edits: instructions inserted before an index and replaced
+    // terminators.
     let mut insert_before: std::collections::BTreeMap<usize, Vec<Vec<u32>>> = Default::default();
     let mut replace: std::collections::HashMap<usize, Vec<u32>> = Default::default();
-    let mut function_variables: std::collections::BTreeMap<usize, Vec<Vec<u32>>> =
-        Default::default();
-
-    // The first block of the function each instruction belongs to: where
-    // OpVariables go (after the function's own variables).
-    let mut variable_slot = Vec::with_capacity(instructions.len());
-    let mut current_slot = 0;
-    let mut in_first_block = false;
-    for (index, words) in instructions.iter().enumerate() {
-        match opcode(words) {
-            OP_FUNCTION => in_first_block = false,
-            OP_LABEL
-                if !in_first_block && index > 0 && {
-                    let previous = opcode(&instructions[index - 1]);
-                    previous == OP_FUNCTION || previous == OP_FUNCTION_PARAMETER
-                } =>
-            {
-                in_first_block = true;
-                current_slot = index + 1;
-            }
-            OP_VARIABLE if in_first_block && current_slot == index => current_slot = index + 1,
-            _ => {}
-        }
-        variable_slot.push(current_slot);
-    }
 
     // Blocks ending in an unconditional branch to `target`.
     let breaks_to = |label: u32, target: u32| {
@@ -219,7 +203,6 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
         if exits.is_empty() {
             continue;
         }
-        let counter = fresh();
         let loaded = fresh();
         let added = fresh();
         insert_before.entry(index).or_default().extend([
@@ -259,16 +242,18 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
                 instruction(OP_BRANCH_CONDITIONAL, &[condition, words[2], words[3]]),
             );
         }
-        function_variables
-            .entry(variable_slot[index])
-            .or_default()
-            .push(instruction(
-                OP_VARIABLE,
-                &[pointer, counter, STORAGE_FUNCTION, zero],
-            ));
     }
     if replace.is_empty() {
         return None;
+    }
+    // From SPIR-V 1.4, an entry point lists every global variable it uses.
+    if spirv[1] >= 0x0001_0400 {
+        for words in instructions.iter_mut() {
+            if opcode(words) == OP_ENTRY_POINT {
+                words.push(counter);
+                words[0] = ((words.len() as u32) << 16) | OP_ENTRY_POINT;
+            }
+        }
     }
 
     let mut out = Vec::with_capacity(spirv.len() + 64 * replace.len());
@@ -277,11 +262,6 @@ fn guard(spirv: &[u32]) -> Option<Vec<u32>> {
         if index == first_function {
             for global in &globals {
                 out.extend_from_slice(global);
-            }
-        }
-        if let Some(variables) = function_variables.get(&index) {
-            for variable in variables {
-                out.extend_from_slice(variable);
             }
         }
         if let Some(inserted) = insert_before.get(&index) {
