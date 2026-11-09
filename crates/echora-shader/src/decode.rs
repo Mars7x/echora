@@ -299,6 +299,17 @@ pub enum Op {
         c: Option<HalfOperand>,
         saturate: bool,
     },
+    /// HSETP2 p, q, a, b, acc: each lane's comparison of the half pairs, p
+    /// lane 0's and q lane 1's, each combined with acc.
+    Hsetp2 {
+        p: u8,
+        q: u8,
+        a: HalfOperand,
+        b: HalfOperand,
+        compare: FloatCompare,
+        combine: Combine,
+        accumulate: Pred,
+    },
     /// F2FP.PACK_AB d, a, b: b and a converted to halves, b in the low
     /// half; with `merge` (MERGE_C, bit 78) the high half is the low half
     /// of register c instead of a.
@@ -942,6 +953,17 @@ fn uniform_mirror(opcode: u16) -> Option<u16> {
         }
         _ => opcode == 0x89c,
     };
+    // The bit operations' uniform forms (UFLO, UBREV, UPOPC) mirror
+    // opcodes elsewhere.
+    let bits = match operation {
+        0x0bd => Some(0x100),
+        0x0be => Some(0x101),
+        0x0bf => Some(0x109),
+        _ => None,
+    };
+    if let Some(mirror) = bits.filter(|_| matches!(form, 1 | 4)) {
+        return Some(form << 9 | mirror);
+    }
     mirrored.then(|| {
         if opcode == 0x89c {
             0x81c
@@ -1444,6 +1466,21 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.half(1)?,
             c: None,
             saturate: false,
+        },
+        // HSETP2 without .H_AND (71).
+        0x034 if matches!(form, 1 | 2) && !word.bit(71) => Op::Hsetp2 {
+            p: word.bits(81, 3) as u8,
+            q: word.bits(84, 3) as u8,
+            a: word.half(0)?,
+            b: word.half(if form == 1 { 1 } else { 2 })?,
+            compare: float_compare(word.bits(76, 4)),
+            combine: match word.bits(69, 2) {
+                0 => Combine::And,
+                1 => Combine::Or,
+                2 => Combine::Xor,
+                _ => return None,
+            },
+            accumulate: word.pred(87, 90),
         },
         0x03e if matches!(form, 1 | 5) && word.bits(73, 5) == 0 && !word.bit(72) => Op::F2fp {
             d,

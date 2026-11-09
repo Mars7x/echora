@@ -1460,6 +1460,15 @@ impl Emitter {
                 c,
                 saturate,
             } => self.half(index, op, d, a, b, c, saturate)?,
+            Op::Hsetp2 {
+                p,
+                q,
+                a,
+                b,
+                compare,
+                combine,
+                accumulate,
+            } => self.half_set_predicates(index, p, q, a, b, compare, combine, accumulate)?,
             Op::F2fp { d, a, b, c, merge } => self.pack_halves(index, d, a, b, c, merge)?,
             Op::Iabs { d, src } => {
                 let x = self.integer(index, src)?;
@@ -3764,6 +3773,21 @@ mod tests {
                 (32, 8, 1),
                 (87, 3, 0),
             ]),
+            // HSETP2.GT.AND P1, P2, R0, R1.H1_H1, PT
+            word(&[
+                (0, 12, 0x234),
+                (24, 8, 0),
+                (32, 8, 1),
+                (60, 2, 3),
+                (76, 4, 4),
+                (81, 3, 1),
+                (84, 3, 2),
+                (87, 3, 7),
+            ]),
+            // UBREV UR4, UR5; UFLO.U32 UR6, UR5; UPOPC UR7, UR5
+            word(&[(0, 12, 0x2be), (16, 8, 4), (32, 8, 5), (91, 1, 1)]),
+            word(&[(0, 12, 0x2bd), (16, 8, 6), (32, 8, 5), (91, 1, 1)]),
+            word(&[(0, 12, 0x2bf), (16, 8, 7), (32, 8, 5), (91, 1, 1)]),
             word(&[(0, 12, 0x23e), (16, 8, 7), (24, 8, 0), (32, 8, 1)]),
             word(&[
                 (0, 12, 0x23e),

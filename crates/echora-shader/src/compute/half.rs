@@ -4,7 +4,7 @@
 use echora_shader_abi::Unsupported;
 
 use super::Emitter;
-use crate::decode::{HalfOp, HalfOperand, Operand, Pred, Reg};
+use crate::decode::{Combine, FloatCompare, HalfOp, HalfOperand, Operand, Pred, Reg};
 use crate::spirv::{Type, capability, glsl, op};
 
 /// OpVectorShuffle.
@@ -124,6 +124,34 @@ impl Emitter {
         });
         let both = self.value(op::COMPOSITE_CONSTRUCT, bool_pair, &[condition, condition]);
         self.value(op::SELECT, pair, &[both, low, high])
+    }
+
+    /// HSETP2: p from lane 0's comparison, q from lane 1's.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn half_set_predicates(
+        &mut self,
+        index: usize,
+        p: u8,
+        q: u8,
+        a: HalfOperand,
+        b: HalfOperand,
+        compare: FloatCompare,
+        combine: Combine,
+        accumulate: Pred,
+    ) -> Result<(), Unsupported> {
+        let f16 = self.f16();
+        let a = self.half_operand(index, a)?;
+        let b = self.half_operand(index, b)?;
+        let mut results = [0; 2];
+        for (lane, result) in results.iter_mut().enumerate() {
+            let x = self.value(op::COMPOSITE_EXTRACT, f16, &[a, lane as u32]);
+            let y = self.value(op::COMPOSITE_EXTRACT, f16, &[b, lane as u32]);
+            let compared = self.float_compare(compare, x, y);
+            *result = self.combined(compared, combine, accumulate);
+        }
+        self.write_predicate(p, results[0]);
+        self.write_predicate(q, results[1]);
+        Ok(())
     }
 
     /// F2FP.PACK_AB: b and a (or c's low half) as halves, b low.
