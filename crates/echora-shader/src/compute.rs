@@ -145,12 +145,16 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     Ok(emitter.finish())
 }
 
+mod io;
 mod memory;
 mod texture;
 
-/// What a compute program needs beyond its code.
+/// What a program needs beyond its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
+    pub stage: Stage,
+    /// A graphics program's header.
+    pub header: Option<crate::header::Header>,
     pub workgroup: [u32; 3],
     /// Bytes of shared memory, when known.
     pub shared_bytes: Option<u32>,
@@ -162,6 +166,8 @@ impl Layout {
     /// A layout with only a workgroup size.
     pub fn workgroup(workgroup: [u32; 3]) -> Self {
         Self {
+            stage: Stage::Compute,
+            header: None,
             workgroup,
             shared_bytes: None,
             local_bytes: None,
@@ -175,6 +181,9 @@ const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
 const BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
 /// SubgroupEqMask; Ge, Gt, Le and Lt follow, as S2R's 0x38-0x3c do.
 const BUILTIN_SUBGROUP_EQ_MASK: u32 = 4416;
+
+/// Descriptors per stage: a stage's bindings start at its slot times this.
+pub const MAX_DESCRIPTORS: u32 = 64;
 
 /// The subgroup scope, for subgroup operations.
 const SCOPE_SUBGROUP: u32 = 3;
@@ -204,7 +213,11 @@ struct Emitter {
     /// first use.
     u64: Option<u32>,
     layout: Layout,
+    stage: Stage,
+    header: Option<crate::header::Header>,
     memory: memory::Memory,
+    io: io::Io,
+    frag_colors: u32,
     push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
     banks: BTreeMap<u8, u32>,
@@ -239,7 +252,16 @@ impl Emitter {
         });
         let function = Function::new(&mut module, void, function_type);
         let entry = function.id;
-        module.execution_mode(entry, execution::LOCAL_SIZE, &workgroup);
+        match layout.stage {
+            Stage::Compute => module.execution_mode(entry, execution::LOCAL_SIZE, &workgroup),
+            Stage::Fragment => {
+                module.execution_mode(entry, execution::ORIGIN_UPPER_LEFT, &[]);
+                if layout.header.is_some_and(|header| header.writes_depth) {
+                    module.execution_mode(entry, execution::DEPTH_REPLACING, &[]);
+                }
+            }
+            _ => {}
+        }
         Self {
             module,
             function,
@@ -256,7 +278,11 @@ impl Emitter {
             uniform: false,
             u64: None,
             layout: *layout,
+            stage: layout.stage,
+            header: layout.header,
             memory: memory::Memory::default(),
+            io: io::Io::default(),
+            frag_colors: 0,
             push_fields: 0,
             banks: BTreeMap::new(),
             bank_block: None,
@@ -279,20 +305,35 @@ impl Emitter {
             0
         };
         self.module.memory_model(addressing, 1);
-        // Compute programs are alone in their pipeline: stage slot 0.
-        self.assign_bindings(0);
+        // Each stage's bindings start at its slot times MAX_DESCRIPTORS;
+        // compute programs are alone in their pipeline.
+        let slot = match self.stage {
+            Stage::Vertex | Stage::Compute => 0,
+            Stage::TessControl => 1,
+            Stage::TessEval => 2,
+            Stage::Geometry => 3,
+            Stage::Fragment => 4,
+            Stage::Task => 5,
+            Stage::Mesh => 6,
+        };
+        self.assign_bindings(slot * MAX_DESCRIPTORS);
         self.function.finish(&mut self.module);
+        let model = match self.stage {
+            Stage::Vertex => execution::VERTEX,
+            Stage::Fragment => execution::FRAGMENT,
+            _ => execution::GL_COMPUTE,
+        };
         self.module
-            .entry_point(execution::GL_COMPUTE, self.entry, "main", &self.interface);
+            .entry_point(model, self.entry, "main", &self.interface);
         Translated {
             abi_version: ABI_VERSION,
-            stage: Stage::Compute,
+            stage: self.stage,
             spirv: self.module.finish(),
             descriptors: self.descriptors,
-            loaded_generics: 0,
-            stored_generics: 0,
-            stores: [0; 8],
-            frag_colors: 0,
+            loaded_generics: self.io.loaded_generics,
+            stored_generics: self.io.stored_generics,
+            stores: self.io.stores,
+            frag_colors: self.frag_colors,
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: Vec::new(),
             push_fields: self.push_fields,
@@ -1808,6 +1849,43 @@ impl Emitter {
                 kind,
             )?,
             Op::Tex(texture) => self.texture(index, &texture)?,
+            Op::Ald {
+                d,
+                offset,
+                vertex,
+                address,
+                count,
+                patch,
+                output,
+            } => self.attribute_load(
+                index,
+                d.0,
+                offset.0,
+                vertex.0,
+                address,
+                count,
+                patch || output,
+            )?,
+            Op::Ast {
+                data,
+                offset,
+                vertex,
+                address,
+                count,
+                patch,
+            } => self.attribute_store(index, data.0, offset.0, vertex.0, address, count, patch)?,
+            Op::Ipa {
+                d,
+                address,
+                location,
+                ..
+            } => self.interpolate(index, d.0, address, location)?,
+            Op::Kill { condition } => {
+                if self.stage != Stage::Fragment {
+                    return Err(unsupported(index, "KILL outside a fragment program"));
+                }
+                self.kill(condition)?;
+            }
             Op::Bar { mode } => {
                 if mode != 0 {
                     return Err(unsupported(index, format!("BAR mode {mode}")));
@@ -2139,6 +2217,7 @@ impl Emitter {
         self.function.emit(op::STORE, &[budget, less]);
         self.function.emit(op::BRANCH, &[header]);
         self.function.label(merge);
+        self.fragment_outputs();
         self.function.emit(op::RETURN, &[]);
         Ok(())
     }
@@ -2708,6 +2787,8 @@ mod tests {
             EXIT,
         ];
         let layout = Layout {
+            stage: Stage::Compute,
+            header: None,
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x1000),
             local_bytes: Some(0x40),
@@ -2842,6 +2923,8 @@ mod tests {
             EXIT,
         ];
         let layout = Layout {
+            stage: Stage::Compute,
+            header: None,
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x100),
             local_bytes: None,

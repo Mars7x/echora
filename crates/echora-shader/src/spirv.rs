@@ -121,6 +121,9 @@ pub mod op {
     pub const ATOMIC_XOR: u16 = 242;
     pub const ATOMIC_F_ADD: u16 = 6035;
     pub const READ_CLOCK: u16 = 5056;
+    pub const DEMOTE_TO_HELPER_INVOCATION: u16 = 5380;
+    pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+    pub const IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
     pub const GROUP_NON_UNIFORM_ALL: u16 = 334;
     pub const GROUP_NON_UNIFORM_ANY: u16 = 335;
     pub const GROUP_NON_UNIFORM_ALL_EQUAL: u16 = 336;
@@ -173,6 +176,8 @@ pub mod capability {
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
     pub const SHADER_CLOCK: u32 = 5055;
+    pub const DRAW_PARAMETERS: u32 = 4427;
+    pub const DEMOTE_TO_HELPER_INVOCATION: u32 = 5379;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
@@ -197,6 +202,8 @@ pub mod execution {
     pub const VERTEX: u32 = 0;
     pub const FRAGMENT: u32 = 4;
     pub const GL_COMPUTE: u32 = 5;
+    pub const ORIGIN_UPPER_LEFT: u32 = 7;
+    pub const DEPTH_REPLACING: u32 = 12;
     pub const LOCAL_SIZE: u32 = 17;
 }
 

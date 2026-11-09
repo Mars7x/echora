@@ -10,6 +10,7 @@ use crate::decode::{Texture, TextureOp};
 use crate::spirv::{Type, capability, glsl, op, storage};
 
 /// SPIR-V image operand bits.
+const OPERAND_BIAS: u32 = 0x1;
 const OPERAND_LOD: u32 = 0x2;
 const OPERAND_OFFSET: u32 = 0x10;
 
@@ -130,7 +131,7 @@ impl Emitter {
     }
 
     /// A vector (or scalar) of `values` of type `component`.
-    fn vector(&mut self, component: u32, values: &[u32]) -> u32 {
+    pub(super) fn vector(&mut self, component: u32, values: &[u32]) -> u32 {
         if values.len() == 1 {
             return values[0];
         }
@@ -261,6 +262,9 @@ impl Emitter {
                 .collect()
         });
         let gather = matches!(texture.op, TextureOp::Gather { .. });
+        // Only fragment programs have derivatives for an implicit level.
+        let implicit =
+            self.stage == echora_shader_abi::Stage::Fragment && matches!(texture.lod, 0 | 2);
         let coordinate = if fetch {
             if let Some(offsets) = &offsets {
                 for (n, &offset) in offsets.iter().enumerate() {
@@ -328,7 +332,16 @@ impl Emitter {
                 mask |= OPERAND_LOD;
                 operands.push(level_operand.unwrap_or_else(|| self.constant(0)));
             }
-            // A bias over level zero is that level.
+            // A fragment program samples at the implicit level, biased.
+            TextureOp::Sample if implicit => {
+                if texture.lod == 2 {
+                    mask |= OPERAND_BIAS;
+                    let bias = level_operand.unwrap_or_else(|| self.float_constant(0.0));
+                    let bias = self.value(op::BITCAST, self.f32, &[bias]);
+                    operands.push(bias);
+                }
+            }
+            // Elsewhere a bias over level zero is that level.
             TextureOp::Sample => {
                 mask |= OPERAND_LOD;
                 let lod = match level_operand {
@@ -362,13 +375,21 @@ impl Emitter {
                 )
             }
             (TextureOp::Sample, None) => self.value(
-                op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                if implicit {
+                    op::IMAGE_SAMPLE_IMPLICIT_LOD
+                } else {
+                    op::IMAGE_SAMPLE_EXPLICIT_LOD
+                },
                 vec4,
                 &image_operands(vec![sampled, coordinate]),
             ),
             (TextureOp::Sample, Some(reference)) => {
                 let value = self.value(
-                    op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+                    if implicit {
+                        op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                    } else {
+                        op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                    },
                     self.f32,
                     &image_operands(vec![sampled, coordinate, reference]),
                 );

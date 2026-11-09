@@ -89,6 +89,25 @@ offsets for a sample, so a sample adds the offsets divided by the
 level's size to its coordinates; a fetch adds them to its integer
 coordinates, and a gather passes them on.
 
+**Graphics programs.** A graphics program is a 128-byte header (the
+first 0x50 bytes the shader program header, SPH: its type at bits 0-4,
+the stage at 10-13) and the code. ALD, AST and IPA address the attribute
+space: 0x6c point size, 0x70-0x7c position (the fragment coordinate in a
+fragment program, scaled back to the guest's resolution by the push
+constants' inverse resolution scale), 0x80 + 16n generic vector n,
+0x2f8 and 0x2fc the instance and vertex ids (without the draw's base).
+Generic vectors between stages are `vec4`s at location n; a fragment
+input's interpolation comes from the SPH's input map (two bits per
+component: constant, perspective, screen-linear), centroid from IPA.
+Vertex inputs are fetched by the program from its vertex buffers through
+the page table, by a per-draw table of addresses, strides and formats
+(to be defined), so translations do not depend on attribute formats. A
+fragment program leaves its outputs in R0.. at exit: four registers per
+render target the SPH enables (four component bits each at bits
+576-607), then a register for the sample mask (bit 608) and the depth
+(bit 609). KILL demotes the invocation to a helper. `stores` has bit
+(address / 4) set for every attribute word written.
+
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
 exact: the nearest result's error is computed without rounding (two-sum
@@ -168,6 +187,9 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
 | TEX, TLD.SCR, TLD4, TXQ | 0xb60, 0xb66, 0xb63, 0xb6f | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76, depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
+| ALD, AST | 0x321, 0x322 | address 40-49, words 74-75 (plus one), index register 24, vertex register 32 (ALD) or 64 (AST), patch 76, ALD output 79; AST data 32 |
+| IPA | 0x326 | address 64-71 (× 4), location 76-77 (default, centroid, offset), mode 78-79 (interpolated, constant), offset register 32 |
+| KILL | 0x95b | condition 87-90 |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |

@@ -8,7 +8,9 @@
 //! local accesses outside their array do the same. Accesses are naturally
 //! aligned and at most 16 bytes, so none crosses a page.
 
-use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE, PUSH_PAGE_TABLE, PUSH_PAGE_TABLE_OFFSET};
+use echora_shader_abi::{
+    PAGE_SHIFT, PAGE_SIZE, PUSH_PAGE_TABLE, PUSH_PAGE_TABLE_OFFSET, PUSH_RESOLUTION_SCALE_OFFSET,
+};
 
 use super::{Emitter, unsupported};
 use crate::decode::{Address, Pred, Space};
@@ -45,7 +47,7 @@ fn words(size: u8) -> Option<u32> {
 
 impl Emitter {
     /// Runs `body` only when the boolean value `condition` holds.
-    fn when(
+    pub(super) fn when(
         &mut self,
         condition: u32,
         body: impl FnOnce(&mut Self) -> Result<(), Unsupported>,
@@ -249,46 +251,56 @@ impl Emitter {
 
     /// The push-constant block's page-table fields: the table's device
     /// address, its first page and its page count (as 64-bit values).
-    fn page_table(&mut self) -> (u32, u32, u32) {
-        let u64 = self.u64();
-        let variable = match self.memory.push_constants {
-            Some(variable) => variable,
-            None => {
-                let block = self.module.ty(Type::Struct {
-                    members: vec![u64, self.u32, self.u32],
-                });
-                self.module.decorate(block, decoration::BLOCK, &[]);
-                for (member, offset) in [0, 8, 12].into_iter().enumerate() {
-                    self.module.member_decorate(
-                        block,
-                        member as u32,
-                        decoration::OFFSET,
-                        &[PUSH_PAGE_TABLE_OFFSET + offset],
-                    );
-                }
-                let pointer = self.module.pointer(storage::PUSH_CONSTANT, block);
-                let variable = self.module.global_variable(pointer, storage::PUSH_CONSTANT);
-                self.interface.push(variable);
-                self.memory.push_constants = Some(variable);
-                self.push_fields |= echora_shader_abi::PUSH_PAGE_TABLE;
-                variable
-            }
-        };
-        let mut fields = [0; 3];
-        for (member, field) in fields.iter_mut().enumerate() {
-            let ty = if member == 0 { u64 } else { self.u32 };
-            let pointer = self.module.pointer(storage::PUSH_CONSTANT, ty);
-            let member = self.constant(member as u32);
-            let element = self.value(op::ACCESS_CHAIN, pointer, &[variable, member]);
-            let value = self.value(op::LOAD, ty, &[element]);
-            *field = if ty == u64 {
-                value
-            } else {
-                self.widen(value, false)
-            };
+    /// The push-constant block: the resolution scale (a vec4 at 96, member
+    /// 0) and the page table (its address as two words, the first page and
+    /// the page count, at 112; members 1-4). Declared once, whole; a
+    /// program reports the fields it reads in `push_fields`.
+    pub(super) fn push_block(&mut self) -> u32 {
+        if let Some(variable) = self.memory.push_constants {
+            return variable;
         }
-        debug_assert_ne!(self.push_fields & PUSH_PAGE_TABLE, 0);
-        (fields[0], fields[1], fields[2])
+        let vec4 = self.module.ty(Type::Vector {
+            component: self.f32,
+            count: 4,
+        });
+        let block = self.module.ty(Type::Struct {
+            members: vec![vec4, self.u32, self.u32, self.u32, self.u32],
+        });
+        self.module.decorate(block, decoration::BLOCK, &[]);
+        let offsets = [
+            PUSH_RESOLUTION_SCALE_OFFSET,
+            PUSH_PAGE_TABLE_OFFSET,
+            PUSH_PAGE_TABLE_OFFSET + 4,
+            PUSH_PAGE_TABLE_OFFSET + 8,
+            PUSH_PAGE_TABLE_OFFSET + 12,
+        ];
+        for (member, offset) in offsets.into_iter().enumerate() {
+            self.module
+                .member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
+        }
+        let pointer = self.module.pointer(storage::PUSH_CONSTANT, block);
+        let variable = self.module.global_variable(pointer, storage::PUSH_CONSTANT);
+        self.interface.push(variable);
+        self.memory.push_constants = Some(variable);
+        variable
+    }
+
+    /// The push constants' page-table fields: the table's device address,
+    /// its first page and its page count (as 64-bit values).
+    fn page_table(&mut self) -> (u32, u32, u32) {
+        let variable = self.push_block();
+        self.push_fields |= PUSH_PAGE_TABLE;
+        let pointer = self.module.pointer(storage::PUSH_CONSTANT, self.u32);
+        let mut words = [0; 4];
+        for (n, word) in words.iter_mut().enumerate() {
+            let member = self.constant(n as u32 + 1);
+            let element = self.value(op::ACCESS_CHAIN, pointer, &[variable, member]);
+            *word = self.value(op::LOAD, self.u32, &[element]);
+        }
+        let address = self.join(words[0], words[1]);
+        let first = self.widen(words[2], false);
+        let count = self.widen(words[3], false);
+        (address, first, count)
     }
 
     /// A global address as a 64-bit value.

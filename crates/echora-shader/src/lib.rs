@@ -8,13 +8,14 @@
 
 pub mod compute;
 pub mod decode;
+pub mod header;
 pub mod spirv;
 
 pub use decode::{Instruction, Op, decode, decode_program};
-use echora_shader_abi::{Parameters, Translate, Translated, Unsupported};
+use echora_shader_abi::{Parameters, Stage, Translate, Translated, Unsupported};
 
 /// Bytes of the header in front of a graphics program's code.
-pub const GRAPHICS_HEADER_SIZE: usize = 128;
+pub const GRAPHICS_HEADER_SIZE: usize = header::SIZE;
 
 /// The most instructions a program may have.
 pub const MAX_INSTRUCTIONS: usize = 65536;
@@ -26,14 +27,36 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
     if let Some(stage) = parameters.stage_slot {
         return Err(whole(format!("{stage:?} stage slot")));
     }
-    if is_graphics(program) {
-        return Err(whole("graphics stages are not translated yet".into()));
+    if let Some(header) = header::parse(program) {
+        if !matches!(header.stage, Stage::Vertex | Stage::Fragment) {
+            return Err(whole(format!(
+                "{:?} programs are not translated yet",
+                header.stage
+            )));
+        }
+        let code = program_code(&program[GRAPHICS_HEADER_SIZE.min(program.len())..])?;
+        let layout = compute::Layout {
+            stage: header.stage,
+            header: Some(header),
+            workgroup: [1, 1, 1],
+            shared_bytes: None,
+            local_bytes: parameters.local_memory_size,
+        };
+        // Offsets in errors are from the program's start.
+        return compute::translate(&code, &layout).map_err(|mut error| {
+            error.offset = error
+                .offset
+                .map(|offset| offset + GRAPHICS_HEADER_SIZE as u32);
+            error
+        });
     }
     let workgroup = parameters
         .workgroup_size
         .ok_or_else(|| whole("compute program without a workgroup size".into()))?;
     let code = program_code(program)?;
     let layout = compute::Layout {
+        stage: Stage::Compute,
+        header: None,
         workgroup,
         shared_bytes: parameters.shared_memory_size,
         local_bytes: parameters.local_memory_size,
@@ -51,17 +74,12 @@ fn whole(reason: String) -> Unsupported {
     }
 }
 
-/// Whether `program` starts with a graphics header (SPH): its first word
-/// names a VTG or pixel header (bits 0-4: 1 or 2) and a shader type (bits
-/// 10-13: 1 vertex, 3 tessellation evaluation, 4 geometry, 5 pixel). A
-/// compute program starts with an instruction, whose guard bits (12-14)
-/// make that type field 12 or more for any instruction guarded by PT.
+/// Whether `program` starts with a graphics header (SPH): a VTG or pixel
+/// header with a known stage. A compute program starts with an
+/// instruction, whose guard bits (12-14) make the header's shader type
+/// field 12 or more for any instruction guarded by PT.
 pub fn is_graphics(program: &[u8]) -> bool {
-    let Some(&first) = program.first_chunk::<4>() else {
-        return false;
-    };
-    let word = u32::from_le_bytes(first);
-    matches!(word & 0x1f, 1 | 2) && matches!((word >> 10) & 0xf, 1 | 3 | 4 | 5)
+    header::is_graphics(program)
 }
 
 /// The program's instructions, up to the unconditional EXIT that no earlier
@@ -97,7 +115,7 @@ pub fn program_code(program: &[u8]) -> Result<Vec<Instruction>, Unsupported> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echora_shader_abi::Stage;
+    use echora_shader_abi::PUSH_RESOLUTION_SCALE;
 
     const EXIT: u128 = 0x794d | 0x7000;
     const MOV_R1_5: u128 = 0x7802 | (1 << 16) | (5 << 32);
@@ -130,12 +148,180 @@ mod tests {
         }
     }
 
+    /// A word with `fields` (bit offset, width, value) set and a PT guard.
+    fn word(fields: &[(u32, u32, u128)]) -> u128 {
+        let mut raw = 7u128 << 12;
+        for &(offset, _, value) in fields {
+            raw |= value << offset;
+        }
+        raw
+    }
+
+    /// A 128-byte header: `sph_type`, `shader_type`, and bits set at the
+    /// given positions.
+    fn header(sph_type: u32, shader_type: u32, set: &[usize]) -> Vec<u8> {
+        let mut bytes = vec![0u8; GRAPHICS_HEADER_SIZE];
+        let first = sph_type | shader_type << 10;
+        bytes[..4].copy_from_slice(&first.to_le_bytes());
+        for &bit in set {
+            bytes[bit / 8] |= 1 << (bit % 8);
+        }
+        bytes
+    }
+
+    fn validated(program: &[u8]) -> Translated {
+        let translated = translate(program, &Parameters::default()).unwrap();
+        if let Some(problem) = spirv::tests::validate(&translated.spirv) {
+            panic!("{problem}");
+        }
+        translated
+    }
+
+    #[test]
+    fn a_vertex_program_writes_position_and_generics() {
+        let mut program = header(1, 1, &[]);
+        program.extend(bytes(&[
+            // ALD R0, a[0x2fc] (vertex id); I2F R1, R0
+            word(&[
+                (0, 12, 0x321),
+                (16, 8, 0),
+                (24, 8, 255),
+                (32, 8, 255),
+                (40, 10, 0x2fc),
+            ]),
+            word(&[
+                (0, 12, 0x306),
+                (16, 8, 1),
+                (32, 8, 0),
+                (75, 2, 2),
+                (84, 2, 2),
+            ]),
+            // AST a[0x70], R0..R3 (4 words); AST a[0x90], R1 (generic 1.x)
+            word(&[
+                (0, 12, 0x322),
+                (24, 8, 255),
+                (32, 8, 0),
+                (40, 10, 0x70),
+                (64, 8, 255),
+                (74, 2, 3),
+            ]),
+            word(&[
+                (0, 12, 0x322),
+                (24, 8, 255),
+                (32, 8, 1),
+                (40, 10, 0x90),
+                (64, 8, 255),
+            ]),
+            EXIT,
+        ]));
+        let translated = validated(&program);
+        assert_eq!(translated.stage, Stage::Vertex);
+        assert_eq!(translated.stored_generics, 1 << 1);
+        // Position x..w (words 28-31) and generic 1.x (word 36).
+        assert_eq!(translated.stores[0], 0xf << 28 | 1 << 36);
+        // A generic vertex input waits for the vertex fetch table.
+        let mut program = header(1, 1, &[]);
+        program.extend(bytes(&[
+            word(&[
+                (0, 12, 0x321),
+                (16, 8, 0),
+                (24, 8, 255),
+                (32, 8, 255),
+                (40, 10, 0x80),
+            ]),
+            EXIT,
+        ]));
+        let error = translate(&program, &Parameters::default()).unwrap_err();
+        assert!(error.reason.contains("vertex fetch"), "{}", error.reason);
+        assert_eq!(error.offset, Some(GRAPHICS_HEADER_SIZE as u32));
+    }
+
+    #[test]
+    fn a_fragment_program_interpolates_samples_and_writes_targets() {
+        // Generic 0 perspective (x, y), generic 1 flat (x); render target
+        // 0 all four components and depth.
+        let mut set = vec![
+            192 + 1,
+            192 + 2 * 2 + 1,
+            192 + 4 * 2,
+            576,
+            577,
+            578,
+            579,
+            609,
+        ];
+        set.sort_unstable();
+        let mut program = header(2, 5, &set);
+        program.extend(bytes(&[
+            // IPA R4, a[0x80]; IPA.CENTROID R5, a[0x84]; IPA R6, a[0x90]
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, 4),
+                (32, 8, 255),
+                (64, 8, 0x20),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, 5),
+                (32, 8, 255),
+                (64, 8, 0x21),
+                (76, 2, 1),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, 6),
+                (32, 8, 255),
+                (64, 8, 0x24),
+                (78, 2, 1),
+                (81, 3, 7),
+            ]),
+            // IPA R7, a[0x70] (frag coord x)
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, 7),
+                (32, 8, 255),
+                (64, 8, 0x1c),
+                (81, 3, 7),
+            ]),
+            // TEX R0, R4, R5, 2D, 0xf (implicit level), c[2][0x20]
+            word(&[
+                (0, 12, 0xb60),
+                (16, 8, 0),
+                (24, 8, 4),
+                (32, 8, 5),
+                (40, 14, 8),
+                (54, 5, 2),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 0xf),
+                (81, 3, 7),
+            ]),
+            // @P0 KILL; MOV R5, R7 (the depth after the sample mask slot)
+            word(&[(0, 12, 0x95b), (12, 4, 0), (87, 3, 7)]),
+            word(&[(0, 12, 0x202), (16, 8, 5), (32, 8, 7)]),
+            EXIT,
+        ]));
+        let translated = validated(&program);
+        assert_eq!(translated.stage, Stage::Fragment);
+        assert_eq!(translated.frag_colors, 1);
+        assert_eq!(translated.loaded_generics, 0b11);
+        assert_eq!(translated.push_fields, PUSH_RESOLUTION_SCALE);
+        // Fragment bindings start at slot 4.
+        let texture = translated.descriptors[0];
+        assert_eq!(
+            (texture.binding, texture.cbuf_index, texture.cbuf_offset),
+            (4 * compute::MAX_DESCRIPTORS, 2, 0x20)
+        );
+    }
+
     #[test]
     fn graphics_and_endless_programs_are_unsupported() {
-        let mut header = vec![0u8; GRAPHICS_HEADER_SIZE];
-        header[..4].copy_from_slice(&(2u32 | (5 << 10)).to_le_bytes());
-        assert!(is_graphics(&header));
-        assert!(translate(&header, &Parameters::default()).is_err());
+        // A geometry program is not translated yet.
+        let geometry = header(1, 4, &[]);
+        assert!(is_graphics(&geometry));
+        assert!(translate(&geometry, &Parameters::default()).is_err());
         assert!(program_code(&bytes(&[MOV_R1_5, NOP])).is_err());
         let no_size = translate(&bytes(&[EXIT]), &Parameters::default());
         assert!(no_size.unwrap_err().reason.contains("workgroup"));

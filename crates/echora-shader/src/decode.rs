@@ -459,6 +459,43 @@ pub enum Op {
         operation: u8,
         kind: u8,
     },
+    /// ALD d, a[offset + address]: `count` (bits 74-75, plus one) words of
+    /// the attribute space from byte `address` (40-49); `vertex` (32)
+    /// picks the vertex in stages with several, `patch` (76) per-patch
+    /// attributes and `output` (79) reads this stage's outputs.
+    Ald {
+        d: Reg,
+        offset: Reg,
+        vertex: Reg,
+        address: u16,
+        count: u8,
+        patch: bool,
+        output: bool,
+    },
+    /// AST a[offset + address], data: as ALD, a store.
+    Ast {
+        data: Reg,
+        offset: Reg,
+        vertex: Reg,
+        address: u16,
+        count: u8,
+        patch: bool,
+    },
+    /// IPA d, a[address]: a fragment input interpolated at `location`
+    /// (76-77: 0 the default, 1 centroid, 2 an offset in register
+    /// `offset`), `mode` (78-79: 0 interpolated, 1 constant).
+    Ipa {
+        d: Reg,
+        address: u16,
+        location: u8,
+        mode: u8,
+        offset: Reg,
+    },
+    /// KILL: where `condition` (87-90) holds, the invocation stops
+    /// writing (becomes a helper).
+    Kill {
+        condition: Pred,
+    },
     /// TEX, TLD.SCR, TLD4 and TXQ with a handle in a constant bank.
     Tex(Texture),
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
@@ -1027,6 +1064,41 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 mask: word.bits(72, 4) as u8,
                 half: word.bit(79),
             }));
+        }
+        0x321 => {
+            return Some(Op::Ald {
+                d,
+                offset: word.reg(24),
+                vertex: word.reg(32),
+                address: word.bits(40, 10) as u16,
+                count: word.bits(74, 2) as u8 + 1,
+                patch: word.bit(76),
+                output: word.bit(79),
+            });
+        }
+        0x322 => {
+            return Some(Op::Ast {
+                data: word.reg(32),
+                offset: word.reg(24),
+                vertex: word.reg(64),
+                address: word.bits(40, 10) as u16,
+                count: word.bits(74, 2) as u8 + 1,
+                patch: word.bit(76),
+            });
+        }
+        0x326 => {
+            return Some(Op::Ipa {
+                d,
+                address: word.bits(64, 8) as u16 * 4,
+                location: word.bits(76, 2) as u8,
+                mode: word.bits(78, 2) as u8,
+                offset: word.reg(32),
+            });
+        }
+        0x95b => {
+            return Some(Op::Kill {
+                condition: word.pred(87, 90),
+            });
         }
         0xb1d => {
             return Some(Op::Bar {
