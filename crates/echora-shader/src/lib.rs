@@ -7,6 +7,7 @@
 //! and translates no program yet, so every program still goes to Lichii.
 
 pub mod decode;
+pub mod spirv;
 
 pub use decode::{Instruction, Op, decode, decode_program};
 use echora_shader_abi::{Parameters, Translate, Translated, Unsupported};
