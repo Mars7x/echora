@@ -123,3 +123,17 @@ instead of a bank. The layouts were cross-checked against NAK's encoder.
 | S2R | 0x919 | special register 72-79 |
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
 | EXIT, NOP | 0x94d, 0x918 | |
+| IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
+| IMAD.WIDE | 0x025 in forms 1-7 | signed 73; C a register pair |
+| LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
+| SHF | 0x019 in forms 1-7 | type 73-74 (S64, U64, S32, U32), wrap 75, right 76, high word 80 |
+| PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74; SGXT signed 73, wrap 75 |
+| SEL, FSEL | 0x007, 0x008 | condition 87-90 |
+| FMNMX, IMNMX | 0x009, 0x017 | minimum when the predicate at 87-90 holds; IMNMX signed 73 |
+| MUFU | 0x108 | function 74-79, f16 73; SIN and COS take turns |
+| F2I, I2F, I2FP, FRND | 0x105, 0x106, 0x045, 0x107 | sizes 75-76 and 84-85 (log2 bytes), rounding 78-79, F2I signed 72, I2F 74 |
+| FSET.BF | 0x00a | as FSETP, with 1.0 or 0.0 in a register |
+| PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71; tables 64-66 with 72-76, and 16-23 |
+| CS2R | 0x805 | special register 72-79 (255 SRZ), pair 80 |
+| LDC, ULDC | 0xb82, 0xab9 | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
+| BSSY, BSYNC, DEPBAR | 0x945, 0x941, 0x91a | no effect per invocation |

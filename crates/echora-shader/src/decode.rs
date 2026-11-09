@@ -106,8 +106,9 @@ pub enum Op {
         d: Reg,
         src: Src,
     },
-    /// IADD3 d, a, b, c, with up to two carry outputs and two carry
-    /// inputs (`.X`).
+    /// IADD3 d, a, b, c, with up to two carry outputs. Without `.X`
+    /// (`extended`, bit 74) a negated source is its two's complement; with
+    /// it, its bitwise inverse, and the two carry inputs are added.
     Iadd3 {
         d: Reg,
         a: Operand,
@@ -115,6 +116,7 @@ pub enum Op {
         c: Operand,
         carry_out: [Pred; 2],
         carry_in: [Pred; 2],
+        extended: bool,
     },
     /// IMAD d, a, b, c: the low word of a * b + c.
     Imad {
@@ -123,6 +125,170 @@ pub enum Op {
         b: Operand,
         c: Operand,
     },
+    /// IMAD.WIDE d:d+1, a, b, c:c+1: the 64-bit a * b + c, the factors
+    /// `signed` (bit 73) or not.
+    ImadWide {
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        c: Operand,
+        signed: bool,
+    },
+    /// LEA d, a, b (and c with `.HI`): (a << shift) + b; with `high`
+    /// (`.HI`, bit 80) the shifted value is the high word of c:a << shift.
+    /// `negate_shifted` (bit 72) negates the shifted value (its inverse
+    /// with `.X`); `.X` (`extended`, bit 74) adds `carry_in`; `overflow`
+    /// receives the carry out.
+    Lea {
+        d: Reg,
+        a: Reg,
+        b: Operand,
+        c: Operand,
+        shift: u8,
+        high: bool,
+        negate_shifted: bool,
+        extended: bool,
+        overflow: u8,
+        carry_in: Pred,
+    },
+    /// SHF d, low, shift, high: the 64-bit funnel high:low shifted left or
+    /// `right`, its low word or, with `high_word`, its high word. `kind`
+    /// (bits 73-74): 0 signed 64-bit, 1 unsigned 64-bit, 2 signed 32-bit,
+    /// 3 unsigned 32-bit; the shift wraps (`wrap`) or clamps at that width.
+    Shf {
+        d: Reg,
+        low: Reg,
+        shift: Operand,
+        high: Operand,
+        kind: u8,
+        wrap: bool,
+        right: bool,
+        high_word: bool,
+    },
+    /// PRMT d, a, selector, c: bytes of c:a picked by the selector's
+    /// nibbles (bit 3 of a nibble replicates the byte's sign); `mode` (bits
+    /// 72-74) 0 is that indexed form.
+    Prmt {
+        d: Reg,
+        a: Reg,
+        selector: Operand,
+        c: Operand,
+        mode: u8,
+    },
+    /// SGXT d, a, bits: the low `bits` bits of a, sign-extended if
+    /// `signed`.
+    Sgxt {
+        d: Reg,
+        a: Reg,
+        bits: Operand,
+        signed: bool,
+        wrap: bool,
+    },
+    /// SEL / FSEL d, a, b, condition: a if the condition holds, else b
+    /// (FSEL, `float`, applies the float modifiers first).
+    Sel {
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        condition: Pred,
+        float: bool,
+    },
+    /// FMNMX d, a, b, min: the minimum if `min` holds, else the maximum (a
+    /// NaN loses to a number).
+    Fmnmx {
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        min: Pred,
+    },
+    /// IMNMX d, a, b, min, as FMNMX for integers.
+    Imnmx {
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        min: Pred,
+        signed: bool,
+    },
+    /// MUFU d, src: `function` (bits 74-79) 0 cos, 1 sin (of turns), 2
+    /// exp2, 3 log2, 4 reciprocal, 5 reciprocal square root, 6/7 their
+    /// 64-bit high-word forms, 8 square root, 9 tanh.
+    Mufu {
+        d: Reg,
+        function: u8,
+        src: Operand,
+    },
+    /// F2I d, src: float to integer of `dst_size` (bits 75-76, log2 bytes)
+    /// from `src_size` (84-85), `signed` (72), rounded by `rounding`.
+    F2i {
+        d: Reg,
+        src: Operand,
+        signed: bool,
+        dst_size: u8,
+        src_size: u8,
+        rounding: u8,
+    },
+    /// I2F / I2FP.F32 d, src: integer (`signed`, bit 74) to float, sizes
+    /// as F2I.
+    I2f {
+        d: Reg,
+        src: Operand,
+        signed: bool,
+        dst_size: u8,
+        src_size: u8,
+        rounding: u8,
+    },
+    /// FRND d, src: rounded to an integral float by `rounding`.
+    Frnd {
+        d: Reg,
+        src: Operand,
+        rounding: u8,
+        dst_size: u8,
+        src_size: u8,
+    },
+    /// FSET.BF d, a, b, acc: 1.0 if (a cmp b) combine acc, else 0.0.
+    Fset {
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        compare: FloatCompare,
+        combine: Combine,
+        accumulate: Pred,
+    },
+    /// PLOP3.LUT p, q, a, b, c: two functions of three predicates.
+    Plop3 {
+        p: u8,
+        q: u8,
+        srcs: [Pred; 3],
+        luts: [u8; 2],
+    },
+    /// CS2R d, special (`wide`: a register pair); 255 is SRZ (zero).
+    Cs2r {
+        d: Reg,
+        special: u8,
+        wide: bool,
+    },
+    /// LDC d, c[bank][index + offset], `size` the memory type (bits 73-75:
+    /// 4 a word, 5 a pair), `mode` (78-79) 0 for one bank.
+    Ldc {
+        d: Reg,
+        index: Reg,
+        bank: u8,
+        offset: u16,
+        size: u8,
+        mode: u8,
+    },
+    /// ULDC d, constant: a uniform register (pair with `size` 5).
+    Uldc {
+        d: UniformReg,
+        src: Src,
+        size: u8,
+    },
+    /// BSSY and BSYNC (convergence barriers) and DEPBAR (scoreboard
+    /// waits): nothing for a translation that runs each invocation on its
+    /// own.
+    Bssy,
+    Bsync,
+    Depbar,
     /// LOP3.LUT d, a, b, c, lut: any function of three inputs by its truth
     /// table; `p`, unless PT, receives whether the result is nonzero.
     Lop3 {
@@ -418,6 +584,58 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         }
         0x94d => return Some(Op::Exit),
         0x918 => return Some(Op::Nop),
+        0x945 => return Some(Op::Bssy),
+        0x941 => return Some(Op::Bsync),
+        0x91a => return Some(Op::Depbar),
+        0x81c => {
+            // The second function's table sits where a destination would.
+            return Some(Op::Plop3 {
+                p: word.bits(81, 3) as u8,
+                q: word.bits(84, 3) as u8,
+                srcs: [word.pred(87, 90), word.pred(77, 80), word.pred(68, 71)],
+                luts: [
+                    (word.bits(64, 3) | word.bits(72, 5) << 3) as u8,
+                    word.bits(16, 8) as u8,
+                ],
+            });
+        }
+        0x805 => {
+            return Some(Op::Cs2r {
+                d,
+                special: word.bits(72, 8) as u8,
+                wide: word.bit(80),
+            });
+        }
+        0xb82 => {
+            return Some(Op::Ldc {
+                d,
+                index: word.reg(24),
+                bank: word.bits(54, 5) as u8,
+                offset: word.bits(38, 16) as u16,
+                size: word.bits(73, 3) as u8,
+                mode: word.bits(78, 2) as u8,
+            });
+        }
+        0xab9 => {
+            let offset = word.bits(38, 16) as u16;
+            // Bindless: the handle in the uniform register at 24.
+            let src = if word.bit(91) {
+                Src::BindlessConst {
+                    handle: UniformReg(word.bits(24, 6) as u8),
+                    offset,
+                }
+            } else {
+                Src::Const {
+                    bank: word.bits(54, 5) as u8,
+                    offset,
+                }
+            };
+            return Some(Op::Uldc {
+                d: UniformReg(word.bits(16, 6) as u8),
+                src,
+                size: word.bits(73, 3) as u8,
+            });
+        }
         _ => {}
     }
     Some(match opcode & 0x1ff {
@@ -435,6 +653,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 ..pred
             }),
             carry_in: [word.pred(87, 90), word.pred(77, 80)],
+            extended: word.bit(74),
         },
         0x024 if (1..=7).contains(&form) => Op::Imad {
             d,
@@ -446,7 +665,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             d,
             a: word.reg(24),
             b: word.source(1)?,
-            c: word.source(2)?,
+            c: plain(word.source(2)?),
             lut: word.bits(72, 8) as u8,
             p: Pred {
                 index: word.bits(81, 3) as u8,
@@ -499,8 +718,128 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             accumulate: word.pred(87, 90),
             extended: word.bit(72).then(|| word.pred(68, 71)),
         },
+        0x025 if (1..=7).contains(&form) => Op::ImadWide {
+            d,
+            a: word.a(),
+            b: word.source(1)?,
+            c: word.source(2)?,
+            signed: word.bit(73),
+        },
+        0x011 if (1..=7).contains(&form) => {
+            let mut b = word.source(1)?;
+            // Bits 74-79 are .X and the shift, not the C slot's modifiers
+            // (where B sits in the C slot).
+            if matches!(form, 2 | 3 | 7) {
+                b.neg = false;
+            }
+            // Bits 74 and 75 are .X and the shift, not C's modifiers.
+            let c = plain(word.source(2)?);
+            Op::Lea {
+                d,
+                a: word.reg(24),
+                b,
+                c,
+                shift: word.bits(75, 5) as u8,
+                high: word.bit(80),
+                negate_shifted: word.bit(72),
+                extended: word.bit(74),
+                overflow: word.bits(81, 3) as u8,
+                carry_in: word.pred(87, 90),
+            }
+        }
+        0x019 if (1..=7).contains(&form) => Op::Shf {
+            d,
+            low: word.reg(24),
+            shift: word.source(1)?,
+            high: plain(word.source(2)?),
+            kind: word.bits(73, 2) as u8,
+            wrap: word.bit(75),
+            right: word.bit(76),
+            high_word: word.bit(80),
+        },
+        0x016 if (1..=7).contains(&form) => Op::Prmt {
+            d,
+            a: word.reg(24),
+            selector: word.source(1)?,
+            c: plain(word.source(2)?),
+            mode: word.bits(72, 3) as u8,
+        },
+        0x01a if matches!(form, 1 | 4 | 5 | 6) => Op::Sgxt {
+            d,
+            a: word.reg(24),
+            bits: word.source(1)?,
+            signed: word.bit(73),
+            wrap: word.bit(75),
+        },
+        0x007 | 0x008 if matches!(form, 1 | 4 | 5 | 6) => Op::Sel {
+            d,
+            a: word.a(),
+            b: word.source(1)?,
+            condition: word.pred(87, 90),
+            float: opcode & 0x1ff == 0x008,
+        },
+        0x009 if matches!(form, 1 | 4 | 5 | 6) => Op::Fmnmx {
+            d,
+            a: word.a(),
+            b: word.source(1)?,
+            min: word.pred(87, 90),
+        },
+        0x017 if matches!(form, 1 | 4 | 5 | 6) => Op::Imnmx {
+            d,
+            a: word.a(),
+            b: word.source(1)?,
+            min: word.pred(87, 90),
+            signed: word.bit(73),
+        },
+        // Bit 73 selects half precision, not translated yet.
+        0x108 if matches!(form, 1 | 4 | 5 | 6) && !word.bit(73) => Op::Mufu {
+            d,
+            function: word.bits(74, 6) as u8,
+            src: word.source(1)?,
+        },
+        0x105 if matches!(form, 1 | 4 | 5 | 6) => Op::F2i {
+            d,
+            src: word.source(1)?,
+            signed: word.bit(72),
+            dst_size: word.bits(75, 2) as u8,
+            src_size: word.bits(84, 2) as u8,
+            rounding: word.bits(78, 2) as u8,
+        },
+        0x106 | 0x045 if matches!(form, 1 | 4 | 5 | 6) => Op::I2f {
+            d,
+            src: word.source(1)?,
+            signed: word.bit(74),
+            dst_size: word.bits(75, 2) as u8,
+            src_size: word.bits(84, 2) as u8,
+            rounding: word.bits(78, 2) as u8,
+        },
+        0x107 if matches!(form, 1 | 4 | 5 | 6) => Op::Frnd {
+            d,
+            src: word.source(1)?,
+            rounding: word.bits(78, 2) as u8,
+            dst_size: word.bits(75, 2) as u8,
+            src_size: word.bits(84, 2) as u8,
+        },
+        0x00a if matches!(form, 1 | 4 | 5 | 6) => Op::Fset {
+            d,
+            a: word.a(),
+            b: word.source(1)?,
+            compare: float_compare(word.bits(76, 4)),
+            combine: word.combine()?,
+            accumulate: word.pred(87, 90),
+        },
         _ => return None,
     })
+}
+
+/// An operand without float modifiers, for operations whose modifier bits
+/// mean something else.
+fn plain(operand: Operand) -> Operand {
+    Operand {
+        abs: false,
+        neg: false,
+        ..operand
+    }
 }
 
 fn float_compare(bits: u64) -> FloatCompare {
@@ -682,6 +1021,121 @@ mod tests {
             panic!("FADD")
         };
         assert_eq!(b.src, Src::Imm(0x4000_0000));
+    }
+
+    #[test]
+    fn address_shift_and_predicate_logic_fields() {
+        // LEA.HI.X R6, R1, R4, R2, 0x2, P2
+        let raw = word(&[
+            (0, 12, 0x211),
+            (16, 8, 6),
+            (24, 8, 1),
+            (32, 8, 4),
+            (64, 8, 2),
+            (74, 1, 1),
+            (75, 5, 2),
+            (80, 1, 1),
+            (81, 3, 7),
+            (87, 3, 2),
+        ]);
+        let Op::Lea {
+            d,
+            a,
+            b,
+            c,
+            shift,
+            high,
+            extended,
+            overflow,
+            carry_in,
+            ..
+        } = decode(raw).op
+        else {
+            panic!("LEA")
+        };
+        assert_eq!((d, a, b, c), (Reg(6), Reg(1), reg(4), reg(2)));
+        assert_eq!((shift, high, extended, overflow), (2, true, true, 7));
+        assert_eq!(carry_in.index, 2);
+        // SHF.R.S32.HI R12, RZ, 0x1f, R1
+        let raw = word(&[
+            (0, 12, 0x819),
+            (16, 8, 12),
+            (24, 8, 255),
+            (32, 32, 0x1f),
+            (64, 8, 1),
+            (73, 2, 2),
+            (76, 1, 1),
+            (80, 1, 1),
+        ]);
+        let Op::Shf {
+            low,
+            shift,
+            high,
+            kind,
+            right,
+            high_word,
+            wrap,
+            ..
+        } = decode(raw).op
+        else {
+            panic!("SHF")
+        };
+        assert_eq!((low, shift.src, high), (Reg::ZERO, Src::Imm(0x1f), reg(1)));
+        assert_eq!((kind, right, high_word, wrap), (2, true, true, false));
+        // PLOP3.LUT P3, P4, P0, P1, PT, 0x80, 0x8: the first table split
+        // over bits 64-66 and 72-76, the second in the destination field.
+        let raw = word(&[
+            (0, 12, 0x81c),
+            (16, 8, 0x08),
+            (64, 3, 0),
+            (72, 5, 0x10),
+            (81, 3, 3),
+            (84, 3, 4),
+            (87, 3, 0),
+            (77, 3, 1),
+            (68, 3, 7),
+        ]);
+        let Op::Plop3 { p, q, srcs, luts } = decode(raw).op else {
+            panic!("PLOP3")
+        };
+        assert_eq!((p, q, luts), (3, 4, [0x80, 0x08]));
+        assert_eq!(srcs.map(|pred| pred.index), [0, 1, 7]);
+        // ULDC.64 UR4, c[0x0][0x118]
+        let raw = word(&[
+            (0, 12, 0xab9),
+            (16, 6, 4),
+            (54, 5, 0),
+            (38, 16, 0x118),
+            (73, 3, 5),
+        ]);
+        assert_eq!(
+            decode(raw).op,
+            Op::Uldc {
+                d: UniformReg(4),
+                src: Src::Const {
+                    bank: 0,
+                    offset: 0x118
+                },
+                size: 5,
+            }
+        );
+        // I2FP.F32.U32 R9, R2 decodes as I2F.
+        let raw = word(&[
+            (0, 12, 0x245),
+            (16, 8, 9),
+            (32, 8, 2),
+            (75, 2, 2),
+            (84, 2, 2),
+        ]);
+        assert!(matches!(
+            decode(raw).op,
+            Op::I2f {
+                signed: false,
+                dst_size: 2,
+                src_size: 2,
+                ..
+            }
+        ));
     }
 
     #[test]

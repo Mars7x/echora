@@ -163,6 +163,10 @@ struct Emitter {
     /// Variables of general registers and predicates, by number.
     registers: BTreeMap<u8, u32>,
     predicates: BTreeMap<u8, u32>,
+    uniform_registers: BTreeMap<u8, u32>,
+    /// The 64-bit integer type, declared (with the Int64 capability) on
+    /// first use.
+    u64: Option<u32>,
     /// Uniform buffer of each constant bank used, by bank.
     banks: BTreeMap<u8, u32>,
     /// The block type every bank's buffer shares, once declared.
@@ -204,6 +208,8 @@ impl Emitter {
             bool_ptr,
             registers: BTreeMap::new(),
             predicates: BTreeMap::new(),
+            uniform_registers: BTreeMap::new(),
+            u64: None,
             banks: BTreeMap::new(),
             bank_block: None,
             builtins: BTreeMap::new(),
@@ -282,9 +288,10 @@ impl Emitter {
     }
 
     fn read_predicate(&mut self, pred: Pred) -> u32 {
-        let value = if pred.index == 7 {
-            self.module.bool_constant(true)
-        } else {
+        if pred.index == 7 {
+            return self.module.bool_constant(!pred.negated);
+        }
+        let value = {
             let variable = self.predicate_variable(pred.index);
             self.value(op::LOAD, self.bool, &[variable])
         };
@@ -300,6 +307,206 @@ impl Emitter {
             let variable = self.predicate_variable(n);
             self.function.emit(op::STORE, &[variable, value]);
         }
+    }
+
+    /// The variable of uniform register `n` (declared, zero, on first
+    /// use).
+    fn uniform_variable(&mut self, n: u8) -> u32 {
+        if let Some(&variable) = self.uniform_registers.get(&n) {
+            return variable;
+        }
+        let zero = self.constant(0);
+        let variable = self
+            .function
+            .variable(&mut self.module, self.u32_ptr, Some(zero));
+        self.uniform_registers.insert(n, variable);
+        variable
+    }
+
+    fn read_uniform(&mut self, n: u8) -> u32 {
+        if n == 63 {
+            return self.constant(0);
+        }
+        let variable = self.uniform_variable(n);
+        self.value(op::LOAD, self.u32, &[variable])
+    }
+
+    fn write_uniform(&mut self, n: u8, value: u32) {
+        if n != 63 {
+            let variable = self.uniform_variable(n);
+            self.function.emit(op::STORE, &[variable, value]);
+        }
+    }
+
+    /// The 64-bit unsigned integer type.
+    fn u64(&mut self) -> u32 {
+        if let Some(ty) = self.u64 {
+            return ty;
+        }
+        self.module.capability(capability::INT64);
+        let ty = self.module.u64();
+        self.u64 = Some(ty);
+        ty
+    }
+
+    fn constant64(&mut self, value: u64) -> u32 {
+        let ty = self.u64();
+        self.module.constant64(ty, value)
+    }
+
+    /// A word zero- or sign-extended to 64 bits.
+    fn widen(&mut self, value: u32, signed: bool) -> u32 {
+        let ty = self.u64();
+        let opcode = if signed { op::S_CONVERT } else { op::U_CONVERT };
+        self.value(opcode, ty, &[value])
+    }
+
+    /// high:low as one 64-bit value.
+    fn join(&mut self, low: u32, high: u32) -> u32 {
+        let ty = self.u64();
+        let low = self.widen(low, false);
+        let high = self.widen(high, false);
+        let thirty_two = self.constant(32);
+        let high = self.value(op::SHIFT_LEFT_LOGICAL, ty, &[high, thirty_two]);
+        self.value(op::BITWISE_OR, ty, &[high, low])
+    }
+
+    /// The low and high words of a 64-bit value.
+    fn split(&mut self, value: u32) -> (u32, u32) {
+        let ty = self.u64();
+        let low = self.value(op::U_CONVERT, self.u32, &[value]);
+        let thirty_two = self.constant(32);
+        let high = self.value(op::SHIFT_RIGHT_LOGICAL, ty, &[value, thirty_two]);
+        let high = self.value(op::U_CONVERT, self.u32, &[high]);
+        (low, high)
+    }
+
+    /// Registers n:n+1 as a 64-bit value (RZ reads zero).
+    fn read_pair(&mut self, n: u8) -> u32 {
+        if n == 255 {
+            return self.constant64(0);
+        }
+        let low = self.read_register(n);
+        let high = self.read_register(n.saturating_add(1));
+        self.join(low, high)
+    }
+
+    fn write_pair(&mut self, n: u8, value: u32) {
+        if n == 255 {
+            return;
+        }
+        let (low, high) = self.split(value);
+        self.write_register(n, low);
+        self.write_register(n.saturating_add(1), high);
+    }
+
+    /// A 64-bit operand pair: registers, or RZ.
+    fn pair_operand(&mut self, index: usize, operand: Operand) -> Result<u32, Unsupported> {
+        match operand.src {
+            Src::Reg(reg) => Ok(self.read_pair(reg.0)),
+            _ => Err(unsupported(
+                index,
+                "64-bit operand that is not a register pair",
+            )),
+        }
+    }
+
+    /// One added term of a carry chain: the value, or with `negate` its
+    /// two's complement (`extended`: its bitwise inverse), widened.
+    fn term(&mut self, value: u32, negate: bool, extended: bool) -> u32 {
+        if !negate {
+            return self.widen(value, false);
+        }
+        let inverse = self.value(op::NOT, self.u32, &[value]);
+        let wide = self.widen(inverse, false);
+        if extended {
+            return wide;
+        }
+        let ty = self.u64();
+        let one = self.constant64(1);
+        self.value(op::I_ADD, ty, &[wide, one])
+    }
+
+    /// A predicate as a 64-bit 0 or 1.
+    fn carry(&mut self, pred: Pred) -> u32 {
+        let ty = self.u64();
+        let condition = self.read_predicate(pred);
+        let (one, zero) = (self.constant64(1), self.constant64(0));
+        self.value(op::SELECT, ty, &[condition, one, zero])
+    }
+
+    /// The sum of 64-bit terms; its low word goes to `d` and to each
+    /// carry output `outputs[i]` whether the sum reached `(i + 1) << 32`.
+    fn carry_sum(&mut self, d: u8, terms: &[u32], outputs: &[u8]) {
+        let ty = self.u64();
+        let mut sum = terms[0];
+        for &term in &terms[1..] {
+            sum = self.value(op::I_ADD, ty, &[sum, term]);
+        }
+        let (low, high) = self.split(sum);
+        self.write_register(d, low);
+        for (i, &output) in outputs.iter().enumerate() {
+            if output != 7 {
+                let bound = self.constant(i as u32 + 1);
+                let reached = self.value(op::U_GREATER_THAN_EQUAL, self.bool, &[high, bound]);
+                self.write_predicate(output, reached);
+            }
+        }
+    }
+
+    fn glsl(&mut self, ty: u32, function: u32, operands: &[u32]) -> u32 {
+        let glsl = self.module.glsl();
+        let mut all = vec![glsl, function];
+        all.extend_from_slice(operands);
+        self.value(op::EXT_INST, ty, &all)
+    }
+
+    fn float_constant(&mut self, value: f32) -> u32 {
+        self.module.constant(self.f32, value.to_bits())
+    }
+
+    fn write_float(&mut self, d: u8, value: u32) {
+        let bits = self.value(op::BITCAST, self.u32, &[value]);
+        self.write_register(d, bits);
+    }
+
+    /// `result combine accumulate`.
+    fn combined(&mut self, result: u32, combine: Combine, accumulate: Pred) -> u32 {
+        let accumulate = self.read_predicate(accumulate);
+        let opcode = match combine {
+            Combine::And => op::LOGICAL_AND,
+            Combine::Or => op::LOGICAL_OR,
+            Combine::Xor => op::LOGICAL_NOT_EQUAL,
+        };
+        self.value(opcode, self.bool, &[result, accumulate])
+    }
+
+    /// The word at byte address `address` (a value) of a bank's buffer,
+    /// zero outside the bank; `words` 1 or 2.
+    fn bank_words(&mut self, variable: u32, address: u32, words: u32) -> Vec<u32> {
+        let bytes = words * 4;
+        let limit = self.constant(BANK_SIZE - bytes);
+        let inside = self.value(op::U_LESS_THAN_EQUAL, self.bool, &[address, limit]);
+        let clamped = self.glsl(self.u32, glsl::U_MIN, &[address, limit]);
+        let pointer = self.module.pointer(storage::UNIFORM, self.u32);
+        let (member, zero) = (self.constant(0), self.constant(0));
+        let (two, four, three) = (self.constant(2), self.constant(4), self.constant(3));
+        let mut values = Vec::new();
+        for word in 0..words {
+            let offset = self.constant(word * 4);
+            let at = self.value(op::I_ADD, self.u32, &[clamped, offset]);
+            let vector = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[at, four]);
+            let component = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[at, two]);
+            let component = self.value(op::BITWISE_AND, self.u32, &[component, three]);
+            let element = self.value(
+                op::ACCESS_CHAIN,
+                pointer,
+                &[variable, member, vector, component],
+            );
+            let value = self.value(op::LOAD, self.u32, &[element]);
+            values.push(self.value(op::SELECT, self.u32, &[inside, value, zero]));
+        }
+        values
     }
 
     /// The uniform buffer of constant bank `bank`: a 64 KiB block of
@@ -382,7 +589,7 @@ impl Emitter {
             Src::Const { bank, offset } => self
                 .constant_word(bank, offset)
                 .map_err(|reason| unsupported(index, reason)),
-            Src::Uniform(_) => Err(unsupported(index, "uniform register operand")),
+            Src::Uniform(reg) => Ok(self.read_uniform(reg.0)),
             Src::BindlessConst { .. } => Err(unsupported(index, "bindless constant buffer")),
         }
     }
@@ -503,22 +710,31 @@ impl Emitter {
                 c,
                 carry_out,
                 carry_in,
+                extended,
             } => {
-                if carry_out
-                    .iter()
-                    .chain(&carry_in)
-                    .any(|pred| pred.index != 7)
-                {
-                    return Err(unsupported(index, "IADD3 with carries"));
+                let outputs = carry_out.map(|pred| pred.index);
+                if outputs == [7, 7] && !extended {
+                    let (a, b, c) = (
+                        self.signed_integer(index, a)?,
+                        self.signed_integer(index, b)?,
+                        self.signed_integer(index, c)?,
+                    );
+                    let sum = self.value(op::I_ADD, self.u32, &[a, b]);
+                    let sum = self.value(op::I_ADD, self.u32, &[sum, c]);
+                    self.write_register(d.0, sum);
+                } else {
+                    let mut terms = Vec::new();
+                    for operand in [a, b, c] {
+                        let value = self.integer(index, operand)?;
+                        terms.push(self.term(value, operand.neg, extended));
+                    }
+                    if extended {
+                        for pred in carry_in {
+                            terms.push(self.carry(pred));
+                        }
+                    }
+                    self.carry_sum(d.0, &terms, &outputs);
                 }
-                let (a, b, c) = (
-                    self.signed_integer(index, a)?,
-                    self.signed_integer(index, b)?,
-                    self.signed_integer(index, c)?,
-                );
-                let sum = self.value(op::I_ADD, self.u32, &[a, b]);
-                let sum = self.value(op::I_ADD, self.u32, &[sum, c]);
-                self.write_register(d.0, sum);
             }
             Op::Imad { d, a, b, c } => {
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
@@ -614,6 +830,383 @@ impl Emitter {
                 let value = self.builtin(builtin, component);
                 self.write_register(d.0, value);
             }
+            Op::ImadWide { d, a, b, c, signed } => {
+                let ty = self.u64();
+                let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
+                let c = self.pair_operand(index, c)?;
+                let (a, b) = (self.widen(a, signed), self.widen(b, signed));
+                let product = self.value(op::I_MUL, ty, &[a, b]);
+                let sum = self.value(op::I_ADD, ty, &[product, c]);
+                self.write_pair(d.0, sum);
+            }
+            Op::Lea {
+                d,
+                a,
+                b,
+                c,
+                shift,
+                high,
+                negate_shifted,
+                extended,
+                overflow,
+                carry_in,
+            } => {
+                let a = self.read_register(a.0);
+                let amount = self.constant(u32::from(shift));
+                let shifted = if high {
+                    let c = self.integer(index, c)?;
+                    let ty = self.u64();
+                    let joined = self.join(a, c);
+                    let amount = self.constant(32 - u32::from(shift).min(32));
+                    let wide = self.value(op::SHIFT_RIGHT_LOGICAL, ty, &[joined, amount]);
+                    self.value(op::U_CONVERT, self.u32, &[wide])
+                } else {
+                    self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[a, amount])
+                };
+                let b_value = self.integer(index, b)?;
+                if overflow == 7 && !extended && !negate_shifted && !b.neg {
+                    let sum = self.value(op::I_ADD, self.u32, &[shifted, b_value]);
+                    self.write_register(d.0, sum);
+                } else {
+                    let mut terms = vec![
+                        self.term(shifted, negate_shifted, extended),
+                        self.term(b_value, b.neg, extended),
+                    ];
+                    if extended {
+                        terms.push(self.carry(carry_in));
+                    }
+                    self.carry_sum(d.0, &terms, &[overflow]);
+                }
+            }
+            Op::Shf {
+                d,
+                low,
+                shift,
+                high,
+                kind,
+                wrap,
+                right,
+                high_word,
+            } => {
+                let ty = self.u64();
+                let width = if kind < 2 { 64 } else { 32 };
+                let signed = kind & 1 == 0;
+                let low = self.read_register(low.0);
+                let high = self.integer(index, high)?;
+                let amount = self.integer(index, shift)?;
+                let amount = if wrap {
+                    let mask = self.constant(width - 1);
+                    self.value(op::BITWISE_AND, self.u32, &[amount, mask])
+                } else {
+                    let width = self.constant(width);
+                    self.glsl(self.u32, glsl::U_MIN, &[amount, width])
+                };
+                // A shift by 64 (a clamped 64-bit shift) is done as 63 and
+                // then fixed: a signed right shift fills with the sign
+                // either way, anything else gives zero.
+                let sixty_three = self.constant(63);
+                let safe = self.glsl(self.u32, glsl::U_MIN, &[amount, sixty_three]);
+                let value = self.join(low, high);
+                let opcode = match (right, signed) {
+                    (true, true) => op::SHIFT_RIGHT_ARITHMETIC,
+                    (true, false) => op::SHIFT_RIGHT_LOGICAL,
+                    (false, _) => op::SHIFT_LEFT_LOGICAL,
+                };
+                let mut shifted = self.value(opcode, ty, &[value, safe]);
+                if width == 64 && !wrap && !(right && signed) {
+                    let sixty_four = self.constant(64);
+                    let all = self.value(op::I_EQUAL, self.bool, &[amount, sixty_four]);
+                    let zero = self.constant64(0);
+                    shifted = self.value(op::SELECT, ty, &[all, zero, shifted]);
+                }
+                let (low, high) = self.split(shifted);
+                self.write_register(d.0, if high_word { high } else { low });
+            }
+            Op::Prmt {
+                d,
+                a,
+                selector,
+                c,
+                mode,
+            } => {
+                if mode != 0 {
+                    return Err(unsupported(index, format!("PRMT mode {mode}")));
+                }
+                let a = self.read_register(a.0);
+                let selector = self.integer(index, selector)?;
+                let c = self.integer(index, c)?;
+                let (three, four, seven, eight) = (
+                    self.constant(3),
+                    self.constant(4),
+                    self.constant(7),
+                    self.constant(8),
+                );
+                let (byte_mask, sign_bit, zero) =
+                    (self.constant(0xff), self.constant(0x80), self.constant(0));
+                let mut result = self.constant(0);
+                for byte in 0..4u32 {
+                    let at = self.constant(byte * 4);
+                    let nibble = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[selector, at]);
+                    let which = self.value(op::BITWISE_AND, self.u32, &[nibble, seven]);
+                    let from_c = self.value(op::U_GREATER_THAN_EQUAL, self.bool, &[which, four]);
+                    let source = self.value(op::SELECT, self.u32, &[from_c, c, a]);
+                    let lane = self.value(op::BITWISE_AND, self.u32, &[which, three]);
+                    let bit = self.value(op::I_MUL, self.u32, &[lane, eight]);
+                    let value = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[source, bit]);
+                    let value = self.value(op::BITWISE_AND, self.u32, &[value, byte_mask]);
+                    // Nibble bit 3: the byte's sign bit, replicated.
+                    let replicate = self.value(op::BITWISE_AND, self.u32, &[nibble, eight]);
+                    let replicate = self.value(op::I_NOT_EQUAL, self.bool, &[replicate, zero]);
+                    let sign = self.value(op::BITWISE_AND, self.u32, &[value, sign_bit]);
+                    let negative = self.value(op::I_NOT_EQUAL, self.bool, &[sign, zero]);
+                    let fill = self.value(op::SELECT, self.u32, &[negative, byte_mask, zero]);
+                    let value = self.value(op::SELECT, self.u32, &[replicate, fill, value]);
+                    let place = self.constant(byte * 8);
+                    let value = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[value, place]);
+                    result = self.value(op::BITWISE_OR, self.u32, &[result, value]);
+                }
+                self.write_register(d.0, result);
+            }
+            Op::Sgxt {
+                d,
+                a,
+                bits,
+                signed,
+                wrap,
+            } => {
+                if wrap {
+                    return Err(unsupported(index, "SGXT.W"));
+                }
+                let a = self.read_register(a.0);
+                let bits = self.integer(index, bits)?;
+                let thirty_two = self.constant(32);
+                let count = self.glsl(self.u32, glsl::U_MIN, &[bits, thirty_two]);
+                let zero = self.constant(0);
+                let opcode = if signed {
+                    op::BIT_FIELD_S_EXTRACT
+                } else {
+                    op::BIT_FIELD_U_EXTRACT
+                };
+                let value = self.value(opcode, self.u32, &[a, zero, count]);
+                self.write_register(d.0, value);
+            }
+            Op::Sel {
+                d,
+                a,
+                b,
+                condition,
+                float,
+            } => {
+                let (a, b) = if float {
+                    let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+                    (
+                        self.value(op::BITCAST, self.u32, &[a]),
+                        self.value(op::BITCAST, self.u32, &[b]),
+                    )
+                } else {
+                    (self.integer(index, a)?, self.integer(index, b)?)
+                };
+                let condition = self.read_predicate(condition);
+                let value = self.value(op::SELECT, self.u32, &[condition, a, b]);
+                self.write_register(d.0, value);
+            }
+            Op::Fmnmx { d, a, b, min } => {
+                let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+                let value = self.min_max(self.f32, min, glsl::N_MIN, glsl::N_MAX, a, b);
+                self.write_float(d.0, value);
+            }
+            Op::Imnmx {
+                d,
+                a,
+                b,
+                min,
+                signed,
+            } => {
+                let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
+                let (smaller, larger) = if signed {
+                    (glsl::S_MIN, glsl::S_MAX)
+                } else {
+                    (glsl::U_MIN, glsl::U_MAX)
+                };
+                let value = self.min_max(self.u32, min, smaller, larger, a, b);
+                self.write_register(d.0, value);
+            }
+            Op::Mufu { d, function, src } => {
+                let x = self.float(index, src)?;
+                let value = match function {
+                    // SIN and COS take turns, not radians.
+                    0 | 1 => {
+                        let turn = self.float_constant(std::f32::consts::TAU);
+                        let radians = self.value(op::F_MUL, self.f32, &[x, turn]);
+                        let f = if function == 0 { glsl::COS } else { glsl::SIN };
+                        self.glsl(self.f32, f, &[radians])
+                    }
+                    2 => self.glsl(self.f32, glsl::EXP2, &[x]),
+                    3 => self.glsl(self.f32, glsl::LOG2, &[x]),
+                    4 => {
+                        let one = self.float_constant(1.0);
+                        self.value(op::F_DIV, self.f32, &[one, x])
+                    }
+                    5 => self.glsl(self.f32, glsl::INVERSE_SQRT, &[x]),
+                    8 => self.glsl(self.f32, glsl::SQRT, &[x]),
+                    9 => self.glsl(self.f32, glsl::TANH, &[x]),
+                    _ => return Err(unsupported(index, format!("MUFU function {function}"))),
+                };
+                self.write_float(d.0, value);
+            }
+            Op::F2i {
+                d,
+                src,
+                signed,
+                dst_size,
+                src_size,
+                rounding,
+            } => {
+                if (dst_size, src_size) != (2, 2) {
+                    return Err(unsupported(index, "F2I other than 32-bit"));
+                }
+                let x = self.float(index, src)?;
+                let rounded = self.rounded(x, rounding);
+                let value = self.saturating_integer(rounded, signed);
+                self.write_register(d.0, value);
+            }
+            Op::I2f {
+                d,
+                src,
+                signed,
+                dst_size,
+                src_size,
+                rounding,
+            } => {
+                if (dst_size, src_size) != (2, 2) {
+                    return Err(unsupported(index, "I2F other than 32-bit"));
+                }
+                if rounding != 0 {
+                    return Err(unsupported(index, "I2F rounding mode"));
+                }
+                let x = self.integer(index, src)?;
+                let opcode = if signed {
+                    op::CONVERT_S_TO_F
+                } else {
+                    op::CONVERT_U_TO_F
+                };
+                let value = self.value(opcode, self.f32, &[x]);
+                self.write_float(d.0, value);
+            }
+            Op::Frnd {
+                d,
+                src,
+                rounding,
+                dst_size,
+                src_size,
+            } => {
+                if (dst_size, src_size) != (2, 2) {
+                    return Err(unsupported(index, "FRND other than 32-bit"));
+                }
+                let x = self.float(index, src)?;
+                let value = self.rounded(x, rounding);
+                self.write_float(d.0, value);
+            }
+            Op::Fset {
+                d,
+                a,
+                b,
+                compare,
+                combine,
+                accumulate,
+            } => {
+                let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+                let result = self.float_compare(compare, a, b);
+                let result = self.combined(result, combine, accumulate);
+                let (one, zero) = (self.float_constant(1.0), self.float_constant(0.0));
+                let value = self.value(op::SELECT, self.f32, &[result, one, zero]);
+                self.write_float(d.0, value);
+            }
+            Op::Plop3 { p, q, srcs, luts } => {
+                let inputs = srcs.map(|pred| self.read_predicate(pred));
+                let zero = self.constant(0);
+                let mut entry = zero;
+                for (input, weight) in inputs.into_iter().zip([4, 2, 1]) {
+                    let weight = self.constant(weight);
+                    let term = self.value(op::SELECT, self.u32, &[input, weight, zero]);
+                    entry = self.value(op::BITWISE_OR, self.u32, &[entry, term]);
+                }
+                let one = self.constant(1);
+                for (output, lut) in [(p, luts[0]), (q, luts[1])] {
+                    if output == 7 {
+                        continue;
+                    }
+                    let table = self.constant(u32::from(lut));
+                    let bit = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[table, entry]);
+                    let bit = self.value(op::BITWISE_AND, self.u32, &[bit, one]);
+                    let set = self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero]);
+                    self.write_predicate(output, set);
+                }
+            }
+            Op::Cs2r { d, special, wide } => {
+                if special != 255 {
+                    return Err(unsupported(
+                        index,
+                        format!("CS2R special register {special}"),
+                    ));
+                }
+                let zero = self.constant(0);
+                self.write_register(d.0, zero);
+                if wide && d.0 != 255 {
+                    self.write_register(d.0.saturating_add(1), zero);
+                }
+            }
+            Op::Ldc {
+                d,
+                index: base,
+                bank,
+                offset,
+                size,
+                mode,
+            } => {
+                if mode != 0 {
+                    return Err(unsupported(index, format!("LDC mode {mode}")));
+                }
+                let words = match size {
+                    4 => 1,
+                    5 => 2,
+                    _ => return Err(unsupported(index, format!("LDC size {size}"))),
+                };
+                let variable = self
+                    .bank(bank)
+                    .map_err(|reason| unsupported(index, reason))?;
+                if let Some(used) = self.cbuf_used_sizes.get_mut(usize::from(bank)) {
+                    *used = BANK_SIZE;
+                }
+                let base = self.read_register(base.0);
+                let offset = self.constant(u32::from(offset));
+                let address = self.value(op::I_ADD, self.u32, &[base, offset]);
+                let values = self.bank_words(variable, address, words);
+                for (n, value) in values.into_iter().enumerate() {
+                    if d.0 != 255 {
+                        self.write_register(d.0.saturating_add(n as u8), value);
+                    }
+                }
+            }
+            Op::Uldc { d, src, size } => {
+                let words = match size {
+                    4 => 1,
+                    5 => 2,
+                    _ => return Err(unsupported(index, format!("ULDC size {size}"))),
+                };
+                let Src::Const { bank, offset } = src else {
+                    return Err(unsupported(index, "bindless ULDC"));
+                };
+                for n in 0..words {
+                    let value = self
+                        .constant_word(bank, offset.wrapping_add(n * 4))
+                        .map_err(|reason| unsupported(index, reason))?;
+                    if d.0 != 63 {
+                        self.write_uniform(d.0.saturating_add(n as u8), value);
+                    }
+                }
+            }
+            Op::Bssy | Op::Bsync | Op::Depbar => {}
             Op::Bra { .. } | Op::Exit => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
@@ -633,6 +1226,64 @@ impl Emitter {
         } else {
             value
         })
+    }
+
+    /// The minimum of a and b where `min` holds, else the maximum.
+    fn min_max(&mut self, ty: u32, min: Pred, smaller: u32, larger: u32, a: u32, b: u32) -> u32 {
+        if min.index == 7 {
+            let f = if min.negated { larger } else { smaller };
+            return self.glsl(ty, f, &[a, b]);
+        }
+        let condition = self.read_predicate(min);
+        let low = self.glsl(ty, smaller, &[a, b]);
+        let high = self.glsl(ty, larger, &[a, b]);
+        self.value(op::SELECT, ty, &[condition, low, high])
+    }
+
+    /// A float rounded to an integral value: 0 to nearest even, 1 down, 2
+    /// up, 3 toward zero.
+    fn rounded(&mut self, x: u32, rounding: u8) -> u32 {
+        let f = match rounding {
+            0 => glsl::ROUND_EVEN,
+            1 => glsl::FLOOR,
+            2 => glsl::CEIL,
+            _ => glsl::TRUNC,
+        };
+        self.glsl(self.f32, f, &[x])
+    }
+
+    /// An integral float converted as the hardware does: saturated to the
+    /// integer's range, NaN to zero.
+    fn saturating_integer(&mut self, x: u32, signed: bool) -> u32 {
+        // The largest float below the range's end, and the end itself.
+        let (low, high, end, top) = if signed {
+            (
+                -2_147_483_648.0f32,
+                2_147_483_520.0f32,
+                2_147_483_648.0f32,
+                0x7fff_ffff,
+            )
+        } else {
+            (0.0, 4_294_967_040.0, 4_294_967_296.0, u32::MAX)
+        };
+        let (low, high, end) = (
+            self.float_constant(low),
+            self.float_constant(high),
+            self.float_constant(end),
+        );
+        let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+        let opcode = if signed {
+            op::CONVERT_F_TO_S
+        } else {
+            op::CONVERT_F_TO_U
+        };
+        let value = self.value(opcode, self.u32, &[clamped]);
+        let over = self.value(op::F_ORD_GREATER_THAN_EQUAL, self.bool, &[x, end]);
+        let top = self.constant(top);
+        let value = self.value(op::SELECT, self.u32, &[over, top, value]);
+        let nan = self.value(op::IS_NAN, self.bool, &[x]);
+        let zero = self.constant(0);
+        self.value(op::SELECT, self.u32, &[nan, zero, value])
     }
 
     /// LOP3's function of `a`, `b`, `c` by truth table: bit `4a + 2b + c`
@@ -969,6 +1620,313 @@ mod tests {
             EXIT,
         ]);
         assert!(unaligned.reason.contains("unaligned"));
+    }
+
+    #[test]
+    fn carries_wide_multiplies_shifts_and_permutes_validate() {
+        valid(&[
+            // IADD3 R2, P0, P1, R1, R3, RZ; IADD3.X R4, R1, R3, RZ, P0, P1
+            word(&[
+                (0, 12, 0x210),
+                (16, 8, 2),
+                (24, 8, 1),
+                (32, 8, 3),
+                (64, 8, 255),
+                (81, 3, 0),
+                (84, 3, 1),
+                (87, 3, 7),
+                (77, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x210),
+                (16, 8, 4),
+                (24, 8, 1),
+                (32, 8, 3),
+                (63, 1, 1),
+                (64, 8, 255),
+                (74, 1, 1),
+                (81, 3, 7),
+                (84, 3, 7),
+                (87, 3, 0),
+                (77, 3, 1),
+            ]),
+            // LEA R5, P2, R1, R3, 0x2; LEA.HI.X R6, R1, R4, R2, 0x2, P2
+            word(&[
+                (0, 12, 0x211),
+                (16, 8, 5),
+                (24, 8, 1),
+                (32, 8, 3),
+                (64, 8, 255),
+                (75, 5, 2),
+                (81, 3, 2),
+                (87, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x211),
+                (16, 8, 6),
+                (24, 8, 1),
+                (32, 8, 4),
+                (64, 8, 2),
+                (74, 1, 1),
+                (75, 5, 2),
+                (80, 1, 1),
+                (81, 3, 7),
+                (87, 3, 2),
+            ]),
+            // IMAD.WIDE.U32 R8, R1, 0x10, R2; IMAD.WIDE R10, R1, R3, RZ
+            word(&[
+                (0, 12, 0x825),
+                (16, 8, 8),
+                (24, 8, 1),
+                (32, 32, 0x10),
+                (64, 8, 2),
+                (81, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x225),
+                (16, 8, 10),
+                (24, 8, 1),
+                (32, 8, 3),
+                (64, 8, 255),
+                (73, 1, 1),
+                (81, 3, 7),
+            ]),
+            // SHF.R.S32.HI R12, RZ, 0x1f, R1; SHF.L.U64 R13, R1, R3, R2;
+            // SHF.R.W.S64 R14, R1, R3, R2
+            word(&[
+                (0, 12, 0x819),
+                (16, 8, 12),
+                (24, 8, 255),
+                (32, 32, 0x1f),
+                (64, 8, 1),
+                (73, 2, 2),
+                (76, 1, 1),
+                (80, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x219),
+                (16, 8, 13),
+                (24, 8, 1),
+                (32, 8, 3),
+                (64, 8, 2),
+                (73, 2, 1),
+            ]),
+            word(&[
+                (0, 12, 0x219),
+                (16, 8, 14),
+                (24, 8, 1),
+                (32, 8, 3),
+                (64, 8, 2),
+                (73, 2, 0),
+                (75, 1, 1),
+                (76, 1, 1),
+            ]),
+            // PRMT R15, R1, 0x7650, R3; PRMT R16, R1, R2, R3;
+            // SGXT R17, R1, 0x8
+            word(&[
+                (0, 12, 0x816),
+                (16, 8, 15),
+                (24, 8, 1),
+                (32, 32, 0x7650),
+                (64, 8, 3),
+            ]),
+            word(&[
+                (0, 12, 0x216),
+                (16, 8, 16),
+                (24, 8, 1),
+                (32, 8, 2),
+                (64, 8, 3),
+            ]),
+            word(&[
+                (0, 12, 0x81a),
+                (16, 8, 17),
+                (24, 8, 1),
+                (32, 32, 8),
+                (73, 1, 1),
+            ]),
+            // IMNMX R18, R1, R2, !P0; PLOP3.LUT P3, P4, P0, P1, PT, 0x80, 0x8
+            word(&[
+                (0, 12, 0x217),
+                (16, 8, 18),
+                (24, 8, 1),
+                (32, 8, 2),
+                (73, 1, 1),
+                (87, 3, 0),
+                (90, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x81c),
+                (16, 8, 0x08),
+                (64, 3, 0),
+                (72, 5, 0x10),
+                (81, 3, 3),
+                (84, 3, 4),
+                (87, 3, 0),
+                (77, 3, 1),
+                (68, 3, 7),
+            ]),
+            // CS2R R20, SRZ (.64); BSSY B0; BSYNC B0; DEPBAR
+            word(&[(0, 12, 0x805), (16, 8, 20), (72, 8, 255), (80, 1, 1)]),
+            word(&[(0, 12, 0x945)]),
+            word(&[(0, 12, 0x941)]),
+            word(&[(0, 12, 0x91a)]),
+            EXIT,
+        ]);
+    }
+
+    #[test]
+    fn selects_conversions_and_special_functions_validate() {
+        let mut words = vec![
+            // SEL R2, R1, 0x5, P0; FSEL R3, -R1, 1.0, !P1
+            word(&[
+                (0, 12, 0x807),
+                (16, 8, 2),
+                (24, 8, 1),
+                (32, 32, 5),
+                (87, 3, 0),
+            ]),
+            word(&[
+                (0, 12, 0x808),
+                (16, 8, 3),
+                (24, 8, 1),
+                (72, 1, 1),
+                (32, 32, 0x3f80_0000),
+                (87, 3, 1),
+                (90, 1, 1),
+            ]),
+            // FMNMX R4, R1, R3, PT; FMNMX R5, R1, R3, P2
+            word(&[
+                (0, 12, 0x209),
+                (16, 8, 4),
+                (24, 8, 1),
+                (32, 8, 3),
+                (87, 3, 7),
+            ]),
+            word(&[
+                (0, 12, 0x209),
+                (16, 8, 5),
+                (24, 8, 1),
+                (32, 8, 3),
+                (87, 3, 2),
+            ]),
+            // F2I.TRUNC.NTZ R6, R1; F2I.U32 R7, |R1|
+            word(&[
+                (0, 12, 0x305),
+                (16, 8, 6),
+                (32, 8, 1),
+                (72, 1, 1),
+                (75, 2, 2),
+                (78, 2, 3),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x305),
+                (16, 8, 7),
+                (32, 8, 1),
+                (62, 1, 1),
+                (75, 2, 2),
+                (84, 2, 2),
+            ]),
+            // I2F R8, R2 (signed); I2FP.F32.U32 R9, R2; FRND.FLOOR R10, R1
+            word(&[
+                (0, 12, 0x306),
+                (16, 8, 8),
+                (32, 8, 2),
+                (74, 1, 1),
+                (75, 2, 2),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x245),
+                (16, 8, 9),
+                (32, 8, 2),
+                (75, 2, 2),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x307),
+                (16, 8, 10),
+                (32, 8, 1),
+                (75, 2, 2),
+                (78, 2, 1),
+                (84, 2, 2),
+            ]),
+            // FSET.BF.GT.AND R11, R1, R3, PT
+            word(&[
+                (0, 12, 0x20a),
+                (16, 8, 11),
+                (24, 8, 1),
+                (32, 8, 3),
+                (76, 4, 4),
+                (87, 3, 7),
+            ]),
+        ];
+        // MUFU of each translated function.
+        for function in [0, 1, 2, 3, 4, 5, 8, 9] {
+            words.push(word(&[
+                (0, 12, 0x308),
+                (16, 8, 12),
+                (32, 8, 1),
+                (74, 6, function),
+            ]));
+        }
+        words.push(EXIT);
+        valid(&words);
+        let rcp64 = translated_err(&[word(&[(0, 12, 0x308), (16, 8, 2), (74, 6, 6)]), EXIT]);
+        assert!(rcp64.reason.contains("MUFU"));
+    }
+
+    #[test]
+    fn indexed_and_uniform_constant_loads_validate() {
+        let translated = valid(&[
+            // LDC R2, c[0x3][R1+0x10]; LDC.64 R4, c[0x3][R1+0x20]
+            word(&[
+                (0, 12, 0xb82),
+                (16, 8, 2),
+                (24, 8, 1),
+                (54, 5, 3),
+                (38, 16, 0x10),
+                (73, 3, 4),
+            ]),
+            word(&[
+                (0, 12, 0xb82),
+                (16, 8, 4),
+                (24, 8, 1),
+                (54, 5, 3),
+                (38, 16, 0x20),
+                (73, 3, 5),
+            ]),
+            // ULDC.64 UR4, c[0x0][0x118]; MOV R6, UR5; IADD3 R7, R6, UR4, RZ
+            word(&[
+                (0, 12, 0xab9),
+                (16, 6, 4),
+                (54, 5, 0),
+                (38, 16, 0x118),
+                (73, 3, 5),
+            ]),
+            word(&[(0, 12, 0xc02), (16, 8, 6), (32, 6, 5)]),
+            word(&[
+                (0, 12, 0xc10),
+                (16, 8, 7),
+                (24, 8, 6),
+                (32, 6, 4),
+                (64, 8, 255),
+                (77, 3, 7),
+                (81, 3, 7),
+                (84, 3, 7),
+                (87, 3, 7),
+            ]),
+            EXIT,
+        ]);
+        let banks: Vec<u32> = translated
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.index)
+            .collect();
+        assert_eq!(banks, [3, 0]);
+        // An indexed load may read anywhere in its bank.
+        assert_eq!(translated.cbuf_used_sizes[3], 0x10000);
+        assert_eq!(translated.cbuf_used_sizes[0], 0x120);
     }
 
     #[test]

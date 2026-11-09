@@ -38,6 +38,12 @@ pub mod op {
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
     pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const CONVERT_F_TO_U: u16 = 109;
+    pub const CONVERT_F_TO_S: u16 = 110;
+    pub const CONVERT_S_TO_F: u16 = 111;
+    pub const CONVERT_U_TO_F: u16 = 112;
+    pub const U_CONVERT: u16 = 113;
+    pub const S_CONVERT: u16 = 114;
     pub const CONVERT_U_TO_PTR: u16 = 120;
     pub const BITCAST: u16 = 124;
     pub const S_NEGATE: u16 = 126;
@@ -48,6 +54,7 @@ pub mod op {
     pub const F_SUB: u16 = 131;
     pub const I_MUL: u16 = 132;
     pub const F_MUL: u16 = 133;
+    pub const F_DIV: u16 = 136;
     pub const I_ADD_CARRY: u16 = 149;
     pub const IS_NAN: u16 = 156;
     pub const LOGICAL_EQUAL: u16 = 164;
@@ -85,6 +92,8 @@ pub mod op {
     pub const BITWISE_XOR: u16 = 198;
     pub const BITWISE_AND: u16 = 199;
     pub const NOT: u16 = 200;
+    pub const BIT_FIELD_S_EXTRACT: u16 = 202;
+    pub const BIT_FIELD_U_EXTRACT: u16 = 203;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -140,11 +149,28 @@ pub mod execution {
 /// GLSL.std.450 extended instructions.
 #[allow(missing_docs)]
 pub mod glsl {
+    pub const ROUND_EVEN: u32 = 2;
+    pub const TRUNC: u32 = 3;
     pub const F_ABS: u32 = 4;
+    pub const FLOOR: u32 = 8;
+    pub const CEIL: u32 = 9;
+    pub const SIN: u32 = 13;
+    pub const COS: u32 = 14;
+    pub const TANH: u32 = 21;
+    pub const EXP2: u32 = 29;
+    pub const LOG2: u32 = 30;
+    pub const SQRT: u32 = 31;
+    pub const INVERSE_SQRT: u32 = 32;
+    pub const U_MIN: u32 = 38;
+    pub const S_MIN: u32 = 39;
+    pub const U_MAX: u32 = 41;
+    pub const S_MAX: u32 = 42;
     pub const F_MIN: u32 = 37;
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
     pub const FMA: u32 = 50;
+    pub const N_MIN: u32 = 79;
+    pub const N_MAX: u32 = 80;
 }
 
 /// Function control, selection control and loop control: none.
@@ -184,6 +210,7 @@ pub struct Module {
     functions: Vec<u32>,
     types: HashMap<Type, u32>,
     constants: HashMap<(u32, u32), u32>,
+    constants64: HashMap<(u32, u64), u32>,
     glsl: Option<u32>,
 }
 
@@ -348,6 +375,21 @@ impl Module {
         let id = self.id();
         instruction(&mut self.globals, op::CONSTANT, &[ty, id, value]);
         self.constants.insert((ty, value), id);
+        id
+    }
+
+    /// A 64-bit constant of type `ty`, declared once.
+    pub fn constant64(&mut self, ty: u32, value: u64) -> u32 {
+        if let Some(&id) = self.constants64.get(&(ty, value)) {
+            return id;
+        }
+        let id = self.id();
+        instruction(
+            &mut self.globals,
+            op::CONSTANT,
+            &[ty, id, value as u32, (value >> 32) as u32],
+        );
+        self.constants64.insert((ty, value), id);
         id
     }
 
