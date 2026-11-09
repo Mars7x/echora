@@ -275,6 +275,15 @@ impl Gpu {
                 s12.shader_sampled_image_array_non_uniform_indexing != 0,
             )
             .runtime_descriptor_array(s12.runtime_descriptor_array != 0)
+            // The texture pool (descriptor set 1): arrays written as
+            // textures are registered, partly, while work using them runs.
+            .descriptor_binding_partially_bound(s12.descriptor_binding_partially_bound != 0)
+            .descriptor_binding_update_unused_while_pending(
+                s12.descriptor_binding_update_unused_while_pending != 0,
+            )
+            .descriptor_binding_sampled_image_update_after_bind(
+                s12.descriptor_binding_sampled_image_update_after_bind != 0,
+            )
             .scalar_block_layout(s12.scalar_block_layout != 0)
             .shader_output_viewport_index(s12.shader_output_viewport_index != 0)
             .shader_output_layer(s12.shader_output_layer != 0)
