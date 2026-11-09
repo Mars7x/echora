@@ -49,3 +49,7 @@ when the code for it does.
    the shader binaries, would bring that close to the console's footprint.
 7. Translate and compile every shader before the game starts, so nothing
    stutters while it runs.
+8. Decode the game's AV1 movies on the GPU's video engine through Vulkan
+   Video, keeping the CPU decoder for GPUs without AV1 decoding. The movie is
+   limited by decoding today, so this should bring it to full speed, free the
+   CPU cores for the game and leave the pictures on the GPU.
