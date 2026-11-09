@@ -1,6 +1,5 @@
-//! Preparing the installed game to run: `echora prepare` fetches the shader
-//! recompiler, translates the game and builds the translation, which takes
-//! about an hour the first time. It runs as a child process; its progress
+//! Preparing the installed game to run: `echora prepare` translates the game
+//! and builds the translation, which takes about an hour the first time. It runs as a child process; its progress
 //! lines (`echora-prepare: ...`) are followed here for the launcher to show.
 
 use std::io::{BufRead, BufReader};
@@ -15,7 +14,6 @@ const PREFIX: &str = "echora-prepare: ";
 pub enum Step {
     #[default]
     Starting,
-    Fetch,
     Lift,
     /// Region crates built of the total.
     Build(u32, u32),
@@ -26,8 +24,7 @@ impl Step {
     /// What the player reads under the title.
     pub fn describe(self) -> String {
         match self {
-            Self::Starting | Self::Fetch => "Getting the shader recompiler".into(),
-            Self::Lift => "Translating the game".into(),
+            Self::Starting | Self::Lift => "Translating the game".into(),
             Self::Build(built, total) => {
                 format!(
                     "Building the game, {} of {}",
@@ -43,7 +40,6 @@ impl Step {
     pub fn fraction(self) -> f32 {
         match self {
             Self::Starting => 0.0,
-            Self::Fetch => 0.01,
             Self::Lift => 0.03,
             Self::Build(_, 0) => 0.1,
             Self::Build(built, total) => 0.1 + 0.9 * (built as f32 / total as f32).min(1.0),
@@ -69,7 +65,6 @@ fn grouped(n: u32) -> String {
 pub fn parse(line: &str) -> Option<Step> {
     let event = line.strip_prefix(PREFIX)?;
     match event.split_whitespace().collect::<Vec<_>>()[..] {
-        ["step", "fetch"] => Some(Step::Fetch),
         ["step", "lift"] => Some(Step::Lift),
         ["step", "build"] => Some(Step::Build(0, 0)),
         ["built", built, "of", total] => {
@@ -212,7 +207,6 @@ mod tests {
 
     #[test]
     fn progress_lines_become_steps() {
-        assert_eq!(parse("echora-prepare: step fetch"), Some(Step::Fetch));
         assert_eq!(parse("echora-prepare: step lift"), Some(Step::Lift));
         assert_eq!(
             parse("echora-prepare: built 340 of 1111"),

@@ -1023,10 +1023,9 @@ fn last_game_file() -> Option<PathBuf> {
 }
 
 /// The people and projects Echora builds on, with what each contributed.
-const CREDITS: [(&str, &str); 6] = [
+const CREDITS: [(&str, &str); 5] = [
     ("Andrew Slaiman (Mars7x)", "Creator of Echora"),
-    ("Lichii, an Eglantine fork", "Shader recompiler"),
-    ("sirit", "SPIR-V generation"),
+    ("Lichii and Mesa's NAK", "Shader instruction references"),
     ("GPUI by Zed Industries", "Launcher interface"),
     ("a55uka/nup", "NUP format specification"),
     ("Switchbrew, libnx, Atmosphère", "Format documentation"),
