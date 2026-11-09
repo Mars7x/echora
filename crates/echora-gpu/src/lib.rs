@@ -16,4 +16,5 @@ pub mod renderer;
 pub mod shader;
 mod shader_cache;
 mod timing;
+pub mod video;
 pub mod vulkan;
