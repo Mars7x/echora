@@ -285,6 +285,9 @@ pub struct Nvn {
     objects: BTreeMap<u64, Object>,
     /// Next free host GPU virtual address for memory pools.
     next_gpu_address: u64,
+    /// Bumped when a memory pool is initialized or finalized: the GPU page
+    /// table is rebuilt only then (and when pools are shared).
+    pub(super) pool_epoch: u64,
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
@@ -990,6 +993,7 @@ impl Nvn {
                         v: [0; 2],
                     },
                 );
+                self.pool_epoch += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -2149,6 +2153,7 @@ impl Nvn {
                 if kind == "MemoryPool" {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
                     self.gpu_forget_pool(base);
+                    self.pool_epoch += 1;
                 }
                 self.objects.remove(&this);
                 return Ok(true);

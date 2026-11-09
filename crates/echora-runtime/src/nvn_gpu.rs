@@ -3701,6 +3701,22 @@ impl Nvn {
         if super::debug_var_os("ECHORA_PAGE_TABLE").is_none() {
             return Ok(Default::default());
         }
+        // Host-visible pools reach the GPU through the file spans presents
+        // record (`share_new_pools`, under the machine lock): a queue
+        // submission's memory view cannot look them up. The table is rebuilt
+        // when a pool is shared (one made between presents is mapped from
+        // the next present on) or the pools change (`pool_epoch`), not by
+        // walking the objects on every dispatch.
+        let shared = self
+            .gpu
+            .as_ref()
+            .map_or(0, |backend| backend.shared_pools.len());
+        let key = (shared, self.pool_epoch);
+        if let Some((built, table)) = self.gpu.as_ref().and_then(|backend| backend.page_table)
+            && built == key
+        {
+            return Ok(table);
+        }
         let pools: Vec<(u64, u64, u64, u64)> = self
             .objects
             .values()
@@ -3713,26 +3729,6 @@ impl Nvn {
             })
             .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
             .collect();
-        // Host-visible pools reach the GPU through the file spans presents
-        // record (`share_new_pools`, under the machine lock): a queue
-        // submission's memory view cannot look them up. The table is rebuilt
-        // when a pool is shared, so one made between presents is mapped from
-        // the next present on.
-        let shared = self
-            .gpu
-            .as_ref()
-            .map_or(0, |backend| backend.shared_pools.len());
-        let key = (
-            pools.len() ^ shared << 32,
-            pools
-                .iter()
-                .fold(0u64, |sum, (_, size, gpu, _)| sum.wrapping_add(gpu ^ size)),
-        );
-        if let Some((built, table)) = self.gpu.as_ref().and_then(|backend| backend.page_table)
-            && built == key
-        {
-            return Ok(table);
-        }
         let first = pools
             .iter()
             .map(|(_, _, gpu, _)| gpu >> PAGE_SHIFT)
