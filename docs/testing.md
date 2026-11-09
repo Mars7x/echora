@@ -94,6 +94,8 @@ them natively, reporting guest instructions per second (best and median of
 | `switch` | An eight-way switch through a halfword jump table (BR). |
 | `vector` | FMLA, FADD and FMUL on 4S vectors loaded with post-indexing. |
 | `poll` | An LDAR/CBZ polling loop; the host ends it after 500 slices of 100,000 instructions, as another thread setting the flag would. |
+| `scalar` | Single-precision loads, FMUL, FMADD, FCMP, FCSEL and a store, with flush-to-zero. |
+| `ldst` | A 64-bit LDR, an ADD and an STR per word: the cost of plain guest loads and stores. |
 
 A positional argument filters kernels by name, and `--scale` multiplies each
 kernel's work. The kernels are original code. To change them, edit

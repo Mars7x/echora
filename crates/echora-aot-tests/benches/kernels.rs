@@ -113,6 +113,12 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
             m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
         }
+        "ldst" => {
+            regs[0] = 1_000 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 8;
+        }
         "poll" => {
             regs[0] = FLAG;
             return Some(POLL_SLICES * scale);

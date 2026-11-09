@@ -152,3 +152,21 @@ scalar:
     b.ne 1b
     svc #7
     udf #0
+
+.p2align 10
+// Integer loads and stores as data structures use them: a load, an add and
+// a store per word. x0 = repetitions, x1 = source, x2 = destination,
+// x3 = words.
+ldst:
+1:  mov x6, x1
+    mov x7, x2
+    mov x8, x3
+2:  ldr x9, [x6], #8
+    add x10, x10, x9
+    str x10, [x7], #8
+    subs x8, x8, #1
+    b.ne 2b
+    subs x0, x0, #1
+    b.ne 1b
+    svc #7
+    udf #0

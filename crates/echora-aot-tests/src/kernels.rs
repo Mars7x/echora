@@ -15,10 +15,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("vector", 0x1800),
     ("poll", 0x1c00),
     ("scalar", 0x2000),
+    ("ldst", 0x2400),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x2400;
+pub const KERNEL_SIZE: u64 = 0x2800;
 
 /// The image as bytes from `KERNEL_BASE`, with zeros (UDF) in the gaps.
 pub fn image() -> Vec<u8> {
@@ -179,6 +180,22 @@ pub const KERNEL_IMAGE: &[(u64, &[u32])] = &[
             0x54ff_ff21, // 
             0xf100_0400, // 
             0x54ff_fe61, // 
+            0xd400_00e1, // 
+        ],
+    ),
+    (
+        0x2400,
+        &[
+            0xaa01_03e6, // 
+            0xaa02_03e7, // 
+            0xaa03_03e8, // 
+            0xf840_84c9, // 
+            0x8b09_014a, // 
+            0xf800_84ea, // 
+            0xf100_0508, // 
+            0x54ff_ff81, // 
+            0xf100_0400, // 
+            0x54ff_fee1, // 
             0xd400_00e1, // 
         ],
     ),
