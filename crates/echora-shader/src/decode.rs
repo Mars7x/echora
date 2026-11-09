@@ -208,6 +208,9 @@ pub enum Op {
     Mov {
         d: Reg,
         src: Src,
+        /// Bits 72-75: the lanes of each quad (bit n for lane n) that are
+        /// written; the others keep d. 0xf (every lane) in ordinary code.
+        lanes: u8,
     },
     /// IADD3 d, a, b, c, with up to two carry outputs. Without `.X`
     /// (`extended`, bit 74) a negated source is its two's complement; with
@@ -980,6 +983,11 @@ pub fn decode(raw: u128) -> Instruction {
             matches!(opcode, 0xab9 | 0xabb | 0x9c3),
         ),
     };
+    // UMOV has no lane mask: it writes its uniform register.
+    let op = match op {
+        Some(Op::Mov { d, src, .. }) if uniform => Some(Op::Mov { d, src, lanes: 0xf }),
+        op => op,
+    };
     Instruction {
         raw,
         guard: word.pred(12, 15),
@@ -1417,6 +1425,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         0x002 if matches!(form, 1 | 4 | 5 | 6) => Op::Mov {
             d,
             src: word.source(1)?.src,
+            lanes: word.bits(72, 4) as u8,
         },
         0x010 if (1..=7).contains(&form) => Op::Iadd3 {
             d,
@@ -1747,31 +1756,50 @@ mod tests {
 
     #[test]
     fn mov_in_each_operand_form() {
-        let base = |opcode: u128| [(0, 12, opcode), (16, 8, 4)];
+        let base = |opcode: u128| [(0, 12, opcode), (16, 8, 4), (72, 4, 0xf)];
         let cases = [
             (
-                word(&[base(0x202)[0], base(0x202)[1], (32, 8, 9)]),
+                word(&[base(0x202)[0], base(0x202)[1], base(0x202)[2], (32, 8, 9)]),
                 Src::Reg(Reg(9)),
             ),
             (
-                word(&[base(0x802)[0], base(0x802)[1], (32, 32, 0x3f80_0000)]),
+                word(&[
+                    base(0x802)[0],
+                    base(0x802)[1],
+                    base(0x802)[2],
+                    (32, 32, 0x3f80_0000),
+                ]),
                 Src::Imm(0x3f80_0000),
             ),
             (
-                word(&[base(0xa02)[0], base(0xa02)[1], (54, 5, 3), (38, 16, 0x1c)]),
+                word(&[
+                    base(0xa02)[0],
+                    base(0xa02)[1],
+                    base(0xa02)[2],
+                    (54, 5, 3),
+                    (38, 16, 0x1c),
+                ]),
                 Src::Const {
                     bank: 3,
                     offset: 0x1c,
                 },
             ),
             (
-                word(&[base(0xc02)[0], base(0xc02)[1], (32, 6, 17)]),
+                word(&[base(0xc02)[0], base(0xc02)[1], base(0xc02)[2], (32, 6, 17)]),
                 Src::Uniform(UniformReg(17)),
             ),
         ];
         for (raw, src) in cases {
             let instruction = decode(raw);
-            assert_eq!(instruction.op, Op::Mov { d: Reg(4), src }, "{raw:#034x}");
+            assert_eq!(
+                instruction.op,
+                Op::Mov {
+                    d: Reg(4),
+                    src,
+                    lanes: 0xf
+                },
+                "{raw:#034x}"
+            );
             assert!(instruction.guard.is_true());
         }
     }
@@ -1784,6 +1812,7 @@ mod tests {
             (91, 1, 1),
             (32, 6, 5),
             (38, 16, 0x40),
+            (72, 4, 0xf),
         ]);
         assert_eq!(
             decode(raw).op,
@@ -1792,7 +1821,8 @@ mod tests {
                 src: Src::BindlessConst {
                     handle: UniformReg(5),
                     offset: 0x40
-                }
+                },
+                lanes: 0xf
             }
         );
     }

@@ -364,7 +364,7 @@ mod tests {
             ]),
             // @P0 KILL; MOV R5, R7 (the depth after the sample mask slot)
             word(&[(0, 12, 0x95b), (12, 4, 0), (87, 3, 7)]),
-            word(&[(0, 12, 0x202), (16, 8, 5), (32, 8, 7)]),
+            word(&[(0, 12, 0x202), (72, 4, 0xf), (16, 8, 5), (32, 8, 7)]),
             EXIT,
         ]));
         let translated = validated(&program);
@@ -384,7 +384,9 @@ mod tests {
     fn calls_return_through_the_address_register() {
         // MOV R2, 0x20 (return to instruction 2); CALL to 3; EXIT;
         // MOV R3, 0x1; RET R2. The program ends at the RET.
-        let mov = |d: u128, value: u128| word(&[(0, 12, 0x802), (16, 8, d), (32, 32, value)]);
+        let mov = |d: u128, value: u128| {
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, d), (32, 32, value)])
+        };
         let call = word(&[(0, 12, 0x944), (32, 50, 16)]);
         let ret = word(&[(0, 12, 0x950), (24, 8, 2)]);
         let program = bytes(&[mov(2, 0x20), call, EXIT, mov(3, 1), ret, NOP, NOP]);

@@ -200,7 +200,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 
 | Operation | Opcodes (bits 0-11) | Notes |
 |---|---|---|
-| MOV | 0x202, 0x802, 0xa02, 0xc02 | register, immediate, constant, uniform |
+| MOV | 0x202, 0x802, 0xa02, 0xc02 | register, immediate, constant, uniform; quad-lane write mask 72-75 (lane n of each quad written when bit n is set, 0xf in ordinary code; UMOV has none) |
 | IADD3 | 0x010 in forms 1-7 | carry outputs 81-86, inputs 87-90 and 77-80 |
 | IMAD | 0x024 in forms 1-7 | low word |
 | LOP3.LUT | 0x012 in forms 1-7 | table 72-79, `.PAND` 80, predicate output 81-83 |

@@ -1132,8 +1132,22 @@ impl Emitter {
     fn operation(&mut self, index: usize, op: Op) -> Result<(), Unsupported> {
         match op {
             Op::Nop => {}
-            Op::Mov { d, src } => {
-                let value = self.source(index, src)?;
+            Op::Mov { d, src, lanes } => {
+                let mut value = self.source(index, src)?;
+                if lanes != 0xf {
+                    // Only the quad lanes in the mask take the value.
+                    let lane = self.special_register(index, 0)?;
+                    let three = self.constant(3);
+                    let position = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+                    let mask = self.constant(u32::from(lanes));
+                    let bit = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[mask, position]);
+                    let one = self.constant(1);
+                    let bit = self.value(op::BITWISE_AND, self.u32, &[bit, one]);
+                    let zero = self.constant(0);
+                    let written = self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero]);
+                    let old = self.read_register(d.0);
+                    value = self.value(op::SELECT, self.u32, &[written, value, old]);
+                }
                 self.write_register(d.0, value);
             }
             Op::Iadd3 {
@@ -2577,7 +2591,7 @@ mod tests {
     fn integer_and_logic_families_validate() {
         valid(&[
             // MOV R1, 0x5; IADD3 R2, R1, -R1, 0x7 (form 4: imm b);
-            word(&[(0, 12, 0x802), (16, 8, 1), (32, 32, 5)]),
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, 1), (32, 32, 5)]),
             word(&[
                 (0, 12, 0x210),
                 (16, 8, 2),
@@ -2616,7 +2630,13 @@ mod tests {
         // MOV R1, c[0x3][0x14]; IADD3 R2, R1, c[0x0][0x8], RZ;
         // FADD R3, R1, c[0x3][0x20]
         let translated = valid(&[
-            word(&[(0, 12, 0xa02), (16, 8, 1), (54, 5, 3), (38, 16, 0x14)]),
+            word(&[
+                (0, 12, 0xa02),
+                (72, 4, 0xf),
+                (16, 8, 1),
+                (54, 5, 3),
+                (38, 16, 0x14),
+            ]),
             word(&[
                 (0, 12, 0xa10),
                 (16, 8, 2),
@@ -2647,7 +2667,13 @@ mod tests {
         assert_eq!(translated.cbuf_used_sizes[3], 0x24);
         assert_eq!(translated.cbuf_used_sizes[0], 0xc);
         let unaligned = translated_err(&[
-            word(&[(0, 12, 0xa02), (16, 8, 1), (54, 5, 3), (38, 16, 0x2)]),
+            word(&[
+                (0, 12, 0xa02),
+                (72, 4, 0xf),
+                (16, 8, 1),
+                (54, 5, 3),
+                (38, 16, 0x2),
+            ]),
             EXIT,
         ]);
         assert!(unaligned.reason.contains("unaligned"));
@@ -2935,7 +2961,7 @@ mod tests {
                 (38, 16, 0x118),
                 (73, 3, 5),
             ]),
-            word(&[(0, 12, 0xc02), (16, 8, 6), (32, 6, 5)]),
+            word(&[(0, 12, 0xc02), (72, 4, 0xf), (16, 8, 6), (32, 6, 5)]),
             word(&[
                 (0, 12, 0xc10),
                 (16, 8, 7),
@@ -3131,8 +3157,8 @@ mod tests {
             ]),
             // R2UR UR8, R1; MOV R2, UR7; MOV R3, UR8
             word(&[(0, 12, 0x3c2), (16, 8, 8), (24, 8, 1)]),
-            word(&[(0, 12, 0xc02), (16, 8, 2), (32, 6, 7)]),
-            word(&[(0, 12, 0xc02), (16, 8, 3), (32, 6, 8)]),
+            word(&[(0, 12, 0xc02), (72, 4, 0xf), (16, 8, 2), (32, 6, 7)]),
+            word(&[(0, 12, 0xc02), (72, 4, 0xf), (16, 8, 3), (32, 6, 8)]),
             // ISETP.GT.U32.EX P1, PT, R3, R2, PT, P0 (low result in P0)
             word(&[
                 (0, 12, 0x20c),
@@ -3146,7 +3172,7 @@ mod tests {
                 (87, 3, 7),
             ]),
             // MOV R4, c[0x18][0x0]: bank 24 is never bound and reads zero.
-            word(&[(0, 12, 0xa02), (16, 8, 4), (54, 5, 24)]),
+            word(&[(0, 12, 0xa02), (72, 4, 0xf), (16, 8, 4), (54, 5, 24)]),
             EXIT,
         ];
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -3568,7 +3594,7 @@ mod tests {
     fn textures_are_combined_samplers_found_by_their_handle_word() {
         let translated = valid(&[
             // MOV R0, c[0x3][0x0] (a uniform buffer first in use)
-            word(&[(0, 12, 0xa02), (16, 8, 0), (54, 5, 3)]),
+            word(&[(0, 12, 0xa02), (72, 4, 0xf), (16, 8, 0), (54, 5, 3)]),
             // TEX.LZ R4, R6, R0, R1, 2D, 0xf (c[0][0x50]); split result
             tex(
                 0xb60,
@@ -3738,7 +3764,7 @@ mod tests {
     fn computed_branches_and_swizzled_adds_validate() {
         valid(&[
             // MOV R0, 0x30; BRX R0 (to instruction 3); EXIT
-            word(&[(0, 12, 0x802), (16, 8, 0), (32, 32, 0x30)]),
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, 0), (32, 32, 0x30)]),
             word(&[(0, 12, 0x949), (24, 8, 0)]),
             EXIT,
             // FSWZADD R2, R0, R1, 0x99 (lanes: a+b... per pattern); EXIT
@@ -3831,7 +3857,9 @@ mod tests {
     #[test]
     fn reducible_programs_are_structured() {
         let nop = word(&[(0, 12, 0x918)]);
-        let mov = |d: u128, value: u128| word(&[(0, 12, 0x802), (16, 8, d), (32, 32, value)]);
+        let mov = |d: u128, value: u128| {
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, d), (32, 32, value)])
+        };
         // A diamond: @P0 BRA 3; MOV; BRA 4; MOV; EXIT.
         let diamond = valid(&[bra(0, 3, 0), mov(1, 1), bra(2, 4, 7), mov(1, 2), EXIT]);
         assert!(!dispatches(&diamond.spirv));
@@ -4103,6 +4131,14 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_move_writes_only_its_quad_lanes() {
+        // MOV R1, 0x7 to quad lanes 0 and 2 only.
+        let masked = word(&[(0, 12, 0x802), (16, 8, 1), (32, 32, 7), (72, 4, 0x5)]);
+        assert!(matches!(decode(masked).op, Op::Mov { lanes: 0x5, .. }));
+        valid(&[masked, EXIT]);
+    }
+
+    #[test]
     fn float_families_validate() {
         valid(&[
             // FFMA.SAT R0, -|R1|, R2, R3; FMUL R4, R0, 2.0; FADD R5, R4, R0
@@ -4154,7 +4190,7 @@ mod tests {
         //       @P0 BRA loop; @!P0 EXIT (guarded exit, then a final EXIT).
         let words = [
             word(&[(0, 12, 0x919), (72, 8, 33)]),
-            word(&[(0, 12, 0x802), (16, 8, 1), (32, 32, 0)]),
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, 1), (32, 32, 0)]),
             word(&[
                 (0, 12, 0x810),
                 (16, 8, 1),
