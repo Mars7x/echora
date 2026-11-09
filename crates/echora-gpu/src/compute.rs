@@ -277,7 +277,7 @@ impl Renderer {
                     constants,
                 );
             }
-            if !program.page_table_stages.is_empty() {
+            if !program.abi_stages.is_empty() {
                 let table = dispatch.page_table;
                 let mut bytes = [0u8; 16];
                 bytes[..8].copy_from_slice(&table.address.to_le_bytes());
@@ -286,7 +286,7 @@ impl Renderer {
                 device.cmd_push_constants(
                     commands,
                     program.pipeline_layout,
-                    program.page_table_stages,
+                    program.abi_stages,
                     echora_shader_abi::PUSH_PAGE_TABLE_OFFSET,
                     &bytes,
                 );

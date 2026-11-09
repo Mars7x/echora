@@ -27,7 +27,9 @@ pub struct Program {
     pub(crate) texture_bits: Vec<(usize, u32)>,
     /// The stages that read the GPU page table (bytes 112..128 of the push
     /// constants, `echora_shader_abi::PageTable`).
-    pub(crate) page_table_stages: vk::ShaderStageFlags,
+    /// Stages that read the ABI push-constant fields (`PUSH_ABI_FIELDS`):
+    /// they take the whole block; `push_stages` excludes them.
+    pub(crate) abi_stages: vk::ShaderStageFlags,
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -284,6 +286,11 @@ pub struct Draw<'a> {
     /// task and mesh): drawn with vkCmdDrawMeshTasks*EXT, with no vertex
     /// input.
     pub mesh: Option<MeshGroups>,
+    /// The GPU page table, for stages that read it.
+    pub page_table: echora_shader_abi::PageTable,
+    /// Vertex pulling (`PUSH_VERTEX_FETCH`): the fetch table entries, one
+    /// per generic input location, uploaded with the draw.
+    pub vertex_fetch: Vec<echora_shader_abi::VertexAttribute>,
 }
 
 /// The workgroups of a mesh draw.
@@ -334,27 +341,27 @@ impl Renderer {
             bindings.sort_unstable();
             texture_bits.extend(bindings.into_iter().map(|binding| (index, binding)));
         }
-        let page_table_stages = stages
+        let abi_stages = stages
             .iter()
-            .filter(|stage| stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0)
+            .filter(|stage| stage.push_fields & echora_shader_abi::PUSH_ABI_FIELDS != 0)
             .fold(vk::ShaderStageFlags::empty(), |flags, stage| {
                 flags | stage_flags(stage.stage)
             });
         // One range per stage (Vulkan allows no more): the whole ABI block
-        // for stages that read the page table, the rescaling words for the
+        // for stages that read its fields, the rescaling words for the
         // others.
+        let push_stages = push_stages & !abi_stages;
         let mut push_ranges = Vec::new();
-        if !page_table_stages.is_empty() {
+        if !abi_stages.is_empty() {
             push_ranges.push(vk::PushConstantRange {
-                stage_flags: page_table_stages,
+                stage_flags: abi_stages,
                 offset: 0,
                 size: echora_shader_abi::PUSH_CONSTANTS_SIZE,
             });
         }
-        let rescaled = push_stages & !page_table_stages;
-        if !rescaled.is_empty() {
+        if !push_stages.is_empty() {
             push_ranges.push(vk::PushConstantRange {
-                stage_flags: rescaled,
+                stage_flags: push_stages,
                 offset: 0,
                 size: RESCALING_BYTES,
             });
@@ -419,7 +426,7 @@ impl Renderer {
             shaders,
             push_stages,
             texture_bits,
-            page_table_stages,
+            abi_stages,
         })
     }
 
@@ -495,6 +502,7 @@ impl Renderer {
             Indices::None => 0,
             Indices::U16(data) | Indices::U32(data) => data.len() as u64 + 16,
         };
+        bytes += draw.vertex_fetch.len() as u64 * 32 + 256;
         self.reserve(bytes, descriptors)?;
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
@@ -784,6 +792,46 @@ impl Renderer {
                 .collect();
             rescaling_constants(&scaled, 1.0 / factor)
         });
+        // The ABI block: the vertex fetch table (uploaded now, before
+        // rendering is recorded), the resolution scale and the page table.
+        let abi = if program.abi_stages.is_empty() {
+            None
+        } else {
+            let mut fetch = echora_shader_abi::VertexFetch {
+                base_instance: draw.first_instance,
+                ..Default::default()
+            };
+            if !draw.vertex_fetch.is_empty() {
+                let bytes: Vec<u8> = draw
+                    .vertex_fetch
+                    .iter()
+                    .flat_map(echora_shader_abi::VertexAttribute::to_bytes)
+                    .collect();
+                let (buffer, offset) = self.ring_upload(&bytes, 256)?;
+                fetch.table = self
+                    .buffer_address(buffer)
+                    .ok_or("vertex pulling needs buffer device addresses")?
+                    + offset;
+                let count = draw
+                    .vertex_fetch
+                    .len()
+                    .min(echora_shader_abi::VERTEX_ATTRIBUTES);
+                fetch.attributes = if count == 32 {
+                    u32::MAX
+                } else {
+                    (1 << count) - 1
+                };
+            }
+            Some(
+                echora_shader_abi::PushConstants {
+                    vertex_fetch: fetch,
+                    resolution_scale: [factor, factor, 1.0 / factor, 1.0 / factor],
+                    page_table: draw.page_table,
+                    ..Default::default()
+                }
+                .to_bytes(),
+            )
+        };
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
@@ -803,6 +851,15 @@ impl Renderer {
                     program.push_stages,
                     0,
                     constants,
+                );
+            }
+            if let Some(block) = &abi {
+                device.cmd_push_constants(
+                    commands,
+                    program.pipeline_layout,
+                    program.abi_stages,
+                    0,
+                    block,
                 );
             }
             if draw.mesh.is_none() {
@@ -1046,6 +1103,8 @@ pub(crate) mod tests {
             },
             blends: vec![Blend::default()],
             mesh: None,
+            page_table: Default::default(),
+            vertex_fetch: Vec::new(),
         };
         renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();

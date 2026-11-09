@@ -494,8 +494,11 @@ impl Renderer {
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC;
-        renderer.ring = renderer.host_buffer(RING_SIZE, usage)?;
-        renderer.spare.ring = renderer.host_buffer(RING_SIZE, usage)?;
+        // Addressable, where the device allows: vertex fetch tables are
+        // read through their device address.
+        let addressable = renderer.gpu.buffer_device_address;
+        renderer.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
+        renderer.spare.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
         Ok(renderer)
     }
 

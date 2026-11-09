@@ -309,6 +309,56 @@ pub fn vk_format(format: u32) -> Option<vk::Format> {
     })
 }
 
+/// How a vertex program pulling its inputs decodes an NVN vertex format
+/// (`echora_shader_abi::VertexFormat`); 0 (no format) reads as unbound.
+pub fn vertex_format(format: u32) -> Option<echora_shader_abi::VertexFormat> {
+    use echora_shader_abi::{VertexFormat, VertexLayout as L, VertexNumeric as N};
+    if format == 0 {
+        return Some(VertexFormat::default());
+    }
+    let name = crate::nvn_format::info(format)?.name;
+    let packed = |components, layout, numeric| VertexFormat {
+        components,
+        layout,
+        numeric,
+        bgra: false,
+    };
+    match name {
+        "RGB10A2" => return Some(packed(4, L::Packed1010102, N::Unorm)),
+        "RGB10A2UI" => return Some(packed(4, L::Packed1010102, N::Uint)),
+        "R11G11B10F" => return Some(packed(3, L::Packed111110, N::Float)),
+        "BGRA8" => {
+            return Some(VertexFormat {
+                bgra: true,
+                ..packed(4, L::Bits8, N::Unorm)
+            });
+        }
+        _ => {}
+    }
+    // R/RG/RGB/RGBA, then 8/16/32, then "" (unorm), SN, UI, I or F.
+    let channels = name.len() - name.trim_start_matches(['R', 'G', 'B', 'A']).len();
+    let rest = &name[channels..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let layout = match &rest[..digits] {
+        "8" => L::Bits8,
+        "16" => L::Bits16,
+        "32" => L::Bits32,
+        _ => return None,
+    };
+    let numeric = match &rest[digits..] {
+        "" => N::Unorm,
+        "SN" => N::Snorm,
+        "UI" => N::Uint,
+        "I" => N::Sint,
+        "F" => N::Float,
+        _ => return None,
+    };
+    if !(1..=4).contains(&channels) || (numeric == N::Float && layout == L::Bits8) {
+        return None;
+    }
+    Some(packed(channels as u32, layout, numeric))
+}
+
 /// NVN stage index (as in BindTexture/BindUniformBuffer) of a stage.
 fn nvn_stage(stage: Stage) -> u32 {
     match stage {
@@ -3513,6 +3563,43 @@ impl Nvn {
     /// Record the file offsets of memory pools not yet known, where the GPU
     /// can share them in place (needs the page table: `core` under the
     /// machine lock).
+    /// A vertex fetch table entry (`echora_shader_abi::VertexAttribute`)
+    /// for an attribute state reading NVN `format`: its stream's bound
+    /// buffer, stride and divisor. A stream with no buffer reads as
+    /// unbound.
+    fn fetch_entry(
+        &self,
+        attribute: &BTreeMap<String, super::Args>,
+        streams: &[BTreeMap<String, super::Args>],
+        format: u32,
+    ) -> Result<echora_shader_abi::VertexAttribute, String> {
+        let value = |props: &BTreeMap<String, super::Args>, key: &str| {
+            props.get(key).map_or(0, |args| args.x[0])
+        };
+        let encoded =
+            vertex_format(format).ok_or_else(|| format!("vertex attribute format {format}"))?;
+        let stream = value(attribute, "StreamIndex") as usize;
+        // SetFormat(state, format, relative offset).
+        let offset = attribute.get("Format").map_or(0, |args| args.x[1]);
+        let (Some(props), Some(bind)) = (
+            streams.get(stream),
+            self.render.state.get(&format!("BindVertexBuffer/{stream}")),
+        ) else {
+            return Ok(Default::default());
+        };
+        if encoded.components == 0 || bind.x[2] == 0 {
+            return Ok(Default::default());
+        }
+        Ok(echora_shader_abi::VertexAttribute {
+            address: bind.x[2] + offset,
+            stride: value(props, "Stride") as u32,
+            divisor: value(props, "Divisor") as u32,
+            format: encoded.encode(),
+            size: bind.x[3].saturating_sub(offset).min(u64::from(u32::MAX)) as u32,
+            reserved: [0; 2],
+        })
+    }
+
     /// The GPU page table programs reach global memory through
     /// (ECHORA_PAGE_TABLE; `echora_shader_abi::PageTable`), rebuilt when the
     /// memory pools change. A host-visible pool's pages point into shared
@@ -4156,6 +4243,16 @@ impl Nvn {
             props.get(key).map_or(0, |args| args.x[0])
         };
         let mut attributes = Vec::new();
+        // Vertex pulling (a Rust-translated vertex program): the program
+        // fetches its inputs through the page table from this table, and
+        // no vertex data is copied.
+        let pulling =
+            !mesh_draw && stages[0].push_fields & echora_shader_abi::PUSH_VERTEX_FETCH != 0;
+        let mut vertex_fetch = Vec::new();
+        if pulling {
+            let locations = 32 - stages[0].loaded_generics.leading_zeros() as usize;
+            vertex_fetch = vec![echora_shader_abi::VertexAttribute::default(); locations];
+        }
         // Attributes the shader loads but the state leaves without a format
         // (0): read as (0, 0, 0, 1), the usual value of an attribute with no
         // vertex data (inferred; NVN's documentation is not public).
@@ -4165,6 +4262,10 @@ impl Nvn {
                 continue;
             }
             let format = value(props, "Format") as u32;
+            if pulling {
+                vertex_fetch[location] = self.fetch_entry(props, &stream_states, format)?;
+                continue;
+            }
             if format == 0 {
                 unformatted.push(location as u32);
                 continue;
@@ -4358,7 +4459,7 @@ impl Nvn {
         let per_vertex = |props: &BTreeMap<String, super::Args>| {
             value(props, "Divisor") == 0 && value(props, "Stride") != 0
         };
-        let shifted = vertex_start > 0 && stream_states.iter().any(per_vertex);
+        let shifted = !pulling && vertex_start > 0 && stream_states.iter().any(per_vertex);
         // Each stream's bytes per vertex the loaded attributes reach (past
         // the furthest attribute's offset and size): a stream no attribute
         // reads is not read, and a stride-0 one (the same element for every
@@ -4438,6 +4539,15 @@ impl Nvn {
             }));
         }
 
+        let page_table = if pulling
+            || stages
+                .iter()
+                .any(|stage| stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0)
+        {
+            self.page_table(core)?
+        } else {
+            Default::default()
+        };
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams
             .iter()
@@ -4818,6 +4928,8 @@ impl Nvn {
             storage,
             storage_in_place,
             fixed,
+            page_table,
+            vertex_fetch,
         };
         let probe_target = draw.colors.first().copied();
         let colors_written = draw.colors.clone();
@@ -5301,4 +5413,27 @@ fn label_sources<'a>(sources: impl Iterator<Item = &'a TextureSource>) -> String
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod vertex_format_tests {
+    use super::vertex_format;
+    use echora_shader_abi::{VertexLayout as L, VertexNumeric as N};
+
+    #[test]
+    fn vertex_formats_decode_by_name() {
+        let decoded =
+            |format| vertex_format(format).map(|f| (f.components, f.layout, f.numeric, f.bgra));
+        assert_eq!(decoded(0).map(|f| f.0), Some(0));
+        assert_eq!(decoded(1), Some((1, L::Bits8, N::Unorm, false))); // R8
+        assert_eq!(decoded(19), Some((2, L::Bits16, N::Snorm, false))); // RG16SN
+        assert_eq!(decoded(36), Some((3, L::Bits32, N::Sint, false))); // RGB32I
+        assert_eq!(decoded(41), Some((4, L::Bits16, N::Float, false))); // RGBA16F
+        assert_eq!(decoded(47), Some((4, L::Bits32, N::Uint, false))); // RGBA32UI
+        assert_eq!(decoded(61), Some((4, L::Packed1010102, N::Unorm, false)));
+        assert_eq!(decoded(63), Some((3, L::Packed111110, N::Float, false)));
+        assert_eq!(decoded(154), Some((4, L::Bits8, N::Unorm, true))); // BGRA8
+        assert_eq!(decoded(50), None); // DEPTH16
+        assert_eq!(decoded(66), None); // BC1
+    }
 }

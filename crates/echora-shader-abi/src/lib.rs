@@ -178,11 +178,41 @@ pub struct PushConstants {
     pub page_table: PageTable,
 }
 
+impl PushConstants {
+    /// The block as pushed (little-endian, the layout above).
+    pub fn to_bytes(&self) -> [u8; PUSH_CONSTANTS_SIZE as usize] {
+        let mut bytes = [0u8; PUSH_CONSTANTS_SIZE as usize];
+        let mut words = Vec::with_capacity(32);
+        words.extend_from_slice(&self.translator);
+        let fetch = &self.vertex_fetch;
+        words.extend([
+            fetch.table as u32,
+            (fetch.table >> 32) as u32,
+            fetch.base_instance,
+            fetch.attributes,
+        ]);
+        words.extend(self.resolution_scale.map(f32::to_bits));
+        let table = &self.page_table;
+        words.extend([
+            table.address as u32,
+            (table.address >> 32) as u32,
+            table.first_page,
+            table.page_count,
+        ]);
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+}
+
 /// `Translated::push_fields` bits.
 pub const PUSH_TRANSLATOR: u32 = 1;
 pub const PUSH_RESOLUTION_SCALE: u32 = 2;
 pub const PUSH_PAGE_TABLE: u32 = 4;
 pub const PUSH_VERTEX_FETCH: u32 = 8;
+/// The fields of the ABI block (all but the translator's words).
+pub const PUSH_ABI_FIELDS: u32 = PUSH_RESOLUTION_SCALE | PUSH_PAGE_TABLE | PUSH_VERTEX_FETCH;
 
 pub const PUSH_TRANSLATOR_OFFSET: u32 = 0;
 pub const PUSH_VERTEX_FETCH_OFFSET: u32 = 80;
@@ -250,6 +280,27 @@ pub struct VertexFetch {
 }
 
 pub const VERTEX_ATTRIBUTES: usize = 32;
+
+impl VertexAttribute {
+    /// The entry as the table stores it.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let words = [
+            self.address as u32,
+            (self.address >> 32) as u32,
+            self.stride,
+            self.divisor,
+            self.format,
+            self.size,
+            self.reserved[0],
+            self.reserved[1],
+        ];
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+}
 
 /// One generic input's source, 32 bytes, std430.
 #[repr(C)]
@@ -385,6 +436,48 @@ mod tests {
         assert_eq!(std::mem::size_of::<PageTable>(), 16);
         assert_eq!(std::mem::size_of::<VertexFetch>(), 16);
         assert_eq!(std::mem::size_of::<VertexAttribute>(), 32);
+    }
+
+    #[test]
+    fn push_bytes_follow_the_struct_layout() {
+        let constants = PushConstants {
+            vertex_fetch: VertexFetch {
+                table: 0x1122_3344_5566_7788,
+                base_instance: 9,
+                attributes: 3,
+            },
+            resolution_scale: [2.0, 2.0, 0.5, 0.5],
+            page_table: PageTable {
+                address: 0xaabb_ccdd_0000_1000,
+                first_page: 5,
+                page_count: 6,
+            },
+            ..Default::default()
+        };
+        let bytes = constants.to_bytes();
+        let at = |offset: u32, length: usize| &bytes[offset as usize..offset as usize + length];
+        assert_eq!(
+            at(PUSH_VERTEX_FETCH_OFFSET, 16),
+            [
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 9, 0, 0, 0, 3, 0, 0, 0
+            ]
+        );
+        assert_eq!(at(PUSH_RESOLUTION_SCALE_OFFSET, 4), 2.0f32.to_le_bytes());
+        assert_eq!(
+            at(PUSH_RESOLUTION_SCALE_OFFSET + 8, 4),
+            0.5f32.to_le_bytes()
+        );
+        assert_eq!(
+            at(PUSH_PAGE_TABLE_OFFSET, 16),
+            [
+                0, 0x10, 0, 0, 0xdd, 0xcc, 0xbb, 0xaa, 5, 0, 0, 0, 6, 0, 0, 0
+            ]
+        );
+        assert!(
+            at(0, PUSH_VERTEX_FETCH_OFFSET as usize)
+                .iter()
+                .all(|&b| b == 0)
+        );
     }
 
     #[test]
