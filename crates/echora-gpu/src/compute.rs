@@ -27,6 +27,10 @@ pub struct Dispatch<'a> {
     pub textures: HashMap<u32, (TextureSource, Sampler)>,
     /// Storage images by binding: the render target each binding writes.
     pub images: HashMap<u32, (u64, u32)>,
+    /// Indirect: the group counts are three u32 in this buffer at this
+    /// offset, read by the GPU when the dispatch runs (after every write
+    /// recorded before it); `groups` is then unused.
+    pub indirect: Option<(vk::Buffer, u64)>,
 }
 
 impl Renderer {
@@ -228,7 +232,11 @@ impl Renderer {
         let commands = self.commands()?;
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::UNIFORM_READ);
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::UNIFORM_READ
+                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
+            );
         let after = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ);
@@ -251,7 +259,7 @@ impl Renderer {
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
                 vk::DependencyFlags::empty(),
                 &[before],
                 &[],
@@ -275,8 +283,13 @@ impl Renderer {
                 &[set],
                 &[],
             );
-            let [x, y, z] = dispatch.groups;
-            device.cmd_dispatch(commands, x, y, z);
+            match dispatch.indirect {
+                Some((buffer, offset)) => device.cmd_dispatch_indirect(commands, buffer, offset),
+                None => {
+                    let [x, y, z] = dispatch.groups;
+                    device.cmd_dispatch(commands, x, y, z);
+                }
+            }
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -364,6 +377,7 @@ mod tests {
             storage_in_place: HashMap::new(),
             textures: HashMap::new(),
             images: HashMap::new(),
+            indirect: None,
         };
         let results = renderer.dispatch(&dispatch).unwrap();
         assert_eq!(

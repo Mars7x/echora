@@ -1414,6 +1414,37 @@ impl Renderer {
         if let Some(path) = std::env::var_os("ECHORA_LAST_SUBMIT") {
             let _ = std::fs::write(path, labels.join("\n"));
         }
+        // ECHORA_SUBMIT_LOG=<file> (debugging): every submission's labels
+        // from present ECHORA_SUBMIT_LOG_FROM on, appended.
+        if let Some(path) = std::env::var_os("ECHORA_SUBMIT_LOG") {
+            let from = std::env::var("ECHORA_SUBMIT_LOG_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let present = |label: &String| {
+                label
+                    .strip_prefix("present ")
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|number| number.parse::<u64>().ok())
+            };
+            let lines: Vec<&String> = labels
+                .iter()
+                .filter(|label| present(label).is_some_and(|number| number >= from))
+                .collect();
+            if !lines.is_empty() {
+                use std::io::Write as _;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    for line in lines {
+                        let _ = writeln!(file, "{line}");
+                    }
+                    let _ = writeln!(file, "-- submit");
+                }
+            }
+        }
         self.submitted_labels = labels;
         if let Some(timer) = &self.timer {
             timer.end(&self.gpu.device, self.commands, self.fence);
@@ -2118,6 +2149,7 @@ impl Renderer {
         *ON.get_or_init(|| {
             std::env::var_os("ECHORA_LAST_SUBMIT").is_some()
                 || std::env::var_os("ECHORA_SLOW_SUBMITS").is_some()
+                || std::env::var_os("ECHORA_SUBMIT_LOG").is_some()
         })
     }
 

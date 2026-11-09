@@ -3099,22 +3099,46 @@ impl Nvn {
                 }
                 // DispatchComputeIndirect(cmd, NVNbufferAddress): the group
                 // counts are three u32 at the address when the GPU reaches
-                // the command (a dispatch before it may have written them,
-                // so its results are resolved first); it runs as
-                // DispatchCompute with them.
-                if rest == "DispatchComputeIndirect" {
-                    if let Err(message) = self.resolve_storage(core, None) {
+                // the command. The results that may have written them
+                // (a counter in a resident pool's GPU copy) are stored for
+                // that range, and it runs as DispatchCompute with them.
+                // ECHORA_GPU_INDIRECT (being validated): the GPU reads them
+                // itself (see `gpu_dispatch`).
+                if rest == "DispatchComputeIndirect"
+                    && (self.gpu().is_none() || debug_var_os("ECHORA_GPU_INDIRECT").is_none())
+                {
+                    let at = self.gpu_to_guest(command.x[1], 12).map_err(stop)?;
+                    // ECHORA_INDIRECT_EXACT (being investigated): the counts
+                    // a resident pool's GPU copy holds are stored first. The
+                    // dispatches they enable past the movie hang the GPU
+                    // (a runaway shader under study), so by default only
+                    // uncached pools are read back, as before.
+                    let range = debug_var_os("ECHORA_INDIRECT_EXACT").map(|_| at..at + 12);
+                    if let Err(message) = self.resolve_storage(core, range) {
                         return Err(stop(format!("dispatch results: {message}")));
                     }
-                    let at = self.gpu_to_guest(command.x[1], 12).map_err(stop)?;
                     let mut direct = command.clone();
                     direct.name = "nvnCommandBufferDispatchCompute".into();
                     for (index, slot) in direct.x[1..4].iter_mut().enumerate() {
                         *slot = u64::from(core.memory.read_u32(at + index as u64 * 4)?);
                     }
+                    // Counts past the smallest per-axis limit Vulkan allows
+                    // are not dispatched (an overrun stalls the GPU): noted,
+                    // since they mean the arguments were read wrong.
+                    if direct.x[1..4].iter().any(|count| *count > 65_535) {
+                        let note = format!(
+                            "indirect dispatch skipped: groups {:?} at {:#x}",
+                            &direct.x[1..4],
+                            command.x[1]
+                        );
+                        self.gpu_note(note);
+                        return Ok(());
+                    }
                     return self.execute_command(&direct, core);
                 }
-                if rest == "DispatchCompute" && self.gpu().is_some() {
+                if matches!(rest, "DispatchCompute" | "DispatchComputeIndirect")
+                    && self.gpu().is_some()
+                {
                     let start = std::time::Instant::now();
                     let result = self.gpu_dispatch(core, command);
                     let backend = self.gpu().unwrap();

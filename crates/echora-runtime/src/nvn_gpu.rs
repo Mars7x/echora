@@ -2747,6 +2747,15 @@ impl Nvn {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
         let key = (self.stage_code(core, address).unwrap().1, u64::MAX);
+        // ECHORA_GPU_SKIP_DISPATCH=<program key>[,...] (debugging): those
+        // compute programs are not run.
+        if super::debug_var("ECHORA_GPU_SKIP_DISPATCH").is_ok_and(|skipped| {
+            skipped
+                .split(',')
+                .any(|skip| skip == format!("{:016x}", key.0))
+        }) {
+            return Ok(());
+        }
         // For skipped dispatches: the program's bindings and the compute
         // slots bound, from which the driver constant layout is inferred.
         let layout = {
@@ -2921,6 +2930,23 @@ impl Nvn {
                         c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
                     }
                     let guest = self.gpu_to_guest(base, length)?;
+                    // ECHORA_GPU_STORAGE_PROBE=<program key> (debugging): each
+                    // storage buffer that program binds, its flags and the
+                    // path it takes, at every 300th present.
+                    let probing = super::debug_var("ECHORA_GPU_STORAGE_PROBE")
+                        .is_ok_and(|probe| probe == format!("{:016x}", key.0))
+                        && self.presented_frames.is_multiple_of(300);
+                    if probing {
+                        eprintln!(
+                            "probe present {} {:016x} binding {} c{}+{:#x} gpu {gpu:#x} size {size:#x} flags {:#x}",
+                            self.presented_frames,
+                            key.0,
+                            descriptor.binding,
+                            descriptor.cbuf_index,
+                            descriptor.cbuf_offset,
+                            descriptor.flags
+                        );
+                    }
                     // In place when guest memory can be imported: the GPU
                     // reads and writes it directly, with no copies either
                     // way (earlier in-place writes are already ordered on
@@ -2935,6 +2961,9 @@ impl Nvn {
                         None => None,
                     };
                     if let Some((buffer, offset)) = in_place {
+                        if probing {
+                            eprintln!("probe   in place");
+                        }
                         self.resolve_copies(core, Some(guest..guest + length))?;
                         storage_in_place.insert(descriptor.binding, (buffer, offset, length));
                         let written = &mut self.gpu.as_mut().unwrap().in_place_writes;
@@ -2952,6 +2981,9 @@ impl Nvn {
                     self.resolve_copies(core, Some(guest..guest + length))?;
                     match self.resident_pool_binding(core, guest, length)? {
                         Some((buffer, offset)) => {
+                            if probing {
+                                eprintln!("probe   resident at {offset:#x}");
+                            }
                             storage_in_place.insert(descriptor.binding, (buffer, offset, length));
                             if descriptor.flags & 1 != 0 {
                                 let backend = self.gpu.as_mut().unwrap();
@@ -2965,6 +2997,9 @@ impl Nvn {
                             }
                         }
                         None => {
+                            if probing {
+                                eprintln!("probe   copied");
+                            }
                             self.resolve_storage(core, Some(guest..guest + length))?;
                             storage.insert(descriptor.binding, self.gpu_bytes(core, base, length)?);
                             if descriptor.flags & 1 != 0 {
@@ -3170,6 +3205,20 @@ impl Nvn {
                 )
             })
             .collect();
+        // DispatchComputeIndirect(cmd, NVNbufferAddress): the GPU reads the
+        // three group counts at the address when the dispatch runs, from
+        // the pool's GPU copy (an earlier pass's writes, a counter its
+        // atomics advanced, are there in order).
+        let indirect = if command.name.ends_with("DispatchComputeIndirect") {
+            let guest = self.gpu_to_guest(command.x[1], 12)?;
+            self.resolve_copies(core, Some(guest..guest + 12))?;
+            Some(
+                self.resident_pool_binding(core, guest, 12)?
+                    .ok_or("indirect dispatch arguments are in no memory pool")?,
+            )
+        } else {
+            None
+        };
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
             program: &backend.programs[&key],
@@ -3183,6 +3232,7 @@ impl Nvn {
             storage_in_place,
             textures,
             images,
+            indirect,
         };
         let started = std::time::Instant::now();
         let lengths: HashMap<u32, u64> = dispatch
@@ -3192,10 +3242,13 @@ impl Nvn {
             .collect();
         if echora_gpu::renderer::Renderer::labelling() {
             let label = format!(
-                "present {} dispatch {:016x} groups {:?} reads [{}] writes {:x?}",
+                "present {} dispatch {:016x} groups {} reads [{}] writes {:x?}",
                 self.presented_frames,
                 key.0,
-                dispatch.groups,
+                match dispatch.indirect {
+                    Some(_) => format!("indirect at {:#x}", command.x[1]),
+                    None => format!("{:?}", dispatch.groups),
+                },
                 label_sources(dispatch.textures.values().map(|(source, _)| source)),
                 dispatch.images.values().collect::<Vec<_>>()
             );

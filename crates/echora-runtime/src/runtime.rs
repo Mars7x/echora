@@ -3097,7 +3097,8 @@ impl Machine {
     /// controller sample in the hid shared memory (see crate::hid).
     /// Publish one controller sample per present: the window's keyboard,
     /// or without a window, ECHORA_AUTO_PRESS=N holds a button for 6
-    /// samples every N (for headless runs through menus): the next one of
+    /// samples (ECHORA_AUTO_HOLD) every N (for headless runs through
+    /// menus): the next one of
     /// ECHORA_AUTO_KEYS (comma-separated names such as A,UP,A), then A,
     /// from sample ECHORA_AUTO_START until ECHORA_AUTO_END; otherwise an
     /// idle, connected controller.
@@ -3133,6 +3134,11 @@ impl Machine {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|every| *every > 6)
         {
+            let hold = std::env::var("ECHORA_AUTO_HOLD")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(6)
+                .clamp(1, every - 1);
             // ECHORA_AUTO_START=S: no presses before sample S (loading
             // screens take a nearly fixed number of presents).
             let start = std::env::var("ECHORA_AUTO_START")
@@ -3169,7 +3175,7 @@ impl Machine {
                         .and_then(crate::window::button::named)
                 })
                 .unwrap_or(crate::window::button::A);
-            u64::from(sample % every < 6) * key
+            u64::from(sample % every < hold) * key
         } else {
             // No window and no scripted presses: the controller is still
             // connected, with nothing pressed.
