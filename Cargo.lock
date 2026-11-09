@@ -1935,6 +1935,7 @@ dependencies = [
  "echora-input",
  "echora-loader",
  "echora-nup",
+ "echora-shader-abi",
  "getrandom 0.4.3",
  "jiff",
  "libc",
