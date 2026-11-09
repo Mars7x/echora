@@ -333,6 +333,9 @@ mod tests {
                 (64, 8, 0x20),
                 (81, 3, 7),
             ]),
+            // S2R R10, SR_THREAD_KILL; S2R R11, SR_VARIABLE_RATE
+            word(&[(0, 12, 0x919), (16, 8, 10), (72, 8, 0x13)]),
+            word(&[(0, 12, 0x919), (16, 8, 11), (72, 8, 0x84)]),
             // IPA R7, a[0x70] (frag coord x)
             word(&[
                 (0, 12, 0x326),

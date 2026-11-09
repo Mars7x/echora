@@ -132,6 +132,7 @@ pub mod op {
     pub const ATOMIC_F_ADD: u16 = 6035;
     pub const READ_CLOCK: u16 = 5056;
     pub const DEMOTE_TO_HELPER_INVOCATION: u16 = 5380;
+    pub const IS_HELPER_INVOCATION: u16 = 5381;
     pub const TYPE_COOPERATIVE_MATRIX: u16 = 4456;
     pub const COOPERATIVE_MATRIX_LOAD: u16 = 4457;
     pub const COOPERATIVE_MATRIX_STORE: u16 = 4458;

@@ -1032,6 +1032,19 @@ impl Emitter {
                 let vector = self.value(op::LOAD, uvec4, &[variable]);
                 self.value(op::COMPOSITE_EXTRACT, self.u32, &[vector, 0])
             }
+            // THREAD_KILL: whether the invocation is a helper (or was
+            // demoted by KILL), as 1 or 0.
+            0x13 => {
+                self.module
+                    .capability(capability::DEMOTE_TO_HELPER_INVOCATION);
+                let helper = self.value(op::IS_HELPER_INVOCATION, self.bool, &[]);
+                let (one, zero) = (self.constant(1), self.constant(0));
+                self.value(op::SELECT, self.u32, &[helper, one, zero])
+            }
+            // VARIABLE_RATE: the fragment shading rate, X in bits 8-15 and Y
+            // in 16-23. Rendering never enables variable-rate shading, so
+            // every fragment is 1x1.
+            0x84 => self.constant(1 << 8 | 1 << 16),
             0x50 | 0x51 => {
                 self.module.capability(capability::SHADER_CLOCK);
                 self.module.extension("SPV_KHR_shader_clock");
