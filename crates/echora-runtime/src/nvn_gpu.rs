@@ -2758,18 +2758,38 @@ impl Nvn {
             let entry = descriptor.cbuf_offset as usize;
             match descriptor.kind() {
                 DescriptorKind::StorageBuffer => {
-                    let slot = slot(descriptor, DescriptorKind::StorageBuffer)
-                        .ok_or_else(|| unplaced(descriptor))?;
-                    let bind = self
-                        .render
-                        .state
-                        .get(&format!("BindStorageBuffer/5/{slot}"))
-                        .ok_or_else(|| format!("storage buffer 5/{slot} is not bound: {layout}"))?;
-                    let (gpu, size) = (bind.x[3], bind.x[4]);
+                    let (gpu, size) = match slot(descriptor, DescriptorKind::StorageBuffer) {
+                        Some(slot) => {
+                            let bind = self
+                                .render
+                                .state
+                                .get(&format!("BindStorageBuffer/5/{slot}"))
+                                .ok_or_else(|| {
+                                    format!("storage buffer 5/{slot} is not bound: {layout}")
+                                })?;
+                            (bind.x[3], bind.x[4])
+                        }
+                        // Global memory through an address and size kept
+                        // elsewhere in c0: a uniform buffer's entry or the
+                        // pushed constants (OoT's post-movie passes).
+                        None => {
+                            let pointer = constant_pointer(descriptor, &c0);
+                            let (gpu, size) = pointer
+                                .filter(|&(gpu, size)| gpu != 0 && size != 0)
+                                .ok_or_else(|| unplaced(descriptor))?;
+                            self.gpu.as_mut().unwrap().note(format!(
+                                "compute storage through c{}+{:#x}",
+                                descriptor.cbuf_index, descriptor.cbuf_offset
+                            ));
+                            (gpu, size)
+                        }
+                    };
                     let base = gpu & !15;
                     let length = gpu - base + size;
-                    c0[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
-                    c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
+                    if descriptor.cbuf_index == 0 {
+                        c0[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
+                        c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
+                    }
                     let guest = self.gpu_to_guest(base, length)?;
                     // In place when guest memory can be imported: the GPU
                     // reads and writes it directly, with no copies either
@@ -4740,4 +4760,20 @@ mod range_tests {
         remove_range(&mut ranges, 100..200);
         assert_eq!(ranges, [12..15, 25..40]);
     }
+}
+
+/// The storage buffer address and size (eight and four bytes) a compute
+/// program reads at `descriptor`'s place in its c0 (`c0`, as filled)
+/// outside the storage buffer entries. Words the tracking finds in other
+/// constant buffers were constants, not addresses (floats 1.0 and 10.0 in
+/// c1), so only c0 is read.
+fn constant_pointer(descriptor: &shader::Descriptor, c0: &[u8]) -> Option<(u64, u64)> {
+    if descriptor.cbuf_index != 0 {
+        return None;
+    }
+    let at = descriptor.cbuf_offset as usize;
+    let bytes = c0.get(at..at + 12)?;
+    let gpu = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let size = u64::from(u32::from_le_bytes(bytes[8..].try_into().unwrap()));
+    Some((gpu, size))
 }
