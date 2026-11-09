@@ -328,6 +328,20 @@ pub enum Op {
         address: Address,
         size: u8,
     },
+    /// RED / ATOMG / ATOMS d, [address], data: `operation` (bits 87-90) 0
+    /// add, 1 min, 2 max, 3 increment, 4 decrement, 5 and, 6 or, 7 xor, 8
+    /// exchange; with `compare` (CAS) a compare-and-swap. `kind` (73-75):
+    /// 0 U32, 1 S32, 2 U64, 3 F32, 4 F16x2, 5 S64, 6 F64. RED has no
+    /// result (RZ).
+    Atomic {
+        d: Reg,
+        space: Space,
+        address: Address,
+        data: Reg,
+        compare: Option<Reg>,
+        operation: u8,
+        kind: u8,
+    },
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
     Bar {
         mode: u8,
@@ -574,31 +588,32 @@ impl Word {
         })
     }
 
-    /// A load or store's address. Global accesses with uniform registers
-    /// (0x9xx) flag a register pair at bit 90 and the uniform pair at 72;
-    /// without (0x3xx), the register pair at 72. Bit 91 adds the uniform
-    /// register at `uniform_at`. Shared accesses scale the register by
-    /// bits 78-79 (1, 4, 8 or 16).
-    fn address(self, opcode: u16, uniform_at: u32) -> Address {
-        let global = matches!(opcode & 0xff, 0x81 | 0x86);
-        let with_uniform = opcode & 0x800 != 0;
-        let wide = global && self.bit(if with_uniform { 90 } else { 72 });
-        let uniform = (with_uniform && self.bit(91)).then(|| {
+    /// A memory access's address: the register at 24, a pair when
+    /// `wide_bit` is set; the uniform register at `uniform_at` when bit 91
+    /// is set, a pair when `uniform_wide_bit` is; a signed offset at 40-63;
+    /// and for `scaled` (shared) accesses the register's scale at 78-79
+    /// (1, 4, 8 or 16).
+    fn address(
+        self,
+        wide_bit: Option<u32>,
+        uniform_at: Option<u32>,
+        uniform_wide_bit: Option<u32>,
+        scaled: bool,
+    ) -> Address {
+        let uniform = uniform_at.filter(|_| self.bit(91)).map(|at| {
             (
-                UniformReg(self.bits(uniform_at, 6) as u8),
-                global && self.bit(72),
+                UniformReg(self.bits(at, 6) as u8),
+                uniform_wide_bit.is_some_and(|bit| self.bit(bit)),
             )
         });
-        let shared = matches!(opcode & 0xff, 0x84 | 0x88);
-        let scale = if shared {
-            [1, 4, 8, 16][self.bits(78, 2) as usize]
-        } else {
-            1
-        };
         Address {
             reg: self.reg(24),
-            wide,
-            scale,
+            wide: wide_bit.is_some_and(|bit| self.bit(bit)),
+            scale: if scaled {
+                [1, 4, 8, 16][self.bits(78, 2) as usize]
+            } else {
+                1
+            },
             uniform,
             offset: ((self.bits(40, 24) as u32) << 8) as i32 >> 8,
         }
@@ -738,10 +753,16 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             } else {
                 Pred::TRUE
             };
+            let address = match opcode {
+                0x381 => word.address(Some(72), None, None, false),
+                0x981 => word.address(Some(90), Some(32), Some(72), false),
+                0x984 => word.address(None, Some(32), None, true),
+                _ => word.address(None, Some(32), None, false),
+            };
             return Some(Op::Load {
                 d,
                 space,
-                address: word.address(opcode, 32),
+                address,
                 size: word.bits(73, 3) as u8,
                 condition,
             });
@@ -752,11 +773,48 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 0x88 => Space::Shared,
                 _ => Space::Local,
             };
+            let address = match opcode {
+                0x386 => word.address(Some(72), None, None, false),
+                0x986 => word.address(Some(90), Some(64), Some(72), false),
+                0x388 => word.address(None, None, None, true),
+                0x988 => word.address(None, Some(64), None, true),
+                0x387 => word.address(None, None, None, false),
+                _ => word.address(None, Some(64), None, false),
+            };
             return Some(Op::Store {
                 data: word.reg(32),
                 space,
-                address: word.address(opcode, 64),
+                address,
                 size: word.bits(73, 3) as u8,
+            });
+        }
+        0x98e | 0x9a8 | 0x3a8 | 0x3a9 | 0x38c | 0x98c | 0x38d => {
+            let (space, address) = match opcode {
+                0x98e => (
+                    Space::Global,
+                    word.address(Some(90), Some(64), Some(72), false),
+                ),
+                0x9a8 => (
+                    Space::Global,
+                    word.address(Some(70), Some(64), Some(72), false),
+                ),
+                0x3a8 | 0x3a9 => (Space::Global, word.address(Some(72), None, None, false)),
+                0x98c => (Space::Shared, word.address(None, Some(64), None, true)),
+                _ => (Space::Shared, word.address(None, None, None, true)),
+            };
+            let exchange = matches!(opcode, 0x3a9 | 0x38d);
+            return Some(Op::Atomic {
+                d: if opcode == 0x98e { Reg::ZERO } else { d },
+                space,
+                address,
+                data: word.reg(if exchange { 64 } else { 32 }),
+                compare: exchange.then(|| word.reg(32)),
+                operation: if exchange {
+                    0
+                } else {
+                    word.bits(87, if opcode == 0x98e { 3 } else { 4 }) as u8
+                },
+                kind: word.bits(73, 3) as u8,
             });
         }
         0xb1d => {

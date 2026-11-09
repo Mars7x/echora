@@ -130,6 +130,110 @@ impl Emitter {
         }
     }
 
+    /// An atomic read-modify-write, or with `compare` a compare-and-swap;
+    /// `d` receives the old value (0 where nothing was there).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn atomic(
+        &mut self,
+        index: usize,
+        d: u8,
+        space: Space,
+        address: Address,
+        data: u8,
+        compare: Option<u8>,
+        operation: u8,
+        kind: u8,
+    ) -> Result<(), Unsupported> {
+        let float = kind == 3;
+        let opcode = match (compare.is_some(), operation, kind) {
+            (true, _, 0 | 1) => op::ATOMIC_COMPARE_EXCHANGE,
+            (false, 0, 0 | 1) => op::ATOMIC_I_ADD,
+            (false, 0, 3) => op::ATOMIC_F_ADD,
+            (false, 1, 0) => op::ATOMIC_U_MIN,
+            (false, 1, 1) => op::ATOMIC_S_MIN,
+            (false, 2, 0) => op::ATOMIC_U_MAX,
+            (false, 2, 1) => op::ATOMIC_S_MAX,
+            (false, 5, 0 | 1) => op::ATOMIC_AND,
+            (false, 6, 0 | 1) => op::ATOMIC_OR,
+            (false, 7, 0 | 1) => op::ATOMIC_XOR,
+            (false, 8, 0 | 1) => op::ATOMIC_EXCHANGE,
+            _ => {
+                return Err(unsupported(
+                    index,
+                    format!("atomic operation {operation} on type {kind}"),
+                ));
+            }
+        };
+        if float {
+            self.module.capability(capability::ATOMIC_FLOAT32_ADD);
+            self.module.extension("SPV_EXT_shader_atomic_float_add");
+        }
+        let value = self.read_register(data);
+        let compare = compare.map(|reg| self.read_register(reg));
+        let result = self.result_variables(1)[0];
+        let scope = self.constant(if space == Space::Global {
+            SCOPE_DEVICE
+        } else {
+            SCOPE_WORKGROUP
+        });
+        let relaxed = self.constant(0);
+        let apply = |e: &mut Self, pointer: u32| {
+            let (ty, value) = if float {
+                (e.f32, e.value(op::BITCAST, e.f32, &[value]))
+            } else {
+                (e.u32, value)
+            };
+            let old = match compare {
+                Some(compare) => e.value(
+                    opcode,
+                    ty,
+                    &[pointer, scope, relaxed, relaxed, value, compare],
+                ),
+                None => e.value(opcode, ty, &[pointer, scope, relaxed, value]),
+            };
+            let old = if float {
+                e.value(op::BITCAST, e.u32, &[old])
+            } else {
+                old
+            };
+            e.function.emit(op::STORE, &[result, old]);
+        };
+        match space {
+            Space::Global => {
+                let va = self.global_address(address);
+                self.mapped(va, None, |e, device| {
+                    let pointer = if float {
+                        let pointer = e.module.pointer(storage::PHYSICAL_STORAGE_BUFFER, e.f32);
+                        e.value(op::CONVERT_U_TO_PTR, pointer, &[device])
+                    } else {
+                        e.device_pointer(device, 1).0
+                    };
+                    apply(e, pointer);
+                    Ok(())
+                })?;
+            }
+            // Shared memory is an array of words.
+            Space::Shared if float => {
+                return Err(unsupported(index, "shared float atomic"));
+            }
+            Space::Shared => {
+                let (variable, bytes) = self.array(index, space)?;
+                let at = self.array_address(address);
+                let (element, inside) = self.array_word(variable, storage::WORKGROUP, bytes, at, 0);
+                self.when(inside, |e| {
+                    apply(e, element);
+                    Ok(())
+                })?;
+            }
+            Space::Local => return Err(unsupported(index, "local atomic")),
+        }
+        let old = self.value(op::LOAD, self.u32, &[result]);
+        if !self.zero_register(d) {
+            self.write_register(d, old);
+        }
+        Ok(())
+    }
+
     /// The `size`-typed value at byte `low_bits` (0-3) of `word`.
     fn sub_word(&mut self, word: u32, low_bits: u32, size: u8) -> u32 {
         let eight = self.constant(8);
@@ -464,6 +568,10 @@ impl Emitter {
         Ok(())
     }
 }
+
+/// Scope and semantics of an atomic: the device for global memory, the
+/// workgroup for shared, relaxed either way.
+const SCOPE_DEVICE: u32 = 1;
 
 fn storage_class(space: Space) -> u32 {
     if space == Space::Shared {

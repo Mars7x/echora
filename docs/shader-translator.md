@@ -139,6 +139,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDC, ULDC | 0xb82, 0xab9 | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
+| RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |

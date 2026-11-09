@@ -96,6 +96,17 @@ pub mod op {
     pub const BIT_FIELD_S_EXTRACT: u16 = 202;
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
     pub const CONTROL_BARRIER: u16 = 224;
+    pub const ATOMIC_EXCHANGE: u16 = 229;
+    pub const ATOMIC_COMPARE_EXCHANGE: u16 = 230;
+    pub const ATOMIC_I_ADD: u16 = 234;
+    pub const ATOMIC_S_MIN: u16 = 236;
+    pub const ATOMIC_U_MIN: u16 = 237;
+    pub const ATOMIC_S_MAX: u16 = 238;
+    pub const ATOMIC_U_MAX: u16 = 239;
+    pub const ATOMIC_AND: u16 = 240;
+    pub const ATOMIC_OR: u16 = 241;
+    pub const ATOMIC_XOR: u16 = 242;
+    pub const ATOMIC_F_ADD: u16 = 6035;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -125,6 +136,7 @@ pub mod storage {
 pub mod capability {
     pub const SHADER: u32 = 1;
     pub const INT64: u32 = 11;
+    pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
     pub const ADDRESSING_PHYSICAL_STORAGE_BUFFER64: u32 = 5348;
@@ -248,12 +260,25 @@ impl Module {
         id
     }
 
+    /// Declares a capability (once).
     pub fn capability(&mut self, capability: u32) {
-        instruction(&mut self.capabilities, op::CAPABILITY, &[capability]);
+        let (declared, _) = self.capabilities.as_chunks::<2>();
+        if declared.iter().all(|&[_, existing]| existing != capability) {
+            instruction(&mut self.capabilities, op::CAPABILITY, &[capability]);
+        }
     }
 
+    /// Declares an extension (once).
     pub fn extension(&mut self, name: &str) {
-        instruction(&mut self.extensions, op::EXTENSION, &string(name));
+        let mut words = Vec::new();
+        instruction(&mut words, op::EXTENSION, &string(name));
+        if !self
+            .extensions
+            .windows(words.len())
+            .any(|window| window == words.as_slice())
+        {
+            self.extensions.extend(words);
+        }
     }
 
     /// The GLSL.std.450 import (declared once).

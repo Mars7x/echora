@@ -1302,6 +1302,24 @@ impl Emitter {
                 address,
                 size,
             } => self.store(index, data.0, space, address, size)?,
+            Op::Atomic {
+                d,
+                space,
+                address,
+                data,
+                compare,
+                operation,
+                kind,
+            } => self.atomic(
+                index,
+                d.0,
+                space,
+                address,
+                data.0,
+                compare.map(|reg| reg.0),
+                operation,
+                kind,
+            )?,
             Op::Bar { mode } => {
                 if mode != 0 {
                     return Err(unsupported(index, format!("BAR mode {mode}")));
@@ -2222,6 +2240,88 @@ mod tests {
         assert!(!code[5].uniform && !code[6].uniform);
         let translated = valid(&words);
         assert!(translated.descriptors.is_empty());
+    }
+
+    #[test]
+    fn atomics_validate() {
+        let words = [
+            // RED.E.ADD.F32 [R2.64+UR4], R1 (0x0c10e7 in bits 72-95)
+            word(&[
+                (0, 12, 0x98e),
+                (24, 8, 2),
+                (32, 8, 1),
+                (64, 6, 4),
+                (72, 24, 0x0c10e7),
+            ]),
+            // RED.E.MIN.S32 [R2.64], R1
+            word(&[
+                (0, 12, 0x98e),
+                (24, 8, 2),
+                (32, 8, 1),
+                (64, 6, 63),
+                (72, 24, 0x0c90e3),
+            ]),
+            // ATOMG.E.ADD R3, [R2.64+UR4], R1 (pair flag at 70)
+            word(&[
+                (0, 12, 0x9a8),
+                (16, 8, 3),
+                (24, 8, 2),
+                (32, 8, 1),
+                (64, 6, 4),
+                (70, 1, 1),
+                (72, 24, 0x081ee1),
+            ]),
+            // ATOMG.E.CAS R5, [R2.64], R3, R4
+            word(&[
+                (0, 12, 0x3a9),
+                (16, 8, 5),
+                (24, 8, 2),
+                (32, 8, 3),
+                (64, 8, 4),
+                (72, 1, 1),
+            ]),
+            // ATOMS.EXCH R6, [R1+0x8], R2; ATOMS.CAS R7, [R1], R2, R3
+            word(&[
+                (0, 12, 0x38c),
+                (16, 8, 6),
+                (24, 8, 1),
+                (32, 8, 2),
+                (40, 24, 8),
+                (87, 4, 8),
+            ]),
+            word(&[
+                (0, 12, 0x38d),
+                (16, 8, 7),
+                (24, 8, 1),
+                (32, 8, 2),
+                (64, 8, 3),
+            ]),
+            EXIT,
+        ];
+        let layout = Layout {
+            workgroup: [64, 1, 1],
+            shared_bytes: Some(0x100),
+            local_bytes: None,
+        };
+        valid_with(&words, &layout);
+        let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
+        let Op::Atomic {
+            address,
+            operation,
+            kind,
+            ..
+        } = code[2].op
+        else {
+            panic!("ATOMG")
+        };
+        assert!(address.wide && address.uniform.is_some_and(|(_, wide)| wide));
+        assert_eq!((operation, kind), (0, 0));
+        // Increment wraps at a bound, which is not translated yet.
+        let inc = translated_err(&[
+            word(&[(0, 12, 0x98e), (24, 8, 2), (32, 8, 1), (87, 3, 3)]),
+            EXIT,
+        ]);
+        assert!(inc.reason.contains("atomic operation 3"));
     }
 
     #[test]
