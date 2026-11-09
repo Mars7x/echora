@@ -3,8 +3,10 @@
 //! The encodings here were learned from the Ampere front end of Lichii
 //! (<https://github.com/zortos293/Lichii>, GPL-3.0-or-later,
 //! `src/shader_recompiler/frontend/ampere/lower_to_maxwell.h` at `c215653`):
-//! field positions and meanings only. The code and its structure are
-//! written for Echora. See NOTICE.md and docs/research.md.
+//! field positions and meanings only, cross-checked against the SM70+
+//! encoder of Mesa's NAK (MIT, `src/nouveau/compiler/nak/sm70_encode.rs` at
+//! `979c6d1`). The code and its structure are written for Echora. See
+//! NOTICE.md and docs/research.md.
 //!
 //! An instruction is one little-endian 128-bit word. Bits 0-8 select the
 //! operation and bits 9-11 the form of its operands (register, immediate,
@@ -59,6 +61,12 @@ pub enum Src {
     /// A word of constant buffer `bank` at byte `offset`.
     Const {
         bank: u8,
+        offset: u16,
+    },
+    /// A word at byte `offset` of the constant buffer whose handle is in
+    /// uniform register `handle` (bit 91 set in a constant form).
+    BindlessConst {
+        handle: UniformReg,
         offset: u16,
     },
 }
@@ -121,9 +129,12 @@ pub enum Op {
         d: Reg,
         a: Reg,
         b: Operand,
-        c: Reg,
+        c: Operand,
         lut: u8,
         p: Pred,
+        /// `.PAND` (bit 80), as nvdisasm prints it: the predicate output's
+        /// mode, decoded but not yet interpreted.
+        pand: bool,
     },
     /// FFMA d, a, b, c (a * b + c, fused).
     Ffma {
@@ -132,6 +143,9 @@ pub enum Op {
         b: Operand,
         c: Operand,
         modes: FloatModes,
+        /// `.FMZ` (bit 76): a denormal or infinite factor times zero is
+        /// zero.
+        dnz: bool,
     },
     /// FMUL d, a, b, with a power-of-two `scale` of the result (bits
     /// 84-86; 4 is none).
@@ -141,6 +155,8 @@ pub enum Op {
         b: Operand,
         modes: FloatModes,
         scale: u8,
+        /// As FFMA's.
+        dnz: bool,
     },
     /// FADD d, a, b.
     Fadd {
@@ -272,10 +288,20 @@ impl Word {
         self.bits(9, 3) as u8
     }
 
+    /// A constant-buffer operand: bank 54-58 and byte offset 38-53, or
+    /// with bit 91 the buffer's handle in the uniform register at 32-37.
     fn constant(self) -> Src {
-        Src::Const {
-            bank: self.bits(54, 5) as u8,
-            offset: self.bits(38, 16) as u16,
+        let offset = self.bits(38, 16) as u16;
+        if self.bit(91) {
+            Src::BindlessConst {
+                handle: UniformReg(self.bits(32, 6) as u8),
+                offset,
+            }
+        } else {
+            Src::Const {
+                bank: self.bits(54, 5) as u8,
+                offset,
+            }
         }
     }
 
@@ -402,7 +428,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             d,
             src: word.source(1)?.src,
         },
-        0x010 if matches!(form, 1 | 4 | 5 | 6) => Op::Iadd3 {
+        0x010 if (1..=7).contains(&form) => Op::Iadd3 {
             d,
             a: word.a(),
             b: word.source(1)?,
@@ -419,16 +445,17 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.source(1)?,
             c: word.source(2)?,
         },
-        0x012 if matches!(form, 1 | 4 | 5 | 6) => Op::Lop3 {
+        0x012 if (1..=7).contains(&form) => Op::Lop3 {
             d,
             a: word.reg(24),
             b: word.source(1)?,
-            c: word.reg(64),
+            c: word.source(2)?,
             lut: word.bits(72, 8) as u8,
             p: Pred {
                 index: word.bits(81, 3) as u8,
                 negated: false,
             },
+            pand: word.bit(80),
         },
         0x023 if (1..=7).contains(&form) => Op::Ffma {
             d,
@@ -436,6 +463,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.source(1)?,
             c: word.source(2)?,
             modes: word.float_modes(),
+            dnz: word.bit(76),
         },
         0x020 if matches!(form, 1 | 4 | 5 | 6) => Op::Fmul {
             d,
@@ -443,6 +471,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.source(1)?,
             modes: word.float_modes(),
             scale: word.bits(84, 3) as u8,
+            dnz: word.bit(76),
         },
         // FADD's second source is the third slot in the forms that put a
         // wide operand there.
@@ -545,6 +574,27 @@ mod tests {
     }
 
     #[test]
+    fn a_constant_form_with_bit_91_takes_its_buffer_from_a_uniform_register() {
+        let raw = word(&[
+            (0, 12, 0xa02),
+            (16, 8, 1),
+            (91, 1, 1),
+            (32, 6, 5),
+            (38, 16, 0x40),
+        ]);
+        assert_eq!(
+            decode(raw).op,
+            Op::Mov {
+                d: Reg(1),
+                src: Src::BindlessConst {
+                    handle: UniformReg(5),
+                    offset: 0x40
+                }
+            }
+        );
+    }
+
+    #[test]
     fn three_source_forms_place_the_wide_operand() {
         // IMAD form 1: registers in 24, 32, 64; form 2: immediate third,
         // register second in 64; form 6: uniform second.
@@ -621,6 +671,7 @@ mod tests {
                     rounding: 3,
                     flush_to_zero: true
                 },
+                dnz: false,
             }
         );
         // FADD form 2 takes its second source from the third slot.

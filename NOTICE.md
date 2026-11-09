@@ -62,7 +62,7 @@ from these projects; no code is taken from them:
 | Source | Used for | License |
 |---|---|---|
 | [Lichii](https://github.com/zortos293/Lichii) `c215653`, `src/shader_recompiler/frontend/ampere` | Ampere instruction encodings and semantics | GPL-3.0-or-later |
-| Mesa's NAK (`src/nouveau/compiler`) | Ampere bit layouts (planned) | MIT |
+| Mesa's NAK `979c6d1`, `src/nouveau/compiler/nak/sm70_encode.rs` | Ampere bit layouts (cross-checks) | MIT |
 
 GPL-3.0 section 13 permits combining with AGPL-3.0 code. A binary built
 with the shader library carries the AGPL terms for the sirit part,

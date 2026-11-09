@@ -1952,6 +1952,9 @@ dependencies = [
 [[package]]
 name = "echora-shader"
 version = "0.1.0"
+dependencies = [
+ "echora-shader-abi",
+]
 
 [[package]]
 name = "echora-shader-abi"

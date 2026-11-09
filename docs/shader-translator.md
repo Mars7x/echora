@@ -89,16 +89,18 @@ Field layout: bits 0-8 the operation, 9-11 the operand form, 12-15 the
 guard predicate (15 negates; 7 is PT), 16-23 the destination (255 RZ),
 24-31 the first source. The form places the wide operand: forms 4, 5 and 6
 put an immediate (bits 32-63), a constant (bank 54-58, byte offset 38-53)
-or a uniform register (32-37) in the second source; forms 2, 3 and 7 in the
-third; register sources sit in 64-71, or the second in 32-39 in form 1.
+or a uniform register (32-37, with bit 91) in the second source; forms 2, 3 and 7 in the
+third; register sources sit in 64-71, or the second in 32-39 in form 1. A
+constant form with bit 91 takes its buffer from a uniform register (32-37)
+instead of a bank. The layouts were cross-checked against NAK's encoder.
 
 | Operation | Opcodes (bits 0-11) | Notes |
 |---|---|---|
 | MOV | 0x202, 0x802, 0xa02, 0xc02 | register, immediate, constant, uniform |
-| IADD3 | 0x010 in forms 1, 4, 5, 6 | carry outputs 81-86, inputs 87-90 and 77-80 |
+| IADD3 | 0x010 in forms 1-7 | carry outputs 81-86, inputs 87-90 and 77-80 |
 | IMAD | 0x024 in forms 1-7 | low word |
-| LOP3.LUT | 0x012 in forms 1, 4, 5, 6 | table 72-79, predicate output 81-83 |
-| FFMA, FMUL, FADD | 0x023, 0x020, 0x021 | saturate 77, rounding 78-79, FTZ 80; FMUL scale 84-86 |
+| LOP3.LUT | 0x012 in forms 1-7 | table 72-79, `.PAND` 80, predicate output 81-83 |
+| FFMA, FMUL, FADD | 0x023, 0x020, 0x021 | saturate 77, rounding 78-79, FTZ 80; FFMA and FMUL `.FMZ` 76; FMUL scale 84-86 |
 | FSETP, ISETP | 0x00b, 0x00c in forms 1, 4, 5, 6 | compare 76-79/76-78, outputs 81 and 84, accumulator 87-90, combine 74-75, ISETP signed 73 and `.EX` 72 |
 | S2R | 0x919 | special register 72-79 |
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |

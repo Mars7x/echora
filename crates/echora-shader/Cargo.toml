@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+echora-shader-abi.workspace = true
 
 [lints]
 workspace = true
