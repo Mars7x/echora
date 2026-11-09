@@ -21,8 +21,8 @@ use crate::spirv::{Type, capability, op, storage};
 /// Elements of a 16x16 matrix.
 const MATRIX_ELEMENTS: u32 = 256;
 
-/// SPIR-V's LocalInvocationIndex built-in.
-const BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29;
+/// SPIR-V's SubgroupId built-in.
+const BUILTIN_SUBGROUP_ID: u32 = 40;
 
 /// OpFConvert.
 const F_CONVERT: u16 = 115;
@@ -144,10 +144,13 @@ impl Emitter {
         } else {
             halves
         };
-        // This warp's region.
-        let invocation = self.scalar_builtin(BUILTIN_LOCAL_INVOCATION_INDEX);
-        let five = self.constant(5);
-        let warp = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[invocation, five]);
+        // This warp's region: by subgroup id (Vulkan does not promise that
+        // invocation index / 32 names the subgroup).
+        self.module.capability(capability::GROUP_NON_UNIFORM);
+        let warp = self.scalar_builtin(BUILTIN_SUBGROUP_ID);
+        // The previous multiply's lanes may still be reading D: wait
+        // before writing the fragments.
+        self.subgroup_barrier();
         let size = self.constant(MATRIX_ELEMENTS * 3);
         let base = self.value(op::I_MUL, self.u32, &[warp, size]);
         let lane = self.special_register(index, 0)?;
