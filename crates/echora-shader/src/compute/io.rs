@@ -22,6 +22,7 @@ use crate::spirv::{Type, capability, decoration, op, storage};
 const BUILTIN_POSITION: u32 = 0;
 const BUILTIN_POINT_SIZE: u32 = 1;
 const BUILTIN_FRAG_COORD: u32 = 15;
+const BUILTIN_FRONT_FACING: u32 = 17;
 const BUILTIN_SAMPLE_MASK: u32 = 20;
 const BUILTIN_FRAG_DEPTH: u32 = 22;
 const BUILTIN_VERTEX_INDEX: u32 = 42;
@@ -168,6 +169,13 @@ impl Emitter {
                 let base = self.scalar_builtin(base_builtin);
                 self.value(op::I_SUB, self.u32, &[id, base])
             }
+            (Stage::Fragment, 0x3fc) => {
+                // Front facing: all ones, else zero.
+                let variable = self.builtin_variable(BUILTIN_FRONT_FACING, self.bool);
+                let front = self.value(op::LOAD, self.bool, &[variable]);
+                let (all, zero) = (self.constant(u32::MAX), self.constant(0));
+                self.value(op::SELECT, self.u32, &[front, all, zero])
+            }
             (Stage::Fragment, 0x70..=0x7f) => {
                 let vec4 = self.vec4();
                 let variable = self.builtin_variable(BUILTIN_FRAG_COORD, vec4);
@@ -207,6 +215,10 @@ impl Emitter {
     ) -> Result<(), Unsupported> {
         let address = u32::from(address);
         let word = (address / 4) % 4;
+        // A per-primitive hint with no meaning here.
+        if address == 0x5c {
+            return Ok(());
+        }
         let float = self.value(op::BITCAST, self.f32, &[value]);
         let pointer = match address {
             0x6c => self.builtin_output(BUILTIN_POINT_SIZE, self.f32),

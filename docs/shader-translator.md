@@ -105,7 +105,9 @@ the stage at 10-13) and the code. ALD, AST and IPA address the attribute
 space: 0x6c point size, 0x70-0x7c position (the fragment coordinate in a
 fragment program, scaled back to the guest's resolution by the push
 constants' inverse resolution scale), 0x80 + 16n generic vector n,
-0x2f8 and 0x2fc the instance and vertex ids (without the draw's base).
+0x2f8 and 0x2fc the instance and vertex ids (without the draw's base),
+0x3fc front facing (all ones or zero); writes to 0x5c (a per-primitive
+hint) are dropped.
 Generic vectors between stages are `vec4`s at location n; a fragment
 input's interpolation comes from the SPH's input map (two bits per
 component: constant, perspective, screen-linear), centroid from IPA.
@@ -177,6 +179,8 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | S2R | 0x919 | special register 72-79 |
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
 | EXIT, NOP | 0x94d, 0x918 | |
+| BRX, BRXU | 0x949, 0x958 | to the byte offset from the code's start in register 24 (BRXU: a uniform register); blocks start after every unconditional transfer, and the dispatcher selects blocks by their first instruction's index |
+| FSWZADD | 0x822 | a 24, b 64, pattern 32-39: per quad lane n, bits 2n give a + b, a - b, b - a or b |
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
 | IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
 | IABS | 0x013 | the source in the second slot |

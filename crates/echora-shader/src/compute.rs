@@ -35,6 +35,9 @@ enum End {
     Branch { target: usize, condition: Guard },
     /// The invocation ends when `condition` holds, else falls through.
     Exit { condition: Guard },
+    /// To the instruction at the byte offset in `target` when `condition`
+    /// holds, else into the next block.
+    Indirect { target: Src, condition: Guard },
 }
 
 /// An instruction's guard and a branch condition together.
@@ -85,7 +88,7 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
                 leaders.insert(target);
                 leaders.insert(index + 1);
             }
-            Op::Exit => {
+            Op::Exit | Op::Brx { .. } => {
                 leaders.insert(index + 1);
             }
             _ => {}
@@ -116,6 +119,16 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
             Op::Exit => (
                 next - 1,
                 End::Exit {
+                    condition: Guard {
+                        guard: last.guard,
+                        extra: Pred::TRUE,
+                    },
+                },
+            ),
+            Op::Brx { target } => (
+                next - 1,
+                End::Indirect {
+                    target,
                     condition: Guard {
                         guard: last.guard,
                         extra: Pred::TRUE,
@@ -1320,6 +1333,33 @@ impl Emitter {
                     self.uniform = false;
                 }
             }
+            Op::Fswzadd { d, a, b, pattern } => {
+                // The lane's operation: bits 2n of the pattern for quad lane n.
+                let a = self.read_register(a.0);
+                let b = self.read_register(b.0);
+                let (a, b) = (
+                    self.value(op::BITCAST, self.f32, &[a]),
+                    self.value(op::BITCAST, self.f32, &[b]),
+                );
+                let lane = self.special_register(index, 0)?;
+                let three = self.constant(3);
+                let quad = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+                let two = self.constant(2);
+                let shift = self.value(op::I_MUL, self.u32, &[quad, two]);
+                let pattern = self.constant(u32::from(pattern));
+                let code = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[pattern, shift]);
+                let code = self.value(op::BITWISE_AND, self.u32, &[code, three]);
+                let sum = self.exact(op::F_ADD, &[a, b]);
+                let difference = self.exact(op::F_SUB, &[a, b]);
+                let reverse = self.exact(op::F_SUB, &[b, a]);
+                let mut value = b;
+                for (n, candidate) in [(0, sum), (1, difference), (2, reverse)] {
+                    let n = self.constant(n);
+                    let matches = self.value(op::I_EQUAL, self.bool, &[code, n]);
+                    value = self.value(op::SELECT, self.f32, &[matches, candidate, value]);
+                }
+                self.write_float(d.0, value);
+            }
             Op::Iabs { d, src } => {
                 let x = self.integer(index, src)?;
                 let value = self.glsl(self.u32, glsl::S_ABS, &[x]);
@@ -1897,7 +1937,7 @@ impl Emitter {
                 self.barrier();
             }
             Op::Bssy | Op::Bsync | Op::Depbar => {}
-            Op::Bra { .. } | Op::Exit => {
+            Op::Bra { .. } | Op::Exit | Op::Brx { .. } => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
             Op::Unknown { opcode } => {
@@ -2118,14 +2158,12 @@ impl Emitter {
         self.write_predicate(q, second);
     }
 
-    /// The dispatch loop over `blocks`.
+    /// The dispatch loop over `blocks`, selecting each by the index of its
+    /// first instruction (so a computed branch's target selects its block
+    /// directly; a target that starts no block stops the invocation).
     fn program(&mut self, code: &[Instruction], blocks: &[Block]) -> Result<(), Unsupported> {
         self.vertex_prologue(code);
-        let block_of: BTreeMap<usize, u32> = blocks
-            .iter()
-            .enumerate()
-            .map(|(number, block)| (block.start, number as u32))
-            .collect();
+        let starts: BTreeSet<usize> = blocks.iter().map(|block| block.start).collect();
         let u32_ptr = self.u32_ptr;
         let bool_ptr = self.bool_ptr;
         let first = self.constant(0);
@@ -2166,8 +2204,8 @@ impl Emitter {
         // An index past the blocks stops the invocation.
         let stop = self.module.id();
         let mut switch = vec![selector, stop];
-        for (number, label) in labels.iter().enumerate() {
-            switch.extend([number as u32, *label]);
+        for (block, label) in blocks.iter().zip(&labels) {
+            switch.extend([block.start as u32, *label]);
         }
         self.function
             .emit(op::SELECTION_MERGE, &[switch_merge, spirv::NONE]);
@@ -2186,17 +2224,16 @@ impl Emitter {
             {
                 self.instruction(index, instruction)?;
             }
-            let fall = block_of
-                .get(&block.end_index(block.body_end))
-                .copied()
-                .unwrap_or(u32::MAX);
+            let fall = Some(block.end_index(block.body_end))
+                .filter(|index| starts.contains(index))
+                .map_or(u32::MAX, |index| index as u32);
             match block.end {
                 End::Fall => {
                     let fall = self.constant(fall);
                     self.function.emit(op::STORE, &[next, fall]);
                 }
                 End::Branch { target, condition } => {
-                    let target = self.constant(block_of[&target]);
+                    let target = self.constant(target as u32);
                     let fall = self.constant(fall);
                     let taken = self.condition(condition);
                     let chosen = self.value(op::SELECT, self.u32, &[taken, target, fall]);
@@ -2208,6 +2245,27 @@ impl Emitter {
                     let exits = self.condition(condition);
                     let still = self.value(op::LOGICAL_NOT, self.bool, &[exits]);
                     self.function.emit(op::STORE, &[running, still]);
+                }
+                End::Indirect { target, condition } => {
+                    let value = self
+                        .source(block.body_end, target)
+                        .map_err(|error| unsupported(block.body_end, error.reason))?;
+                    // A byte offset that is not an instruction's selects
+                    // nothing, and stops.
+                    let (four, fifteen, zero, none) = (
+                        self.constant(4),
+                        self.constant(15),
+                        self.constant(0),
+                        self.constant(u32::MAX),
+                    );
+                    let low = self.value(op::BITWISE_AND, self.u32, &[value, fifteen]);
+                    let aligned = self.value(op::I_EQUAL, self.bool, &[low, zero]);
+                    let index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[value, four]);
+                    let index = self.value(op::SELECT, self.u32, &[aligned, index, none]);
+                    let fall = self.constant(fall);
+                    let taken = self.condition(condition);
+                    let chosen = self.value(op::SELECT, self.u32, &[taken, index, fall]);
+                    self.function.emit(op::STORE, &[next, chosen]);
                 }
             }
             self.function.emit(op::BRANCH, &[switch_merge]);
@@ -3432,6 +3490,25 @@ mod tests {
                 (4, 4, 0x60, 5, 0),
             ]
         );
+    }
+
+    #[test]
+    fn computed_branches_and_swizzled_adds_validate() {
+        valid(&[
+            // MOV R0, 0x30; BRX R0 (to instruction 3); EXIT
+            word(&[(0, 12, 0x802), (16, 8, 0), (32, 32, 0x30)]),
+            word(&[(0, 12, 0x949), (24, 8, 0)]),
+            EXIT,
+            // FSWZADD R2, R0, R1, 0x99 (lanes: a+b... per pattern); EXIT
+            word(&[
+                (0, 12, 0x822),
+                (16, 8, 2),
+                (24, 8, 0),
+                (32, 8, 0x99),
+                (64, 8, 1),
+            ]),
+            EXIT,
+        ]);
     }
 
     #[test]

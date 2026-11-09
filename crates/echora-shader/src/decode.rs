@@ -597,6 +597,19 @@ pub enum Op {
         condition: Pred,
     },
     Exit,
+    /// BRX / BRXU: to the instruction at the byte offset (from the code's
+    /// start) in a register or uniform register.
+    Brx {
+        target: Src,
+    },
+    /// FSWZADD d, a, b, pattern: per quad lane (bits 2n of `pattern` for
+    /// lane n), a + b, a - b, b - a or b.
+    Fswzadd {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+        pattern: u8,
+    },
     Nop,
     /// An operation or form not decoded (yet); `opcode` is bits 0-11.
     Unknown {
@@ -929,6 +942,24 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             });
         }
         0x94d => return Some(Op::Exit),
+        0x949 => {
+            return Some(Op::Brx {
+                target: Src::Reg(word.reg(24)),
+            });
+        }
+        0x958 => {
+            return Some(Op::Brx {
+                target: Src::Uniform(UniformReg(word.bits(24, 6) as u8)),
+            });
+        }
+        0x822 => {
+            return Some(Op::Fswzadd {
+                d,
+                a: word.reg(24),
+                b: word.reg(64),
+                pattern: word.bits(32, 8) as u8,
+            });
+        }
         0x918 => return Some(Op::Nop),
         0x945 => return Some(Op::Bssy),
         0x941 => return Some(Op::Bsync),
@@ -1041,8 +1072,10 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 _ => TextureOp::Query,
             };
             // Bit 59 is the bindless form and 77 per-tap offsets (only the
-            // packed form, 76, is decoded); 81-83 a fault predicate.
-            if word.bit(59) || word.bit(77) || word.bits(81, 3) != 7 {
+            // packed form, 76, is decoded); 81-83 a fault predicate (not in
+            // TXQ).
+            let fault = op != TextureOp::Query && word.bits(81, 3) != 7;
+            if word.bit(59) || word.bit(77) || fault {
                 return None;
             }
             return Some(Op::Tex(Texture {
