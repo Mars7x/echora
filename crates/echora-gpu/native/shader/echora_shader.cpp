@@ -6,6 +6,7 @@
 // emitted as SPIR-V.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <vector>
@@ -67,6 +68,14 @@ public:
         }
         return code[index];
     }
+    /// Retranslation for global memory the NVN tracking cannot route (a
+    /// pointer table read at a dynamic constant buffer offset): pointers
+    /// are raw 8-byte arguments, every candidate is bound, and the program
+    /// picks among them at run time.
+    bool native_pointers = false;
+
+    bool IsNativeProgram() const override { return native_pointers; }
+
     u32 TranslateProgramAddress(u32 address) const override {
         if (const auto translated = Shader::Ampere::NativeProgramAddress(code, address)) {
             return *translated;
@@ -75,6 +84,14 @@ public:
     }
     u32 ReadCbufValue(u32 index, u32 offset) override {
         return callbacks.read_cbuf ? callbacks.read_cbuf(callbacks.user, index, offset) : 0;
+    }
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
+        return !callbacks.is_storage_pointer ||
+               callbacks.is_storage_pointer(callbacks.user, index, offset) != 0;
+    }
+    bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override {
+        return !callbacks.is_indirect_storage_pointer ||
+               callbacks.is_indirect_storage_pointer(callbacks.user, index, offset, indirect) != 0;
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
         return callbacks.texture_type
@@ -178,7 +195,8 @@ u32 DescribeBindings(const Shader::Info& info, u32 base, EchoraShaderOutput* out
     for (const auto& desc : info.storage_buffers_descriptors) {
         add({.kind = ECHORA_DESCRIPTOR_STORAGE_BUFFER, .count = desc.count,
              .cbuf_index = desc.cbuf_index, .cbuf_offset = desc.cbuf_offset,
-             .flags = desc.is_written ? 1u : 0u},
+             .flags = (desc.is_written ? 1u : 0u) | (info.native_global_bounds ? 32u : 0u),
+             .indirect_offset = desc.indirect_offset},
             desc.count);
     }
     for (const auto& desc : info.texture_buffer_descriptors) {
@@ -240,8 +258,26 @@ void Fail(EchoraShaderOutput* output, const char* message) {
 
 } // namespace
 
+namespace {
+int Translate(const EchoraShaderInput* input, EchoraShaderOutput* output, bool native_pointers);
+} // namespace
+
 extern "C" int echora_shader_translate(const EchoraShaderInput* input,
                                         EchoraShaderOutput* output) {
+    if (input->native_pointers != 0) {
+        return Translate(input, output, true);
+    }
+    if (Translate(input, output, false) != 0) {
+        return 1;
+    }
+    if (std::strstr(output->error, "no routable storage buffer") == nullptr) {
+        return 0;
+    }
+    return Translate(input, output, true);
+}
+
+namespace {
+int Translate(const EchoraShaderInput* input, EchoraShaderOutput* output, bool native_pointers) {
     std::memset(output, 0, sizeof(*output));
     try {
         // The rescaling pass reads this global (translation runs on one
@@ -307,6 +343,7 @@ extern "C" int echora_shader_translate(const EchoraShaderInput* input,
         }
 
         Env env;
+        env.native_pointers = native_pointers;
         env.callbacks = input->callbacks;
         env.texture_bound = lowered.required_texture_buffer == ~0U ? 0 : lowered.required_texture_buffer;
         // SPH, then the lowered instructions with a scheduling word before
@@ -347,6 +384,15 @@ extern "C" int echora_shader_translate(const EchoraShaderInput* input,
         const auto host_info = MakeHostInfo();
         Shader::Maxwell::Flow::CFG cfg(env, flow_blocks, cfg_start, stage == Shader::Stage::VertexB);
         auto program = Shader::Maxwell::TranslateProgram(insts, blocks, env, cfg, host_info);
+        // Debug aid: ECHORA_SHADER_IR=<file> appends each translated
+        // program's IR (after the optimization passes).
+        if (const char* path = std::getenv("ECHORA_SHADER_IR")) {
+            if (std::FILE* file = std::fopen(path, "a")) {
+                const std::string text = Shader::IR::DumpProgram(program);
+                std::fwrite(text.data(), 1, text.size(), file);
+                std::fclose(file);
+            }
+        }
         Shader::RuntimeInfo runtime_info{};
         for (size_t index = 0; index < runtime_info.generic_input_types.size(); ++index) {
             runtime_info.generic_input_types[index] =
@@ -384,6 +430,7 @@ extern "C" int echora_shader_translate(const EchoraShaderInput* input,
         return 0;
     }
 }
+} // namespace
 
 extern "C" void echora_shader_free(EchoraShaderOutput* output) {
     delete[] output->spirv;

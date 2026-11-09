@@ -62,8 +62,14 @@ pub struct Descriptor {
     pub secondary_shift_left: u32,
     pub size_shift: u32,
     pub texture_type: u32,
-    /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample.
+    /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample, 5 a
+    /// storage buffer at a raw 8-byte pointer (no size word: the binding
+    /// gives the bounds).
     pub flags: u32,
+    /// Storage buffers: the pointer is read from memory this many bytes
+    /// past the constant buffer pointer (`u32::MAX`: the constant buffer
+    /// word is the pointer).
+    pub indirect_offset: u32,
 }
 
 impl Descriptor {
@@ -88,6 +94,16 @@ pub trait Environment {
     /// Shader::TextureType of a raw texture handle (2 is Color2D).
     fn texture_type(&mut self, _handle: u32) -> u32 {
         2
+    }
+    /// Programs with raw pointers: whether the eight bytes at byte
+    /// `offset` of constant buffer `index` are a mapped GPU address (a
+    /// candidate the program may read through).
+    fn is_storage_pointer(&mut self, _index: u32, _offset: u32) -> bool {
+        true
+    }
+    /// Whether the eight bytes `indirect` bytes past that pointer are one.
+    fn is_indirect_storage_pointer(&mut self, _index: u32, _offset: u32, _indirect: u32) -> bool {
+        true
     }
 }
 
@@ -117,6 +133,10 @@ pub struct Parameters {
     /// Translate a graphics program as a task or mesh program instead of the
     /// stage its header names (the slot NVN binds it in).
     pub mesh: Option<MeshParameters>,
+    /// Read storage buffer pointers as raw 8-byte arguments from the start
+    /// (see `Descriptor::flags` bit 5), for a program whose NVN-tracked
+    /// pointer words are not addresses.
+    pub native_pointers: bool,
 }
 
 /// The task or mesh pipeline state a program is translated against.
@@ -150,6 +170,8 @@ struct Callbacks {
     user: *mut c_void,
     read_cbuf: Option<unsafe extern "C" fn(*mut c_void, u32, u32) -> u32>,
     texture_type: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    is_storage_pointer: Option<unsafe extern "C" fn(*mut c_void, u32, u32) -> u32>,
+    is_indirect_storage_pointer: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> u32>,
 }
 
 #[repr(C)]
@@ -172,6 +194,7 @@ struct Input {
     has_mesh_primitive_header: u32,
     mesh_primitive_header: [u8; 0x50],
     callbacks: Callbacks,
+    native_pointers: u32,
 }
 
 #[repr(C)]
@@ -209,6 +232,23 @@ unsafe extern "C" fn read_cbuf_thunk<E: Environment>(
 
 unsafe extern "C" fn texture_type_thunk<E: Environment>(user: *mut c_void, handle: u32) -> u32 {
     unsafe { (*(user as *mut E)).texture_type(handle) }
+}
+
+unsafe extern "C" fn is_storage_pointer_thunk<E: Environment>(
+    user: *mut c_void,
+    index: u32,
+    offset: u32,
+) -> u32 {
+    unsafe { (*(user as *mut E)).is_storage_pointer(index, offset) }.into()
+}
+
+unsafe extern "C" fn is_indirect_storage_pointer_thunk<E: Environment>(
+    user: *mut c_void,
+    index: u32,
+    offset: u32,
+    indirect: u32,
+) -> u32 {
+    unsafe { (*(user as *mut E)).is_indirect_storage_pointer(index, offset, indirect) }.into()
 }
 
 /// Whether this build links the shader recompiler.
@@ -249,7 +289,10 @@ pub fn translate<E: Environment>(
             user: environment as *mut E as *mut c_void,
             read_cbuf: Some(read_cbuf_thunk::<E>),
             texture_type: Some(texture_type_thunk::<E>),
+            is_storage_pointer: Some(is_storage_pointer_thunk::<E>),
+            is_indirect_storage_pointer: Some(is_indirect_storage_pointer_thunk::<E>),
         },
+        native_pointers: compute.native_pointers.into(),
     };
     // SAFETY: Output is plain data; all-zero is its documented empty state.
     let mut output: Output = unsafe { std::mem::zeroed() };
@@ -311,10 +354,10 @@ mod tests {
 
     #[test]
     fn output_layout_matches_the_header() {
-        assert_eq!(std::mem::size_of::<Descriptor>(), 56);
-        // 8 + 8 + 4 + 64 * 56 + 3 * 4 (+ 4 padding) + 8 * 8 + 4 + 18 * 4 + 256,
-        // padded to 8.
-        assert_eq!(std::mem::size_of::<Output>(), 4016);
+        assert_eq!(std::mem::size_of::<Descriptor>(), 60);
+        // 8 + 8 + 4 + 64 * 60 + 3 * 4 + 8 * 8 + 4 + 18 * 4 + 256, padded
+        // to 8.
+        assert_eq!(std::mem::size_of::<Output>(), 4272);
         #[cfg(echora_shader_lib)]
         // SAFETY: a pure function of the C type.
         assert_eq!(

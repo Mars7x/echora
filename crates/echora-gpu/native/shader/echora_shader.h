@@ -34,6 +34,13 @@ struct EchoraShaderCallbacks {
     uint32_t (*read_cbuf)(void* user, uint32_t index, uint32_t offset);
     /// Shader::TextureType of a raw texture handle; null means Color2D.
     uint32_t (*texture_type)(void* user, uint32_t handle);
+    /// Native pointer programs: whether the 8 bytes at `offset` of
+    /// constant buffer `index` are a mapped GPU address; null means yes.
+    uint32_t (*is_storage_pointer)(void* user, uint32_t index, uint32_t offset);
+    /// Whether the 8 bytes `indirect` bytes past that pointer are one;
+    /// null means yes.
+    uint32_t (*is_indirect_storage_pointer)(void* user, uint32_t index, uint32_t offset,
+                                            uint32_t indirect);
 };
 
 struct EchoraShaderInput {
@@ -80,6 +87,9 @@ struct EchoraShaderInput {
     uint32_t has_mesh_primitive_header;
     uint8_t mesh_primitive_header[0x50];
     EchoraShaderCallbacks callbacks;
+    /// Nonzero: storage buffer pointers are raw 8-byte arguments from the
+    /// start (the NVN tracking found words that are not addresses).
+    uint32_t native_pointers;
 };
 
 enum EchoraDescriptorKind {
@@ -110,8 +120,14 @@ struct EchoraShaderDescriptor {
     uint32_t size_shift;
     /// Shader::TextureType for textures and images.
     uint32_t texture_type;
-    /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample.
+    /// Bit 0 written, 1 read, 2 integer, 3 depth, 4 multisample, 5 a
+    /// storage buffer whose address is a raw 8-byte pointer (no size word:
+    /// the binding gives the bounds).
     uint32_t flags;
+    /// Storage buffers: the pointer is read from memory this many bytes
+    /// past the constant buffer pointer (~0: the constant buffer word is
+    /// the pointer).
+    uint32_t indirect_offset;
 };
 
 #define ECHORA_SHADER_MAX_DESCRIPTORS 64

@@ -28,6 +28,9 @@ pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
     translations: HashMap<TranslationKey, Result<Arc<Translated>, String>>,
+    /// Compute stage keys translated with raw storage pointers
+    /// (`Parameters::native_pointers`).
+    native_programs: std::collections::HashSet<u64>,
     /// Linked programs by (vertex key, fragment key).
     programs: HashMap<(u64, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
@@ -139,6 +142,7 @@ impl Backend {
             max_extent: renderer.max_image_extent(),
             renderer,
             translations: HashMap::new(),
+            native_programs: Default::default(),
             programs: HashMap::new(),
             notes: BTreeMap::new(),
             traced: 0,
@@ -205,6 +209,7 @@ type TranslationKey = (
     [u8; 32],
     [u32; 5],
     Option<MeshParameters>,
+    bool,
 );
 
 /// Shader::AttributeType of each vertex attribute's format: integer formats
@@ -932,53 +937,75 @@ impl Nvn {
         let (code, key) = self
             .stage_code(core, gpu)
             .ok_or_else(|| format!("stage at {gpu:#x} is in no memory pool"))?;
-        let backend = self.gpu.as_mut().unwrap();
-        let resolution_scale = backend.renderer.resolution_scale().terms();
-        backend
-            .translations
-            .entry((
-                key,
-                base,
+        let native_pointers = self.gpu.as_ref().unwrap().native_programs.contains(&key);
+        let cache_key = (
+            key,
+            base,
+            previous_stores,
+            generic_input_types,
+            compute,
+            mesh,
+            native_pointers,
+        );
+        if let Some(found) = self.gpu.as_ref().unwrap().translations.get(&cache_key) {
+            return found.clone();
+        }
+        let resolution_scale = self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .resolution_scale()
+            .terms();
+        let translated = {
+            let parameters = Parameters {
+                binding_base: base[0],
+                resolution_scale,
+                scaling_base: [base[1], base[2]],
+                mesh,
                 previous_stores,
                 generic_input_types,
-                compute,
-                mesh,
-            ))
-            .or_insert_with(|| {
-                let parameters = Parameters {
-                    binding_base: base[0],
-                    resolution_scale,
-                    scaling_base: [base[1], base[2]],
-                    mesh,
-                    previous_stores,
-                    generic_input_types,
-                    workgroup_size: [compute[0], compute[1], compute[2]],
-                    // Compute shared memory from the control section; zero
-                    // (graphics) is raised to 48 KiB, as zero aborts the
-                    // recompiler on shared accesses.
-                    shared_memory_size: if compute[3] == 0 { 0xc000 } else { compute[3] },
-                    // Local (per-invocation stack) memory: without it the
-                    // recompiler drops stores at constant offsets.
-                    local_memory_size: compute[4],
-                };
-                // ECHORA_SHADER_TRACE=FILE (debugging): each translation's
-                // stage key and parameters, appended before it runs, so the
-                // last line names a translation that aborts the process.
-                if let Some(path) = super::debug_var_os("ECHORA_SHADER_TRACE") {
-                    use std::io::Write as _;
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                    {
-                        let _ = writeln!(file, "{key:016x} {parameters:?}");
-                    }
+                workgroup_size: [compute[0], compute[1], compute[2]],
+                // Compute shared memory from the control section; zero
+                // (graphics) is raised to 48 KiB, as zero aborts the
+                // recompiler on shared accesses.
+                shared_memory_size: if compute[3] == 0 { 0xc000 } else { compute[3] },
+                // Local (per-invocation stack) memory: without it the
+                // recompiler drops stores at constant offsets.
+                local_memory_size: compute[4],
+                native_pointers,
+            };
+            // ECHORA_SHADER_TRACE=FILE (debugging): each translation's
+            // stage key and parameters, appended before it runs, so the
+            // last line names a translation that aborts the process.
+            if let Some(path) = super::debug_var_os("ECHORA_SHADER_TRACE") {
+                use std::io::Write as _;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(file, "{key:016x} {parameters:?}");
                 }
+            }
+            // Compute programs see the bindings of the dispatch that
+            // first runs them (which constant buffer words are
+            // pointers); graphics stages bind every candidate.
+            let result = if compute[0] != 0 {
+                shader::translate(&code, parameters, &mut PointerProbe { nvn: self, core })
+            } else {
                 shader::translate(&code, parameters, &mut shader::NoEnvironment)
-                    .map(Arc::new)
-                    .map_err(|error| format!("stage {key:016x}: {error}"))
-            })
-            .clone()
+            };
+            result
+                .map(Arc::new)
+                .map_err(|error| format!("stage {key:016x}: {error}"))
+        };
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .translations
+            .insert(cache_key, translated.clone());
+        translated
     }
 
     /// Stage keys and translations of the bound vertex and fragment programs.
@@ -990,6 +1017,76 @@ impl Nvn {
         let bind = self.render.state.get(&format!("BindProgram@{bit}"))?;
         let stage = self.program_stage(core, bind.x[1], bit).ok()?;
         self.stage_constants_of(core, stage)
+    }
+
+    /// The memory a raw storage pointer candidate of a compute program
+    /// names (`Descriptor::flags` bit 5): the eight bytes at its place in
+    /// c0 (`c0`, as filled), the stage's constants (c1) or bound uniform
+    /// buffer `index - 3`, read through `indirect_offset` when set. The
+    /// pointer carries no size: the binding runs to the end of its memory
+    /// pool, at most `NATIVE_STORAGE_SPAN`. `None` when it maps nowhere.
+    fn native_pointer(
+        &mut self,
+        core: &mut Guest,
+        descriptor: &shader::Descriptor,
+        c0: &[u8],
+    ) -> Result<Option<(u64, u64)>, String> {
+        let at = descriptor.cbuf_offset as usize;
+        let mut word = [0u8; 8];
+        match descriptor.cbuf_index {
+            0 => match c0.get(at..at + 8) {
+                Some(bytes) => word.copy_from_slice(bytes),
+                None => return Ok(None),
+            },
+            1 => match self.stage_constants(core, 5) {
+                Some(bytes) if bytes.len() >= at + 8 => word.copy_from_slice(&bytes[at..at + 8]),
+                _ => return Ok(None),
+            },
+            2 => return Ok(None),
+            index => {
+                let Some(bind) = self
+                    .render
+                    .state
+                    .get(&format!("BindUniformBuffer/5/{}", index - 3))
+                    .map(|bind| (bind.x[3], bind.x[4]))
+                else {
+                    return Ok(None);
+                };
+                if at as u64 + 8 > bind.1 {
+                    return Ok(None);
+                }
+                if !self.read_gpu_word(core, bind.0 + at as u64, &mut word)? {
+                    return Ok(None);
+                }
+            }
+        }
+        let mut pointer = u64::from_le_bytes(word);
+        if descriptor.indirect_offset != u32::MAX {
+            let at = pointer.wrapping_add(u64::from(descriptor.indirect_offset));
+            if !self.read_gpu_word(core, at, &mut word)? {
+                return Ok(None);
+            }
+            pointer = u64::from_le_bytes(word);
+        }
+        let base = pointer & !15;
+        Ok(self
+            .pool_for(base)
+            .map(|(_, remaining)| (base, remaining.min(NATIVE_STORAGE_SPAN))))
+    }
+
+    /// The eight bytes at GPU address `address`, after the dispatch results
+    /// that may have written them; false when no pool maps it.
+    fn read_gpu_word(
+        &mut self,
+        core: &mut Guest,
+        address: u64,
+        word: &mut [u8; 8],
+    ) -> Result<bool, String> {
+        let Ok(guest) = self.gpu_to_guest(address, 8) else {
+            return Ok(false);
+        };
+        self.resolve_storage(core, Some(guest..guest + 8))?;
+        Ok(core.memory.read(guest, word).is_ok())
     }
 
     /// The constants a stage's control section places beside its code.
@@ -2627,7 +2724,25 @@ impl Nvn {
         if compute[..3].iter().any(|size| *size == 0 || *size > 1024) {
             return Err(format!("compute workgroup {:?}", &compute[..3]));
         }
-        let stage = self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
+        let mut stage =
+            self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
+        // Storage pointers the NVN tracking found outside c0 were constants,
+        // not addresses (floats 1.0 and 10.0 in c1): such a program reads
+        // its pointers as raw arguments instead, picking among every
+        // mapped candidate at run time.
+        if stage.descriptors.iter().any(|descriptor| {
+            descriptor.kind() == DescriptorKind::StorageBuffer
+                && descriptor.cbuf_index != 0
+                && descriptor.flags & 32 == 0
+        }) {
+            let code_key = self.stage_code(core, address).map(|(_, key)| key);
+            if let Some(code_key) = code_key
+                && self.gpu.as_mut().unwrap().native_programs.insert(code_key)
+            {
+                stage =
+                    self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
+            }
+        }
         if stage.stage != Stage::Compute {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
@@ -2758,7 +2873,22 @@ impl Nvn {
             let entry = descriptor.cbuf_offset as usize;
             match descriptor.kind() {
                 DescriptorKind::StorageBuffer => {
+                    let native = descriptor.flags & 32 != 0;
                     let (gpu, size) = match slot(descriptor, DescriptorKind::StorageBuffer) {
+                        // A raw pointer candidate (the program picks among
+                        // them by address): one that maps nowhere binds
+                        // zeros it never selects.
+                        _ if native => match self.native_pointer(core, descriptor, &c0)? {
+                            Some(found) => found,
+                            None => {
+                                storage.insert(descriptor.binding, vec![0; 16]);
+                                self.gpu
+                                    .as_mut()
+                                    .unwrap()
+                                    .stat("stat: compute native pointers unmapped", 1);
+                                continue;
+                            }
+                        },
                         Some(slot) => {
                             let bind = self
                                 .render
@@ -2786,7 +2916,7 @@ impl Nvn {
                     };
                     let base = gpu & !15;
                     let length = gpu - base + size;
-                    if descriptor.cbuf_index == 0 {
+                    if descriptor.cbuf_index == 0 && !native {
                         c0[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
                         c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
                     }
@@ -4761,6 +4891,73 @@ mod range_tests {
         assert_eq!(ranges, [12..15, 25..40]);
     }
 }
+
+/// The recompiler's view of a compute dispatch's bindings while it
+/// translates the program: which constant buffer words are mapped GPU
+/// addresses (c1, the stage's constants, and the bound uniform buffers;
+/// c0 is built later, so its words count as pointers).
+struct PointerProbe<'a, 'g> {
+    nvn: &'a Nvn,
+    core: &'a Guest<'g>,
+}
+
+impl PointerProbe<'_, '_> {
+    /// The eight bytes at `offset` of constant buffer `index`.
+    fn word(&self, index: u32, offset: u32) -> Option<u64> {
+        let at = offset as usize;
+        let mut word = [0u8; 8];
+        match index {
+            0 | 2 => return None,
+            1 => word.copy_from_slice(self.nvn.stage_constants(self.core, 5)?.get(at..at + 8)?),
+            index => {
+                let bind = self
+                    .nvn
+                    .render
+                    .state
+                    .get(&format!("BindUniformBuffer/5/{}", index - 3))?;
+                if u64::from(offset) + 8 > bind.x[4] {
+                    return None;
+                }
+                self.read(bind.x[3] + u64::from(offset), &mut word)?;
+            }
+        }
+        Some(u64::from_le_bytes(word))
+    }
+
+    fn read(&self, gpu: u64, word: &mut [u8; 8]) -> Option<()> {
+        let guest = self.nvn.gpu_to_guest(gpu, 8).ok()?;
+        self.core.memory.read(guest, word).ok()
+    }
+
+    fn mapped(&self, pointer: u64) -> bool {
+        pointer != 0 && self.nvn.pool_for(pointer & !15).is_some()
+    }
+}
+
+impl shader::Environment for PointerProbe<'_, '_> {
+    fn is_storage_pointer(&mut self, index: u32, offset: u32) -> bool {
+        index == 0
+            || self
+                .word(index, offset)
+                .is_some_and(|pointer| self.mapped(pointer))
+    }
+
+    fn is_indirect_storage_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        if index == 0 {
+            return true;
+        }
+        let Some(table) = self.word(index, offset) else {
+            return false;
+        };
+        let mut word = [0u8; 8];
+        self.read(table.wrapping_add(u64::from(indirect)), &mut word)
+            .is_some_and(|()| self.mapped(u64::from_le_bytes(word)))
+    }
+}
+
+/// The most a raw storage pointer binds: its memory pool's rest, up to this
+/// (copied bindings carry it whole).
+const NATIVE_STORAGE_SPAN: u64 = 4 << 20;
 
 /// The storage buffer address and size (eight and four bytes) a compute
 /// program reads at `descriptor`'s place in its c0 (`c0`, as filled)
