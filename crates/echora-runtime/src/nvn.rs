@@ -3354,6 +3354,44 @@ impl Nvn {
         let bytes = u64::from(info.bytes_per_block);
         let (columns, rows) = (rw.div_ceil(bw), rh.div_ceil(bh));
         let row_size = u64::from(columns) * bytes;
+        // A copy into the whole of a single 2D block-linear level (a movie
+        // picture every present): tiled in memory with the rows' 16-byte
+        // runs, then written back at once, instead of a guest write per run.
+        // The level's storage is read first so its padding keeps its bytes.
+        if to_texture
+            && stride == 0
+            && matches!(target, 1 | 7)
+            && layers == 1
+            && depth == 1
+            && (rx, ry, rz, rd) == (0, 0, 0, 1)
+            && (rw, rh) == (width, height)
+            && bytes != 0
+            && 16 % bytes == 0
+        {
+            let shape = crate::nvn_format::level_block_shape(info, height, 1, 0);
+            let size = crate::nvn_format::block_linear_size(info, width, height, 1, 1, 1).0;
+            let mut tiled = vec![0u8; size as usize];
+            core.memory
+                .read(base, &mut tiled)
+                .map_err(TexelError::Trap)?;
+            let mut linear = vec![0u8; (row_size * u64::from(rows)) as usize];
+            core.memory
+                .read(source, &mut linear)
+                .map_err(TexelError::Trap)?;
+            for (row, line) in linear.chunks_exact(row_size as usize).enumerate() {
+                for (start, offset) in crate::nvn_format::block_linear_row_runs(
+                    info, width, height, shape, row as u32, 0,
+                ) {
+                    let (start, offset) = (start as usize, offset as usize);
+                    let length = 16.min(line.len() - start);
+                    if let Some(out) = tiled.get_mut(offset..offset + length) {
+                        out.copy_from_slice(&line[start..start + length]);
+                    }
+                }
+            }
+            core.memory.write(base, &tiled).map_err(TexelError::Trap)?;
+            return Ok(());
+        }
         let mut line = vec![0u8; row_size as usize];
         // Move `length` bytes between the CPU line at `start` and texture
         // storage at `address`, in the copy's direction.
