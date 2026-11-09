@@ -58,10 +58,12 @@ goals first-class, next to correctness:
 - `ECHORA_SHADER_TRANSLATOR` selects `plugin` (the default with a plugin),
   `rust` (Rust where supported, the plugin otherwise; the default without
   one) or `compare`.
-- **Page table**: 64 KiB pages; a buffer of u64 device addresses (0
-  unmapped) for `[va_base, va_base + pages * 64 KiB)`; the table's address,
-  `va_base >> 16` and the page count in bytes 112-128 of the push-constant
-  block. A global access reads `table[(va >> 16) - base] + (va & 0xffff)`
+- **Page table**: 4 KiB pages (`PAGE_SHIFT` 12, the granularity of NVN
+  memory pools, so no page spans two pools); a buffer of u64 device
+  addresses (0 unmapped) for `[va_base, va_base + pages * 4 KiB)`; the
+  table's address, `va_base >> 12` and the page count in bytes 112-128 of
+  the push-constant block. A global access reads
+  `table[(va >> 12) - base] + (va & 0xfff)`
   through PhysicalStorageBuffer64. Accesses are naturally aligned (a
   misaligned global access faults on the hardware) and at most 16 bytes, so
   none crosses a page: the first byte's page decides. An unmapped or

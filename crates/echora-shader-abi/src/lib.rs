@@ -8,7 +8,7 @@
 /// Changes whenever anything a translated program relies on changes (the
 /// push-constant layout, the page-table format, descriptor numbering). It
 /// is stored in every `Translated` and is part of every shader cache key.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// A program's pipeline stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -187,12 +187,14 @@ pub const PUSH_CONSTANTS_SIZE: u32 = 128;
 
 /// Global memory a program reaches through pointers. The table is a buffer
 /// of u64 device addresses, one per `PAGE_SIZE` page of guest GPU virtual
-/// address space from page `first_page`; 0 marks an unmapped page. An
+/// address space from page `first_page`; 0 marks an unmapped page. Pages
+/// are 4 KiB, the granularity of NVN memory pools, so no page spans two
+/// pools. An
 /// access to guest address `va` reads `table[(va >> PAGE_SHIFT) -
 /// first_page] + (va & (PAGE_SIZE - 1))` through PhysicalStorageBuffer64.
 ///
 /// Only the first byte's page is looked up: guest global accesses are
-/// naturally aligned and at most 16 bytes, so none crosses a page. An
+/// naturally aligned and at most 16 bytes, so none crosses a 4 KiB page. An
 /// address outside the table or on an unmapped page reads 0, drops a
 /// write, and an atomic there returns 0. Shared and local memory do not
 /// go through the table.
@@ -207,7 +209,7 @@ pub struct PageTable {
     pub page_count: u32,
 }
 
-pub const PAGE_SHIFT: u32 = 16;
+pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 #[cfg(test)]
