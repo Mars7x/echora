@@ -1884,6 +1884,7 @@ name = "echora-gpu"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "echora-av1",
  "echora-shader",
  "echora-shader-abi",
  "libc",
@@ -1965,6 +1966,7 @@ dependencies = [
  "anyhow",
  "astc-decode",
  "echora-audio",
+ "echora-av1",
  "echora-config",
  "echora-gpu",
  "echora-guest",

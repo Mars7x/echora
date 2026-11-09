@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 ash = "0.38"
+echora-av1.workspace = true
 echora-shader.workspace = true
 echora-shader-abi.workspace = true
 

@@ -32,6 +32,7 @@ publish = false
 
 [workspace.dependencies]
 echora-audio = { path = "crates/echora-audio" }
+echora-av1 = { path = "crates/echora-av1" }
 echora-config = { path = "crates/echora-config" }
 echora-content = { path = "crates/echora-content" }
 echora-gpu = { path = "crates/echora-gpu" }
