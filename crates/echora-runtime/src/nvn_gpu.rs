@@ -68,6 +68,10 @@ pub struct Backend {
     /// For uploads over DENSE_SAMPLE_ABOVE bytes: a hash of 4096 pieces
     /// spread over the storage, checked instead of every flushed byte.
     dense_samples: HashMap<u64, u64>,
+    /// The linear rows a whole-level copy last wrote into a texture
+    /// (`copy_texels`), with the texture's storage sample after it: while
+    /// the storage samples the same they are its untiled level 0.
+    pub(super) copied_levels: HashMap<u64, (u64, Arc<Vec<u8>>)>,
     /// Raw storage of uploads from CPU-uncached pools (up to
     /// SHADOW_LIMIT bytes). The application writes those without flushes
     /// (it flushes only CPU-cached pools), so each frame's first use
@@ -160,6 +164,7 @@ impl Backend {
             dirty: HashMap::new(),
             storage_hashes: HashMap::new(),
             dense_samples: HashMap::new(),
+            copied_levels: HashMap::new(),
             shadows: HashMap::new(),
             shadow_quiet: HashMap::new(),
             pending_storage: Vec::new(),
@@ -2023,6 +2028,8 @@ impl Nvn {
     fn guest_texture(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         // Flushed pieces of a cached upload: unchanged bytes keep it.
         if let Some(ranges) = self.gpu.as_mut().unwrap().dirty.remove(&texture) {
+            // The CPU wrote the storage: a copy's rows no longer stand for it.
+            self.gpu.as_mut().unwrap().copied_levels.remove(&texture);
             let backend = self.gpu.as_ref().unwrap();
             let unchanged = match (
                 backend.textures.get(&texture),
@@ -2200,16 +2207,15 @@ impl Nvn {
                     .map(|entry| entry.0)
             })
             .flatten();
-        let mut sample = u64::from(format) << 48 ^ u64::from(width) << 24 ^ u64::from(height);
-        sample ^= u64::from(depth_or_layers) << 40;
-        let mut chunk = [0u8; 64];
-        for index in 0..if kept_sample.is_some() { 0 } else { 256u64 } {
-            let offset = (storage_size.saturating_sub(64)) * index / 255;
-            if core.memory.read(base + offset, &mut chunk).is_ok() {
-                sample = (sample ^ hash_bytes(&chunk)).wrapping_mul(0x100_0000_01b3);
-            }
-        }
-        let sample = kept_sample.unwrap_or(sample);
+        let sample = kept_sample.unwrap_or_else(|| {
+            texture_sample(
+                core,
+                base,
+                storage_size,
+                format,
+                [width, height, depth_or_layers],
+            )
+        });
         let check_micros = check_started.elapsed().as_micros() as u64;
         // ECHORA_GPU_VERIFY_UPLOADS=1 (debugging): a cached upload whose
         // sample still matches is also checked against its whole storage.
@@ -2256,8 +2262,26 @@ impl Nvn {
             let levels = get("Levels").unwrap_or(1).clamp(1, 16);
             levels.min(32 - width.max(height).max(depth).leading_zeros())
         };
+        // The rows of the last whole-level copy into the texture, when the
+        // storage still samples as the copy left it: they are level 0
+        // untiled, so neither the storage read nor untiling is needed.
+        let copied = (level_count == 1 && layers == 1 && depth == 1 && !astc && !uncached)
+            .then(|| {
+                let backend = self.gpu.as_ref().unwrap();
+                let (copied_sample, rows) = backend.copied_levels.get(&texture)?;
+                (*copied_sample == sample).then(|| rows.clone())
+            })
+            .flatten();
         // The whole storage, read once: untiling reads it block by block.
-        let raw = read_storage(core, base, storage_size);
+        let raw = if copied.is_some() {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: texture uploads from copies", 1);
+            Vec::new()
+        } else {
+            read_storage(core, base, storage_size)
+        };
         if matches!(shape, ImageShape::D3 { .. })
             && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
         {
@@ -2340,49 +2364,54 @@ impl Nvn {
                 let layer_base = u64::from(layer) * layer_stride + level_offset;
                 let slice_bytes = row_bytes * rows as usize;
                 let mut data = vec![0u8; slice_bytes * level_depth as usize];
-                for z in 0..level_depth {
-                    for row in 0..rows {
-                        let line = &mut data[z as usize * slice_bytes + row as usize * row_bytes..]
-                            [..row_bytes];
-                        if stride != 0 {
-                            copy_block(line, u64::from(row) * stride);
-                            continue;
-                        }
-                        // Blocks dividing 16 bytes: the row's 16-byte runs.
-                        if 16 % block == 0 {
-                            for (start, offset) in crate::nvn_format::block_linear_row_runs(
-                                info,
-                                level_width,
-                                level_height,
-                                level_shape,
-                                row,
-                                z,
-                            ) {
-                                let start = start as usize;
-                                let end = (start + 16).min(row_bytes);
-                                copy_block(&mut line[start..end], layer_base + offset);
+                if let Some(rows) = copied.as_ref().filter(|rows| rows.len() == data.len()) {
+                    data.copy_from_slice(rows);
+                } else {
+                    for z in 0..level_depth {
+                        for row in 0..rows {
+                            let line = &mut data
+                                [z as usize * slice_bytes + row as usize * row_bytes..]
+                                [..row_bytes];
+                            if stride != 0 {
+                                copy_block(line, u64::from(row) * stride);
+                                continue;
                             }
-                            continue;
-                        }
-                        // A run of blocks at consecutive addresses at a time.
-                        let mut column = 0;
-                        while column < columns {
-                            let run = crate::nvn_format::block_linear_run(info, column)
-                                .min(columns - column);
-                            let offset = crate::nvn_format::block_linear_offset_in(
-                                info,
-                                level_width,
-                                level_height,
-                                level_shape,
-                                column,
-                                row,
-                                z,
-                            );
-                            copy_block(
-                                &mut line[column as usize * block..][..run as usize * block],
-                                layer_base + offset,
-                            );
-                            column += run;
+                            // Blocks dividing 16 bytes: the row's 16-byte runs.
+                            if 16 % block == 0 {
+                                for (start, offset) in crate::nvn_format::block_linear_row_runs(
+                                    info,
+                                    level_width,
+                                    level_height,
+                                    level_shape,
+                                    row,
+                                    z,
+                                ) {
+                                    let start = start as usize;
+                                    let end = (start + 16).min(row_bytes);
+                                    copy_block(&mut line[start..end], layer_base + offset);
+                                }
+                                continue;
+                            }
+                            // A run of blocks at consecutive addresses at a time.
+                            let mut column = 0;
+                            while column < columns {
+                                let run = crate::nvn_format::block_linear_run(info, column)
+                                    .min(columns - column);
+                                let offset = crate::nvn_format::block_linear_offset_in(
+                                    info,
+                                    level_width,
+                                    level_height,
+                                    level_shape,
+                                    column,
+                                    row,
+                                    z,
+                                );
+                                copy_block(
+                                    &mut line[column as usize * block..][..run as usize * block],
+                                    layer_base + offset,
+                                );
+                                column += run;
+                            }
                         }
                     }
                 }
@@ -2449,9 +2478,7 @@ impl Nvn {
             }
         }
         // Content-keyed: guest writes that change the texels upload again.
-        let generation = texels.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-        });
+        let generation = hash_bytes(&texels);
         // ECHORA_TEXTURE_DUMP: each distinct upload, named by key, format,
         // size and content hash: 4-byte texels as a PAM image (RGBA), other
         // formats as their raw blocks.
@@ -5287,6 +5314,27 @@ fn read_storage(core: &Guest, base: u64, length: u64) -> Vec<u8> {
 }
 
 /// A fast 64-bit hash of `bytes`.
+/// A texture storage's sample: its shape, and 256 evenly spaced 64-byte
+/// chunks of its `storage_size` bytes at `base` (see `guest_texture`).
+pub(super) fn texture_sample(
+    core: &Guest,
+    base: u64,
+    storage_size: u64,
+    format: u32,
+    [width, height, depth_or_layers]: [u32; 3],
+) -> u64 {
+    let mut sample = u64::from(format) << 48 ^ u64::from(width) << 24 ^ u64::from(height);
+    sample ^= u64::from(depth_or_layers) << 40;
+    let mut chunk = [0u8; 64];
+    for index in 0..256u64 {
+        let offset = (storage_size.saturating_sub(64)) * index / 255;
+        if core.memory.read(base + offset, &mut chunk).is_ok() {
+            sample = (sample ^ hash_bytes(&chunk)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    sample
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hash = bytes.len() as u64 ^ 0x9e37_79b9_7f4a_7c15;
     let (words, tail) = bytes.as_chunks::<8>();

@@ -1762,10 +1762,12 @@ impl Nvn {
                         Err(error) => self.gpu_note(format!("texel read: {error}")),
                     }
                 }
-                self.copy_texels(core, this, view.as_ref(), region, x[3], to_texture)
+                let copied = self
+                    .copy_texels(core, this, view.as_ref(), region, x[3], to_texture)
                     .map_err(|error| error.into_trap(name, core.cpu.pc))?;
                 if to_texture {
                     self.gpu_invalidate(0..0, Some(this));
+                    self.record_copied_level(this, copied);
                 }
                 return Ok(true);
             }
@@ -2952,11 +2954,13 @@ impl Nvn {
                     ));
                 }
                 let view = (command.captured[6] != 0).then_some(&view);
-                self.copy_texels(core, command.x[2], view, region, source, true)
+                let copied = self
+                    .copy_texels(core, command.x[2], view, region, source, true)
                     .map_err(|error| error.into_trap(&command.name, core.cpu.pc))?;
                 // As WriteTexels: the texture's contents changed (new glyphs
                 // in a font atlas, say), so its cached upload is dropped.
                 self.gpu_invalidate(0..0, Some(command.x[2]));
+                self.record_copied_level(command.x[2], copied);
                 Ok(())
             }
             // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU
@@ -3268,6 +3272,27 @@ impl Nvn {
     /// other levels or layers are not.
     /// Copy tightly packed texels between CPU memory at `source` and the
     /// texture's storage: into the texture when `to_texture`, else out.
+    /// Keep the linear rows of a whole-level copy into `texture` (see
+    /// `copy_texels`) for its next upload; any other copy forgets them.
+    fn record_copied_level(&mut self, texture: u64, copied: Option<(u64, Vec<u8>)>) {
+        let Some(backend) = self.gpu.as_mut() else {
+            return;
+        };
+        match copied {
+            Some((sample, rows)) => {
+                if backend.copied_levels.len() >= 64 {
+                    backend.copied_levels.clear();
+                }
+                backend
+                    .copied_levels
+                    .insert(texture, (sample, std::sync::Arc::new(rows)));
+            }
+            None => {
+                backend.copied_levels.remove(&texture);
+            }
+        }
+    }
+
     fn copy_texels(
         &self,
         core: &mut Guest,
@@ -3276,7 +3301,7 @@ impl Nvn {
         region: [u32; 6],
         source: u64,
         to_texture: bool,
-    ) -> Result<(), TexelError> {
+    ) -> Result<Option<(u64, Vec<u8>)>, TexelError> {
         let texture_object = texture;
         let texture = self
             .object(texture, "Texture")
@@ -3390,7 +3415,13 @@ impl Nvn {
                 }
             }
             core.memory.write(base, &tiled).map_err(TexelError::Trap)?;
-            return Ok(());
+            // A single-level texture's upload can take these rows as they
+            // are while its storage stays as written here.
+            let copied = (get("Levels").unwrap_or(1) <= 1).then(|| {
+                let sample = gpu::texture_sample(core, base, size, format, [width, height, 1]);
+                (sample, linear)
+            });
+            return Ok(copied);
         }
         let mut line = vec![0u8; row_size as usize];
         // Move `length` bytes between the CPU line at `start` and texture
@@ -3454,7 +3485,7 @@ impl Nvn {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The code window of the stage at GPU address `gpu` (up to 256 KiB:
