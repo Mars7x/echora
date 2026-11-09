@@ -453,6 +453,16 @@ pub enum Op {
         src_size: u8,
         rounding: u8,
     },
+    /// F2IP.U8.F32 d, a, b, RZ: b and a converted to saturated unsigned
+    /// bytes (rounded by `rounding`, bits 78-79; NaN to 0), b's in bits 0-7
+    /// and a's in bits 8-15, the rest zero. Only the form with a zero third
+    /// source (64-71 RZ) and no other mode bits besides 74 is accepted.
+    F2ip {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+        rounding: u8,
+    },
     /// I2F / I2FP.F32 d, src: integer (`signed`, bit 74) to float, sizes
     /// as F2I.
     I2f {
@@ -1420,6 +1430,17 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 return None;
             }
             return Some(Op::Movm { d, a: word.reg(24) });
+        }
+        0x243 => {
+            if word.bits(40, 24) != 0 || word.bits(64, 32) & !0xc000 != 0x4ff {
+                return None;
+            }
+            return Some(Op::F2ip {
+                d,
+                a: word.reg(24),
+                b: word.reg(32),
+                rounding: word.bits(78, 2) as u8,
+            });
         }
         0x83b => {
             if word.bits(72, 2) == 3 || word.bit(79) {

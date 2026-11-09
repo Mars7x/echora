@@ -1855,6 +1855,19 @@ impl Emitter {
                     self.write_register(d.0, value);
                 }
             }
+            Op::F2ip { d, a, b, rounding } => {
+                let mut bytes = Vec::new();
+                for source in [b, a] {
+                    let bits = self.read_register(source.0);
+                    let x = self.value(op::BITCAST, self.f32, &[bits]);
+                    let rounded = self.rounded(x, rounding);
+                    bytes.push(self.saturating_integer(rounded, false, 8));
+                }
+                let eight = self.constant(8);
+                let high = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[bytes[1], eight]);
+                let value = self.value(op::BITWISE_OR, self.u32, &[high, bytes[0]]);
+                self.write_register(d.0, value);
+            }
             Op::I2f {
                 d,
                 src,
@@ -4112,6 +4125,36 @@ mod tests {
             matrices: MatrixPath::Subgroup,
         };
         valid_with(&words, &layout);
+    }
+
+    #[test]
+    fn packed_float_to_byte_conversions_validate() {
+        // F2IP.U8.F32 R2, R5, R6, RZ (nearest); F2IP.U8.F32.TRUNC R3, RZ, R6, RZ
+        valid(&[
+            word(&[
+                (0, 12, 0x243),
+                (16, 8, 2),
+                (24, 8, 5),
+                (32, 8, 6),
+                (64, 8, 255),
+                (74, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x243),
+                (16, 8, 3),
+                (24, 8, 255),
+                (32, 8, 6),
+                (64, 8, 255),
+                (74, 1, 1),
+                (78, 2, 3),
+            ]),
+            EXIT,
+        ]);
+        // A third source is refused.
+        assert!(matches!(
+            crate::decode::decode(word(&[(0, 12, 0x243), (32, 8, 6), (64, 8, 7), (74, 1, 1)])).op,
+            crate::decode::Op::Unknown { .. }
+        ));
     }
 
     #[test]

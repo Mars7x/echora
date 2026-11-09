@@ -237,6 +237,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | FMNMX, IMNMX | 0x009, 0x017 | minimum when the predicate at 87-90 holds; IMNMX signed 73 |
 | MUFU | 0x108 | function 74-79, f16 73; SIN and COS take turns |
 | F2I, I2F, I2FP, FRND | 0x105, 0x106, 0x045, 0x107 | sizes 75-76 and 84-85 (log2 bytes), rounding 78-79, F2I signed 72, I2F 74 |
+| F2IP | 0x243 | `.U8.F32` with the third source RZ and bit 74 set (other mode bits refused); b and a rounded by 78-79, saturated to 0-255 with NaN to 0, packed as b in bits 0-7 and a in 8-15. The saturation and NaN results are inferred from F2I, not measured |
 | FSET.BF | 0x00a | as FSETP, with 1.0 or 0.0 in a register |
 | PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71; tables 64-66 with 72-76, and 16-23 |
 | CS2R | 0x805 | special register 72-79 (255 SRZ), pair 80 |
