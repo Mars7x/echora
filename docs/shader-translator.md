@@ -228,6 +228,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | ALD, AST | 0x321, 0x322 | address 40-49, words 74-75 (plus one), index register 24, vertex register 32 (ALD) or 64 (AST), patch 76, ALD output 79; AST data 32 |
 | IPA | 0x326, 0x526 (address plus the uniform register at 24: a select over the generic components the SPH uses) | address 64-71 (× 4), location 76-77 (default, centroid, offset), mode 78-79 (interpolated, constant), offset register 32 |
 | KILL | 0x95b | condition 87-90 |
+| LDSM | 0x83b | matrices 1 << 72-73, `.MT88` 78; address register 24, uniform register 32 with bit 91, offset 40-63; row addresses shuffled from the lanes that supply them, shared words read (halves for `.MT88`) |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |

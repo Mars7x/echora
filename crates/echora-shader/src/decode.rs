@@ -581,6 +581,20 @@ pub enum Op {
     },
     /// TEX, TLD.SCR, TLD4 and TXQ with a handle in a constant bank.
     Tex(Texture),
+    /// LDSM.16.M88 (ldmatrix): `count` (1 << bits 72-73) 8x8 matrices of
+    /// halves from shared memory, matrix m's row addresses from lanes 8m..
+    /// (address register 24, plus the uniform register at 32 with bit 91,
+    /// plus `offset` at 40-63); lane t gets row t/4, word t%4 of each in
+    /// d+m. `.MT88` (`transpose`, bit 78) gives lane t rows 2(t%4) and
+    /// 2(t%4)+1 at column t/4 instead.
+    Ldsm {
+        d: Reg,
+        a: Reg,
+        uniform: Option<UniformReg>,
+        offset: i32,
+        count: u8,
+        transpose: bool,
+    },
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
     Bar {
         mode: u8,
@@ -1319,6 +1333,19 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 handle_offset: word.bits(40, 14) as u16 * 4,
                 dimension: word.bits(61, 3) as u8,
                 mask: word.bits(72, 4) as u8,
+            });
+        }
+        0x83b => {
+            if word.bits(72, 2) == 3 || word.bit(79) {
+                return None;
+            }
+            return Some(Op::Ldsm {
+                d,
+                a: word.reg(24),
+                uniform: word.bit(91).then(|| UniformReg(word.bits(32, 6) as u8)),
+                offset: ((word.bits(40, 24) as u32) << 8) as i32 >> 8,
+                count: 1 << word.bits(72, 2),
+                transpose: word.bit(78),
             });
         }
         0xb1d => {

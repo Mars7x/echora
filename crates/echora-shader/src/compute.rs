@@ -2106,6 +2106,22 @@ impl Emitter {
                 }
                 self.kill(condition)?;
             }
+            Op::Ldsm {
+                d,
+                a,
+                uniform,
+                offset,
+                count,
+                transpose,
+            } => self.matrix_load(
+                index,
+                d.0,
+                a.0,
+                uniform.map(|register| register.0),
+                offset,
+                count,
+                transpose,
+            )?,
             Op::Bar { mode } => {
                 if mode != 0 {
                     return Err(unsupported(index, format!("BAR mode {mode}")));
@@ -3942,6 +3958,38 @@ mod tests {
             .collect();
         use echora_shader_abi::SpecMeaning::IntegerFormat;
         assert_eq!(constants, [(33, IntegerFormat(0)), (32, IntegerFormat(1))]);
+    }
+
+    #[test]
+    fn matrix_loads_shuffle_row_addresses_and_read_shared_memory() {
+        let words = [
+            // LDSM.16.M88.4 R4, [R0+UR4+0x10]; LDSM.16.MT88.2 R8, [R1]
+            word(&[
+                (0, 12, 0x83b),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 6, 4),
+                (40, 24, 0x10),
+                (72, 2, 2),
+                (91, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x83b),
+                (16, 8, 8),
+                (24, 8, 1),
+                (72, 2, 1),
+                (78, 1, 1),
+            ]),
+            EXIT,
+        ];
+        let layout = Layout {
+            stage: Stage::Compute,
+            header: None,
+            workgroup: [32, 1, 1],
+            shared_bytes: Some(0x2000),
+            local_bytes: None,
+        };
+        valid_with(&words, &layout);
     }
 
     #[test]

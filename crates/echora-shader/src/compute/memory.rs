@@ -237,6 +237,97 @@ impl Emitter {
         Ok(())
     }
 
+    /// The shared word at byte address `at` (a value), or zero outside.
+    fn shared_word(&mut self, index: usize, at: u32) -> Result<u32, Unsupported> {
+        let (variable, bytes) = self.array(index, Space::Shared)?;
+        let (element, inside) = self.array_word(variable, storage::WORKGROUP, bytes, at, 0);
+        let value = self.value(op::LOAD, self.u32, &[element]);
+        let zero = self.constant(0);
+        Ok(self.value(op::SELECT, self.u32, &[inside, value, zero]))
+    }
+
+    /// LDSM: 8x8 half matrices from shared memory, each lane's row address
+    /// taken from the lane that supplies that row.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matrix_load(
+        &mut self,
+        index: usize,
+        d: u8,
+        a: u8,
+        uniform: Option<u8>,
+        offset: i32,
+        count: u8,
+        transpose: bool,
+    ) -> Result<(), Unsupported> {
+        self.module
+            .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
+        let mut address = self.read_register(a);
+        if let Some(uniform) = uniform {
+            let value = self.read_uniform(uniform);
+            address = self.value(op::I_ADD, self.u32, &[address, value]);
+        }
+        let offset = self.constant(offset as u32);
+        let lane = self.special_register(index, 0)?;
+        let (two, three) = (self.constant(2), self.constant(3));
+        let quarter = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
+        let within = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+        let subgroup = self.constant(super::SCOPE_SUBGROUP);
+        // The row address lane `source` supplies, plus the offset.
+        let row = |e: &mut Self, source: u32| {
+            let base = e.value(
+                op::GROUP_NON_UNIFORM_SHUFFLE,
+                e.u32,
+                &[subgroup, address, source],
+            );
+            e.value(op::I_ADD, e.u32, &[base, offset])
+        };
+        let mut values = Vec::new();
+        for matrix in 0..u32::from(count) {
+            let first = self.constant(matrix * 8);
+            let value = if transpose {
+                // Rows 2(t%4) and 2(t%4)+1, column t/4: a half from each.
+                let mut halves = Vec::new();
+                for half in 0..2u32 {
+                    let pair = self.value(op::I_MUL, self.u32, &[within, two]);
+                    let pick = self.constant(half);
+                    let row_index = self.value(op::I_ADD, self.u32, &[pair, pick]);
+                    let source = self.value(op::I_ADD, self.u32, &[first, row_index]);
+                    let base = row(self, source);
+                    let column = self.value(op::I_MUL, self.u32, &[quarter, two]);
+                    let at = self.value(op::I_ADD, self.u32, &[base, column]);
+                    let word = self.shared_word(index, at)?;
+                    let low_bits = self.value(op::BITWISE_AND, self.u32, &[at, two]);
+                    let eight = self.constant(8);
+                    let shift = self.value(op::I_MUL, self.u32, &[low_bits, eight]);
+                    let sixteen = self.constant(16);
+                    halves.push(self.value(
+                        op::BIT_FIELD_U_EXTRACT,
+                        self.u32,
+                        &[word, shift, sixteen],
+                    ));
+                }
+                let sixteen = self.constant(16);
+                let high = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[halves[1], sixteen]);
+                self.value(op::BITWISE_OR, self.u32, &[high, halves[0]])
+            } else {
+                // Row t/4, word t%4.
+                let source = self.value(op::I_ADD, self.u32, &[first, quarter]);
+                let base = row(self, source);
+                let four = self.constant(4);
+                let column = self.value(op::I_MUL, self.u32, &[within, four]);
+                let at = self.value(op::I_ADD, self.u32, &[base, column]);
+                self.shared_word(index, at)?
+            };
+            values.push(value);
+        }
+        if d != 255 {
+            for (n, value) in values.into_iter().enumerate() {
+                self.write_register(d.saturating_add(n as u8), value);
+            }
+        }
+        Ok(())
+    }
+
     /// The `size`-typed value at byte `low_bits` (0-3) of `word`.
     pub(super) fn sub_word(&mut self, word: u32, low_bits: u32, size: u8) -> u32 {
         let eight = self.constant(8);
