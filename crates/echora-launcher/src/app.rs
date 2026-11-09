@@ -7,7 +7,7 @@ use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use echora_config::{InternalResolutionSetting, Settings, WindowMode};
+use echora_config::{InternalResolutionSetting, Settings, WindowMode, Workers};
 use echora_content::ContentSource;
 use echora_input::button;
 use gpui::{
@@ -34,6 +34,17 @@ const RESOLUTIONS: [(&str, InternalResolutionSetting); 5] = [
     ("1080p", InternalResolutionSetting::Height { height: 1080 }),
     ("1440p", InternalResolutionSetting::Height { height: 1440 }),
     ("2160p", InternalResolutionSetting::Height { height: 2160 }),
+];
+
+/// How many CPU cores run the game: automatic (up to six), or a count.
+const CPU_CORES: [(&str, Workers); 7] = [
+    ("Auto", Workers::Auto),
+    ("1", Workers::Count(1)),
+    ("2", Workers::Count(2)),
+    ("3", Workers::Count(3)),
+    ("4", Workers::Count(4)),
+    ("5", Workers::Count(5)),
+    ("6", Workers::Count(6)),
 ];
 
 const WINDOW_MODES: [(&str, WindowMode); 3] = [
@@ -1598,6 +1609,26 @@ impl Launcher {
                                 live,
                                 cx,
                                 |s, v| s.display.internal_resolution = v,
+                            )),
+                        )
+                        .into_any_element(),
+                        ui::row(
+                            None,
+                            ui::titles(
+                                "CPU cores",
+                                Some(
+                                    "Auto uses up to six. Several cores are still experimental."
+                                        .into(),
+                                ),
+                            ),
+                            Some(self.popup(
+                                "cores",
+                                &CPU_CORES,
+                                settings.cpu.workers,
+                                window,
+                                live,
+                                cx,
+                                |s, v| s.cpu.workers = v,
                             )),
                         )
                         .into_any_element(),
