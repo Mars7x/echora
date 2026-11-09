@@ -219,21 +219,35 @@ mod tests {
         assert_eq!(translated.stored_generics, 1 << 1);
         // Position x..w (words 28-31) and generic 1.x (word 36).
         assert_eq!(translated.stores[0], 0xf << 28 | 1 << 36);
-        // A generic vertex input waits for the vertex fetch table.
+        // Generic inputs are fetched by the program from the draw's fetch
+        // table, through the page table.
         let mut program = header(1, 1, &[]);
         program.extend(bytes(&[
+            // ALD R0, a[0x90], 4 words (generic 1); AST a[0x70], R0..R3
             word(&[
                 (0, 12, 0x321),
                 (16, 8, 0),
                 (24, 8, 255),
                 (32, 8, 255),
-                (40, 10, 0x80),
+                (40, 10, 0x90),
+                (74, 2, 3),
+            ]),
+            word(&[
+                (0, 12, 0x322),
+                (24, 8, 255),
+                (32, 8, 0),
+                (40, 10, 0x70),
+                (64, 8, 255),
+                (74, 2, 3),
             ]),
             EXIT,
         ]));
-        let error = translate(&program, &Parameters::default()).unwrap_err();
-        assert!(error.reason.contains("vertex fetch"), "{}", error.reason);
-        assert_eq!(error.offset, Some(GRAPHICS_HEADER_SIZE as u32));
+        let translated = validated(&program);
+        assert_eq!(translated.loaded_generics, 1 << 1);
+        assert_eq!(
+            translated.push_fields,
+            echora_shader_abi::PUSH_VERTEX_FETCH | echora_shader_abi::PUSH_PAGE_TABLE
+        );
     }
 
     #[test]

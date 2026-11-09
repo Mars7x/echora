@@ -10,6 +10,7 @@
 
 use echora_shader_abi::{
     PAGE_SHIFT, PAGE_SIZE, PUSH_PAGE_TABLE, PUSH_PAGE_TABLE_OFFSET, PUSH_RESOLUTION_SCALE_OFFSET,
+    PUSH_VERTEX_FETCH_OFFSET,
 };
 
 use super::{Emitter, unsupported};
@@ -251,10 +252,13 @@ impl Emitter {
 
     /// The push-constant block's page-table fields: the table's device
     /// address, its first page and its page count (as 64-bit values).
-    /// The push-constant block: the resolution scale (a vec4 at 96, member
-    /// 0) and the page table (its address as two words, the first page and
-    /// the page count, at 112; members 1-4). Declared once, whole; a
-    /// program reports the fields it reads in `push_fields`.
+    /// The push-constant block, members in offset order: the vertex fetch
+    /// fields (the table address as two words, the base instance and the
+    /// present attributes, at 80; members 0-3), the resolution scale (a
+    /// vec4 at 96; member 4) and the page table (its address as two words,
+    /// the first page and the page count, at 112; members 5-8). Declared
+    /// once, whole; a program reports the fields it reads in
+    /// `push_fields`.
     pub(super) fn push_block(&mut self) -> u32 {
         if let Some(variable) = self.memory.push_constants {
             return variable;
@@ -263,11 +267,16 @@ impl Emitter {
             component: self.f32,
             count: 4,
         });
+        let u32 = self.u32;
         let block = self.module.ty(Type::Struct {
-            members: vec![vec4, self.u32, self.u32, self.u32, self.u32],
+            members: vec![u32, u32, u32, u32, vec4, u32, u32, u32, u32],
         });
         self.module.decorate(block, decoration::BLOCK, &[]);
         let offsets = [
+            PUSH_VERTEX_FETCH_OFFSET,
+            PUSH_VERTEX_FETCH_OFFSET + 4,
+            PUSH_VERTEX_FETCH_OFFSET + 8,
+            PUSH_VERTEX_FETCH_OFFSET + 12,
             PUSH_RESOLUTION_SCALE_OFFSET,
             PUSH_PAGE_TABLE_OFFSET,
             PUSH_PAGE_TABLE_OFFSET + 4,
@@ -293,7 +302,7 @@ impl Emitter {
         let pointer = self.module.pointer(storage::PUSH_CONSTANT, self.u32);
         let mut words = [0; 4];
         for (n, word) in words.iter_mut().enumerate() {
-            let member = self.constant(n as u32 + 1);
+            let member = self.constant(n as u32 + 5);
             let element = self.value(op::ACCESS_CHAIN, pointer, &[variable, member]);
             *word = self.value(op::LOAD, self.u32, &[element]);
         }
@@ -333,7 +342,7 @@ impl Emitter {
 
     /// Looks up global address `va` and, where it is mapped and `extra`
     /// holds, runs `access` with the device address of `va`.
-    fn mapped(
+    pub(super) fn mapped(
         &mut self,
         va: u32,
         extra: Option<u32>,
@@ -388,7 +397,7 @@ impl Emitter {
     }
 
     /// Zero-initialised variables that receive a conditional load's words.
-    fn result_variables(&mut self, count: u32) -> Vec<u32> {
+    pub(super) fn result_variables(&mut self, count: u32) -> Vec<u32> {
         let zero = self.constant(0);
         (0..count)
             .map(|_| {

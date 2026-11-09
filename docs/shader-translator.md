@@ -110,8 +110,14 @@ Generic vectors between stages are `vec4`s at location n; a fragment
 input's interpolation comes from the SPH's input map (two bits per
 component: constant, perspective, screen-linear), centroid from IPA.
 Vertex inputs are fetched by the program from its vertex buffers through
-the page table, by a per-draw table of addresses, strides and formats
-(to be defined), so translations do not depend on attribute formats. A
+the page table, by the draw's fetch table (`VertexFetch` at push constant
+80, one `VertexAttribute` per location: address, stride, divisor, format
+and size), so translations do not depend on attribute formats: a helper
+function decodes any format at run time (8-, 16- and 32-bit components,
+10/10/10/2 and 11/11/10 float; normalized, integer, float and scaled;
+BGRA order), each word through its own page lookup and reading zero past
+the stream's size, and the program's prologue fetches each location it
+reads once. A
 fragment program leaves its outputs in R0.. at exit: four registers per
 render target the SPH enables (four component bits each at bits
 576-607), then a register for the sample mask (bit 608) and the depth

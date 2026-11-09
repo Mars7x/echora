@@ -129,16 +129,6 @@ impl Emitter {
         self.value(op::ACCESS_CHAIN, pointer, &[variable, component])
     }
 
-    /// Word `word` of vertex input `location`, fetched from its vertex
-    /// buffer. The fetch table's layout is not settled yet.
-    fn vertex_fetch(&mut self, index: usize, location: u32, word: u32) -> Result<u32, Unsupported> {
-        let _ = (location, word);
-        Err(unsupported(
-            index,
-            "vertex input (the vertex fetch table is not defined yet)",
-        ))
-    }
-
     /// One word of the attribute space, read.
     fn attribute(
         &mut self,
@@ -203,7 +193,7 @@ impl Emitter {
         let variable = self.push_block();
         self.push_fields |= PUSH_RESOLUTION_SCALE;
         let pointer = self.module.pointer(storage::PUSH_CONSTANT, self.f32);
-        let (member, word) = (self.constant(0), self.constant(word));
+        let (member, word) = (self.constant(4), self.constant(word));
         let element = self.value(op::ACCESS_CHAIN, pointer, &[variable, member, word]);
         self.value(op::LOAD, self.f32, &[element])
     }

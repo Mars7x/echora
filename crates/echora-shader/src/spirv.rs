@@ -32,7 +32,9 @@ pub mod op {
     pub const CONSTANT_FALSE: u16 = 42;
     pub const CONSTANT: u16 = 43;
     pub const FUNCTION: u16 = 54;
+    pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
+    pub const FUNCTION_CALL: u16 = 57;
     pub const VARIABLE: u16 = 59;
     pub const LOAD: u16 = 61;
     pub const STORE: u16 = 62;
@@ -65,6 +67,7 @@ pub mod op {
     pub const F_SUB: u16 = 131;
     pub const I_MUL: u16 = 132;
     pub const F_MUL: u16 = 133;
+    pub const U_DIV: u16 = 134;
     pub const F_DIV: u16 = 136;
     pub const I_ADD_CARRY: u16 = 149;
     pub const IS_NAN: u16 = 156;
@@ -144,6 +147,7 @@ pub mod op {
     pub const BRANCH_CONDITIONAL: u16 = 250;
     pub const SWITCH: u16 = 251;
     pub const RETURN: u16 = 253;
+    pub const RETURN_VALUE: u16 = 254;
 }
 
 /// Storage classes.
@@ -601,6 +605,17 @@ impl Function {
     /// Begins a function returning `result` of type `function_type`, and
     /// its first block.
     pub fn new(module: &mut Module, result: u32, function_type: u32) -> Self {
+        Self::with_parameters(module, result, function_type, &[]).0
+    }
+
+    /// As `new`, with parameters of `parameter_types` (which
+    /// `function_type` must list); returns their ids too.
+    pub fn with_parameters(
+        module: &mut Module,
+        result: u32,
+        function_type: u32,
+        parameter_types: &[u32],
+    ) -> (Self, Vec<u32>) {
         let id = module.id();
         let mut header = Vec::new();
         instruction(
@@ -608,14 +623,25 @@ impl Function {
             op::FUNCTION,
             &[result, id, NONE, function_type],
         );
+        let parameters: Vec<u32> = parameter_types
+            .iter()
+            .map(|&ty| {
+                let parameter = module.id();
+                instruction(&mut header, op::FUNCTION_PARAMETER, &[ty, parameter]);
+                parameter
+            })
+            .collect();
         let label = module.id();
         instruction(&mut header, op::LABEL, &[label]);
-        Self {
-            id,
-            header,
-            variables: Vec::new(),
-            code: Vec::new(),
-        }
+        (
+            Self {
+                id,
+                header,
+                variables: Vec::new(),
+                code: Vec::new(),
+            },
+            parameters,
+        )
     }
 
     /// A `Function`-storage variable of pointer type `pointer_type`, with

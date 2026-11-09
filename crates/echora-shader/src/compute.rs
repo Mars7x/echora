@@ -145,6 +145,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     Ok(emitter.finish())
 }
 
+mod fetch;
 mod io;
 mod memory;
 mod texture;
@@ -217,6 +218,8 @@ struct Emitter {
     header: Option<crate::header::Header>,
     memory: memory::Memory,
     io: io::Io,
+    /// Vertex inputs the prologue fetched, by location.
+    fetched: BTreeMap<u32, u32>,
     frag_colors: u32,
     push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
@@ -282,6 +285,7 @@ impl Emitter {
             header: layout.header,
             memory: memory::Memory::default(),
             io: io::Io::default(),
+            fetched: BTreeMap::new(),
             frag_colors: 0,
             push_fields: 0,
             banks: BTreeMap::new(),
@@ -2116,6 +2120,7 @@ impl Emitter {
 
     /// The dispatch loop over `blocks`.
     fn program(&mut self, code: &[Instruction], blocks: &[Block]) -> Result<(), Unsupported> {
+        self.vertex_prologue(code);
         let block_of: BTreeMap<usize, u32> = blocks
             .iter()
             .enumerate()
