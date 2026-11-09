@@ -18,7 +18,7 @@ when the code for it does.
 | 10. In-game settings | Dropped: settings are changed in the launcher only. | — |
 | 11. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 12. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 13. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie decodes at about 22 to 24 pictures per second (`ECHORA_MOVIE_RATE`), with the main CPU thread as the limit. |
+| 13. Performance | Reproducible measurements show gains without regressions. | In progress. With six cores the opening movie plays at about 29 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene at about 6 frames per second, about 2.9 times one core. |
 | 14. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 15. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
@@ -27,10 +27,9 @@ when the code for it does.
 1. Correct the overexposed first scene after the New Game movie, check what
    it draws (including the mesh and task pipelines) and carry on to gameplay.
 2. Translate the last 16 failing shader stages.
-3. Finish multi-core (`ECHORA_WORKERS`): runs no longer crash, so check long
-   runs against single-core ones, cut the time workers spend waiting for the
-   global machine lock, and give each guest core its own run queue inside a
-   worker. Then make it the default.
+3. Make each thread faster in the 3D scene: profile it, then cut the cost of
+   the translated code and of each GPU command, which now limit speed more
+   than the number of cores.
 4. Turn on the faster code generation in game builds once it is checked in
    game: inline vector arithmetic first, then structured control flow and
    direct calls once they measure faster.

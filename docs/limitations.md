@@ -24,14 +24,13 @@ to be missing or incomplete.
 ## Performance
 
 - Runs are far below full speed. The console runs the game at 60 frames per
-  second; here the opening movie decodes at about 22 to 24 pictures per second.
-- By default every guest thread runs on one host thread, which does most of
-  the work. `ECHORA_WORKERS` spreads them over up to six host threads, one per
-  application core. Those runs no longer crash in testing and get through the
-  movie and into the first scene about 1.5 times as fast, but long runs are
-  not yet checked against single-core ones, so they stay off by default. With fewer than six workers,
-  threads of different guest cores on one worker compete by strict priority,
-  which can starve some of them.
+  second; here the opening movie plays at about 22 to 29 pictures per second
+  and the first 3D scene at about 6 frames per second.
+- Guest threads run on up to six host threads by default, one per
+  application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
+  On six cores the first 3D scene runs about 2.9 times as fast as on one, and
+  three cores get most of that. More cores help little for now, because the
+  thread that turns the game's GPU commands into Vulkan works alone.
 - The faster code-generation options (`inline-vector`, `direct-calls`,
   `structured`) are off by default until they are checked in game.
 
