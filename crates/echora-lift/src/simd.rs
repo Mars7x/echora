@@ -2352,6 +2352,62 @@ fn min_max(op_max: bool, float: &str) -> String {
     }
 }
 
+thread_local! {
+    /// `EmitOptions::whole_vector_checks` of the emission on this thread.
+    static WHOLE_VECTOR_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets whether inlined vector float operations check their operands and
+/// results a whole vector at a time (`EmitOptions::whole_vector_checks`);
+/// returns the previous setting.
+pub(crate) fn set_whole_vector_checks(on: bool) -> bool {
+    WHOLE_VECTOR_CHECKS.replace(on)
+}
+
+/// Closures over a whole vector (lanes of `width` bits, those of `mask`):
+/// `usable_all` (every lane normal or zero) and `normal_all` (every lane
+/// normal). Each lane's exponent and mantissa fields are below its top bit,
+/// so adding all-ones below the top bit sets that bit exactly when the field
+/// is nonzero, without a carry into the next lane: one test per vector
+/// instead of one per lane.
+fn whole_vector_closures(width: u32, mask: &str) -> String {
+    let repeat = |lane: u64| -> String {
+        let mut value: u128 = 0;
+        for index in 0..128 / width {
+            value |= u128::from(lane) << (index * width);
+        }
+        format!("{value:#x}u128")
+    };
+    let (exponent, mantissa, low) = if width == 32 {
+        (
+            repeat(0x7f80_0000),
+            repeat(0x007f_ffff),
+            repeat(0x7fff_ffff),
+        )
+    } else {
+        (
+            repeat(0x7ff0_0000_0000_0000),
+            repeat(0x000f_ffff_ffff_ffff),
+            repeat(0x7fff_ffff_ffff_ffff),
+        )
+    };
+    let high = if width == 32 {
+        repeat(0x8000_0000)
+    } else {
+        repeat(0x8000_0000_0000_0000)
+    };
+    format!(
+        "let lanes_mask: u128 = {mask}; \
+         let fields = |vector: u128| {{ let vector = vector & lanes_mask; let e = vector & {exponent}; \
+         ((e.wrapping_add({low})) & {high}, ((e ^ {exponent}).wrapping_add({low})) & {high}, \
+         ((vector & {mantissa}).wrapping_add({low})) & {high}) }}; \
+         let usable_all = |vector: u128| {{ let (e_set, not_all_ones, m_set) = fields(vector); \
+         (!not_all_ones & {high} & lanes_mask) | (!e_set & m_set) == 0 }}; \
+         let normal_all = |vector: u128| {{ let (e_set, not_all_ones, _) = fields(vector); \
+         (!(e_set & not_all_ones)) & {high} & lanes_mask == 0 }};"
+    )
+}
+
 /// Inlined lanewise FADD/FSUB/FMUL/FMLA/FMLS under the helpers' fast-path
 /// guard (see [`emit_inline`]); `element` takes the second operand from
 /// lane `index` of `rm` in every lane (the by-element forms).
@@ -2418,6 +2474,44 @@ fn vec_fp_arith(
     } else {
         String::new()
     };
+    if WHOLE_VECTOR_CHECKS.get() {
+        let mask = if lanes * width == 128 {
+            "u128::MAX".to_owned()
+        } else {
+            format!("(1u128 << {}) - 1", lanes * width)
+        };
+        let closures = whole_vector_closures(width, &mask);
+        let second_usable = match element {
+            Some(_) => "usable(element)".to_owned(),
+            None => "usable_all(v)".to_owned(),
+        };
+        let lane_z = if fused {
+            format!("let z = (d >> (lane * {width})) as {int};")
+        } else {
+            String::new()
+        };
+        let d_usable = if fused { " && usable_all(d)" } else { "" };
+        return format!(
+            "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
+             let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+             let zero = |value: {int}| value & !{sign} == 0; \
+             let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {closures} \
+             let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+             && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable_all(n) && {second_usable}{d_usable}; \
+             let mut out = 0u128; \
+             for lane in 0..{lanes} {{ \
+             let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
+             let raw = ({value}).to_bits(); \
+             out |= u128::from(raw) << (lane * {width}); }} \
+             if fast && !normal_all(out) {{ \
+             for lane in 0..{lanes} {{ \
+             let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
+             let raw = (out >> (lane * {width})) as {int}; \
+             fast &= normal(raw) | (zero(raw) & ({exact})); }} }} \
+             let _ = d; \
+             if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+        );
+    }
     format!(
         "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
                  let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \

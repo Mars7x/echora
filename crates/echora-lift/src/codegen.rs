@@ -3228,12 +3228,31 @@ pub struct EmitOptions {
     /// is not computed. Where it is dead, nothing reads it before it is
     /// written again, so no guest-visible state changes.
     pub fused_flags: bool,
+    /// With `inline_vector`: check an inlined vector float operation's
+    /// operands and results a whole vector at a time
+    /// (`crate::simd::set_whole_vector_checks`) instead of lane by lane.
+    pub whole_vector_checks: bool,
 }
 
 thread_local! {
     /// `EmitOptions::inline_vector` of the emission running on this thread,
     /// read where SIMD operations are written.
     static INLINE_VECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets `crate::simd`'s whole-vector checks for as long as it lives.
+struct WholeVectorChecks(bool);
+
+impl WholeVectorChecks {
+    fn set(on: bool) -> Self {
+        Self(crate::simd::set_whole_vector_checks(on))
+    }
+}
+
+impl Drop for WholeVectorChecks {
+    fn drop(&mut self) {
+        crate::simd::set_whole_vector_checks(self.0);
+    }
 }
 
 /// Sets [`INLINE_VECTOR`] for as long as it lives.
@@ -3433,6 +3452,7 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options
             .fused_flags

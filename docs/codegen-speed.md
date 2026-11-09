@@ -138,12 +138,33 @@ inline FP operation checks every lane for a normal or zero value before its
 fast path, and reloads `m.cpu.fpcr` (and `fpsr`) after every guest store,
 which may alias the `Cpu`.
 
+## Whole-vector checks (opt-in)
+
+An inlined vector float operation (FADD, FSUB, FMUL, FMLA, FMLS) runs
+natively only when every operand lane is normal or zero and every result
+lane is normal or an exact zero. Checked lane by lane, that was half the
+`vector` kernel's time (skipping it, incorrectly, doubled the rate).
+`EmitOptions::whole_vector_checks` tests each operand vector at once: the
+exponent and mantissa fields of every lane are below its top bit, so adding
+all-ones below the top bit sets that bit exactly when the field is
+nonzero, without a carry into the next lane. A result that is not all
+normal (a zero, say) falls back to the exact per-lane test. Three
+alternating runs: `vector` 199/226/199 to 284/262/259 Minstr/s (best),
+`scalar` (no vector float operations) unchanged. Every aot suite passes
+with it; accepting every operand fails the FP semantics suite.
+
+On x86-64, `mul_add` (FMLA, FMADD) is a call to `compiler_builtins`'
+`fmaf`/`fma`, which dispatches again at run time: building the translation
+with `-C target-feature=+fma` inlines it (`scalar` +12-15%), but needs a
+host CPU with FMA (x86-64-v3); a decision for the game build's flags.
+
 ## Order for the rebuild
 
 1. Land the `echora-guest` API and runtime changes with today's emission
    (the generated code still calls `tick_block_at` / `finish_block`, now
    cheaper).
 2. Turn on, in `ECHORA_LIFT_OPTIONS`: `inline-vector`, `fused-flags`,
-   `window-memory`, and the block bookkeeping emission.
+   `whole-vector-checks`, `window-memory`, and the block bookkeeping
+   emission.
 3. One full rebuild of the game's translation; compare frames and speed
    with the previous build.
