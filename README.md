@@ -34,21 +34,23 @@ What works today:
 - Echora reads and checks your NUP file or dump, and translates the whole
   game, 17.3 million instructions, into native code. The first start takes
   about an hour; after that it starts straight away.
-- The translated game runs: it boots through the system services, plays its
+- The translated game runs. With the old shader recompiler loaded as a
+  plugin, as on my machine, it boots through the system services, plays its
   sound, takes input, and gets through New Game and the opening movie into
-  its first 3D scene.
+  its first 3D scene. Without it, a run stops at the first draw, before the
+  title screen.
 - The game's threads run on up to six CPU cores by default.
 - The launcher installs the game, changes settings and starts it, with a
   mouse, keyboard or controller.
 
 What doesn't work yet:
 
-- Drawing. Echora's own shader translator, written in Rust, handles more than
-  half of the game's compute shaders so far and none of its drawing shaders,
-  so a run stops at the first shader it can't translate and says which one.
-  With the old shader recompiler the title screen and the opening movie
-  rendered correctly; I still load it on my own machine as a plugin to test
-  against. The section below explains why I'm replacing it.
+- Drawing on its own. Echora's own shader translator, written in Rust,
+  handles more than half of the game's compute shaders so far and none of its
+  drawing shaders, so a run stops at the first shader it can't translate and
+  says which one. The old recompiler isn't part of Echora any more; I only
+  load it on my own machine to test against. The section below explains why
+  I'm replacing it.
 - Gameplay. The first 3D scene after the movie isn't drawn correctly, and
   nothing past it has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
