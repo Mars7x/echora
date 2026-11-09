@@ -533,7 +533,7 @@ impl Renderer {
             unsafe { self.device().begin_command_buffer(self.commands, &begin) }
                 .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
-            if let Some(timer) = &self.timer {
+            if let Some(timer) = self.timer.as_mut() {
                 timer.begin(&self.gpu.device, self.commands, self.fence);
             }
             if self.spare.in_flight {
@@ -2310,7 +2310,30 @@ impl Renderer {
             std::env::var_os("ECHORA_LAST_SUBMIT").is_some()
                 || std::env::var_os("ECHORA_SLOW_SUBMITS").is_some()
                 || std::env::var_os("ECHORA_SUBMIT_LOG").is_some()
+                || std::env::var_os("ECHORA_GPU_TIME").is_some_and(|value| value == "items")
         })
+    }
+
+    /// Debugging (ECHORA_GPU_TIME=items): time the draw or dispatch about
+    /// to be recorded (`start`), or end its timing; it is named by the
+    /// latest label without its present number.
+    pub(crate) fn time_item(&mut self, start: bool) {
+        let Some(timer) = self.timer.as_mut() else {
+            return;
+        };
+        if !timer.timing_items() {
+            return;
+        }
+        let name = self
+            .labels
+            .last()
+            .map(|label| {
+                let words: Vec<&str> = label.split_whitespace().collect();
+                // "present N dispatch HASH ..." or "present N draw A/B ...".
+                words.get(2..4).map_or(label.clone(), |kind| kind.join(" "))
+            })
+            .unwrap_or_default();
+        timer.item(&self.gpu.device, self.commands, self.fence, &name, start);
     }
 
     /// Debugging: name a piece of work in the current submission.

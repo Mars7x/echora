@@ -871,6 +871,7 @@ impl Renderer {
                 .to_bytes(),
             )
         };
+        self.time_item(true);
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
@@ -995,6 +996,7 @@ impl Renderer {
             }
             // The pass stays open for the next draw into the same targets.
         }
+        self.time_item(false);
         Ok(written
             .into_iter()
             .map(|(key, offset, length)| (key, self.defer_ring_read(offset, length)))

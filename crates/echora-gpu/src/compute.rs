@@ -255,6 +255,7 @@ impl Renderer {
                 .collect();
             crate::draw::rescaling_constants(&scaled, 1.0)
         });
+        self.time_item(true);
         // SAFETY: recording outside rendering; the program and set are live.
         unsafe {
             let device = &self.gpu.device;
@@ -316,6 +317,7 @@ impl Renderer {
                 &[],
             );
         }
+        self.time_item(false);
         // Only written storage buffers come back to the guest, after the
         // next flush (the ring keeps them until it is reused).
         Ok(storage
