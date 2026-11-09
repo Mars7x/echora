@@ -92,7 +92,9 @@ Notes on values:
   game's movies do not use.
 - CDEF secondary strengths are the spec's values (a coded 3 is 4).
 - `loop_restoration_size` is in samples, zero for every plane when loop
-  restoration is off.
+  restoration is off. `StdVideoAV1LoopRestoration::LoopRestorationSize`
+  takes log2(size) - 5 instead (`crates/echora-gpu/src/video_av1.rs`
+  converts it).
 - `ar_coeffs_*_plus_128` are stored as coded (0..=255); the Std header
   declares them `int8_t`, so copy the bits.
 - With `update_grain` clear the film grain parameters are already loaded

@@ -294,6 +294,9 @@ pub struct Av1Capabilities {
     pub distinct: bool,
     /// StdVideoAV1Level.
     pub max_level: u32,
+    /// DPB pictures may be separate images
+    /// (`VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR`).
+    pub separate_images: bool,
     pub std_header_version: vk::ExtensionProperties,
 }
 
@@ -354,6 +357,9 @@ pub fn av1_capabilities(video: &VideoDevice) -> Result<Av1Capabilities, String> 
             coincide: false,
             distinct: false,
             max_level: 0,
+            separate_images: capabilities
+                .flags
+                .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES),
             std_header_version: capabilities.std_header_version,
         };
         let flags = decode.flags;
@@ -439,8 +445,8 @@ pub fn nv12_size(height: u32, pitch: u32) -> usize {
     pitch as usize * (height as usize + height.div_ceil(2) as usize)
 }
 
-/// An AV1 decode session: the DPB (one image, a layer per slot, that
-/// decoded pictures are also written to), the bitstream buffer and a
+/// An AV1 decode session: the DPB (an image per slot, that decoded
+/// pictures are also written to), the bitstream buffer and a
 /// read-back buffer. Decoding is synchronous: each call waits for the GPU.
 pub struct Av1Decoder {
     video: Arc<VideoDevice>,
@@ -448,9 +454,8 @@ pub struct Av1Decoder {
     session: vk::VideoSessionKHR,
     session_memory: Vec<vk::DeviceMemory>,
     parameters: vk::VideoSessionParametersKHR,
-    pictures: vk::Image,
-    pictures_memory: vk::DeviceMemory,
-    view: vk::ImageView,
+    /// The DPB, one image per slot.
+    pictures: Vec<DpbPicture>,
     bitstream: Mapped,
     size_alignment: u64,
     readback: Mapped,
@@ -611,9 +616,7 @@ impl Av1Decoder {
             session: vk::VideoSessionKHR::null(),
             session_memory: Vec::new(),
             parameters: vk::VideoSessionParametersKHR::null(),
-            pictures: vk::Image::null(),
-            pictures_memory: vk::DeviceMemory::null(),
-            view: vk::ImageView::null(),
+            pictures: Vec::new(),
             bitstream: Mapped::NONE,
             size_alignment: capabilities.bitstream_size_alignment.max(1),
             readback: Mapped::NONE,
@@ -712,59 +715,73 @@ impl Av1Decoder {
         .result()
         .map_err(vk_error("vkBindVideoSessionMemoryKHR"))?;
 
-        // The DPB: one layer per slot, also read back by the copy queue.
+        // The DPB: an image per slot (separate reference images), also read
+        // back by the copy queue. One array image would do on paper, but
+        // RADV reads and writes a picture's chroma plane in array layers
+        // past the first at the wrong place.
+        if !capabilities.separate_images {
+            return Err("the device keeps DPB pictures only in one image".into());
+        }
         let families = [video.decode_family, video.transfer_family];
         let concurrent = families[0] != families[1];
-        self.pictures = with_profile(|profile| {
-            let profiles = [*profile];
-            let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-            let mut info = vk::ImageCreateInfo::default()
-                .flags(format.create_flags)
-                .image_type(vk::ImageType::TYPE_2D)
+        for _ in 0..SLOTS {
+            let mut picture = DpbPicture::NONE;
+            let created = with_profile(|profile| {
+                let profiles = [*profile];
+                let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+                let mut info = vk::ImageCreateInfo::default()
+                    .flags(format.create_flags)
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format.format)
+                    .extent(vk::Extent3D {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(format.tiling)
+                    .usage(
+                        vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                            | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                            | vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .push_next(&mut list);
+                if concurrent {
+                    info = info
+                        .sharing_mode(vk::SharingMode::CONCURRENT)
+                        .queue_family_indices(&families);
+                }
+                // SAFETY: valid create info; destroyed in Drop.
+                unsafe { device.create_image(&info, None) }
+            });
+            // Kept before anything can fail, so Drop releases it.
+            let image = created.map_err(vk_error("vkCreateImage (DPB)"))?;
+            picture.image = image;
+            self.pictures.push(picture);
+            let picture = self.pictures.last_mut().ok_or("no DPB picture")?;
+            // SAFETY: a live image.
+            let requirements = unsafe { device.get_image_memory_requirements(image) };
+            picture.memory = video.allocate_local(requirements)?;
+            // SAFETY: fresh memory of the size the image asks for.
+            unsafe { device.bind_image_memory(image, picture.memory, 0) }
+                .map_err(vk_error("vkBindImageMemory (DPB)"))?;
+            let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(
+                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                    | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
+            );
+            let info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
                 .format(format.format)
-                .extent(vk::Extent3D {
-                    width: self.extent.width,
-                    height: self.extent.height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(SLOTS)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(format.tiling)
-                .usage(
-                    vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                        | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
-                )
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .push_next(&mut list);
-            if concurrent {
-                info = info
-                    .sharing_mode(vk::SharingMode::CONCURRENT)
-                    .queue_family_indices(&families);
-            }
+                .subresource_range(color_layers(0, 1))
+                .push_next(&mut view_usage);
             // SAFETY: valid create info; destroyed in Drop.
-            unsafe { device.create_image(&info, None) }
-        })
-        .map_err(vk_error("vkCreateImage (DPB)"))?;
-        // SAFETY: a live image.
-        let requirements = unsafe { device.get_image_memory_requirements(self.pictures) };
-        self.pictures_memory = video.allocate_local(requirements)?;
-        // SAFETY: fresh memory of the size the image asks for.
-        unsafe { device.bind_image_memory(self.pictures, self.pictures_memory, 0) }
-            .map_err(vk_error("vkBindImageMemory (DPB)"))?;
-        let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
-        );
-        let info = vk::ImageViewCreateInfo::default()
-            .image(self.pictures)
-            .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
-            .format(format.format)
-            .subresource_range(color_layers(0, SLOTS))
-            .push_next(&mut view_usage);
-        // SAFETY: valid create info; destroyed in Drop.
-        self.view = unsafe { device.create_image_view(&info, None) }
-            .map_err(vk_error("vkCreateImageView (DPB)"))?;
+            picture.view = unsafe { device.create_image_view(&info, None) }
+                .map_err(vk_error("vkCreateImageView (DPB)"))?;
+        }
 
         self.readback = Mapped::new(
             &video,
@@ -849,8 +866,7 @@ impl Av1Decoder {
     ) -> vk::VideoPictureResourceInfoKHR<'static> {
         vk::VideoPictureResourceInfoKHR::default()
             .coded_extent(extent)
-            .base_array_layer(slot)
-            .image_view_binding(self.view)
+            .image_view_binding(self.pictures[slot as usize].view)
     }
 
     /// Decodes `frame` into its slot and waits for it.
@@ -1001,18 +1017,24 @@ impl Av1Decoder {
                 )
                 .map_err(vk_error("vkBeginCommandBuffer (video)"))?;
             if self.fresh {
-                let barrier = [vk::ImageMemoryBarrier2::default()
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-                    .dst_access_mask(
-                        vk::AccessFlags2::VIDEO_DECODE_READ_KHR
-                            | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-                    )
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.pictures)
-                    .subresource_range(color_layers(0, SLOTS))];
+                let barrier: Vec<_> = self
+                    .pictures
+                    .iter()
+                    .map(|picture| {
+                        vk::ImageMemoryBarrier2::default()
+                            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+                            .dst_access_mask(
+                                vk::AccessFlags2::VIDEO_DECODE_READ_KHR
+                                    | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+                            )
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(picture.image)
+                            .subresource_range(color_layers(0, 1))
+                    })
+                    .collect();
                 device.cmd_pipeline_barrier2(
                     command,
                     &vk::DependencyInfo::default().image_memory_barriers(&barrier),
@@ -1075,10 +1097,10 @@ impl Av1Decoder {
                 true,
             )?;
         }
+        let image = self.pictures[slot as usize].image;
         let layer = |aspect| {
             vk::ImageSubresourceLayers::default()
                 .aspect_mask(aspect)
-                .base_array_layer(slot)
                 .layer_count(1)
         };
         let regions = [
@@ -1107,8 +1129,8 @@ impl Av1Decoder {
                 .new_layout(new)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.pictures)
-                .subresource_range(color_layers(slot, 1))
+                .image(image)
+                .subresource_range(color_layers(0, 1))
         };
         // The decode that wrote the picture was waited for, so the copy
         // needs only the layout changes around it.
@@ -1149,7 +1171,7 @@ impl Av1Decoder {
             );
             device.cmd_copy_image_to_buffer(
                 command,
-                self.pictures,
+                image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.readback.buffer,
                 &regions,
@@ -1181,6 +1203,21 @@ impl Av1Decoder {
     }
 }
 
+/// One DPB slot's picture: its image, memory and view.
+struct DpbPicture {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
+impl DpbPicture {
+    const NONE: Self = Self {
+        image: vk::Image::null(),
+        memory: vk::DeviceMemory::null(),
+        view: vk::ImageView::null(),
+    };
+}
+
 fn color_layers(base: u32, count: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1207,14 +1244,14 @@ impl Drop for Av1Decoder {
                     device.destroy_command_pool(pool, None);
                 }
             }
-            if self.view != vk::ImageView::null() {
-                device.destroy_image_view(self.view, None);
-            }
-            if self.pictures != vk::Image::null() {
-                device.destroy_image(self.pictures, None);
-            }
-            if self.pictures_memory != vk::DeviceMemory::null() {
-                device.free_memory(self.pictures_memory, None);
+            for picture in self.pictures.drain(..) {
+                if picture.view != vk::ImageView::null() {
+                    device.destroy_image_view(picture.view, None);
+                }
+                device.destroy_image(picture.image, None);
+                if picture.memory != vk::DeviceMemory::null() {
+                    device.free_memory(picture.memory, None);
+                }
             }
             if self.parameters != vk::VideoSessionParametersKHR::null() {
                 (functions.destroy_video_session_parameters_khr)(

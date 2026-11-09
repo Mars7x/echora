@@ -135,6 +135,13 @@ fn main() {
                 }
                 (count, largest)
             };
+            // AV1_CHECK_DUMP=DIR: both pictures as gpu-N.nv12 and
+            // cpu-N.nv12, for inspection.
+            if let Some(directory) = std::env::var_os("AV1_CHECK_DUMP") {
+                let directory = std::path::Path::new(&directory);
+                let _ = std::fs::write(directory.join(format!("gpu-{compared}.nv12")), &ours);
+                let _ = std::fs::write(directory.join(format!("cpu-{compared}.nv12")), &expected);
+            }
             let size_ok = (width, height) == (reference.width, reference.height);
             let (y, y_max) = differ(0..luma);
             let (uv, uv_max) = differ(luma..ours.len().min(expected.len()));

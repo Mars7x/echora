@@ -171,7 +171,12 @@ fn with_picture<R>(
         .loop_restoration
         .frame_restoration_type
         .map(std_video::StdVideoAV1FrameRestorationType::from);
-    restoration.LoopRestorationSize = p.loop_restoration.loop_restoration_size;
+    // Vulkan takes each plane's unit size as log2(size) - 5 (the parser
+    // gives samples; 0 when the plane is not restored).
+    restoration.LoopRestorationSize = p.loop_restoration.loop_restoration_size.map(|size| {
+        size.checked_ilog2()
+            .map_or(0, |log2| log2.saturating_sub(5) as u16)
+    });
 
     let mut motion: std_video::StdVideoAV1GlobalMotion = zeroed();
     motion.GmType = p.global_motion.gm_type;
