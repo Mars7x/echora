@@ -132,6 +132,10 @@ pub mod op {
     pub const ATOMIC_F_ADD: u16 = 6035;
     pub const READ_CLOCK: u16 = 5056;
     pub const DEMOTE_TO_HELPER_INVOCATION: u16 = 5380;
+    pub const TYPE_COOPERATIVE_MATRIX: u16 = 4456;
+    pub const COOPERATIVE_MATRIX_LOAD: u16 = 4457;
+    pub const COOPERATIVE_MATRIX_STORE: u16 = 4458;
+    pub const COOPERATIVE_MATRIX_MUL_ADD: u16 = 4459;
     pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
     pub const IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
     pub const GROUP_NON_UNIFORM_ALL: u16 = 334;
@@ -199,6 +203,7 @@ pub mod capability {
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: u32 = 5307;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
+    pub const COOPERATIVE_MATRIX: u32 = 6022;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
     pub const ADDRESSING_PHYSICAL_STORAGE_BUFFER64: u32 = 5348;
@@ -313,6 +318,15 @@ pub enum Type {
         image: u32,
     },
     Sampler,
+    /// OpTypeCooperativeMatrixKHR: component type, then the scope, rows,
+    /// columns and use as constant ids.
+    CooperativeMatrix {
+        component: u32,
+        scope: u32,
+        rows: u32,
+        columns: u32,
+        usage: u32,
+    },
 }
 
 /// A module being built. Sections are kept apart and joined in the order
@@ -492,6 +506,16 @@ impl Module {
             ),
             Type::SampledImage { image } => (op::TYPE_SAMPLED_IMAGE, vec![id, *image]),
             Type::Sampler => (op::TYPE_SAMPLER, vec![id]),
+            Type::CooperativeMatrix {
+                component,
+                scope,
+                rows,
+                columns,
+                usage,
+            } => (
+                op::TYPE_COOPERATIVE_MATRIX,
+                vec![id, *component, *scope, *rows, *columns, *usage],
+            ),
         };
         instruction(&mut self.globals, opcode, &operands);
         self.types.insert(ty, id);

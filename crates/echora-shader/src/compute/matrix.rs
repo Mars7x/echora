@@ -16,7 +16,13 @@
 use echora_shader_abi::Unsupported;
 
 use super::{Emitter, SCOPE_SUBGROUP};
-use crate::spirv::{Type, capability, op};
+use crate::spirv::{Type, capability, op, storage};
+
+/// Elements of a 16x16 matrix.
+const MATRIX_ELEMENTS: u32 = 256;
+
+/// SPIR-V's LocalInvocationIndex built-in.
+const BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29;
 
 /// OpFConvert.
 const F_CONVERT: u16 = 115;
@@ -57,6 +63,233 @@ impl Emitter {
         }
     }
 
+    /// The workgroup scratch for cooperative matrices of `component`
+    /// (`f16` for A, B and a half accumulator, `f32` for a single one):
+    /// per warp, three 16x16 matrices (A, B, C) row-major. Declared once
+    /// per component type.
+    fn matrix_scratch(&mut self, component: u32) -> u32 {
+        if let Some(&variable) = self.matrix_scratch.get(&component) {
+            return variable;
+        }
+        let threads: u32 = self.layout.workgroup.iter().product();
+        let warps = threads.div_ceil(32).max(1);
+        let length = self.constant(warps * MATRIX_ELEMENTS * 3);
+        let array = self.module.ty(Type::Array {
+            element: component,
+            length,
+        });
+        let pointer = self.module.pointer(storage::WORKGROUP, array);
+        let variable = self.module.global_variable(pointer, storage::WORKGROUP);
+        self.interface.push(variable);
+        self.matrix_scratch.insert(component, variable);
+        variable
+    }
+
+    /// A pointer to element `(row, column)` of matrix `which` (0 A, 1 B, 2
+    /// C) of this warp's scratch region at `base`.
+    #[allow(clippy::too_many_arguments)]
+    fn scratch_element(
+        &mut self,
+        scratch: u32,
+        component: u32,
+        base: u32,
+        which: u32,
+        row: u32,
+        column: u32,
+    ) -> u32 {
+        let sixteen = self.constant(16);
+        let offset = self.constant(which * MATRIX_ELEMENTS);
+        let at = self.value(op::I_MUL, self.u32, &[row, sixteen]);
+        let at = self.value(op::I_ADD, self.u32, &[at, column]);
+        let at = self.value(op::I_ADD, self.u32, &[at, offset]);
+        let at = self.value(op::I_ADD, self.u32, &[at, base]);
+        let pointer = self.module.pointer(storage::WORKGROUP, component);
+        self.value(op::ACCESS_CHAIN, pointer, &[scratch, at])
+    }
+
+    /// A subgroup barrier that orders workgroup memory.
+    fn subgroup_barrier(&mut self) {
+        let scope = self.constant(SCOPE_SUBGROUP);
+        let semantics = self.constant(0x8 | 0x100);
+        self.function
+            .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
+    }
+
+    /// HMMA.16816 on a 16x16x16 cooperative matrix multiply: the lanes
+    /// write their fragments (PTX layout) to the warp's scratch, B's upper
+    /// eight columns zero, the subgroup multiplies, and each lane reads its
+    /// part of D back.
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_multiply(
+        &mut self,
+        index: usize,
+        d: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        single: bool,
+    ) -> Result<(), Unsupported> {
+        self.module.capability(capability::COOPERATIVE_MATRIX);
+        self.module.extension("SPV_KHR_cooperative_matrix");
+        self.module.capability(capability::FLOAT16);
+        let f16 = self.module.ty(Type::Float { width: 16 });
+        let pair = self.module.ty(Type::Vector {
+            component: f16,
+            count: 2,
+        });
+        let accumulator_type = if single { self.f32 } else { f16 };
+        let halves = self.matrix_scratch(f16);
+        let wide = if single {
+            self.matrix_scratch(self.f32)
+        } else {
+            halves
+        };
+        // This warp's region.
+        let invocation = self.scalar_builtin(BUILTIN_LOCAL_INVOCATION_INDEX);
+        let five = self.constant(5);
+        let warp = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[invocation, five]);
+        let size = self.constant(MATRIX_ELEMENTS * 3);
+        let base = self.value(op::I_MUL, self.u32, &[warp, size]);
+        let lane = self.special_register(index, 0)?;
+        let (one, two, three, four) = (
+            self.constant(1),
+            self.constant(2),
+            self.constant(3),
+            self.constant(4),
+        );
+        let group = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
+        let thread = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+        let column_pair = self.value(op::I_MUL, self.u32, &[thread, two]);
+        let next = |base: u8, n: u8| {
+            if base == 255 {
+                255
+            } else {
+                base.saturating_add(n)
+            }
+        };
+        let half_of = |e: &mut Self, register: u8, h: u32| {
+            let bits = e.register_or_zero(register);
+            let both = e.value(op::BITCAST, pair, &[bits]);
+            e.value(op::COMPOSITE_EXTRACT, f16, &[both, h])
+        };
+        let plus = |e: &mut Self, value: u32, n: u32| {
+            let n = e.constant(n);
+            e.value(op::I_ADD, e.u32, &[value, n])
+        };
+        // A: register j, half h at (g + 8 (j & 1), 2t + h + 8 (j >> 1)).
+        for j in 0..4u32 {
+            let row = plus(self, group, 8 * (j & 1));
+            for h in 0..2 {
+                let column = plus(self, column_pair, h + 8 * (j >> 1));
+                let value = half_of(self, next(a, j as u8), h);
+                let pointer = self.scratch_element(halves, f16, base, 0, row, column);
+                self.function.emit(op::STORE, &[pointer, value]);
+            }
+        }
+        // B: register j, half h at (2t + h + 8j, g); columns 8-15 zero
+        // (lane l zeroes row l / 2, four columns from 8 + 4 (l & 1)).
+        for j in 0..2u32 {
+            for h in 0..2 {
+                let row = plus(self, column_pair, h + 8 * j);
+                let value = half_of(self, next(b, j as u8), h);
+                let pointer = self.scratch_element(halves, f16, base, 1, row, group);
+                self.function.emit(op::STORE, &[pointer, value]);
+            }
+        }
+        let zero = self.module.constant(f16, 0);
+        let zero_row = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, one]);
+        let odd = self.value(op::BITWISE_AND, self.u32, &[lane, one]);
+        let quarter = self.value(op::I_MUL, self.u32, &[odd, four]);
+        for n in 0..4 {
+            let column = plus(self, quarter, 8 + n);
+            let pointer = self.scratch_element(halves, f16, base, 1, zero_row, column);
+            self.function.emit(op::STORE, &[pointer, zero]);
+        }
+        // C: element i at (g + 8 (i >> 1), 2t + (i & 1)).
+        for i in 0..4u32 {
+            let row = plus(self, group, 8 * (i >> 1));
+            let column = plus(self, column_pair, i & 1);
+            let value = if single {
+                let bits = self.register_or_zero(next(c, i as u8));
+                self.value(op::BITCAST, self.f32, &[bits])
+            } else {
+                half_of(self, next(c, (i / 2) as u8), i % 2)
+            };
+            let pointer = self.scratch_element(wide, accumulator_type, base, 2, row, column);
+            self.function.emit(op::STORE, &[pointer, value]);
+        }
+        self.subgroup_barrier();
+        // The multiply: row-major, stride 16.
+        let (scope, sixteen) = (self.constant(SCOPE_SUBGROUP), self.constant(16));
+        let row_major = self.constant(0);
+        let matrix = |e: &mut Self, component: u32, usage: u32| {
+            let usage = e.constant(usage);
+            e.module.ty(Type::CooperativeMatrix {
+                component,
+                scope,
+                rows: sixteen,
+                columns: sixteen,
+                usage,
+            })
+        };
+        let (a_type, b_type) = (matrix(self, f16, 0), matrix(self, f16, 1));
+        let c_type = matrix(self, accumulator_type, 2);
+        let zero_index = self.constant(0);
+        let a_pointer = self.scratch_element(halves, f16, base, 0, zero_index, zero_index);
+        let b_pointer = self.scratch_element(halves, f16, base, 1, zero_index, zero_index);
+        let c_pointer =
+            self.scratch_element(wide, accumulator_type, base, 2, zero_index, zero_index);
+        let load = |e: &mut Self, ty: u32, pointer: u32| {
+            e.value(
+                op::COOPERATIVE_MATRIX_LOAD,
+                ty,
+                &[pointer, row_major, sixteen],
+            )
+        };
+        let a_matrix = load(self, a_type, a_pointer);
+        let b_matrix = load(self, b_type, b_pointer);
+        let c_matrix = load(self, c_type, c_pointer);
+        let product = self.value(
+            op::COOPERATIVE_MATRIX_MUL_ADD,
+            c_type,
+            &[a_matrix, b_matrix, c_matrix],
+        );
+        self.function.emit(
+            op::COOPERATIVE_MATRIX_STORE,
+            &[c_pointer, product, row_major, sixteen],
+        );
+        self.subgroup_barrier();
+        self.matrices_used = true;
+        // D back, where C was.
+        if d == 255 {
+            return Ok(());
+        }
+        let values: Vec<u32> = (0..4u32)
+            .map(|i| {
+                let row = plus(self, group, 8 * (i >> 1));
+                let column = plus(self, column_pair, i & 1);
+                let pointer = self.scratch_element(wide, accumulator_type, base, 2, row, column);
+                self.value(op::LOAD, accumulator_type, &[pointer])
+            })
+            .collect();
+        if single {
+            for (n, value) in values.into_iter().enumerate() {
+                self.write_float(d.saturating_add(n as u8), value);
+            }
+        } else {
+            for n in 0..2 {
+                let vector = self.value(
+                    op::COMPOSITE_CONSTRUCT,
+                    pair,
+                    &[values[2 * n], values[2 * n + 1]],
+                );
+                let bits = self.value(op::BITCAST, self.u32, &[vector]);
+                self.write_register(d.saturating_add(n as u8), bits);
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn matrix_multiply(
         &mut self,
@@ -68,6 +301,9 @@ impl Emitter {
         k16: bool,
         single: bool,
     ) -> Result<(), Unsupported> {
+        if k16 && self.layout.matrices == super::MatrixPath::Cooperative {
+            return self.cooperative_multiply(index, d, a, b, c, single);
+        }
         self.module
             .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
         let next = |base: u8, n: u8| {

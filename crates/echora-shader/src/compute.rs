@@ -265,6 +265,19 @@ pub struct Layout {
     pub shared_bytes: Option<u32>,
     /// Bytes of local memory per invocation, when known.
     pub local_bytes: Option<u32>,
+    /// How HMMA is translated.
+    pub matrices: MatrixPath,
+}
+
+/// HMMA's translation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatrixPath {
+    /// Subgroup shuffles and 32-bit sums (any device).
+    #[default]
+    Subgroup,
+    /// Cooperative matrices (VK_KHR_cooperative_matrix, 16x16x16 at
+    /// subgroup scope) for HMMA.16816, the subgroup path otherwise.
+    Cooperative,
 }
 
 impl Layout {
@@ -276,6 +289,7 @@ impl Layout {
             workgroup,
             shared_bytes: None,
             local_bytes: None,
+            matrices: MatrixPath::Subgroup,
         }
     }
 }
@@ -341,6 +355,10 @@ struct Emitter {
     /// Combined image samplers by handle bank, offset, texture type and
     /// depth comparison.
     textures: BTreeMap<(u8, u16, u32, bool), u32>,
+    /// Cooperative-matrix scratch by component type, and whether any
+    /// cooperative matrix is used.
+    matrix_scratch: BTreeMap<u32, u32>,
+    matrices_used: bool,
     /// Texture pool arrays by binding, and the bindings used (bit n).
     pool_arrays: BTreeMap<u32, u32>,
     pool_bindings: u32,
@@ -413,6 +431,8 @@ impl Emitter {
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
             images: BTreeMap::new(),
+            matrix_scratch: BTreeMap::new(),
+            matrices_used: false,
             pool_arrays: BTreeMap::new(),
             pool_bindings: 0,
             descriptor_aliases: Vec::new(),
@@ -3061,6 +3081,7 @@ mod tests {
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x1000),
             local_bytes: Some(0x40),
+            matrices: MatrixPath::Subgroup,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3197,6 +3218,7 @@ mod tests {
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x100),
             local_bytes: None,
+            matrices: MatrixPath::Subgroup,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4010,6 +4032,7 @@ mod tests {
             workgroup: [32, 1, 1],
             shared_bytes: Some(0x2000),
             local_bytes: None,
+            matrices: MatrixPath::Subgroup,
         };
         valid_with(&words, &layout);
     }
@@ -4046,6 +4069,37 @@ mod tests {
             ]),
             EXIT,
         ]);
+    }
+
+    #[test]
+    fn warp_matrix_multiplies_use_cooperative_matrices_when_chosen() {
+        let words = [
+            // HMMA.16816.F16 R8, R0, R4, R8 then HMMA.16816.F32 R12, R0, R4, R12
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, 8),
+                (24, 8, 0),
+                (32, 8, 4),
+                (64, 8, 8),
+                (75, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, 12),
+                (24, 8, 0),
+                (32, 8, 4),
+                (64, 8, 12),
+                (75, 1, 1),
+                (76, 1, 1),
+            ]),
+            EXIT,
+        ];
+        let layout = Layout {
+            workgroup: [32, 2, 1],
+            matrices: MatrixPath::Cooperative,
+            ..Layout::workgroup([32, 2, 1])
+        };
+        valid_with(&words, &layout);
     }
 
     #[test]

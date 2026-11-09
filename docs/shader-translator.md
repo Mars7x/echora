@@ -147,8 +147,12 @@ order with 32-bit round-to-nearest; a half result is rounded once at the
 end. Published measurements of NVIDIA's tensor cores (Fasi, Higham,
 Mikaitis and Pranesh, 2021) show an internal summation that aligns and
 truncates, so the last bits of a long sum can differ from the hardware.
-Cooperative matrices (VK_KHR_cooperative_matrix) are the planned fast
-path.
+With cooperative matrices (`MatrixPath::Cooperative`,
+VK_KHR_cooperative_matrix at 16x16x16 and subgroup scope), HMMA.16816
+instead writes the lanes' fragments to per-warp workgroup scratch in the
+PTX layout (B's upper eight columns zero), multiplies with
+OpCooperativeMatrixMulAddKHR (a half or 32-bit accumulator) and reads D
+back; the device's matrix units then decide the summation's rounding.
 
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
