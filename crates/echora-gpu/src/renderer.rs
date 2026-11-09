@@ -181,6 +181,9 @@ pub struct Renderer {
     /// Host memory imported as storage buffers (VK_EXT_external_memory_host),
     /// by page-aligned host address and length.
     imported: HashMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
+    /// The GPU page table (`set_page_table`): its buffer and the entries
+    /// written there.
+    page_table: Option<(HostBuffer, Vec<u64>)>,
     /// Spans the driver refused to import (file-backed memory, on drivers
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
@@ -445,6 +448,7 @@ impl Renderer {
             samplers: HashMap::new(),
             extra_views: HashMap::new(),
             imported: HashMap::new(),
+            page_table: None,
             import_refused: Default::default(),
             shared: Vec::new(),
             shared_bytes: 0,
@@ -570,25 +574,97 @@ impl Renderer {
             }
         }
         let device = self.gpu.device.clone();
+        let addressable = self.gpu.buffer_device_address;
         let info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(
+            .usage(addressed_usage(
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
-            )
+                addressable,
+            ))
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: valid create info; destroyed with the renderer.
         let buffer =
             unsafe { device.create_buffer(&info, None) }.map_err(vk_error("vkCreateBuffer"))?;
         // SAFETY: the buffer is live.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let memory = self.allocate_with(
+            requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            addressable,
+        )?;
         // SAFETY: fresh buffer and memory of the required size.
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(vk_error("vkBindBufferMemory"))?;
         self.resident.insert(key, (buffer, memory, size));
         Ok((buffer, true))
+    }
+
+    /// The device address of `buffer` (made by this renderer with device
+    /// addresses: resident buffers, shared file spans), or None where the
+    /// device has none.
+    pub fn buffer_address(&self, buffer: vk::Buffer) -> Option<u64> {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+        // SAFETY: a live buffer created with SHADER_DEVICE_ADDRESS usage
+        // (addressed_usage) when the device supports addresses.
+        self.gpu
+            .buffer_device_address
+            .then(|| unsafe { self.gpu.device.get_buffer_device_address(&info) })
+    }
+
+    /// The device address of resident buffer `key`.
+    pub fn resident_address(&self, key: u64) -> Option<u64> {
+        let &(buffer, _, _) = self.resident.get(&key)?;
+        self.buffer_address(buffer)
+    }
+
+    /// The GPU page table: `entries[i]` is the device address of guest page
+    /// `first_page + i` (0: unmapped; see `echora_shader_abi::PageTable`).
+    /// Rewritten only when the entries change, after the work that may
+    /// still read it; the value is what programs get in their push
+    /// constants.
+    pub fn set_page_table(
+        &mut self,
+        first_page: u32,
+        entries: &[u64],
+    ) -> Result<echora_shader_abi::PageTable, String> {
+        if !self.gpu.buffer_device_address {
+            return Ok(echora_shader_abi::PageTable::default());
+        }
+        let bytes = (entries.len().max(1) * 8) as u64;
+        let current = self
+            .page_table
+            .as_ref()
+            .is_some_and(|(_, written)| written.as_slice() == entries);
+        if !current {
+            self.flush()?;
+            let fits = self
+                .page_table
+                .as_ref()
+                .is_some_and(|(buffer, _)| buffer.size >= bytes);
+            if !fits {
+                if let Some((old, _)) = self.page_table.take() {
+                    old.destroy(&self.gpu.device);
+                }
+                let buffer =
+                    self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+                self.page_table = Some((buffer, Vec::new()));
+            }
+            let (buffer, written) = self.page_table.as_mut().unwrap();
+            let raw: Vec<u8> = entries
+                .iter()
+                .flat_map(|entry| entry.to_le_bytes())
+                .collect();
+            buffer.write(0, &raw);
+            *written = entries.to_vec();
+        }
+        let (buffer, _) = self.page_table.as_ref().unwrap();
+        Ok(echora_shader_abi::PageTable {
+            address: self.buffer_address(buffer.buffer).unwrap_or(0),
+            first_page,
+            page_count: entries.len() as u32,
+        })
     }
 
     /// Record a copy of `bytes` into resident buffer `key` at `at` (before
@@ -1732,14 +1808,16 @@ impl Renderer {
             close();
             return Ok(None);
         }
+        let addressable = self.gpu.buffer_device_address;
         let mut external_info = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
         let info = vk::BufferCreateInfo::default()
             .size(span)
-            .usage(
+            .usage(addressed_usage(
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
-            )
+                addressable,
+            ))
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut external_info);
         // SAFETY: valid create info; destroyed with the span.
@@ -1765,10 +1843,15 @@ impl Renderer {
         let mut import = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(handle)
             .fd(dma_buf);
-        let allocate = vk::MemoryAllocateInfo::default()
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocate = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(bits.trailing_zeros())
             .push_next(&mut import);
+        if addressable {
+            allocate = allocate.push_next(&mut address_flags);
+        }
         // SAFETY: a successful import takes ownership of `dma_buf`.
         let memory = match unsafe { device.allocate_memory(&allocate, None) } {
             Ok(memory) => memory,
@@ -1891,6 +1974,18 @@ impl Renderer {
         requirements: vk::MemoryRequirements,
         flags: vk::MemoryPropertyFlags,
     ) -> Result<vk::DeviceMemory, String> {
+        self.allocate_with(requirements, flags, false)
+    }
+
+    /// `allocate`, and with `addressable` memory buffers bound to it can
+    /// have device addresses (`buffer_address`).
+    #[track_caller]
+    pub(crate) fn allocate_with(
+        &self,
+        requirements: vk::MemoryRequirements,
+        flags: vk::MemoryPropertyFlags,
+        addressable: bool,
+    ) -> Result<vk::DeviceMemory, String> {
         // Allocations this large are unusual for guest-sized resources:
         // named with their caller, so a runaway size can be traced.
         if requirements.size >= LARGE_ALLOCATION {
@@ -1908,9 +2003,14 @@ impl Renderer {
                         .contains(flags)
             })
             .ok_or_else(|| format!("no memory type with {flags:?}"))?;
-        let info = vk::MemoryAllocateInfo::default()
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(index);
+        if addressable {
+            info = info.push_next(&mut address_flags);
+        }
         // SAFETY: valid allocate info; freed by the owner.
         unsafe { self.device().allocate_memory(&info, None) }.map_err(vk_error("vkAllocateMemory"))
     }
@@ -3618,6 +3718,18 @@ impl Renderer {
         size: u64,
         usage: vk::BufferUsageFlags,
     ) -> Result<HostBuffer, String> {
+        self.host_buffer_with(size, usage, false)
+    }
+
+    /// `host_buffer`, with a device address when `addressable`.
+    #[track_caller]
+    pub(crate) fn host_buffer_with(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        addressable: bool,
+    ) -> Result<HostBuffer, String> {
+        let usage = addressed_usage(usage, addressable);
         let info = vk::BufferCreateInfo::default()
             .size(size.max(4))
             .usage(usage)
@@ -3634,11 +3746,12 @@ impl Renderer {
         let coherent =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let memory = self
-            .allocate(
+            .allocate_with(
                 requirements,
                 coherent | vk::MemoryPropertyFlags::HOST_CACHED,
+                addressable,
             )
-            .or_else(|_| self.allocate(requirements, coherent))?;
+            .or_else(|_| self.allocate_with(requirements, coherent, addressable))?;
         // SAFETY: fresh buffer and memory; mapped for the buffer's lifetime.
         let mapped = unsafe {
             device
@@ -3740,6 +3853,9 @@ impl Drop for Renderer {
                 self.gpu.device.free_memory(memory, None);
             }
         }
+        if let Some((buffer, _)) = self.page_table.take() {
+            buffer.destroy(&self.gpu.device);
+        }
         for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
@@ -3811,6 +3927,30 @@ mod tests {
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.
         Gpu::new().ok().map(|gpu| Renderer::new(gpu).unwrap())
+    }
+
+    #[test]
+    fn the_page_table_and_resident_buffers_have_device_addresses() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.gpu.buffer_device_address {
+            return;
+        }
+        let (_, created) = renderer.resident_buffer(7, 4096).unwrap();
+        assert!(created);
+        let resident = renderer.resident_address(7).unwrap();
+        assert_ne!(resident, 0);
+        let table = renderer
+            .set_page_table(0x100, &[resident, 0, resident + 4096])
+            .unwrap();
+        assert_ne!(table.address, 0);
+        assert_eq!((table.first_page, table.page_count), (0x100, 3));
+        // The same entries: the same table, not rewritten.
+        let again = renderer
+            .set_page_table(0x100, &[resident, 0, resident + 4096])
+            .unwrap();
+        assert_eq!(again, table);
     }
 
     #[test]
@@ -4107,4 +4247,13 @@ pub(crate) fn declared_image_format(flags: u32) -> Option<vk::Format> {
         7 => F::R32G32B32A32_UINT,
         _ => return None,
     })
+}
+
+/// `usage`, plus device addresses when the device supports them.
+fn addressed_usage(usage: vk::BufferUsageFlags, addressable: bool) -> vk::BufferUsageFlags {
+    if addressable {
+        usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+    } else {
+        usage
+    }
 }

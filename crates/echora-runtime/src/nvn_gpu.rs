@@ -3498,6 +3498,45 @@ impl Nvn {
     /// can share them in place (needs the page table: `core` under the
     /// machine lock).
     pub(super) fn share_new_pools(&mut self, core: &Guest) {
+        // ECHORA_POOL_LOG (debugging): every 300th present, the memory
+        // pools a GPU page table would cover: count, bytes by CPU access
+        // (uncached, cached, none) and the GPU address range.
+        if super::debug_var_os("ECHORA_POOL_LOG").is_some()
+            && self.presented_frames.is_multiple_of(300)
+        {
+            let (mut count, mut bytes, mut low, mut high) = (0u64, [0u64; 3], u64::MAX, 0u64);
+            for pool in self
+                .objects
+                .values()
+                .filter(|object| object.kind == "MemoryPool")
+            {
+                let Some(storage) = pool.builder.get("Storage") else {
+                    continue;
+                };
+                let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
+                let class = if flags & 2 != 0 {
+                    0
+                } else if flags & 4 != 0 {
+                    1
+                } else {
+                    2
+                };
+                count += 1;
+                bytes[class] += storage.x[1];
+                if let Some(gpu) = pool.state.get("GpuAddress").map(|address| address.x[0]) {
+                    low = low.min(gpu);
+                    high = high.max(gpu + storage.x[1]);
+                }
+            }
+            eprintln!(
+                "pools present {}: {count} pools, uncached {} MiB, cached {} MiB, gpu-only {} MiB, gpu {low:#x}..{high:#x} ({} MiB span)",
+                self.presented_frames,
+                bytes[0] >> 20,
+                bytes[1] >> 20,
+                bytes[2] >> 20,
+                high.saturating_sub(low) >> 20
+            );
+        }
         let Some(backend) = self.gpu.as_ref() else {
             return;
         };

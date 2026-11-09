@@ -28,6 +28,9 @@ pub struct Gpu {
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
     pub compute_subgroup_32: bool,
+    /// Buffers can be given device addresses (bufferDeviceAddress, core in
+    /// 1.2): the GPU page table points into them.
+    pub buffer_device_address: bool,
     /// VK_EXT_external_memory_host: guest memory can be imported as device
     /// memory, so buffers in it are shared with the GPU without copies.
     pub host_import: Option<ash::ext::external_memory_host::Device>,
@@ -150,6 +153,7 @@ impl Gpu {
             object_properties.shader_binary_uuid,
             object_properties.shader_binary_version,
         );
+        let buffer_device_address = supported12.buffer_device_address != 0;
         let compute_subgroup_32 = supported13.subgroup_size_control != 0
             && (size_control.min_subgroup_size..=size_control.max_subgroup_size).contains(&32)
             && size_control
@@ -326,6 +330,7 @@ impl Gpu {
             depth_clip_control,
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
+            buffer_device_address,
             host_import,
             dma_buf_import,
             mesh_shader,
