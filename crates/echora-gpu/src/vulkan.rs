@@ -129,6 +129,8 @@ impl Gpu {
         let mut supported_clip = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut supported_robust = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
         let mut supported_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut supported_clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+        let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported11)
             .push_next(&mut supported12)
@@ -136,7 +138,9 @@ impl Gpu {
             .push_next(&mut supported_objects)
             .push_next(&mut supported_clip)
             .push_next(&mut supported_robust)
-            .push_next(&mut supported_mesh);
+            .push_next(&mut supported_mesh)
+            .push_next(&mut supported_clock)
+            .push_next(&mut supported_atomic_float);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_features2(physical, &mut supported) };
         let core = supported.features;
@@ -218,6 +222,18 @@ impl Gpu {
             && has(ash::ext::mesh_shader::NAME);
         if mesh_shader {
             enabled_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
+        }
+        // The guest's clock special registers (SPV_KHR_shader_clock) and
+        // float atomic adds on storage (SPV_EXT_shader_atomic_float_add).
+        let subgroup_clock =
+            supported_clock.shader_subgroup_clock != 0 && has(ash::khr::shader_clock::NAME);
+        if subgroup_clock {
+            enabled_extensions.push(ash::khr::shader_clock::NAME.as_ptr());
+        }
+        let float_atomic_add = supported_atomic_float.shader_buffer_float32_atomic_add != 0
+            && has(ash::ext::shader_atomic_float::NAME);
+        if float_atomic_add {
+            enabled_extensions.push(ash::ext::shader_atomic_float::NAME.as_ptr());
         }
 
         let features = vk::PhysicalDeviceFeatures::default()
@@ -304,6 +320,16 @@ impl Gpu {
             .mesh_shader(true);
         if mesh_shader {
             device_info = device_info.push_next(&mut enable_mesh);
+        }
+        let mut enable_clock =
+            vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_subgroup_clock(true);
+        if subgroup_clock {
+            device_info = device_info.push_next(&mut enable_clock);
+        }
+        let mut enable_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
+            .shader_buffer_float32_atomic_add(true);
+        if float_atomic_add {
+            device_info = device_info.push_next(&mut enable_atomic_float);
         }
         // SAFETY: every enabled feature was reported as supported.
         let device = unsafe { instance.create_device(physical, &device_info, None) }
