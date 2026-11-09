@@ -76,7 +76,6 @@ pub struct MeshParameters {
     pub primitive_header: Option<[u8; 0x50]>,
 }
 
-
 #[repr(C)]
 struct Callbacks {
     user: *mut c_void,
