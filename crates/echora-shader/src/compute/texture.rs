@@ -241,6 +241,7 @@ impl Emitter {
         let count = view.coordinates
             + u32::from(level_value)
             + u32::from(texture.offsets)
+            + 2 * u32::from(texture.per_tap)
             + u32::from(texture.depth_compare);
         let values = self.texture_values(texture, count);
         let (variable, types) = self.texture_variable(texture, view, texture.depth_compare);
@@ -252,6 +253,10 @@ impl Emitter {
         let packed_offsets = texture.offsets.then(|| {
             next += 1;
             values[next - 1]
+        });
+        let per_tap = texture.per_tap.then(|| {
+            next += 2;
+            [values[next - 2], values[next - 1]]
         });
         let reference = texture
             .depth_compare
@@ -379,6 +384,37 @@ impl Emitter {
             }
             list
         };
+        if let (Some(packed), TextureOp::Gather { component }) = (per_tap, texture.op) {
+            // One gather per tap at that tap's offset (signed six bits per
+            // byte: x0, y0, x1, y1 then x2, y2, x3, y3), keeping its tap.
+            self.module.capability(capability::IMAGE_GATHER_EXTENDED);
+            let six = self.constant(6);
+            let component = self.constant(u32::from(component));
+            let mut taps = Vec::new();
+            for tap in 0..4u32 {
+                let word = packed[tap as usize / 2];
+                let at = |e: &mut Self, byte: u32| {
+                    let shift = e.constant(byte * 8);
+                    e.value(op::BIT_FIELD_S_EXTRACT, e.u32, &[word, shift, six])
+                };
+                let x = at(self, tap % 2 * 2);
+                let y = at(self, tap % 2 * 2 + 1);
+                let offset = self.vector(self.u32, &[x, y]);
+                let operands = match reference {
+                    Some(reference) => vec![sampled, coordinate, reference, OPERAND_OFFSET, offset],
+                    None => vec![sampled, coordinate, component, OPERAND_OFFSET, offset],
+                };
+                let opcode = if reference.is_some() {
+                    op::IMAGE_DREF_GATHER
+                } else {
+                    op::IMAGE_GATHER
+                };
+                let gathered = self.value(opcode, vec4, &operands);
+                let tap_value = self.value(op::COMPOSITE_EXTRACT, self.f32, &[gathered, tap]);
+                taps.push(self.value(op::BITCAST, self.u32, &[tap_value]));
+            }
+            return Ok(taps);
+        }
         let result = match (texture.op, reference) {
             (TextureOp::Fetch, _) => {
                 let image = self.value(op::IMAGE, types.image, &[sampled]);

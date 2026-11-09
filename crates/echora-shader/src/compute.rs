@@ -1486,8 +1486,18 @@ impl Emitter {
                 d,
                 a,
                 b,
+                saturate,
+                single: true,
+                ..
+            } => self.half_single(index, op, d, a, b, saturate)?,
+            Op::Half {
+                op,
+                d,
+                a,
+                b,
                 c,
                 saturate,
+                ..
             } => self.half(index, op, d, a, b, c, saturate)?,
             Op::Hsetp2 {
                 p,
@@ -3619,6 +3629,20 @@ mod tests {
                     (87, 3, 1),
                 ],
             ),
+            // TLD4.PTP.G.F16 R30, R0, R2, 2D (bits 72-95 0x009eaf, as games
+            // use it: per-tap offsets in R2, R3, half results)
+            tex(
+                0xb63,
+                &[
+                    (16, 8, 30),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 31),
+                    (72, 24, 0x009eaf),
+                ],
+            ),
             // TXQ R24, R1 (level), 0xf, c[0][0x50]
             tex(
                 0xb6f,
@@ -3827,6 +3851,16 @@ mod tests {
                 (24, 8, 0),
                 (32, 8, 1),
                 (87, 3, 0),
+            ]),
+            // HADD2.F32 R9, -RZ, R1.H1_H1 (a half to a float)
+            word(&[
+                (0, 12, 0x230),
+                (16, 8, 9),
+                (24, 8, 255),
+                (32, 8, 1),
+                (60, 2, 3),
+                (72, 1, 1),
+                (78, 1, 1),
             ]),
             // HSETP2.GT.AND P1, P2, R0, R1.H1_H1, PT
             word(&[

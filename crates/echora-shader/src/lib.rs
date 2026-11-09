@@ -343,7 +343,8 @@ mod tests {
                 (72, 4, 0xf),
                 (81, 3, 7),
             ]),
-            // TMML R12, R4, R5, 2D, 0x3 (the level and the raw level)
+            // TMML R12, R4, R5, 2D, 0x3 (the level and the raw level; no
+            // fault predicate field)
             word(&[
                 (0, 12, 0xb69),
                 (16, 8, 12),
@@ -354,7 +355,6 @@ mod tests {
                 (61, 3, 1),
                 (64, 8, 255),
                 (72, 4, 3),
-                (81, 3, 7),
             ]),
             // @P0 KILL; MOV R5, R7 (the depth after the sample mask slot)
             word(&[(0, 12, 0x95b), (12, 4, 0), (87, 3, 7)]),

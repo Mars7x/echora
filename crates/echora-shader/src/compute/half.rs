@@ -3,7 +3,7 @@
 
 use echora_shader_abi::Unsupported;
 
-use super::Emitter;
+use super::{Emitter, unsupported};
 use crate::decode::{Combine, FloatCompare, HalfOp, HalfOperand, Operand, Pred, Reg};
 use crate::spirv::{Type, capability, glsl, op};
 
@@ -102,6 +102,37 @@ impl Emitter {
         }
         let bits = self.value(op::BITCAST, self.u32, &[value]);
         self.write_register(d.0, bits);
+        Ok(())
+    }
+
+    /// HADD2.F32: the operands' lane-0 halves added as 32-bit floats, one
+    /// float result.
+    pub(super) fn half_single(
+        &mut self,
+        index: usize,
+        operation: HalfOp,
+        d: Reg,
+        a: HalfOperand,
+        b: HalfOperand,
+        saturate: bool,
+    ) -> Result<(), Unsupported> {
+        if operation != HalfOp::Add {
+            return Err(unsupported(index, "half operation with a 32-bit result"));
+        }
+        let f16 = self.f16();
+        let a = self.half_operand(index, a)?;
+        let b = self.half_operand(index, b)?;
+        let lane = |e: &mut Self, pair: u32| {
+            let half = e.value(op::COMPOSITE_EXTRACT, f16, &[pair, 0]);
+            e.value(F_CONVERT, e.f32, &[half])
+        };
+        let (a, b) = (lane(self, a), lane(self, b));
+        let mut value = self.exact(op::F_ADD, &[a, b]);
+        if saturate {
+            let (zero, one) = (self.float_constant(0.0), self.float_constant(1.0));
+            value = self.glsl(self.f32, glsl::F_CLAMP, &[value, zero, one]);
+        }
+        self.write_float(d.0, value);
         Ok(())
     }
 

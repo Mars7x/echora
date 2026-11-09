@@ -152,6 +152,9 @@ pub struct Texture {
     /// Bits 87-89: 0 implicit, 1 level zero, 2 bias, 3 explicit level.
     pub lod: u8,
     pub offsets: bool,
+    /// TLD4.PTP (bits 76-77 = 2): a signed 6-bit (x, y) offset per tap, the
+    /// four packed in bytes of two registers after the coordinates.
+    pub per_tap: bool,
     pub depth_compare: bool,
     /// Bits 72-75: the components written.
     pub mask: u8,
@@ -298,6 +301,9 @@ pub enum Op {
         b: HalfOperand,
         c: Option<HalfOperand>,
         saturate: bool,
+        /// `.F32` (HADD2 bit 78): the lane-0 values added as one 32-bit
+        /// float result (`HADD2.F32 d, -RZ, b.H0_H0` converts a half).
+        single: bool,
     },
     /// HSETP2 p, q, a, b, acc: each lane's comparison of the half pairs, p
     /// lane 0's and q lane 1's, each combined with acc.
@@ -1231,8 +1237,11 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             // Bit 59 is the bindless form and 77 per-tap offsets (only the
             // packed form, 76, is decoded); 81-83 a fault predicate (not in
             // TXQ).
-            let fault = op != TextureOp::Query && word.bits(81, 3) != 7;
-            if word.bit(59) || word.bit(77) || fault {
+            let fault =
+                !matches!(op, TextureOp::Query | TextureOp::LevelQuery) && word.bits(81, 3) != 7;
+            // Bit 77 alone: TLD4's per-tap offsets.
+            let per_tap = matches!(op, TextureOp::Gather { .. }) && word.bits(76, 2) == 2;
+            if word.bit(59) || (word.bit(77) && !per_tap) || fault {
                 return None;
             }
             return Some(Op::Tex(Texture {
@@ -1255,6 +1264,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                     word.bits(87, 3) as u8
                 },
                 offsets: word.bit(76),
+                per_tap,
                 depth_compare: word.bit(78),
                 mask: word.bits(72, 4) as u8,
                 half: word.bit(79),
@@ -1457,13 +1467,14 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         },
         // HADD2: the second source in the third slot in forms 2 and 3.
         // Bit 78 (a 32-bit result) and 76/79 are not decoded.
-        0x030 if matches!(form, 1..=3) && word.bits(76, 4) & 0b1101 == 0 => Op::Half {
+        0x030 if matches!(form, 1..=3) && word.bits(76, 4) & 0b1001 == 0 => Op::Half {
             op: HalfOp::Add,
             d,
             a: word.half(0)?,
             b: word.half(if form == 1 { 1 } else { 2 })?,
             c: None,
             saturate: word.bit(77),
+            single: word.bit(78),
         },
         0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 => Op::Half {
             op: HalfOp::Mul,
@@ -1472,6 +1483,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.half(1)?,
             c: None,
             saturate: word.bit(77),
+            single: false,
         },
         // HFMA2 without .RELU (79), its mixed-sign form (86) or 85.
         0x031
@@ -1487,6 +1499,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 b: word.half(1)?,
                 c: Some(word.half(2)?),
                 saturate: word.bit(77),
+                single: false,
             }
         }
         0x040 if matches!(form, 1 | 4) && word.bits(76, 11) == 0 => Op::Half {
@@ -1498,6 +1511,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.half(1)?,
             c: None,
             saturate: false,
+            single: false,
         },
         // HSETP2 without .H_AND (71).
         0x034 if matches!(form, 1 | 2) && !word.bit(71) => Op::Hsetp2 {
