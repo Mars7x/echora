@@ -140,6 +140,16 @@ at one binding, and a boolean specialization constant
 (`SpecMeaning::IntegerFormat(binding)`, ids from 32) picks the view the
 access uses; the runtime precompiles both values.
 
+**Matrix multiply.** HMMA runs on the subgroup: each lane gathers its A
+row from its own quad and its B columns from the quads of lanes 8t and
+8t + 4. Half products are exact in 32-bit floats and are summed in k
+order with 32-bit round-to-nearest; a half result is rounded once at the
+end. Published measurements of NVIDIA's tensor cores (Fasi, Higham,
+Mikaitis and Pranesh, 2021) show an internal summation that aligns and
+truncates, so the last bits of a long sum can differ from the hardware.
+Cooperative matrices (VK_KHR_cooperative_matrix) are the planned fast
+path.
+
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
 exact: the nearest result's error is computed without rounding (two-sum
@@ -233,6 +243,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | IPA | 0x326, 0x526 (address plus the uniform register at 24: a select over the generic components the SPH uses) | address 64-71 (× 4), location 76-77 (default, centroid, offset), mode 78-79 (interpolated, constant), offset register 32 |
 | KILL | 0x95b | condition 87-90 |
 | LDSM | 0x83b | matrices 1 << 72-73, `.MT88` 78; address register 24, uniform register 32 with bit 91, offset 40-63; row addresses shuffled from the lanes that supply them, shared words read (halves for `.MT88`) |
+| HMMA | 0x23c | d 16, a 24, b 32, c 64; m16n8k16 with bit 75 (else m16n8k8; 78 the k4 form, not decoded), 32-bit accumulator with bit 76 (else halves), half sources (82-83 zero); PTX fragment layout per lane, rows and columns gathered by subgroup shuffles |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |

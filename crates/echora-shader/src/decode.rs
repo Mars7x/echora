@@ -595,6 +595,18 @@ pub enum Op {
         count: u8,
         transpose: bool,
     },
+    /// HMMA.16816 / HMMA.1688 d, a, b, c: the warp's 16x8 matrix
+    /// a (16xK halves) x b (Kx8 halves) + c, K 16 (`k16`, bit 75) or 8,
+    /// in 32-bit floats (`single`, bit 76: four registers of c and d per
+    /// lane) or halves (two). Each lane holds the PTX fragment layout.
+    Hmma {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+        c: Reg,
+        k16: bool,
+        single: bool,
+    },
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
     Bar {
         mode: u8,
@@ -1333,6 +1345,20 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 handle_offset: word.bits(40, 14) as u16 * 4,
                 dimension: word.bits(61, 3) as u8,
                 mask: word.bits(72, 4) as u8,
+            });
+        }
+        // HMMA with half sources (82-83 zero), not the m16n8k4 form (78).
+        0x23c => {
+            if word.bits(82, 2) != 0 || word.bit(78) {
+                return None;
+            }
+            return Some(Op::Hmma {
+                d,
+                a: word.reg(24),
+                b: word.reg(32),
+                c: word.reg(64),
+                k16: word.bit(75),
+                single: word.bit(76),
             });
         }
         0x83b => {

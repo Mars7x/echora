@@ -202,6 +202,7 @@ mod fetch;
 mod half;
 mod image;
 mod io;
+mod matrix;
 mod memory;
 mod structure;
 mod texture;
@@ -2111,6 +2112,14 @@ impl Emitter {
                 }
                 self.kill(condition)?;
             }
+            Op::Hmma {
+                d,
+                a,
+                b,
+                c,
+                k16,
+                single,
+            } => self.matrix_multiply(index, d.0, a.0, b.0, c.0, k16, single)?,
             Op::Ldsm {
                 d,
                 a,
@@ -4003,6 +4012,40 @@ mod tests {
             local_bytes: None,
         };
         valid_with(&words, &layout);
+    }
+
+    #[test]
+    fn warp_matrix_multiplies_validate() {
+        valid(&[
+            // HMMA.16816.F32 R8, R0, R4, R8; HMMA.16816.F16 R12, R0, R4, R14;
+            // HMMA.1688.F32 R16, R0, R4, RZ
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, 8),
+                (24, 8, 0),
+                (32, 8, 4),
+                (64, 8, 8),
+                (75, 1, 1),
+                (76, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, 12),
+                (24, 8, 0),
+                (32, 8, 4),
+                (64, 8, 14),
+                (75, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, 16),
+                (24, 8, 0),
+                (32, 8, 4),
+                (64, 8, 255),
+                (76, 1, 1),
+            ]),
+            EXIT,
+        ]);
     }
 
     #[test]
