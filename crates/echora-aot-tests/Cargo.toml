@@ -22,9 +22,6 @@ structured-kernels = []
 # Lift every program with flag setters fused with their B.cond where NZCV
 # is dead after the block (EmitOptions::fused_flags).
 fused-flags = []
-# Keep vector registers in window locals (EmitOptions::vector_locals);
-# with inline-vector, the inline paths then work on locals.
-vector-locals = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
