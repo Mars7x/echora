@@ -41,6 +41,10 @@ pub struct Gpu {
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
+    /// The texture pool's descriptor set layout (`echora_shader_abi`
+    /// `TEXTURE_POOL_SET`), when the device has the descriptor indexing it
+    /// needs: set 1 of every program that reads the pool.
+    pub texture_pool_layout: Option<vk::DescriptorSetLayout>,
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
     pub shader_binary_version: ([u8; 16], u32),
@@ -284,6 +288,12 @@ impl Gpu {
             .descriptor_binding_sampled_image_update_after_bind(
                 s12.descriptor_binding_sampled_image_update_after_bind != 0,
             )
+            .descriptor_binding_storage_image_update_after_bind(
+                s12.descriptor_binding_storage_image_update_after_bind != 0,
+            )
+            .descriptor_binding_uniform_texel_buffer_update_after_bind(
+                s12.descriptor_binding_uniform_texel_buffer_update_after_bind != 0,
+            )
             .scalar_block_layout(s12.scalar_block_layout != 0)
             .shader_output_viewport_index(s12.shader_output_viewport_index != 0)
             .shader_output_layer(s12.shader_output_layer != 0)
@@ -353,6 +363,14 @@ impl Gpu {
             dma_buf_import.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let mesh_shader =
             mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
+        let texture_pool_layout = (s12.runtime_descriptor_array != 0
+            && s12.descriptor_binding_partially_bound != 0
+            && s12.descriptor_binding_sampled_image_update_after_bind != 0
+            && s12.descriptor_binding_storage_image_update_after_bind != 0
+            && s12.descriptor_binding_uniform_texel_buffer_update_after_bind != 0
+            && s12.shader_sampled_image_array_non_uniform_indexing != 0)
+            .then(|| texture_pool_layout(&device))
+            .transpose()?;
         Ok(Self {
             entry,
             instance,
@@ -366,6 +384,7 @@ impl Gpu {
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
             buffer_device_address,
+            texture_pool_layout,
             host_import,
             dma_buf_import,
             mesh_shader,
@@ -446,7 +465,17 @@ impl Gpu {
             .ok_or("driver lacks VK_EXT_shader_object")?;
         let stage = stage_flags(translated.stage);
         let layout = self.descriptor_set_layout(&translated.descriptors, stage)?;
-        let layouts = [layout];
+        let mut layouts = vec![layout];
+        if translated.texture_pool_bindings != 0 {
+            match self.texture_pool_layout {
+                Some(pool) => layouts.push(pool),
+                None => {
+                    // SAFETY: the layout is not used.
+                    unsafe { self.device.destroy_descriptor_set_layout(layout, None) };
+                    return Err("the device cannot hold the texture pool".into());
+                }
+            }
+        }
         let next = if translated.stage == Stage::Vertex {
             vk::ShaderStageFlags::FRAGMENT
         } else {
@@ -492,11 +521,61 @@ impl Gpu {
     }
 }
 
+/// Descriptors per texture pool array: NVN texture indices have 20 bits,
+/// but pools this size cover every pool the game makes (the runtime notes
+/// a larger one).
+pub const TEXTURE_POOL_CAPACITY: u32 = 1 << 16;
+/// NVN sampler indices have 12 bits.
+pub const SAMPLER_POOL_CAPACITY: u32 = 1 << 12;
+
+/// The set layout of `echora_shader_abi::texture_pool`: arrays updated
+/// after bind and partially bound, for every stage.
+fn texture_pool_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, String> {
+    use echora_shader_abi::texture_pool as pool;
+    let kind = |binding| match binding {
+        pool::SAMPLERS => vk::DescriptorType::SAMPLER,
+        pool::SAMPLED_BUFFER => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+        pool::STORAGE_2D | pool::STORAGE_3D => vk::DescriptorType::STORAGE_IMAGE,
+        _ => vk::DescriptorType::SAMPLED_IMAGE,
+    };
+    let bindings: Vec<_> = (0..pool::COUNT)
+        .map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(kind(binding))
+                .descriptor_count(if binding == pool::SAMPLERS {
+                    SAMPLER_POOL_CAPACITY
+                } else {
+                    TEXTURE_POOL_CAPACITY
+                })
+                .stage_flags(vk::ShaderStageFlags::ALL)
+        })
+        .collect();
+    let flags = vec![
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+            | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING;
+        bindings.len()
+    ];
+    let mut binding_flags =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+    let info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+        .bindings(&bindings)
+        .push_next(&mut binding_flags);
+    // SAFETY: valid create info on a live device; destroyed with the Gpu.
+    unsafe { device.create_descriptor_set_layout(&info, None) }
+        .map_err(vk_error("vkCreateDescriptorSetLayout (texture pool)"))
+}
+
 impl Drop for Gpu {
     fn drop(&mut self) {
         // SAFETY: nothing created from the device outlives it.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(layout) = self.texture_pool_layout {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }

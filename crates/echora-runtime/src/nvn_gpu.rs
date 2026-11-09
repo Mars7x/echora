@@ -1065,8 +1065,23 @@ impl Nvn {
             // handles (`rust`), or beside the plugin for a report
             // (`compare`); what it does not handle is noted by reason.
             let translator = shader::Translator::from_env();
+            // A program reading the texture pool (set 1) needs the pool
+            // bound, which the renderer does not do yet: such programs stay
+            // with the plugin.
             let rust = (translator != shader::Translator::Plugin)
-                .then(|| shader::translate_rust(&code, &parameters));
+                .then(|| shader::translate_rust(&code, &parameters))
+                .map(|result| {
+                    result.and_then(|translated| {
+                        if translated.texture_pool_bindings == 0 {
+                            Ok(translated)
+                        } else {
+                            Err(echora_shader_abi::Unsupported {
+                                reason: "texture pool not bound by the renderer yet".into(),
+                                offset: None,
+                            })
+                        }
+                    })
+                });
             let result = match (translator, rust) {
                 (shader::Translator::Rust, Some(Ok(translated))) => {
                     notes.push("stat: rust translator programs".into());
