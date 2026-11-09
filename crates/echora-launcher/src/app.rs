@@ -1617,7 +1617,7 @@ impl Launcher {
                             ui::titles(
                                 "CPU cores",
                                 Some(
-                                    "Auto uses up to six. Several cores are still experimental."
+                                    "Auto uses up to six, as many as the console gives the game."
                                         .into(),
                                 ),
                             ),
