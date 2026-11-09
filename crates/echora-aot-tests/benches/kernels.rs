@@ -1,6 +1,6 @@
 //! Guest instructions per second of lifted code, without the game.
 //!
-//! Runs the kernels of `kernels.s` (lifted by `build.rs` through split
+//! Runs the kernels of `src/kernels.rs` (lifted by `build.rs` through split
 //! emission, the layout real builds use) natively and reports how many
 //! guest instructions each retires per second. See `docs/testing.md`.
 //!

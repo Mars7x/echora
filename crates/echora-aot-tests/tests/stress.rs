@@ -1,4 +1,4 @@
-//! Concurrency stress: the patterns a job system uses (`stress.s`), lifted
+//! Concurrency stress: the patterns a job system uses (`src/stress.rs`), lifted
 //! and run on two to four Cores that share one Memory, each on its own
 //! host thread. Each program checks an invariant: no item claimed twice
 //! or lost, no torn value inside a lock or a seqlock read, every message
@@ -17,7 +17,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use echora_aot_tests::stress::{STRESS_BASE, STRESS_ENTRIES, STRESS_WORDS};
+use echora_aot_tests::stress::{STRESS_BASE, STRESS_ENTRIES, stress_words};
 use echora_aot_tests::{Core, Machine, Trap, stress_code};
 
 const DATA: u64 = 0x400_0000;
@@ -66,7 +66,10 @@ fn run_after(
     preempt: bool,
     setup: impl FnOnce(&mut Machine),
 ) -> (Vec<(u64, u64)>, Machine) {
-    let image: Vec<u8> = STRESS_WORDS.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let image: Vec<u8> = stress_words()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
     let mut m = Machine::with_layout(STRESS_BASE, &image, image.len() as u64, DATA, DATA_SIZE);
     setup(&mut m);
     stress_code::install();

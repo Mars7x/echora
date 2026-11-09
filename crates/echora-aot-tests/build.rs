@@ -1739,10 +1739,8 @@ fn concurrency_code(out: &mut String) {
 
 /// The concurrency stress programs of `tests/stress.rs` (`src/stress.rs`).
 fn stress_code(out: &mut String) {
-    let bytes: Vec<u8> = stress::STRESS_WORDS
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect();
+    let words = stress::stress_words();
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     let region = CodeRegion {
         name: "stress".into(),
         base: stress::STRESS_BASE,
@@ -1752,7 +1750,7 @@ fn stress_code(out: &mut String) {
         .iter()
         .map(|(_, offset)| stress::STRESS_BASE + offset)
         .collect();
-    let translation = discover(&[region], &entries, stress::STRESS_WORDS.len()).expect("stress");
+    let translation = discover(&[region], &entries, words.len()).expect("stress");
     let report = translation.report();
     assert!(
         report.unsupported.is_empty(),
