@@ -3,9 +3,8 @@
 //! game. build.rs hashes the Rust that split emission writes for every
 //! program it lifts. If this fails after an intended change to default
 //! output, update the constants, and say so in the commit message.
-//! Options that are off by default (structured, direct calls) must leave
-//! these unchanged.
-#![cfg(not(feature = "direct-calls"))]
+//! Options that are off by default (structured) must leave these
+//! unchanged.
 
 use echora_aot_tests::golden;
 

@@ -701,7 +701,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     let simd = simd.to_string_lossy().into_owned();
 
     // ECHORA_LIFT_OPTIONS: code generation options, comma-separated
-    // (structured, inline-vector, direct-calls); all off by default.
+    // (structured, inline-vector); all off by default.
     let mut options = EmitOptions::default();
     for option in std::env::var("ECHORA_LIFT_OPTIONS")
         .unwrap_or_default()
@@ -712,7 +712,6 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         match option {
             "structured" => options.structured = true,
             "inline-vector" => options.inline_vector = true,
-            "direct-calls" => options.direct_calls = true,
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
     }

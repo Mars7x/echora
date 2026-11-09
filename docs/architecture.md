@@ -48,9 +48,9 @@ input and audio are host crates of their own.
   and task pipelines are drawn with `VK_EXT_mesh_shader`. The
   `translate-dump` and `shader-check` tools translate dumped shader stages
   offline.
-- **Generated code.** Three code-generation options can be turned on for a
-  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `direct-calls`,
-  `structured`). All are off by default until they are checked in game.
+- **Generated code.** Two code-generation options can be turned on for a
+  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `structured`). Both are
+  off by default until they are checked in game.
 
 ## Front ends
 
@@ -101,33 +101,21 @@ Split emission puts each 1 KiB guest window in a function `run_window_W`.
 Windows are grouped into regions of `1 << region_bits` guest bytes, one crate
 each (`gen_r_R`), so an unchanged region does not recompile. The build links
 the regions into a few shared libraries ("bundles"), and only the dispatcher
-crate sees every region. A guest BL runs its callee in nested host frames:
+crate sees every region. A guest BL runs its callee in nested host frames: `Core::call(return_to)`
+looks the callee's window up in the process-wide window table and calls it
+indirectly, repeating until the PC is back at `return_to`.
 
-- By default, `Core::call(return_to)` looks the callee's window up in the
-  process-wide window table and calls it indirectly, repeating until the PC
-  is back at `return_to`.
-- With the `direct-calls` option, a BL to a window in the caller's own region
-  calls `Core::call_window(return_to, run_window_W)` by name. A BL to another
-  region goes through that region's call slots: a static
-  `[OnceLock<WindowFn>; N]`, one per window it calls elsewhere, filled by the
-  generated `install()`. Until a slot is filled the call falls back to
-  `Core::call`. BLRs and calls to untranslated addresses always use
-  `Core::call`.
-
-In the game's translation, about 13% of BL sites call within their own region
-and the rest cross regions (126k against 853k sites, counted statically). On
-the benchmark's calls kernel, direct calls are currently about 15% slower than
-`Core::call`: each call site carries `call_window`'s full fallback inlined,
-which outweighs the table lookup it saves. A leaner `call_window`, with the
-fallback out of line, is the next step; until it measures faster in game,
-`direct-calls` stays off.
-
-Other ways to call across regions were considered: exported window symbols
-resolved by the loader (true direct calls, but bundles would depend on each
-other and Windows would need import libraries), grouping regions by the call
-graph (rebuilds become less local), and one crate per bundle (loses the
-per-region crates that keep small rebuilds cheap). The slot tables need no
-build changes and work the same on every host.
+Calling a window function by name instead was tried and retired. In the
+game's translation only about 13% of BL sites call within their own region
+(126k against 853k sites, counted statically); the rest would need a call
+slot per target filled at `install()`, which is still an indirect call. On
+the benchmark's calls kernel the direct form was about 15% slower than
+`Core::call`, and no change in emission could make the cross-region call
+anything but indirect. Truly direct calls across regions would need
+exported window symbols resolved by the loader (bundles would then depend
+on each other, and Windows would need import libraries), grouping regions
+by the call graph (rebuilds become less local), or one crate per bundle
+(losing the per-region crates that keep small rebuilds cheap).
 
 ## Guest memory backends
 

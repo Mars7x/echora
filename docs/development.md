@@ -88,7 +88,7 @@ read.
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `direct-calls`, `structured`. All are off by default. |
+| `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `structured`. Both are off by default. |
 | `ECHORA_SHADER_CACHE=dir` | Keep the driver's compiled shader binaries in this folder between runs, so later runs skip compiling them. `echora run` sets it to `shader-cache` in the translation folder. |
 | `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for `translate-dump` and `shader-check` in `echora-gpu`. |
 

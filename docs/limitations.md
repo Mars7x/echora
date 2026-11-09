@@ -31,8 +31,8 @@ to be missing or incomplete.
   On six cores the first 3D scene runs about 2.9 times as fast as on one, and
   three cores get most of that. More cores help little for now, because the
   thread that turns the game's GPU commands into Vulkan works alone.
-- The faster code-generation options (`inline-vector`, `direct-calls`,
-  `structured`) are off by default until they are checked in game.
+- The faster code-generation options (`inline-vector`, `structured`) are off
+  by default until they are checked in game.
 
 ## Platforms
 

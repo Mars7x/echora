@@ -1,8 +1,7 @@
-//! Calls between windows before `install()` has run: no window table and,
-//! with direct calls (`--features direct-calls`, with `small-regions` for
-//! calls into other regions), empty call slots. Every BL must then fall
-//! back to running its callee through the dispatcher, with the same
-//! result. Its own test binary, so nothing in the process installs.
+//! Calls between windows before `install()` has run: no window table.
+//! Every BL must then fall back to running its callee through the
+//! dispatcher, with the same result. Its own test binary, so nothing in
+//! the process installs.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 

@@ -33,22 +33,12 @@ fn options() -> EmitOptions {
     EmitOptions {
         inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
-        direct_calls: direct_calls(),
     }
 }
 
-/// Direct BL calls with the `direct-calls` feature.
-fn direct_calls() -> bool {
-    std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some()
-}
-
-/// Region size of split emission: one 1 KiB window per region, or with
-/// direct calls 64 KiB, so that most calls between windows stay in one
-/// region. With `small-regions` it stays 1 KiB, so that direct calls go
-/// through the call slots of other regions.
+/// Region size of split emission: one 1 KiB window per region.
 fn region_bits() -> u32 {
-    let small = std::env::var_os("CARGO_FEATURE_SMALL_REGIONS").is_some();
-    if direct_calls() && !small { 16 } else { 10 }
+    10
 }
 
 /// The benchmark kernels' options: structured also with
