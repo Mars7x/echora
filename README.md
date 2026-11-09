@@ -2,7 +2,6 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/Mars7x/echora/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Mars7x/echora/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square)](LICENSE)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square)](https://www.rust-lang.org)
 ![Written in pure Rust](https://img.shields.io/badge/written%20in-pure%20Rust-orange?style=flat-square)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-red?style=flat-square)
 
@@ -52,33 +51,30 @@ into more detail.
 
 ## What I'm working on
 
-**A shader translator of my own.** The game's GPU programs are written for the
-Switch 2's NVIDIA GPU and have to be translated into shaders your PC's GPU can
-run. Until now Echora used a C++ shader recompiler from the Switch emulator
-world. It got the title screen and the opening movie on screen, but after the
-movie it turned out to be the source of the hardest bugs so far: it guessed
-where shaders keep their data, and the wrong guesses fed the game's own
-programs bad data and hung the GPU. So I'm writing Echora's translator in
-Rust, for four reasons:
+The game's GPU programs are written for the Switch 2's NVIDIA GPU and have to
+be translated into shaders your PC's GPU can run. Until now Echora used a C++
+shader recompiler from the Switch emulator world. It got the title screen and
+the opening movie on screen, but after the movie it turned out to be the
+source of the hardest bugs so far: it guessed where shaders keep their data,
+and the wrong guesses fed the game's own programs bad data and hung the GPU.
+So I'm writing Echora's translator in Rust, for four reasons:
 
-- **The game's real memory.** Shaders reach the game's memory through a page
-  table, the way the console's GPU sees it, instead of guesses.
-- **Shaders ready before you play.** Every shader can be translated without
-  running the game, so they can all be prepared before it starts and nothing
-  stutters while you play.
-- **The PC's own hardware.** Things like the matrix units the game's
-  upscaler needs can be used directly instead of being emulated step by step.
-- **One language and one design** across the whole project.
+- Shaders reach the game's real memory through a page table, the way the
+  console's GPU sees it, instead of guesses.
+- Every shader can be translated without running the game, so they can all
+  be prepared before it starts and nothing stutters while you play.
+- The PC's own hardware, such as the matrix units the game's upscaler needs,
+  can be used directly instead of being emulated step by step.
+- The whole project shares one language and one design.
 
 It is a new design, with the details of each instruction checked against
 public references and every translation compared with the old recompiler on
 my own machine. The old recompiler is no longer part of Echora, but it can
 still be loaded as a separate plugin for testing.
 
-**Then the scene after the movie, gameplay and speed.** Once the title screen,
-the movie and the first 3D scene render through the new translator, the next
-steps are getting that scene right, reaching gameplay, and making each CPU
-thread do less work than it does now.
+Once the title screen, the movie and the first 3D scene render through the new
+translator, the next steps are getting that scene right, reaching gameplay,
+and making each CPU thread do less work than it does now.
 
 ## Approach
 
