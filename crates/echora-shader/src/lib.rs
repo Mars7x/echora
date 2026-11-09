@@ -22,13 +22,28 @@ pub const MAX_INSTRUCTIONS: usize = 65536;
 
 /// Translates one program (its bytes as NVN stores them at the stage's GPU
 /// address) to SPIR-V: a pure function, callable from many threads at once.
-/// Only compute programs are translated so far.
+/// Compute, vertex, fragment, task and mesh programs are translated.
 pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, Unsupported> {
-    if let Some(stage) = parameters.stage_slot {
-        return Err(whole(format!("{stage:?} stage slot")));
-    }
-    if let Some(header) = header::parse(program) {
-        if !matches!(header.stage, Stage::Vertex | Stage::Fragment) {
+    let mesh = match parameters.stage_slot {
+        None => None,
+        Some(stage @ (Stage::Task | Stage::Mesh)) => Some(mesh_layout(stage, parameters)?),
+        Some(stage) => return Err(whole(format!("{stage:?} stage slot"))),
+    };
+    if let Some(mut header) = header::parse(program) {
+        if let Some(mesh) = mesh {
+            // NVN binds a task program in the vertex slot and a mesh
+            // program in the vertex or tessellation evaluation slot.
+            if !matches!(header.stage, Stage::Vertex | Stage::TessEval) {
+                return Err(whole(format!(
+                    "a {:?} header in a mesh pipeline",
+                    header.stage
+                )));
+            }
+            if header.outputs_beyond {
+                return Err(whole("mesh outputs past the generic vectors".into()));
+            }
+            header.stage = if mesh.task { Stage::Task } else { Stage::Mesh };
+        } else if !matches!(header.stage, Stage::Vertex | Stage::Fragment) {
             return Err(whole(format!(
                 "{:?} programs are not translated yet",
                 header.stage
@@ -43,6 +58,10 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             // Graphics programs carry it in their header.
             local_bytes: parameters.local_memory_size.or(header.local_bytes),
             matrices: matrix_path(parameters.matrix_mode),
+            mesh: mesh.map(|mesh| compute::MeshLayout {
+                vertex_outputs: header.outputs,
+                ..mesh
+            }),
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {
@@ -51,6 +70,9 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
                 .map(|offset| offset + GRAPHICS_HEADER_SIZE as u32);
             error
         });
+    }
+    if mesh.is_some() {
+        return Err(whole("a task or mesh program without a header".into()));
     }
     let workgroup = parameters
         .workgroup_size
@@ -63,8 +85,78 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         shared_bytes: parameters.shared_memory_size,
         local_bytes: parameters.local_memory_size,
         matrices: matrix_path(parameters.matrix_mode),
+        mesh: None,
     };
     compute::translate(&code, &layout)
+}
+
+/// A task or mesh program's layout from the pipeline's mesh registers (the
+/// field widths Lichii decodes them with; see `MeshParameters`), without
+/// the program's own outputs.
+fn mesh_layout(stage: Stage, parameters: &Parameters) -> Result<compute::MeshLayout, Unsupported> {
+    let mesh = parameters
+        .mesh
+        .ok_or_else(|| whole(format!("{stage:?} program without mesh parameters")))?;
+    if mesh.task != (stage == Stage::Task) {
+        return Err(whole(format!(
+            "{stage:?} slot with mesh parameters for the other stage"
+        )));
+    }
+    let [a, b, init] = mesh.registers;
+    let vertices_per_primitive = match a & 0xf {
+        0 => 1,
+        1 => 2,
+        4 => 3,
+        topology => return Err(whole(format!("mesh topology {topology}"))),
+    };
+    let (max_vertices, max_primitives) = (a >> 4 & 0x1ff, a >> 13 & 0x3ff);
+    if !(1..=256).contains(&max_vertices) || !(1..=256).contains(&max_primitives) {
+        return Err(whole(format!(
+            "mesh outputs of {max_vertices} vertices and {max_primitives} primitives"
+        )));
+    }
+    let has_task = init & 0x3f != 0;
+    let threads = if mesh.task {
+        init & 0x3f
+    } else {
+        b >> 20 & 0x3f
+    };
+    if !(1..=32).contains(&threads) {
+        return Err(whole(format!("{stage:?} workgroup of {threads} threads")));
+    }
+    // 128-byte lines: the stage's local buffer (12-20) and those passed
+    // to the mesh stage (22-30); the payload holds the larger.
+    let (local, passed) = (init >> 12 & 0x1ff, init >> 22 & 0x1ff);
+    let payload_words = local.max(passed).max(1) * 32;
+    if payload_words > 4096 {
+        return Err(whole(format!("a task payload of {payload_words} words")));
+    }
+    let primitive_outputs = match mesh.primitive_header.filter(|_| !mesh.task) {
+        Some(bytes) => {
+            let (outputs, beyond) = header::output_map(&bytes);
+            if beyond {
+                return Err(whole(
+                    "per-primitive outputs past the generic vectors".into(),
+                ));
+            }
+            Some(outputs)
+        }
+        None => None,
+    };
+    Ok(compute::MeshLayout {
+        task: mesh.task,
+        has_task,
+        threads,
+        max_vertices,
+        max_primitives,
+        vertices_per_primitive,
+        payload_words,
+        // INIT describes the mesh program only when no task program is
+        // bound.
+        local_words: if has_task { 0 } else { local * 32 },
+        vertex_outputs: [0; 5],
+        primitive_outputs,
+    })
 }
 
 /// The translation of HMMA a mode asks for.
@@ -422,6 +514,147 @@ mod tests {
         ]));
         assert_eq!(header::parse(&program).unwrap().local_bytes, Some(0x40));
         validated(&program);
+    }
+
+    /// ISBEWR [a + offset], data / ISBERD d, [a + offset]: `.O` with
+    /// `output`, region 3 (attributes) or 0 (the map), size 2 (32-bit) or
+    /// 0 (U8).
+    fn isbe(
+        write: bool,
+        reg: u128,
+        a: u128,
+        offset: u128,
+        region: u128,
+        size: u128,
+        output: bool,
+    ) -> u128 {
+        let mut fields = vec![
+            (0, 12, if write { 0x927 } else { 0x923 }),
+            (24, 8, a),
+            (40, 16, offset),
+            (74, 2, size),
+            (76, 2, region),
+            (79, 1, u128::from(output)),
+        ];
+        fields.push(if write { (32, 8, reg) } else { (16, 8, reg) });
+        word(&fields)
+    }
+
+    /// Mesh registers: triangles, `vertices` and `primitives`, `threads`.
+    fn mesh_registers(vertices: u32, primitives: u32, threads: u32, init: u32) -> [u32; 3] {
+        [4 | vertices << 4 | primitives << 13, threads << 20, init]
+    }
+
+    fn mesh_parameters(
+        task: bool,
+        registers: [u32; 3],
+        primitive_header: Option<[u8; 0x50]>,
+    ) -> Parameters {
+        Parameters {
+            stage_slot: Some(if task { Stage::Task } else { Stage::Mesh }),
+            mesh: Some(echora_shader_abi::MeshParameters {
+                task,
+                registers,
+                primitive_header,
+            }),
+            ..Parameters::default()
+        }
+    }
+
+    fn validated_with(program: &[u8], parameters: &Parameters) -> Translated {
+        let translated = translate(program, parameters).unwrap();
+        if let Some(problem) = spirv::tests::validate(&translated.spirv) {
+            panic!("{problem}");
+        }
+        translated
+    }
+
+    /// Output map bits: position x-w (header bits 428-431), generic 0's x
+    /// and y (432, 433).
+    const POSITION_AND_GENERIC: [usize; 6] = [428, 429, 430, 431, 432, 433];
+
+    #[test]
+    fn a_mesh_program_writes_its_outputs_through_the_stage_buffer() {
+        // A mesh program in the tessellation evaluation slot, without a
+        // task program: an attribute word, a vertex index, the primitive
+        // count, then its workgroup index and the draw's group count.
+        let mut program = header(1, 3, &POSITION_AND_GENERIC);
+        program.extend(bytes(&[
+            isbe(true, 1, 0, 0x80, 3, 2, true),
+            isbe(true, 2, 0, 4, 0, 0, true),
+            isbe(true, 3, 255, 3, 0, 2, true),
+            isbe(false, 4, 255, 0, 3, 2, false),
+            isbe(false, 5, 255, 4, 3, 2, false),
+            EXIT,
+        ]));
+        // The primitive id per primitive (header bit 424).
+        let mut primitive = [0u8; 0x50];
+        primitive.copy_from_slice(&header(1, 4, &[424])[..0x50]);
+        let parameters =
+            mesh_parameters(false, mesh_registers(64, 126, 32, 8 << 12), Some(primitive));
+        let translated = validated_with(&program, &parameters);
+        assert_eq!(translated.stage, Stage::Mesh);
+        assert_eq!(translated.stored_generics, 1);
+        // Without the primitive header too, and as points.
+        let mut registers = mesh_registers(3, 1, 1, 0);
+        registers[0] &= !0xf;
+        validated_with(&program, &mesh_parameters(false, registers, None));
+    }
+
+    #[test]
+    fn a_task_program_passes_its_payload_to_the_mesh_program() {
+        // The task program: its workgroup index into the payload (byte
+        // 0x14), the mesh workgroup count at byte 4.
+        let mut task = header(1, 1, &[]);
+        task.extend(bytes(&[
+            isbe(false, 0, 255, 0, 3, 2, false),
+            isbe(true, 0, 255, 0x14, 3, 2, true),
+            word(&[(0, 12, 0x802), (72, 4, 0xf), (16, 8, 1), (32, 32, 2)]),
+            isbe(true, 1, 255, 4, 3, 2, true),
+            EXIT,
+        ]));
+        let registers = mesh_registers(64, 64, 32, 32 | 1 << 12);
+        let translated = validated_with(&task, &mesh_parameters(true, registers, None));
+        assert_eq!(translated.stage, Stage::Task);
+        // The mesh program after it reads the payload at a register
+        // address, and its own index at byte 0.
+        let mut mesh = header(1, 3, &POSITION_AND_GENERIC);
+        mesh.extend(bytes(&[
+            isbe(false, 2, 0, 0x14, 3, 2, false),
+            isbe(false, 3, 255, 0, 3, 2, false),
+            isbe(true, 2, 3, 0x80, 3, 2, true),
+            EXIT,
+        ]));
+        validated_with(&mesh, &mesh_parameters(false, registers, None));
+    }
+
+    #[test]
+    fn mesh_programs_refuse_what_they_cannot_express() {
+        let mut program = header(1, 3, &POSITION_AND_GENERIC);
+        program.extend(bytes(&[EXIT]));
+        let registers = mesh_registers(64, 126, 32, 0);
+        // A per-primitive generic vector: the fragment program would need
+        // to know.
+        let mut primitive = [0u8; 0x50];
+        primitive.copy_from_slice(&header(1, 4, &[432])[..0x50]);
+        let refused = translate(
+            &program,
+            &mesh_parameters(false, registers, Some(primitive)),
+        );
+        assert!(refused.unwrap_err().reason.contains("per-primitive output"));
+        // More than 32 threads.
+        let wide = mesh_registers(64, 126, 33, 0);
+        assert!(translate(&program, &mesh_parameters(false, wide, None)).is_err());
+        // A 16-bit stage buffer write.
+        let mut half = header(1, 3, &POSITION_AND_GENERIC);
+        half.extend(bytes(&[isbe(true, 1, 0, 0x80, 3, 1, true), EXIT]));
+        assert!(translate(&half, &mesh_parameters(false, registers, None)).is_err());
+        // A mesh slot without its parameters.
+        let bare = Parameters {
+            stage_slot: Some(Stage::Mesh),
+            ..Parameters::default()
+        };
+        assert!(translate(&program, &bare).is_err());
     }
 
     #[test]

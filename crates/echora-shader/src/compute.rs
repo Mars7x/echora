@@ -189,12 +189,14 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     }
     let blocks = blocks(code)?;
     let mut emitter = Emitter::new(layout);
+    emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     // Structured control flow where the graph allows, else the dispatch
     // loop.
     if !emitter.structured(code, &blocks)? {
         emitter.program(code, &blocks)?;
     }
+    emitter.mesh_end()?;
     Ok(emitter.finish())
 }
 
@@ -204,6 +206,7 @@ mod image;
 mod io;
 mod matrix;
 mod memory;
+mod mesh;
 mod structure;
 mod texture;
 
@@ -267,6 +270,33 @@ pub struct Layout {
     pub local_bytes: Option<u32>,
     /// How HMMA is translated.
     pub matrices: MatrixPath,
+    /// Task and mesh programs: their pipeline state.
+    pub mesh: Option<MeshLayout>,
+}
+
+/// A task or mesh program's pipeline state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshLayout {
+    /// The task program (else the mesh program).
+    pub task: bool,
+    /// A task program runs before the mesh program.
+    pub has_task: bool,
+    /// Threads per workgroup (at most 32).
+    pub threads: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// 1 points, 2 lines, 3 triangles.
+    pub vertices_per_primitive: u8,
+    /// Words of the task payload (the task's output attributes).
+    pub payload_words: u32,
+    /// Words of the mesh program's local stage buffer, as the pipeline
+    /// sizes it (beyond the lines the outputs need).
+    pub local_words: u32,
+    /// The mesh program's per-vertex outputs (its header's output map,
+    /// `header::output_map`).
+    pub vertex_outputs: [u32; 5],
+    /// The per-primitive outputs (the primitive header's output map).
+    pub primitive_outputs: Option<[u32; 5]>,
 }
 
 /// HMMA's translation.
@@ -293,6 +323,7 @@ impl Layout {
             shared_bytes: None,
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
+            mesh: None,
         }
     }
 }
@@ -369,6 +400,8 @@ struct Emitter {
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
     /// R32_UINT image descriptors for SURED (by handle and dimension).
     atomic_images: BTreeMap<(u8, u16, u8), u32>,
+    /// Task and mesh programs' variables.
+    mesh: Option<mesh::MeshState>,
     /// More variables at a descriptor's binding (by descriptor index).
     descriptor_aliases: Vec<(usize, u32)>,
     /// Each image descriptor's integer-format spec constant id.
@@ -437,6 +470,7 @@ impl Emitter {
             textures: BTreeMap::new(),
             images: BTreeMap::new(),
             atomic_images: BTreeMap::new(),
+            mesh: None,
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
             pool_arrays: BTreeMap::new(),
@@ -474,7 +508,7 @@ impl Emitter {
         let model = match self.stage {
             Stage::Vertex => execution::VERTEX,
             Stage::Fragment => execution::FRAGMENT,
-            _ => execution::GL_COMPUTE,
+            stage => Self::mesh_model(stage).unwrap_or(execution::GL_COMPUTE),
         };
         self.module
             .entry_point(model, self.entry, "main", &self.interface);
@@ -2203,6 +2237,16 @@ impl Emitter {
                 k16,
                 single,
             } => self.matrix_multiply(index, d.0, a.0, b.0, c.0, k16, single)?,
+            Op::Isbe {
+                write,
+                value,
+                a,
+                offset,
+                size,
+                region,
+                output,
+                ..
+            } => self.stage_buffer(index, write, value.0, a.0, offset, size, region, output)?,
             Op::Movm { d, a } => self.matrix_transpose(index, d.0, a.0)?,
             Op::Ldsm {
                 d,
@@ -3158,6 +3202,7 @@ mod tests {
             shared_bytes: Some(0x1000),
             local_bytes: Some(0x40),
             matrices: MatrixPath::Subgroup,
+            mesh: None,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3295,6 +3340,7 @@ mod tests {
             shared_bytes: Some(0x100),
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
+            mesh: None,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4175,6 +4221,7 @@ mod tests {
             shared_bytes: Some(0x2000),
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
+            mesh: None,
         };
         valid_with(&words, &layout);
     }
@@ -4294,6 +4341,7 @@ mod tests {
         let layout = Layout {
             workgroup: [32, 2, 1],
             matrices: MatrixPath::Cooperative,
+            mesh: None,
             ..Layout::workgroup([32, 2, 1])
         };
         valid_with(&words, &layout);

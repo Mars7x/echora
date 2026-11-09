@@ -88,6 +88,7 @@ goals first-class, next to correctness:
    flow; an emitter, `rspirv` or a small hand-written writer).
 4. **Graphics stages** and textures.
 5. **HMMA**: a subgroup path, VK_KHR_cooperative_matrix, and an exact tensor-core model.
+6. **Task and mesh programs** (VK_EXT_mesh_shader), with the stage buffer.
 
 **Textures.** A texture whose handle is a constant-bank word becomes a
 combined image sampler, one per handle word, view type and depth
@@ -148,6 +149,40 @@ SUST also uses), an R32ui image declared R32_UINT in the descriptor's
 format bits (flags 8-11 = 5): Vulkan's image atomics require a format,
 and the runtime views a 4-byte-texel image as R32_UINT for it. The operation numbering is inferred from a Maxwell lowering,
 not measured.
+
+**Task and mesh programs.** NVN binds a task program in the vertex slot
+and a mesh program in the vertex or tessellation evaluation slot; the
+runtime says which (`Parameters::stage_slot`) and passes the mesh
+registers (`Parameters::mesh`), from which come the workgroup size (at
+most 32 threads: the hardware runs one warp), the output limits (at most
+256 vertices and primitives), the topology and the task payload's size
+(the larger of the line counts in SET_MESH_INIT_SHADER bits 12-20 and
+22-30, times 128 bytes). The field widths are Lichii's decoding.
+
+The programs talk through the internal stage buffer, which ISBERD and
+ISBEWR address by byte, laid out as Mesa's NAK lays it out. A task
+program's output attributes become the task payload (the mesh workgroup
+count at byte 4, then the counts per dimension and the payload proper);
+its function returns, a barrier follows, and `OpEmitMeshTasksEXT` emits
+that many mesh workgroups in x. A program's input attributes give its
+workgroup index at byte 0; a mesh program after a task program reads the
+payload at the other bytes, and one without a task program reads the
+draw's workgroup counts at bytes 4-16. A mesh program's output attributes
+are a workgroup array: per-vertex lines, then per-primitive lines, in
+groups of 32 elements, one 128-byte line per output word its header's
+output map lists (the primitive header, a pass-through geometry
+program's, lists the per-primitive ones). Its map holds the primitive
+count (a word at byte 3) and the vertex indices (bytes from byte 4). At
+the end, after a barrier, the program sets its outputs (all its
+`max_vertices` vertices, the written primitive count capped at
+`max_primitives`) and copies the lines to the position, point size (for
+points) and generic vector arrays and to the per-primitive id, layer and
+viewport index, and the indices to the primitive index built-in.
+Per-primitive generic vectors are refused, as the fragment program would
+have to declare them per-primitive; so are 16-bit stage buffer accesses
+and outputs past the generic vectors. The `.SKEW` bit is ignored (NAK
+computes linear addresses with it set). None of this has run on a GPU
+yet.
 
 **Matrix multiply.** HMMA runs on the subgroup: each lane gathers its A
 row from its own quad and its B columns from the quads of lanes 8t and
@@ -274,6 +309,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | KILL | 0x95b | condition 87-90 |
 | LDSM | 0x83b | matrices 1 << 72-73, `.MT88` 78; address register 24, uniform register 32 with bit 91, offset 40-63; row addresses shuffled from the lanes that supply them, shared words read (halves for `.MT88`) |
 | MOVM | 0x23a | `.16.MT88` only (bits 32-95 zero); the 8x8 half matrix transposed in the same lane layout: two subgroup shuffles from lanes 8(t%4) + t/8 and +4, the half picked by (t/4)%2 |
+| ISBERD, ISBEWR | 0x923, 0x927 | NAK's fields: address register 24, offset 40-55 (56-73 must be clear), size 74-75, region 76-77 (0 the map, 3 attributes), `.SKEW` 78, `.O` 79; ISBERD destination 16, ISBEWR data 32. 32-bit attribute reads and writes, U8 map writes and the primitive count; see Task and mesh programs |
 | HMMA | 0x23c | d 16, a 24, b 32, c 64; m16n8k16 with bit 75 (else m16n8k8; 78 the k4 form, not decoded), 32-bit accumulator with bit 76 (else halves), half sources (82-83 zero); PTX fragment layout per lane, rows and columns gathered by subgroup shuffles |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |

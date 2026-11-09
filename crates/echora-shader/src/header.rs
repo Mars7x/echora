@@ -35,6 +35,28 @@ pub struct Header {
     /// (ShaderLocalMemoryLowSize); `None` when common word 2's high size
     /// (bits 32 and up of the size) is not zero.
     pub local_bytes: Option<u32>,
+    /// VTG: the output map, bit (address / 4) of each attribute word the
+    /// program writes, for the 0x280 bytes of system values (0x00-0x7f)
+    /// and generic vectors (0x80-0x27f); see [`output_map`].
+    pub outputs: [u32; 5],
+    /// VTG: whether the output map lists anything past the generic
+    /// vectors (system values C and D: clip distances, point sprite and
+    /// fog coordinates, tessellation points, instance and vertex ids).
+    pub outputs_beyond: bool,
+}
+
+/// A VTG header's output map from its first 0x50 bytes: bit (address / 4)
+/// of the 0x280 attribute bytes it lists (system values A and B at header
+/// bits 400-431, generic vectors at 432-559), and whether it lists any
+/// system value C (576-591) or D (632-639).
+pub fn output_map(bytes: &[u8; 0x50]) -> ([u32; 5], bool) {
+    let mut outputs = [0; 5];
+    outputs[0] = bits(bytes, 400, 32);
+    for (n, word) in outputs[1..].iter_mut().enumerate() {
+        *word = bits(bytes, 432 + n * 32, 32);
+    }
+    let beyond = bits(bytes, 576, 16) != 0 || bits(bytes, 632, 8) != 0;
+    (outputs, beyond)
 }
 
 fn bits(bytes: &[u8], offset: usize, count: usize) -> u32 {
@@ -73,7 +95,14 @@ pub fn parse(program: &[u8]) -> Option<Header> {
         }
     }
     let pixel = stage == Stage::Fragment;
+    let (outputs, outputs_beyond) = if pixel {
+        ([0; 5], false)
+    } else {
+        output_map(bytes.try_into().ok()?)
+    };
     Some(Header {
+        outputs,
+        outputs_beyond,
         stage,
         imap,
         targets: if pixel { bits(bytes, 576, 32) } else { 0 },

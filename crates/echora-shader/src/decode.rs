@@ -631,6 +631,22 @@ pub enum Op {
         count: u8,
         transpose: bool,
     },
+    /// ISBERD d, [a + offset] / ISBEWR [a + offset], data: the internal
+    /// stage buffer of task and mesh programs (bits as Mesa's NAK encodes
+    /// them: offset 40-55, size 74-75 (0 U8, 1 U16, 2 32-bit), region
+    /// 76-77 (0 the map, 1 patch, 2 primitive, 3 attributes), `.SKEW` 78,
+    /// `.O` 79 (the output buffer); ISBEWR's data 32-39, no destination).
+    Isbe {
+        write: bool,
+        /// The destination (ISBERD) or the data (ISBEWR).
+        value: Reg,
+        a: Reg,
+        offset: u16,
+        size: u8,
+        region: u8,
+        skew: bool,
+        output: bool,
+    },
     /// MOVM.16.MT88 d, a: the warp's 8x8 matrix of halves, lane t holding
     /// row t/4, columns 2(t%4) and 2(t%4)+1 in a, transposed into d in the
     /// same layout. Only the plain form (bits 32-95 zero) is accepted.
@@ -1449,6 +1465,24 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 c: word.reg(64),
                 k16: word.bit(75),
                 single: word.bit(76),
+            });
+        }
+        // The fields past those NAK encodes (offset bits 56-63, 64-73) must
+        // be clear.
+        0x923 | 0x927 => {
+            if word.bits(56, 8) != 0 || word.bits(64, 10) != 0 {
+                return None;
+            }
+            let write = opcode == 0x927;
+            return Some(Op::Isbe {
+                write,
+                value: if write { word.reg(32) } else { d },
+                a: word.reg(24),
+                offset: word.bits(40, 16) as u16,
+                size: word.bits(74, 2) as u8,
+                region: word.bits(76, 2) as u8,
+                skew: word.bit(78),
+                output: word.bit(79),
             });
         }
         0x23a => {

@@ -38,6 +38,8 @@ pub mod op {
     pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
     pub const FUNCTION_CALL: u16 = 57;
+    pub const EMIT_MESH_TASKS_EXT: u16 = 5294;
+    pub const SET_MESH_OUTPUTS_EXT: u16 = 5295;
     pub const VARIABLE: u16 = 59;
     pub const LOAD: u16 = 61;
     pub const STORE: u16 = 62;
@@ -173,6 +175,7 @@ pub mod storage {
     pub const OUTPUT: u32 = 3;
     pub const WORKGROUP: u32 = 4;
     pub const PRIVATE: u32 = 6;
+    pub const TASK_PAYLOAD_WORKGROUP_EXT: u32 = 5402;
     pub const IMAGE: u32 = 11;
     pub const FUNCTION: u32 = 7;
     pub const PUSH_CONSTANT: u32 = 9;
@@ -207,6 +210,9 @@ pub mod capability {
     pub const SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: u32 = 5307;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const COOPERATIVE_MATRIX: u32 = 6022;
+    pub const MESH_SHADING_EXT: u32 = 5283;
+    pub const SHADER_LAYER: u32 = 69;
+    pub const SHADER_VIEWPORT_INDEX: u32 = 70;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
     pub const ADDRESSING_PHYSICAL_STORAGE_BUFFER64: u32 = 5348;
@@ -234,6 +240,13 @@ pub mod execution {
     pub const ORIGIN_UPPER_LEFT: u32 = 7;
     pub const DEPTH_REPLACING: u32 = 12;
     pub const LOCAL_SIZE: u32 = 17;
+    pub const TASK_EXT: u32 = 5364;
+    pub const MESH_EXT: u32 = 5365;
+    pub const OUTPUT_VERTICES: u32 = 26;
+    pub const OUTPUT_POINTS: u32 = 27;
+    pub const OUTPUT_LINES_EXT: u32 = 5269;
+    pub const OUTPUT_PRIMITIVES_EXT: u32 = 5270;
+    pub const OUTPUT_TRIANGLES_EXT: u32 = 5298;
 }
 
 /// GLSL.std.450 extended instructions.

@@ -53,7 +53,7 @@ pub(super) struct Io {
 }
 
 impl Emitter {
-    fn vec4(&mut self) -> u32 {
+    pub(super) fn vec4(&mut self) -> u32 {
         self.module.ty(Type::Vector {
             component: self.f32,
             count: 4,
