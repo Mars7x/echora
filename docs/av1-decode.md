@@ -99,8 +99,7 @@ Notes on values:
 - `video::LoopRestoration::log2_restoration_size_minus_5` is Vulkan's
   `LoopRestorationSize`: log2 of the unit size minus 5 (0..=3), zero when
   loop restoration is off. `frame::LoopRestoration` has the size in
-  samples (and `video::LoopRestoration::loop_restoration_size` still
-  has it; `echora-gpu` uses the log2 field).
+  samples.
 - `pMiColStarts` and `pMiRowStarts` are in 4x4 (MI) units, as the Vulkan
   spec and FFmpeg have them. RADV 25.2 copies them into fields named for
   superblock units, so multi-tile streams on RADV deserve a check.

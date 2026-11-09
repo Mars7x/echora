@@ -211,9 +211,6 @@ pub struct LoopRestoration {
     /// restoration is off. The size in samples is in
     /// [`crate::frame::LoopRestoration`].
     pub log2_restoration_size_minus_5: [u16; 3],
-    /// The unit size in samples (32..=256), zero when off. Superseded by
-    /// `log2_restoration_size_minus_5`; kept until echora-gpu moves to it.
-    pub loop_restoration_size: [u16; 3],
 }
 
 /// StdVideoAV1GlobalMotion, indexed by reference name (0 is intra).
@@ -485,7 +482,6 @@ impl PictureInfo {
                 log2_restoration_size_minus_5: lr
                     .loop_restoration_size
                     .map(|size| size.checked_ilog2().map_or(0, |log2| log2 as u16 - 5)),
-                loop_restoration_size: lr.loop_restoration_size,
             },
             global_motion: GlobalMotion {
                 gm_type: gm.gm_type.map(|t| t as u8),
