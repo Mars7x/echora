@@ -6,6 +6,7 @@
 //! [`translate`] has the runtime's signature (`echora_shader_abi::Translate`)
 //! and translates no program yet, so every program still goes to Lichii.
 
+pub mod compute;
 pub mod decode;
 pub mod spirv;
 
