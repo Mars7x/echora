@@ -108,6 +108,10 @@ pub struct Parameters {
     pub shared_memory_size: Option<u32>,
     /// Local (per-invocation stack) memory bytes, when not given.
     pub local_memory_size: Option<u32>,
+    /// The device multiplies 16x16x16 half matrices into half or 32-bit
+    /// accumulators at subgroup scope (VK_KHR_cooperative_matrix): HMMA
+    /// may use them.
+    pub cooperative_matrix: bool,
 }
 
 /// A program a translator does not handle (yet).

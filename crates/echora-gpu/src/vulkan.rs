@@ -408,6 +408,7 @@ impl Gpu {
         } else {
             Vec::new()
         };
+        crate::shader::set_cooperative_matrix(&cooperative_matrix);
         Ok(Self {
             entry,
             instance,

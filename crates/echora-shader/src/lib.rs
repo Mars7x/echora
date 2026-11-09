@@ -41,7 +41,11 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             workgroup: [1, 1, 1],
             shared_bytes: None,
             local_bytes: parameters.local_memory_size,
-            matrices: compute::MatrixPath::Subgroup,
+            matrices: if parameters.cooperative_matrix {
+                compute::MatrixPath::Cooperative
+            } else {
+                compute::MatrixPath::Subgroup
+            },
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {

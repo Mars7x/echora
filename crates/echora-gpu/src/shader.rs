@@ -48,7 +48,31 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
         workgroup_size: compute.then_some(parameters.workgroup_size),
         shared_memory_size: compute.then_some(parameters.shared_memory_size),
         local_memory_size: compute.then_some(parameters.local_memory_size),
+        cooperative_matrix: COOPERATIVE_MATRIX.load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// Whether HMMA translates to cooperative matrices: set when the device
+/// has the shapes (`Gpu::new`), unless ECHORA_HMMA=subgroup.
+static COOPERATIVE_MATRIX: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Lets the Rust translator use cooperative matrices for HMMA when the
+/// device multiplies 16x16x16 half matrices at subgroup scope.
+pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) {
+    use ash::vk::{ComponentTypeKHR as T, ScopeKHR};
+    let has = |result: T| {
+        shapes.iter().any(|shape| {
+            (shape.m, shape.n, shape.k) == (16, 16, 16)
+                && (shape.a, shape.b) == (T::FLOAT16, T::FLOAT16)
+                && (shape.c, shape.result) == (result, result)
+                && shape.scope == ScopeKHR::SUBGROUP
+        })
+    };
+    let on = has(T::FLOAT16)
+        && has(T::FLOAT32)
+        && std::env::var("ECHORA_HMMA").as_deref() != Ok("subgroup");
+    COOPERATIVE_MATRIX.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The Rust translator's program, if it handles `program`.
