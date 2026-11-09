@@ -65,7 +65,11 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         workgroup,
         shared_bytes: parameters.shared_memory_size,
         local_bytes: parameters.local_memory_size,
-        matrices: compute::MatrixPath::Subgroup,
+        matrices: if parameters.cooperative_matrix {
+            compute::MatrixPath::Cooperative
+        } else {
+            compute::MatrixPath::Subgroup
+        },
     };
     compute::translate(&code, &layout)
 }
