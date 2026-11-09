@@ -99,13 +99,11 @@ Notes on values:
 - `video::LoopRestoration::log2_restoration_size_minus_5` is Vulkan's
   `LoopRestorationSize`: log2 of the unit size minus 5 (0..=3), zero when
   loop restoration is off. `frame::LoopRestoration` has the size in
-  samples (and `video::LoopRestoration::loop_restoration_size` keeps it
-  until the Vulkan side has moved over).
+  samples (and `video::LoopRestoration::loop_restoration_size` still
+  has it; `echora-gpu` uses the log2 field).
 - `pMiColStarts` and `pMiRowStarts` are in 4x4 (MI) units, as the Vulkan
   spec and FFmpeg have them. RADV 25.2 copies them into fields named for
-  superblock units, so multi-tile streams on RADV deserve a check. `StdVideoAV1LoopRestoration::LoopRestorationSize`
-  takes log2(size) - 5 instead (`crates/echora-gpu/src/video_av1.rs`
-  converts it).
+  superblock units, so multi-tile streams on RADV deserve a check.
 - `ar_coeffs_*_plus_128` are stored as coded (0..=255); the Std header
   declares them `int8_t`, so copy the bits.
 - With `update_grain` clear the film grain parameters are already loaded

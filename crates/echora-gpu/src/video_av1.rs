@@ -171,12 +171,7 @@ fn with_picture<R>(
         .loop_restoration
         .frame_restoration_type
         .map(std_video::StdVideoAV1FrameRestorationType::from);
-    // Vulkan takes each plane's unit size as log2(size) - 5 (the parser
-    // gives samples; 0 when the plane is not restored).
-    restoration.LoopRestorationSize = p.loop_restoration.loop_restoration_size.map(|size| {
-        size.checked_ilog2()
-            .map_or(0, |log2| log2.saturating_sub(5) as u16)
-    });
+    restoration.LoopRestorationSize = p.loop_restoration.log2_restoration_size_minus_5;
 
     let mut motion: std_video::StdVideoAV1GlobalMotion = zeroed();
     motion.GmType = p.global_motion.gm_type;
@@ -252,6 +247,8 @@ pub struct MovieDecoder {
     generation: Option<u64>,
     /// The picture each DPB slot holds.
     dpb: [Option<PictureId>; SLOTS as usize],
+    /// Also return pictures that are never shown (for comparisons).
+    hidden: bool,
 }
 
 impl MovieDecoder {
@@ -262,7 +259,14 @@ impl MovieDecoder {
             decoder: None,
             generation: None,
             dpb: [None; SLOTS as usize],
+            hidden: false,
         }
+    }
+
+    /// Also return the pictures decoded only as references, in decode
+    /// order (to compare with a decoder that outputs them too).
+    pub fn set_return_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
     }
 
     /// Decodes one temporal unit (low-overhead OBUs) and returns the
@@ -280,7 +284,7 @@ impl MovieDecoder {
                 Output::Decode(picture) => {
                     let showing: Vec<u32> = shown.iter().map(|shown: &Shown| shown.slot).collect();
                     let slot = self.decode_picture(unit, &picture, &showing)?;
-                    if picture.show_frame {
+                    if picture.show_frame || self.hidden {
                         shown.push(Shown {
                             slot,
                             width: picture.upscaled_width,

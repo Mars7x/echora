@@ -69,6 +69,13 @@ impl Decoder {
     /// comes out of the same `decode` call; up to four threads share each
     /// frame's tiles and rows (the guest runs on another host core).
     pub fn new() -> Result<Self, String> {
+        Self::with_invisible_frames(false)
+    }
+
+    /// `new`, also returning pictures that are never shown (hidden frames,
+    /// decoded only as references) when `invisible`: for comparing
+    /// decoders picture by picture.
+    pub fn with_invisible_frames(invisible: bool) -> Result<Self, String> {
         let mut settings = MaybeUninit::<Dav1dSettings>::zeroed();
         // SAFETY: the pointer is to writable storage for a Dav1dSettings,
         // which dav1d_default_settings fills completely.
@@ -79,6 +86,7 @@ impl Decoder {
         settings.n_threads =
             std::thread::available_parallelism().map_or(1, |cores| cores.get().min(4) as i32);
         settings.max_frame_delay = 1;
+        settings.output_invisible_frames = i32::from(invisible);
         let mut context = None;
         // SAFETY: both pointers are to live, initialized locals.
         let result = unsafe {

@@ -77,8 +77,11 @@ fn main() {
         units.len(),
         device.name
     );
+    // AV1_CHECK_HIDDEN: compare the hidden pictures too.
+    let hidden = std::env::var_os("AV1_CHECK_HIDDEN").is_some();
     let mut gpu = MovieDecoder::new(device);
-    let mut cpu = Decoder::new().unwrap_or_else(|error| {
+    gpu.set_return_hidden(hidden);
+    let mut cpu = Decoder::with_invisible_frames(hidden).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
     });
