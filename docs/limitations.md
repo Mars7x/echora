@@ -12,9 +12,6 @@ to be missing or incomplete.
 - Mesh and task pipelines (`DrawMeshTasks`) are drawn through
   `VK_EXT_mesh_shader`, but have not yet been checked against the console's
   output.
-- Of the 6,074 shader stages the game has reached so far, 16 do not translate
-  yet: 15 texture gathers whose offsets are not provably constant, and one
-  return linkage mode. Draws that need them are skipped.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
 - The Rust shader translator does not translate programs yet. Without an

@@ -10,8 +10,8 @@ when the code for it does.
 | 2. Content processing | The NUP is validated and inventoried, and its ExeFS cached, without manual extraction; NUP and folder input give the same result. | Done for the supported input. Overlaying update RomFS on a base is not needed yet. |
 | 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.3 million instructions) is translated and runs on Linux. |
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
-| 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with translated shaders, and the internal render scale is applied; the resolution planner is not connected yet. |
-| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06. The title screen and the opening movie render correctly. |
+| 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan and the internal render scale is applied; shader translation is moving to Echora's own Rust translator, and the resolution planner is not connected yet. |
+| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler; to be reached again with Echora's own shader translator. |
 | 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie and draws its first 3D scene, still overexposed. |
 | 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
@@ -24,15 +24,21 @@ when the code for it does.
 
 ## Next steps
 
-1. Correct the overexposed first scene after the New Game movie, check what
-   it draws (including the mesh and task pipelines) and carry on to gameplay.
-2. Translate the last 16 failing shader stages.
+1. Finish Echora's own shader translator (`echora-shader`, in Rust): compute
+   programs first, then the stages the title screen and the movie use, then
+   the rest. Shaders reach the game's memory through a page table, every
+   shader can be translated before the game starts, and each translation is
+   compared with the old recompiler, loaded as a plugin on the developer's
+   machine. See [shader-translator.md](shader-translator.md).
+2. Get the first scene after the New Game movie right, check what it draws
+   (including the mesh and task pipelines) and carry on to gameplay.
 3. Make each thread faster in the 3D scene: profile it, then cut the cost of
    the translated code and of each GPU command, which now limit speed more
    than the number of cores.
 4. Turn on the faster code generation in game builds once it is checked in
-   game: inline vector arithmetic first, then structured control flow and
-   direct calls once they measure faster.
+   game: inline vector arithmetic, branches that skip unused flags and
+   floating-point status kept in locals, then structured control flow once
+   it measures faster. They go in with the next full rebuild.
 5. Shorten the first build from about an hour: leaner generated code (about
    a third smaller in tests so far), full optimisation only for the hot code a
    profile finds, and more parallel compiler jobs.
@@ -41,8 +47,5 @@ when the code for it does.
    uses four to eight times the video memory (one 90-layer array after the
    opening movie becomes 852 MiB). Re-encoding them as BC7, cached on disk like
    the shader binaries, would bring that close to the console's footprint.
-7. Replace the C++ shader recompiler with a translator written in Rust, a
-   piece at a time. It runs alongside the current one, takes each program it
-   can handle and hands the rest to the current one, and is checked by
-   translating every captured shader with both and comparing the results.
-   The current recompiler goes once the Rust translator handles everything.
+7. Translate and compile every shader before the game starts, so nothing
+   stutters while it runs.

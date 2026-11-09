@@ -27,12 +27,13 @@ game.
 ## Status
 
 The game boots, shows the title screen and plays the opening movie in colour
-with sound. After New Game it now gets past the opening movie and draws its
-first 3D scene, a sky with a moving camera, though far too bright for now.
-Getting that scene right and reaching gameplay is what I am working on next.
-Shader support is nearly complete, with 6,058 of the 6,074 shader stages seen
-so far translating, and the launcher works with a mouse, keyboard or
-controller.
+with sound, and after New Game it gets past the movie into its first 3D scene,
+though that scene doesn't render correctly yet. The launcher works with a
+mouse, keyboard or controller.
+
+Right now I'm replacing the shader translator, so on its own Echora currently
+draws nothing: a run stops at the first shader it can't translate yet, and
+says which one. The section below explains why.
 
 Speed is the other big gap. The console runs the game at 60 frames per
 second. Here the opening movie plays at about 22 to 29 pictures per second,
@@ -47,6 +48,36 @@ passes its tests on Windows too. These figures come from update 1.1.1
 (`0400486024DEC000` v131072) on an AMD RX 9070 XT. The
 [roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md) go
 into more detail.
+
+## What I'm working on
+
+**A shader translator of my own.** The game's GPU programs are written for the
+Switch 2's NVIDIA GPU and have to be translated into shaders your PC's GPU can
+run. Until now Echora used a C++ shader recompiler from the Switch emulator
+world. It got the title screen and the opening movie on screen, but after the
+movie it turned out to be the source of the hardest bugs so far: it guessed
+where shaders keep their data, and the wrong guesses fed the game's own
+programs bad data and hung the GPU. So I'm writing Echora's translator in
+Rust, for four reasons:
+
+- **The game's real memory.** Shaders reach the game's memory through a page
+  table, the way the console's GPU sees it, instead of guesses.
+- **Shaders ready before you play.** Every shader can be translated without
+  running the game, so they can all be prepared before it starts and nothing
+  stutters while you play.
+- **The PC's own hardware.** Things like the matrix units the game's
+  upscaler needs can be used directly instead of being emulated step by step.
+- **One language and one design** across the whole project.
+
+It is a new design, with the details of each instruction checked against
+public references and every translation compared with the old recompiler on
+my own machine. The old recompiler is no longer part of Echora, but it can
+still be loaded as a separate plugin for testing.
+
+**Then the scene after the movie, gameplay and speed.** Once the title screen,
+the movie and the first 3D scene render through the new translator, the next
+steps are getting that scene right, reaching gameplay, and making each CPU
+thread do less work than it does now.
 
 ## Approach
 
@@ -64,8 +95,7 @@ pretending it worked. The translated code is tested against a reference
 interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
-The project is written in Rust, apart from the C++ shader recompiler and a few
-C libraries. Anything that goes beyond what the console does, such as frame
+The project is written in Rust, apart from a few C libraries. Anything that goes beyond what the console does, such as frame
 rates above 60 or ultrawide, will be kept in a separate layer of enhancements
 that can be turned off.
 
@@ -78,7 +108,8 @@ that can be turned off.
 3. The running game talks to Echora's implementation of the Switch kernel and
    system services.
 4. NVN graphics calls are replayed on Vulkan, with the console's shaders
-   translated to SPIR-V, and movies are decoded on the PC.
+   translated to SPIR-V by Echora's own translator, and movies are decoded on
+   the PC.
 
 See the [architecture notes](docs/architecture.md) for how the crates fit
 together.
