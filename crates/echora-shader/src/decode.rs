@@ -387,13 +387,10 @@ pub fn decode(raw: u128) -> Instruction {
 /// Decodes the instructions of a program (16 bytes each; a trailing
 /// partial instruction is ignored).
 pub fn decode_program(bytes: &[u8]) -> Vec<Instruction> {
-    bytes
-        .chunks_exact(16)
-        .map(|chunk| {
-            let mut word = [0u8; 16];
-            word.copy_from_slice(chunk);
-            decode(u128::from_le_bytes(word))
-        })
+    let (words, _) = bytes.as_chunks::<16>();
+    words
+        .iter()
+        .map(|word| decode(u128::from_le_bytes(*word)))
         .collect()
 }
 
