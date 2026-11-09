@@ -93,7 +93,10 @@ goals first-class, next to correctness:
 combined image sampler, one per handle word, view type and depth
 comparison, reported as a descriptor naming that word; the runtime binds
 the texture and sampler the word names. Bindings follow the uniform
-buffers. Programs without derivatives sample at an explicit level (a
+buffers. A bindless form (0xf60, 0xf63, 0xf66, 0xf6f: the handle in the
+uniform register at bits 40-45) binds the same way when that register
+only ever holds one constant-bank word (every write a ULDC of it); a
+handle computed at run time needs descriptor arrays, not done yet. Programs without derivatives sample at an explicit level (a
 bias over level zero is that level). Vulkan takes only constant texel
 offsets for a sample, so a sample adds the offsets divided by the
 level's size to its coordinates; a fetch adds them to its integer

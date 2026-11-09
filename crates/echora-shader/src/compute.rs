@@ -154,6 +154,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     }
     let blocks = blocks(code)?;
     let mut emitter = Emitter::new(layout);
+    emitter.handle_words = handle_words(code);
     emitter.program(code, &blocks)?;
     Ok(emitter.finish())
 }
@@ -162,6 +163,53 @@ mod fetch;
 mod io;
 mod memory;
 mod texture;
+
+/// The uniform registers that only ever hold one constant-bank word (each
+/// write a ULDC of that same word), by register: the bank and offset. A
+/// bindless texture whose handle is in one binds like a bound one.
+fn handle_words(code: &[Instruction]) -> BTreeMap<u8, (u8, u16)> {
+    let mut words: BTreeMap<u8, Option<(u8, u16)>> = BTreeMap::new();
+    let mut note = |register: u8, word: Option<(u8, u16)>| {
+        let entry = words.entry(register).or_insert(word);
+        if *entry != word {
+            *entry = None;
+        }
+    };
+    for instruction in code {
+        let destination = (instruction.raw >> 16) as u8 & 0x3f;
+        match instruction.op {
+            Op::Uldc {
+                d,
+                src: Src::Const { bank, offset },
+                size,
+            } => {
+                note(d.0, Some((bank, offset)));
+                if size == 5 {
+                    note(d.0.saturating_add(1), Some((bank, offset.wrapping_add(4))));
+                }
+            }
+            Op::R2ur { .. }
+            | Op::Redux { .. }
+            | Op::Vote {
+                uniform_out: true, ..
+            } => {
+                note(destination, None);
+            }
+            // Any other uniform instruction may write its destination and
+            // the registers after it.
+            _ if instruction.uniform => {
+                for n in 0..4 {
+                    note(destination.saturating_add(n), None);
+                }
+            }
+            _ => {}
+        }
+    }
+    words
+        .into_iter()
+        .filter_map(|(register, word)| Some((register, word?)))
+        .collect()
+}
 
 /// What a program needs beyond its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +281,8 @@ struct Emitter {
     io: io::Io,
     /// Vertex inputs the prologue fetched, by location.
     fetched: BTreeMap<u32, u32>,
+    /// Uniform registers holding a fixed constant-bank word.
+    handle_words: BTreeMap<u8, (u8, u16)>,
     frag_colors: u32,
     push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
@@ -299,6 +349,7 @@ impl Emitter {
             memory: memory::Memory::default(),
             io: io::Io::default(),
             fetched: BTreeMap::new(),
+            handle_words: BTreeMap::new(),
             frag_colors: 0,
             push_fields: 0,
             banks: BTreeMap::new(),
@@ -3509,6 +3560,48 @@ mod tests {
             ]),
             EXIT,
         ]);
+    }
+
+    #[test]
+    fn bindless_handles_loaded_from_one_constant_word_bind_like_bound_ones() {
+        let uldc = word(&[
+            (0, 12, 0xab9),
+            (16, 6, 4),
+            (54, 5, 2),
+            (38, 16, 0x28),
+            (73, 3, 4),
+        ]);
+        // TEX R0, R2, R3, UR4, 2D, 0x1 (bindless: handle register 40-45)
+        let bindless = word(&[
+            (0, 12, 0xf60),
+            (16, 8, 0),
+            (24, 8, 2),
+            (32, 8, 3),
+            (40, 6, 4),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 1),
+            (81, 3, 7),
+            (91, 1, 1),
+        ]);
+        let translated = valid(&[uldc, bindless, EXIT]);
+        // The ULDC's bank is a uniform buffer; the texture follows it.
+        let texture = translated.descriptors[1];
+        assert_eq!(
+            (texture.kind, texture.cbuf_index, texture.cbuf_offset),
+            (4, 2, 0x28)
+        );
+        // A handle also written by other instructions is computed.
+        let uiadd3 = word(&[
+            (0, 12, 0x890),
+            (16, 8, 4),
+            (24, 8, 4),
+            (32, 32, 8),
+            (64, 8, 63),
+            (91, 1, 1),
+        ]);
+        let computed = translated_err(&[uldc, uiadd3, bindless, EXIT]);
+        assert!(computed.reason.contains("computed"), "{}", computed.reason);
     }
 
     #[test]

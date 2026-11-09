@@ -140,6 +140,9 @@ pub struct Texture {
     pub b: Reg,
     pub bank: u8,
     pub handle_offset: u16,
+    /// The bindless forms (0xf60, 0xf63, 0xf66, 0xf6f): the handle is in
+    /// this uniform register instead (`bank` and `handle_offset` unused).
+    pub handle: Option<UniformReg>,
     /// Bits 61-63: 0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D array, 7
     /// cube array.
     pub dimension: u8,
@@ -1062,11 +1065,15 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 kind: word.bits(73, 3) as u8,
             });
         }
-        0xb60 | 0xb66 | 0xb63 | 0xb6f => {
-            let op = match opcode {
-                0xb60 => TextureOp::Sample,
-                0xb66 => TextureOp::Fetch,
-                0xb63 => TextureOp::Gather {
+        0xb60 | 0xb66 | 0xb63 | 0xb6f | 0xf60 | 0xf66 | 0xf63 | 0xf6f => {
+            let bindless = opcode & 0x400 != 0;
+            if bindless && (word.bits(46, 13) != 0 || !word.bit(91)) {
+                return None;
+            }
+            let op = match opcode & 0x1ff {
+                0x160 => TextureOp::Sample,
+                0x166 => TextureOp::Fetch,
+                0x163 => TextureOp::Gather {
                     component: word.bits(87, 2) as u8,
                 },
                 _ => TextureOp::Query,
@@ -1084,8 +1091,13 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 d2: word.reg(64),
                 a: word.reg(24),
                 b: word.reg(32),
-                bank: word.bits(54, 5) as u8,
-                handle_offset: word.bits(40, 14) as u16 * 4,
+                bank: if bindless { 0 } else { word.bits(54, 5) as u8 },
+                handle_offset: if bindless {
+                    0
+                } else {
+                    word.bits(40, 14) as u16 * 4
+                },
+                handle: bindless.then(|| UniformReg(word.bits(40, 6) as u8)),
                 dimension: word.bits(61, 3) as u8,
                 lod: if matches!(op, TextureOp::Gather { .. }) {
                     0

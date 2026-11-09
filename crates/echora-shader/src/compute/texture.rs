@@ -147,6 +147,19 @@ impl Emitter {
     }
 
     pub(super) fn texture(&mut self, index: usize, texture: &Texture) -> Result<(), Unsupported> {
+        // A bindless handle binds like a bound one when its uniform
+        // register only ever holds one constant-bank word.
+        let mut texture = *texture;
+        if let Some(register) = texture.handle {
+            let &(bank, offset) = self
+                .handle_words
+                .get(&register.0)
+                .ok_or_else(|| unsupported(index, "texture handle computed at run time"))?;
+            texture.bank = bank;
+            texture.handle_offset = offset;
+            texture.handle = None;
+        }
+        let texture = &texture;
         let view = view(texture.dimension).ok_or_else(|| {
             unsupported(index, format!("texture dimension {}", texture.dimension))
         })?;
