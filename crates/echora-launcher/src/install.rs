@@ -166,14 +166,16 @@ fn clone(_source: &Path, _target: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
+/// Free space kept on top of the game when copying it.
+const SPACE_HEADROOM: u64 = 512 << 20;
+
 /// Fails with a plain message when the disk holding `target` has less than
 /// `needed` bytes free (plus a little headroom).
 fn check_space(target: &Path, needed: u64) -> io::Result<()> {
     let Some(free) = free_space(target.parent().unwrap_or(target)) else {
         return Ok(());
     };
-    const HEADROOM: u64 = 512 << 20;
-    if free < needed + HEADROOM {
+    if free < needed + SPACE_HEADROOM {
         let gb = |bytes: u64| bytes as f64 / 1e9;
         return Err(io::Error::other(format!(
             "there isn't enough free space: the game needs {:.1} GB and the disk has {:.1} GB free",
@@ -293,7 +295,10 @@ mod tests {
             let error = result.unwrap_err();
             assert!(error.to_string().contains("free space"), "{error}");
         }
-        assert!(check_space(&dir.join("game.nup"), 1).is_ok());
+        // A small copy fits whenever the disk has the headroom free.
+        if free_space(&dir).is_none_or(|free| free > SPACE_HEADROOM + 1) {
+            assert!(check_space(&dir.join("game.nup"), 1).is_ok());
+        }
         remove(&dir).unwrap();
     }
 
