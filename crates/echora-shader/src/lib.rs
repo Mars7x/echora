@@ -98,11 +98,16 @@ pub fn program_code(program: &[u8]) -> Result<Vec<Instruction>, Unsupported> {
                     last_forward = last_forward.max((target / 16) as usize);
                 }
             }
-            Op::Exit
-                if instruction.guard.index == 7
-                    && !instruction.guard.negated
-                    && index >= last_forward =>
-            {
+            // A subroutine's entry counts as a forward target.
+            Op::Call { offset } => {
+                let target = (index as i64 + 1) * 16 + offset;
+                if target > 0 {
+                    last_forward = last_forward.max((target / 16) as usize);
+                }
+            }
+            // The end: an unconditional EXIT (or a subroutine's RET) that
+            // no earlier branch or call reaches past.
+            Op::Exit | Op::Ret { .. } if instruction.guard.is_true() && index >= last_forward => {
                 return Ok(code);
             }
             _ => {}
@@ -329,6 +334,19 @@ mod tests {
                 (72, 4, 0xf),
                 (81, 3, 7),
             ]),
+            // TMML R12, R4, R5, 2D, 0x3 (the level and the raw level)
+            word(&[
+                (0, 12, 0xb69),
+                (16, 8, 12),
+                (24, 8, 4),
+                (32, 8, 5),
+                (40, 14, 8),
+                (54, 5, 2),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 3),
+                (81, 3, 7),
+            ]),
             // @P0 KILL; MOV R5, R7 (the depth after the sample mask slot)
             word(&[(0, 12, 0x95b), (12, 4, 0), (87, 3, 7)]),
             word(&[(0, 12, 0x202), (16, 8, 5), (32, 8, 7)]),
@@ -345,6 +363,25 @@ mod tests {
             (texture.binding, texture.cbuf_index, texture.cbuf_offset),
             (4 * compute::MAX_DESCRIPTORS, 2, 0x20)
         );
+    }
+
+    #[test]
+    fn calls_return_through_the_address_register() {
+        // MOV R2, 0x20 (return to instruction 2); CALL to 3; EXIT;
+        // MOV R3, 0x1; RET R2. The program ends at the RET.
+        let mov = |d: u128, value: u128| word(&[(0, 12, 0x802), (16, 8, d), (32, 32, value)]);
+        let call = word(&[(0, 12, 0x944), (32, 50, 16)]);
+        let ret = word(&[(0, 12, 0x950), (24, 8, 2)]);
+        let program = bytes(&[mov(2, 0x20), call, EXIT, mov(3, 1), ret, NOP, NOP]);
+        assert_eq!(program_code(&program).unwrap().len(), 5);
+        let parameters = Parameters {
+            workgroup_size: Some([32, 1, 1]),
+            ..Parameters::default()
+        };
+        let translated = translate(&program, &parameters).unwrap();
+        if let Some(problem) = spirv::tests::validate(&translated.spirv) {
+            panic!("{problem}");
+        }
     }
 
     #[test]

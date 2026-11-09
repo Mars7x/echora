@@ -50,6 +50,7 @@ pub mod op {
     pub const IMAGE_DREF_GATHER: u16 = 97;
     pub const IMAGE: u16 = 100;
     pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_QUERY_LOD: u16 = 105;
     pub const IMAGE_QUERY_LEVELS: u16 = 106;
     pub const CONVERT_F_TO_U: u16 = 109;
     pub const CONVERT_F_TO_S: u16 = 110;

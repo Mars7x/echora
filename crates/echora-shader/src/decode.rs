@@ -122,6 +122,9 @@ pub enum TextureOp {
     Gather { component: u8 },
     /// TXQ: the dimensions (width, height, depth or layers, levels).
     Query,
+    /// TMML: the level of detail a sample would use, and the unclamped
+    /// one, as 8.8 fixed point.
+    LevelQuery,
 }
 
 /// A texture instruction's operands. The handle is the word at byte
@@ -600,6 +603,15 @@ pub enum Op {
         condition: Pred,
     },
     Exit,
+    /// CALL.REL to `offset` bytes from the next instruction (the return
+    /// address is put in a register before it).
+    Call {
+        offset: i64,
+    },
+    /// RET.REL to the byte offset (from the code's start) in `target`.
+    Ret {
+        target: Reg,
+    },
     /// BRX / BRXU: to the instruction at the byte offset (from the code's
     /// start) in a register or uniform register.
     Brx {
@@ -945,6 +957,17 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             });
         }
         0x94d => return Some(Op::Exit),
+        0x944 => {
+            let field = word.bits(32, 50);
+            return Some(Op::Call {
+                offset: (field << 14) as i64 >> 14,
+            });
+        }
+        0x950 => {
+            return Some(Op::Ret {
+                target: word.reg(24),
+            });
+        }
         0x949 => {
             return Some(Op::Brx {
                 target: Src::Reg(word.reg(24)),
@@ -1065,7 +1088,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 kind: word.bits(73, 3) as u8,
             });
         }
-        0xb60 | 0xb66 | 0xb63 | 0xb6f | 0xf60 | 0xf66 | 0xf63 | 0xf6f => {
+        0xb60 | 0xb66 | 0xb63 | 0xb6f | 0xb69 | 0xf60 | 0xf66 | 0xf63 | 0xf6f | 0xf69 => {
             let bindless = opcode & 0x400 != 0;
             if bindless && (word.bits(46, 13) != 0 || !word.bit(91)) {
                 return None;
@@ -1073,6 +1096,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             let op = match opcode & 0x1ff {
                 0x160 => TextureOp::Sample,
                 0x166 => TextureOp::Fetch,
+                0x169 => TextureOp::LevelQuery,
                 0x163 => TextureOp::Gather {
                     component: word.bits(87, 2) as u8,
                 },

@@ -88,7 +88,18 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
                 leaders.insert(target);
                 leaders.insert(index + 1);
             }
-            Op::Exit | Op::Brx { .. } => {
+            Op::Exit | Op::Brx { .. } | Op::Ret { .. } => {
+                leaders.insert(index + 1);
+            }
+            Op::Call { offset } => {
+                let target = i64::try_from(index + 1)
+                    .ok()
+                    .and_then(|next| next.checked_mul(16)?.checked_add(offset))
+                    .filter(|target| *target >= 0 && target % 16 == 0)
+                    .map(|target| (target / 16) as usize)
+                    .filter(|target| *target < code.len())
+                    .ok_or_else(|| unsupported(index, "call outside the program"))?;
+                leaders.insert(target);
                 leaders.insert(index + 1);
             }
             _ => {}
@@ -119,6 +130,28 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
             Op::Exit => (
                 next - 1,
                 End::Exit {
+                    condition: Guard {
+                        guard: last.guard,
+                        extra: Pred::TRUE,
+                    },
+                },
+            ),
+            // A call goes to its subroutine; the return address is already
+            // in a register, which RET branches to.
+            Op::Call { offset } => (
+                next - 1,
+                End::Branch {
+                    target: ((next as i64) * 16 + offset) as usize / 16,
+                    condition: Guard {
+                        guard: last.guard,
+                        extra: Pred::TRUE,
+                    },
+                },
+            ),
+            Op::Ret { target } => (
+                next - 1,
+                End::Indirect {
+                    target: Src::Reg(target),
                     condition: Guard {
                         guard: last.guard,
                         extra: Pred::TRUE,
@@ -1988,7 +2021,7 @@ impl Emitter {
                 self.barrier();
             }
             Op::Bssy | Op::Bsync | Op::Depbar => {}
-            Op::Bra { .. } | Op::Exit | Op::Brx { .. } => {
+            Op::Bra { .. } | Op::Exit | Op::Brx { .. } | Op::Call { .. } | Op::Ret { .. } => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
             Op::Unknown { opcode } => {

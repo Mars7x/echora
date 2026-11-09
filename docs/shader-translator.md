@@ -183,6 +183,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
 | EXIT, NOP | 0x94d, 0x918 | |
 | BRX, BRXU | 0x949, 0x958 | to the byte offset from the code's start in register 24 (BRXU: a uniform register); blocks start after every unconditional transfer, and the dispatcher selects blocks by their first instruction's index |
+| CALL, RET | 0x944, 0x950 | CALL.REL to its 50-bit offset at 32-81 (the return address put in a register by a MOV before it); RET.REL to the byte offset (from the code's start) in register 24, like BRX. A program ends at an unconditional EXIT or RET that no earlier branch or call reaches past |
 | FSWZADD | 0x822 | a 24, b 64, pattern 32-39: per quad lane n, bits 2n give a + b, a - b, b - a or b |
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
 | IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
@@ -209,7 +210,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
-| TEX, TLD.SCR, TLD4, TXQ | 0xb60, 0xb66, 0xb63, 0xb6f | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76, depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
+| TEX, TLD.SCR, TLD4, TXQ, TMML | 0xb60, 0xb66, 0xb63, 0xb6f, 0xb69 (bindless 0xf6x) | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76, depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
 | ALD, AST | 0x321, 0x322 | address 40-49, words 74-75 (plus one), index register 24, vertex register 32 (ALD) or 64 (AST), patch 76, ALD output 79; AST data 32 |
 | IPA | 0x326 | address 64-71 (× 4), location 76-77 (default, centroid, offset), mode 78-79 (interpolated, constant), offset register 32 |
 | KILL | 0x95b | condition 87-90 |

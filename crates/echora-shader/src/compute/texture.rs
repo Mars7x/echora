@@ -171,6 +171,7 @@ impl Emitter {
         }
         let results = match texture.op {
             TextureOp::Query => self.texture_query(texture)?,
+            TextureOp::LevelQuery => self.texture_level_query(index, texture, &view)?,
             _ => self.texture_read(index, texture, &view)?,
         };
         // The written components, in mask order.
@@ -423,7 +424,9 @@ impl Emitter {
                 vec4,
                 &image_operands(vec![sampled, coordinate, reference]),
             ),
-            (TextureOp::Query, _) => unreachable!("queries are not reads"),
+            (TextureOp::Query | TextureOp::LevelQuery, _) => {
+                unreachable!("queries are not reads")
+            }
         };
         Ok((0..4)
             .map(|n| {
@@ -431,6 +434,52 @@ impl Emitter {
                 self.value(op::BITCAST, self.u32, &[component])
             })
             .collect())
+    }
+
+    /// TMML: the level a sample would use and the unclamped level, as 8.8
+    /// fixed point. Only a fragment program has the derivatives it needs.
+    fn texture_level_query(
+        &mut self,
+        index: usize,
+        texture: &Texture,
+        view: &View,
+    ) -> Result<Vec<u32>, Unsupported> {
+        if self.stage != echora_shader_abi::Stage::Fragment || view.arrayed {
+            return Err(unsupported(
+                index,
+                "TMML outside a fragment program or on an array",
+            ));
+        }
+        self.module.capability(capability::IMAGE_QUERY);
+        // The coordinates: all in Ra when Rb is RZ, else half in each.
+        let values: Vec<u32> = if texture.b.0 == 255 {
+            (0..view.coordinates as u8)
+                .map(|n| self.read_register(texture.a.0.saturating_add(n)))
+                .collect()
+        } else {
+            self.texture_values(texture, view.coordinates)
+        };
+        let (variable, types) = self.texture_variable(texture, view, false);
+        let floats: Vec<u32> = values
+            .iter()
+            .map(|&value| self.value(op::BITCAST, self.f32, &[value]))
+            .collect();
+        let coordinate = self.vector(self.f32, &floats);
+        let sampled = self.value(op::LOAD, types.sampled, &[variable]);
+        let vec2 = self.module.ty(Type::Vector {
+            component: self.f32,
+            count: 2,
+        });
+        let lod = self.value(op::IMAGE_QUERY_LOD, vec2, &[sampled, coordinate]);
+        let scale = self.float_constant(256.0);
+        let clamped = self.value(op::COMPOSITE_EXTRACT, self.f32, &[lod, 0]);
+        let clamped = self.value(op::F_MUL, self.f32, &[clamped, scale]);
+        let clamped = self.value(op::CONVERT_F_TO_U, self.u32, &[clamped]);
+        let raw = self.value(op::COMPOSITE_EXTRACT, self.f32, &[lod, 1]);
+        let raw = self.value(op::F_MUL, self.f32, &[raw, scale]);
+        let raw = self.value(op::CONVERT_F_TO_S, self.u32, &[raw]);
+        let zero = self.constant(0);
+        Ok(vec![clamped, raw, zero, zero])
     }
 
     /// TXQ: width, height, depth or layers, and the level count. The
