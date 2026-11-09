@@ -245,10 +245,9 @@ pub enum Workers {
     Count(u8),
 }
 
-/// The worker setting when the settings leave it out. Running several
-/// workers by default waits for the long-run check; then this becomes
-/// `Workers::Auto`.
-pub const DEFAULT_WORKERS: Workers = Workers::Count(1);
+/// The worker setting when the settings leave it out: one per host CPU, at
+/// most six.
+pub const DEFAULT_WORKERS: Workers = Workers::Auto;
 
 /// The most workers a setting may ask for: one per application core.
 pub const MAX_WORKERS: u8 = 6;
@@ -745,7 +744,7 @@ mod tests {
         assert!("0".parse::<Workers>().is_err());
         assert!("x".parse::<Workers>().is_err());
         let mut next = Settings::default();
-        next.cpu.workers = Workers::Auto;
+        next.cpu.workers = Workers::Count(2);
         assert_eq!(
             Settings::default().changes(&next),
             vec![(SettingKey::Workers, ApplyClass::GameRestart)]
