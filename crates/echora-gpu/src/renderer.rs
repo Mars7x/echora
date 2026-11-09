@@ -141,6 +141,31 @@ impl Scale {
 
 /// Allocations at least this large are logged with their caller.
 const LARGE_ALLOCATION: u64 = 512 << 20;
+
+/// ECHORA_ALLOC_LOG: running totals of device allocations by caller.
+fn log_allocation(caller: &'static std::panic::Location<'static>, size: u64) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static TOTALS: Mutex<(u64, Option<HashMap<String, (u64, u64)>>)> = Mutex::new((0, None));
+    let mut guard = TOTALS.lock().unwrap_or_else(|poison| poison.into_inner());
+    let (sum, totals) = &mut *guard;
+    let totals = totals.get_or_insert_with(HashMap::new);
+    let entry = totals.entry(caller.to_string()).or_default();
+    entry.0 += 1;
+    entry.1 += size;
+    let before = *sum >> 30;
+    *sum += size;
+    if *sum >> 30 > before {
+        let mut ranked: Vec<_> = totals.iter().collect();
+        ranked.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        let top: Vec<String> = ranked
+            .iter()
+            .take(6)
+            .map(|(site, (count, bytes))| format!("{site} {} MiB/{count}", bytes >> 20))
+            .collect();
+        eprintln!("gpu alloc: {} MiB total; {}", *sum >> 20, top.join(", "));
+    }
+}
 /// The largest span `import_file` shares: udmabuf's default size limit.
 const MAX_SHARED_SPAN: u64 = 64 << 20;
 /// Guest memory pinned by shared spans before the least recently used are
@@ -2041,6 +2066,11 @@ impl Renderer {
         flags: vk::MemoryPropertyFlags,
         addressable: bool,
     ) -> Result<vk::DeviceMemory, String> {
+        // ECHORA_ALLOC_LOG (debugging): device memory allocated, summed by
+        // caller, printed at each further GiB (frees are not counted).
+        if std::env::var_os("ECHORA_ALLOC_LOG").is_some() {
+            log_allocation(std::panic::Location::caller(), requirements.size);
+        }
         // Allocations this large are unusual for guest-sized resources:
         // named with their caller, so a runaway size can be traced.
         if requirements.size >= LARGE_ALLOCATION {
