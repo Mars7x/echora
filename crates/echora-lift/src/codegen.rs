@@ -1234,6 +1234,10 @@ struct RegisterLocals {
     sp_used: bool,
     sp_written: bool,
     flags: bool,
+    /// With `EmitOptions::vector_locals`: the vector registers the window
+    /// reads or writes as `m.cpu.vectors[N]`, and those it writes.
+    vectors_used: BTreeSet<u8>,
+    vectors_written: BTreeSet<u8>,
 }
 
 /// Helper calls that read general registers from the `Core`.
@@ -1291,7 +1295,22 @@ impl RegisterLocals {
                 || FLAG_OPERATIONS
                     .iter()
                     .any(|operation| cases.contains(&format!("m.cpu.{operation}"))),
+            vectors_used: BTreeSet::new(),
+            vectors_written: BTreeSet::new(),
         };
+        if VECTOR_LOCALS.get() {
+            for (at, _) in cases.match_indices("m.cpu.vectors[") {
+                let rest = &cases[at + "m.cpu.vectors[".len()..];
+                let Some(end) = rest.find(']') else { continue };
+                let Ok(index) = rest[..end].parse::<u8>() else {
+                    continue;
+                };
+                locals.vectors_used.insert(index);
+                if Self::assigned(&rest[end + 1..]) {
+                    locals.vectors_written.insert(index);
+                }
+            }
+        }
         for (at, _) in cases.match_indices("m.cpu.regs[") {
             let rest = &cases[at + "m.cpu.regs[".len()..];
             let Some(end) = rest.find(']') else { continue };
@@ -1335,6 +1354,10 @@ impl RegisterLocals {
             fields.push_str("fl: cpu::Flags, ");
             values.push_str("fl: cpu::Flags { nzcv: m.cpu.nzcv }, ");
         }
+        for index in &self.vectors_used {
+            write!(fields, "v{index}: u128, ").unwrap();
+            write!(values, "v{index}: m.cpu.vectors[{index}], ").unwrap();
+        }
         format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
     }
 
@@ -1348,6 +1371,27 @@ impl RegisterLocals {
         }
         if self.flags {
             text.push_str("    m.cpu.nzcv = r.fl.nzcv;\n");
+        }
+        for index in &self.vectors_written {
+            writeln!(text, "    m.cpu.vectors[{index}] = r.v{index};").unwrap();
+        }
+        text
+    }
+
+    /// The written vector locals stored into the `Cpu`, on one line.
+    fn store_vectors(&self) -> String {
+        let mut text = String::new();
+        for index in &self.vectors_written {
+            write!(text, "m.cpu.vectors[{index}] = r.v{index}; ").unwrap();
+        }
+        text
+    }
+
+    /// The used vector locals reloaded from the `Cpu`, on one line.
+    fn reload_vectors(&self) -> String {
+        let mut text = String::new();
+        for index in &self.vectors_used {
+            write!(text, "r.v{index} = m.cpu.vectors[{index}]; ").unwrap();
         }
         text
     }
@@ -1363,6 +1407,7 @@ impl RegisterLocals {
         if self.flags {
             text.push_str("r.fl.nzcv = m.cpu.nzcv; ");
         }
+        text.push_str(&self.reload_vectors());
         text
     }
 
@@ -1370,8 +1415,15 @@ impl RegisterLocals {
         let store = self.store().replace('\n', " ");
         let reload = self.reload();
         let mut text = String::with_capacity(cases.len());
+        let vectors = !self.vectors_used.is_empty();
         for line in cases.lines() {
             let mut line = line.replace("m.cpu.regs[", "x[");
+            if vectors {
+                for index in &self.vectors_used {
+                    line = line.replace(&format!("m.cpu.vectors[{index}]"), &format!("r.v{index}"));
+                }
+                line = wrap_vector_helpers(&line, &self.store_vectors(), &self.reload_vectors());
+            }
             for index in &self.used {
                 line = line.replace(&format!("x[{index}]"), &format!("r.x{index}"));
             }
@@ -1420,6 +1472,78 @@ impl RegisterLocals {
             }
         }
         text
+    }
+}
+
+/// Each call in `line` that hands the `Cpu` to a helper (`&mut m.cpu`,
+/// `&m.cpu`) or moves Q pairs through it (`m.cpu.load_q_pair`,
+/// `m.cpu.store_q_pair`), wrapped as a block that stores the written vector
+/// locals first and, when the helper may write, reloads the used ones after
+/// (also when it fails, so the window's final store keeps what it left).
+/// Only the call is wrapped: an inline fast path on the same line keeps its
+/// locals.
+fn wrap_vector_helpers(line: &str, store: &str, reload: &str) -> String {
+    let mut text = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        // The earliest helper call left in the line: (start of the call,
+        // index of its opening parenthesis, whether it may write).
+        let found = [
+            ("(&mut m.cpu", true),
+            ("(&m.cpu", false),
+            ("m.cpu.load_q_pair(", true),
+            ("m.cpu.store_q_pair(", false),
+        ]
+        .iter()
+        .filter_map(|&(pattern, writes)| {
+            let at = rest.find(pattern)?;
+            let (start, open) = if pattern.starts_with('(') {
+                // Back over the helper's path to the start of its name.
+                let start = rest[..at]
+                    .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .map_or(0, |i| i + 1);
+                (start, at)
+            } else {
+                (at, at + pattern.len() - 1)
+            };
+            Some((start, open, writes))
+        })
+        .min_by_key(|&(start, _, _)| start);
+        let Some((start, open, writes)) = found else {
+            text.push_str(rest);
+            return text;
+        };
+        // The call's closing parenthesis.
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, c) in rest[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            text.push_str(rest);
+            return text;
+        };
+        let call = &rest[start..=close];
+        let question = rest[close + 1..].starts_with('?');
+        let after = if writes { reload } else { "" };
+        text.push_str(&rest[..start]);
+        if question {
+            write!(text, "{{ {store}let called = {call}; {after}called? }}").unwrap();
+            rest = &rest[close + 2..];
+        } else {
+            write!(text, "{{ {store}let called = {call}; {after}called }}").unwrap();
+            rest = &rest[close + 1..];
+        }
     }
 }
 
@@ -3228,6 +3352,11 @@ pub struct EmitOptions {
     /// is not computed. Where it is dead, nothing reads it before it is
     /// written again, so no guest-visible state changes.
     pub fused_flags: bool,
+    /// Keep the vector registers a window reads or writes directly (the
+    /// inline vector paths) in locals, like the general registers: stored
+    /// and reloaded around each helper or call that takes the `Cpu`, not
+    /// reloaded after every guest store.
+    pub vector_locals: bool,
 }
 
 thread_local! {
@@ -3248,6 +3377,26 @@ impl InlineVector {
 impl Drop for InlineVector {
     fn drop(&mut self) {
         INLINE_VECTOR.set(self.0);
+    }
+}
+
+thread_local! {
+    /// `EmitOptions::vector_locals` of the emission running on this thread.
+    static VECTOR_LOCALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`VECTOR_LOCALS`] for as long as it lives.
+struct VectorLocals(bool);
+
+impl VectorLocals {
+    fn set(on: bool) -> Self {
+        Self(VECTOR_LOCALS.replace(on))
+    }
+}
+
+impl Drop for VectorLocals {
+    fn drop(&mut self) {
+        VECTOR_LOCALS.set(self.0);
     }
 }
 
@@ -3433,6 +3582,7 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _vector_locals = VectorLocals::set(options.vector_locals);
     let _fused_flags = FusedFlags::set(
         options
             .fused_flags

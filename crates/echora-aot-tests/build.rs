@@ -26,7 +26,8 @@ thread_local! {
 
 /// Codegen options: common vector operations as native code with the
 /// `inline-vector` feature, structured emission with `structured`, flag
-/// setters fused with their B.cond with `fused-flags`.
+/// setters fused with their B.cond with `fused-flags`, vector registers in
+/// window locals with `vector-locals`.
 fn options() -> EmitOptions {
     if let Some(mode) = MODE.get() {
         return mode;
@@ -35,6 +36,7 @@ fn options() -> EmitOptions {
         inline_vector: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR").is_some(),
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
         fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
+        vector_locals: std::env::var_os("CARGO_FEATURE_VECTOR_LOCALS").is_some(),
     }
 }
 
