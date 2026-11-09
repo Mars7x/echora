@@ -26,28 +26,40 @@ game.
 
 ## Status
 
-The game boots, shows the title screen and plays the opening movie in colour
-with sound, and after New Game it gets past the movie into its first 3D scene,
-though that scene doesn't render correctly yet. The launcher works with a
-mouse, keyboard or controller.
+In short: Echora runs the game's code, but on its own it can't draw anything
+yet, because I'm in the middle of replacing its shader translator.
 
-Right now I'm replacing the shader translator, so on its own Echora currently
-draws nothing: a run stops at the first shader it can't translate yet, and
-says which one. The section below explains why.
+What works today:
 
-Speed is the other big gap. The console runs the game at 60 frames per
-second. Here the opening movie plays at about 22 to 29 pictures per second,
-limited by video decoding, and the first 3D scene after it at about 6. The
-game's threads now run on up to six CPU cores by default, which makes that
-scene almost three times as fast as on one core. The rest of the gap is the
-speed of the translated code itself and of turning the game's GPU commands
-into Vulkan.
+- Echora reads and checks your NUP file or dump, and translates the whole
+  game, 17.3 million instructions, into native code. The first start takes
+  about an hour; after that it starts straight away.
+- The translated game runs: it boots through the system services, plays its
+  sound, takes input, and gets through New Game and the opening movie into
+  its first 3D scene.
+- The game's threads run on up to six CPU cores by default.
+- The launcher installs the game, changes settings and starts it, with a
+  mouse, keyboard or controller.
 
-The game only runs on Linux at the moment. The rest of the project builds and
-passes its tests on Windows too. These figures come from update 1.1.1
-(`0400486024DEC000` v131072) on an AMD RX 9070 XT. The
-[roadmap](docs/roadmap.md) and [known limitations](docs/limitations.md) go
-into more detail.
+What doesn't work yet:
+
+- Drawing. Echora's own shader translator, written in Rust, handles more than
+  half of the game's compute shaders so far and none of its drawing shaders,
+  so a run stops at the first shader it can't translate and says which one.
+  With the old shader recompiler the title screen and the opening movie
+  rendered correctly; I still load it on my own machine as a plugin to test
+  against. The section below explains why I'm replacing it.
+- Gameplay. The first 3D scene after the movie isn't drawn correctly, and
+  nothing past it has been reached.
+- Speed. The console runs the game at 60 frames per second. Here the opening
+  movie plays at about 22 to 29 pictures per second, limited by video
+  decoding, and the first 3D scene at about 6.
+- Platforms. The game only runs on Linux at the moment. The rest of the
+  project builds and passes its tests on Windows too.
+
+These figures come from update 1.1.1 (`0400486024DEC000` v131072) on an AMD
+RX 9070 XT. The [roadmap](docs/roadmap.md) and
+[known limitations](docs/limitations.md) go into more detail.
 
 ## What I'm working on
 
