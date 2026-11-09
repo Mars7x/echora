@@ -34,11 +34,11 @@ What works today:
 - Echora reads and checks your NUP file or dump, and translates the whole
   game, 17.3 million instructions, into native code. The first start takes
   about an hour; after that it starts straight away.
-- The translated game runs. With the old shader recompiler loaded as a
-  plugin, as on my machine, it boots through the system services, plays its
-  sound, takes input, and gets through New Game and the opening movie into
-  its first 3D scene. Without it, a run stops at the first draw, before the
-  title screen.
+- The translated game runs. With the old shader recompiler, which I still
+  use on my own machine for testing, it boots through the system services,
+  plays its sound, takes input, and gets through New Game and the opening
+  movie into its first 3D scene. Without it, a run stops at the first draw,
+  before the title screen.
 - The game's threads run on up to six CPU cores by default.
 - The launcher installs the game, changes settings and starts it, with a
   mouse, keyboard or controller.
@@ -83,8 +83,7 @@ So I'm writing Echora's translator in Rust, for four reasons:
 
 It is a new design, with the details of each instruction checked against
 public references and every translation compared with the old recompiler on
-my own machine. The old recompiler is no longer part of Echora, but it can
-still be loaded as a separate plugin for testing.
+my own machine. The old recompiler is no longer part of Echora.
 
 Once the title screen, the movie and the first 3D scene render through the new
 translator, the next steps are getting that scene right, reaching gameplay,
