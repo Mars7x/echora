@@ -33,20 +33,31 @@ const AGAIN: i32 = -35;
 )))]
 const AGAIN: i32 = -11;
 
-/// A decoded 8-bit 4:2:0 picture with rows packed tightly.
+/// A decoded 8-bit 4:2:0 picture as NV12, the layout the guest's video
+/// output takes: `height` rows of luma, then `ceil(height / 2)` rows of
+/// interleaved U and V, both `pitch` (the width rounded up to even) bytes
+/// apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    /// width x height luma samples.
-    pub y: Vec<u8>,
-    /// ceil(width / 2) x ceil(height / 2) samples each.
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub nv12: Vec<u8>,
     /// Full-range samples (the sequence header's color_range).
     pub full_range: bool,
     /// The sequence header's matrix coefficients (1 BT.709, 6 BT.601, ...).
     pub matrix: u32,
+}
+
+impl Picture {
+    /// Bytes from one row to the next in both planes.
+    pub fn pitch(&self) -> usize {
+        (self.width as usize).next_multiple_of(2)
+    }
+
+    /// Offset of the interleaved chroma rows.
+    pub fn chroma_offset(&self) -> usize {
+        self.pitch() * self.height as usize
+    }
 }
 
 pub struct Decoder {
@@ -180,23 +191,37 @@ unsafe fn copy_planes(picture: &Dav1dPicture) -> Result<Picture, String> {
     }
     let (width, height) = (parameters.w as usize, parameters.h as usize);
     let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let plane =
-        |index: usize, stride: isize, columns: usize, rows: usize| -> Result<Vec<u8>, String> {
-            let base = picture.data[index].ok_or("rav1d picture without a plane")?;
-            let mut out = Vec::with_capacity(columns * rows);
-            for row in 0..rows {
-                // SAFETY: each of the plane's rows holds at least `columns`
-                // samples `stride` bytes apart (the caller's contract).
-                let line = unsafe {
-                    std::slice::from_raw_parts(
-                        (base.as_ptr() as *const u8).offset(row as isize * stride),
-                        columns,
-                    )
-                };
-                out.extend_from_slice(line);
-            }
-            Ok(out)
+    let pitch = width.next_multiple_of(2);
+    let base = |index: usize| {
+        picture.data[index]
+            .map(|base| base.as_ptr() as *const u8)
+            .ok_or("rav1d picture without a plane")
+    };
+    let (luma, u, v) = (base(0)?, base(1)?, base(2)?);
+    let mut nv12 = vec![0u8; pitch * (height + chroma_height)];
+    let (luma_rows, chroma_rows) = nv12.split_at_mut(pitch * height);
+    for (row, line) in luma_rows.chunks_exact_mut(pitch).enumerate() {
+        // SAFETY: each luma row holds `width` samples `stride[0]` bytes
+        // apart (the caller's contract).
+        let source = unsafe {
+            std::slice::from_raw_parts(luma.offset(row as isize * picture.stride[0]), width)
         };
+        line[..width].copy_from_slice(source);
+    }
+    for (row, line) in chroma_rows.chunks_exact_mut(pitch).enumerate() {
+        let at = row as isize * picture.stride[1];
+        // SAFETY: as above, for the two chroma planes (`stride[1]`).
+        let (u, v) = unsafe {
+            (
+                std::slice::from_raw_parts(u.offset(at), chroma_width),
+                std::slice::from_raw_parts(v.offset(at), chroma_width),
+            )
+        };
+        for ((pair, u), v) in line.chunks_exact_mut(2).zip(u).zip(v) {
+            pair[0] = *u;
+            pair[1] = *v;
+        }
+    }
     let (full_range, matrix) = match picture.seq_hdr {
         // SAFETY: the sequence header lives as long as the picture.
         Some(header) => unsafe {
@@ -208,9 +233,7 @@ unsafe fn copy_planes(picture: &Dav1dPicture) -> Result<Picture, String> {
     Ok(Picture {
         width: width as u32,
         height: height as u32,
-        y: plane(0, picture.stride[0], width, height)?,
-        u: plane(1, picture.stride[1], chroma_width, chroma_height)?,
-        v: plane(2, picture.stride[1], chroma_width, chroma_height)?,
+        nv12,
         full_range,
         matrix,
     })
@@ -234,15 +257,15 @@ impl Picture {
         };
         let kg = 1.0 - kr - kb;
         let (width, height) = (self.width as usize, self.height as usize);
-        let chroma_width = width.div_ceil(2);
+        let (pitch, chroma_rows) = (self.pitch(), self.chroma_offset());
         let mut out = vec![0u8; width * height * 4];
         for row in 0..height {
             for column in 0..width {
-                let chroma = (row / 2) * chroma_width + column / 2;
+                let chroma = chroma_rows + (row / 2) * pitch + column / 2 * 2;
                 let (mut y, mut cb, mut cr) = (
-                    f32::from(self.y[row * width + column]),
-                    f32::from(self.u[chroma]) - 128.0,
-                    f32::from(self.v[chroma]) - 128.0,
+                    f32::from(self.nv12[row * pitch + column]),
+                    f32::from(self.nv12[chroma]) - 128.0,
+                    f32::from(self.nv12[chroma + 1]) - 128.0,
                 );
                 if !self.full_range {
                     y = (y - 16.0) * (255.0 / 219.0);
@@ -280,9 +303,7 @@ mod tests {
         let picture = Picture {
             width: 2,
             height: 2,
-            y: vec![126; 4],
-            u: vec![128],
-            v: vec![128],
+            nv12: vec![126, 126, 126, 126, 128, 128],
             full_range: false,
             matrix: 1,
         };

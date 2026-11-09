@@ -2520,6 +2520,16 @@ impl Nvn {
         }
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: texture uploads", 1);
+        // ECHORA_UPLOAD_LOG (debugging): uploads counted by shape, to find
+        // textures re-uploaded every present.
+        if super::debug_var_os("ECHORA_UPLOAD_LOG").is_some() {
+            let layout = if stride != 0 { "pitch" } else { "block" };
+            let note = format!(
+                "upload {} {width}x{height} {layout} at {base:#x} (texture {texture:#x})",
+                info.name
+            );
+            *backend.notes.entry(note).or_default() += 1;
+        }
         backend.shadow_quiet.remove(&texture);
         backend.stat("stat: texture checks", 1);
         backend.stat("stat: texture check microseconds", check_micros);

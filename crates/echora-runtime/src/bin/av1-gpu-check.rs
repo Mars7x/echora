@@ -31,27 +31,6 @@ fn temporal_units(data: &[u8]) -> Result<Vec<&[u8]>, String> {
         .collect())
 }
 
-/// rav1d's planes as NV12 rows `pitch` bytes apart.
-fn nv12(picture: &echora_runtime::av1::Picture, pitch: u32) -> Vec<u8> {
-    let (width, height) = (picture.width as usize, picture.height as usize);
-    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let pitch = pitch as usize;
-    let mut out = vec![0u8; nv12_size(picture.height, pitch as u32)];
-    for row in 0..height {
-        out[row * pitch..row * pitch + width]
-            .copy_from_slice(&picture.y[row * width..(row + 1) * width]);
-    }
-    let base = pitch * height;
-    for row in 0..chroma_height {
-        for column in 0..chroma_width {
-            let at = base + row * pitch + column * 2;
-            out[at] = picture.u[row * chroma_width + column];
-            out[at + 1] = picture.v[row * chroma_width + column];
-        }
-    }
-    out
-}
-
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
@@ -125,9 +104,8 @@ fn main() {
             else {
                 break;
             };
-            let pitch = width.next_multiple_of(2);
-            let expected = nv12(&reference, pitch);
-            let luma = (pitch * height) as usize;
+            let expected = &reference.nv12;
+            let luma = reference.chroma_offset();
             let differ = |range: std::ops::Range<usize>| {
                 let (mut count, mut largest) = (0usize, 0u8);
                 for (a, b) in ours[range.clone()].iter().zip(&expected[range]) {
@@ -143,7 +121,7 @@ fn main() {
             if let Some(directory) = std::env::var_os("AV1_CHECK_DUMP") {
                 let directory = std::path::Path::new(&directory);
                 let _ = std::fs::write(directory.join(format!("gpu-{compared}.nv12")), &ours);
-                let _ = std::fs::write(directory.join(format!("cpu-{compared}.nv12")), &expected);
+                let _ = std::fs::write(directory.join(format!("cpu-{compared}.nv12")), expected);
             }
             let size_ok = (width, height) == (reference.width, reference.height);
             let (y, y_max) = differ(0..luma);

@@ -4643,31 +4643,14 @@ impl Services {
         Some((|| {
             let mut pictures = Vec::new();
             for shown in movie.decode(bytes)? {
-                let (width, height) = (shown.width as usize, shown.height as usize);
-                let pitch = width.next_multiple_of(2);
-                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch as u32)];
-                movie.read_nv12(shown, pitch as u32, &mut nv12)?;
-                let (luma, chroma) = nv12.split_at(pitch * height);
-                let y = luma
-                    .chunks(pitch)
-                    .flat_map(|row| &row[..width])
-                    .copied()
-                    .collect();
-                let chroma_width = width.div_ceil(2);
-                let (mut u, mut v) = (Vec::new(), Vec::new());
-                for row in chroma.chunks(pitch).take(height.div_ceil(2)) {
-                    for pair in row[..chroma_width * 2].chunks(2) {
-                        u.push(pair[0]);
-                        v.push(pair[1]);
-                    }
-                }
+                let pitch = shown.width.next_multiple_of(2);
+                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch)];
+                movie.read_nv12(shown, pitch, &mut nv12)?;
                 let (full_range, matrix) = movie.color().unwrap_or((false, 1));
                 pictures.push(crate::av1::Picture {
                     width: shown.width,
                     height: shown.height,
-                    y,
-                    u,
-                    v,
+                    nv12,
                     full_range,
                     matrix,
                 });
@@ -7030,28 +7013,18 @@ impl Services {
                 let mut descriptor = [0u8; 0x80];
                 descriptor[0] = 0x14;
                 if let Some(picture) = self.slot_pictures.get(&image) {
-                    let (width, height) = (picture.width as usize, picture.height as usize);
-                    let chroma_width = width.div_ceil(2);
-                    let mut uv = Vec::with_capacity(chroma_width * 2 * height.div_ceil(2));
-                    for (u, v) in picture.u.iter().zip(&picture.v) {
-                        uv.push(*u);
-                        uv.push(*v);
-                    }
-                    let pitch = chroma_width as u64 * 2;
-                    let uv_offset = offset + pitch * height as u64;
-                    if uv_offset + uv.len() as u64 > offset + share {
+                    let (width, height) = (picture.width, picture.height);
+                    // The picture is already NV12 at the guest's pitch: luma
+                    // rows, then interleaved chroma rows.
+                    let pitch = picture.pitch() as u64;
+                    let uv_offset = offset + picture.chroma_offset() as u64;
+                    if picture.nv12.len() as u64 > share {
                         return Err(call.unsupported(
                             SERVICE,
                             format!("{width}x{height} picture in a {share:#x}-byte image"),
                         ));
                     }
-                    let mut y = Vec::with_capacity(pitch as usize * height);
-                    for row in picture.y.chunks(width) {
-                        y.extend_from_slice(row);
-                        y.resize(y.len() + pitch as usize - width, 0);
-                    }
-                    call.memory.write(address + offset, &y)?;
-                    call.memory.write(address + uv_offset, &uv)?;
+                    call.memory.write(address + offset, &picture.nv12)?;
                     descriptor[8..12].copy_from_slice(&(offset as u32).to_le_bytes());
                     descriptor[0x10..0x18].copy_from_slice(&pitch.to_le_bytes());
                     descriptor[0x18..0x1c].copy_from_slice(&(uv_offset as u32).to_le_bytes());
