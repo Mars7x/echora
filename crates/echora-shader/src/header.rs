@@ -31,6 +31,10 @@ pub struct Header {
     pub targets: u32,
     pub writes_depth: bool,
     pub writes_sample_mask: bool,
+    /// Local memory bytes per invocation: common word 1's low 24 bits
+    /// (ShaderLocalMemoryLowSize); `None` when common word 2's high size
+    /// (bits 32 and up of the size) is not zero.
+    pub local_bytes: Option<u32>,
 }
 
 fn bits(bytes: &[u8], offset: usize, count: usize) -> u32 {
@@ -75,6 +79,7 @@ pub fn parse(program: &[u8]) -> Option<Header> {
         targets: if pixel { bits(bytes, 576, 32) } else { 0 },
         writes_sample_mask: pixel && bits(bytes, 608, 1) != 0,
         writes_depth: pixel && bits(bytes, 609, 1) != 0,
+        local_bytes: (bits(bytes, 64, 24) == 0).then(|| bits(bytes, 32, 24)),
     })
 }
 

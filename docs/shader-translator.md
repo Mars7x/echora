@@ -134,7 +134,7 @@ reads once. A
 fragment program leaves its outputs in R0.. at exit: four registers per
 render target the SPH enables (four component bits each at bits
 576-607), then a register for the sample mask (bit 608) and the depth
-(bit 609). KILL demotes the invocation to a helper. `stores` has bit
+(bit 609). KILL demotes the invocation to a helper. A graphics program's local memory size is the SPH's ShaderLocalMemoryLowSize (common word 1, bits 0-23); a nonzero high size (common word 2, bits 32 and up of the size) is refused. `stores` has bit
 (address / 4) set for every attribute word written.
 
 **Storage images.** A formatted image access (SULD.P, SUST.P) is typeless

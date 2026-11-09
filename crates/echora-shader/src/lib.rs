@@ -40,7 +40,8 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             header: Some(header),
             workgroup: [1, 1, 1],
             shared_bytes: None,
-            local_bytes: parameters.local_memory_size,
+            // Graphics programs carry it in their header.
+            local_bytes: parameters.local_memory_size.or(header.local_bytes),
             matrices: if parameters.cooperative_matrix {
                 compute::MatrixPath::Cooperative
             } else {
@@ -403,6 +404,20 @@ mod tests {
         if let Some(problem) = spirv::tests::validate(&translated.spirv) {
             panic!("{problem}");
         }
+    }
+
+    #[test]
+    fn graphics_programs_take_their_local_memory_size_from_the_header() {
+        // 0x40 bytes of local memory (common word 1); STL [R1], R0 then
+        // LDL R2, [R1].
+        let mut program = header(2, 5, &[38]);
+        program.extend(bytes(&[
+            word(&[(0, 12, 0x387), (24, 8, 1), (32, 8, 0), (73, 3, 4)]),
+            word(&[(0, 12, 0x983), (16, 8, 2), (24, 8, 1), (73, 3, 4)]),
+            EXIT,
+        ]));
+        assert_eq!(header::parse(&program).unwrap().local_bytes, Some(0x40));
+        validated(&program);
     }
 
     #[test]
