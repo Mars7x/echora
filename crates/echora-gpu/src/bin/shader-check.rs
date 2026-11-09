@@ -98,15 +98,7 @@ fn main() {
             let mut compile = None;
             let outcome = match shader::translate_rust(&bytes, &parameters) {
                 Err(unsupported) => format!("unsupported: {}", unsupported.reason),
-                Ok(program) => match {
-                    let started = std::time::Instant::now();
-                    let result = gpu.check_stage(&program);
-                    compile = Some((
-                        started.elapsed().as_secs_f64() * 1e3,
-                        program.texture_pool_bindings != 0,
-                    ));
-                    result
-                } {
+                Ok(program) => match timed_check(&gpu, &program, &mut compile) {
                     Err(error) => format!("driver rejects: {error}"),
                     Ok(()) => match shader::translate(&bytes, parameters, &mut NoEnvironment) {
                         Err(_) => "translated (the plugin does not)".into(),
@@ -213,4 +205,20 @@ fn main() {
             println!("{count:6} {outcome}");
         }
     }
+}
+
+/// `check_stage`, noting its compile time (ms) and whether the program
+/// reads the texture pool.
+fn timed_check(
+    gpu: &Gpu,
+    program: &shader::Translated,
+    compile: &mut Option<(f64, bool)>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let result = gpu.check_stage(program);
+    *compile = Some((
+        started.elapsed().as_secs_f64() * 1e3,
+        program.texture_pool_bindings != 0,
+    ));
+    result
 }
