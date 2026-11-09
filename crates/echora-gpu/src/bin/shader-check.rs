@@ -105,7 +105,23 @@ fn main() {
                     },
                 },
             };
-            *rust.entry(outcome).or_default() += 1;
+            // Split by stage kind (the SPH's shader type for graphics).
+            let kind = if graphics {
+                match bytes
+                    .first_chunk::<4>()
+                    .map_or(0, |b| (u32::from_le_bytes(*b) >> 10) & 0xf)
+                {
+                    1 => "vertex",
+                    2 => "tess control",
+                    3 => "tess eval",
+                    4 => "geometry",
+                    5 => "fragment",
+                    _ => "graphics",
+                }
+            } else {
+                "compute"
+            };
+            *rust.entry(format!("{kind:8} {outcome}")).or_default() += 1;
         }
         let program = match shader::translate(&bytes, parameters, &mut NoEnvironment) {
             Ok(program) => program,

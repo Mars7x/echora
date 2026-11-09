@@ -8,7 +8,7 @@
 /// Changes whenever anything a translated program relies on changes (the
 /// push-constant layout, the page-table format, descriptor numbering). It
 /// is stored in every `Translated` and is part of every shader cache key.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// A program's pipeline stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -165,9 +165,12 @@ pub struct Translated {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PushConstants {
-    /// Bytes 0..96: words of the translator's own (the C++ recompiler's
+    /// Bytes 0..80: words of the translator's own (the C++ recompiler's
     /// texture rescaling bits, say).
-    pub translator: [u32; 24],
+    pub translator: [u32; 20],
+    /// Bytes 80..96: where a vertex program's generic inputs come from
+    /// (`VertexFetch`).
+    pub vertex_fetch: VertexFetch,
     /// Bytes 96..112: render-target resolution scale (x, y, inverse x,
     /// inverse y).
     pub resolution_scale: [f32; 4],
@@ -179,8 +182,10 @@ pub struct PushConstants {
 pub const PUSH_TRANSLATOR: u32 = 1;
 pub const PUSH_RESOLUTION_SCALE: u32 = 2;
 pub const PUSH_PAGE_TABLE: u32 = 4;
+pub const PUSH_VERTEX_FETCH: u32 = 8;
 
 pub const PUSH_TRANSLATOR_OFFSET: u32 = 0;
+pub const PUSH_VERTEX_FETCH_OFFSET: u32 = 80;
 pub const PUSH_RESOLUTION_SCALE_OFFSET: u32 = 96;
 pub const PUSH_PAGE_TABLE_OFFSET: u32 = 112;
 pub const PUSH_CONSTANTS_SIZE: u32 = 128;
@@ -209,6 +214,145 @@ pub struct PageTable {
     pub page_count: u32,
 }
 
+/// Vertex pulling: a vertex program reads its generic inputs from guest
+/// memory itself, through the page table, as the console's hardware
+/// fetches them; so one translation serves every vertex format. The draw's
+/// fetch table is a buffer of `VertexAttribute`s, one per generic input
+/// location (up to `VERTEX_ATTRIBUTES`), read through
+/// PhysicalStorageBuffer64 at `table`.
+///
+/// For the input at location `n`, `entry = table[n]`:
+/// - element index: `VertexIndex` (Vulkan's, base vertex included) when
+///   `divisor == 0`, else `base_instance + (InstanceIndex - base_instance) /
+///   divisor`;
+/// - its bytes start at guest address `entry.address + element *
+///   entry.stride`; each 32-bit word (or smaller component, inside its
+///   aligned word) is looked up in the page table on its own, so an
+///   element may straddle pages; bytes at or past `entry.size` from
+///   `entry.address` read as 0;
+/// - `entry.format` (`VertexFormat`) says how to decode them. The result is
+///   four 32-bit words as the guest's ALD reads them: float bits for
+///   normalized, scaled and float formats, the integer for integer formats
+///   (sign-extended for signed). Components the format lacks read (0, 0,
+///   0, 1), with 1 as 1.0 for float results and 1 for integer ones. An
+///   entry with no components (unbound or unformatted) reads (0.0, 0.0,
+///   0.0, 1.0).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertexFetch {
+    /// Device address of the draw's `VertexAttribute` table (0: no table;
+    /// every input reads as unbound).
+    pub table: u64,
+    /// The draw's first instance (`InstanceIndex` of instance 0).
+    pub base_instance: u32,
+    /// Bit n: `table[n]` is present (locations past the table are unbound).
+    pub attributes: u32,
+}
+
+pub const VERTEX_ATTRIBUTES: usize = 32;
+
+/// One generic input's source, 32 bytes, std430.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertexAttribute {
+    /// Guest GPU address of element 0's first byte (stream base plus the
+    /// attribute's offset).
+    pub address: u64,
+    /// Bytes from one element to the next (0: every element is the same).
+    pub stride: u32,
+    /// 0: per vertex; n: per instance, advancing every n instances.
+    pub divisor: u32,
+    /// `VertexFormat::encode`.
+    pub format: u32,
+    /// Bytes readable from `address` (the bound stream's size past it).
+    pub size: u32,
+    pub reserved: [u32; 2],
+}
+
+/// How the bytes of one vertex element decode. Encoded as bits 0..3
+/// components (0-4), 4..8 `Layout`, 8..12 `Numeric`, bit 12 BGRA order
+/// (components 0 and 2 swapped after decoding).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertexFormat {
+    pub components: u32,
+    pub layout: VertexLayout,
+    pub numeric: VertexNumeric,
+    pub bgra: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VertexLayout {
+    /// Components of 8, 16 or 32 bits each.
+    #[default]
+    Bits8 = 0,
+    Bits16 = 1,
+    Bits32 = 2,
+    /// One 32-bit word: 10, 10, 10, 2 bits (RGB10A2), from bit 0.
+    Packed1010102 = 3,
+    /// One 32-bit word: unsigned 11-, 11-, 10-bit floats (R11G11B10F).
+    Packed111110 = 4,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VertexNumeric {
+    /// Unsigned normalized to [0, 1].
+    #[default]
+    Unorm = 0,
+    /// Signed normalized to [-1, 1] (the most negative value clamps to -1).
+    Snorm = 1,
+    /// Unsigned integer, kept as an integer.
+    Uint = 2,
+    /// Signed integer, kept as an integer.
+    Sint = 3,
+    /// IEEE half (16-bit) or single (32-bit) float.
+    Float = 4,
+    /// Unsigned integer converted to float.
+    Uscaled = 5,
+    /// Signed integer converted to float.
+    Sscaled = 6,
+}
+
+impl VertexFormat {
+    pub fn encode(self) -> u32 {
+        self.components & 7
+            | (self.layout as u32) << 4
+            | (self.numeric as u32) << 8
+            | u32::from(self.bgra) << 12
+    }
+
+    pub fn decode(word: u32) -> Option<Self> {
+        let layout = match word >> 4 & 0xf {
+            0 => VertexLayout::Bits8,
+            1 => VertexLayout::Bits16,
+            2 => VertexLayout::Bits32,
+            3 => VertexLayout::Packed1010102,
+            4 => VertexLayout::Packed111110,
+            _ => return None,
+        };
+        let numeric = match word >> 8 & 0xf {
+            0 => VertexNumeric::Unorm,
+            1 => VertexNumeric::Snorm,
+            2 => VertexNumeric::Uint,
+            3 => VertexNumeric::Sint,
+            4 => VertexNumeric::Float,
+            5 => VertexNumeric::Uscaled,
+            6 => VertexNumeric::Sscaled,
+            _ => return None,
+        };
+        Some(Self {
+            components: word & 7,
+            layout,
+            numeric,
+            bgra: word >> 12 & 1 != 0,
+        })
+    }
+
+    /// Whether components decode to integers (else to float bits).
+    pub fn integer(self) -> bool {
+        matches!(self.numeric, VertexNumeric::Uint | VertexNumeric::Sint)
+    }
+}
+
 pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
@@ -227,6 +371,10 @@ mod tests {
             PUSH_TRANSLATOR_OFFSET as usize
         );
         assert_eq!(
+            std::mem::offset_of!(PushConstants, vertex_fetch),
+            PUSH_VERTEX_FETCH_OFFSET as usize
+        );
+        assert_eq!(
             std::mem::offset_of!(PushConstants, resolution_scale),
             PUSH_RESOLUTION_SCALE_OFFSET as usize
         );
@@ -235,6 +383,20 @@ mod tests {
             PUSH_PAGE_TABLE_OFFSET as usize
         );
         assert_eq!(std::mem::size_of::<PageTable>(), 16);
+        assert_eq!(std::mem::size_of::<VertexFetch>(), 16);
+        assert_eq!(std::mem::size_of::<VertexAttribute>(), 32);
+    }
+
+    #[test]
+    fn vertex_formats_round_trip() {
+        let format = VertexFormat {
+            components: 4,
+            layout: VertexLayout::Bits8,
+            numeric: VertexNumeric::Unorm,
+            bgra: true,
+        };
+        assert_eq!(VertexFormat::decode(format.encode()), Some(format));
+        assert_eq!(VertexFormat::decode(0).map(|f| f.components), Some(0));
     }
 
     #[test]

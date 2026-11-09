@@ -68,6 +68,16 @@ goals first-class, next to correctness:
   misaligned global access faults on the hardware) and at most 16 bytes, so
   none crosses a page: the first byte's page decides. An unmapped or
   out-of-range page reads 0 and drops writes.
+- **Vertex pulling**: a vertex program fetches its generic inputs from
+  guest memory itself, through the page table, so one translation serves
+  every attribute format. Bytes 80-96 of the push-constant block
+  (`VertexFetch`) hold the address of the draw's table of
+  `VertexAttribute`s (one per input location: guest address, stride,
+  instance divisor, format, readable size), the base instance and a mask
+  of present entries. The format is decoded in the shader
+  (`VertexFormat`: component count, 8/16/32-bit or packed layout, and
+  normalized, integer, float or scaled numbers), bit-exact for integers.
+  Index buffers stay fixed-function.
 
 ## Plan
 
