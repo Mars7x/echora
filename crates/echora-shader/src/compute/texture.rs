@@ -3,7 +3,10 @@
 //! the runtime binds from that word (`Descriptor::cbuf_index` and
 //! `cbuf_offset`), so a translation holds no texture state.
 
-use echora_shader_abi::{Descriptor, Unsupported};
+use echora_shader_abi::{
+    Descriptor, SAMPLER_INDEX_SHIFT, TEXTURE_INDEX_MASK, TEXTURE_POOL_SET, Unsupported,
+    texture_pool,
+};
 
 use super::{Emitter, unsupported};
 use crate::decode::{Texture, TextureOp};
@@ -41,21 +44,6 @@ fn view(dimension: u8) -> Option<View> {
         coordinates,
     })
 }
-
-/// The texture pool for handles computed at run time (ABI version 4): set
-/// 1, an unsized array per view type, indexed by the handle's low 20 bits,
-/// and the samplers by its high 12.
-const POOL_SET: u32 = 1;
-const POOL_TEXTURE_MASK: u32 = 0xf_ffff;
-const POOL_SAMPLER_SHIFT: u32 = 20;
-const POOL_SAMPLERS: u32 = 0;
-const POOL_SAMPLED_1D: u32 = 1;
-const POOL_SAMPLED_1D_ARRAY: u32 = 2;
-const POOL_SAMPLED_2D: u32 = 3;
-const POOL_SAMPLED_2D_ARRAY: u32 = 4;
-const POOL_SAMPLED_3D: u32 = 5;
-const POOL_SAMPLED_CUBE: u32 = 6;
-const POOL_SAMPLED_CUBE_ARRAY: u32 = 7;
 
 /// The runtime's descriptor kind for a texture.
 const KIND_TEXTURE: u32 = 4;
@@ -141,13 +129,13 @@ impl Emitter {
             return Ok((sampled, types));
         };
         let binding = match (view.dim, view.arrayed) {
-            (0, false) => POOL_SAMPLED_1D,
-            (0, true) => POOL_SAMPLED_1D_ARRAY,
-            (1, false) => POOL_SAMPLED_2D,
-            (1, true) => POOL_SAMPLED_2D_ARRAY,
-            (2, _) => POOL_SAMPLED_3D,
-            (3, false) => POOL_SAMPLED_CUBE,
-            (3, true) => POOL_SAMPLED_CUBE_ARRAY,
+            (0, false) => texture_pool::SAMPLED_1D,
+            (0, true) => texture_pool::SAMPLED_1D_ARRAY,
+            (1, false) => texture_pool::SAMPLED_2D,
+            (1, true) => texture_pool::SAMPLED_2D_ARRAY,
+            (2, _) => texture_pool::SAMPLED_3D,
+            (3, false) => texture_pool::SAMPLED_CUBE,
+            (3, true) => texture_pool::SAMPLED_CUBE_ARRAY,
             _ => return Err(unsupported(index, "texture pool view")),
         };
         // The pool's images take no depth flag: the sampler's state
@@ -155,14 +143,14 @@ impl Emitter {
         let types = self.texture_types(view, false);
         let handle = self.read_uniform(register.0);
         let (mask, shift) = (
-            self.constant(POOL_TEXTURE_MASK),
-            self.constant(POOL_SAMPLER_SHIFT),
+            self.constant(TEXTURE_INDEX_MASK),
+            self.constant(SAMPLER_INDEX_SHIFT),
         );
         let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
         let sampler_index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
         let image = self.pool_entry(binding, types.image, texture_index);
         let sampler_type = self.module.ty(Type::Sampler);
-        let sampler = self.pool_entry(POOL_SAMPLERS, sampler_type, sampler_index);
+        let sampler = self.pool_entry(texture_pool::SAMPLERS, sampler_type, sampler_index);
         let sampled = self.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
         self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
         Ok((sampled, types))
@@ -184,7 +172,7 @@ impl Emitter {
                     .module
                     .global_variable(pointer, storage::UNIFORM_CONSTANT);
                 self.module
-                    .decorate(variable, decoration::DESCRIPTOR_SET, &[POOL_SET]);
+                    .decorate(variable, decoration::DESCRIPTOR_SET, &[TEXTURE_POOL_SET]);
                 self.module
                     .decorate(variable, decoration::BINDING, &[binding]);
                 self.interface.push(variable);

@@ -463,7 +463,7 @@ impl Emitter {
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: self.spec_constants,
             push_fields: self.push_fields,
-            texture_pool_bindings: 0,
+            texture_pool_bindings: self.pool_bindings,
         }
     }
 
@@ -3764,6 +3764,12 @@ mod tests {
         // time: it indexes the texture pool (set 1) instead.
         let computed = valid(&[uldc, uiadd3, bindless, EXIT]);
         assert!(computed.descriptors.iter().all(|d| d.kind != 4));
+        // The 2D images and the samplers.
+        use echora_shader_abi::texture_pool::{SAMPLED_2D, SAMPLERS};
+        assert_eq!(
+            computed.texture_pool_bindings,
+            1 << SAMPLERS | 1 << SAMPLED_2D
+        );
     }
 
     /// Whether the module has an OpSwitch (the dispatch loop's).
