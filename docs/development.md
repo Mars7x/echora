@@ -22,9 +22,8 @@ target/release/echora extract /path/to/game.nup out --subtree romfs
 See [content input](content.md) for the formats Echora reads.
 
 `prepare` does nothing when the game is already prepared. The steps it
-runs can also be run one at a time: `scripts/fetch-shader-sources.sh`
-(before lifting, since `lift` records where the shader sources are),
-`echora lift`, then `cargo build --release -p echora-run` in the
+runs can also be run one at a time: `echora lift`, then
+`cargo build --release -p echora-run` in the
 translation folder it prints. A translation built by hand this way is
 used as it is.
 

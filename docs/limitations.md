@@ -17,9 +17,9 @@ to be missing or incomplete.
   return linkage mode. Draws that need them are skipped.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
-- Shader translation needs the fetched recompiler sources
-  (`ECHORA_SHADER_SRC`). Binaries built with them include AGPL-3.0 code from
-  sirit.
+- The Rust shader translator does not translate programs yet. Without an
+  external translator plugin ([shader-plugin.md](shader-plugin.md)) the
+  run stops at the first program it does not handle, naming the reason.
 
 ## Performance
 

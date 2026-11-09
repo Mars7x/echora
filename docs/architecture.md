@@ -15,7 +15,7 @@ crates chosen for each host.
 | `echora-guest` | The guest CPU state, guest memory and the `Core` that generated code runs against, with a memory backend for each host. |
 | `echora-simd` | The vector and floating-point operations. Generated code reaches them through declarations in `echora-guest`, so changing one does not recompile the game's code. |
 | `echora-runtime` | Boots the game and runs it: threads and scheduling, kernel calls, IPC and system services, file systems, input, audio, movies, and the NVN graphics layer. |
-| `echora-gpu` | The Vulkan device, renderer and presentation, plus shader translation through the Lichii recompiler. |
+| `echora-gpu` | The Vulkan device, renderer and presentation, plus shader translation: the Rust translator (`echora-shader`) and an optional external plugin (docs/shader-plugin.md). |
 | `echora-input` | Gamepads as a Switch controller: evdev on Linux, gilrs on Windows. |
 | `echora-audio` | Plays the game's audio on the default output device through CPAL. |
 | `echora-resolution` | Plans render and output sizes. Not yet connected to the renderer. |

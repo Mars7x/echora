@@ -1,6 +1,6 @@
 [package]
 name = "echora-gpu"
-description = "Vulkan backend for the NVN layer, and shader translation through the recompiler library"
+description = "Vulkan backend for the NVN layer, and shader translation (Rust translator, external plugin)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,9 +15,6 @@ echora-shader-abi.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-
-[build-dependencies]
-cc = { version = "1", features = ["parallel"] }
 
 [dev-dependencies]
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }

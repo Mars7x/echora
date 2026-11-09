@@ -1,5 +1,5 @@
-//! Host GPU execution of NVN work (ECHORA_GPU=1, with the shader recompiler
-//! linked through ECHORA_SHADER_LIB): bound programs are translated, their
+//! Host GPU execution of NVN work (ECHORA_GPU=1): bound programs are
+//! translated (`echora_gpu::shader`), their
 //! bindings resolved through the inferred NVN2 binding map (docs/roadmap.md),
 //! and clears and draws run through `echora_gpu`.
 //!
@@ -118,8 +118,10 @@ impl Backend {
         if super::debug_var_os("ECHORA_GPU").is_none_or(|value| value == "0") {
             return Ok(None);
         }
-        if !shader::AVAILABLE {
-            return Err("ECHORA_GPU needs the shader recompiler (ECHORA_SHADER_LIB)".into());
+        if !shader::available() {
+            eprintln!(
+                "gpu: no shader translator plugin is installed (ECHORA_SHADER_PLUGIN): programs the Rust translator does not handle are skipped"
+            );
         }
         let gpu = echora_gpu::vulkan::Gpu::new()?;
         let mut renderer = Renderer::new(gpu)?;
@@ -998,7 +1000,7 @@ impl Nvn {
             // Compute programs see the bindings of the dispatch that
             // first runs them (which constant buffer words are
             // pointers); graphics stages bind every candidate.
-            let lichii = |nvn: &Self| {
+            let plugin = |nvn: &Self| {
                 if compute[0] != 0 {
                     shader::translate(&code, parameters, &mut PointerProbe { nvn, core })
                 } else {
@@ -1006,10 +1008,10 @@ impl Nvn {
                 }
             };
             // ECHORA_SHADER_TRANSLATOR: the Rust translator for programs it
-            // handles (`rust`), or beside the C++ one for a report
+            // handles (`rust`), or beside the plugin for a report
             // (`compare`); what it does not handle is noted by reason.
             let translator = shader::Translator::from_env();
-            let rust = (translator != shader::Translator::Lichii)
+            let rust = (translator != shader::Translator::Plugin)
                 .then(|| shader::translate_rust(&code, &parameters));
             let result = match (translator, rust) {
                 (shader::Translator::Rust, Some(Ok(translated))) => {
@@ -1018,19 +1020,26 @@ impl Nvn {
                 }
                 (_, Some(Err(unsupported))) => {
                     notes.push(format!("rust translator: {}", unsupported.reason));
-                    lichii(self)
+                    if shader::available() {
+                        plugin(self)
+                    } else {
+                        Err(match unsupported.offset {
+                            Some(offset) => format!("{} (at byte {offset:#x})", unsupported.reason),
+                            None => unsupported.reason,
+                        })
+                    }
                 }
                 (shader::Translator::Compare, Some(Ok(rust))) => {
-                    let lichii = lichii(self);
-                    if let Ok(lichii) = &lichii {
-                        notes.push(match shader::compare(lichii, &rust) {
+                    let plugin = plugin(self);
+                    if let Ok(plugin) = &plugin {
+                        notes.push(match shader::compare(plugin, &rust) {
                             Some(difference) => format!("rust translator differs: {difference}"),
                             None => "stat: rust translator alike".into(),
                         });
                     }
-                    lichii
+                    plugin
                 }
-                _ => lichii(self),
+                _ => plugin(self),
             };
             result
                 .map(Arc::new)
@@ -1039,6 +1048,14 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         for note in notes {
             backend.note(note);
+        }
+        // Without a translator plugin, a program the Rust translator does
+        // not handle stops the run with its report: nothing is drawn wrong
+        // in silence.
+        if let Err(error) = &translated
+            && !shader::available()
+        {
+            backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
         }
         backend.translations.insert(cache_key, translated.clone());
         translated

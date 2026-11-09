@@ -1,13 +1,12 @@
 # Shader translator (`echora-shader`)
 
 The game's GPU programs are NVN2 programs: NVIDIA Ampere (SM 8.x, the
-Switch 2's T239) machine code with a control section. Today Lichii's
-recompiler (C++, behind `echora-gpu/native/shader`) turns them into
-SPIR-V, lowering Ampere to Maxwell first. `echora-shader` is Echora's own
-translator, in Rust, growing beside it: a program the Rust translator
-handles uses its SPIR-V, anything else still goes to Lichii, and a
-differential mode compares the two. Lichii stays until the Rust translator
-covers every program.
+Switch 2's T239) machine code with a control section. `echora-shader` is
+Echora's own translator, in Rust. Until it covers every program, an
+external translator plugin loaded at run time handles the rest
+([shader-plugin.md](shader-plugin.md)): a program the Rust translator
+handles uses its SPIR-V, anything else goes to the plugin, and a
+differential mode compares the two.
 
 ## Design stance
 
@@ -48,16 +47,17 @@ goals first-class, next to correctness:
 
 - `echora-shader-abi`, a small dependency-free crate, holds the shared
   types (translation result, descriptors, stages, the push-constant block
-  and `ABI_VERSION`, which is part of every shader cache key). Lichii's
-  bridge fills the same types.
+  and `ABI_VERSION`, which is part of every shader cache key). The plugin
+  interface fills the same types.
 - `echora_shader::translate(program, &Parameters) -> Result<Translated,
   Unsupported>`: pure, no callbacks. `Parameters` carries what the program
   does not (only the stage slot a task or mesh program is bound as);
   `Unsupported` names the first unhandled instruction or feature and its
   offset. `Translated` lists the specialization constants and push
   constants it reads.
-- `ECHORA_SHADER_TRANSLATOR` selects `lichii` (default), `rust` (Rust where
-  supported, Lichii otherwise) or `compare`.
+- `ECHORA_SHADER_TRANSLATOR` selects `plugin` (the default with a plugin),
+  `rust` (Rust where supported, the plugin otherwise; the default without
+  one) or `compare`.
 - **Page table**: 64 KiB pages; a buffer of u64 device addresses (0
   unmapped) for `[va_base, va_base + pages * 64 KiB)`; the table's address,
   `va_base >> 16` and the page count in bytes 112-128 of the push-constant

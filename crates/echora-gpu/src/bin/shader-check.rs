@@ -74,8 +74,8 @@ fn main() {
                 Ok(program) => match gpu.check_stage(&program) {
                     Err(error) => format!("driver rejects: {error}"),
                     Ok(()) => match shader::translate(&bytes, parameters, &mut NoEnvironment) {
-                        Err(_) => "translated (the C++ recompiler does not)".into(),
-                        Ok(lichii) => match shader::compare(&lichii, &program) {
+                        Err(_) => "translated (the plugin does not)".into(),
+                        Ok(plugin) => match shader::compare(&plugin, &program) {
                             Some(difference) => format!("differs: {difference}"),
                             None => "alike".into(),
                         },

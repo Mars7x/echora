@@ -25,15 +25,6 @@ pub const PREFIX: &str = "echora-prepare: ";
 /// binary that prepared it, so a new build of Echora prepares it again.
 const STAMP: &str = "prepared";
 
-/// The repository this binary was built from: the generated workspace
-/// depends on its crates, and the fetch script lives there.
-fn repository() -> Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .context("locate the Echora source tree this binary was built from")
-}
-
 /// Identifies the running `echora` binary by size and modification time.
 pub fn binary_identity() -> String {
     let meta = std::env::current_exe().and_then(std::fs::metadata);
@@ -74,29 +65,6 @@ pub fn mark_ready(translation: &Path) -> Result<()> {
 
 pub fn step(name: &str) {
     println!("{PREFIX}step {name}");
-}
-
-/// Fetches the shader recompiler sources into `sources` with the
-/// repository's script. Existing sources are kept when the fetch fails
-/// (offline, say).
-pub fn fetch_shader_sources(sources: &Path) -> Result<()> {
-    let script = repository()?.join("scripts/fetch-shader-sources.sh");
-    let status = Command::new("bash")
-        .arg(&script)
-        .env("ECHORA_SHADER_SRC", sources)
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("run {}", script.display()))?;
-    if status.success() {
-        return Ok(());
-    }
-    if sources.join("lichii/src/shader_recompiler").is_dir() {
-        eprintln!(
-            "warning: fetching the shader recompiler failed; using the sources already there"
-        );
-        return Ok(());
-    }
-    bail!("fetching the shader recompiler failed ({status})");
 }
 
 /// `cargo`, from `PATH` or rustup's default location (a launcher started

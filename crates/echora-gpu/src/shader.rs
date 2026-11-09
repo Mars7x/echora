@@ -1,5 +1,7 @@
-//! Native NVN programs to SPIR-V through `native/shader` (the Lichii/Eden
-//! recompiler behind a C interface). Mirrors `echora_shader.h`.
+//! Native NVN programs to SPIR-V: the Rust translator (`echora-shader`),
+//! and an external translator plugin loaded at run time when one is
+//! installed (`docs/shader-plugin.md` describes its C interface, which the
+//! `Input` and `Output` structs here mirror).
 
 use std::ffi::c_void;
 
@@ -12,29 +14,31 @@ pub const MAX_DESCRIPTORS: usize = 64;
 /// Which translator turns a program into SPIR-V (ECHORA_SHADER_TRANSLATOR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Translator {
-    /// The C++ recompiler (the default).
-    Lichii,
+    /// The external translator plugin (the default when one is installed).
+    Plugin,
     /// The Rust translator (`echora-shader`) for each program it handles,
-    /// the C++ recompiler for the rest.
+    /// the plugin for the rest (the default without a plugin).
     Rust,
-    /// Both: the C++ recompiler's program is used; what the Rust
-    /// translator does differently is reported (`compare`).
+    /// Both: the plugin's program is used; what the Rust translator does
+    /// differently is reported (`compare`).
     Compare,
 }
 
 impl Translator {
-    /// `lichii`, `rust` or `compare` in ECHORA_SHADER_TRANSLATOR.
+    /// `plugin`, `rust` or `compare` in ECHORA_SHADER_TRANSLATOR.
     pub fn from_env() -> Self {
         match std::env::var("ECHORA_SHADER_TRANSLATOR").as_deref() {
             Ok("rust") => Self::Rust,
             Ok("compare") => Self::Compare,
-            _ => Self::Lichii,
+            Ok("plugin") => Self::Plugin,
+            _ if available() => Self::Plugin,
+            _ => Self::Rust,
         }
     }
 }
 
-/// The ahead-of-time parameters the Rust translator takes, from the C++
-/// recompiler's (which also carry pipeline state it gets at run time).
+/// The ahead-of-time parameters the Rust translator takes, from the
+/// plugin's (which also carry pipeline state it gets at run time).
 pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters {
     let compute = parameters.workgroup_size != [0; 3];
     echora_shader_abi::Parameters {
@@ -67,9 +71,9 @@ pub fn translate_rust(
 
 /// How two translations of one program differ, in the respects the
 /// runtime relies on (None: alike). The SPIR-V itself may differ freely.
-pub fn compare(lichii: &Translated, rust: &Translated) -> Option<String> {
-    if lichii.stage != rust.stage {
-        return Some(format!("stage {:?} vs {:?}", lichii.stage, rust.stage));
+pub fn compare(plugin: &Translated, rust: &Translated) -> Option<String> {
+    if plugin.stage != rust.stage {
+        return Some(format!("stage {:?} vs {:?}", plugin.stage, rust.stage));
     }
     let kinds = |translated: &Translated| -> Vec<DescriptorKind> {
         translated
@@ -78,23 +82,23 @@ pub fn compare(lichii: &Translated, rust: &Translated) -> Option<String> {
             .map(Descriptor::kind)
             .collect()
     };
-    if kinds(lichii) != kinds(rust) {
+    if kinds(plugin) != kinds(rust) {
         return Some(format!(
             "descriptors {:?} vs {:?}",
-            kinds(lichii),
+            kinds(plugin),
             kinds(rust)
         ));
     }
-    if lichii.frag_colors != rust.frag_colors {
+    if plugin.frag_colors != rust.frag_colors {
         return Some(format!(
             "fragment colors {:#x} vs {:#x}",
-            lichii.frag_colors, rust.frag_colors
+            plugin.frag_colors, rust.frag_colors
         ));
     }
     None
 }
 
-/// Answers the recompiler's questions about state outside the program.
+/// Answers the plugin's questions about state outside the program.
 pub trait Environment {
     /// Word at byte `offset` of guest constant buffer `index`.
     fn read_cbuf(&mut self, _index: u32, _offset: u32) -> u32 {
@@ -208,16 +212,6 @@ struct Output {
     error: [u8; 256],
 }
 
-#[cfg(echora_shader_lib)]
-unsafe extern "C" {
-    fn echora_shader_translate(input: *const Input, output: *mut Output) -> i32;
-    fn echora_shader_free(output: *mut Output);
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn echora_shader_output_size() -> usize;
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn echora_shader_input_size() -> usize;
-}
-
 unsafe extern "C" fn read_cbuf_thunk<E: Environment>(
     user: *mut c_void,
     index: u32,
@@ -247,8 +241,101 @@ unsafe extern "C" fn is_indirect_storage_pointer_thunk<E: Environment>(
     unsafe { (*(user as *mut E)).is_indirect_storage_pointer(index, offset, indirect) }.into()
 }
 
-/// Whether this build links the shader recompiler.
-pub const AVAILABLE: bool = cfg!(echora_shader_lib);
+/// The external translator plugin's entry points.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Plugin {
+    translate: unsafe extern "C" fn(*const Input, *mut Output) -> i32,
+    free: unsafe extern "C" fn(*mut Output),
+}
+
+/// The plugin: `ECHORA_SHADER_PLUGIN`, else `shader-plugin.so` in Echora's
+/// cache directory, loaded once. One built for another `ABI_VERSION`, or
+/// whose input and output structs differ in size, is not used.
+fn plugin() -> Option<&'static Plugin> {
+    static PLUGIN: std::sync::OnceLock<Option<Plugin>> = std::sync::OnceLock::new();
+    PLUGIN
+        .get_or_init(|| {
+            let path = std::env::var_os("ECHORA_SHADER_PLUGIN")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    let cache = std::env::var_os("XDG_CACHE_HOME")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME")
+                                .map(|home| std::path::Path::new(&home).join(".cache"))
+                        })?;
+                    Some(cache.join("echora/shader-plugin.so"))
+                })?;
+            match load_plugin(&path) {
+                Ok(plugin) => Some(plugin),
+                Err(error) => {
+                    if std::env::var_os("ECHORA_SHADER_PLUGIN").is_some() {
+                        eprintln!("shader plugin {}: {error}", path.display());
+                    }
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+#[cfg(target_os = "linux")]
+fn load_plugin(path: &std::path::Path) -> Result<Plugin, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let name =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
+    // SAFETY: a valid C string; the library stays loaded for the process.
+    let library = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if library.is_null() {
+        return Err("not loadable".into());
+    }
+    let symbol = |name: &std::ffi::CStr| {
+        // SAFETY: a live library handle and a valid C string.
+        let address = unsafe { libc::dlsym(library, name.as_ptr()) };
+        (!address.is_null())
+            .then_some(address)
+            .ok_or_else(|| format!("no {}", name.to_string_lossy()))
+    };
+    // SAFETY: each symbol has the plugin interface's signature.
+    unsafe {
+        let version: extern "C" fn() -> u32 =
+            std::mem::transmute(symbol(c"echora_plugin_abi_version")?);
+        let input_size: extern "C" fn() -> usize =
+            std::mem::transmute(symbol(c"echora_plugin_input_size")?);
+        let output_size: extern "C" fn() -> usize =
+            std::mem::transmute(symbol(c"echora_plugin_output_size")?);
+        if version() != ABI_VERSION {
+            return Err(format!(
+                "made for shader ABI {}, not {ABI_VERSION}",
+                version()
+            ));
+        }
+        if input_size() != std::mem::size_of::<Input>()
+            || output_size() != std::mem::size_of::<Output>()
+        {
+            return Err("its input or output layout differs".into());
+        }
+        Ok(Plugin {
+            translate: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(*const Input, *mut Output) -> i32,
+            >(symbol(c"echora_plugin_translate")?),
+            free: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut Output)>(symbol(
+                c"echora_plugin_free",
+            )?),
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_plugin(_path: &std::path::Path) -> Result<Plugin, String> {
+    Err("translator plugins load on Linux only".into())
+}
+
+/// Whether an external translator plugin is installed.
+pub fn available() -> bool {
+    plugin().is_some()
+}
 
 /// Translate one program as NVN stores it at its stage address (graphics
 /// stages include their 128-byte header).
@@ -312,8 +399,8 @@ pub fn translate<E: Environment>(
         frag_colors: output.frag_colors,
         cbuf_used_sizes: output.cbuf_used_sizes,
         abi_version: ABI_VERSION,
-        // The recompiler takes pipeline state as translation parameters
-        // and may push texture rescaling words.
+        // The plugin takes pipeline state as translation parameters and
+        // may push texture rescaling words.
         spec_constants: Vec::new(),
         push_fields: PUSH_TRANSLATOR,
     };
@@ -321,10 +408,11 @@ pub fn translate<E: Environment>(
     Ok(result)
 }
 
-#[cfg(echora_shader_lib)]
 fn run(input: &Input, output: &mut Output) -> Result<(), String> {
-    // SAFETY: both structs match echora_shader.h; callbacks outlive the call.
-    if unsafe { echora_shader_translate(input, output) } != 0 {
+    let plugin = plugin().ok_or("no shader translator plugin is installed")?;
+    // SAFETY: both structs match the plugin interface (sizes checked at
+    // load); callbacks outlive the call.
+    if unsafe { (plugin.translate)(input, output) } != 0 {
         return Ok(());
     }
     let end = output
@@ -335,19 +423,12 @@ fn run(input: &Input, output: &mut Output) -> Result<(), String> {
     Err(String::from_utf8_lossy(&output.error[..end]).into_owned())
 }
 
-#[cfg(not(echora_shader_lib))]
-fn run(_input: &Input, _output: &mut Output) -> Result<(), String> {
-    Err("built without the shader recompiler (set ECHORA_SHADER_LIB)".into())
-}
-
-#[cfg(echora_shader_lib)]
 fn free(output: &mut Output) {
-    // SAFETY: frees what echora_shader_translate allocated.
-    unsafe { echora_shader_free(output) }
+    if let Some(plugin) = plugin() {
+        // SAFETY: frees what the plugin's translate allocated.
+        unsafe { (plugin.free)(output) }
+    }
 }
-
-#[cfg(not(echora_shader_lib))]
-fn free(_output: &mut Output) {}
 
 #[cfg(test)]
 mod tests {
@@ -359,18 +440,6 @@ mod tests {
         // 8 + 8 + 4 + 64 * 60 + 3 * 4 + 8 * 8 + 4 + 18 * 4 + 256, padded
         // to 8.
         assert_eq!(std::mem::size_of::<Output>(), 4272);
-        #[cfg(echora_shader_lib)]
-        // SAFETY: a pure function of the C type.
-        assert_eq!(
-            unsafe { echora_shader_output_size() },
-            std::mem::size_of::<Output>()
-        );
-        #[cfg(echora_shader_lib)]
-        // SAFETY: a pure function of the C type.
-        assert_eq!(
-            unsafe { echora_shader_input_size() },
-            std::mem::size_of::<Input>()
-        );
     }
 
     #[test]

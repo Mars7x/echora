@@ -328,8 +328,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 });
             }
             if !ready || force {
-                prepare::step("fetch");
-                prepare::fetch_shader_sources(&shader_sources(&cache))?;
                 prepare::step("lift");
                 let lifted = lift(input, Some(cache), 20_000_000, 16)?;
                 prepare::step("build");
@@ -661,12 +659,6 @@ fn translation_dir(input: &std::path::Path, cache: &std::path::Path) -> Result<(
     Ok((exefs, cache.join("translations").join(key)))
 }
 
-/// The shader recompiler sources: `ECHORA_SHADER_SRC`, else `shader-src`
-/// in the cache, where `scripts/fetch-shader-sources.sh` puts them.
-fn shader_sources(cache: &std::path::Path) -> PathBuf {
-    std::env::var_os("ECHORA_SHADER_SRC").map_or_else(|| cache.join("shader-src"), PathBuf::from)
-}
-
 fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<PathBuf> {
     use echora_lift::codegen::{EmitOptions, emit_rust_split_to_with};
 
@@ -872,17 +864,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         flags.push("-C".into());
         flags.push(format!("link-arg=-Wl,-rpath,{libdir}"));
     }
-    // The shader recompiler is built into the runtime when its fetched
-    // sources are present (scripts/fetch-shader-sources.sh): the workspace
-    // passes them on, so a plain `cargo build` of the runner can draw.
-    let shader_sources = Some(shader_sources(&d.cache)).filter(|dir| dir.is_dir());
-    let mut config = format!("[build]\nrustflags = {flags:?}\n");
-    if let Some(sources) = shader_sources {
-        config.push_str(&format!(
-            "\n[env]\nECHORA_SHADER_SRC = {:?}\n",
-            sources.to_string_lossy()
-        ));
-    }
+    let config = format!("[build]\nrustflags = {flags:?}\n");
     write_if_changed(&out.join(".cargo/config.toml"), &config)?;
     std::fs::write(
         out.join("translation-report.json"),

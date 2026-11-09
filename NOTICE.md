@@ -41,18 +41,11 @@ these separately; preserve their notices when redistributing builds.
 | `yaxpeax-arm` | 0.4.0 | 0BSD |
 | `zstd` | 0.13.4 | MIT (bundles zstd, BSD-3-Clause OR GPL-2.0) |
 
-## Fetched build inputs
+## Shader translator plugins
 
-When `ECHORA_SHADER_SRC` is set, `echora-gpu` compiles sources fetched by
-`scripts/fetch-shader-sources.sh`; none are stored in this repository:
-
-| Source | Pinned | License |
-|---|---|---|
-| [Lichii](https://github.com/zortos293/Lichii) shader recompiler | `809fb3a` plus `crates/echora-gpu/native/shader/patches` | GPL-3.0-or-later |
-| [sirit](https://github.com/eden-emulator/sirit) | v1.0.5 | AGPL-3.0 |
-| [fmt](https://github.com/fmtlib/fmt) | 12.1.0 | MIT |
-| [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) | vulkan-sdk-1.4.341.0 | MIT-style (Khronos) |
-| Boost headers | 1.91.0 | BSL-1.0 |
+Echora can load an external shader translator at run time
+([docs/shader-plugin.md](docs/shader-plugin.md)). None is stored in or
+built by this repository; a plugin is distributed under its own license.
 
 ## Sources of facts
 
@@ -63,10 +56,6 @@ from these projects; no code is taken from them:
 |---|---|---|
 | [Lichii](https://github.com/zortos293/Lichii) `c215653`, `src/shader_recompiler/frontend/ampere` | Ampere instruction encodings and semantics | GPL-3.0-or-later |
 | Mesa's NAK `979c6d1`, `src/nouveau/compiler/nak/sm70_encode.rs` | Ampere bit layouts (cross-checks) | MIT |
-
-GPL-3.0 section 13 permits combining with AGPL-3.0 code. A binary built
-with the shader library carries the AGPL terms for the sirit part,
-including its network-interaction clause.
 
 ## Bundled fonts
 
