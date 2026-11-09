@@ -79,6 +79,16 @@ goals first-class, next to correctness:
 4. **Graphics stages** and textures.
 5. **HMMA**: a subgroup path, and VK_KHR_cooperative_matrix.
 
+**Textures.** A texture whose handle is a constant-bank word becomes a
+combined image sampler, one per handle word, view type and depth
+comparison, reported as a descriptor naming that word; the runtime binds
+the texture and sampler the word names. Bindings follow the uniform
+buffers. Programs without derivatives sample at an explicit level (a
+bias over level zero is that level). Vulkan takes only constant texel
+offsets for a sample, so a sample adds the offsets divided by the
+level's size to its coordinates; a fetch adds them to its integer
+coordinates, and a gather passes them on.
+
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
 exact: the nearest result's error is computed without rounding (two-sum
@@ -157,6 +167,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
+| TEX, TLD.SCR, TLD4, TXQ | 0xb60, 0xb66, 0xb63, 0xb6f | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76, depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC) |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |

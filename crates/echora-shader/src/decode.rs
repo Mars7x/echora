@@ -111,6 +111,48 @@ pub struct Address {
     pub offset: i32,
 }
 
+/// What a texture instruction does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureOp {
+    /// TEX: a filtered sample.
+    Sample,
+    /// TLD: a texel fetch by integer coordinates.
+    Fetch,
+    /// TLD4: the four texels a bilinear sample would read, one component.
+    Gather { component: u8 },
+    /// TXQ: the dimensions (width, height, depth or layers, levels).
+    Query,
+}
+
+/// A texture instruction's operands. The handle is the word at byte
+/// `handle_offset` of constant bank `bank`. Its values (coordinates with
+/// an array index first, then a level or bias, packed texel offsets and a
+/// depth reference) sit in registers `a`.. then `b`..: up to four values
+/// half in each (the first half rounded up), more as four and the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Texture {
+    pub op: TextureOp,
+    /// The destinations: components in mask order to d, d+1, ..., or with
+    /// a second destination `d2` the third and fourth go there.
+    pub d: Reg,
+    pub d2: Reg,
+    pub a: Reg,
+    pub b: Reg,
+    pub bank: u8,
+    pub handle_offset: u16,
+    /// Bits 61-63: 0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D array, 7
+    /// cube array.
+    pub dimension: u8,
+    /// Bits 87-89: 0 implicit, 1 level zero, 2 bias, 3 explicit level.
+    pub lod: u8,
+    pub offsets: bool,
+    pub depth_compare: bool,
+    /// Bits 72-75: the components written.
+    pub mask: u8,
+    /// Bit 79: results as packed halves.
+    pub half: bool,
+}
+
 /// A decoded instruction: its guard and operation, and the word it came
 /// from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,6 +459,8 @@ pub enum Op {
         operation: u8,
         kind: u8,
     },
+    /// TEX, TLD.SCR, TLD4 and TXQ with a handle in a constant bank.
+    Tex(Texture),
     /// BAR.SYNC (`mode` 0, bits 77-78) and the other barrier modes.
     Bar {
         mode: u8,
@@ -949,6 +993,40 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 },
                 kind: word.bits(73, 3) as u8,
             });
+        }
+        0xb60 | 0xb66 | 0xb63 | 0xb6f => {
+            let op = match opcode {
+                0xb60 => TextureOp::Sample,
+                0xb66 => TextureOp::Fetch,
+                0xb63 => TextureOp::Gather {
+                    component: word.bits(87, 2) as u8,
+                },
+                _ => TextureOp::Query,
+            };
+            // Bit 59 is the bindless form and 77 per-tap offsets (only the
+            // packed form, 76, is decoded); 81-83 a fault predicate.
+            if word.bit(59) || word.bit(77) || word.bits(81, 3) != 7 {
+                return None;
+            }
+            return Some(Op::Tex(Texture {
+                op,
+                d,
+                d2: word.reg(64),
+                a: word.reg(24),
+                b: word.reg(32),
+                bank: word.bits(54, 5) as u8,
+                handle_offset: word.bits(40, 14) as u16 * 4,
+                dimension: word.bits(61, 3) as u8,
+                lod: if matches!(op, TextureOp::Gather { .. }) {
+                    0
+                } else {
+                    word.bits(87, 3) as u8
+                },
+                offsets: word.bit(76),
+                depth_compare: word.bit(78),
+                mask: word.bits(72, 4) as u8,
+                half: word.bit(79),
+            }));
         }
         0xb1d => {
             return Some(Op::Bar {

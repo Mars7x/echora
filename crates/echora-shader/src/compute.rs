@@ -146,6 +146,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
 }
 
 mod memory;
+mod texture;
 
 /// What a compute program needs beyond its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +214,11 @@ struct Emitter {
     builtins: BTreeMap<u32, u32>,
     interface: Vec<u32>,
     descriptors: Vec<Descriptor>,
+    /// Each descriptor's variable.
+    descriptor_variables: Vec<u32>,
+    /// Combined image samplers by handle bank, offset, texture type and
+    /// depth comparison.
+    textures: BTreeMap<(u8, u16, u32, bool), u32>,
     cbuf_used_sizes: [u32; 18],
 }
 
@@ -257,6 +263,8 @@ impl Emitter {
             builtins: BTreeMap::new(),
             interface: Vec::new(),
             descriptors: Vec::new(),
+            descriptor_variables: Vec::new(),
+            textures: BTreeMap::new(),
             cbuf_used_sizes: [0; 18],
         }
     }
@@ -271,6 +279,8 @@ impl Emitter {
             0
         };
         self.module.memory_model(addressing, 1);
+        // Compute programs are alone in their pipeline: stage slot 0.
+        self.assign_bindings(0);
         self.function.finish(&mut self.module);
         self.module
             .entry_point(execution::GL_COMPUTE, self.entry, "main", &self.interface);
@@ -610,21 +620,45 @@ impl Emitter {
         };
         let pointer = self.module.pointer(storage::UNIFORM, block);
         let variable = self.module.global_variable(pointer, storage::UNIFORM);
-        let binding = self.descriptors.len() as u32;
-        self.module
-            .decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
-        self.module
-            .decorate(variable, decoration::BINDING, &[binding]);
-        self.descriptors.push(Descriptor {
-            kind: 0,
-            binding,
-            count: 1,
-            index: u32::from(bank),
-            ..Descriptor::default()
-        });
-        self.interface.push(variable);
+        self.add_descriptor(
+            variable,
+            Descriptor {
+                kind: 0,
+                count: 1,
+                index: u32::from(bank),
+                ..Descriptor::default()
+            },
+        );
         self.banks.insert(bank, variable);
         Ok(variable)
+    }
+
+    /// Records a set-0 resource; its binding is assigned at the end.
+    fn add_descriptor(&mut self, variable: u32, descriptor: Descriptor) {
+        self.descriptors.push(descriptor);
+        self.descriptor_variables.push(variable);
+        self.interface.push(variable);
+    }
+
+    /// Numbers the descriptors: the stage's base (its slot times
+    /// `MAX_DESCRIPTORS`), then uniform buffers, storage buffers, texel
+    /// buffers, image buffers, textures and images, each in the order
+    /// first used.
+    fn assign_bindings(&mut self, base: u32) {
+        let mut order: Vec<usize> = (0..self.descriptors.len()).collect();
+        order.sort_by_key(|&n| self.descriptors[n].kind);
+        let mut sorted = Vec::new();
+        for (binding, &n) in order.iter().enumerate() {
+            let mut descriptor = self.descriptors[n];
+            descriptor.binding = base + binding as u32;
+            let variable = self.descriptor_variables[n];
+            self.module
+                .decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
+            self.module
+                .decorate(variable, decoration::BINDING, &[descriptor.binding]);
+            sorted.push(descriptor);
+        }
+        self.descriptors = sorted;
     }
 
     /// The word at byte `offset` of constant bank `bank`. Banks past the
@@ -1773,6 +1807,7 @@ impl Emitter {
                 operation,
                 kind,
             )?,
+            Op::Tex(texture) => self.texture(index, &texture)?,
             Op::Bar { mode } => {
                 if mode != 0 {
                     return Err(unsupported(index, format!("BAR mode {mode}")));
@@ -3146,6 +3181,169 @@ mod tests {
             word(&[(0, 12, 0x948)]),
             EXIT,
         ]);
+    }
+
+    /// A texture instruction word with a handle at c[0][handle_offset].
+    fn tex(opcode: u128, fields: &[(u32, u32, u128)]) -> u128 {
+        let mut all = vec![(0, 12, opcode), (54, 5, 0), (81, 3, 7)];
+        all.extend_from_slice(fields);
+        word(&all)
+    }
+
+    #[test]
+    fn textures_are_combined_samplers_found_by_their_handle_word() {
+        let translated = valid(&[
+            // MOV R0, c[0x3][0x0] (a uniform buffer first in use)
+            word(&[(0, 12, 0xa02), (16, 8, 0), (54, 5, 3)]),
+            // TEX.LZ R4, R6, R0, R1, 2D, 0xf (c[0][0x50]); split result
+            tex(
+                0xb60,
+                &[
+                    (16, 8, 4),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 6),
+                    (72, 4, 0xf),
+                    (87, 3, 1),
+                ],
+            ),
+            // TEX.LL.DC R8, R0, R2, 2D, 0x1: (x, y | level, reference)
+            tex(
+                0xb60,
+                &[
+                    (16, 8, 8),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 1),
+                    (78, 1, 1),
+                    (87, 3, 3),
+                ],
+            ),
+            // TEX R9, R0, R1, ARRAY_2D, 0x3 (layer, x | y); TEX CUBE.F16 R10
+            tex(
+                0xb60,
+                &[
+                    (16, 8, 9),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (40, 14, 0x16),
+                    (61, 3, 5),
+                    (64, 8, 255),
+                    (72, 4, 3),
+                ],
+            ),
+            tex(
+                0xb60,
+                &[
+                    (16, 8, 10),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x18),
+                    (61, 3, 3),
+                    (64, 8, 255),
+                    (72, 4, 0xf),
+                    (79, 1, 1),
+                ],
+            ),
+            // TLD.SCR.LL.AOFFI R12, R0, R2, 2D, 0xf: (x, y | level, offsets)
+            tex(
+                0xb66,
+                &[
+                    (16, 8, 12),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 14),
+                    (72, 4, 0xf),
+                    (76, 1, 1),
+                    (87, 3, 3),
+                ],
+            ),
+            // TLD4.G.AOFFI R16, R0, R2, 2D; TLD4.DC R20, R0, R2, 2D
+            tex(
+                0xb63,
+                &[
+                    (16, 8, 16),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 18),
+                    (72, 4, 0xf),
+                    (76, 1, 1),
+                    (87, 2, 1),
+                ],
+            ),
+            tex(
+                0xb63,
+                &[
+                    (16, 8, 20),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 22),
+                    (72, 4, 0xf),
+                    (78, 1, 1),
+                ],
+            ),
+            // TEX.LZ.AOFFI R28, R0, R2, 2D, 0x1: (x, y | offsets)
+            tex(
+                0xb60,
+                &[
+                    (16, 8, 28),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (40, 14, 0x14),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 1),
+                    (76, 1, 1),
+                    (87, 3, 1),
+                ],
+            ),
+            // TXQ R24, R1 (level), 0xf, c[0][0x50]
+            tex(
+                0xb6f,
+                &[
+                    (16, 8, 24),
+                    (24, 8, 1),
+                    (40, 14, 0x14),
+                    (64, 8, 26),
+                    (72, 4, 0xf),
+                ],
+            ),
+            EXIT,
+        ]);
+        let summary: Vec<(u32, u32, u32, u32, u32)> = translated
+            .descriptors
+            .iter()
+            .map(|d| {
+                (
+                    d.kind,
+                    d.binding,
+                    d.cbuf_offset,
+                    d.texture_type,
+                    d.flags & 8,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0, 0, 0, 0, 0),
+                (4, 1, 0x50, 2, 0),
+                (4, 2, 0x50, 2, 8),
+                (4, 3, 0x58, 3, 0),
+                (4, 4, 0x60, 5, 0),
+            ]
+        );
     }
 
     #[test]

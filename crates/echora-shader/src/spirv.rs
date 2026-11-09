@@ -21,6 +21,8 @@ pub mod op {
     pub const TYPE_INT: u16 = 21;
     pub const TYPE_FLOAT: u16 = 22;
     pub const TYPE_VECTOR: u16 = 23;
+    pub const TYPE_IMAGE: u16 = 25;
+    pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const TYPE_ARRAY: u16 = 28;
     pub const TYPE_RUNTIME_ARRAY: u16 = 29;
     pub const TYPE_STRUCT: u16 = 30;
@@ -39,6 +41,14 @@ pub mod op {
     pub const MEMBER_DECORATE: u16 = 72;
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+    pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
+    pub const IMAGE_FETCH: u16 = 95;
+    pub const IMAGE_GATHER: u16 = 96;
+    pub const IMAGE_DREF_GATHER: u16 = 97;
+    pub const IMAGE: u16 = 100;
+    pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_QUERY_LEVELS: u16 = 106;
     pub const CONVERT_F_TO_U: u16 = 109;
     pub const CONVERT_F_TO_S: u16 = 110;
     pub const CONVERT_S_TO_F: u16 = 111;
@@ -153,6 +163,10 @@ pub mod storage {
 pub mod capability {
     pub const SHADER: u32 = 1;
     pub const INT64: u32 = 11;
+    pub const IMAGE_GATHER_EXTENDED: u32 = 25;
+    pub const SAMPLED_1D: u32 = 43;
+    pub const SAMPLED_CUBE_ARRAY: u32 = 45;
+    pub const IMAGE_QUERY: u32 = 50;
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
     pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
@@ -210,6 +224,7 @@ pub mod glsl {
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
     pub const FMA: u32 = 50;
+    pub const PACK_HALF_2X16: u32 = 58;
     pub const UNPACK_HALF_2X16: u32 = 62;
     pub const FIND_S_MSB: u32 = 74;
     pub const FIND_U_MSB: u32 = 75;
@@ -225,14 +240,50 @@ pub const NONE: u32 = 0;
 pub enum Type {
     Void,
     Bool,
-    Int { width: u32, signed: bool },
-    Float { width: u32 },
-    Vector { component: u32, count: u32 },
-    Array { element: u32, length: u32 },
-    RuntimeArray { element: u32 },
-    Struct { members: Vec<u32> },
-    Pointer { storage: u32, pointee: u32 },
-    Function { result: u32, parameters: Vec<u32> },
+    Int {
+        width: u32,
+        signed: bool,
+    },
+    Float {
+        width: u32,
+    },
+    Vector {
+        component: u32,
+        count: u32,
+    },
+    Array {
+        element: u32,
+        length: u32,
+    },
+    RuntimeArray {
+        element: u32,
+    },
+    Struct {
+        members: Vec<u32>,
+    },
+    Pointer {
+        storage: u32,
+        pointee: u32,
+    },
+    Function {
+        result: u32,
+        parameters: Vec<u32>,
+    },
+    /// OpTypeImage: `dim` (0 1D, 1 2D, 2 3D, 3 cube, 5 buffer), `depth` (0
+    /// no, 1 yes, 2 unknown), `sampled` (1 with a sampler, 2 storage),
+    /// `format` (0 unknown).
+    Image {
+        sampled_type: u32,
+        dim: u32,
+        depth: u32,
+        arrayed: bool,
+        multisampled: bool,
+        sampled: u32,
+        format: u32,
+    },
+    SampledImage {
+        image: u32,
+    },
 }
 
 /// A module being built. Sections are kept apart and joined in the order
@@ -388,6 +439,28 @@ impl Module {
                 operands.extend_from_slice(parameters);
                 (op::TYPE_FUNCTION, operands)
             }
+            Type::Image {
+                sampled_type,
+                dim,
+                depth,
+                arrayed,
+                multisampled,
+                sampled,
+                format,
+            } => (
+                op::TYPE_IMAGE,
+                vec![
+                    id,
+                    *sampled_type,
+                    *dim,
+                    *depth,
+                    u32::from(*arrayed),
+                    u32::from(*multisampled),
+                    *sampled,
+                    *format,
+                ],
+            ),
+            Type::SampledImage { image } => (op::TYPE_SAMPLED_IMAGE, vec![id, *image]),
         };
         instruction(&mut self.globals, opcode, &operands);
         self.types.insert(ty, id);
