@@ -533,6 +533,9 @@ impl Gpu {
             .set_layouts(&layouts);
         if self.compute_subgroup_32 && translated.stage == Stage::Compute {
             info = info.push_next(&mut subgroup_32);
+            if whole_subgroups(&translated.spirv) {
+                info = info.flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
+            }
         }
         // SAFETY: the code and layout outlive the call.
         let result = unsafe { objects.create_shaders(&[info], None) };
@@ -558,6 +561,28 @@ impl Gpu {
             }
         }
     }
+}
+
+/// Whether a compute program's workgroups split into whole 32-lane
+/// subgroups (its LocalSize x is a multiple of 32), so it may be created
+/// with REQUIRE_FULL_SUBGROUPS: every lane of a guest warp is then active,
+/// as warp-wide operations (subgroup shuffles, cooperative matrices)
+/// assume.
+pub(crate) fn whole_subgroups(spirv: &[u32]) -> bool {
+    const OP_EXECUTION_MODE: u32 = 16;
+    const LOCAL_SIZE: u32 = 17;
+    let mut at = 5;
+    while let Some(&first) = spirv.get(at) {
+        let (count, opcode) = ((first >> 16) as usize, first & 0xffff);
+        if count == 0 {
+            return false;
+        }
+        if opcode == OP_EXECUTION_MODE && spirv.get(at + 2) == Some(&LOCAL_SIZE) {
+            return spirv.get(at + 3).is_some_and(|x| *x != 0 && x % 32 == 0);
+        }
+        at += count;
+    }
+    false
 }
 
 /// One shape the device's cooperative matrices multiply.

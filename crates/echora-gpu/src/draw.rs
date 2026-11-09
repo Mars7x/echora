@@ -450,6 +450,9 @@ impl Renderer {
             .collect();
         if compute_32 {
             infos[0] = infos[0].push_next(&mut subgroup_32);
+            if crate::vulkan::whole_subgroups(&stages[0].spirv) {
+                infos[0] = infos[0].flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
+            }
         }
         let shaders = crate::shader_cache::create_shaders(
             objects,
