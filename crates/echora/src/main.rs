@@ -2,6 +2,7 @@
 
 mod host_paths;
 mod prepare;
+mod shaders;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,6 +32,18 @@ enum Command {
         /// Print the full inventory as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Count every GPU program the game ships (shader containers in its
+    /// romfs and executables), read from the NUP without running anything.
+    Shaders {
+        input: PathBuf,
+        /// Print the counts as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also write each unique program stage there as
+        /// stage-<key>.code and .control (the ECHORA_SHADER_DIR layout).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Decode and hash-check every file in a NUP.
     Verify {
@@ -168,6 +181,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 print_inventory(&inv);
             }
+        }
+        Command::Shaders { input, json, dump } => {
+            shaders::inventory(&input, json, dump.as_deref())?;
         }
         Command::Verify { input, threads } => {
             let archive = NupArchive::open(&input)?;
