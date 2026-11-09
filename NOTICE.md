@@ -57,6 +57,21 @@ from these projects; no code is taken from them:
 | [Lichii](https://github.com/zortos293/Lichii) `c215653`, `src/shader_recompiler/frontend/ampere` | Ampere instruction encodings and semantics | GPL-3.0-or-later |
 | Mesa's NAK `979c6d1`, `src/nouveau/compiler/nak/sm70_encode.rs` | Ampere bit layouts (cross-checks) | MIT |
 
+## Test data
+
+`crates/echora-av1/tests/vectors` holds AV1 conformance test vectors from
+the Alliance for Open Media's libaom test data
+(`https://storage.googleapis.com/aom-test-data/`, listed in libaom's
+`test/test_vectors.cc`), unchanged. They are Copyright (c) the Alliance
+for Open Media, under the BSD 2-Clause license and the Alliance for Open
+Media Patent License 1.0 (<https://aomedia.org/license/>).
+`crates/echora-av1/tests/fetch-vectors.sh` downloads more of them at test
+time; they are not stored in the repository.
+
+| Files | Source | License |
+|---|---|---|
+| `av1-1-b8-01-size-*.ivf`, `av1-1-b8-04-cdfupdate.ivf`, `av1-1-b8-05-mv.ivf`, `av1-1-b8-06-mfmv.ivf`, `av1-1-b8-22-svc-L1T2.ivf`, `av1-1-b8-23-film_grain-50.ivf`, `av1-1-b10-23-film_grain-50.ivf`, `av1-1-b8-24-monochrome.ivf`, `av1-1-b10-24-monochrome.ivf` | libaom test vectors | BSD-2-Clause, AOM Patent License 1.0 |
+
 ## Bundled fonts
 
 `crates/echora-launcher/assets/fonts` holds Inter 4.1 (Regular, SemiBold,

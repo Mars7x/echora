@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/echora",
     "crates/echora-aot-tests",
+    "crates/echora-av1",
     "crates/echora-audio",
     "crates/echora-config",
     "crates/echora-content",

@@ -1849,6 +1849,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "echora-av1"
+version = "0.1.0"
+dependencies = [
+ "rav1d",
+]
+
+[[package]]
 name = "echora-config"
 version = "0.1.0"
 dependencies = [

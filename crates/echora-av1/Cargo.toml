@@ -1,0 +1,17 @@
+[package]
+name = "echora-av1"
+description = "AV1 OBU, sequence and frame header parsing and reference tracking for GPU (Vulkan Video) decoding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+
+[lints]
+workspace = true
