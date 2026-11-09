@@ -2440,6 +2440,18 @@ impl Renderer {
     }
 
     /// Whether a texture binding of `source` samples a scaled target.
+    /// The format a texture source's texels are in (a target's, or the
+    /// decoded upload's).
+    pub fn source_format(&self, source: &crate::draw::TextureSource) -> Option<vk::Format> {
+        use crate::draw::TextureSource;
+        match source {
+            TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                self.targets.get(key).map(|target| target.format)
+            }
+            TextureSource::Upload { format, .. } => Some(*format),
+        }
+    }
+
     pub(crate) fn samples_scaled(&self, source: &crate::draw::TextureSource) -> bool {
         use crate::draw::TextureSource;
         match source {
@@ -4307,6 +4319,37 @@ pub(crate) fn declared_image_format(flags: u32) -> Option<vk::Format> {
         7 => F::R32G32B32A32_UINT,
         _ => return None,
     })
+}
+
+/// Whether texels of `format` are integers (read through int or uint
+/// images), as SpecMeaning::IntegerFormat asks.
+pub fn integer_format(format: vk::Format) -> bool {
+    use vk::Format as F;
+    matches!(
+        format,
+        F::R8_UINT
+            | F::R8_SINT
+            | F::R8G8_UINT
+            | F::R8G8_SINT
+            | F::R8G8B8A8_UINT
+            | F::R8G8B8A8_SINT
+            | F::R16_UINT
+            | F::R16_SINT
+            | F::R16G16_UINT
+            | F::R16G16_SINT
+            | F::R16G16B16A16_UINT
+            | F::R16G16B16A16_SINT
+            | F::R32_UINT
+            | F::R32_SINT
+            | F::R32G32_UINT
+            | F::R32G32_SINT
+            | F::R32G32B32_UINT
+            | F::R32G32B32_SINT
+            | F::R32G32B32A32_UINT
+            | F::R32G32B32A32_SINT
+            | F::A2B10G10R10_UINT_PACK32
+            | F::S8_UINT
+    )
 }
 
 /// `usage`, plus device addresses when the device supports them.

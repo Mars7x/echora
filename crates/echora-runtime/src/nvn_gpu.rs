@@ -2926,12 +2926,6 @@ impl Nvn {
                 bound.join(" ")
             )
         };
-        let backend = self.gpu.as_mut().unwrap();
-        if !backend.programs.contains_key(&key) {
-            let program = backend.renderer.create_program(vec![stage.clone()])?;
-            backend.programs.insert(key, program);
-        }
-
         // The driver constant buffer c0 of a compute program is a table of
         // its resources, in this order: uniform buffers (16 bytes each:
         // address and size), storage buffers (16 bytes), texture handles
@@ -3367,6 +3361,47 @@ impl Nvn {
         } else {
             None
         };
+        // The program, specialized for what is bound: an IntegerFormat
+        // constant is 1 when its binding's image or texture is integer. Each
+        // combination is its own program (key.1 holds the values as bits).
+        let backend = self.gpu.as_mut().unwrap();
+        let mut specialization = Vec::new();
+        for constant in &stage.spec_constants {
+            let echora_shader_abi::SpecMeaning::IntegerFormat(binding) = constant.meaning else {
+                return Err(format!("compute spec constant {:?}", constant.meaning));
+            };
+            let format = match images.get(&binding) {
+                Some((texture, _)) => backend
+                    .renderer
+                    .existing_target(*texture)
+                    .map(|target| target.format),
+                None => textures
+                    .get(&binding)
+                    .and_then(|(source, _)| backend.renderer.source_format(source)),
+            };
+            let integer = format.is_some_and(echora_gpu::renderer::integer_format);
+            specialization.push((constant.id, u32::from(integer)));
+        }
+        if specialization.len() > 32 {
+            return Err(format!("{} spec constants", specialization.len()));
+        }
+        let key = if specialization.is_empty() {
+            key
+        } else {
+            let bits = specialization
+                .iter()
+                .enumerate()
+                .fold(0u64, |bits, (index, (_, value))| {
+                    bits | u64::from(*value) << index
+                });
+            (key.0, 1 << 63 | bits)
+        };
+        if !backend.programs.contains_key(&key) {
+            let program = backend
+                .renderer
+                .create_program_specialized(vec![stage.clone()], &[specialization])?;
+            backend.programs.insert(key, program);
+        }
         // The GPU page table, for programs that read global memory through
         // it (ECHORA_PAGE_TABLE).
         let page_table = if self.gpu.as_ref().unwrap().programs[&key]

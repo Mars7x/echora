@@ -312,6 +312,16 @@ impl Renderer {
     /// set-0 layout. Each stage must have been translated with its binding
     /// base after the previous stage's bindings.
     pub fn create_program(&self, stages: Vec<Arc<Translated>>) -> Result<Program, String> {
+        self.create_program_specialized(stages, &[])
+    }
+
+    /// `create_program`, with specialization constants: for each stage (by
+    /// index; missing stages take none), its (constant id, value) pairs.
+    pub fn create_program_specialized(
+        &self,
+        stages: Vec<Arc<Translated>>,
+        specialization: &[Vec<(u32, u32)>],
+    ) -> Result<Program, String> {
         let objects = self.gpu.shader_objects()?;
         let mut descriptors: Vec<(Descriptor, vk::ShaderStageFlags)> = Vec::new();
         for stage in &stages {
@@ -378,6 +388,34 @@ impl Renderer {
             .iter()
             .map(|stage| words_as_bytes(&stage.spirv))
             .collect();
+        // Each stage's constants as 4-byte entries in one data block.
+        let constants: Vec<(Vec<vk::SpecializationMapEntry>, Vec<u8>)> = (0..stages.len())
+            .map(|index| {
+                let values = specialization.get(index).map_or(&[][..], Vec::as_slice);
+                let entries = values
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &(id, _))| vk::SpecializationMapEntry {
+                        constant_id: id,
+                        offset: at as u32 * 4,
+                        size: 4,
+                    })
+                    .collect();
+                let data = values
+                    .iter()
+                    .flat_map(|(_, value)| value.to_le_bytes())
+                    .collect();
+                (entries, data)
+            })
+            .collect();
+        let specialization_infos: Vec<_> = constants
+            .iter()
+            .map(|(entries, data)| {
+                vk::SpecializationInfo::default()
+                    .map_entries(entries)
+                    .data(data)
+            })
+            .collect();
         // Compute stages run in 32-lane subgroups, as guest warps, where the
         // device can require it.
         let mut subgroup_32 =
@@ -407,6 +445,7 @@ impl Renderer {
                     .name(c"main")
                     .set_layouts(&layouts)
                     .push_constant_ranges(push_ranges)
+                    .specialization_info(&specialization_infos[index])
             })
             .collect();
         if compute_32 {
@@ -417,7 +456,7 @@ impl Renderer {
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
             &infos,
-            &format!("{descriptors:?} {push_ranges:?} {compute_32}"),
+            &format!("{descriptors:?} {push_ranges:?} {compute_32} {specialization:?}"),
         )?;
         Ok(Program {
             stages,
