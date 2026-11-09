@@ -826,6 +826,12 @@ impl Nvn {
                 continue;
             }
             let (width, height) = (target.width, target.height);
+            let (vk_format, shape) = (target.format, target.shape);
+            let nvn_format = self
+                .objects
+                .get(&key)
+                .and_then(|texture| texture.builder.get("Format"))
+                .map_or(0, |format| format.x[0]);
             // Deeper mip levels: statistics only.
             for level in 1..target.levels {
                 let texels = backend.renderer.read_target_level(key, level)?;
@@ -869,7 +875,7 @@ impl Nvn {
                 }
                 let count = finite.len().max(1) as f64;
                 let mut line = format!(
-                    "{key:x} {width}x{height} mean {:.4} {:.4} {:.4} {:.4} max {max:.3} nonfinite {nan}\n",
+                    "{key:x} {width}x{height} mean {:.4} {:.4} {:.4} {:.4} max {max:.3} nonfinite {nan} {vk_format:?} nvn {nvn_format:#x} {shape:?}\n",
                     mean[0] / count,
                     mean[1] / count,
                     mean[2] / count,
@@ -3531,6 +3537,14 @@ impl Nvn {
         }) else {
             return Ok(None);
         };
+        // A CPU-uncached pool is coherent on the console: the CPU writes it
+        // without flushing (a list it builds for a GPU pass to walk). Its
+        // copy here takes the CPU's bytes for the bound range before each
+        // binding, after any GPU-newer bytes there are stored back.
+        let uncached = flags & 2 != 0 && flags & 4 == 0;
+        if uncached {
+            self.resolve_resident(core, Some(guest..guest + length))?;
+        }
         let backend = self.gpu.as_mut().unwrap();
         let (buffer, created) = backend.renderer.resident_buffer(base, size)?;
         let fresh = !backend.resident.contains_key(&base);
@@ -3552,6 +3566,9 @@ impl Nvn {
                 guest_dirty: vec![base..base + size],
                 gpu_dirty: Vec::new(),
             };
+        }
+        if uncached {
+            add_range(&mut pool.guest_dirty, guest..guest + length);
         }
         let uploads = std::mem::take(&mut pool.guest_dirty);
         for range in uploads {
