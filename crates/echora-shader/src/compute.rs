@@ -168,6 +168,13 @@ impl Layout {
     }
 }
 
+/// SPIR-V built-ins.
+const BUILTIN_WORKGROUP_ID: u32 = 26;
+const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
+const BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
+/// SubgroupEqMask; Ge, Gt, Le and Lt follow, as S2R's 0x38-0x3c do.
+const BUILTIN_SUBGROUP_EQ_MASK: u32 = 4416;
+
 /// Bytes of a constant bank.
 const BANK_SIZE: u32 = 0x10000;
 
@@ -673,19 +680,79 @@ impl Emitter {
         Ok(value)
     }
 
-    /// A float result with the saturate mode, written to `d`. Rounding
-    /// other than to nearest even is not translated.
+    /// A float operation the driver must not fuse with another
+    /// (NoContraction): the hardware rounds each one.
+    fn exact(&mut self, opcode: u16, operands: &[u32]) -> u32 {
+        let value = self.value(opcode, self.f32, operands);
+        self.module.decorate(value, decoration::NO_CONTRACTION, &[]);
+        value
+    }
+
+    /// `value`, the nearest-even result of an operation whose exact
+    /// result is `value + residual` (by sign), rounded instead by
+    /// `rounding`: 1 down, 2 up, 3 toward zero. Infinities and NaN stay.
+    fn directed(&mut self, value: u32, residual: u32, rounding: u8) -> u32 {
+        let zero_f = self.float_constant(0.0);
+        let below = self.value(op::F_ORD_LESS_THAN, self.bool, &[residual, zero_f]);
+        let above = self.value(op::F_ORD_GREATER_THAN, self.bool, &[residual, zero_f]);
+        let no = self.module.bool_constant(false);
+        let (down, up) = match rounding {
+            1 => (below, no),
+            2 => (no, above),
+            _ => {
+                let positive = self.value(op::F_ORD_GREATER_THAN, self.bool, &[value, zero_f]);
+                let negative = self.value(op::F_ORD_LESS_THAN, self.bool, &[value, zero_f]);
+                (
+                    self.value(op::LOGICAL_AND, self.bool, &[positive, below]),
+                    self.value(op::LOGICAL_AND, self.bool, &[negative, above]),
+                )
+            }
+        };
+        let bits = self.value(op::BITCAST, self.u32, &[value]);
+        let (zero, sign, one) = (
+            self.constant(0),
+            self.constant(0x8000_0000),
+            self.constant(1),
+        );
+        // The next float up: -0 counts as +0.
+        let is_negative_zero = self.value(op::I_EQUAL, self.bool, &[bits, sign]);
+        let b = self.value(op::SELECT, self.u32, &[is_negative_zero, zero, bits]);
+        let sign_bit = self.value(op::BITWISE_AND, self.u32, &[b, sign]);
+        let negative = self.value(op::I_NOT_EQUAL, self.bool, &[sign_bit, zero]);
+        let minus = self.value(op::I_SUB, self.u32, &[b, one]);
+        let plus = self.value(op::I_ADD, self.u32, &[b, one]);
+        let next_up = self.value(op::SELECT, self.u32, &[negative, minus, plus]);
+        // The next float down: +0 counts as -0.
+        let is_zero = self.value(op::I_EQUAL, self.bool, &[bits, zero]);
+        let b = self.value(op::SELECT, self.u32, &[is_zero, sign, bits]);
+        let sign_bit = self.value(op::BITWISE_AND, self.u32, &[b, sign]);
+        let negative = self.value(op::I_NOT_EQUAL, self.bool, &[sign_bit, zero]);
+        let minus = self.value(op::I_SUB, self.u32, &[b, one]);
+        let plus = self.value(op::I_ADD, self.u32, &[b, one]);
+        let next_down = self.value(op::SELECT, self.u32, &[negative, plus, minus]);
+        let result = self.value(op::SELECT, self.u32, &[down, next_down, bits]);
+        let result = self.value(op::SELECT, self.u32, &[up, next_up, result]);
+        let infinite = self.value(op::IS_INF, self.bool, &[value]);
+        let nan = self.value(op::IS_NAN, self.bool, &[value]);
+        let special = self.value(op::LOGICAL_OR, self.bool, &[infinite, nan]);
+        let result = self.value(op::SELECT, self.u32, &[special, bits, result]);
+        self.value(op::BITCAST, self.f32, &[result])
+    }
+
+    /// A float result with its rounding (`residual`: the sign of the
+    /// exact result's excess over `value`, needed for directed rounding)
+    /// and saturate modes, written to `d`.
     fn float_result(
         &mut self,
-        index: usize,
         d: u8,
         value: u32,
+        residual: Option<u32>,
         modes: FloatModes,
     ) -> Result<(), Unsupported> {
-        if modes.rounding != 0 {
-            return Err(unsupported(index, "float rounding mode"));
-        }
-        let mut value = value;
+        let mut value = match residual {
+            Some(residual) if modes.rounding != 0 => self.directed(value, residual, modes.rounding),
+            _ => value,
+        };
         if modes.saturate {
             let glsl = self.module.glsl();
             let zero = self.module.constant(self.f32, 0);
@@ -699,6 +766,66 @@ impl Emitter {
         let bits = self.value(op::BITCAST, self.u32, &[value]);
         self.write_register(d, bits);
         Ok(())
+    }
+
+    /// Special register `special` (S2R's numbering): the lane id, thread
+    /// and workgroup ids, lane masks (subgroups of 32 lanes) and the clock.
+    fn special_register(&mut self, index: usize, special: u8) -> Result<u32, Unsupported> {
+        Ok(match special {
+            0 => {
+                self.module.capability(capability::GROUP_NON_UNIFORM);
+                self.scalar_builtin(BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID)
+            }
+            0x21..=0x23 => self.builtin(BUILTIN_LOCAL_INVOCATION_ID, u32::from(special - 0x21)),
+            0x25..=0x27 => self.builtin(BUILTIN_WORKGROUP_ID, u32::from(special - 0x25)),
+            0x38..=0x3c => {
+                self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
+                let builtin = BUILTIN_SUBGROUP_EQ_MASK + u32::from(special - 0x38);
+                let uvec4 = self.module.ty(Type::Vector {
+                    component: self.u32,
+                    count: 4,
+                });
+                let variable = self.builtin_variable(builtin, uvec4);
+                let vector = self.value(op::LOAD, uvec4, &[variable]);
+                self.value(op::COMPOSITE_EXTRACT, self.u32, &[vector, 0])
+            }
+            0x50 | 0x51 => {
+                self.module.capability(capability::SHADER_CLOCK);
+                self.module.extension("SPV_KHR_shader_clock");
+                let uvec2 = self.module.ty(Type::Vector {
+                    component: self.u32,
+                    count: 2,
+                });
+                let subgroup = self.constant(3);
+                let clock = self.value(op::READ_CLOCK, uvec2, &[subgroup]);
+                self.value(
+                    op::COMPOSITE_EXTRACT,
+                    self.u32,
+                    &[clock, u32::from(special - 0x50)],
+                )
+            }
+            _ => return Err(unsupported(index, format!("special register {special:#x}"))),
+        })
+    }
+
+    /// A built-in input variable of type `ty`, declared once.
+    fn builtin_variable(&mut self, builtin: u32, ty: u32) -> u32 {
+        if let Some(&variable) = self.builtins.get(&builtin) {
+            return variable;
+        }
+        let pointer = self.module.pointer(storage::INPUT, ty);
+        let variable = self.module.global_variable(pointer, storage::INPUT);
+        self.module
+            .decorate(variable, decoration::BUILT_IN, &[builtin]);
+        self.builtins.insert(builtin, variable);
+        self.interface.push(variable);
+        variable
+    }
+
+    /// A scalar `u32` built-in input.
+    fn scalar_builtin(&mut self, builtin: u32) -> u32 {
+        let variable = self.builtin_variable(builtin, self.u32);
+        self.value(op::LOAD, self.u32, &[variable])
     }
 
     /// A built-in `uvec3` input's component `component`.
@@ -827,9 +954,14 @@ impl Emitter {
                     self.float(index, b)?,
                     self.float(index, c)?,
                 );
-                let glsl = self.module.glsl();
-                let value = self.value(op::EXT_INST, self.f32, &[glsl, glsl::FMA, a, b, c]);
-                self.float_result(index, d.0, value, modes)?;
+                let value = self.glsl(self.f32, glsl::FMA, &[a, b, c]);
+                // a*b - value, then + c: the excess's sign.
+                let residual = (modes.rounding != 0).then(|| {
+                    let negated = self.value(op::F_NEGATE, self.f32, &[value]);
+                    let part = self.glsl(self.f32, glsl::FMA, &[a, b, negated]);
+                    self.exact(op::F_ADD, &[part, c])
+                });
+                self.float_result(d.0, value, residual, modes)?;
             }
             Op::Fmul {
                 d,
@@ -843,13 +975,26 @@ impl Emitter {
                     return Err(unsupported(index, "FMUL with a result scale"));
                 }
                 let (a, b) = (self.float(index, a)?, self.float(index, b)?);
-                let value = self.value(op::F_MUL, self.f32, &[a, b]);
-                self.float_result(index, d.0, value, modes)?;
+                let value = self.exact(op::F_MUL, &[a, b]);
+                // The product's error, exactly: a*b - value.
+                let residual = (modes.rounding != 0).then(|| {
+                    let negated = self.value(op::F_NEGATE, self.f32, &[value]);
+                    self.glsl(self.f32, glsl::FMA, &[a, b, negated])
+                });
+                self.float_result(d.0, value, residual, modes)?;
             }
             Op::Fadd { d, a, b, modes } => {
                 let (a, b) = (self.float(index, a)?, self.float(index, b)?);
-                let value = self.value(op::F_ADD, self.f32, &[a, b]);
-                self.float_result(index, d.0, value, modes)?;
+                let value = self.exact(op::F_ADD, &[a, b]);
+                // The sum's error, exactly (two-sum).
+                let residual = (modes.rounding != 0).then(|| {
+                    let b_part = self.exact(op::F_SUB, &[value, a]);
+                    let a_part = self.exact(op::F_SUB, &[value, b_part]);
+                    let a_error = self.exact(op::F_SUB, &[a, a_part]);
+                    let b_error = self.exact(op::F_SUB, &[b, b_part]);
+                    self.exact(op::F_ADD, &[a_error, b_error])
+                });
+                self.float_result(d.0, value, residual, modes)?;
             }
             Op::Fsetp {
                 p,
@@ -895,22 +1040,75 @@ impl Emitter {
             }
             Op::S2r { d, special } => {
                 // Thread id (33-35) and workgroup id (37-39), as on Maxwell.
-                let (builtin, component) = match special {
-                    33..=35 => (27, u32::from(special - 33)), // LocalInvocationId
-                    37..=39 => (26, u32::from(special - 37)), // WorkgroupId
-                    _ => return Err(unsupported(index, format!("special register {special}"))),
-                };
-                let value = self.builtin(builtin, component);
+                let value = self.special_register(index, special)?;
                 self.write_register(d.0, value);
             }
-            Op::ImadWide { d, a, b, c, signed } => {
+            Op::ImadWide {
+                d,
+                a,
+                b,
+                c,
+                signed,
+                high,
+                carry_out,
+            } => {
+                if carry_out != 7 {
+                    return Err(unsupported(index, "IMAD.WIDE carry output"));
+                }
                 let ty = self.u64();
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
                 let c = self.pair_operand(index, c)?;
                 let (a, b) = (self.widen(a, signed), self.widen(b, signed));
                 let product = self.value(op::I_MUL, ty, &[a, b]);
                 let sum = self.value(op::I_ADD, ty, &[product, c]);
-                self.write_pair(d.0, sum);
+                if high {
+                    let (_, high_word) = self.split(sum);
+                    self.write_register(d.0, high_word);
+                } else {
+                    self.write_pair(d.0, sum);
+                }
+            }
+            Op::Iabs { d, src } => {
+                let x = self.integer(index, src)?;
+                let value = self.glsl(self.u32, glsl::S_ABS, &[x]);
+                self.write_register(d.0, value);
+            }
+            Op::P2r { d, a, mask, byte } => {
+                let a = self.read_register(a.0);
+                let zero = self.constant(0);
+                let mut bits = zero;
+                for n in 0..7u8 {
+                    if mask >> n & 1 == 0 {
+                        continue;
+                    }
+                    let predicate = self.read_predicate(Pred {
+                        index: n,
+                        negated: false,
+                    });
+                    let bit = self.constant(1 << n);
+                    let value = self.value(op::SELECT, self.u32, &[predicate, bit, zero]);
+                    bits = self.value(op::BITWISE_OR, self.u32, &[bits, value]);
+                }
+                let shift = u32::from(byte) * 8;
+                let place = self.constant(shift);
+                let bits = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[bits, place]);
+                let keep = self.constant(!((mask & 0x7f) << shift));
+                let kept = self.value(op::BITWISE_AND, self.u32, &[a, keep]);
+                let value = self.value(op::BITWISE_OR, self.u32, &[kept, bits]);
+                self.write_register(d.0, value);
+            }
+            Op::R2p { a, mask, byte } => {
+                let a = self.read_register(a.0);
+                let zero = self.constant(0);
+                for n in 0..7u8 {
+                    if mask >> n & 1 == 0 {
+                        continue;
+                    }
+                    let bit = self.constant(1 << (u32::from(n) + u32::from(byte) * 8));
+                    let value = self.value(op::BITWISE_AND, self.u32, &[a, bit]);
+                    let set = self.value(op::I_NOT_EQUAL, self.bool, &[value, zero]);
+                    self.write_predicate(n, set);
+                }
             }
             Op::Lea {
                 d,
@@ -1151,19 +1349,71 @@ impl Emitter {
                 src_size,
                 rounding,
             } => {
-                if (dst_size, src_size) != (2, 2) {
-                    return Err(unsupported(index, "I2F other than 32-bit"));
+                if dst_size != 2 {
+                    return Err(unsupported(index, "I2F to other than 32-bit"));
                 }
-                if rounding != 0 {
-                    return Err(unsupported(index, "I2F rounding mode"));
-                }
-                let x = self.integer(index, src)?;
                 let opcode = if signed {
                     op::CONVERT_S_TO_F
                 } else {
                     op::CONVERT_U_TO_F
                 };
-                let value = self.value(opcode, self.f32, &[x]);
+                let value = match src_size {
+                    // A byte or half from the source's low bits, exactly.
+                    0 | 1 => {
+                        let x = self.integer(index, src)?;
+                        let zero = self.constant(0);
+                        let bits = self.constant(if src_size == 0 { 8 } else { 16 });
+                        let extract = if signed {
+                            op::BIT_FIELD_S_EXTRACT
+                        } else {
+                            op::BIT_FIELD_U_EXTRACT
+                        };
+                        let x = self.value(extract, self.u32, &[x, zero, bits]);
+                        self.value(opcode, self.f32, &[x])
+                    }
+                    2 => {
+                        let x = self.integer(index, src)?;
+                        let value = self.value(opcode, self.f32, &[x]);
+                        if rounding == 0 {
+                            value
+                        } else {
+                            // The excess's sign: x against the result
+                            // converted back (in 64 bits, where it fits).
+                            let ty = self.u64();
+                            let wide = self.widen(x, signed);
+                            let back_opcode = if signed {
+                                op::CONVERT_F_TO_S
+                            } else {
+                                op::CONVERT_F_TO_U
+                            };
+                            let back = self.value(back_opcode, ty, &[value]);
+                            let (greater, less) = if signed {
+                                (op::S_GREATER_THAN, op::S_LESS_THAN)
+                            } else {
+                                (op::U_GREATER_THAN, op::U_LESS_THAN)
+                            };
+                            let above = self.value(greater, self.bool, &[wide, back]);
+                            let below = self.value(less, self.bool, &[wide, back]);
+                            let (one, minus_one, zero) = (
+                                self.float_constant(1.0),
+                                self.float_constant(-1.0),
+                                self.float_constant(0.0),
+                            );
+                            let residual =
+                                self.value(op::SELECT, self.f32, &[below, minus_one, zero]);
+                            let residual =
+                                self.value(op::SELECT, self.f32, &[above, one, residual]);
+                            self.directed(value, residual, rounding)
+                        }
+                    }
+                    _ => {
+                        if rounding != 0 {
+                            return Err(unsupported(index, "I2F of 64 bits with a rounding mode"));
+                        }
+                        let x = self.pair_operand(index, src)?;
+                        self.value(opcode, self.f32, &[x])
+                    }
+                };
                 self.write_float(d.0, value);
             }
             Op::Frnd {
@@ -1217,16 +1467,16 @@ impl Emitter {
                 }
             }
             Op::Cs2r { d, special, wide } => {
-                if special != 255 {
-                    return Err(unsupported(
-                        index,
-                        format!("CS2R special register {special}"),
-                    ));
-                }
-                let zero = self.constant(0);
-                self.write_register(d.0, zero);
+                let (low, high) = match special {
+                    255 => (self.constant(0), self.constant(0)),
+                    _ => (
+                        self.special_register(index, special)?,
+                        self.special_register(index, special.wrapping_add(1))?,
+                    ),
+                };
+                self.write_register(d.0, low);
                 if wide && !self.zero_register(d.0) {
-                    self.write_register(d.0.saturating_add(1), zero);
+                    self.write_register(d.0.saturating_add(1), high);
                 }
             }
             Op::Ldc {
@@ -1240,8 +1490,9 @@ impl Emitter {
                 if mode != 0 {
                     return Err(unsupported(index, format!("LDC mode {mode}")));
                 }
+                // A byte or half word comes from the word that holds it.
                 let words = match size {
-                    4 => 1,
+                    0..=4 => 1,
                     5 => 2,
                     _ => return Err(unsupported(index, format!("LDC size {size}"))),
                 };
@@ -1264,7 +1515,13 @@ impl Emitter {
                 let base = self.read_register(base.0);
                 let offset = self.constant(u32::from(offset));
                 let address = self.value(op::I_ADD, self.u32, &[base, offset]);
-                let values = self.bank_words(variable, address, words);
+                let (three, not_three) = (self.constant(3), self.constant(!3));
+                let aligned = self.value(op::BITWISE_AND, self.u32, &[address, not_three]);
+                let mut values = self.bank_words(variable, aligned, words);
+                if size < 4 {
+                    let low_bits = self.value(op::BITWISE_AND, self.u32, &[address, three]);
+                    values[0] = self.sub_word(values[0], low_bits, size);
+                }
                 for (n, value) in values.into_iter().enumerate() {
                     if !self.zero_register(d.0) {
                         self.write_register(d.0.saturating_add(n as u8), value);
@@ -1273,7 +1530,7 @@ impl Emitter {
             }
             Op::Uldc { d, src, size } => {
                 let words = match size {
-                    4 => 1,
+                    0..=4 => 1,
                     5 => 2,
                     _ => return Err(unsupported(index, format!("ULDC size {size}"))),
                 };
@@ -1281,9 +1538,14 @@ impl Emitter {
                     return Err(unsupported(index, "bindless ULDC"));
                 };
                 for n in 0..words {
-                    let value = self
-                        .constant_word(bank, offset.wrapping_add(n * 4))
+                    let at = (offset & !3).wrapping_add(n * 4);
+                    let mut value = self
+                        .constant_word(bank, at)
                         .map_err(|reason| unsupported(index, reason))?;
+                    if size < 4 {
+                        let low_bits = self.constant(u32::from(offset & 3));
+                        value = self.sub_word(value, low_bits, size);
+                    }
                     if d.0 != 63 {
                         self.write_uniform(d.0.saturating_add(n as u8), value);
                     }
@@ -2325,6 +2587,190 @@ mod tests {
     }
 
     #[test]
+    fn rounding_modes_conversions_and_special_registers_validate() {
+        valid(&[
+            // FADD.RZ R2, R0, R1; FMUL.RM R3, R0, R1; FFMA.RP R4, R0, R1, R2
+            word(&[
+                (0, 12, 0x221),
+                (16, 8, 2),
+                (24, 8, 0),
+                (32, 8, 1),
+                (78, 2, 3),
+            ]),
+            word(&[
+                (0, 12, 0x220),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (78, 2, 1),
+                (84, 3, 4),
+            ]),
+            word(&[
+                (0, 12, 0x223),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 1),
+                (64, 8, 2),
+                (78, 2, 2),
+            ]),
+            // I2F.RZ R5, R1; I2F.S16 R6, R1; I2F.S64 R7, R8
+            word(&[
+                (0, 12, 0x306),
+                (16, 8, 5),
+                (32, 8, 1),
+                (75, 2, 2),
+                (78, 2, 3),
+                (84, 2, 2),
+            ]),
+            word(&[
+                (0, 12, 0x306),
+                (16, 8, 6),
+                (32, 8, 1),
+                (74, 1, 1),
+                (75, 2, 2),
+                (84, 2, 1),
+            ]),
+            word(&[
+                (0, 12, 0x306),
+                (16, 8, 7),
+                (32, 8, 8),
+                (74, 1, 1),
+                (75, 2, 2),
+                (84, 2, 3),
+            ]),
+            // IMAD.HI.U32 R9, R1, 0x55555556, RZ; IABS R10, R1
+            word(&[
+                (0, 12, 0x827),
+                (16, 8, 9),
+                (24, 8, 1),
+                (32, 32, 0x5555_5556),
+                (64, 8, 255),
+                (81, 3, 7),
+            ]),
+            word(&[(0, 12, 0x213), (16, 8, 10), (32, 8, 1)]),
+            // P2R R11, PR, R1, 0x7f; R2P PR, R11, 0x3
+            word(&[(0, 12, 0x803), (16, 8, 11), (24, 8, 1), (32, 32, 0x7f)]),
+            word(&[(0, 12, 0x804), (24, 8, 11), (32, 32, 0x3)]),
+            // S2R R12, SR_LANEID; S2R R13, SR_LTMASK; CS2R R14, SR_CLOCKLO
+            word(&[(0, 12, 0x919), (16, 8, 12), (72, 8, 0)]),
+            word(&[(0, 12, 0x919), (16, 8, 13), (72, 8, 0x39)]),
+            word(&[(0, 12, 0x805), (16, 8, 14), (72, 8, 0x50), (80, 1, 1)]),
+            // LDC.U8 R16, c[0x3][R1+0x3]; ULDC.S16 UR4, c[0x3][0x6];
+            // ULDC (indexed) UR5, c[0x3][UR4+0x10]
+            word(&[
+                (0, 12, 0xb82),
+                (16, 8, 16),
+                (24, 8, 1),
+                (54, 5, 3),
+                (38, 16, 3),
+                (73, 3, 0),
+            ]),
+            word(&[
+                (0, 12, 0xab9),
+                (16, 6, 4),
+                (54, 5, 3),
+                (38, 16, 6),
+                (73, 3, 3),
+            ]),
+            word(&[
+                (0, 12, 0xabb),
+                (16, 6, 5),
+                (24, 6, 4),
+                (54, 5, 3),
+                (38, 16, 0x10),
+                (73, 3, 4),
+                (91, 1, 1),
+            ]),
+            EXIT,
+        ]);
+    }
+
+    /// The directed-rounding steps the translation emits, in Rust: the
+    /// nearest result, its residual's sign, and one step up or down.
+    fn directed_model(value: f32, residual: f32, rounding: u8) -> f32 {
+        let (down, up) = match rounding {
+            1 => (residual < 0.0, false),
+            2 => (false, residual > 0.0),
+            _ => (value > 0.0 && residual < 0.0, value < 0.0 && residual > 0.0),
+        };
+        if !value.is_finite() {
+            return value;
+        }
+        let bits = value.to_bits();
+        let b = if bits == 0x8000_0000 { 0 } else { bits };
+        let next_up = if b & 0x8000_0000 != 0 { b - 1 } else { b + 1 };
+        let b = if bits == 0 { 0x8000_0000 } else { bits };
+        let next_down = if b & 0x8000_0000 != 0 { b + 1 } else { b - 1 };
+        f32::from_bits(if up {
+            next_up
+        } else if down {
+            next_down
+        } else {
+            bits
+        })
+    }
+
+    /// `exact` rounded to f32 by `rounding`, from f64 (exact for these
+    /// operations' results on f32 inputs, sums and products).
+    fn rounded_from(exact: f64, rounding: u8) -> f32 {
+        let nearest = exact as f32;
+        let n = f64::from(nearest);
+        let step = |x: f32, up: bool| {
+            let b = x.to_bits();
+            f32::from_bits(match (x >= 0.0, up) {
+                (_, _) if x == 0.0 => {
+                    if up {
+                        1
+                    } else {
+                        0x8000_0001
+                    }
+                }
+                (true, true) | (false, false) => b + 1,
+                _ => b - 1,
+            })
+        };
+        match rounding {
+            1 if n > exact => step(nearest, false),
+            2 if n < exact => step(nearest, true),
+            3 if n.abs() > exact.abs() => step(nearest, exact < 0.0),
+            _ => nearest,
+        }
+    }
+
+    #[test]
+    fn directed_rounding_steps_match_exact_rounding() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Moderate exponents, so f64 holds sums and products exactly.
+            let mantissa = state & 0x007f_ffff;
+            let exponent = 100 + (state >> 24) % 50;
+            let sign = state & 0x8000_0000;
+            f32::from_bits(sign | exponent << 23 | mantissa)
+        };
+        for _ in 0..20_000 {
+            let (a, b) = (next(), next());
+            for rounding in 1..=3 {
+                // FADD: two-sum's error.
+                let sum = a + b;
+                let b_part = sum - a;
+                let error = (a - (sum - b_part)) + (b - b_part);
+                let got = directed_model(sum, error, rounding);
+                let want = rounded_from(f64::from(a) + f64::from(b), rounding);
+                assert_eq!(got.to_bits(), want.to_bits(), "{a} + {b} by {rounding}");
+                // FMUL: the product's error by FMA.
+                let product = a * b;
+                let error = a.mul_add(b, -product);
+                let got = directed_model(product, error, rounding);
+                let want = rounded_from(f64::from(a) * f64::from(b), rounding);
+                assert_eq!(got.to_bits(), want.to_bits(), "{a} * {b} by {rounding}");
+            }
+        }
+    }
+
+    #[test]
     fn float_families_validate() {
         valid(&[
             // FFMA.SAT R0, -|R1|, R2, R3; FMUL R4, R0, 2.0; FADD R5, R4, R0
@@ -2411,8 +2857,9 @@ mod tests {
         let unknown = translated(&[word(&[(0, 12, 0x1ff)]), EXIT]).unwrap_err();
         assert_eq!(unknown.offset, Some(0));
         assert!(unknown.reason.contains("0x1ff"), "{}", unknown.reason);
-        let rounding = translated(&[EXIT, word(&[(0, 12, 0x221), (78, 2, 3)]), EXIT]).unwrap_err();
-        assert_eq!(rounding.offset, Some(16));
+        // FMUL's result scale (other than 4, none) is not translated.
+        let scaled = translated(&[EXIT, word(&[(0, 12, 0x220), (84, 3, 5)]), EXIT]).unwrap_err();
+        assert_eq!(scaled.offset, Some(16));
         let outside = translated(&[bra(0, 50, 7), EXIT]).unwrap_err();
         assert!(outside.reason.contains("outside"), "{}", outside.reason);
     }

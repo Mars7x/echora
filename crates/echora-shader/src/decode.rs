@@ -154,13 +154,36 @@ pub enum Op {
         c: Operand,
     },
     /// IMAD.WIDE d:d+1, a, b, c:c+1: the 64-bit a * b + c, the factors
-    /// `signed` (bit 73) or not.
+    /// `signed` (bit 73) or not; IMAD.HI (`high`) writes only its high
+    /// word to d. `carry_out` (81-83) receives the 64-bit sum's carry.
     ImadWide {
         d: Reg,
         a: Operand,
         b: Operand,
         c: Operand,
         signed: bool,
+        high: bool,
+        carry_out: u8,
+    },
+    /// IABS d, src: the absolute value of a signed word.
+    Iabs {
+        d: Reg,
+        src: Operand,
+    },
+    /// P2R d, a, mask: a with byte `byte` (bits 76-77) replaced, where
+    /// `mask` is set, by the predicates P0-P6 as bits.
+    P2r {
+        d: Reg,
+        a: Reg,
+        mask: u32,
+        byte: u8,
+    },
+    /// R2P a, mask: predicate Pi, where bit i of `mask` is set, from bit i
+    /// of byte `byte` of a.
+    R2p {
+        a: Reg,
+        mask: u32,
+        byte: u8,
     },
     /// LEA d, a, b (and c with `.HI`): (a << shift) + b; with `high`
     /// (`.HI`, bit 80) the shifted value is the high word of c:a << shift.
@@ -644,7 +667,10 @@ pub fn decode(raw: u128) -> Instruction {
     let opcode = word.bits(0, 12) as u16;
     let (op, uniform) = match uniform_mirror(opcode) {
         Some(mirror) => (decode_op(word, mirror), true),
-        None => (decode_op(word, opcode), matches!(opcode, 0xab9 | 0x9c3)),
+        None => (
+            decode_op(word, opcode),
+            matches!(opcode, 0xab9 | 0xabb | 0x9c3),
+        ),
     };
     Instruction {
         raw,
@@ -691,6 +717,21 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
     let form = word.form();
     // Operations whose bits 9-11 are not an ALU form match all 12 bits.
     match opcode {
+        0x803 => {
+            return Some(Op::P2r {
+                d,
+                a: word.reg(24),
+                mask: word.bits(32, 32) as u32,
+                byte: word.bits(76, 2) as u8,
+            });
+        }
+        0x804 => {
+            return Some(Op::R2p {
+                a: word.reg(24),
+                mask: word.bits(32, 32) as u32,
+                byte: word.bits(76, 2) as u8,
+            });
+        }
         0x3c2 => {
             return Some(Op::R2ur {
                 d: UniformReg(word.bits(16, 6) as u8),
@@ -822,7 +863,9 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 mode: word.bits(77, 2) as u8,
             });
         }
-        0xb82 => {
+        // LDC, and 0xabb: ULDC indexed by the uniform register at 24 (a
+        // uniform instruction, so its registers are uniform ones).
+        0xb82 | 0xabb => {
             return Some(Op::Ldc {
                 d,
                 index: word.reg(24),
@@ -934,12 +977,18 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             accumulate: word.pred(87, 90),
             extended: word.bit(72).then(|| word.pred(68, 71)),
         },
-        0x025 if (1..=7).contains(&form) => Op::ImadWide {
+        0x025 | 0x027 if (1..=7).contains(&form) => Op::ImadWide {
             d,
             a: word.a(),
             b: word.source(1)?,
             c: word.source(2)?,
             signed: word.bit(73),
+            high: opcode & 0x1ff == 0x027,
+            carry_out: word.bits(81, 3) as u8,
+        },
+        0x013 if matches!(form, 1 | 4 | 5 | 6) => Op::Iabs {
+            d,
+            src: word.source(1)?,
         },
         0x011 if (1..=7).contains(&form) => {
             let mut b = word.source(1)?;

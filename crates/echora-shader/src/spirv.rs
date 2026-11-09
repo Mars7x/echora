@@ -58,6 +58,7 @@ pub mod op {
     pub const F_DIV: u16 = 136;
     pub const I_ADD_CARRY: u16 = 149;
     pub const IS_NAN: u16 = 156;
+    pub const IS_INF: u16 = 157;
     pub const LOGICAL_EQUAL: u16 = 164;
     pub const LOGICAL_NOT_EQUAL: u16 = 165;
     pub const LOGICAL_OR: u16 = 166;
@@ -107,6 +108,7 @@ pub mod op {
     pub const ATOMIC_OR: u16 = 241;
     pub const ATOMIC_XOR: u16 = 242;
     pub const ATOMIC_F_ADD: u16 = 6035;
+    pub const READ_CLOCK: u16 = 5056;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -136,6 +138,9 @@ pub mod storage {
 pub mod capability {
     pub const SHADER: u32 = 1;
     pub const INT64: u32 = 11;
+    pub const GROUP_NON_UNIFORM: u32 = 61;
+    pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
+    pub const SHADER_CLOCK: u32 = 5055;
     pub const ATOMIC_FLOAT32_ADD: u32 = 6033;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     /// The addressing model with physical storage buffer pointers.
@@ -147,6 +152,7 @@ pub mod capability {
 pub mod decoration {
     pub const BLOCK: u32 = 2;
     pub const ARRAY_STRIDE: u32 = 6;
+    pub const NO_CONTRACTION: u32 = 42;
     pub const BUILT_IN: u32 = 11;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
@@ -166,6 +172,7 @@ pub mod execution {
 #[allow(missing_docs)]
 pub mod glsl {
     pub const ROUND_EVEN: u32 = 2;
+    pub const S_ABS: u32 = 5;
     pub const TRUNC: u32 = 3;
     pub const F_ABS: u32 = 4;
     pub const FLOOR: u32 = 8;

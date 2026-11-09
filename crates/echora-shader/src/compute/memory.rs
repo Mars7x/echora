@@ -235,7 +235,7 @@ impl Emitter {
     }
 
     /// The `size`-typed value at byte `low_bits` (0-3) of `word`.
-    fn sub_word(&mut self, word: u32, low_bits: u32, size: u8) -> u32 {
+    pub(super) fn sub_word(&mut self, word: u32, low_bits: u32, size: u8) -> u32 {
         let eight = self.constant(8);
         let shift = self.value(op::I_MUL, self.u32, &[low_bits, eight]);
         let bits = self.constant(if size < 2 { 8 } else { 16 });

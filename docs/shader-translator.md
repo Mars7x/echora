@@ -79,6 +79,14 @@ goals first-class, next to correctness:
 4. **Graphics stages** and textures.
 5. **HMMA**: a subgroup path, and VK_KHR_cooperative_matrix.
 
+**Exactness.** Float multiplies and adds are marked NoContraction, as
+the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
+exact: the nearest result's error is computed without rounding (two-sum
+for an add, a fused multiply-add for a product) and the result steps one
+ulp where its sign says the exact value lies. Lane ids, lane masks and the
+warp operations assume 32-lane subgroups, which the runtime requests
+(VK_EXT_subgroup_size_control) for every translated program.
+
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
 plain structured code, so the output aims for that:
 
@@ -125,7 +133,9 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
 | EXIT, NOP | 0x94d, 0x918 | |
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
-| IMAD.WIDE | 0x025 in forms 1-7 | signed 73; C a register pair |
+| IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
+| IABS | 0x013 | the source in the second slot |
+| P2R, R2P | 0x803, 0x804 | immediate mask 32-63 (P0-P6), byte 76-77 |
 | LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
 | SHF | 0x019 in forms 1-7 | type 73-74 (S64, U64, S32, U32), wrap 75, right 76, high word 80 |
 | PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74; SGXT signed 73, wrap 75 |
@@ -136,7 +146,8 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | FSET.BF | 0x00a | as FSETP, with 1.0 or 0.0 in a register |
 | PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71; tables 64-66 with 72-76, and 16-23 |
 | CS2R | 0x805 | special register 72-79 (255 SRZ), pair 80 |
-| LDC, ULDC | 0xb82, 0xab9 | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
+| S2R specials | | 0 lane id, 0x21-0x23 thread id, 0x25-0x27 workgroup id, 0x38-0x3c lane masks (EQ, LT, LE, GT, GE), 0x50-0x51 clock |
+| LDC, ULDC | 0xb82, 0xab9, 0xabb (ULDC indexed by a uniform register) | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67) |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
