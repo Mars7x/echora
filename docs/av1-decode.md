@@ -114,35 +114,29 @@ Notes on values:
   The spec has the decoder substitute a frame; the parser reports the slot
   as empty.
 
-## What the Vulkan side still does
+## The Vulkan side
 
-- Query `VkVideoDecodeAV1ProfileInfoKHR` (Main, 8-bit 4:2:0 for the
-  movies; `filmGrainSupport` if grain is to be applied), the capabilities
-  and the NV12 formats; create the video session and bind its memory.
-- Create session parameters from `std_sequence` (one per
-  `sequence_generation`).
-- Allocate the DPB: eight AV1 slots plus the picture being decoded, so
-  nine images (or layers) are always enough. Key the images by
-  `PictureId`; an image can be reused once no slot holds its id and it has
-  been presented.
-- Upload each submission into a bitstream buffer (respecting
-  `minBitstreamBufferOffsetAlignment` and `minBitstreamBufferSizeAlignment`)
-  and record `vkCmdBeginVideoCodingKHR` with the DPB slots in use,
-  `vkCmdDecodeVideoKHR` with `VkVideoDecodeAV1PictureInfoKHR`, the setup
-  slot (`VkVideoDecodeAV1DpbSlotInfoKHR` with `setup_reference_info`) and
-  one reference slot per distinct DPB image named by
-  `reference_name_slot_indices`, then `vkCmdEndVideoCodingKHR`. Reset the
-  session (`VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`) before the first
-  decode.
-- The output image: with grain, decode into a separate output picture (the
-  DPB picture must stay grain-free); without, the output can coincide with
-  the DPB picture. For `ShowExisting`, present the DPB image of `show.id`
-  again, applying `show.film_grain` if present (Vulkan only applies grain
-  during a decode, so this needs a compute pass or the CPU fallback).
-- Copy or convert the NV12 output to the guest's buffer, honouring
-  `render_width` x `render_height`.
-- Fall back to rav1d when the device lacks AV1 decode or a stream needs
-  something it does not support.
+`crates/echora-gpu/src/video.rs` and `video_av1.rs`:
+
+- `VideoDevice` is a Vulkan device of its own with a decode queue and a
+  copy queue, so movie decoding never shares a queue with the renderer.
+  On RADV the decode family cannot copy.
+- The session is AV1 Main, 8-bit 4:2:0, without film grain. The DPB is
+  nine images, one per slot, which also hold the output pictures
+  (`DPB_AND_OUTPUT_COINCIDE`). An array image would be one allocation,
+  but RADV 25.2 misplaces the chroma plane of layers past the first.
+- `MovieDecoder` keeps the DPB slots by `PictureId`, maps the AV1 slots
+  of `reference_name_slot_indices` to DPB slots, and reads shown pictures
+  back as NV12 at the guest's pitch. It refuses film grain and superres,
+  so the caller falls back to rav1d.
+- `ECHORA_VIDEO_DECODE=gpu` makes the game's movies decode this way
+  (rav1d stays the default). If the device has no AV1 decode, or a decode
+  fails, that movie continues on rav1d.
+- `av1-gpu-check FILE.obu [PICTURES]` (in `echora-runtime`) decodes a raw
+  stream (`ffmpeg -c:v copy -an -f obu`) both ways and compares the NV12
+  planes; `AV1_CHECK_HIDDEN=1` compares hidden frames too (rav1d's
+  invisible-frame output). All 26 of the game's movies, 83,449 pictures,
+  decode identically, at 2 to 4 ms per 1080p picture on an RX 9070 XT.
 
 ## Tests
 

@@ -1133,6 +1133,14 @@ pub struct Services {
     /// The host AV1 decoder of the current decoder session (created by
     /// 201, dropped by 115), and its failures.
     av1_decoder: Option<crate::av1::Decoder>,
+    /// ECHORA_VIDEO_DECODE=gpu: the session's decoder on the GPU's video
+    /// engine, used instead of `av1_decoder` until it fails (then the
+    /// session goes back to rav1d).
+    gpu_movie: Option<echora_gpu::video_av1::MovieDecoder>,
+    gpu_movie_failed: bool,
+    /// The video engine's device, opened on first use (None inside when
+    /// the host has no AV1 decode).
+    video_device: Option<Option<std::sync::Arc<echora_gpu::video::VideoDevice>>>,
     /// Pictures decoded and when the first was (ECHORA_MOVIE_RATE).
     av1_pictures: (u64, Option<std::time::Instant>, std::time::Instant),
     av1_errors: Vec<String>,
@@ -1268,6 +1276,9 @@ impl Default for Services {
             video_submissions: 0,
             video_input: Vec::new(),
             av1_decoder: None,
+            gpu_movie: None,
+            gpu_movie_failed: false,
+            video_device: None,
             av1_pictures: (0, None, std::time::Instant::now()),
             av1_errors: Vec::new(),
             video_log: Default::default(),
@@ -2464,6 +2475,8 @@ impl Services {
                 call.reply(0, None, 0, &[])?;
                 self.video_decoders.push((size, parameters));
                 self.av1_decoder = None;
+                self.gpu_movie = None;
+                self.gpu_movie_failed = false;
                 self.decoder_fences.clear();
                 self.decoder_fences_released = false;
                 self.provisional_commands
@@ -2684,6 +2697,8 @@ impl Services {
                 self.video_input_event = None;
                 self.video_decoder_running = false;
                 self.av1_decoder = None;
+                self.gpu_movie = None;
+                self.gpu_movie_failed = false;
                 self.release_decoder_fences();
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands
@@ -4545,13 +4560,29 @@ impl Services {
     /// first use): the last picture it completes, if any. Failures are
     /// recorded (the first 16) and give no picture.
     fn decode_av1(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
-        let result = match &mut self.av1_decoder {
-            Some(decoder) => decoder.decode(bytes),
-            None => crate::av1::Decoder::new().and_then(|mut decoder| {
-                let result = decoder.decode(bytes);
-                self.av1_decoder = Some(decoder);
-                result
-            }),
+        let gpu = match self.decode_av1_gpu(bytes) {
+            Some(Ok(pictures)) => Some(Ok(pictures)),
+            Some(Err(error)) => {
+                // The session continues on rav1d (from its next key frame).
+                if self.av1_errors.len() < 16 {
+                    self.av1_errors.push(format!("GPU decode: {error}"));
+                }
+                self.gpu_movie = None;
+                self.gpu_movie_failed = true;
+                None
+            }
+            None => None,
+        };
+        let result = match gpu {
+            Some(result) => result,
+            None => match &mut self.av1_decoder {
+                Some(decoder) => decoder.decode(bytes),
+                None => crate::av1::Decoder::new().and_then(|mut decoder| {
+                    let result = decoder.decode(bytes);
+                    self.av1_decoder = Some(decoder);
+                    result
+                }),
+            },
         };
         if let Ok(pictures) = &result {
             // ECHORA_MOVIE_RATE: decoded movie pictures per host second, a
@@ -4579,6 +4610,65 @@ impl Services {
                 None
             }
         }
+    }
+
+    /// With ECHORA_VIDEO_DECODE=gpu, decode one submission on the GPU's
+    /// video engine: the pictures it shows, as rav1d gives them. None when
+    /// GPU decoding is off, unavailable, or failed earlier this session.
+    fn decode_av1_gpu(&mut self, bytes: &[u8]) -> Option<Result<Vec<crate::av1::Picture>, String>> {
+        if self.gpu_movie_failed
+            || crate::nvn::debug_var("ECHORA_VIDEO_DECODE").as_deref() != Ok("gpu")
+        {
+            return None;
+        }
+        if self.gpu_movie.is_none() {
+            let device = self
+                .video_device
+                .get_or_insert_with(|| match echora_gpu::video::VideoDevice::new() {
+                    Ok(device) => Some(device),
+                    Err(error) => {
+                        eprintln!("video: no GPU AV1 decode ({error}); using rav1d");
+                        None
+                    }
+                })
+                .clone()?;
+            self.gpu_movie = Some(echora_gpu::video_av1::MovieDecoder::new(device));
+        }
+        let movie = self.gpu_movie.as_mut()?;
+        Some((|| {
+            let mut pictures = Vec::new();
+            for shown in movie.decode(bytes)? {
+                let (width, height) = (shown.width as usize, shown.height as usize);
+                let pitch = width.next_multiple_of(2);
+                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch as u32)];
+                movie.read_nv12(shown, pitch as u32, &mut nv12)?;
+                let (luma, chroma) = nv12.split_at(pitch * height);
+                let y = luma
+                    .chunks(pitch)
+                    .flat_map(|row| &row[..width])
+                    .copied()
+                    .collect();
+                let chroma_width = width.div_ceil(2);
+                let (mut u, mut v) = (Vec::new(), Vec::new());
+                for row in chroma.chunks(pitch).take(height.div_ceil(2)) {
+                    for pair in row[..chroma_width * 2].chunks(2) {
+                        u.push(pair[0]);
+                        v.push(pair[1]);
+                    }
+                }
+                let (full_range, matrix) = movie.color().unwrap_or((false, 1));
+                pictures.push(crate::av1::Picture {
+                    width: shown.width,
+                    height: shown.height,
+                    y,
+                    u,
+                    v,
+                    full_range,
+                    matrix,
+                });
+            }
+            Ok(pictures)
+        })())
     }
 
     /// The internal handle of a request that parked its thread, once.

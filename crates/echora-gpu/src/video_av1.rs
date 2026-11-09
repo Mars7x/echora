@@ -316,6 +316,13 @@ impl MovieDecoder {
         Ok(shown)
     }
 
+    /// The stream's color range (full when true) and matrix coefficients,
+    /// once a sequence header has been seen.
+    pub fn color(&self) -> Option<(bool, u32)> {
+        let color = &self.parser.sequence()?.color_config;
+        Some((color.color_range, u32::from(color.matrix_coefficients)))
+    }
+
     /// Copies a shown picture into `out` as NV12 (`video::nv12_size`).
     pub fn read_nv12(&mut self, shown: Shown, pitch: u32, out: &mut [u8]) -> Result<(), String> {
         self.decoder
