@@ -3661,8 +3661,17 @@ impl Nvn {
             })
             .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
             .collect();
+        // Host-visible pools reach the GPU through the file spans presents
+        // record (`share_new_pools`, under the machine lock): a queue
+        // submission's memory view cannot look them up. The table is rebuilt
+        // when a pool is shared, so one made between presents is mapped from
+        // the next present on.
+        let shared = self
+            .gpu
+            .as_ref()
+            .map_or(0, |backend| backend.shared_pools.len());
         let key = (
-            pools.len(),
+            pools.len() ^ shared << 32,
             pools
                 .iter()
                 .fold(0u64, |sum, (_, size, gpu, _)| sum.wrapping_add(gpu ^ size)),
@@ -3693,7 +3702,13 @@ impl Nvn {
             while offset < size {
                 let length = (size - offset).min(CHUNK);
                 let address = if host_visible {
-                    match core.memory.shared_span(base + offset, length) {
+                    let recorded = self
+                        .gpu
+                        .as_ref()
+                        .and_then(|backend| backend.shared_pools.get(&base))
+                        .filter(|(shared_size, ..)| *shared_size >= offset + length)
+                        .map(|&(_, file, at)| (file, at + offset));
+                    match recorded.or_else(|| core.memory.shared_span(base + offset, length)) {
                         Some((file, at)) => self
                             .gpu
                             .as_mut()
