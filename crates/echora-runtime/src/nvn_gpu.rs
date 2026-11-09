@@ -31,6 +31,9 @@ pub struct Backend {
     /// Compute stage keys translated with raw storage pointers
     /// (`Parameters::native_pointers`).
     native_programs: std::collections::HashSet<u64>,
+    /// The GPU page table (ECHORA_PAGE_TABLE) and the pool set it was built
+    /// for (count, and the sum of their GPU addresses and sizes).
+    page_table: Option<((usize, u64), echora_shader_abi::PageTable)>,
     /// Linked programs by (vertex key, fragment key).
     programs: HashMap<(u64, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
@@ -145,6 +148,7 @@ impl Backend {
             renderer,
             translations: HashMap::new(),
             native_programs: Default::default(),
+            page_table: None,
             programs: HashMap::new(),
             notes: BTreeMap::new(),
             traced: 0,
@@ -3313,6 +3317,17 @@ impl Nvn {
         } else {
             None
         };
+        // The GPU page table, for programs that read global memory through
+        // it (ECHORA_PAGE_TABLE).
+        let page_table = if self.gpu.as_ref().unwrap().programs[&key]
+            .stages
+            .iter()
+            .any(|stage| stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0)
+        {
+            self.page_table(core)?
+        } else {
+            Default::default()
+        };
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
             program: &backend.programs[&key],
@@ -3327,6 +3342,7 @@ impl Nvn {
             textures,
             images,
             indirect,
+            page_table,
         };
         let started = std::time::Instant::now();
         let lengths: HashMap<u32, u64> = dispatch
@@ -3497,6 +3513,103 @@ impl Nvn {
     /// Record the file offsets of memory pools not yet known, where the GPU
     /// can share them in place (needs the page table: `core` under the
     /// machine lock).
+    /// The GPU page table programs reach global memory through
+    /// (ECHORA_PAGE_TABLE; `echora_shader_abi::PageTable`), rebuilt when the
+    /// memory pools change. A host-visible pool's pages point into shared
+    /// spans of guest memory (the CPU's bytes, coherent as on the console);
+    /// a GPU-only pool's into its resident copy. A page the GPU cannot reach
+    /// stays 0 (reads 0).
+    pub(super) fn page_table(
+        &mut self,
+        core: &mut Guest,
+    ) -> Result<echora_shader_abi::PageTable, String> {
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        if super::debug_var_os("ECHORA_PAGE_TABLE").is_none() {
+            return Ok(Default::default());
+        }
+        let pools: Vec<(u64, u64, u64, u64)> = self
+            .objects
+            .values()
+            .filter(|object| object.kind == "MemoryPool")
+            .filter_map(|pool| {
+                let storage = pool.builder.get("Storage")?;
+                let gpu = pool.state.get("GpuAddress")?.x[0];
+                let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
+                Some((storage.x[0], storage.x[1], gpu, flags))
+            })
+            .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
+            .collect();
+        let key = (
+            pools.len(),
+            pools
+                .iter()
+                .fold(0u64, |sum, (_, size, gpu, _)| sum.wrapping_add(gpu ^ size)),
+        );
+        if let Some((built, table)) = self.gpu.as_ref().and_then(|backend| backend.page_table)
+            && built == key
+        {
+            return Ok(table);
+        }
+        let first = pools
+            .iter()
+            .map(|(_, _, gpu, _)| gpu >> PAGE_SHIFT)
+            .min()
+            .unwrap_or(0);
+        let end = pools
+            .iter()
+            .map(|(_, size, gpu, _)| (gpu + size).div_ceil(PAGE_SIZE))
+            .max()
+            .unwrap_or(first);
+        // A table past 16 million pages (64 GiB) means the pools are not
+        // what this model expects.
+        let count = (end - first).min(16 << 20) as usize;
+        let mut entries = vec![0u64; count];
+        const CHUNK: u64 = 64 << 20;
+        for (base, size, gpu, flags) in pools {
+            let host_visible = flags & 6 != 0;
+            let mut offset = 0;
+            while offset < size {
+                let length = (size - offset).min(CHUNK);
+                let address = if host_visible {
+                    match core.memory.shared_span(base + offset, length) {
+                        Some((file, at)) => self
+                            .gpu
+                            .as_mut()
+                            .unwrap()
+                            .renderer
+                            .address_span(file, at, length)?,
+                        None => None,
+                    }
+                } else {
+                    self.resident_pool_binding(core, base, size)?;
+                    self.gpu
+                        .as_ref()
+                        .unwrap()
+                        .renderer
+                        .resident_address(base)
+                        .map(|address| address + offset)
+                };
+                if let Some(address) = address {
+                    let first_page = (gpu + offset) >> PAGE_SHIFT;
+                    for page in 0..length.div_ceil(PAGE_SIZE) {
+                        if let Some(entry) = entries.get_mut((first_page + page - first) as usize) {
+                            *entry = address + page * PAGE_SIZE;
+                        }
+                    }
+                }
+                offset += length;
+            }
+        }
+        let backend = self.gpu.as_mut().unwrap();
+        let table = backend.renderer.set_page_table(first as u32, &entries)?;
+        backend.stat(
+            "stat: page table pinned MiB",
+            backend.renderer.addressed_bytes() >> 20,
+        );
+        backend.page_table = Some((key, table));
+        Ok(table)
+    }
+
     pub(super) fn share_new_pools(&mut self, core: &Guest) {
         // ECHORA_POOL_LOG (debugging): every 300th present, the memory
         // pools a GPU page table would cover: count, bytes by CPU access

@@ -31,6 +31,8 @@ pub struct Dispatch<'a> {
     /// offset, read by the GPU when the dispatch runs (after every write
     /// recorded before it); `groups` is then unused.
     pub indirect: Option<(vk::Buffer, u64)>,
+    /// The GPU page table, for a program that reads it.
+    pub page_table: echora_shader_abi::PageTable,
 }
 
 impl Renderer {
@@ -275,6 +277,20 @@ impl Renderer {
                     constants,
                 );
             }
+            if !program.page_table_stages.is_empty() {
+                let table = dispatch.page_table;
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&table.address.to_le_bytes());
+                bytes[8..12].copy_from_slice(&table.first_page.to_le_bytes());
+                bytes[12..].copy_from_slice(&table.page_count.to_le_bytes());
+                device.cmd_push_constants(
+                    commands,
+                    program.pipeline_layout,
+                    program.page_table_stages,
+                    echora_shader_abi::PUSH_PAGE_TABLE_OFFSET,
+                    &bytes,
+                );
+            }
             device.cmd_bind_descriptor_sets(
                 commands,
                 vk::PipelineBindPoint::COMPUTE,
@@ -378,6 +394,7 @@ mod tests {
             textures: HashMap::new(),
             images: HashMap::new(),
             indirect: None,
+            page_table: Default::default(),
         };
         let results = renderer.dispatch(&dispatch).unwrap();
         assert_eq!(

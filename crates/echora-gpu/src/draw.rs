@@ -25,6 +25,9 @@ pub struct Program {
     /// order across the stages).
     pub(crate) push_stages: vk::ShaderStageFlags,
     pub(crate) texture_bits: Vec<(usize, u32)>,
+    /// The stages that read the GPU page table (bytes 112..128 of the push
+    /// constants, `echora_shader_abi::PageTable`).
+    pub(crate) page_table_stages: vk::ShaderStageFlags,
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -331,16 +334,32 @@ impl Renderer {
             bindings.sort_unstable();
             texture_bits.extend(bindings.into_iter().map(|binding| (index, binding)));
         }
-        let push_ranges = [vk::PushConstantRange {
-            stage_flags: push_stages,
-            offset: 0,
-            size: RESCALING_BYTES,
-        }];
-        let push_ranges: &[vk::PushConstantRange] = if push_stages.is_empty() {
-            &[]
-        } else {
-            &push_ranges
-        };
+        let page_table_stages = stages
+            .iter()
+            .filter(|stage| stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0)
+            .fold(vk::ShaderStageFlags::empty(), |flags, stage| {
+                flags | stage_flags(stage.stage)
+            });
+        // One range per stage (Vulkan allows no more): the whole ABI block
+        // for stages that read the page table, the rescaling words for the
+        // others.
+        let mut push_ranges = Vec::new();
+        if !page_table_stages.is_empty() {
+            push_ranges.push(vk::PushConstantRange {
+                stage_flags: page_table_stages,
+                offset: 0,
+                size: echora_shader_abi::PUSH_CONSTANTS_SIZE,
+            });
+        }
+        let rescaled = push_stages & !page_table_stages;
+        if !rescaled.is_empty() {
+            push_ranges.push(vk::PushConstantRange {
+                stage_flags: rescaled,
+                offset: 0,
+                size: RESCALING_BYTES,
+            });
+        }
+        let push_ranges = push_ranges.as_slice();
         let pipeline_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&layouts)
             .push_constant_ranges(push_ranges);
@@ -400,6 +419,7 @@ impl Renderer {
             shaders,
             push_stages,
             texture_bits,
+            page_table_stages,
         })
     }
 

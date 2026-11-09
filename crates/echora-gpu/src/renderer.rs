@@ -190,6 +190,10 @@ pub struct Renderer {
     /// Spans of guest memory's file shared as dma-bufs (see `import_file`),
     /// by page-aligned file offset and length, oldest use first.
     shared: Vec<((u64, u64), vk::Buffer, vk::DeviceMemory)>,
+    /// Shared spans the GPU page table points into (`address_span`): kept
+    /// until their file range is released, never evicted while the table
+    /// may use them. Start, span, buffer, memory and device address.
+    addressed: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
     /// Bytes `shared` pins in host memory (udmabuf pins its pages).
     pub shared_bytes: u64,
     /// /dev/udmabuf, opened on first use; None after it failed to open.
@@ -448,6 +452,7 @@ impl Renderer {
             samplers: HashMap::new(),
             extra_views: HashMap::new(),
             imported: HashMap::new(),
+            addressed: Vec::new(),
             page_table: None,
             import_refused: Default::default(),
             shared: Vec::new(),
@@ -1726,10 +1731,57 @@ impl Renderer {
         Ok(Some((imported.0, offset - start)))
     }
 
+    /// The device address of `length` bytes of guest memory's file `file`
+    /// at `offset`, shared in place (a udmabuf, as `import_file`) for the
+    /// GPU page table, at most `MAX_SHARED_SPAN` bytes. The span stays until
+    /// `release_file_range` covers it. None where sharing or device
+    /// addresses are unavailable.
+    pub fn address_span(
+        &mut self,
+        file: i32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<u64>, String> {
+        const PAGE: u64 = 4096;
+        let start = offset & !(PAGE - 1);
+        let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
+        if let Some(&(known, _, _, _, address)) = self
+            .addressed
+            .iter()
+            .find(|(known, held, ..)| *known <= start && start + span <= known + held)
+        {
+            return Ok(Some(address + (offset - known)));
+        }
+        if span > MAX_SHARED_SPAN || !self.gpu.buffer_device_address {
+            return Ok(None);
+        }
+        let Some((buffer, memory)) = self.share_span(file, start, span)? else {
+            return Ok(None);
+        };
+        let Some(address) = self.buffer_address(buffer) else {
+            self.retired_shared.push((buffer, memory));
+            return Ok(None);
+        };
+        self.addressed.push((start, span, buffer, memory, address));
+        Ok(Some(address + (offset - start)))
+    }
+
+    /// Bytes of guest memory the page table's spans pin.
+    pub fn addressed_bytes(&self) -> u64 {
+        self.addressed.iter().map(|(_, span, ..)| span).sum()
+    }
+
     /// Stop sharing file range `[offset, offset + length)`: its pages may be
     /// released (a udmabuf would keep the old ones).
     pub fn release_file_range(&mut self, offset: u64, length: u64) {
         let end = offset + length;
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
+            .into_iter()
+            .partition(|(start, span, ..)| *start < end && offset < start + span);
+        self.addressed = kept;
+        for (_, _, buffer, memory, _) in gone {
+            self.retired_shared.push((buffer, memory));
+        }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
             .into_iter()
             .partition(|((start, span), _, _)| *start < end && offset < start + span);
@@ -3865,7 +3917,12 @@ impl Drop for Renderer {
         }
         let shared = std::mem::take(&mut self.shared)
             .into_iter()
-            .map(|(_, buffer, memory)| (buffer, memory));
+            .map(|(_, buffer, memory)| (buffer, memory))
+            .chain(
+                std::mem::take(&mut self.addressed)
+                    .into_iter()
+                    .map(|(_, _, buffer, memory, _)| (buffer, memory)),
+            );
         let retired = std::mem::take(&mut self.retired_shared)
             .into_iter()
             .chain(std::mem::take(&mut self.spare.retired_shared));

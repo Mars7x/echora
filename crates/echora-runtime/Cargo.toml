@@ -14,6 +14,7 @@ astc-decode = "0.3"
 echora-audio.workspace = true
 echora-config.workspace = true
 echora-gpu.workspace = true
+echora-shader-abi.workspace = true
 echora-guest.workspace = true
 echora-input.workspace = true
 echora-loader.workspace = true
