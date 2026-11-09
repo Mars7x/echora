@@ -31,6 +31,7 @@ pub mod op {
     pub const CONSTANT_TRUE: u16 = 41;
     pub const CONSTANT_FALSE: u16 = 42;
     pub const CONSTANT: u16 = 43;
+    pub const CONSTANT_COMPOSITE: u16 = 44;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
@@ -171,6 +172,7 @@ pub mod storage {
 #[allow(missing_docs)]
 pub mod capability {
     pub const SHADER: u32 = 1;
+    pub const FLOAT16: u32 = 9;
     pub const INT64: u32 = 11;
     pub const IMAGE_GATHER_EXTENDED: u32 = 25;
     pub const SAMPLED_1D: u32 = 43;
@@ -319,6 +321,7 @@ pub struct Module {
     types: HashMap<Type, u32>,
     constants: HashMap<(u32, u32), u32>,
     constants64: HashMap<(u32, u64), u32>,
+    composites: HashMap<Vec<u32>, u32>,
     glsl: Option<u32>,
 }
 
@@ -533,6 +536,20 @@ impl Module {
             &[ty, id, value as u32, (value >> 32) as u32],
         );
         self.constants64.insert((ty, value), id);
+        id
+    }
+
+    /// A composite constant of type `ty`, declared once.
+    pub fn composite_constant(&mut self, ty: u32, parts: &[u32]) -> u32 {
+        let key: Vec<u32> = std::iter::once(ty).chain(parts.iter().copied()).collect();
+        if let Some(&id) = self.composites.get(&key) {
+            return id;
+        }
+        let id = self.id();
+        let mut operands = vec![ty, id];
+        operands.extend_from_slice(parts);
+        instruction(&mut self.globals, op::CONSTANT_COMPOSITE, &operands);
+        self.composites.insert(key, id);
         id
     }
 

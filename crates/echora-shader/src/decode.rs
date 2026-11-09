@@ -159,6 +159,30 @@ pub struct Texture {
     pub half: bool,
 }
 
+/// A source of a half-precision pair operation: the pair (`swizzle` 0),
+/// a 32-bit float converted to both halves (1), or its low (2) or high (3)
+/// half in both; then absolute value and negation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HalfOperand {
+    pub src: Src,
+    pub swizzle: u8,
+    pub abs: bool,
+    pub neg: bool,
+}
+
+/// What a half-precision pair operation computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HalfOp {
+    Add,
+    Mul,
+    /// a * b + c, fused.
+    Fma,
+    /// The minimum where the predicate holds, else the maximum.
+    MinMax {
+        min: Pred,
+    },
+}
+
 /// A decoded instruction: its guard and operation, and the word it came
 /// from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +288,26 @@ pub enum Op {
         src: Reg,
         operation: u8,
         signed: bool,
+    },
+    /// HADD2 / HMUL2 / HFMA2 / HMNMX2 d, a, b(, c): on pairs of halves,
+    /// each lane alone; `saturate` (bit 77) clamps to [0, 1].
+    Half {
+        op: HalfOp,
+        d: Reg,
+        a: HalfOperand,
+        b: HalfOperand,
+        c: Option<HalfOperand>,
+        saturate: bool,
+    },
+    /// F2FP.PACK_AB d, a, b: b and a converted to halves, b in the low
+    /// half; with `merge` (MERGE_C, bit 78) the high half is the low half
+    /// of register c instead of a.
+    F2fp {
+        d: Reg,
+        a: Reg,
+        b: Operand,
+        c: Reg,
+        merge: bool,
     },
     /// IABS d, src: the absolute value of a signed word.
     Iabs {
@@ -803,6 +847,50 @@ impl Word {
         }
     }
 
+    /// A half-pair source (as `source`): A, or the second or third slot.
+    fn half(self, which: u32) -> Option<HalfOperand> {
+        if which == 0 {
+            return Some(HalfOperand {
+                src: Src::Reg(self.reg(24)),
+                swizzle: self.bits(74, 2) as u8,
+                abs: self.bit(73),
+                neg: self.bit(72),
+            });
+        }
+        let form = self.form();
+        let wide = if which == 1 {
+            matches!(form, 4 | 5)
+        } else {
+            matches!(form, 2 | 3)
+        };
+        Some(if wide {
+            let immediate = matches!(form, 2 | 4);
+            HalfOperand {
+                src: if immediate {
+                    Src::Imm(self.bits(32, 32) as u32)
+                } else {
+                    self.constant()
+                },
+                swizzle: if immediate { 0 } else { self.bits(60, 2) as u8 },
+                abs: !immediate && self.bit(62),
+                neg: !immediate && self.bit(63),
+            }
+        } else {
+            let upper = which == 2 || matches!(form, 2 | 3);
+            let (reg, swizzle, abs, neg) = if upper {
+                (64, 81, 83, 84)
+            } else {
+                (32, 60, 62, 63)
+            };
+            HalfOperand {
+                src: Src::Reg(self.reg(reg)),
+                swizzle: self.bits(swizzle, 2) as u8,
+                abs: self.bit(abs),
+                neg: self.bit(neg),
+            }
+        })
+    }
+
     fn float_modes(self) -> FloatModes {
         FloatModes {
             saturate: self.bit(77),
@@ -1312,6 +1400,57 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         0x101 if matches!(form, 1 | 4 | 5 | 6) => Op::Brev {
             d,
             src: word.source(1)?,
+        },
+        // HADD2: the second source in the third slot in forms 2 and 3.
+        // Bit 78 (a 32-bit result) and 76/79 are not decoded.
+        0x030 if matches!(form, 1..=3) && word.bits(76, 4) & 0b1101 == 0 => Op::Half {
+            op: HalfOp::Add,
+            d,
+            a: word.half(0)?,
+            b: word.half(if form == 1 { 1 } else { 2 })?,
+            c: None,
+            saturate: word.bit(77),
+        },
+        0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 => Op::Half {
+            op: HalfOp::Mul,
+            d,
+            a: word.half(0)?,
+            b: word.half(1)?,
+            c: None,
+            saturate: word.bit(77),
+        },
+        // HFMA2 without .RELU (79), its mixed-sign form (86) or 85.
+        0x031
+            if (1..=5).contains(&form)
+                && !word.bit(78)
+                && !word.bit(79)
+                && word.bits(85, 2) == 0 =>
+        {
+            Op::Half {
+                op: HalfOp::Fma,
+                d,
+                a: word.half(0)?,
+                b: word.half(1)?,
+                c: Some(word.half(2)?),
+                saturate: word.bit(77),
+            }
+        }
+        0x040 if matches!(form, 1 | 4) && word.bits(76, 11) == 0 => Op::Half {
+            op: HalfOp::MinMax {
+                min: word.pred(87, 90),
+            },
+            d,
+            a: word.half(0)?,
+            b: word.half(1)?,
+            c: None,
+            saturate: false,
+        },
+        0x03e if matches!(form, 1 | 5) && word.bits(73, 5) == 0 && !word.bit(72) => Op::F2fp {
+            d,
+            a: word.reg(24),
+            b: word.source(1)?,
+            c: word.reg(64),
+            merge: word.bit(78),
         },
         0x013 if matches!(form, 1 | 4 | 5 | 6) => Op::Iabs {
             d,

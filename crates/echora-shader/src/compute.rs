@@ -199,6 +199,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
 }
 
 mod fetch;
+mod half;
 mod io;
 mod memory;
 mod structure;
@@ -1451,6 +1452,15 @@ impl Emitter {
                 }
                 self.write_float(d.0, value);
             }
+            Op::Half {
+                op,
+                d,
+                a,
+                b,
+                c,
+                saturate,
+            } => self.half(index, op, d, a, b, c, saturate)?,
+            Op::F2fp { d, a, b, c, merge } => self.pack_halves(index, d, a, b, c, merge)?,
             Op::Iabs { d, src } => {
                 let x = self.integer(index, src)?;
                 let value = self.glsl(self.u32, glsl::S_ABS, &[x]);
@@ -3707,6 +3717,63 @@ mod tests {
         // Two entries into a loop: irreducible, so the dispatch loop.
         let irreducible = valid(&[bra(0, 2, 0), nop, bra(2, 1, 1), EXIT]);
         assert!(dispatches(&irreducible.spirv));
+    }
+
+    #[test]
+    fn half_pair_operations_validate() {
+        valid(&[
+            // HADD2 R2, R0.H1_H0, -R1.H0_H0; HADD2.SAT R3, R0, 1.0 (form 2)
+            word(&[
+                (0, 12, 0x230),
+                (16, 8, 2),
+                (24, 8, 0),
+                (32, 8, 1),
+                (60, 2, 2),
+                (63, 1, 1),
+            ]),
+            word(&[
+                (0, 12, 0x430),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 32, 0x3c00_3c00),
+                (77, 1, 1),
+            ]),
+            // HMUL2 R4, |R0|.H1_H1, R1; HFMA2 R5, R0, R1, R2.F32
+            word(&[
+                (0, 12, 0x232),
+                (16, 8, 4),
+                (24, 8, 0),
+                (73, 1, 1),
+                (74, 2, 3),
+                (32, 8, 1),
+            ]),
+            word(&[
+                (0, 12, 0x231),
+                (16, 8, 5),
+                (24, 8, 0),
+                (32, 8, 1),
+                (64, 8, 2),
+                (81, 2, 1),
+            ]),
+            // HMNMX2 R6, R0, R1, P0; F2FP.PACK_AB R7, R0, R1;
+            // F2FP.MERGE_C R8, R1, R2
+            word(&[
+                (0, 12, 0x240),
+                (16, 8, 6),
+                (24, 8, 0),
+                (32, 8, 1),
+                (87, 3, 0),
+            ]),
+            word(&[(0, 12, 0x23e), (16, 8, 7), (24, 8, 0), (32, 8, 1)]),
+            word(&[
+                (0, 12, 0x23e),
+                (16, 8, 8),
+                (32, 8, 1),
+                (64, 8, 2),
+                (78, 1, 1),
+            ]),
+            EXIT,
+        ]);
     }
 
     #[test]

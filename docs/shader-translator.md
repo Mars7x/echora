@@ -190,6 +190,8 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
 | IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
 | IABS | 0x013 | the source in the second slot |
+| HADD2, HMUL2, HFMA2, HMNMX2 | 0x030 (forms 1-3), 0x032 (1, 4, 5), 0x031 (1-5), 0x040 (1, 4) | half pairs on SPIR-V's 16-bit floats; A at 24 (swizzle 74-75, abs 73, neg 72), B at 32 (swizzle 60-61, abs 62, neg 63) or 64 (81-82, 83, 84) in forms 2 and 3, or wide; swizzle 0 the pair, 1 a float in both, 2 the low half, 3 the high; saturate 77; HMNMX2's minimum predicate 87-90; HADD2's second source in the third slot in forms 2 and 3 |
+| F2FP.PACK_AB | 0x03e (forms 1, 5) | b's half low, a's high, or with MERGE_C (78) register 64's low half high |
 | POPC, FLO, BREV | 0x109, 0x100, 0x101 | invert 63 (form 1); FLO signed 73, shift amount 74 |
 | SHFL | 0x389, 0x589, 0x989, 0xf89 | lane register 32 or immediate 53-57, clamp and segment mask register 64 or immediate 40-52, mode 58-59, in-range predicate 81-83 |
 | REDUX | 0x3c4 | uniform destination 16-21, register 24, operation 78-80 (AND, OR, XOR, SUM, MIN, MAX), signed 73 |
