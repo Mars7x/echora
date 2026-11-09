@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 
 pub use echora_shader_abi::{
-    ABI_VERSION, Descriptor, DescriptorKind, PUSH_TRANSLATOR, Stage, Translated,
+    ABI_VERSION, Descriptor, DescriptorKind, MeshParameters, PUSH_TRANSLATOR, Stage, Translated,
 };
 
 pub const MAX_DESCRIPTORS: usize = 64;
@@ -53,6 +53,7 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
             2 => echora_shader_abi::MatrixMode::Exact,
             _ => echora_shader_abi::MatrixMode::Subgroup,
         },
+        mesh: parameters.mesh,
     }
 }
 
@@ -183,19 +184,6 @@ pub struct Parameters {
     /// (see `Descriptor::flags` bit 5), for a program whose NVN-tracked
     /// pointer words are not addresses.
     pub native_pointers: bool,
-}
-
-/// The task or mesh pipeline state a program is translated against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MeshParameters {
-    /// The task stage (else the mesh stage).
-    pub task: bool,
-    /// SET_MESH_SHADER_A, SET_MESH_SHADER_B and SET_MESH_INIT_SHADER.
-    pub registers: [u32; 3],
-    /// Mesh programs: the program header (0x50 bytes) of the pass-through
-    /// geometry program bound with them, whose output map lists the
-    /// per-primitive outputs.
-    pub primitive_header: Option<[u8; 0x50]>,
 }
 
 #[repr(C)]

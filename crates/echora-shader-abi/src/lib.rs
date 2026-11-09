@@ -110,6 +110,34 @@ pub struct Parameters {
     pub local_memory_size: Option<u32>,
     /// How HMMA (the warp's half matrix multiply) translates.
     pub matrix_mode: MatrixMode,
+    /// Task and mesh programs: the pipeline state they are translated
+    /// against (`stage_slot` names which of the two).
+    pub mesh: Option<MeshParameters>,
+}
+
+/// The task or mesh pipeline state a program is translated against, as the
+/// runtime derives it from the programs' control sections (`bound_mesh_program`
+/// in the runtime).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeshParameters {
+    /// The task stage (else the mesh stage).
+    pub task: bool,
+    /// The hardware's SET_MESH_SHADER_A, SET_MESH_SHADER_B and
+    /// SET_MESH_INIT_SHADER words:
+    /// - A: bits 0..4 the output topology (4, triangles: the only one the
+    ///   game's mesh programs use), bits 4..13 the maximum vertices, bits
+    ///   13..23 the maximum primitives. The two counts come from the mesh
+    ///   program's control section word +0x60 (vertices in its low half,
+    ///   primitives in its high half).
+    /// - B: bits 20..26 the mesh program's threads per workgroup (its
+    ///   control word +0x58, bits 0..6).
+    /// - INIT: the task program's control word +0x58 when a task program
+    ///   is bound, else the mesh program's +0x58 with bits 0..6 cleared.
+    pub registers: [u32; 3],
+    /// Mesh programs: the program header (0x50 bytes) of the pass-through
+    /// geometry program bound with them, whose output map lists the
+    /// per-primitive outputs.
+    pub primitive_header: Option<[u8; 0x50]>,
 }
 
 /// HMMA's translation.
