@@ -98,7 +98,7 @@ fn main() {
             let mut compile = None;
             let outcome = match shader::translate_rust(&bytes, &parameters) {
                 Err(unsupported) => format!("unsupported: {}", unsupported.reason),
-                Ok(program) => match timed_check(&gpu, &program, &mut compile) {
+                Ok(program) => match timed_check(&gpu, &program, &path, &mut compile) {
                     Err(error) => format!("driver rejects: {error}"),
                     Ok(()) => match shader::translate(&bytes, parameters, &mut NoEnvironment) {
                         Err(_) => "translated (the plugin does not)".into(),
@@ -212,8 +212,22 @@ fn main() {
 fn timed_check(
     gpu: &Gpu,
     program: &shader::Translated,
+    path: &str,
     compile: &mut Option<(f64, bool)>,
 ) -> Result<(), String> {
+    // ECHORA_RUST_SPIRV=<dir>: keep each Rust translation as <name>.spv.
+    if let Some(directory) = std::env::var_os("ECHORA_RUST_SPIRV") {
+        let name = std::path::Path::new(path).file_name().unwrap_or_default();
+        let target = std::path::Path::new(&directory)
+            .join(name)
+            .with_extension("spv");
+        let bytes: Vec<u8> = program
+            .spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let _ = std::fs::write(target, bytes);
+    }
     let started = std::time::Instant::now();
     let result = gpu.check_stage(program);
     *compile = Some((
