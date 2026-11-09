@@ -48,14 +48,17 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
         workgroup_size: compute.then_some(parameters.workgroup_size),
         shared_memory_size: compute.then_some(parameters.shared_memory_size),
         local_memory_size: compute.then_some(parameters.local_memory_size),
-        cooperative_matrix: COOPERATIVE_MATRIX.load(std::sync::atomic::Ordering::Relaxed),
+        matrix_mode: match MATRIX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => echora_shader_abi::MatrixMode::Cooperative,
+            2 => echora_shader_abi::MatrixMode::Exact,
+            _ => echora_shader_abi::MatrixMode::Subgroup,
+        },
     }
 }
 
-/// Whether HMMA translates to cooperative matrices: set when the device
-/// has the shapes (`Gpu::new`) and ECHORA_HMMA=cooperative.
-static COOPERATIVE_MATRIX: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// HMMA's translation (0 subgroup, 1 cooperative, 2 exact), from
+/// ECHORA_HMMA when the device allows it (`Gpu::new`).
+static MATRIX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Lets the Rust translator use cooperative matrices for HMMA when the
 /// device multiplies 16x16x16 half matrices at subgroup scope.
@@ -71,10 +74,14 @@ pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) 
     };
     // Opt-in (ECHORA_HMMA=cooperative): the first in-game run of these
     // programs on RADV 25.2 under 32-lane subgroups lost the device.
-    let on = has(T::FLOAT16)
-        && has(T::FLOAT32)
-        && std::env::var("ECHORA_HMMA").as_deref() == Ok("cooperative");
-    COOPERATIVE_MATRIX.store(on, std::sync::atomic::Ordering::Relaxed);
+    // ECHORA_HMMA=exact: the tensor cores' published arithmetic, on any
+    // device.
+    let mode = match std::env::var("ECHORA_HMMA").as_deref() {
+        Ok("cooperative") if has(T::FLOAT16) && has(T::FLOAT32) => 1,
+        Ok("exact") => 2,
+        _ => 0,
+    };
+    MATRIX_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The Rust translator's program, if it handles `program`.

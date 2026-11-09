@@ -42,11 +42,7 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             shared_bytes: None,
             // Graphics programs carry it in their header.
             local_bytes: parameters.local_memory_size.or(header.local_bytes),
-            matrices: if parameters.cooperative_matrix {
-                compute::MatrixPath::Cooperative
-            } else {
-                compute::MatrixPath::Subgroup
-            },
+            matrices: matrix_path(parameters.matrix_mode),
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {
@@ -66,13 +62,18 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         workgroup,
         shared_bytes: parameters.shared_memory_size,
         local_bytes: parameters.local_memory_size,
-        matrices: if parameters.cooperative_matrix {
-            compute::MatrixPath::Cooperative
-        } else {
-            compute::MatrixPath::Subgroup
-        },
+        matrices: matrix_path(parameters.matrix_mode),
     };
     compute::translate(&code, &layout)
+}
+
+/// The translation of HMMA a mode asks for.
+fn matrix_path(mode: echora_shader_abi::MatrixMode) -> compute::MatrixPath {
+    match mode {
+        echora_shader_abi::MatrixMode::Subgroup => compute::MatrixPath::Subgroup,
+        echora_shader_abi::MatrixMode::Cooperative => compute::MatrixPath::Cooperative,
+        echora_shader_abi::MatrixMode::Exact => compute::MatrixPath::Exact,
+    }
 }
 
 /// `translate` is the runtime's translator signature.

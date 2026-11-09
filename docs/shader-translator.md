@@ -87,7 +87,7 @@ goals first-class, next to correctness:
 3. **SPIR-V** for simple compute programs (a structurizer for the control
    flow; an emitter, `rspirv` or a small hand-written writer).
 4. **Graphics stages** and textures.
-5. **HMMA**: a subgroup path, and VK_KHR_cooperative_matrix.
+5. **HMMA**: a subgroup path, VK_KHR_cooperative_matrix, and an exact tensor-core model.
 
 **Textures.** A texture whose handle is a constant-bank word becomes a
 combined image sampler, one per handle word, view type and depth
@@ -162,6 +162,19 @@ instead writes the lanes' fragments to per-warp workgroup scratch in the
 PTX layout (B's upper eight columns zero), multiplies with
 OpCooperativeMatrixMulAddKHR (a half or 32-bit accumulator) and reads D
 back; the device's matrix units then decide the summation's rounding.
+With `MatrixPath::Exact` (`Parameters::matrix_mode` `MatrixMode::Exact`)
+the subgroup path sums like the A100's tensor cores as published (Fasi,
+Higham, Mikaitis and Pranesh, 2021; Khattak and Mikaitis, 2025): each
+block of eight k adds its products and the accumulator in one step, every
+addend aligned to the largest exponent and truncated to 24 bits below its
+leading bit, the exact sum normalised once by truncation (a half result's
+last block rounded to the nearest half instead, through a round-to-odd
+32-bit value). It is done in integers from the addends' bits. The
+papers do not settle the sign-magnitude truncation, the chaining of the
+two blocks of HMMA.16816 through a 32-bit value, the results past the
+32-bit range (the largest finite value) and below it (truncated
+subnormals), or blocks with an infinity or NaN (their plain sum); these
+are inferred, and none of it has been compared with hardware results.
 
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is

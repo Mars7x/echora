@@ -278,6 +278,9 @@ pub enum MatrixPath {
     /// Cooperative matrices (VK_KHR_cooperative_matrix, 16x16x16 at
     /// subgroup scope) for HMMA.16816, the subgroup path otherwise.
     Cooperative,
+    /// The subgroup path with the tensor cores' published arithmetic
+    /// (block sums aligned and truncated; see `compute::matrix`).
+    Exact,
 }
 
 impl Layout {
@@ -4223,7 +4226,17 @@ mod tests {
 
     #[test]
     fn warp_matrix_multiplies_validate() {
-        valid(&[
+        let words = warp_matrix_multiplies();
+        valid(&words);
+        let exact = Layout {
+            matrices: MatrixPath::Exact,
+            ..Layout::workgroup([64, 1, 1])
+        };
+        valid_with(&words, &exact);
+    }
+
+    fn warp_matrix_multiplies() -> [u128; 4] {
+        [
             // HMMA.16816.F32 R8, R0, R4, R8; HMMA.16816.F16 R12, R0, R4, R14;
             // HMMA.1688.F32 R16, R0, R4, RZ
             word(&[
@@ -4252,7 +4265,7 @@ mod tests {
                 (76, 1, 1),
             ]),
             EXIT,
-        ]);
+        ]
     }
 
     #[test]
