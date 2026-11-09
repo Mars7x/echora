@@ -6,23 +6,26 @@ to be missing or incomplete.
 
 ## Gameplay and graphics
 
-- The game gets past the New Game movie and draws its first 3D scene, but
-  the scene is heavily overexposed and no gameplay has been reached yet.
+- The game gets past the New Game movie into its first 3D scene, but that
+  scene's lighting passes don't run yet (their sizes are written by the GPU
+  and read too early), so it shows little more than outlines. No gameplay has
+  been reached yet.
   Every unimplemented operation still stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`) are drawn through
   `VK_EXT_mesh_shader`, but have not yet been checked against the console's
   output.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
-- The Rust shader translator does not translate programs yet. Without an
-  external translator plugin ([shader-plugin.md](shader-plugin.md)) the
-  run stops at the first program it does not handle, naming the reason.
+- The Rust shader translator handles about nine in ten of the shaders seen
+  in runs so far. Without an external translator plugin
+  ([shader-plugin.md](shader-plugin.md)) the run stops at the first program
+  it does not handle, naming the reason.
 
 ## Performance
 
 - Runs are far below full speed. The console runs the game at 60 frames per
-  second; here the opening movie plays at about 22 to 29 pictures per second
-  and the first 3D scene at about 6 frames per second.
+  second; here the opening movie averages about 30 pictures per second and
+  the first 3D scene runs at about 6 frames per second.
 - Guest threads run on up to six host threads by default, one per
   application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   On six cores the first 3D scene runs about 2.9 times as fast as on one, and

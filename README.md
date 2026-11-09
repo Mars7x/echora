@@ -37,8 +37,8 @@ What works today:
 - The translated game runs. With the old shader recompiler, which I still
   use on my own machine for testing, it boots through the system services,
   plays its sound, takes input, and gets through New Game and the opening
-  movie into its first 3D scene. Without it, a run stops at the first draw,
-  before the title screen.
+  movie into its first 3D scene. Without it, a run stops at the first shader
+  Echora's own translator can't handle yet.
 - The game's threads run on up to six CPU cores by default.
 - The launcher installs the game, changes settings and starts it, with a
   mouse, keyboard or controller.
@@ -46,16 +46,16 @@ What works today:
 What doesn't work yet:
 
 - Drawing on its own. Echora's own shader translator, written in Rust,
-  handles more than half of the game's compute shaders so far and none of its
-  drawing shaders, so a run stops at the first shader it can't translate and
-  says which one. The old recompiler isn't part of Echora any more; I only
-  load it on my own machine to test against. The section below explains why
-  I'm replacing it.
-- Gameplay. The first 3D scene after the movie isn't drawn correctly, and
-  nothing past it has been reached.
+  handles about nine in ten of the shaders seen in runs so far, and its
+  title-screen output matches the old recompiler's exactly. A run still stops
+  at the first shader it can't translate and says which one. The old
+  recompiler isn't part of Echora any more; I only load it on my own machine
+  to test against. The section below explains why I'm replacing it.
+- Gameplay. The first 3D scene after the movie isn't lit yet, and nothing
+  past it has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie plays at about 22 to 29 pictures per second, limited by video
-  decoding, and the first 3D scene at about 6.
+  movie, now decoded on the GPU, averages about 30 pictures per second, and
+  the first 3D scene runs at about 6.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
@@ -111,8 +111,9 @@ interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
 Echora is written in pure Rust. Like any PC program it uses the system's own
-libraries for graphics, sound, input and windows, and its AV1 video decoder
-keeps hand-written assembly for speed. Anything that goes beyond what the
+libraries for graphics, sound, input and windows, and the CPU video decoder
+it falls back on when a GPU can't decode the movies keeps hand-written
+assembly for speed. Anything that goes beyond what the
 console does, such as frame rates above 60 or ultrawide, will be kept in a
 separate layer of enhancements that can be turned off.
 
@@ -126,7 +127,7 @@ separate layer of enhancements that can be turned off.
    system services.
 4. NVN graphics calls are replayed on Vulkan, with the console's shaders
    translated to SPIR-V by Echora's own translator, and movies are decoded on
-   the PC.
+   the GPU's video engine.
 
 See the [architecture notes](docs/architecture.md) for how the crates fit
 together.
