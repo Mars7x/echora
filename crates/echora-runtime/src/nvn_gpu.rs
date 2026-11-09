@@ -2946,7 +2946,10 @@ impl Nvn {
                     }
                     // Otherwise the pool holding it stays on the GPU between
                     // dispatches (see `ResidentPool`); outside any pool the
-                    // bytes are copied in and out.
+                    // bytes are copied in and out. Copied results still
+                    // pending for the range land first, so the pool's copy
+                    // takes them (a counter an earlier pass wrote).
+                    self.resolve_copies(core, Some(guest..guest + length))?;
                     match self.resident_pool_binding(core, guest, length)? {
                         Some((buffer, offset)) => {
                             storage_in_place.insert(descriptor.binding, (buffer, offset, length));

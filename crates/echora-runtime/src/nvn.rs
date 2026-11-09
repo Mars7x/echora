@@ -2991,6 +2991,9 @@ impl Nvn {
                     .flatten()
                     .collect();
                 core.memory.write(to, &bytes)?;
+                // In GPU order: a resident copy of the range (a counter a
+                // later dispatch adds to) takes the cleared words too.
+                self.gpu_invalidate(to..to + size, None);
                 Ok(())
             }
             name => {
