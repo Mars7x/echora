@@ -34,6 +34,10 @@ pub struct Backend {
     /// The GPU page table (ECHORA_PAGE_TABLE) and the pool set it was built
     /// for (count, and the sum of their GPU addresses and sizes).
     page_table: Option<((usize, u64), echora_shader_abi::PageTable)>,
+    /// ECHORA_LOOP_TRACE (debugging): each traced compute program's
+    /// counter buffer (`Renderer::debug_buffer` index and address) and the
+    /// present it was last reported at.
+    loop_traces: HashMap<u64, (usize, u64, u64)>,
     /// Linked programs by (vertex key, fragment key).
     programs: HashMap<(u64, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
@@ -153,6 +157,7 @@ impl Backend {
             translations: HashMap::new(),
             native_programs: Default::default(),
             page_table: None,
+            loop_traces: HashMap::new(),
             programs: HashMap::new(),
             notes: BTreeMap::new(),
             traced: 0,
@@ -3487,6 +3492,25 @@ impl Nvn {
                 echora_shader_abi::SpecMeaning::IntegerFormat(binding) => binding,
                 // The renderer gives every program the pool's capacity.
                 echora_shader_abi::SpecMeaning::TexturePoolCapacity => continue,
+                // ECHORA_LOOP_TRACE: the program's counter buffer, 64 KiB.
+                meaning @ (echora_shader_abi::SpecMeaning::LoopTraceLow
+                | echora_shader_abi::SpecMeaning::LoopTraceHigh) => {
+                    let address = match backend.loop_traces.get(&key.0) {
+                        Some(&(_, address, _)) => address,
+                        None => {
+                            let (index, address) = backend.renderer.debug_buffer(64 << 10)?;
+                            backend.loop_traces.insert(key.0, (index, address, 0));
+                            address
+                        }
+                    };
+                    let half = if meaning == echora_shader_abi::SpecMeaning::LoopTraceLow {
+                        address as u32
+                    } else {
+                        (address >> 32) as u32
+                    };
+                    specialization.push((constant.id, half));
+                    continue;
+                }
                 other => return Err(format!("compute spec constant {other:?}")),
             };
             let format = match images.get(&binding) {
@@ -3511,7 +3535,7 @@ impl Nvn {
                 .iter()
                 .enumerate()
                 .fold(0u64, |bits, (index, (_, value))| {
-                    bits | u64::from(*value) << index
+                    bits | u64::from(*value != 0) << index
                 });
             (key.0, 1 << 63 | bits)
         };
@@ -3520,6 +3544,35 @@ impl Nvn {
                 .renderer
                 .create_program_specialized(vec![stage.clone()], &[specialization])?;
             backend.programs.insert(key, program);
+        }
+        // Every 60 presents, a traced program's loops that ran: for loop k,
+        // total iterations, the most one invocation made, invocations the
+        // budget stopped, and the header's guest offset.
+        if let Some(&(index, address, reported)) = backend.loop_traces.get(&key.0)
+            && self.presented_frames >= reported + 60
+        {
+            let words: Vec<u32> = backend
+                .renderer
+                .read_debug_buffer(index)
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            for (loop_index, entry) in words.chunks_exact(4).enumerate() {
+                if entry[0] != 0 {
+                    eprintln!(
+                        "loop trace present {} program {:016x} loop {loop_index} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
+                        self.presented_frames,
+                        key.0,
+                        entry[3].wrapping_sub(1),
+                        entry[0],
+                        entry[1],
+                        entry[2]
+                    );
+                }
+            }
+            backend
+                .loop_traces
+                .insert(key.0, (index, address, self.presented_frames));
         }
         // The GPU page table, for programs that read global memory through
         // it (ECHORA_PAGE_TABLE).

@@ -181,6 +181,9 @@ pub struct Renderer {
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
     /// Counts for the runtime's statistics (`take_stats`).
     pub(crate) stats: HashMap<&'static str, u64>,
+    /// Debugging buffers shaders write through device addresses
+    /// (`debug_buffer`).
+    debug_buffers: Vec<HostBuffer>,
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
@@ -464,6 +467,7 @@ impl Renderer {
         let mut renderer = Self {
             texture_pool: None,
             stats: HashMap::new(),
+            debug_buffers: Vec::new(),
             timer,
             shader_cache: None,
             fatal: None,
@@ -3632,6 +3636,26 @@ impl Renderer {
         }
     }
 
+    /// Debugging: a zeroed host-visible buffer of `size` bytes that shaders
+    /// can write through its device address; returns its index (for
+    /// `read_debug_buffer`) and that address.
+    pub fn debug_buffer(&mut self, size: u64) -> Result<(usize, u64), String> {
+        let buffer = self.host_buffer_with(size, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+        buffer.write(0, &vec![0; size as usize]);
+        let address = self
+            .buffer_address(buffer.buffer)
+            .ok_or("debug buffers need buffer device addresses")?;
+        self.debug_buffers.push(buffer);
+        Ok((self.debug_buffers.len() - 1, address))
+    }
+
+    /// Debugging: a `debug_buffer`'s bytes as they are now.
+    pub fn read_debug_buffer(&self, index: usize) -> Vec<u8> {
+        self.debug_buffers
+            .get(index)
+            .map_or_else(Vec::new, |buffer| buffer.read_bytes(buffer.size as usize))
+    }
+
     /// Make sure a guest texture is uploaded (debugging reads).
     pub fn texture_view_for(&mut self, source: &crate::draw::TextureSource) -> Result<(), String> {
         self.texture_view(source, 2).map(|_| ())
@@ -3973,6 +3997,14 @@ impl HostBuffer {
         };
     }
 
+    /// The first `length` bytes as they are now (debugging: work may still
+    /// be writing them).
+    fn read_bytes(&self, length: usize) -> Vec<u8> {
+        let length = length.min(self.size as usize);
+        // SAFETY: in bounds of the mapping.
+        unsafe { std::slice::from_raw_parts(self.mapped, length) }.to_vec()
+    }
+
     fn read_f32x4(&self, count: usize) -> Vec<[f32; 4]> {
         assert!(count * 16 <= self.size as usize);
         // SAFETY: in bounds; the GPU work writing it has completed.
@@ -4073,6 +4105,9 @@ impl Drop for Renderer {
         let ring = std::mem::replace(&mut self.spare.ring, HostBuffer::empty());
         ring.destroy(&self.gpu.device);
         self.destroy_texture_pool();
+        for buffer in std::mem::take(&mut self.debug_buffers) {
+            buffer.destroy(&self.gpu.device);
+        }
         // SAFETY: all work has completed.
         unsafe {
             for (_, sampler) in std::mem::take(&mut self.samplers) {
