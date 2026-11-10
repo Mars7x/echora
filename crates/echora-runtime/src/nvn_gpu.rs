@@ -3550,7 +3550,7 @@ impl Nvn {
                 if let Err(error) = self.dump_dispatch(
                     core,
                     key.0,
-                    &stage.spirv,
+                    &stage,
                     groups,
                     &uniforms,
                     &storage_ranges,
@@ -3907,7 +3907,7 @@ impl Nvn {
         &self,
         core: &Guest,
         key: u64,
-        spirv: &[u32],
+        stage: &Translated,
         groups: [u32; 3],
         uniforms: &HashMap<u32, Vec<u8>>,
         storage: &[(u32, u64, u64)],
@@ -3929,8 +3929,32 @@ impl Nvn {
         let write = |name: String, bytes: &[u8]| {
             std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
         };
-        let words: Vec<u8> = spirv.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let words: Vec<u8> = stage
+            .spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
         write("program.spv".into(), &words)?;
+        // Each binding's guest source: kind, constant bank (`index`), its
+        // used size, and where a handle or pointer for it is read.
+        let mut listing = String::new();
+        for descriptor in &stage.descriptors {
+            listing += &format!(
+                "binding {} kind {:?} bank {} used {} at c{}+{:#x} flags {:#x}\n",
+                descriptor.binding,
+                descriptor.kind(),
+                descriptor.index,
+                stage
+                    .cbuf_used_sizes
+                    .get(descriptor.index as usize)
+                    .copied()
+                    .unwrap_or(0),
+                descriptor.cbuf_index,
+                descriptor.cbuf_offset,
+                descriptor.flags
+            );
+        }
+        write("descriptors.txt".into(), listing.as_bytes())?;
         write(
             "dispatch.txt".into(),
             format!(
@@ -3964,6 +3988,36 @@ impl Nvn {
             .flat_map(|entry| entry.to_le_bytes())
             .collect();
         write(format!("memory-{:x}.bin", page_table.address), &table)?;
+        // ECHORA_DUMP_MEMORY=all: every mapped page, in runs whose device
+        // addresses follow on (the GPU addresses do too), at most 64 MiB a
+        // file.
+        if super::debug_var("ECHORA_DUMP_MEMORY").is_ok_and(|mode| mode == "all") {
+            let first = u64::from(page_table.first_page);
+            let mut index = 0;
+            while index < entries.len() {
+                let base = entries[index];
+                if base == 0 {
+                    index += 1;
+                    continue;
+                }
+                let mut end = index + 1;
+                while end < entries.len()
+                    && end - index < 16384
+                    && entries[end] == base + (end - index) as u64 * PAGE_SIZE
+                {
+                    end += 1;
+                }
+                let gpu = (first + index as u64) << PAGE_SHIFT;
+                let length = (end - index) as u64 * PAGE_SIZE;
+                // A page the guest cannot read stays out (it reads as
+                // unmapped in the simulator).
+                if let Ok(bytes) = self.gpu_bytes(core, gpu, length) {
+                    write(format!("memory-{base:x}.bin"), &bytes)?;
+                }
+                index = end;
+            }
+            return Ok(());
+        }
         // Pools an address in the constant buffers falls in.
         let pools: Vec<(u64, u64)> = self
             .objects
