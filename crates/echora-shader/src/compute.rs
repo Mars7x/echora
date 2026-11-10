@@ -2486,9 +2486,16 @@ impl Emitter {
                 d,
                 address,
                 location,
+                mode,
                 index: attribute_index,
                 ..
             } => match attribute_index {
+                // Frequency 1 reads the provoking vertex's value, which
+                // only a flat input holds; 2 (state) is not known.
+                _ if mode == 2 => return Err(unsupported(index, "IPA.STATE")),
+                _ if mode == 1 && !self.flat_input(address) => {
+                    return Err(unsupported(index, "IPA.CONSTANT of an interpolated input"));
+                }
                 Some(register) if register.0 != 63 => {
                     self.interpolate_indexed(index, d.0, address, location, register.0)?
                 }

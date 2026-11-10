@@ -1511,7 +1511,9 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 patch: word.bit(76),
             });
         }
-        0x326 | 0x526 => {
+        // IPA: a predicate output at 81-83 (NAK leaves it PT) is not
+        // translated.
+        0x326 | 0x526 if word.bits(81, 3) == 7 => {
             return Some(Op::Ipa {
                 d,
                 address: word.bits(64, 8) as u16 * 4,
@@ -1951,7 +1953,9 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             b: word.source(1)?,
             min: word.pred(87, 90),
         },
-        0x017 if matches!(form, 1 | 4 | 5 | 6) => Op::Imnmx {
+        // IMNMX: bit 74 is the 64-bit form (refused, as Lichii does; its
+        // accepted words have bits 77-86 clear).
+        0x017 if matches!(form, 1 | 4 | 5 | 6) && !word.bit(74) => Op::Imnmx {
             d,
             a: word.a(),
             b: word.source(1)?,

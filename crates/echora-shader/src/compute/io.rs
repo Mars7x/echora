@@ -388,6 +388,16 @@ impl Emitter {
         Ok(())
     }
 
+    /// Whether the attribute word at `address` reads the same for every
+    /// fragment of a primitive: a system value (front facing, ...), or a
+    /// generic the header maps as constant (flat).
+    pub(super) fn flat_input(&self, address: u16) -> bool {
+        !(0x80..0x280).contains(&address) || {
+            let component = u32::from((address - 0x80) / 4);
+            self.declared_mode(component / 4, component % 4) == Interpolation::Constant
+        }
+    }
+
     /// An input as IPA reads it: a generic the header interpolates with
     /// perspective (or leaves unused) still multiplied by 1/w (Vulkan's
     /// FragCoord.w), as the hardware interpolates attr/w linearly and the
