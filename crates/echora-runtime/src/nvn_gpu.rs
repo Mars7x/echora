@@ -4244,9 +4244,25 @@ impl Nvn {
         // ECHORA_DUMP_MEMORY=all: every mapped page, in runs whose device
         // addresses follow on (the GPU addresses do too), at most 64 MiB a
         // file.
-        if super::debug_var("ECHORA_DUMP_MEMORY").is_ok_and(|mode| mode == "all") {
+        // ECHORA_DUMP_MEMORY=START-END (hex guest GPU addresses): only the
+        // mapped pages in that range.
+        let mode = super::debug_var("ECHORA_DUMP_MEMORY").ok();
+        let range = mode.as_deref().and_then(|mode| {
+            let (start, end) = mode.split_once('-')?;
+            let parse =
+                |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+            Some(parse(start)?..parse(end)?)
+        });
+        if mode.as_deref() == Some("all") || range.is_some() {
             let first = u64::from(page_table.first_page);
-            let mut index = 0;
+            let (mut index, last) = match &range {
+                Some(range) => (
+                    ((range.start >> PAGE_SHIFT).saturating_sub(first) as usize).min(entries.len()),
+                    ((range.end >> PAGE_SHIFT).saturating_sub(first) as usize).min(entries.len()),
+                ),
+                None => (0, entries.len()),
+            };
+            let entries = &entries[..last];
             while index < entries.len() {
                 let base = entries[index];
                 if base == 0 {
