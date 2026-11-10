@@ -112,6 +112,9 @@ pub struct Backend {
     /// not contiguous): the pieces that are, by pool base, as (offset,
     /// length, file, offset in the file).
     shared_pieces: HashMap<u64, Vec<(u64, u64, i32, u64)>>,
+    /// Bumped whenever a pool is shared (or shared again): the page table
+    /// is rebuilt after it changes.
+    share_generation: usize,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -186,6 +189,7 @@ impl Backend {
             resident: HashMap::new(),
             shared_pools: HashMap::new(),
             shared_pieces: HashMap::new(),
+            share_generation: 0,
             target_index: HashMap::new(),
             target_index_stamp: None,
         }))
@@ -3928,9 +3932,10 @@ impl Nvn {
         // when a pool is shared (one made between presents is mapped from
         // the next present on) or the pools change (`pool_epoch`), not by
         // walking the objects on every dispatch.
-        let shared = self.gpu.as_ref().map_or(0, |backend| {
-            backend.shared_pools.len() + backend.shared_pieces.len()
-        });
+        let shared = self
+            .gpu
+            .as_ref()
+            .map_or(0, |backend| backend.share_generation);
         let key = (shared, self.pool_epoch);
         if let Some((built, table)) = self.gpu.as_ref().and_then(|backend| backend.page_table)
             && built == key
@@ -4092,6 +4097,12 @@ impl Nvn {
                             " (no shared span)"
                         }
                     );
+                    let known = self
+                        .gpu
+                        .as_ref()
+                        .and_then(|backend| backend.shared_pools.get(&base))
+                        .map(|&(shared, ..)| shared);
+                    let note = format!("{note}, guest {base:#x}, recorded size {known:x?}");
                     self.gpu.as_mut().unwrap().note(note);
                 }
                 if let Some(address) = address {
@@ -4423,6 +4434,7 @@ impl Nvn {
                 let backend = self.gpu.as_mut().unwrap();
                 backend.stat("stat: pools shared whole", 1);
                 backend.shared_pools.insert(base, (size, file, offset));
+                backend.share_generation += 1;
                 continue;
             }
             // Page by page: runs of pages whose backing follows on.
@@ -4448,6 +4460,7 @@ impl Nvn {
             let backend = self.gpu.as_mut().unwrap();
             backend.stat("stat: pools shared in pieces", 1);
             backend.shared_pieces.insert(base, pieces);
+            backend.share_generation += 1;
         }
     }
 
