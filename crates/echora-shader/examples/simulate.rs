@@ -15,6 +15,8 @@
 //!   being 1/w) and `attribute LOCATION X Y Z W` (an interpolated input as
 //!   Vulkan hands it over, perspective-corrected), floats;
 //! - `push.bin`: the push constants' bytes;
+//! - `payload.bin`: a mesh program's task payload (what its task program
+//!   wrote), if it has one;
 //! - `uniform-SET-BINDING.bin`: each bound uniform buffer's bytes;
 //! - `memory-ADDRESS.bin` (ADDRESS in hex, no 0x): device memory from that
 //!   address: the page table and every page the dispatch may touch;
@@ -72,6 +74,7 @@ fn main() {
     let mut inputs = Inputs {
         workgroup_count: [1, 1, 1],
         push: std::fs::read(directory.join("push.bin")).unwrap_or_default(),
+        payload: std::fs::read(directory.join("payload.bin")).unwrap_or_default(),
         ..Inputs::default()
     };
     let dispatch = String::from_utf8_lossy(&read("dispatch.txt")).into_owned();
@@ -400,6 +403,40 @@ fn main() {
         }
         for problem in &report.problems {
             println!("  PROBLEM: {problem}");
+        }
+        // A task program's emitted groups; a mesh program's counts, its
+        // primitives' indices and its vertices' positions.
+        if let Some([x, y, z]) = report.mesh_tasks {
+            println!("  task: emits {x}x{y}x{z} mesh workgroups");
+        }
+        if let Some((vertices, primitives)) = report.mesh_outputs {
+            println!("  mesh: {vertices} vertices, {primitives} primitives");
+            for (&variable, value) in &report.workgroup_outputs {
+                match machine.builtin(variable) {
+                    Some(0) => {
+                        for (n, position) in value.chunks(4).enumerate() {
+                            let floats: Vec<String> = position
+                                .iter()
+                                .map(|&word| format!("{}", f32::from_bits(word as u32)))
+                                .collect();
+                            println!("    vertex {n} position {}", floats.join(" "));
+                        }
+                    }
+                    Some(5294..=5296) => {
+                        let corners = match machine.builtin(variable) {
+                            Some(5294) => 1,
+                            Some(5295) => 2,
+                            _ => 3,
+                        };
+                        for (n, indices) in
+                            value.chunks(corners).take(primitives as usize).enumerate()
+                        {
+                            println!("    primitive {n} indices {indices:?}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         // A one-pixel run (a fragment program): its located variables (the
         // attributes given and the colours written).

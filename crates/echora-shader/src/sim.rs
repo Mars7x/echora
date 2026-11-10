@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::spirv::{glsl, op, storage};
+use crate::spirv::{execution, glsl, op, storage};
 
 /// Opcodes not in `op`.
 const F_CONVERT: u16 = 115;
@@ -120,7 +120,7 @@ enum Pointer {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Instruction {
     opcode: u16,
     operands: Vec<u32>,
@@ -156,6 +156,8 @@ pub struct Inputs {
     /// Input variables' values by Location (a fragment program's
     /// interpolated attributes, as 32-bit words).
     pub locations: HashMap<u32, Vec<u64>>,
+    /// A mesh program's task payload (bytes) from its task program.
+    pub payload: Vec<u8>,
     /// Address ranges (device addresses, or guest addresses through the
     /// page table) whose stores and atomics `Report::writes` lists.
     pub watch: Vec<std::ops::Range<u64>>,
@@ -258,6 +260,14 @@ pub struct Report {
     pub ends: Vec<usize>,
     /// The stores and atomics into `Inputs::watch`, in the order they ran.
     pub writes: Vec<Write>,
+    /// A mesh program's OpSetMeshOutputsEXT (vertices, primitives), and a
+    /// task program's OpEmitMeshTasksEXT group counts.
+    pub mesh_outputs: Option<(u32, u32)>,
+    pub mesh_tasks: Option<[u32; 3]>,
+    /// The workgroup's own outputs after the run, by variable id: a mesh
+    /// program's output arrays (shared by the workgroup), a task
+    /// program's payload.
+    pub workgroup_outputs: HashMap<u32, Value>,
     /// Each invocation's guest EXIT (byte offset), the first it took; none
     /// when it ran off the end or stopped on a problem.
     pub exits: Vec<Option<u32>>,
@@ -305,6 +315,8 @@ pub struct Machine {
     /// Input and output variables' Locations (a fragment program's
     /// attributes and colours), by variable id.
     pub locations: HashMap<u32, u32>,
+    /// The entry point's execution model.
+    model: u32,
     /// Their first Components (a scalar input of one component of a
     /// location), by variable id.
     components: HashMap<u32, u32>,
@@ -372,6 +384,8 @@ struct Shared {
     /// Guest pages by the device page they map to (when watching).
     guest_pages: HashMap<u64, u64>,
     writes: Vec<Write>,
+    mesh_outputs: Option<(u32, u32)>,
+    mesh_tasks: Option<[u32; 3]>,
 }
 
 impl Shared {
@@ -564,6 +578,7 @@ impl Machine {
             names: BTreeMap::new(),
             locations: HashMap::new(),
             components: HashMap::new(),
+            model: 0,
             step_file: None,
         };
         let mut entry = 0;
@@ -589,7 +604,10 @@ impl Machine {
                         .names
                         .insert(String::from_utf8_lossy(&bytes).into_owned(), operands[0]);
                 }
-                op::ENTRY_POINT => entry = operands[1],
+                op::ENTRY_POINT => {
+                    machine.model = operands[0];
+                    entry = operands[1];
+                }
                 op::EXECUTION_MODE if operands[1] == EXECUTION_LOCAL_SIZE => {
                     machine.local_size = [operands[2], operands[3], operands[4]];
                 }
@@ -757,10 +775,54 @@ impl Machine {
                 }
             }
         }
-        let (_, body) = functions
+        // Calls of functions without parameters (a task or mesh program's
+        // body) run inline: the callee's instructions in place of the call,
+        // each return a branch to a label after them.
+        let callees: HashMap<u32, Vec<Instruction>> = functions
+            .iter()
+            .filter(|(_, body)| body.iter().all(|i| i.opcode != op::FUNCTION_PARAMETER))
+            .map(|(id, body)| (*id, body.clone()))
+            .collect();
+        let (_, mut body) = functions
             .into_iter()
             .find(|(id, _)| *id == entry)
             .expect("the entry function");
+        let mut next_label = u32::MAX;
+        for _ in 0..8 {
+            if !body.iter().any(|i| i.opcode == op::FUNCTION_CALL) {
+                break;
+            }
+            let mut inlined = Vec::with_capacity(body.len());
+            for instruction in body {
+                let callee = (instruction.opcode == op::FUNCTION_CALL)
+                    .then(|| callees.get(&instruction.operands[2]))
+                    .flatten();
+                let Some(callee) = callee else {
+                    inlined.push(instruction);
+                    continue;
+                };
+                let after = next_label;
+                next_label -= 1;
+                for inner in callee {
+                    if inner.opcode == op::RETURN {
+                        inlined.push(Instruction {
+                            opcode: op::BRANCH,
+                            operands: vec![after],
+                        });
+                    } else {
+                        inlined.push(Instruction {
+                            opcode: inner.opcode,
+                            operands: inner.operands.clone(),
+                        });
+                    }
+                }
+                inlined.push(Instruction {
+                    opcode: op::LABEL,
+                    operands: vec![after],
+                });
+            }
+            body = inlined;
+        }
         for (n, instruction) in body.iter().enumerate() {
             if instruction.opcode == op::LABEL {
                 machine.labels.insert(instruction.operands[0], n);
@@ -768,6 +830,11 @@ impl Machine {
         }
         machine.body = body;
         machine
+    }
+
+    /// The BuiltIn a variable is decorated with.
+    pub fn builtin(&self, variable: u32) -> Option<u32> {
+        self.builtins.get(&variable).copied()
     }
 
     /// Whether the module has cooperative matrix types (not simulated).
@@ -1032,6 +1099,8 @@ impl Machine {
             traced: Vec::new(),
             guest_pages: HashMap::new(),
             writes: Vec::new(),
+            mesh_outputs: None,
+            mesh_tasks: None,
             uniforms: self
                 .globals
                 .iter()
@@ -1081,6 +1150,9 @@ impl Machine {
                 }
                 storage::PUSH_CONSTANT => inputs.push.clone(),
                 storage::WORKGROUP => Vec::new(),
+                storage::TASK_PAYLOAD_WORKGROUP_EXT => inputs.payload.clone(),
+                // A mesh program's outputs belong to the workgroup.
+                storage::OUTPUT if self.model == execution::MESH_EXT => Vec::new(),
                 _ => continue,
             };
             let mut slots = Vec::new();
@@ -1216,6 +1288,22 @@ impl Machine {
             images: shared.images,
             uniform_reads: shared.uniform_reads,
             unmapped_pages: shared.unmapped_pages,
+            mesh_outputs: shared.mesh_outputs,
+            mesh_tasks: shared.mesh_tasks,
+            workgroup_outputs: self
+                .globals
+                .iter()
+                .filter(|&&(_, _, class)| {
+                    class == storage::TASK_PAYLOAD_WORKGROUP_EXT
+                        || (class == storage::OUTPUT && self.model == execution::MESH_EXT)
+                })
+                .filter_map(|&(variable, _, _)| {
+                    shared
+                        .variables
+                        .get(&variable)
+                        .map(|value| (variable, value.clone()))
+                })
+                .collect(),
         }
     }
 
@@ -1235,7 +1323,10 @@ impl Machine {
                     pointee,
                 },
             );
-            if matches!(class, storage::INPUT | storage::OUTPUT | storage::PRIVATE) {
+            let shared_output = class == storage::OUTPUT && self.model == execution::MESH_EXT;
+            if matches!(class, storage::INPUT | storage::OUTPUT | storage::PRIVATE)
+                && !shared_output
+            {
                 let located = (class == storage::INPUT)
                     .then(|| self.locations.get(&variable))
                     .flatten()
@@ -1869,6 +1960,17 @@ impl Machine {
             let opcode = instruction.opcode;
             match opcode {
                 op::LABEL | op::SELECTION_MERGE | op::MEMORY_BARRIER => continue,
+                op::SET_MESH_OUTPUTS_EXT => {
+                    let count = |n: usize| invocation.values[&operands[n]][0] as u32;
+                    shared.mesh_outputs = Some((count(0), count(1)));
+                    continue;
+                }
+                op::EMIT_MESH_TASKS_EXT => {
+                    let count = |n: usize| invocation.values[&operands[n]][0] as u32;
+                    shared.mesh_tasks = Some([count(0), count(1), count(2)]);
+                    invocation.done = true;
+                    return;
+                }
                 // The translation marks each guest EXIT taken with a line.
                 op::LINE => {
                     if self.step_file.is_some() && operands.first() == self.step_file.as_ref() {
@@ -5030,6 +5132,117 @@ mod tests {
         let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
         // x: 2.0 * 1/w; y: as delivered.
         assert_eq!((read(1), read(2)), (0.5, 3.0));
+    }
+
+    #[test]
+    fn a_mesh_program_draws_the_primitives_its_map_counts() {
+        use crate::compute::MeshLayout;
+        use echora_shader_abi::Stage;
+        // ISBEWR.O [Ra + offset], Rdata, with a size and region.
+        let isbewr = |a: u128, data: u128, offset: u128, size: u128, region: u128| {
+            word(&[
+                (0, 12, 0x927),
+                (24, 8, a),
+                (32, 8, data),
+                (40, 16, offset),
+                (74, 2, size),
+                (76, 2, region),
+                (79, 1, 1),
+            ])
+        };
+        // R0 = lane; R1 = lane * 4 (the vertex's word in each line);
+        // position (lane, 2, 0, 1); lane 0 writes the count as a byte at
+        // map byte 3 and the three indices as one word at byte 4.
+        let s2r = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]);
+        let times_four = word(&[
+            (0, 12, 0x824),
+            (16, 8, 1),
+            (24, 8, 0),
+            (32, 32, 4),
+            (64, 8, 255),
+        ]);
+        let to_float = word(&[
+            (0, 12, 0x306),
+            (16, 8, 2),
+            (32, 8, 0),
+            (75, 2, 2),
+            (84, 2, 2),
+        ]);
+        let first_lane = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 0),
+            (32, 8, 255),
+            (76, 3, 2),
+            (81, 3, 1),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let only_first = |raw: u128| raw & !(0xf << 12) | 1 << 12;
+        let program = [
+            s2r,
+            times_four,
+            to_float,
+            mov(3, 2.0f32.to_bits()),
+            mov(4, 0),
+            mov(5, 1.0f32.to_bits()),
+            isbewr(1, 2, 0x000, 2, 3),
+            isbewr(1, 3, 0x080, 2, 3),
+            isbewr(1, 4, 0x100, 2, 3),
+            isbewr(1, 5, 0x180, 2, 3),
+            first_lane,
+            mov(6, 1),
+            mov(7, 0x0002_0100),
+            only_first(isbewr(255, 6, 3, 0, 0)),
+            only_first(isbewr(255, 7, 4, 2, 0)),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            stage: Stage::Mesh,
+            mesh: Some(MeshLayout {
+                task: false,
+                has_task: false,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                vertices_per_primitive: 3,
+                payload_words: 32,
+                local_words: 0,
+                // Position (0x70-0x7c: bits 28-31).
+                vertex_outputs: [0xf000_0000, 0, 0, 0, 0],
+                primitive_outputs: None,
+            }),
+            ..Layout::workgroup([32, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let machine = Machine::new(&translated.spirv);
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        // One triangle of three vertices, indices 0, 1, 2.
+        assert_eq!(report.mesh_outputs, Some((3, 1)));
+        let output = |builtin: u32| {
+            let (&variable, _) = machine
+                .builtins
+                .iter()
+                .find(|&(&variable, &b)| {
+                    b == builtin && report.workgroup_outputs.contains_key(&variable)
+                })
+                .unwrap();
+            report.workgroup_outputs[&variable].clone()
+        };
+        assert_eq!(output(5296), vec![0, 1, 2]);
+        let positions: Vec<f32> = output(0)
+            .iter()
+            .map(|&w| f32::from_bits(w as u32))
+            .collect();
+        assert_eq!(
+            positions,
+            vec![0.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0, 1.0, 2.0, 2.0, 0.0, 1.0]
+        );
     }
 
     #[test]
