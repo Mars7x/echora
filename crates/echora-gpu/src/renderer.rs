@@ -3632,6 +3632,11 @@ impl Renderer {
         }
     }
 
+    /// Make sure a guest texture is uploaded (debugging reads).
+    pub fn texture_view_for(&mut self, source: &crate::draw::TextureSource) -> Result<(), String> {
+        self.texture_view(source, 2).map(|_| ())
+    }
+
     /// Debugging: read mip level `level` of upload `key` back as RGBA f32
     /// texels (as a target would be).
     pub fn read_upload_level(&mut self, key: u64, level: u32) -> Result<Vec<[f32; 4]>, String> {

@@ -3558,6 +3558,17 @@ impl Nvn {
                 ) {
                     self.gpu_note(format!("dispatch dump {:016x}: {error}", key.0));
                 }
+                let read: Vec<(u32, TextureSource)> =
+                    textures
+                        .iter()
+                        .map(|(binding, (source, _))| (*binding, source.clone()))
+                        .chain(images.iter().map(|(binding, (target, _))| {
+                            (*binding, TextureSource::Target(*target))
+                        }))
+                        .collect();
+                if let Err(error) = self.dump_images(key.0, &read) {
+                    self.gpu_note(format!("dispatch dump {:016x} images: {error}", key.0));
+                }
             }
             // ECHORA_DUMP_ONLY: listed programs are dumped, never run.
             if wanted && super::debug_var_os("ECHORA_DUMP_ONLY").is_some() {
@@ -3914,17 +3925,7 @@ impl Nvn {
         page_table: echora_shader_abi::PageTable,
     ) -> Result<(), String> {
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
-        let root = match super::debug_var_os("ECHORA_DUMP_DIR") {
-            Some(directory) => std::path::PathBuf::from(directory),
-            None => std::env::var_os("XDG_CACHE_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
-                })
-                .ok_or("no cache directory")?
-                .join("echora/dispatch-dumps"),
-        };
-        let directory = root.join(format!("{key:016x}-{}", self.presented_frames));
+        let directory = self.dump_directory(key)?;
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         let write = |name: String, bytes: &[u8]| {
             std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
@@ -4073,6 +4074,62 @@ impl Nvn {
                 }
                 start = end;
             }
+        }
+        Ok(())
+    }
+
+    /// Where `dump_dispatch` writes program `key`'s dispatch this present.
+    fn dump_directory(&self, key: u64) -> Result<std::path::PathBuf, String> {
+        let root = match super::debug_var_os("ECHORA_DUMP_DIR") {
+            Some(directory) => std::path::PathBuf::from(directory),
+            None => std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
+                })
+                .ok_or("no cache directory")?
+                .join("echora/dispatch-dumps"),
+        };
+        Ok(root.join(format!("{key:016x}-{}", self.presented_frames)))
+    }
+
+    /// A dumped dispatch's textures and storage images, by binding: level
+    /// 0 read back from the GPU as RGBA f32 texels (`image-0-B.bin`, layer
+    /// 0) with `WIDTH HEIGHT DEPTH LAYERS` (`image-0-B.txt`). Integer
+    /// formats read back as floats here.
+    fn dump_images(&mut self, key: u64, read: &[(u32, TextureSource)]) -> Result<(), String> {
+        let directory = self.dump_directory(key)?;
+        let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        for (binding, source) in read {
+            let texels = match source {
+                TextureSource::Upload { key, .. } => {
+                    renderer.texture_view_for(source)?;
+                    renderer.read_upload_level(*key, 0)?
+                }
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                    renderer.read_target_level(*key, 0)?
+                }
+            };
+            let (width, height) = match source {
+                TextureSource::Upload { width, height, .. } => (*width, *height),
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => renderer
+                    .existing_target(*key)
+                    .map(|target| (target.width, target.height))
+                    .ok_or("no such target")?,
+            };
+            let count = (width * height) as usize;
+            let bytes: Vec<u8> = texels
+                .iter()
+                .take(count)
+                .flat_map(|texel| texel.iter().flat_map(|part| part.to_bits().to_le_bytes()))
+                .collect();
+            std::fs::write(directory.join(format!("image-0-{binding}.bin")), bytes)
+                .map_err(|error| error.to_string())?;
+            std::fs::write(
+                directory.join(format!("image-0-{binding}.txt")),
+                format!("{width} {height} 1 1\n"),
+            )
+            .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
