@@ -25,7 +25,13 @@
 //!   of an image array (a texture pool view; its flags buffer is a
 //!   `uniform-` file).
 //!
-//! Each X,Y,Z argument names a workgroup to run (default 0,0,0). Each
+//! Each X,Y,Z argument names a workgroup to run (default 0,0,0); `A..B`
+//! names workgroups A to B - 1 by linear index (x fastest), and `all`
+//! every one. Several run in sequence over one memory image, each seeing
+//! the earlier ones' writes and atomics (a valid schedule, which lets a
+//! last-workgroup pattern finish), unless `--independent` starts each from
+//! the dump. `--quiet` prints only workgroups with problems, unmapped
+//! pages or watched writes. Each
 //! `watch=START..END` argument (hex addresses, or a `watch START END` line
 //! in dispatch.txt) lists every store and atomic into that range, guest
 //! (through the page table) or device: the invocation, the instruction
@@ -165,57 +171,94 @@ fn main() {
             inputs.watch.push(range);
         }
     }
+    let independent = arguments.iter().any(|argument| argument == "--independent");
+    let quiet = arguments.iter().any(|argument| argument == "--quiet");
     let group_arguments: Vec<&String> = arguments[1..]
         .iter()
-        .filter(|argument| !argument.starts_with("watch="))
+        .filter(|argument| !argument.starts_with("watch=") && !argument.starts_with("--"))
         .collect();
-    let groups: Vec<[u32; 3]> = if !group_arguments.is_empty() {
-        group_arguments
-            .into_iter()
-            .filter_map(|group| {
-                let parts: Vec<u32> = group
-                    .split(',')
-                    .filter_map(|part| part.parse().ok())
-                    .collect();
-                (parts.len() == 3).then(|| [parts[0], parts[1], parts[2]])
-            })
+    // Workgroups by linear index, x fastest.
+    let [count_x, count_y, count_z] = inputs.workgroup_count.map(|count| count.max(1));
+    let total = count_x * count_y * count_z;
+    let by_index = |n: u32| [n % count_x, n / count_x % count_y, n / (count_x * count_y)];
+    let mut groups: Vec<[u32; 3]> = Vec::new();
+    for argument in group_arguments {
+        if argument == "all" {
+            groups.extend((0..total).map(by_index));
+        } else if let Some((first, end)) = argument.split_once("..") {
+            if let (Ok(first), Ok(end)) = (first.parse::<u32>(), end.parse::<u32>()) {
+                groups.extend((first..end.min(total)).map(by_index));
+            }
+        } else {
+            let parts: Vec<u32> = argument
+                .split(',')
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            if let [x, y, z] = parts[..] {
+                groups.push([x, y, z]);
+            }
+        }
+    }
+    if groups.is_empty() {
+        groups.push([0, 0, 0]);
+    }
+    if groups.len() > 1 && !independent {
+        println!(
+            "{} workgroups in sequence over one memory image (each sees the earlier ones' \
+             writes and atomics)",
+            groups.len()
+        );
+    }
+    let hex = |bytes: &[u8]| -> String {
+        bytes
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02x}"))
             .collect()
-    } else {
-        vec![[0, 0, 0]]
     };
+    // Each watched word's first and last value, and its writes.
+    let mut words: BTreeMap<u64, (Vec<u8>, Vec<u8>, usize)> = BTreeMap::new();
     let mut failed = false;
     for group in groups {
         inputs.workgroup_id = group;
         let report = machine.simulate(&inputs);
-        println!(
-            "workgroup {group:?} ({:?} invocations): {} barriers passed",
-            machine.local_size,
-            report.barriers.len()
-        );
-        // Where invocations ended, as runs of invocations.
-        let mut start = 0;
-        for n in 1..=report.ends.len() {
-            if n == report.ends.len() || report.ends[n] != report.ends[start] {
-                println!(
-                    "  invocations {start}-{} ended at instruction {}",
-                    n - 1,
-                    report.ends[start]
-                );
-                start = n;
-            }
+        let quiet_group = quiet
+            && report.problems.is_empty()
+            && report.writes.is_empty()
+            && report.unmapped_pages.is_empty();
+        if !quiet_group {
+            println!(
+                "workgroup {group:?} ({:?} invocations): {} barriers passed",
+                machine.local_size,
+                report.barriers.len()
+            );
         }
-        // The uniform buffer words read, as ranges per binding.
-        let mut reads = report.uniform_reads.iter().peekable();
-        while let Some(&(set, binding, first)) = reads.next() {
-            let mut last = first;
-            while let Some(&&(next_set, next_binding, next)) = reads.peek() {
-                if (next_set, next_binding, next) != (set, binding, last + 4) {
-                    break;
+        if !quiet {
+            // Where invocations ended, as runs of invocations.
+            let mut start = 0;
+            for n in 1..=report.ends.len() {
+                if n == report.ends.len() || report.ends[n] != report.ends[start] {
+                    println!(
+                        "  invocations {start}-{} ended at instruction {}",
+                        n - 1,
+                        report.ends[start]
+                    );
+                    start = n;
                 }
-                last = next;
-                reads.next();
             }
-            println!("  uniform {set}/{binding} read at {first:#x}..={last:#x}");
+            // The uniform buffer words read, as ranges per binding.
+            let mut reads = report.uniform_reads.iter().peekable();
+            while let Some(&(set, binding, first)) = reads.next() {
+                let mut last = first;
+                while let Some(&&(next_set, next_binding, next)) = reads.peek() {
+                    if (next_set, next_binding, next) != (set, binding, last + 4) {
+                        break;
+                    }
+                    last = next;
+                    reads.next();
+                }
+                println!("  uniform {set}/{binding} read at {first:#x}..={last:#x}");
+            }
         }
         // Guest pages the page table does not map: the program reads 0
         // from them and its stores there are dropped.
@@ -233,15 +276,6 @@ fn main() {
                 report.unmapped_pages.len()
             );
         }
-        // Watched writes, then each watched word's first and last value.
-        let hex = |bytes: &[u8]| -> String {
-            bytes
-                .iter()
-                .rev()
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
-        };
-        let mut words: BTreeMap<u64, (Vec<u8>, Vec<u8>, usize)> = BTreeMap::new();
         for write in &report.writes {
             let guest = write
                 .guest
@@ -263,20 +297,26 @@ fn main() {
             entry.1.clone_from(&write.new);
             entry.2 += 1;
         }
-        for (address, (first, last, count)) in &words {
-            println!(
-                "  watched {address:#x}: {} -> {} ({count} writes)",
-                hex(first),
-                hex(last)
-            );
-        }
-        for note in &report.notes {
-            println!("  note: {note}");
+        if !quiet {
+            for note in &report.notes {
+                println!("  note: {note}");
+            }
         }
         for problem in &report.problems {
             println!("  PROBLEM: {problem}");
         }
         failed |= !report.problems.is_empty();
+        if !independent {
+            inputs.memory = report.memory;
+            inputs.images = report.images;
+        }
+    }
+    for (address, (first, last, count)) in &words {
+        println!(
+            "watched {address:#x}: {} -> {} ({count} writes)",
+            hex(first),
+            hex(last)
+        );
     }
     std::process::exit(i32::from(failed));
 }
