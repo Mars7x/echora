@@ -459,6 +459,9 @@ struct Emitter {
     atomic_images: BTreeMap<(u8, u16, u8), u32>,
     /// Task and mesh programs' variables.
     mesh: Option<mesh::MeshState>,
+    /// Register, predicate and uniform register variables' values known in
+    /// a block (see `load_variable`).
+    known: BTreeMap<u32, ((u32, u32), u32)>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
     /// c), and the seconds' indices (emitted with their first).
     hmma_pairs: matrix::Pairs,
@@ -531,6 +534,7 @@ impl Emitter {
             images: BTreeMap::new(),
             atomic_images: BTreeMap::new(),
             mesh: None,
+            known: BTreeMap::new(),
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
@@ -646,7 +650,7 @@ impl Emitter {
             return self.constant(0);
         }
         let variable = self.register(n);
-        self.value(op::LOAD, self.u32, &[variable])
+        self.load_variable(variable, self.u32)
     }
 
     fn write_register(&mut self, n: u8, value: u32) {
@@ -654,8 +658,28 @@ impl Emitter {
             self.write_uniform(n.min(63), value);
         } else if n != 255 {
             let variable = self.register(n);
-            self.function.emit(op::STORE, &[variable, value]);
+            self.store_variable(variable, value);
         }
+    }
+
+    /// A register-like variable's value: the one stored or loaded earlier
+    /// in the same block, else a load.
+    fn load_variable(&mut self, variable: u32, ty: u32) -> u32 {
+        let block = self.function.block();
+        if let Some(&(known, value)) = self.known.get(&variable)
+            && known == block
+        {
+            return value;
+        }
+        let value = self.value(op::LOAD, ty, &[variable]);
+        self.known.insert(variable, (block, value));
+        value
+    }
+
+    fn store_variable(&mut self, variable: u32, value: u32) {
+        self.function.emit(op::STORE, &[variable, value]);
+        let block = self.function.block();
+        self.known.insert(variable, (block, value));
     }
 
     /// Predicate `pred.index` (8-15: uniform predicate index - 8, as a
@@ -666,7 +690,7 @@ impl Emitter {
         }
         let value = {
             let variable = self.predicate_variable(pred.index);
-            self.value(op::LOAD, self.bool, &[variable])
+            self.load_variable(variable, self.bool)
         };
         if pred.negated {
             self.value(op::LOGICAL_NOT, self.bool, &[value])
@@ -678,7 +702,7 @@ impl Emitter {
     fn write_predicate(&mut self, n: u8, value: u32) {
         if n != 7 && n != 15 {
             let variable = self.predicate_variable(n);
-            self.function.emit(op::STORE, &[variable, value]);
+            self.store_variable(variable, value);
         }
     }
 
@@ -701,13 +725,13 @@ impl Emitter {
             return self.constant(0);
         }
         let variable = self.uniform_variable(n);
-        self.value(op::LOAD, self.u32, &[variable])
+        self.load_variable(variable, self.u32)
     }
 
     fn write_uniform(&mut self, n: u8, value: u32) {
         if n != 63 {
             let variable = self.uniform_variable(n);
-            self.function.emit(op::STORE, &[variable, value]);
+            self.store_variable(variable, value);
         }
     }
 

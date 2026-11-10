@@ -694,6 +694,8 @@ pub struct Function {
     header: Vec<u32>,
     variables: Vec<u32>,
     code: Vec<u32>,
+    /// Blocks begun so far (each label begins one).
+    blocks: u32,
 }
 
 impl Function {
@@ -734,6 +736,7 @@ impl Function {
                 header,
                 variables: Vec::new(),
                 code: Vec::new(),
+                blocks: 0,
             },
             parameters,
         )
@@ -771,6 +774,13 @@ impl Function {
     /// A new block's label (to be placed with [`Function::label`]).
     pub fn label(&mut self, label: u32) {
         instruction(&mut self.code, op::LABEL, &[label]);
+        self.blocks += 1;
+    }
+
+    /// The current block, as (function, block number): a value defined in
+    /// it can be used later in the same block.
+    pub fn block(&self) -> (u32, u32) {
+        (self.id, self.blocks)
     }
 
     /// Ends the function and adds it to `module`.
