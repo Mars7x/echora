@@ -5891,7 +5891,10 @@ impl Nvn {
                 .unwrap_or_default();
             let mut uniform_summary: Vec<String> = uniforms
                 .iter()
-                .map(|(key, bytes)| format!("{key:?}:{}B {:?}", bytes.len(), floats(bytes, 8)))
+                .map(|(key, bytes)| {
+                    let count = if traced_program { 16 } else { 8 };
+                    format!("{key:?}:{}B {:?}", bytes.len(), floats(bytes, count))
+                })
                 .collect();
             uniform_summary.sort();
             let line = format!(
