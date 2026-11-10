@@ -3670,6 +3670,7 @@ impl Nvn {
                     &storage_ranges,
                     page_table,
                 ) {
+                    eprintln!("dispatch dump {:016x}: {error}", key.0);
                     self.gpu_note(format!("dispatch dump {:016x}: {error}", key.0));
                 }
                 let read: Vec<(u32, TextureSource)> =
@@ -3681,6 +3682,7 @@ impl Nvn {
                         }))
                         .collect();
                 if let Err(error) = self.dump_images(key.0, &read) {
+                    eprintln!("dispatch dump {:016x} images: {error}", key.0);
                     self.gpu_note(format!("dispatch dump {:016x} images: {error}", key.0));
                 }
             }
@@ -4394,38 +4396,50 @@ impl Nvn {
     fn dump_images(&mut self, key: u64, read: &[(u32, TextureSource)]) -> Result<(), String> {
         let directory = self.dump_directory(key)?;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        // A binding that cannot be read is reported and skipped, the
+        // others still written.
+        let mut failed = Vec::new();
         for (binding, source) in read {
-            let texels = match source {
-                TextureSource::Upload { key, .. } => {
-                    renderer.texture_view_for(source)?;
-                    renderer.read_upload_level(*key, 0)?
-                }
-                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
-                    renderer.read_target_level(*key, 0)?
-                }
+            let mut one = || -> Result<(), String> {
+                let texels = match source {
+                    TextureSource::Upload { key, .. } => {
+                        renderer.texture_view_for(source)?;
+                        renderer.read_upload_level(*key, 0)?
+                    }
+                    TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                        renderer.read_target_level(*key, 0)?
+                    }
+                };
+                let (width, height) = match source {
+                    TextureSource::Upload { width, height, .. } => (*width, *height),
+                    TextureSource::Target(key) | TextureSource::TargetView { key, .. } => renderer
+                        .existing_target(*key)
+                        .map(|target| (target.width, target.height))
+                        .ok_or("no such target")?,
+                };
+                let count = (width * height) as usize;
+                let bytes: Vec<u8> = texels
+                    .iter()
+                    .take(count)
+                    .flat_map(|texel| texel.iter().flat_map(|part| part.to_bits().to_le_bytes()))
+                    .collect();
+                std::fs::write(directory.join(format!("image-0-{binding}.bin")), bytes)
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(
+                    directory.join(format!("image-0-{binding}.txt")),
+                    format!("{width} {height} 1 1\n"),
+                )
+                .map_err(|error| error.to_string())
             };
-            let (width, height) = match source {
-                TextureSource::Upload { width, height, .. } => (*width, *height),
-                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => renderer
-                    .existing_target(*key)
-                    .map(|target| (target.width, target.height))
-                    .ok_or("no such target")?,
-            };
-            let count = (width * height) as usize;
-            let bytes: Vec<u8> = texels
-                .iter()
-                .take(count)
-                .flat_map(|texel| texel.iter().flat_map(|part| part.to_bits().to_le_bytes()))
-                .collect();
-            std::fs::write(directory.join(format!("image-0-{binding}.bin")), bytes)
-                .map_err(|error| error.to_string())?;
-            std::fs::write(
-                directory.join(format!("image-0-{binding}.txt")),
-                format!("{width} {height} 1 1\n"),
-            )
-            .map_err(|error| error.to_string())?;
+            if let Err(error) = one() {
+                failed.push(format!("binding {binding}: {error}"));
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 
     /// ECHORA_TARGET_TRACE=<target key>[,...] or `all` (debugging), from

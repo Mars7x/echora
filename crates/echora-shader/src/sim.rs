@@ -250,6 +250,11 @@ pub struct Report {
     /// Each invocation's guest EXIT (byte offset), the first it took; none
     /// when it ran off the end or stopped on a problem.
     pub exits: Vec<Option<u32>>,
+    /// Each invocation's first non-finite float result: the guest
+    /// instruction (byte offset) it came from, when the translation marks
+    /// them (ECHORA_GUEST_LINES), the SPIR-V opcode and the instruction's
+    /// index in the entry function.
+    pub nonfinite: Vec<Option<(Option<u32>, u16, usize)>>,
 }
 
 /// A loaded module.
@@ -280,6 +285,8 @@ pub struct Machine {
     /// Debug names (OpName) and the ids they name: the translation names
     /// its register variables R0.., P0.., UR0.., UP0...
     pub names: BTreeMap<String, u32>,
+    /// The OpString of the translation's guest instruction lines.
+    step_file: Option<u32>,
 }
 
 /// One invocation's state.
@@ -291,6 +298,10 @@ struct Invocation {
     current: usize,
     /// The guest EXIT it took first (an OpLine's line), if any.
     exit: Option<u32>,
+    /// The guest instruction running (its line), when marked.
+    step: Option<u32>,
+    /// The first non-finite float result (see `Report::nonfinite`).
+    nonfinite: Option<(Option<u32>, u16, usize)>,
     values: HashMap<u32, Value>,
     value_types: HashMap<u32, u32>,
     pointers: HashMap<u32, Pointer>,
@@ -524,6 +535,7 @@ impl Machine {
             local_size: [1, 1, 1],
             cooperative: false,
             names: BTreeMap::new(),
+            step_file: None,
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
@@ -535,6 +547,9 @@ impl Machine {
             at += count;
             match opcode {
                 op::EXT_INST_IMPORT => machine.glsl = operands[0],
+                op::STRING if operands.get(1) == Some(&u32::from_le_bytes(*b"step")) => {
+                    machine.step_file = Some(operands[0]);
+                }
                 op::NAME if !operands.is_empty() => {
                     let bytes: Vec<u8> = operands[1..]
                         .iter()
@@ -1137,9 +1152,14 @@ impl Machine {
             .iter()
             .map(|invocation| invocation.exit)
             .collect();
+        let nonfinite = invocations
+            .iter()
+            .map(|invocation| invocation.nonfinite)
+            .collect();
         Report {
             ends,
             exits,
+            nonfinite,
             writes: shared.writes,
             invocations: invocations
                 .into_iter()
@@ -1195,6 +1215,8 @@ impl Machine {
             number: 0,
             current: 0,
             exit: None,
+            step: None,
+            nonfinite: None,
             done: false,
             steps: 0,
         }
@@ -1794,7 +1816,9 @@ impl Machine {
                 op::LABEL | op::SELECTION_MERGE | op::MEMORY_BARRIER => continue,
                 // The translation marks each guest EXIT taken with a line.
                 op::LINE => {
-                    if invocation.exit.is_none() {
+                    if self.step_file.is_some() && operands.first() == self.step_file.as_ref() {
+                        invocation.step = operands.get(1).copied();
+                    } else if invocation.exit.is_none() {
                         invocation.exit = operands.get(1).copied();
                     }
                     continue;
@@ -2158,9 +2182,25 @@ impl Machine {
             } else {
                 invocation.tainted.remove(&id);
             }
+            if invocation.nonfinite.is_none() && self.nonfinite(ty, &result) {
+                invocation.nonfinite = Some((invocation.step, opcode, invocation.current));
+            }
             invocation.values.insert(id, result);
             invocation.value_types.insert(id, ty);
         }
+    }
+
+    /// Whether a float result holds an Inf or NaN.
+    fn nonfinite(&self, ty: u32, value: &Value) -> bool {
+        let (exponent, shift) = match self.scalar(ty) {
+            Ty::Float { width: 16 } => (0x1f, 10),
+            Ty::Float { width: 32 } => (0xff, 23),
+            Ty::Float { width: 64 } => (0x7ff, 52),
+            _ => return false,
+        };
+        value
+            .iter()
+            .any(|&component| component >> shift & exponent == exponent)
     }
 
     /// The bits of `value` (of type `from`) as type `to`.
@@ -2332,7 +2372,7 @@ impl Machine {
                 op::CONVERT_F_TO_S => {
                     let v = f(0);
                     assert!(
-                        v.is_finite() && v > -2_147_483_649.0 && v < 2_147_483_648.0,
+                        v.is_finite() && v >= -2_147_483_648.0 && v < 2_147_483_648.0,
                         "ConvertFToS of {v}"
                     );
                     u64::from(v as i32 as u32)

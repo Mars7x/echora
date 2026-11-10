@@ -43,6 +43,15 @@ pub fn loop_budget() -> u32 {
     })
 }
 
+/// ECHORA_GUEST_LINES (debugging): the translation marks each guest
+/// instruction with an OpLine (file "step", line its byte offset), which
+/// the simulator uses to name the first instruction giving an invocation a
+/// non-finite float. No cost on the GPU; off by default.
+pub fn guest_lines() -> bool {
+    static LINES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LINES.get_or_init(|| std::env::var_os("ECHORA_GUEST_LINES").is_some())
+}
+
 /// How a block ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum End {
@@ -491,6 +500,8 @@ struct Emitter {
     dominators: Vec<(u32, u32)>,
     /// The OpString naming guest code in exit OpLines.
     guest_file: Option<u32>,
+    /// The OpString naming guest instructions (`guest_lines`).
+    step_file: Option<u32>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
     /// c), and the seconds' indices (emitted with their first).
     hmma_pairs: matrix::Pairs,
@@ -566,6 +577,7 @@ impl Emitter {
             known: BTreeMap::new(),
             dominators: Vec::new(),
             guest_file: None,
+            step_file: None,
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
@@ -1358,6 +1370,17 @@ impl Emitter {
     }
 
     fn instruction(&mut self, index: usize, instruction: &Instruction) -> Result<(), Unsupported> {
+        if guest_lines() {
+            let file = match self.step_file {
+                Some(file) => file,
+                None => {
+                    let file = self.module.debug_string("step");
+                    self.step_file = Some(file);
+                    file
+                }
+            };
+            self.function.emit(op::LINE, &[file, index as u32 * 16, 0]);
+        }
         let op = instruction.op;
         self.uniform = instruction.uniform;
         let result = self.guarded(instruction.guard, |e| e.operation(index, op));
