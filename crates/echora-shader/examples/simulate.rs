@@ -166,6 +166,19 @@ fn main() {
                 start = n;
             }
         }
+        // The uniform buffer words read, as ranges per binding.
+        let mut reads = report.uniform_reads.iter().peekable();
+        while let Some(&(set, binding, first)) = reads.next() {
+            let mut last = first;
+            while let Some(&&(next_set, next_binding, next)) = reads.peek() {
+                if (next_set, next_binding, next) != (set, binding, last + 4) {
+                    break;
+                }
+                last = next;
+                reads.next();
+            }
+            println!("  uniform {set}/{binding} read at {first:#x}..={last:#x}");
+        }
         for note in &report.notes {
             println!("  note: {note}");
         }

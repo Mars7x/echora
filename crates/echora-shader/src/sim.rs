@@ -209,6 +209,9 @@ pub struct Report {
     pub memory: BTreeMap<u64, Vec<u8>>,
     /// The images after the run.
     pub images: HashMap<(u32, u32), Image>,
+    /// The uniform buffer bytes the run read: (descriptor set, binding,
+    /// byte offset), each a 4-byte word.
+    pub uniform_reads: std::collections::BTreeSet<(u32, u32, u32)>,
     /// Where each invocation ended: the index of the instruction (in the
     /// entry function) it returned at, or stopped at on a problem.
     pub ends: Vec<usize>,
@@ -272,6 +275,10 @@ struct Shared {
     problems: Vec<String>,
     notes: Vec<String>,
     loop_limit: u32,
+    /// Uniform buffer words read: (set, binding, byte offset).
+    uniform_reads: std::collections::BTreeSet<(u32, u32, u32)>,
+    /// The uniform buffer variables, with their set and binding.
+    uniforms: HashMap<u32, (u32, u32)>,
 }
 
 impl Shared {
@@ -842,6 +849,21 @@ impl Machine {
             images: inputs.images.clone(),
             problems: Vec::new(),
             notes: Vec::new(),
+            uniform_reads: std::collections::BTreeSet::new(),
+            uniforms: self
+                .globals
+                .iter()
+                .filter(|&&(_, _, class)| class == storage::UNIFORM)
+                .map(|&(variable, _, _)| {
+                    (
+                        variable,
+                        (
+                            self.sets.get(&variable).copied().unwrap_or(0),
+                            self.bindings.get(&variable).copied().unwrap_or(0),
+                        ),
+                    )
+                })
+                .collect(),
             loop_limit: if inputs.loop_limit == 0 {
                 1 << 16
             } else {
@@ -971,6 +993,7 @@ impl Machine {
             notes: shared.notes,
             memory: shared.memory,
             images: shared.images,
+            uniform_reads: shared.uniform_reads,
         }
     }
 
@@ -1164,6 +1187,12 @@ impl Machine {
                 pointee,
             } => {
                 let size = self.size(pointee);
+                if let Some(&(set, binding)) = shared.uniforms.get(&variable) {
+                    // Uniform blocks hold 32-bit scalars: a slot is 4 bytes.
+                    for slot in offset..offset + size {
+                        shared.uniform_reads.insert((set, binding, slot as u32 * 4));
+                    }
+                }
                 let slots = invocation
                     .variables
                     .get(&variable)
@@ -3076,5 +3105,26 @@ mod tests {
         // The subnormal flushes to -0, and -0 + +0 is +0.
         let (registers, _) = run(&[input, 0], &[add(1)]);
         assert_eq!(registers[&2], 0x3c00_0000);
+    }
+
+    #[test]
+    fn the_uniform_words_read_are_reported() {
+        // MOV R0, c[0x3][0x10]
+        let read = word(&[
+            (0, 12, 0xa02),
+            (16, 8, 0),
+            (38, 16, 0x10),
+            (54, 5, 3),
+            (72, 4, 0xf),
+        ]);
+        let code: Vec<_> = [read, EXIT].iter().map(|&raw| decode(raw)).collect();
+        let translated = crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let bank = translated.descriptors.iter().find(|d| d.kind == 0).unwrap();
+        assert_eq!(bank.index, 3);
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            ..Inputs::default()
+        });
+        assert!(report.uniform_reads.contains(&(0, bank.binding, 0x10)));
     }
 }
