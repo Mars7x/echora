@@ -4050,6 +4050,329 @@ mod tests {
     }
 
     #[test]
+    fn sixty_four_bit_arithmetic_carries_like_the_hardware() {
+        /// IADD3 Rd, Pp, Pq, Ra, (-)Rb, Rc with carries in Pr, Ps (.X when
+        /// `extended`; negation bits as given; 15 = !PT).
+        #[allow(clippy::too_many_arguments)]
+        fn iadd3(
+            d: u128,
+            p: u128,
+            q: u128,
+            a: u128,
+            b: u128,
+            negate_b: bool,
+            c: u128,
+            extended: bool,
+            r: u128,
+            s: u128,
+        ) -> u128 {
+            word(&[
+                (0, 12, 0x210),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 8, b),
+                (63, 1, u128::from(negate_b)),
+                (64, 8, c),
+                (74, 1, u128::from(extended)),
+                (77, 4, s),
+                (81, 3, p),
+                (84, 3, q),
+                (87, 4, r),
+            ])
+        }
+        let pair = |r: &HashMap<u8, u32>, n: u8| u64::from(r[&n]) | u64::from(r[&(n + 1)]) << 32;
+        let list = values(16);
+        for window in list.windows(6).step_by(2) {
+            let inputs = [
+                window[0], window[1], window[2], window[3], window[4], window[5],
+            ];
+            let x = u64::from(inputs[0]) | u64::from(inputs[1]) << 32;
+            let y = u64::from(inputs[2]) | u64::from(inputs[3]) << 32;
+            let z = u64::from(inputs[4]) | u64::from(inputs[5]) << 32;
+            // x + y: IADD3 R6, P0, PT, R0, R2, RZ; IADD3.X R7, R1, R3, RZ,
+            // P0, !PT.
+            let (r, _) = run(
+                &inputs,
+                &[
+                    iadd3(6, 0, 7, 0, 2, false, 255, false, 7, 7),
+                    iadd3(7, 7, 7, 1, 3, false, 255, true, 0, 15),
+                ],
+            );
+            assert_eq!(pair(&r, 6), x.wrapping_add(y), "{x:#x} + {y:#x}");
+            // x - y: IADD3 R6, P0, PT, R0, -R2, RZ; IADD3.X R7, R1, ~R3, RZ,
+            // P0, !PT.
+            let (r, _) = run(
+                &inputs,
+                &[
+                    iadd3(6, 0, 7, 0, 2, true, 255, false, 7, 7),
+                    iadd3(7, 7, 7, 1, 3, true, 255, true, 0, 15),
+                ],
+            );
+            assert_eq!(pair(&r, 6), x.wrapping_sub(y), "{x:#x} - {y:#x}");
+            // x + y + z: IADD3 R6, P0, P1, R0, R2, R4; IADD3.X R7, R1, R3,
+            // R5, P0, P1.
+            let (r, _) = run(
+                &inputs,
+                &[
+                    iadd3(6, 0, 1, 0, 2, false, 4, false, 7, 7),
+                    iadd3(7, 7, 7, 1, 3, false, 5, true, 0, 1),
+                ],
+            );
+            assert_eq!(
+                pair(&r, 6),
+                x.wrapping_add(y).wrapping_add(z),
+                "{x:#x} + {y:#x} + {z:#x}"
+            );
+            // y + (x << s): LEA R6, P0, R0, R2, s; LEA.HI.X R7, R0, R3, R1,
+            // s, P0.
+            for shift in [0u128, 1, 3, 17, 31] {
+                let lea = |d: u128, b: u128, c: u128, high: bool, p: u128, carry: u128| {
+                    word(&[
+                        (0, 12, 0x211),
+                        (16, 8, d),
+                        (24, 8, 0),
+                        (32, 8, b),
+                        (64, 8, c),
+                        (74, 1, u128::from(high)),
+                        (75, 5, shift),
+                        (80, 1, u128::from(high)),
+                        (81, 3, p),
+                        (87, 4, carry),
+                    ])
+                };
+                let (r, _) = run(
+                    &inputs,
+                    &[lea(6, 2, 255, false, 0, 7), lea(7, 3, 1, true, 7, 0)],
+                );
+                assert_eq!(
+                    pair(&r, 6),
+                    y.wrapping_add(x << shift),
+                    "{y:#x} + {x:#x} << {shift}"
+                );
+            }
+            // IMAD.WIDE(.U32) R6, R0, R2, R4 and IMAD.HI(.U32) R6, R0, R2,
+            // R4: a * b + R5:R4, the pair or its high word.
+            for signed in [false, true] {
+                let imad = |opcode: u128| {
+                    word(&[
+                        (0, 12, opcode),
+                        (16, 8, 6),
+                        (24, 8, 0),
+                        (32, 8, 2),
+                        (64, 8, 4),
+                        (73, 1, u128::from(signed)),
+                        (81, 3, 7),
+                    ])
+                };
+                let product = if signed {
+                    i64::from(inputs[0] as i32).wrapping_mul(i64::from(inputs[2] as i32)) as u64
+                } else {
+                    u64::from(inputs[0]) * u64::from(inputs[2])
+                };
+                let expected = product.wrapping_add(z);
+                let (r, _) = run(&inputs, &[imad(0x225)]);
+                assert_eq!(pair(&r, 6), expected, "IMAD.WIDE signed {signed}");
+                let (r, _) = run(&inputs, &[imad(0x227)]);
+                assert_eq!(r[&6], (expected >> 32) as u32, "IMAD.HI signed {signed}");
+            }
+        }
+        // Division by 7 as a compiler writes it: q = hi(n * 0x24924925),
+        // then (((n - q) >> 1) + q) >> 2. Here only the high multiply:
+        // IMAD.HI.U32 R1, R0, 0x24924925 (immediate form), RZ.
+        let high = word(&[
+            (0, 12, 0x827),
+            (16, 8, 1),
+            (24, 8, 0),
+            (32, 32, 0x2492_4925),
+            (64, 8, 255),
+            (81, 3, 7),
+        ]);
+        for n in values(32) {
+            let (r, _) = run(&[n], &[high]);
+            let q = r[&1];
+            assert_eq!(q, ((u64::from(n) * 0x2492_4925) >> 32) as u32);
+            assert_eq!((((n - q) >> 1) + q) >> 2, n / 7, "{n} / 7");
+        }
+    }
+
+    #[test]
+    fn votes_and_reductions_count_only_the_lanes_still_running() {
+        // `raw` under guard predicate `guard` (index, plus 8 negated).
+        let guarded = |raw: u128, guard: u128| raw & !(0xf << 12) | guard << 12;
+        let and = |d: u128, a: u128, imm: u32| {
+            word(&[
+                (0, 12, 0x812),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 32, u128::from(imm)),
+                (64, 8, 255),
+                (72, 8, 0xc0),
+                (81, 3, 7),
+            ])
+        };
+        // ISETP.EQ.U32.AND P2, PT, R1, R5, PT
+        let equal = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 1),
+            (32, 8, 5),
+            (76, 3, 2),
+            (81, 3, 2),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        // VOTE.mode Rd, Pp, P0
+        let vote = |d: u128, p: u128, mode: u128| {
+            word(&[
+                (0, 12, 0x806),
+                (16, 8, d),
+                (72, 2, mode),
+                (81, 3, p),
+                (87, 3, 0),
+            ])
+        };
+        // REDUX.op URd, R0; MOV Rd, URd
+        let redux = |d: u128, operation: u128| {
+            word(&[(0, 12, 0x3c4), (16, 6, d), (24, 8, 0), (78, 3, operation)])
+        };
+        let from_uniform =
+            |d: u128, u: u128| word(&[(0, 12, 0xc02), (72, 4, 0xf), (16, 8, d), (32, 6, u)]);
+        let program = [
+            // S2R R0, SR_TID.X; R1 = R0 & 7; @(R1 == 5) EXIT
+            word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]),
+            and(1, 0, 7),
+            equal,
+            guarded(EXIT, 2),
+            // P0 = R0 odd
+            and(2, 0, 1),
+            less(0, 255, 2),
+            // VOTE.ANY R6, P1, P0; @P1 R7 += 1; VOTE.ALL R8, P3, P0;
+            // @P3 R9 += 1
+            vote(6, 1, 1),
+            guarded(add(7, 7, 1), 1),
+            vote(8, 3, 0),
+            guarded(add(9, 9, 1), 3),
+            // REDUX.SUM, .MAX, .MIN, .OR of R0 into R10-R13
+            redux(4, 3),
+            from_uniform(10, 4),
+            redux(5, 5),
+            from_uniform(11, 5),
+            redux(6, 4),
+            from_uniform(12, 6),
+            redux(7, 1),
+            from_uniform(13, 7),
+        ];
+        let (registers, _, problems) = run_group(40, &[0, 0, 0, 0, 0, 5], &program);
+        assert!(problems.is_empty(), "{problems:?}");
+        for (n, r) in registers.iter().enumerate() {
+            if n & 7 == 5 {
+                // Exited before voting.
+                assert_eq!((r[&6], r[&10]), (0, 0), "invocation {n}");
+                continue;
+            }
+            // The invocations of n's subgroup still running.
+            let running: Vec<u32> = (n / 32 * 32..(n / 32 * 32 + 32).min(40))
+                .map(|m| m as u32)
+                .filter(|m| m & 7 != 5)
+                .collect();
+            let ballot = running
+                .iter()
+                .filter(|&&m| m & 1 == 1)
+                .fold(0u32, |mask, &m| mask | 1 << (m % 32));
+            assert_eq!(r[&6], ballot, "invocation {n}: VOTE.ANY's ballot");
+            assert_eq!(r[&8], ballot, "invocation {n}: VOTE.ALL's ballot");
+            assert_eq!(r[&7], u32::from(ballot != 0), "invocation {n}: any");
+            let all = running.iter().all(|m| m & 1 == 1);
+            assert_eq!(r[&9], u32::from(all), "invocation {n}: all");
+            assert_eq!(r[&10], running.iter().sum::<u32>(), "invocation {n}: sum");
+            assert_eq!(
+                r[&11],
+                *running.iter().max().unwrap(),
+                "invocation {n}: max"
+            );
+            assert_eq!(
+                r[&12],
+                *running.iter().min().unwrap(),
+                "invocation {n}: min"
+            );
+            let or = running.iter().fold(0, |x, m| x | m);
+            assert_eq!(r[&13], or, "invocation {n}: or");
+        }
+    }
+
+    #[test]
+    fn global_atomics_return_each_invocation_its_own_old_value() {
+        use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
+        // R4:R5 = guest 0x10_0001_0000 (past 32 bits).
+        // ATOMG.E.ADD.STRONG.GPU R2, [R4.64+0x8], R6 (R6 = 3), then
+        // RED.E.ADD.STRONG.GPU [R4.64+0xc], R6, register address (bit 91
+        // clear: .E is bit 72).
+        let atom = word(&[
+            (0, 12, 0x3a8),
+            (16, 8, 2),
+            (24, 8, 4),
+            (32, 8, 6),
+            (40, 24, 8),
+            (72, 1, 1),
+            (87, 4, 0),
+        ]);
+        let red = word(&[
+            (0, 12, 0x98e),
+            (24, 8, 4),
+            (32, 8, 6),
+            (40, 24, 0xc),
+            (72, 1, 1),
+            (87, 3, 0),
+        ]);
+        let guest = 0x10_0001_0000u64;
+        let program = [
+            mov(4, guest as u32),
+            mov(5, (guest >> 32) as u32),
+            mov(6, 3),
+            atom,
+            red,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([64, 1, 1])).unwrap();
+        // The guest page at device 0x3000_0000; words 2 and 3 start at 100
+        // and 1000.
+        let (table, page) = (0x2000_0000u64, 0x3000_0000u64);
+        let mut words = vec![0u8; 64];
+        words[8..12].copy_from_slice(&100u32.to_le_bytes());
+        words[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        let mut push = vec![0u8; 128];
+        let at = PUSH_PAGE_TABLE_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&((guest >> PAGE_SHIFT) as u32).to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+        let inputs = Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory: BTreeMap::from([(table, page.to_le_bytes().to_vec()), (page, words)]),
+            ..Inputs::default()
+        };
+        let report = Machine::new(&translated.spirv).simulate(&inputs);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(
+            report.unmapped_pages.is_empty(),
+            "{:?}",
+            report.unmapped_pages
+        );
+        let memory = &report.memory[&page];
+        let word = |n: usize| u32::from_le_bytes(memory[4 * n..4 * n + 4].try_into().unwrap());
+        assert_eq!((word(2), word(3)), (100 + 64 * 3, 1000 + 64 * 3));
+        // Each invocation's old value: 100, 103, ..., in some order.
+        let mut olds: Vec<u32> = report
+            .invocations
+            .iter()
+            .map(|variables| variables[&registers[&2]][0] as u32)
+            .collect();
+        olds.sort_unstable();
+        assert_eq!(olds, (0..64).map(|n| 100 + 3 * n).collect::<Vec<u32>>());
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {
