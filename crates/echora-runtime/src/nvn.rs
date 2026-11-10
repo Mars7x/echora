@@ -2904,9 +2904,11 @@ impl Nvn {
                     let texture = self.render.depth;
                     if self.depth_traced(texture) {
                         eprintln!(
-                            "depth trace present {} clear {texture:x} value {depth} write {depth_mask} args {:x?}",
+                            "depth trace present {} clear {texture:x} value {depth} write {depth_mask} args {:x?} scissor {:?} layer {}",
                             self.presented_frames,
-                            &command.x[1..4]
+                            &command.x[1..4],
+                            self.render.scissor,
+                            self.render.depth_layer
                         );
                     }
                     if debug_var_os("ECHORA_GPU_FLOW").is_some() {
