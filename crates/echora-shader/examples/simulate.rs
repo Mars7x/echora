@@ -261,24 +261,26 @@ fn main() {
                 report.barriers.len()
             );
         }
-        // Each invocation's first non-finite float result, as runs of
-        // invocations (guest offsets need ECHORA_GUEST_LINES at
+        // Each invocation's first NaN and first infinite float result, as
+        // runs of invocations (guest offsets need ECHORA_GUEST_LINES at
         // translation).
-        let mut start = 0;
-        for n in 1..=report.nonfinite.len() {
-            if n == report.nonfinite.len() || report.nonfinite[n] != report.nonfinite[start] {
-                if let Some((step, opcode, at)) = report.nonfinite[start] {
-                    let guest = step.map_or_else(
-                        || "an unmarked guest instruction".to_string(),
-                        |offset| format!("guest {offset:#06x}"),
-                    );
-                    println!(
-                        "  invocations {start}-{} first made a non-finite float at {guest} \
-                         (instruction {at}, SPIR-V opcode {opcode})",
-                        n - 1
-                    );
+        for (what, sites) in [("NaN", &report.first_nan), ("Inf", &report.first_infinite)] {
+            let mut start = 0;
+            for n in 1..=sites.len() {
+                if n == sites.len() || sites[n] != sites[start] {
+                    if let Some((step, opcode, at)) = sites[start] {
+                        let guest = step.map_or_else(
+                            || "an unmarked guest instruction".to_string(),
+                            |offset| format!("guest {offset:#06x}"),
+                        );
+                        println!(
+                            "  invocations {start}-{} first made a {what} at {guest} \
+                             (instruction {at}, SPIR-V opcode {opcode})",
+                            n - 1
+                        );
+                    }
+                    start = n;
                 }
-                start = n;
             }
         }
         if !quiet {

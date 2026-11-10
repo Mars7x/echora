@@ -250,11 +250,14 @@ pub struct Report {
     /// Each invocation's guest EXIT (byte offset), the first it took; none
     /// when it ran off the end or stopped on a problem.
     pub exits: Vec<Option<u32>>,
-    /// Each invocation's first non-finite float result: the guest
-    /// instruction (byte offset) it came from, when the translation marks
-    /// them (ECHORA_GUEST_LINES), the SPIR-V opcode and the instruction's
-    /// index in the entry function.
-    pub nonfinite: Vec<Option<(Option<u32>, u16, usize)>>,
+    /// Each invocation's first NaN float result: the guest instruction
+    /// (byte offset) it came from, when the translation marks them
+    /// (ECHORA_GUEST_LINES), the SPIR-V opcode and the instruction's index
+    /// in the entry function.
+    pub first_nan: Vec<Option<(Option<u32>, u16, usize)>>,
+    /// Likewise its first infinite one (often legitimate: a reciprocal of
+    /// zero later selected away or multiplied by zero with .DNZ).
+    pub first_infinite: Vec<Option<(Option<u32>, u16, usize)>>,
 }
 
 /// A loaded module.
@@ -300,8 +303,10 @@ struct Invocation {
     exit: Option<u32>,
     /// The guest instruction running (its line), when marked.
     step: Option<u32>,
-    /// The first non-finite float result (see `Report::nonfinite`).
-    nonfinite: Option<(Option<u32>, u16, usize)>,
+    /// The first NaN and infinite float results (see
+    /// `Report::first_nan`).
+    first_nan: Option<(Option<u32>, u16, usize)>,
+    first_infinite: Option<(Option<u32>, u16, usize)>,
     values: HashMap<u32, Value>,
     value_types: HashMap<u32, u32>,
     pointers: HashMap<u32, Pointer>,
@@ -1152,14 +1157,19 @@ impl Machine {
             .iter()
             .map(|invocation| invocation.exit)
             .collect();
-        let nonfinite = invocations
+        let first_nan = invocations
             .iter()
-            .map(|invocation| invocation.nonfinite)
+            .map(|invocation| invocation.first_nan)
+            .collect();
+        let first_infinite = invocations
+            .iter()
+            .map(|invocation| invocation.first_infinite)
             .collect();
         Report {
             ends,
             exits,
-            nonfinite,
+            first_nan,
+            first_infinite,
             writes: shared.writes,
             invocations: invocations
                 .into_iter()
@@ -1216,7 +1226,8 @@ impl Machine {
             current: 0,
             exit: None,
             step: None,
-            nonfinite: None,
+            first_nan: None,
+            first_infinite: None,
             done: false,
             steps: 0,
         }
@@ -2182,25 +2193,37 @@ impl Machine {
             } else {
                 invocation.tainted.remove(&id);
             }
-            if invocation.nonfinite.is_none() && self.nonfinite(ty, &result) {
-                invocation.nonfinite = Some((invocation.step, opcode, invocation.current));
+            let site = Some((invocation.step, opcode, invocation.current));
+            let (nan, infinite) = self.nonfinite(ty, &result);
+            if nan && invocation.first_nan.is_none() {
+                invocation.first_nan = site;
+            }
+            if infinite && invocation.first_infinite.is_none() {
+                invocation.first_infinite = site;
             }
             invocation.values.insert(id, result);
             invocation.value_types.insert(id, ty);
         }
     }
 
-    /// Whether a float result holds an Inf or NaN.
-    fn nonfinite(&self, ty: u32, value: &Value) -> bool {
+    /// Whether a float result holds a NaN, and whether an Inf.
+    fn nonfinite(&self, ty: u32, value: &Value) -> (bool, bool) {
         let (exponent, shift) = match self.scalar(ty) {
             Ty::Float { width: 16 } => (0x1f, 10),
             Ty::Float { width: 32 } => (0xff, 23),
             Ty::Float { width: 64 } => (0x7ff, 52),
-            _ => return false,
+            _ => return (false, false),
         };
-        value
-            .iter()
-            .any(|&component| component >> shift & exponent == exponent)
+        let mantissa = (1u64 << shift) - 1;
+        let special = |component: u64| component >> shift & exponent == exponent;
+        (
+            value
+                .iter()
+                .any(|&component| special(component) && component & mantissa != 0),
+            value
+                .iter()
+                .any(|&component| special(component) && component & mantissa == 0),
+        )
     }
 
     /// The bits of `value` (of type `from`) as type `to`.
@@ -4671,7 +4694,7 @@ mod tests {
             workgroup_count: [1, 1, 1],
             ..Inputs::default()
         });
-        assert_eq!(report.nonfinite, vec![None]);
+        assert_eq!(report.first_nan, vec![None]);
     }
 
     #[test]

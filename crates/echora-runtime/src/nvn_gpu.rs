@@ -4405,6 +4405,7 @@ impl Nvn {
         // others still written.
         let mut failed = Vec::new();
         for (binding, source) in read {
+            eprintln!("dispatch dump {key:016x}: reading binding {binding} from {source:?}");
             let mut one = || -> Result<(), String> {
                 let texels = match source {
                     TextureSource::Upload { key, .. } => {
