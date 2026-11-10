@@ -4805,7 +4805,24 @@ impl Nvn {
                             .render
                             .state
                             .get(&format!("BindUniformBuffer/{nvn}/{slot}"))
-                            .ok_or_else(|| format!("uniform buffer {nvn}/{slot} is not bound"))?;
+                            .ok_or_else(|| {
+                                // The slots that are bound, by stage, and
+                                // the program's stages (which bank it reads).
+                                let mut bound: Vec<&str> = self
+                                    .render
+                                    .state
+                                    .keys()
+                                    .filter(|key| key.starts_with("BindUniformBuffer/"))
+                                    .map(String::as_str)
+                                    .collect();
+                                bound.sort_unstable();
+                                format!(
+                                    "uniform buffer {nvn}/{slot} is not bound (bound [{}], {:?} stage {:016x})",
+                                    bound.join(" "),
+                                    stage.stage,
+                                    keys_for_note.get(index).copied().unwrap_or(0)
+                                )
+                            })?;
                         let used = u64::from(stage.cbuf_used_sizes[descriptor.index as usize]);
                         let size = bind.x[4].min(used.max(16)).min(64 << 10);
                         let address = bind.x[3];
