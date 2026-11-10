@@ -4028,6 +4028,57 @@ impl Nvn {
                         .resident_address(base)
                         .map(|address| address + offset)
                 };
+                // A chunk no single span shares (a page unmapped, or the
+                // backing not contiguous): the runs of pages that are.
+                if address.is_none() && host_visible {
+                    let mut runs: Vec<(u64, u64, i32, u64)> = Vec::new();
+                    let mut page = 0;
+                    while page * PAGE_SIZE < length {
+                        let at = offset + page * PAGE_SIZE;
+                        if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE)
+                        {
+                            match runs.last_mut() {
+                                Some(run)
+                                    if run.2 == file
+                                        && run.0 + run.1 == at
+                                        && run.3 + run.1 == file_at =>
+                                {
+                                    run.1 += PAGE_SIZE;
+                                }
+                                _ => runs.push((at, PAGE_SIZE, file, file_at)),
+                            }
+                        }
+                        page += 1;
+                    }
+                    let backend = self.gpu.as_mut().unwrap();
+                    if runs.is_empty() {
+                        backend.note(format!(
+                            "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped (no shared span)"
+                        ));
+                    } else {
+                        backend.stat("stat: page table chunks mapped in runs", 1);
+                    }
+                    for (at, run_length, file, file_at) in runs {
+                        let mapped = self
+                            .gpu
+                            .as_mut()
+                            .unwrap()
+                            .renderer
+                            .address_span(file, file_at, run_length)?;
+                        if let Some(mapped) = mapped {
+                            let first_page = (gpu + at) >> PAGE_SHIFT;
+                            for page in 0..run_length / PAGE_SIZE {
+                                if let Some(entry) =
+                                    entries.get_mut((first_page + page - first) as usize)
+                                {
+                                    *entry = mapped + page * PAGE_SIZE;
+                                }
+                            }
+                        }
+                    }
+                    offset += length;
+                    continue;
+                }
                 if address.is_none() {
                     let note = format!(
                         "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped{}",
