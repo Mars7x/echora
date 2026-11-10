@@ -151,6 +151,9 @@ pub struct Inputs {
     /// Address ranges (device addresses, or guest addresses through the
     /// page table) whose stores and atomics `Report::writes` lists.
     pub watch: Vec<std::ops::Range<u64>>,
+    /// An invocation (local index) and a variable (a register's id) whose
+    /// every store `Report::traced` lists.
+    pub trace: Option<(usize, u32)>,
 }
 
 /// A store or atomic into a watched range.
@@ -258,6 +261,9 @@ pub struct Report {
     /// Likewise its first infinite one (often legitimate: a reciprocal of
     /// zero later selected away or multiplied by zero with .DNZ).
     pub first_infinite: Vec<Option<(Option<u32>, u16, usize)>>,
+    /// The stores `Inputs::trace` names, in order: the guest instruction
+    /// (byte offset, when marked) and the value stored.
+    pub traced: Vec<(Option<u32>, Value)>,
 }
 
 /// A loaded module.
@@ -347,6 +353,8 @@ struct Shared {
     page_table: Option<(u64, u64, u64)>,
     unmapped_pages: BTreeMap<u64, u32>,
     watch: Vec<std::ops::Range<u64>>,
+    trace: Option<(usize, u32)>,
+    traced: Vec<(Option<u32>, Value)>,
     /// Guest pages by the device page they map to (when watching).
     guest_pages: HashMap<u64, u64>,
     writes: Vec<Write>,
@@ -997,6 +1005,8 @@ impl Machine {
             },
             unmapped_pages: BTreeMap::new(),
             watch: inputs.watch.clone(),
+            trace: inputs.trace,
+            traced: Vec::new(),
             guest_pages: HashMap::new(),
             writes: Vec::new(),
             uniforms: self
@@ -1171,6 +1181,7 @@ impl Machine {
             first_nan,
             first_infinite,
             writes: shared.writes,
+            traced: shared.traced,
             invocations: invocations
                 .into_iter()
                 .map(|invocation| invocation.variables)
@@ -1916,6 +1927,9 @@ impl Machine {
                     let pointer = invocation.pointers[&operands[0]];
                     let value = invocation.values[&operands[1]].clone();
                     if let Pointer::Logical { variable, .. } = pointer {
+                        if shared.trace == Some((invocation.number, variable)) {
+                            shared.traced.push((invocation.step, value.clone()));
+                        }
                         if invocation.tainted.contains(&operands[1]) {
                             invocation.tainted_variables.insert(variable);
                         } else if invocation.variables.get(&variable).map(Vec::len)
@@ -1943,9 +1957,16 @@ impl Machine {
                                         *slot = texel.get(n).copied().unwrap_or(0) as u32;
                                     }
                                 }
-                                None => shared.problem(format!(
-                                    "image write at ({x}, {y}, {z}) outside the image at {key:?}"
-                                )),
+                                None => {
+                                    let guest =
+                                        invocation.step.map_or_else(String::new, |offset| {
+                                            format!(" (guest {offset:#06x})")
+                                        });
+                                    shared.problem(format!(
+                                        "image write at ({x}, {y}, {z}) outside the image at \
+                                         {key:?}{guest}"
+                                    ))
+                                }
                             }
                         }
                         _ => shared.note("writes to images without dumped data are dropped"),
@@ -3714,8 +3735,9 @@ mod tests {
                     let variables = &report.invocations[0];
                     let register = |n: u8| registers.get(&n).map(|v| variables[v][0] as u32);
                     // Texel (2, 1): the components in mask order, packed
-                    // in pairs when half; the third and fourth words go to
-                    // R8 when it is a destination.
+                    // in pairs when half; components 2-3 (the third and
+                    // fourth words, or the second packed word) go to R8 when
+                    // it is a destination.
                     let mut words: Vec<u32> = (0..4u32)
                         .filter(|c| mask >> c & 1 != 0)
                         .map(|c| component(2, 1, c).to_bits())
@@ -3729,11 +3751,12 @@ mod tests {
                             })
                             .collect();
                     }
+                    let per_register = if half { 1 } else { 2 };
                     for (n, &expected) in words.iter().enumerate() {
-                        let target = if d2 == 255 || n < 2 {
+                        let target = if d2 == 255 || n < per_register {
                             4 + n as u8
                         } else {
-                            d2 + n as u8 - 2
+                            d2 + (n - per_register) as u8
                         };
                         assert_eq!(
                             register(target),

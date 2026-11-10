@@ -174,6 +174,14 @@ fn main() {
             inputs.watch.push(range);
         }
     }
+    // --trace=N,NAME: every store to register NAME by invocation N.
+    inputs.trace = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--trace="))
+        .find_map(|spec| {
+            let (number, name) = spec.split_once(',')?;
+            Some((number.parse().ok()?, *machine.names.get(name)?))
+        });
     let independent = arguments.iter().any(|argument| argument == "--independent");
     let quiet = arguments.iter().any(|argument| argument == "--quiet");
     // Invocations whose final registers to print.
@@ -282,6 +290,12 @@ fn main() {
                     start = n;
                 }
             }
+        }
+        for (step, value) in &report.traced {
+            let guest =
+                step.map_or_else(|| "unmarked".to_string(), |offset| format!("{offset:#06x}"));
+            let words: Vec<String> = value.iter().map(|word| format!("{word:#x}")).collect();
+            println!("  traced store at guest {guest}: {}", words.join(" "));
         }
         if !quiet {
             // Where invocations ended, as runs of invocations.

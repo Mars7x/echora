@@ -473,14 +473,17 @@ impl Emitter {
         } else {
             components
         };
+        // Components 0-1 go to Rd and 2-3 to Rd2 (else the registers after
+        // Rd's): as words, or as one packed word each with halves.
+        let per_register = if texture.half { 1 } else { 2 };
         for (n, value) in components.into_iter().enumerate() {
-            let target = if texture.d2.0 == 255 || n < 2 {
+            let target = if texture.d2.0 == 255 || n < per_register {
                 if texture.d.0 == 255 {
                     continue;
                 }
                 texture.d.0.saturating_add(n as u8)
             } else {
-                texture.d2.0.saturating_add(n as u8 - 2)
+                texture.d2.0.saturating_add((n - per_register) as u8)
             };
             self.write_register(target, value);
         }
