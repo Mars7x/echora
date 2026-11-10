@@ -601,6 +601,13 @@ impl Emitter {
                     }
                     None => self.constant(0),
                 };
+                // A level past the image's last is undefined to query: the
+                // last one instead.
+                let levels = self.value(op::IMAGE_QUERY_LEVELS, self.u32, &[image]);
+                let one = self.constant(1);
+                let levels = self.glsl(self.u32, glsl::U_MAX, &[levels, one]);
+                let last = self.value(op::I_SUB, self.u32, &[levels, one]);
+                let level = self.glsl(self.u32, glsl::U_MIN, &[level, last]);
                 let size_type = self.module.ty(Type::Vector {
                     component: self.u32,
                     count: (spatial + usize::from(view.arrayed)) as u32,
@@ -616,6 +623,9 @@ impl Emitter {
                     } else {
                         self.value(op::COMPOSITE_EXTRACT, self.u32, &[size, n as u32])
                     };
+                    // At least a texel (an unbound texture's size is 0, and
+                    // 0 / 0 would make the coordinate NaN).
+                    let extent = self.glsl(self.u32, glsl::U_MAX, &[extent, one]);
                     let extent = self.value(op::CONVERT_U_TO_F, self.f32, &[extent]);
                     let offset = self.value(op::CONVERT_S_TO_F, self.f32, &[offset]);
                     let step = self.value(op::F_DIV, self.f32, &[offset, extent]);
