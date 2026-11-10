@@ -229,7 +229,10 @@ block of eight k adds its products and the accumulator in one step, every
 addend aligned to the largest exponent and truncated to 24 bits below its
 leading bit, the exact sum normalised once by truncation (a half result's
 last block rounded to the nearest half instead, through a round-to-odd
-32-bit value). It is done in integers from the addends' bits. The
+32-bit value). It is done in integers from the addends' bits, in one
+loop per multiply over its outputs and blocks (operands picked from the
+shuffled registers), so the long block sum is written once per HMMA (a
+program of about 1,900 HMMAs was some 24 million words unrolled). The
 papers do not settle the sign-magnitude truncation, the chaining of the
 two blocks of HMMA.16816 through a 32-bit value, the results past the
 32-bit range (the largest finite value) and below it (truncated

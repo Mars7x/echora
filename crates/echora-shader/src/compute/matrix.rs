@@ -661,9 +661,10 @@ impl Emitter {
 
     /// One tensor-core step (see the module notes): `accumulator` plus
     /// `products`, aligned to the largest exponent and truncated, summed
-    /// exactly and normalised by truncation, or with `odd` by rounding to
-    /// odd (a half rounded from it is then correctly rounded).
-    fn block_sum(&mut self, accumulator: u32, products: &[u32], odd: bool) -> u32 {
+    /// exactly and normalised by truncation, or where `odd` (a bool value)
+    /// holds by rounding to odd (a half rounded from it is then correctly
+    /// rounded).
+    fn block_sum(&mut self, accumulator: u32, products: &[u32], odd: u32) -> u32 {
         let u32_ = self.u32;
         let c = |e: &mut Self, value: u32| e.constant(value);
         let (zero, one, twenty_three, thirty_one, thirty_two) = (
@@ -752,7 +753,7 @@ impl Emitter {
         let left = self.glsl(u32_, glsl::U_MIN, &[left, thirty_one]);
         let raised = self.value(op::SHIFT_LEFT_LOGICAL, u32_, &[magnitude, left]);
         let mut significand = self.value(op::SELECT, u32_, &[right, kept, raised]);
-        if odd {
+        {
             // Round to odd: any dropped bit sets the lowest kept one.
             let back = self.glsl(u32_, glsl::U_MIN, &[shift, thirty_one]);
             let restored = self.value(op::SHIFT_LEFT_LOGICAL, u32_, &[kept, back]);
@@ -765,6 +766,7 @@ impl Emitter {
             let gone = self.value(op::LOGICAL_AND, self.bool, &[gone, nonzero]);
             let inexact = self.value(op::LOGICAL_OR, self.bool, &[lost, gone]);
             let inexact = self.value(op::LOGICAL_AND, self.bool, &[right, inexact]);
+            let inexact = self.value(op::LOGICAL_AND, self.bool, &[odd, inexact]);
             let sticky = self.value(op::SELECT, u32_, &[inexact, one, zero]);
             significand = self.value(op::BITWISE_OR, u32_, &[significand, sticky]);
         }
@@ -792,6 +794,147 @@ impl Emitter {
         }
         let special = special.expect("an accumulator");
         self.value(op::SELECT, self.f32, &[special, plain, result])
+    }
+
+    /// The exact path's sums: each HMMA's four outputs, each block of eight
+    /// k in turn (a `block_sum`), in one loop over (HMMA, output, block)
+    /// whose body picks its operands from the shuffled `rows` and
+    /// `columns` (by block and source lane), so the long block sum is
+    /// written once per multiply instead of once per output and block.
+    fn exact_sums(
+        &mut self,
+        rows: &[[(u32, u32); 4]],
+        columns: &[Vec<[(u32, u32); 4]>],
+        accumulators: &mut [Vec<u32>],
+        single: bool,
+    ) {
+        let u32_ = self.u32;
+        let blocks = rows.len() as u32;
+        let outputs = 4 * columns.len() as u32;
+        let c = |e: &mut Self, value: u32| e.constant(value);
+        // The accumulators, by HMMA and output.
+        let length = c(self, outputs);
+        let array = self.module.ty(Type::Array {
+            element: self.f32,
+            length,
+        });
+        let array_pointer = self.module.pointer(storage::FUNCTION, array);
+        let sums = self
+            .function
+            .variable(&mut self.module, array_pointer, None);
+        let element_pointer = self.module.pointer(storage::FUNCTION, self.f32);
+        for (n, values) in accumulators.iter().enumerate() {
+            for (output, &value) in values.iter().enumerate() {
+                let at = c(self, (4 * n + output) as u32);
+                let pointer = self.value(op::ACCESS_CHAIN, element_pointer, &[sums, at]);
+                self.function.emit(op::STORE, &[pointer, value]);
+            }
+        }
+        let zero = c(self, 0);
+        let counter = self
+            .function
+            .variable(&mut self.module, self.u32_ptr, Some(zero));
+        let before = self.function.block();
+        let (header, check, body, continuing, merge) = (
+            self.module.id(),
+            self.module.id(),
+            self.module.id(),
+            self.module.id(),
+            self.module.id(),
+        );
+        self.function.emit(op::BRANCH, &[header]);
+        self.function.label(header);
+        self.function
+            .emit(op::LOOP_MERGE, &[merge, continuing, crate::spirv::NONE]);
+        self.function.emit(op::BRANCH, &[check]);
+        self.function.label(check);
+        let step = self.value(op::LOAD, u32_, &[counter]);
+        let total = c(self, outputs * blocks);
+        let going = self.value(op::U_LESS_THAN, self.bool, &[step, total]);
+        self.function
+            .emit(op::BRANCH_CONDITIONAL, &[going, body, merge]);
+        self.function.label(body);
+        // step = (4n + output) * blocks + block, blocks 1 or 2.
+        let (low_mask, high_shift) = (c(self, blocks - 1), c(self, blocks - 1));
+        let block = self.value(op::BITWISE_AND, u32_, &[step, low_mask]);
+        let index = self.value(op::SHIFT_RIGHT_LOGICAL, u32_, &[step, high_shift]);
+        let (one, two, three) = (c(self, 1), c(self, 2), c(self, 3));
+        let output = self.value(op::BITWISE_AND, u32_, &[index, three]);
+        let high_row = self.value(op::U_GREATER_THAN_EQUAL, self.bool, &[output, two]);
+        let odd_column = self.value(op::BITWISE_AND, u32_, &[output, one]);
+        let odd_column = self.value(op::I_NOT_EQUAL, self.bool, &[odd_column, zero]);
+        let four = c(self, 4);
+        let second_hmma = self.value(op::U_GREATER_THAN_EQUAL, self.bool, &[index, four]);
+        let upper = self.value(op::I_EQUAL, self.bool, &[block, one]);
+        let pick = |e: &mut Self, condition: u32, yes: u32, no: u32| {
+            if yes == no {
+                no
+            } else {
+                e.value(op::SELECT, u32_, &[condition, yes, no])
+            }
+        };
+        let mut products = Vec::with_capacity(8);
+        for source in 0..4 {
+            // By block (upper half of k), then row or column.
+            let by_block = |e: &mut Self, of: &dyn Fn(usize) -> u32| {
+                if rows.len() == 2 {
+                    pick(e, upper, of(1), of(0))
+                } else {
+                    of(0)
+                }
+            };
+            let low = by_block(self, &|u| rows[u][source].0);
+            let high = by_block(self, &|u| rows[u][source].1);
+            let row = pick(self, high_row, high, low);
+            let column_of = |e: &mut Self, which: usize| {
+                let first = by_block(e, &|u| {
+                    let (zero, one) = columns[0][u][source];
+                    if which == 0 { zero } else { one }
+                });
+                if columns.len() == 2 {
+                    let second = by_block(e, &|u| {
+                        let (zero, one) = columns[1][u][source];
+                        if which == 0 { zero } else { one }
+                    });
+                    pick(e, second_hmma, second, first)
+                } else {
+                    first
+                }
+            };
+            let column_0 = column_of(self, 0);
+            let column_1 = column_of(self, 1);
+            let column = pick(self, odd_column, column_1, column_0);
+            let [x0, x1] = self.halves(row);
+            let [y0, y1] = self.halves(column);
+            for (x, y) in [(x0, y0), (x1, y1)] {
+                products.push(self.exact(op::F_MUL, &[x, y]));
+            }
+        }
+        let pointer = self.value(op::ACCESS_CHAIN, element_pointer, &[sums, index]);
+        let accumulator = self.value(op::LOAD, self.f32, &[pointer]);
+        // A half result's last block rounds to odd.
+        let odd = if single {
+            self.module.bool_constant(false)
+        } else {
+            let last = c(self, blocks - 1);
+            self.value(op::I_EQUAL, self.bool, &[block, last])
+        };
+        let sum = self.block_sum(accumulator, &products, odd);
+        self.function.emit(op::STORE, &[pointer, sum]);
+        self.function.emit(op::BRANCH, &[continuing]);
+        self.function.label(continuing);
+        let next = self.value(op::I_ADD, u32_, &[step, one]);
+        self.function.emit(op::STORE, &[counter, next]);
+        self.function.emit(op::BRANCH, &[header]);
+        self.function.label(merge);
+        self.carry_known(before);
+        for (n, values) in accumulators.iter_mut().enumerate() {
+            for (output, value) in values.iter_mut().enumerate() {
+                let at = c(self, (4 * n + output) as u32);
+                let pointer = self.value(op::ACCESS_CHAIN, element_pointer, &[sums, at]);
+                *value = self.value(op::LOAD, self.f32, &[pointer]);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -880,18 +1023,36 @@ impl Emitter {
         };
         // Each output's products, in k order (for the exact sums).
         let exact = self.layout.matrices == super::MatrixPath::Exact;
-        let mut products: Vec<[Vec<u32>; 4]> = vec![Default::default(); halves.len()];
+        // The exact path's operands: A's rows (g, g + 8) and each HMMA's B
+        // columns (2t, 2t + 1), by upper half of k and source lane.
+        let mut rows: Vec<[(u32, u32); 4]> = Vec::new();
+        let mut columns: Vec<Vec<[(u32, u32); 4]>> = vec![Vec::new(); halves.len()];
         for pair in 0..if k16 { 8u32 } else { 4 } {
             // k = 8 * upper + 2 * source + h, h the half.
-            let (source, upper) = (pair % 4, (pair / 4) as usize);
-            let source = self.constant(source);
+            let (source_index, upper) = ((pair % 4) as usize, (pair / 4) as usize);
+            let source = self.constant(pair % 4);
             let from_quad = self.value(op::I_ADD, self.u32, &[quad, source]);
             let row_low = shuffle(self, a_registers[2 * upper], from_quad);
             let row_high = shuffle(self, a_registers[2 * upper + 1], from_quad);
-            let [a_g0, a_g1] = self.halves(row_low);
-            let [a_h0, a_h1] = self.halves(row_high);
             let first = self.value(op::I_ADD, self.u32, &[column_quad, source]);
             let second = self.value(op::I_ADD, self.u32, &[first, four]);
+            if exact {
+                if source_index == 0 {
+                    rows.push([(0, 0); 4]);
+                    for list in &mut columns {
+                        list.push([(0, 0); 4]);
+                    }
+                }
+                rows[upper][source_index] = (row_low, row_high);
+                for (n, b_registers) in b_registers.iter().enumerate() {
+                    let column_0 = shuffle(self, b_registers[upper], first);
+                    let column_1 = shuffle(self, b_registers[upper], second);
+                    columns[n][upper][source_index] = (column_0, column_1);
+                }
+                continue;
+            }
+            let [a_g0, a_g1] = self.halves(row_low);
+            let [a_h0, a_h1] = self.halves(row_high);
             for (n, b_registers) in b_registers.iter().enumerate() {
                 let column_0 = shuffle(self, b_registers[upper], first);
                 let column_1 = shuffle(self, b_registers[upper], second);
@@ -906,31 +1067,20 @@ impl Emitter {
                 ];
                 for (output, x0, y0, x1, y1) in terms {
                     for (x, y) in [(x0, y0), (x1, y1)] {
-                        if exact {
-                            let product = self.exact(op::F_MUL, &[x, y]);
-                            products[n][output].push(product);
-                        } else {
-                            // A product of two halves is exact in 32 bits,
-                            // so a fused multiply-add rounds as the add after
-                            // it would (fused or not, the result is the same).
-                            accumulators[n][output] =
-                                self.glsl(self.f32, glsl::FMA, &[x, y, accumulators[n][output]]);
-                        }
+                        // A product of two halves is exact in 32 bits, so a
+                        // fused multiply-add rounds as the add after it would
+                        // (fused or not, the result is the same).
+                        accumulators[n][output] =
+                            self.glsl(self.f32, glsl::FMA, &[x, y, accumulators[n][output]]);
                     }
                 }
             }
         }
+        if exact {
+            self.exact_sums(&rows, &columns, &mut accumulators, single);
+        }
         for (n, &(d, _, _)) in halves.iter().enumerate() {
-            let mut accumulator = accumulators[n].clone();
-            if exact {
-                for (output, products) in products[n].iter().enumerate() {
-                    let blocks: Vec<&[u32]> = products.chunks(8).collect();
-                    for (m, block) in blocks.iter().enumerate() {
-                        let odd = !single && m + 1 == blocks.len();
-                        accumulator[output] = self.block_sum(accumulator[output], block, odd);
-                    }
-                }
-            }
+            let accumulator = accumulators[n].clone();
             if d == 255 {
                 continue;
             }
