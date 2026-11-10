@@ -40,6 +40,10 @@ use crate::spirv::{Type, capability, glsl, op, storage};
 /// Elements of a 16x16 matrix.
 const MATRIX_ELEMENTS: u32 = 256;
 
+/// Words of packed-half scratch per warp (coop32): A, B and a half C, 128
+/// words each.
+const PACKED_PER_WARP: u32 = 3 * 128;
+
 /// The lane's scratch indices (see `matrix_lane`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatrixLane {
@@ -47,6 +51,11 @@ enum MatrixLane {
     RowMajor,
     Transposed,
     ZeroRow,
+    /// Packed scratch (coop32): the warp's base W, W + 8g + t, and W + 2
+    /// lane.
+    PackedWarp,
+    Packed,
+    PackedPairs,
 }
 
 /// SPIR-V's SubgroupId built-in.
@@ -171,7 +180,13 @@ impl Emitter {
         }
         let threads: u32 = self.layout.workgroup.iter().product();
         let warps = threads.div_ceil(32).max(1);
-        let length = self.constant(warps * MATRIX_ELEMENTS * 3);
+        // Packed pairs of halves (coop32) take a word per two elements.
+        let per_warp = if component == self.u32 {
+            PACKED_PER_WARP
+        } else {
+            MATRIX_ELEMENTS * 3
+        };
+        let length = self.constant(warps * per_warp);
         let array = self.module.ty(Type::Array {
             element: component,
             length,
@@ -207,13 +222,31 @@ impl Emitter {
         if let Some(value) = self.known(key) {
             return Ok(value);
         }
-        let value = if which == MatrixLane::Warp {
+        let value = if matches!(which, MatrixLane::Warp | MatrixLane::PackedWarp) {
             // By subgroup id (Vulkan does not promise that invocation
             // index / 32 names the subgroup).
             self.module.capability(capability::GROUP_NON_UNIFORM);
             let warp = self.scalar_builtin(BUILTIN_SUBGROUP_ID);
-            let size = self.constant(MATRIX_ELEMENTS * 3);
+            let size = self.constant(if which == MatrixLane::Warp {
+                MATRIX_ELEMENTS * 3
+            } else {
+                PACKED_PER_WARP
+            });
             self.value(op::I_MUL, self.u32, &[warp, size])
+        } else if matches!(which, MatrixLane::Packed | MatrixLane::PackedPairs) {
+            let base = self.matrix_lane(index, MatrixLane::PackedWarp)?;
+            let lane = self.special_register(index, 0)?;
+            let at = if which == MatrixLane::Packed {
+                let (two, three, eight) = (self.constant(2), self.constant(3), self.constant(8));
+                let group = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
+                let thread = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
+                let rows = self.value(op::I_MUL, self.u32, &[group, eight]);
+                self.value(op::I_ADD, self.u32, &[rows, thread])
+            } else {
+                let two = self.constant(2);
+                self.value(op::I_MUL, self.u32, &[lane, two])
+            };
+            self.value(op::I_ADD, self.u32, &[at, base])
         } else {
             let base = self.matrix_lane(index, MatrixLane::Warp)?;
             let lane = self.special_register(index, 0)?;
@@ -430,6 +463,179 @@ impl Emitter {
         Ok(())
     }
 
+    /// As `cooperative_multiply`, with the fragments' registers stored
+    /// whole (coop32): a register holds two halves adjacent in A's rows
+    /// and in B's columns, so A is stored row-major and B column-major, 8
+    /// words a line, and loaded as half matrices through word pointers
+    /// (the stride counts words). A half C and D go the same way as A; a
+    /// 32-bit C and D through the float scratch as before.
+    fn cooperative_multiply_packed(
+        &mut self,
+        index: usize,
+        a: u8,
+        halves_in: &[(u8, u8, u8)],
+        k16: bool,
+        single: bool,
+    ) -> Result<(), Unsupported> {
+        self.module.capability(capability::COOPERATIVE_MATRIX);
+        self.module.extension("SPV_KHR_cooperative_matrix");
+        self.module.capability(capability::FLOAT16);
+        let f16 = self.module.ty(Type::Float { width: 16 });
+        let words = self.matrix_scratch(self.u32);
+        let base = self.matrix_lane(index, MatrixLane::PackedWarp)?;
+        let lane = self.matrix_lane(index, MatrixLane::Packed)?;
+        let (wide, wide_base, rows) = if single {
+            (
+                self.matrix_scratch(self.f32),
+                self.matrix_lane(index, MatrixLane::Warp)?,
+                self.matrix_lane(index, MatrixLane::RowMajor)?,
+            )
+        } else {
+            (words, base, lane)
+        };
+        // The previous multiply's lanes may still be reading D: wait
+        // before writing the fragments.
+        self.subgroup_barrier();
+        let next = |base: u8, n: u8| {
+            if base == 255 {
+                255
+            } else {
+                base.saturating_add(n)
+            }
+        };
+        let zero = self.constant(0);
+        // A: register j at row g + 8 (j & 1), word t + 4 (j >> 1); with K =
+        // 8 (HMMA.1688), words 4-7 of each row are zero.
+        for j in 0..4u32 {
+            let value = if k16 || j < 2 {
+                self.register_or_zero(next(a, j as u8))
+            } else {
+                zero
+            };
+            let pointer = self.scratch_element(words, self.u32, lane, 64 * (j & 1) + 4 * (j >> 1));
+            self.function.emit(op::STORE, &[pointer, value]);
+        }
+        // B (column-major from word 128): register j of HMMA n at column g
+        // + 8 n, word t + 4 j; with one HMMA, columns 8-15 (words 64-127)
+        // are zero, two words a lane.
+        for (n, &(_, b, _)) in halves_in.iter().enumerate() {
+            for j in 0..2u32 {
+                let value = if k16 || j == 0 {
+                    self.register_or_zero(next(b, j as u8))
+                } else {
+                    zero
+                };
+                let pointer =
+                    self.scratch_element(words, self.u32, lane, 128 + 64 * n as u32 + 4 * j);
+                self.function.emit(op::STORE, &[pointer, value]);
+            }
+        }
+        if halves_in.len() == 1 {
+            let pairs = self.matrix_lane(index, MatrixLane::PackedPairs)?;
+            for n in 0..2 {
+                let pointer = self.scratch_element(words, self.u32, pairs, 128 + 64 + n);
+                self.function.emit(op::STORE, &[pointer, zero]);
+            }
+        }
+        // C: a half C's register m of HMMA n at row g + 8 m, word t + 4 n
+        // (from word 256); a 32-bit C's element i at (g + 8 (i >> 1), 2t +
+        // (i & 1) + 8 n) of the float scratch.
+        for (n, &(_, _, c)) in halves_in.iter().enumerate() {
+            if single {
+                for i in 0..4u32 {
+                    let bits = self.register_or_zero(next(c, i as u8));
+                    let value = self.value(op::BITCAST, self.f32, &[bits]);
+                    let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                    let pointer = self.scratch_element(wide, self.f32, rows, offset);
+                    self.function.emit(op::STORE, &[pointer, value]);
+                }
+            } else {
+                for m in 0..2u32 {
+                    let value = self.register_or_zero(next(c, m as u8));
+                    let offset = 256 + 64 * m + 4 * n as u32;
+                    let pointer = self.scratch_element(words, self.u32, lane, offset);
+                    self.function.emit(op::STORE, &[pointer, value]);
+                }
+            }
+        }
+        self.subgroup_barrier();
+        let (scope, sixteen, eight) = (
+            self.constant(SCOPE_SUBGROUP),
+            self.constant(16),
+            self.constant(8),
+        );
+        let (row_major, column_major) = (self.constant(0), self.constant(1));
+        let matrix = |e: &mut Self, component: u32, usage: u32| {
+            let usage = e.constant(usage);
+            e.module.ty(Type::CooperativeMatrix {
+                component,
+                scope,
+                rows: sixteen,
+                columns: sixteen,
+                usage,
+            })
+        };
+        let accumulator_type = if single { self.f32 } else { f16 };
+        let (a_type, b_type) = (matrix(self, f16, 0), matrix(self, f16, 1));
+        let c_type = matrix(self, accumulator_type, 2);
+        let a_pointer = self.scratch_element(words, self.u32, base, 0);
+        let b_pointer = self.scratch_element(words, self.u32, base, 128);
+        let (c_pointer, c_stride) = if single {
+            let pointer = self.scratch_element(wide, self.f32, wide_base, 2 * MATRIX_ELEMENTS);
+            (pointer, sixteen)
+        } else {
+            (self.scratch_element(words, self.u32, base, 256), eight)
+        };
+        let a_matrix = self.value(
+            op::COOPERATIVE_MATRIX_LOAD,
+            a_type,
+            &[a_pointer, row_major, eight],
+        );
+        let b_matrix = self.value(
+            op::COOPERATIVE_MATRIX_LOAD,
+            b_type,
+            &[b_pointer, column_major, eight],
+        );
+        let c_matrix = self.value(
+            op::COOPERATIVE_MATRIX_LOAD,
+            c_type,
+            &[c_pointer, row_major, c_stride],
+        );
+        let product = self.value(
+            op::COOPERATIVE_MATRIX_MUL_ADD,
+            c_type,
+            &[a_matrix, b_matrix, c_matrix],
+        );
+        self.function.emit(
+            op::COOPERATIVE_MATRIX_STORE,
+            &[c_pointer, product, row_major, c_stride],
+        );
+        self.subgroup_barrier();
+        self.matrices_used = true;
+        // D back, where C was.
+        for (n, &(d, _, _)) in halves_in.iter().enumerate() {
+            if d == 255 {
+                continue;
+            }
+            if single {
+                for i in 0..4u32 {
+                    let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                    let pointer = self.scratch_element(wide, self.f32, rows, offset);
+                    let value = self.value(op::LOAD, self.f32, &[pointer]);
+                    self.write_float(d.saturating_add(i as u8), value);
+                }
+            } else {
+                for m in 0..2u32 {
+                    let offset = 256 + 64 * m + 4 * n as u32;
+                    let pointer = self.scratch_element(words, self.u32, lane, offset);
+                    let value = self.value(op::LOAD, self.u32, &[pointer]);
+                    self.write_register(d.saturating_add(m as u8), value);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One tensor-core step (see the module notes): `accumulator` plus
     /// `products`, aligned to the largest exponent and truncated, summed
     /// exactly and normalised by truncation, or with `odd` by rounding to
@@ -576,13 +782,18 @@ impl Emitter {
         k16: bool,
         single: bool,
     ) -> Result<(), Unsupported> {
-        if self.layout.matrices == super::MatrixPath::Cooperative {
+        let packed = self.layout.matrices == super::MatrixPath::Cooperative32;
+        if packed || self.layout.matrices == super::MatrixPath::Cooperative {
             if self.hmma_pairs.seconds.contains(&index) {
                 return Ok(());
             }
             let mut halves = vec![(d, b, c)];
             halves.extend(self.hmma_pairs.firsts.get(&index).copied());
-            return self.cooperative_multiply(index, a, &halves, k16, single);
+            return if packed {
+                self.cooperative_multiply_packed(index, a, &halves, k16, single)
+            } else {
+                self.cooperative_multiply(index, a, &halves, k16, single)
+            };
         }
         self.module
             .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);

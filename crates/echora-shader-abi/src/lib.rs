@@ -151,6 +151,10 @@ pub enum MatrixMode {
     /// half matrices into half and 32-bit accumulators at subgroup scope
     /// (VK_KHR_cooperative_matrix). The device's rounding.
     Cooperative,
+    /// As `Cooperative`, staging the fragments as whole 32-bit registers
+    /// (half matrices loaded through word pointers): half the stores.
+    /// Under test (ECHORA_HMMA=coop32) until it matches `Cooperative`.
+    Cooperative32,
     /// Subgroup shuffles with the tensor cores' published arithmetic:
     /// blocks of eight products and the accumulator aligned to the
     /// largest exponent, truncated, and normalised once. Slower; closest

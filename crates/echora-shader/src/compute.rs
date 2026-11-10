@@ -353,6 +353,9 @@ pub enum MatrixPath {
     /// Cooperative matrices (VK_KHR_cooperative_matrix, 16x16x16 at
     /// subgroup scope) for HMMA.16816 and HMMA.1688 (K padded by zeros).
     Cooperative,
+    /// As `Cooperative`, the fragments staged as whole registers (half
+    /// matrices loaded through word pointers).
+    Cooperative32,
     /// The subgroup path with the tensor cores' published arithmetic
     /// (block sums aligned and truncated; see `compute::matrix`).
     Exact,
@@ -4747,13 +4750,15 @@ mod tests {
             ]),
             EXIT,
         ];
-        let layout = Layout {
-            workgroup: [32, 2, 1],
-            matrices: MatrixPath::Cooperative,
-            mesh: None,
-            ..Layout::workgroup([32, 2, 1])
-        };
-        valid_with(&words, &layout);
+        for matrices in [MatrixPath::Cooperative, MatrixPath::Cooperative32] {
+            let layout = Layout {
+                workgroup: [32, 2, 1],
+                matrices,
+                mesh: None,
+                ..Layout::workgroup([32, 2, 1])
+            };
+            valid_with(&words, &layout);
+        }
     }
 
     #[test]
@@ -4770,26 +4775,28 @@ mod tests {
                 (76, 1, 1),
             ])
         };
-        let layout = Layout {
-            matrices: MatrixPath::Cooperative,
-            ..Layout::workgroup([32, 1, 1])
-        };
-        let multiplies = |words: &[u128]| {
-            let spirv = valid_with(words, &layout).spirv;
-            let mut count = 0;
-            let mut at = 5;
-            while at < spirv.len() {
-                if spirv[at] & 0xffff == u32::from(op::COOPERATIVE_MATRIX_MUL_ADD) {
-                    count += 1;
+        for matrices in [MatrixPath::Cooperative, MatrixPath::Cooperative32] {
+            let layout = Layout {
+                matrices,
+                ..Layout::workgroup([32, 1, 1])
+            };
+            let multiplies = |words: &[u128]| {
+                let spirv = valid_with(words, &layout).spirv;
+                let mut count = 0;
+                let mut at = 5;
+                while at < spirv.len() {
+                    if spirv[at] & 0xffff == u32::from(op::COOPERATIVE_MATRIX_MUL_ADD) {
+                        count += 1;
+                    }
+                    at += ((spirv[at] >> 16) as usize).max(1);
                 }
-                at += ((spirv[at] >> 16) as usize).max(1);
-            }
-            count
-        };
-        // Columns 0-7 and 8-15 of one product: one multiply.
-        assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(12, 6, 12), EXIT]), 1);
-        // The second reads the first's result: two.
-        assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(16, 8, 16), EXIT]), 2);
+                count
+            };
+            // Columns 0-7 and 8-15 of one product: one multiply.
+            assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(12, 6, 12), EXIT]), 1);
+            // The second reads the first's result: two.
+            assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(16, 8, 16), EXIT]), 2);
+        }
     }
 
     #[test]

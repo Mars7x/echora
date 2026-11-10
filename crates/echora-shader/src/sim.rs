@@ -1297,6 +1297,44 @@ impl Machine {
         }
     }
 
+    /// Where element `n` (row-major order) of a matrix of type `ty` lies
+    /// for a load or store at `pointer` with `layout` (0 row-major, 1
+    /// column-major) and `stride` (in the pointer's elements, which may
+    /// hold several of the matrix's): the element's pointer, and the
+    /// element's bit shift and width within it.
+    fn matrix_element(
+        &self,
+        pointer: Pointer,
+        ty: u32,
+        layout: u64,
+        stride: usize,
+        n: usize,
+    ) -> (Pointer, u64, u64) {
+        let Ty::Matrix {
+            columns, component, ..
+        } = self.ty(ty)
+        else {
+            panic!("not a matrix: {ty}");
+        };
+        let pointee = match pointer {
+            Pointer::Logical { pointee, .. } | Pointer::Physical { pointee, .. } => pointee,
+        };
+        let bits = 8 * self.scalar_bytes(component);
+        let per = 8 * self.scalar_bytes(pointee) / bits;
+        let (row, column) = (n / columns as usize, n % columns as usize);
+        let (line, along) = match layout {
+            0 => (row, column),
+            1 => (column, row),
+            other => panic!("cooperative matrix layout {other}"),
+        };
+        let at = line * stride * per + along;
+        (
+            self.offset(pointer, at / per),
+            (at % per * bits) as u64,
+            bits as u64,
+        )
+    }
+
     /// A cooperative matrix operation, run by `invocation` for its
     /// subgroup: the result (id, type, value), if it has one.
     fn matrix_operation(
@@ -1307,19 +1345,17 @@ impl Machine {
         let instruction = &self.body[invocation.at];
         let (opcode, operands) = (instruction.opcode, &instruction.operands);
         if opcode == op::COOPERATIVE_MATRIX_STORE {
-            // Row-major (layout 0) at a stride in elements, from the
-            // pointer's element.
             let pointer = invocation.pointers[&operands[0]];
             let matrix = invocation.values[&operands[1]].clone();
+            let ty = invocation.value_types[&operands[1]];
+            let layout = invocation.values[&operands[2]][0];
             let stride = invocation.values[&operands[3]][0] as usize;
-            assert_eq!(
-                invocation.values[&operands[2]][0], 0,
-                "a column-major matrix"
-            );
-            let columns = self.matrix_columns(invocation.value_types[&operands[1]]);
             for (n, &element) in matrix.iter().enumerate() {
-                let at = self.offset(pointer, n / columns * stride + n % columns);
-                self.store(invocation, shared, at, &vec![element]);
+                let (at, shift, bits) = self.matrix_element(pointer, ty, layout, stride, n);
+                let mask = (1u64 << bits) - 1;
+                let old = self.load(invocation, shared, at)[0];
+                let new = old & !(mask << shift) | (element & mask) << shift;
+                self.store(invocation, shared, at, &vec![new]);
             }
             return None;
         }
@@ -1327,18 +1363,18 @@ impl Machine {
         let value = |n: usize| invocation.values[&args[n]].clone();
         let result = if opcode == op::COOPERATIVE_MATRIX_LOAD {
             let pointer = invocation.pointers[&args[0]];
+            let layout = invocation.values[&args[1]][0];
             let stride = invocation.values[&args[2]][0] as usize;
-            assert_eq!(invocation.values[&args[1]][0], 0, "a column-major matrix");
             let (rows, columns) = match self.ty(ty) {
                 Ty::Matrix { rows, columns, .. } => (rows as usize, columns as usize),
                 other => panic!("a matrix load of {other:?}"),
             };
-            let mut matrix = Vec::with_capacity(rows * columns);
-            for n in 0..rows * columns {
-                let at = self.offset(pointer, n / columns * stride + n % columns);
-                matrix.push(self.load(invocation, shared, at)[0]);
-            }
-            matrix
+            (0..rows * columns)
+                .map(|n| {
+                    let (at, shift, bits) = self.matrix_element(pointer, ty, layout, stride, n);
+                    self.load(invocation, shared, at)[0] >> shift & ((1u64 << bits) - 1)
+                })
+                .collect()
         } else {
             // A x B + C, each element's sum exact, rounded once to the
             // result's component type.
@@ -2890,6 +2926,7 @@ mod tests {
             for matrices in [
                 MatrixPath::Subgroup,
                 MatrixPath::Cooperative,
+                MatrixPath::Cooperative32,
                 MatrixPath::Exact,
             ] {
                 let layout = Layout {
@@ -3769,6 +3806,101 @@ mod tests {
         assert_eq!((r[&0], r[&2]), (3, 3));
         let (r, _) = run(&[5, 3], &body);
         assert_eq!((r[&0], r[&2]), (5, 0));
+    }
+
+    #[test]
+    fn packed_cooperative_multiplies_give_the_same_results() {
+        use crate::compute::MatrixPath;
+        // Halves with magnitudes in [2^-4, 2^4] from a sequence, as each
+        // lane's register bits.
+        let halves = |seed: u32, lane: usize, register: u8| {
+            let mut state = seed ^ (lane as u32) << 8 ^ u32::from(register) << 16;
+            let mut half = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let exponent = 11 + (state >> 8) % 9;
+                (state >> 16) & 0x8000 | exponent << 10 | state & 0x3ff
+            };
+            u64::from(half() | half() << 16)
+        };
+        for (k16, single, pair) in [
+            (true, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let hmma = |d: u128, b: u128, c: u128| {
+                word(&[
+                    (0, 12, 0x23c),
+                    (16, 8, d),
+                    (24, 8, 0),
+                    (32, 8, b),
+                    (64, 8, c),
+                    (75, 1, u128::from(k16)),
+                    (76, 1, u128::from(single)),
+                ])
+            };
+            // A in R0-R3, B in R4-R5 (and R6-R7), C from R8 (and R12), D
+            // from R16 (and R20).
+            let mut program = vec![hmma(16, 4, 8)];
+            if pair {
+                program.push(hmma(20, 6, 12));
+            }
+            program.push(EXIT);
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let run = |matrices| {
+                let layout = Layout {
+                    matrices,
+                    ..Layout::workgroup([32, 1, 1])
+                };
+                let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+                let report = Machine::new(&translated.spirv).run_workgroup_with(
+                    32,
+                    32,
+                    |lane| {
+                        HashMap::from([
+                            (27, vec![lane as u64, 0, 0]),
+                            (29, vec![lane as u64]),
+                            (40, vec![0]),
+                            (41, vec![lane as u64]),
+                        ])
+                    },
+                    |lane| {
+                        (0..16u8)
+                            .filter_map(|n| {
+                                let value = if single && n >= 8 {
+                                    // A float C: a half's value widened.
+                                    let bits = halves(7, lane, n) as u16;
+                                    u64::from(f16_to_f32(bits).to_bits())
+                                } else {
+                                    halves(7, lane, n)
+                                };
+                                registers.get(&n).map(|&variable| (variable, vec![value]))
+                            })
+                            .collect()
+                    },
+                );
+                assert!(
+                    report.problems.is_empty(),
+                    "{matrices:?}: {:?}",
+                    report.problems
+                );
+                (0..32)
+                    .map(|lane| {
+                        (16..24u8)
+                            .map(|n| {
+                                registers
+                                    .get(&n)
+                                    .map(|v| report.invocations[lane][v][0] as u32)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (plain, packed) = (run(MatrixPath::Cooperative), run(MatrixPath::Cooperative32));
+            assert!(plain[0][0].is_some());
+            assert_eq!(plain, packed, "k16 {k16} single {single} pair {pair}");
+        }
     }
 
     #[test]

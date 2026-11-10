@@ -213,6 +213,15 @@ Two HMMAs in a row (both HMMA.16816 or both HMMA.1688) that share A and the accu
 unguarded, in one block, the second reading nothing the first writes)
 run as one multiply: the second's B and C fill columns 8-15 and its D is
 read from there, halving the multiplies and the scratch traffic.
+Scratch addresses are a per-lane base (computed once where it reaches)
+plus a constant. `MatrixPath::Cooperative32` (`MatrixMode::Cooperative32`,
+under test behind ECHORA_HMMA=coop32) stores each fragment register
+whole: a register's two halves are adjacent in A's rows and B's columns,
+so A goes row-major and B column-major into a word scratch, 8 words a
+line, and the half matrices are loaded through word pointers (the stride
+counts the pointer's elements, as Mesa's lowering reads the extension); a
+half C and D go as A does. A simulator test checks it gives the same D
+bits as `Cooperative`; it stays off by default until the GPU agrees.
 With `MatrixPath::Exact` (`Parameters::matrix_mode` `MatrixMode::Exact`)
 the subgroup path sums like the A100's tensor cores as published (Fasi,
 Higham, Mikaitis and Pranesh, 2021; Khattak and Mikaitis, 2025): each

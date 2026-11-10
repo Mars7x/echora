@@ -176,6 +176,7 @@ fn matrix_path(mode: echora_shader_abi::MatrixMode) -> compute::MatrixPath {
     match mode {
         echora_shader_abi::MatrixMode::Subgroup => compute::MatrixPath::Subgroup,
         echora_shader_abi::MatrixMode::Cooperative => compute::MatrixPath::Cooperative,
+        echora_shader_abi::MatrixMode::Cooperative32 => compute::MatrixPath::Cooperative32,
         echora_shader_abi::MatrixMode::Exact => compute::MatrixPath::Exact,
     }
 }
