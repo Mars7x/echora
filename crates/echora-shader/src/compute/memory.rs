@@ -84,7 +84,6 @@ impl Emitter {
             .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// MEMBAR: a memory barrier over every kind of memory, at the
     /// workgroup for CTA and SM scope, the device for GPU and system scope
     /// (Vulkan has nothing wider than the device).
@@ -98,6 +97,7 @@ impl Emitter {
         self.function.emit(op::MEMORY_BARRIER, &[scope, semantics]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn load(
         &mut self,
         index: usize,
