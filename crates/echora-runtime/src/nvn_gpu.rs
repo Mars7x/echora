@@ -4049,6 +4049,10 @@ impl Nvn {
             }
         }
         let backend = self.gpu.as_mut().unwrap();
+        // The renderer's counts from the spans just shared (refusals).
+        for (name, amount) in backend.renderer.take_stats() {
+            backend.stat(name, amount);
+        }
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
         backend.stat(
             "stat: page table pinned MiB",

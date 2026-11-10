@@ -2038,6 +2038,15 @@ impl Renderer {
             )
         };
         if dma_buf < 0 {
+            // The kernel's reason, the first few times (an import the page
+            // table needs that fails leaves its pages unmapped).
+            self.stat("stat: udmabuf creations refused", 1);
+            if self.stats.get("stat: udmabuf creations refused") <= Some(&4) {
+                eprintln!(
+                    "gpu: udmabuf of {span:#x} bytes at file offset {start:#x} refused: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
             return Ok(None);
         }
         let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
@@ -2052,6 +2061,7 @@ impl Renderer {
         };
         if queried.is_err() {
             close();
+            self.stat("stat: dma-buf memory properties refused", 1);
             return Ok(None);
         }
         let addressable = self.gpu.buffer_device_address;
@@ -2084,6 +2094,7 @@ impl Renderer {
             Ok(None)
         };
         if bits == 0 || requirements.size > span {
+            self.stat("stat: dma-buf imports refused (memory type or size)", 1);
             return refuse(&close);
         }
         let mut import = vk::ImportMemoryFdInfoKHR::default()
@@ -2101,7 +2112,10 @@ impl Renderer {
         // SAFETY: a successful import takes ownership of `dma_buf`.
         let memory = match unsafe { device.allocate_memory(&allocate, None) } {
             Ok(memory) => memory,
-            Err(_) => return refuse(&close),
+            Err(_) => {
+                self.stat("stat: dma-buf imports refused (allocation)", 1);
+                return refuse(&close);
+            }
         };
         // SAFETY: fresh buffer and memory of the required size.
         if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
