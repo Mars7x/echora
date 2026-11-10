@@ -489,6 +489,8 @@ struct Emitter {
     /// The blocks that dominate the current one through the selections
     /// `choose` is emitting.
     dominators: Vec<(u32, u32)>,
+    /// The OpString naming guest code in exit OpLines.
+    guest_file: Option<u32>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
     /// c), and the seconds' indices (emitted with their first).
     hmma_pairs: matrix::Pairs,
@@ -563,6 +565,7 @@ impl Emitter {
             mesh: None,
             known: BTreeMap::new(),
             dominators: Vec::new(),
+            guest_file: None,
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,

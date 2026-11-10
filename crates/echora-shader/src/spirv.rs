@@ -9,6 +9,8 @@ use std::collections::HashMap;
 #[allow(missing_docs)]
 pub mod op {
     pub const NAME: u16 = 5;
+    pub const STRING: u16 = 7;
+    pub const LINE: u16 = 8;
     pub const EXTENSION: u16 = 10;
     pub const EXT_INST_IMPORT: u16 = 11;
     pub const EXT_INST: u16 = 12;
@@ -359,6 +361,8 @@ pub struct Module {
     memory_model: Vec<u32>,
     entry_points: Vec<u32>,
     execution_modes: Vec<u32>,
+    /// Debug strings (OpString), before the names.
+    strings: Vec<u32>,
     names: Vec<u32>,
     annotations: Vec<u32>,
     globals: Vec<u32>,
@@ -455,6 +459,15 @@ impl Module {
         let mut operands = vec![function, mode];
         operands.extend_from_slice(literals);
         instruction(&mut self.execution_modes, op::EXECUTION_MODE, &operands);
+    }
+
+    /// An OpString of `text`; returns its id.
+    pub fn debug_string(&mut self, text: &str) -> u32 {
+        let id = self.id();
+        let mut operands = vec![id];
+        operands.extend(string(text));
+        instruction(&mut self.strings, op::STRING, &operands);
+        id
     }
 
     pub fn name(&mut self, target: u32, name: &str) {
@@ -675,6 +688,7 @@ impl Module {
             self.memory_model,
             self.entry_points,
             self.execution_modes,
+            self.strings,
             self.names,
             self.annotations,
             self.globals,

@@ -247,6 +247,9 @@ pub struct Report {
     pub ends: Vec<usize>,
     /// The stores and atomics into `Inputs::watch`, in the order they ran.
     pub writes: Vec<Write>,
+    /// Each invocation's guest EXIT (byte offset), the first it took; none
+    /// when it ran off the end or stopped on a problem.
+    pub exits: Vec<Option<u32>>,
 }
 
 /// A loaded module.
@@ -283,6 +286,8 @@ struct Invocation {
     at: usize,
     /// The instruction running (`at` moves on before it runs).
     current: usize,
+    /// The guest EXIT it took first (an OpLine's line), if any.
+    exit: Option<u32>,
     values: HashMap<u32, Value>,
     value_types: HashMap<u32, u32>,
     pointers: HashMap<u32, Pointer>,
@@ -1114,8 +1119,13 @@ impl Machine {
             break;
         }
         let ends = invocations.iter().map(|invocation| invocation.at).collect();
+        let exits = invocations
+            .iter()
+            .map(|invocation| invocation.exit)
+            .collect();
         Report {
             ends,
+            exits,
             writes: shared.writes,
             invocations: invocations
                 .into_iter()
@@ -1170,6 +1180,7 @@ impl Machine {
             initial: HashMap::new(),
             number: 0,
             current: 0,
+            exit: None,
             done: false,
             steps: 0,
         }
@@ -1767,6 +1778,13 @@ impl Machine {
             let opcode = instruction.opcode;
             match opcode {
                 op::LABEL | op::SELECTION_MERGE | op::MEMORY_BARRIER => continue,
+                // The translation marks each guest EXIT taken with a line.
+                op::LINE => {
+                    if invocation.exit.is_none() {
+                        invocation.exit = operands.get(1).copied();
+                    }
+                    continue;
+                }
                 op::LOOP_MERGE => {
                     let passes = invocation.loops.entry(at).or_insert(0);
                     *passes += 1;
@@ -4370,6 +4388,40 @@ mod tests {
             .collect();
         olds.sort_unstable();
         assert_eq!(olds, (0..64).map(|n| 100 + 3 * n).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn each_invocation_s_guest_exit_is_reported() {
+        // 0: MOV R1, 40; 1: S2R R0, SR_TID.X; 2: ISETP.GE.U32 P0, R0, R1;
+        // 3: @P0 EXIT; 4: (BAR or nothing); 5: EXIT.
+        let s2r = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]);
+        let at_least = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 0),
+            (32, 8, 1),
+            (76, 3, 6),
+            (81, 3, 0),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let early = EXIT & !(0xf << 12);
+        // NOP (0x918) where there is no barrier.
+        for (fourth, flag) in [(BAR, true), (0x918 | 7 << 12, false)] {
+            let program = [mov(1, 40), s2r, at_least, early, fourth, EXIT];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let translated =
+                crate::compute::translate(&code, &Layout::workgroup([64, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            for (n, &exit) in report.exits.iter().enumerate() {
+                let expected = if n >= 40 { 3 * 16 } else { 5 * 16 };
+                assert_eq!(exit, Some(expected), "barrier {flag}: invocation {n}");
+            }
+        }
     }
 
     #[test]

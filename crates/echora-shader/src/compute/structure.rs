@@ -50,7 +50,9 @@ enum Statement {
     },
     Exit(usize),
     Continue(usize),
-    Return,
+    /// The program's end: a guest EXIT's byte offset, or none (running
+    /// off the end, or a computed branch).
+    Return(Option<u32>),
 }
 
 /// The graph of a program's blocks.
@@ -263,7 +265,7 @@ impl Builder<'_> {
 
     fn branch(&mut self, x: usize, y: Option<usize>) -> Statement {
         let Some(y) = y else {
-            return Statement::Return;
+            return Statement::Return(None);
         };
         if self.graph.rpo[y] <= self.graph.rpo[x] {
             let id = self.context.iter().rev().find_map(|frame| match *frame {
@@ -299,17 +301,18 @@ impl Builder<'_> {
                 }
             }
             End::Exit { condition } => {
+                let exit = Statement::Return(Some(self.blocks[x].body_end as u32 * 16));
                 if condition.always() {
-                    Statement::Return
+                    exit
                 } else {
                     Statement::If {
                         condition,
-                        then: Box::new(Statement::Return),
+                        then: Box::new(exit),
                         otherwise: Box::new(self.branch(x, next)),
                     }
                 }
             }
-            End::Indirect { .. } => Statement::Return,
+            End::Indirect { .. } => Statement::Return(None),
         }
     }
 }
@@ -462,19 +465,22 @@ impl Emitter {
                 then,
                 otherwise,
             } if state.exited.is_some()
-                && (matches!(**then, Statement::Return)
-                    || matches!(**otherwise, Statement::Return)) =>
+                && (matches!(**then, Statement::Return(_))
+                    || matches!(**otherwise, Statement::Return(_))) =>
             {
                 let exited = state.exited.unwrap_or_default();
                 let mut value = self.condition(*condition);
-                let rest = if matches!(**then, Statement::Return) {
-                    otherwise
-                } else {
-                    value = self.value(op::LOGICAL_NOT, self.bool, &[value]);
-                    then
+                let (rest, site) = match (&**then, &**otherwise) {
+                    (Statement::Return(site), _) => (otherwise, *site),
+                    (_, Statement::Return(site)) => {
+                        value = self.value(op::LOGICAL_NOT, self.bool, &[value]);
+                        (then, *site)
+                    }
+                    _ => unreachable!("one arm returns"),
                 };
                 let yes = self.module.bool_constant(true);
                 self.when(value, |e| {
+                    e.exit_site(site);
                     e.function.emit(op::STORE, &[exited, yes]);
                     Ok(())
                 })?;
@@ -655,7 +661,10 @@ impl Emitter {
                     self.function.emit(op::BRANCH, &[innermost.merge]);
                 }
             }
-            Statement::Return => self.leave(),
+            Statement::Return(site) => {
+                self.exit_site(*site);
+                self.leave();
+            }
         }
         Ok(())
     }
@@ -700,6 +709,24 @@ impl Emitter {
             e.value(opcode, e.u32, &[pointer, device, relaxed, value]);
             Ok(())
         });
+    }
+
+    /// Marks a guest EXIT taken here with an OpLine (file "guest", line
+    /// its byte offset): no cost on the GPU, and the simulator reports the
+    /// exit each invocation took.
+    fn exit_site(&mut self, site: Option<u32>) {
+        let Some(offset) = site else {
+            return;
+        };
+        let file = match self.guest_file {
+            Some(file) => file,
+            None => {
+                let file = self.module.debug_string("guest");
+                self.guest_file = Some(file);
+                file
+            }
+        };
+        self.function.emit(op::LINE, &[file, offset, 0]);
     }
 
     /// The invocation's end: the fragment outputs, then return.

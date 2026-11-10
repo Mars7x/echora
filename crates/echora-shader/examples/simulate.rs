@@ -31,7 +31,9 @@
 //! the earlier ones' writes and atomics (a valid schedule, which lets a
 //! last-workgroup pattern finish), unless `--independent` starts each from
 //! the dump. `--quiet` prints only workgroups with problems, unmapped
-//! pages or watched writes. Each
+//! pages or watched writes. Otherwise each workgroup's report lists
+//! where its invocations ended and which guest EXIT (byte offset) each
+//! took. Each
 //! `watch=START..END` argument (hex addresses, or a `watch START END` line
 //! in dispatch.txt) lists every store and atomic into that range, guest
 //! (through the page table) or device: the invocation, the instruction
@@ -243,6 +245,18 @@ fn main() {
                         n - 1,
                         report.ends[start]
                     );
+                    start = n;
+                }
+            }
+            // The guest EXIT each took, as runs of invocations.
+            let mut start = 0;
+            for n in 1..=report.exits.len() {
+                if n == report.exits.len() || report.exits[n] != report.exits[start] {
+                    let site = report.exits[start].map_or_else(
+                        || "no guest EXIT".to_string(),
+                        |offset| format!("the EXIT at {offset:#06x}"),
+                    );
+                    println!("  invocations {start}-{} took {site}", n - 1);
                     start = n;
                 }
             }
