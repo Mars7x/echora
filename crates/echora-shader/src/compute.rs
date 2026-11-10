@@ -3397,6 +3397,22 @@ mod tests {
     }
 
     #[test]
+    fn uniform_predicates_pack_into_a_uniform_register() {
+        // UP2UR UR4, UPR, URZ, 0x7f
+        let packed = word(&[
+            (0, 12, 0x883),
+            (16, 8, 4),
+            (24, 8, 63),
+            (32, 32, 0x7f),
+            (91, 1, 1),
+        ]);
+        let instruction = decode(packed);
+        assert!(instruction.uniform);
+        assert!(matches!(instruction.op, Op::P2r { mask: 0x7f, .. }));
+        valid(&[packed, EXIT]);
+    }
+
+    #[test]
     fn bindless_size_queries_read_the_pool() {
         // TXQ.B R4, R0 (handle), R1 (level), width and height.
         let query = word(&[

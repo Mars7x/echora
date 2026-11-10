@@ -296,7 +296,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | VOTEU | 0x886 | as VOTE, into a uniform register and uniform predicate |
 | BREAK, WARPSYNC | 0x942, 0x948 | no effect per invocation |
 | VOTE | 0x806 | mode 72-73 (ALL, ANY, EQ), condition 87-90, vote predicate 81-83, ballot in the destination |
-| P2R, R2P | 0x803, 0x804 | immediate mask 32-63 (P0-P6), byte 76-77 |
+| P2R, R2P, UP2UR | 0x803, 0x804, 0x883 | immediate mask 32-63 (P0-P6), byte 76-77; UP2UR is P2R of the uniform predicates into a uniform register |
 | LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
 | SHF | 0x019 in forms 1-7 | type 73-74 (S64, U64, S32, U32), wrap 75, right 76, high word 80 |
 | PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74; SGXT signed 73, wrap 75 |

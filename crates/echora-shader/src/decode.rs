@@ -1093,6 +1093,8 @@ fn uniform_mirror(opcode: u16) -> Option<u16> {
     let operation = opcode & 0x1ff;
     let mirrored = match operation {
         0x082 => matches!(form, 4 | 6),
+        // UP2UR: P2R of the uniform predicates into a uniform register.
+        0x083 => form == 4,
         0x087 | 0x08c | 0x090 | 0x091 | 0x092 | 0x096 | 0x099 | 0x09a | 0x0a4 | 0x0a5 => {
             matches!(form, 1 | 2 | 4)
         }
