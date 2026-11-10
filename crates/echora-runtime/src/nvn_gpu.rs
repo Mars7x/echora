@@ -1097,7 +1097,17 @@ impl Nvn {
             // ECHORA_SHADER_TRANSLATOR: the Rust translator for programs it
             // handles (`rust`), or beside the plugin for a report
             // (`compare`); what it does not handle is noted by reason.
-            let translator = shader::Translator::from_env();
+            // ECHORA_PLUGIN_PROGRAMS=<stage key>[,...] (debugging): those
+            // stages from the plugin whatever the translator, to tell a Rust
+            // translation's fault from its neighbours'.
+            let translator = if super::debug_var("ECHORA_PLUGIN_PROGRAMS").is_ok_and(|keys| {
+                keys.split(',')
+                    .any(|item| item.trim() == format!("{key:016x}"))
+            }) {
+                shader::Translator::Plugin
+            } else {
+                shader::Translator::from_env()
+            };
             // A program reading the texture pool (set 1) needs a device
             // that holds it; elsewhere such programs stay with the plugin.
             let rust = (translator != shader::Translator::Plugin)
