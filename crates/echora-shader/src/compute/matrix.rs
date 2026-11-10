@@ -31,7 +31,10 @@
 
 use echora_shader_abi::Unsupported;
 
-use super::{Emitter, SCOPE_SUBGROUP};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{Block, Emitter, SCOPE_SUBGROUP};
+use crate::decode::{Instruction, Op};
 use crate::spirv::{Type, capability, glsl, op, storage};
 
 /// Elements of a 16x16 matrix.
@@ -42,6 +45,79 @@ const BUILTIN_SUBGROUP_ID: u32 = 40;
 
 /// OpFConvert.
 const F_CONVERT: u16 = 115;
+
+/// HMMA.16816s run in pairs on one 16x16x16 multiply: two in a row in a
+/// block, both unguarded, with the same A and accumulator type, the second
+/// reading nothing the first writes (its d is not among the second's a, b
+/// and c registers). The first's index maps to the second's (d, b, c).
+#[derive(Debug, Default)]
+pub(super) struct Pairs {
+    firsts: BTreeMap<usize, (u8, u8, u8)>,
+    seconds: BTreeSet<usize>,
+}
+
+/// The registers `count` from `base` (none for RZ).
+fn registers(base: u8, count: u8) -> std::ops::Range<u16> {
+    if base == 255 {
+        0..0
+    } else {
+        u16::from(base)..u16::from(base) + u16::from(count)
+    }
+}
+
+fn overlap(x: &std::ops::Range<u16>, y: &std::ops::Range<u16>) -> bool {
+    x.start < y.end && y.start < x.end
+}
+
+pub(super) fn pairs(code: &[Instruction], blocks: &[Block]) -> Pairs {
+    let starts: BTreeSet<usize> = blocks.iter().map(|block| block.start).collect();
+    let mut pairs = Pairs::default();
+    let mut index = 0;
+    while index + 1 < code.len() {
+        let (first, second) = (&code[index], &code[index + 1]);
+        let paired = match (first.op, second.op) {
+            (
+                Op::Hmma {
+                    d,
+                    a,
+                    k16: true,
+                    single,
+                    ..
+                },
+                Op::Hmma {
+                    a: a2,
+                    b: b2,
+                    c: c2,
+                    k16: true,
+                    single: single2,
+                    ..
+                },
+            ) if a == a2
+                && single == single2
+                && first.guard.is_true()
+                && second.guard.is_true()
+                && !starts.contains(&(index + 1)) =>
+            {
+                let wide = if single { 4 } else { 2 };
+                let written = registers(d.0, wide);
+                !overlap(&written, &registers(a2.0, 4))
+                    && !overlap(&written, &registers(b2.0, 2))
+                    && !overlap(&written, &registers(c2.0, wide))
+            }
+            _ => false,
+        };
+        if paired {
+            if let Op::Hmma { d, b, c, .. } = second.op {
+                pairs.firsts.insert(index, (d.0, b.0, c.0));
+                pairs.seconds.insert(index + 1);
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    pairs
+}
 
 impl Emitter {
     /// A register's two halves as 32-bit floats.
@@ -132,17 +208,15 @@ impl Emitter {
     }
 
     /// HMMA.16816 on a 16x16x16 cooperative matrix multiply: the lanes
-    /// write their fragments (PTX layout) to the warp's scratch, B's upper
-    /// eight columns zero, the subgroup multiplies, and each lane reads its
-    /// part of D back.
-    #[allow(clippy::too_many_arguments)]
+    /// write their fragments (PTX layout) to the warp's scratch, the
+    /// subgroup multiplies, and each lane reads its part of D back. `halves`
+    /// holds one HMMA's (d, b, c), for columns 0-7 (B's upper eight
+    /// columns then zero), or two sharing A, the second's in columns 8-15.
     fn cooperative_multiply(
         &mut self,
         index: usize,
-        d: u8,
         a: u8,
-        b: u8,
-        c: u8,
+        halves_in: &[(u8, u8, u8)],
         single: bool,
     ) -> Result<(), Unsupported> {
         self.module.capability(capability::COOPERATIVE_MATRIX);
@@ -205,37 +279,45 @@ impl Emitter {
                 self.function.emit(op::STORE, &[pointer, value]);
             }
         }
-        // B: register j, half h at (2t + h + 8j, g); columns 8-15 zero
-        // (lane l zeroes row l / 2, four columns from 8 + 4 (l & 1)).
-        for j in 0..2u32 {
-            for h in 0..2 {
-                let row = plus(self, column_pair, h + 8 * j);
-                let value = half_of(self, next(b, j as u8), h);
-                let pointer = self.scratch_element(halves, f16, base, 1, row, group);
-                self.function.emit(op::STORE, &[pointer, value]);
+        // B: register j, half h at (2t + h + 8j, g + 8 n) for HMMA n; with
+        // one, columns 8-15 zero (lane l zeroes row l / 2, four columns from
+        // 8 + 4 (l & 1)).
+        for (n, &(_, b, _)) in halves_in.iter().enumerate() {
+            let column = plus(self, group, 8 * n as u32);
+            for j in 0..2u32 {
+                for h in 0..2 {
+                    let row = plus(self, column_pair, h + 8 * j);
+                    let value = half_of(self, next(b, j as u8), h);
+                    let pointer = self.scratch_element(halves, f16, base, 1, row, column);
+                    self.function.emit(op::STORE, &[pointer, value]);
+                }
             }
         }
-        let zero = self.module.constant(f16, 0);
-        let zero_row = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, one]);
-        let odd = self.value(op::BITWISE_AND, self.u32, &[lane, one]);
-        let quarter = self.value(op::I_MUL, self.u32, &[odd, four]);
-        for n in 0..4 {
-            let column = plus(self, quarter, 8 + n);
-            let pointer = self.scratch_element(halves, f16, base, 1, zero_row, column);
-            self.function.emit(op::STORE, &[pointer, zero]);
+        if halves_in.len() == 1 {
+            let zero = self.module.constant(f16, 0);
+            let zero_row = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, one]);
+            let odd = self.value(op::BITWISE_AND, self.u32, &[lane, one]);
+            let quarter = self.value(op::I_MUL, self.u32, &[odd, four]);
+            for n in 0..4 {
+                let column = plus(self, quarter, 8 + n);
+                let pointer = self.scratch_element(halves, f16, base, 1, zero_row, column);
+                self.function.emit(op::STORE, &[pointer, zero]);
+            }
         }
-        // C: element i at (g + 8 (i >> 1), 2t + (i & 1)).
-        for i in 0..4u32 {
-            let row = plus(self, group, 8 * (i >> 1));
-            let column = plus(self, column_pair, i & 1);
-            let value = if single {
-                let bits = self.register_or_zero(next(c, i as u8));
-                self.value(op::BITCAST, self.f32, &[bits])
-            } else {
-                half_of(self, next(c, (i / 2) as u8), i % 2)
-            };
-            let pointer = self.scratch_element(wide, accumulator_type, base, 2, row, column);
-            self.function.emit(op::STORE, &[pointer, value]);
+        // C: element i at (g + 8 (i >> 1), 2t + (i & 1) + 8 n) for HMMA n.
+        for (n, &(_, _, c)) in halves_in.iter().enumerate() {
+            for i in 0..4u32 {
+                let row = plus(self, group, 8 * (i >> 1));
+                let column = plus(self, column_pair, (i & 1) + 8 * n as u32);
+                let value = if single {
+                    let bits = self.register_or_zero(next(c, i as u8));
+                    self.value(op::BITCAST, self.f32, &[bits])
+                } else {
+                    half_of(self, next(c, (i / 2) as u8), i % 2)
+                };
+                let pointer = self.scratch_element(wide, accumulator_type, base, 2, row, column);
+                self.function.emit(op::STORE, &[pointer, value]);
+            }
         }
         self.subgroup_barrier();
         // The multiply: row-major, stride 16.
@@ -280,30 +362,33 @@ impl Emitter {
         self.subgroup_barrier();
         self.matrices_used = true;
         // D back, where C was.
-        if d == 255 {
-            return Ok(());
-        }
-        let values: Vec<u32> = (0..4u32)
-            .map(|i| {
-                let row = plus(self, group, 8 * (i >> 1));
-                let column = plus(self, column_pair, i & 1);
-                let pointer = self.scratch_element(wide, accumulator_type, base, 2, row, column);
-                self.value(op::LOAD, accumulator_type, &[pointer])
-            })
-            .collect();
-        if single {
-            for (n, value) in values.into_iter().enumerate() {
-                self.write_float(d.saturating_add(n as u8), value);
+        for (n, &(d, _, _)) in halves_in.iter().enumerate() {
+            if d == 255 {
+                continue;
             }
-        } else {
-            for n in 0..2 {
-                let vector = self.value(
-                    op::COMPOSITE_CONSTRUCT,
-                    pair,
-                    &[values[2 * n], values[2 * n + 1]],
-                );
-                let bits = self.value(op::BITCAST, self.u32, &[vector]);
-                self.write_register(d.saturating_add(n as u8), bits);
+            let values: Vec<u32> = (0..4u32)
+                .map(|i| {
+                    let row = plus(self, group, 8 * (i >> 1));
+                    let column = plus(self, column_pair, (i & 1) + 8 * n as u32);
+                    let pointer =
+                        self.scratch_element(wide, accumulator_type, base, 2, row, column);
+                    self.value(op::LOAD, accumulator_type, &[pointer])
+                })
+                .collect();
+            if single {
+                for (m, value) in values.into_iter().enumerate() {
+                    self.write_float(d.saturating_add(m as u8), value);
+                }
+            } else {
+                for m in 0..2 {
+                    let vector = self.value(
+                        op::COMPOSITE_CONSTRUCT,
+                        pair,
+                        &[values[2 * m], values[2 * m + 1]],
+                    );
+                    let bits = self.value(op::BITCAST, self.u32, &[vector]);
+                    self.write_register(d.saturating_add(m as u8), bits);
+                }
             }
         }
         Ok(())
@@ -456,7 +541,12 @@ impl Emitter {
         single: bool,
     ) -> Result<(), Unsupported> {
         if k16 && self.layout.matrices == super::MatrixPath::Cooperative {
-            return self.cooperative_multiply(index, d, a, b, c, single);
+            if self.hmma_pairs.seconds.contains(&index) {
+                return Ok(());
+            }
+            let mut halves = vec![(d, b, c)];
+            halves.extend(self.hmma_pairs.firsts.get(&index).copied());
+            return self.cooperative_multiply(index, a, &halves, single);
         }
         self.module
             .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);

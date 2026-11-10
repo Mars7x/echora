@@ -192,6 +192,9 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     }
     let blocks = blocks(code)?;
     let mut emitter = Emitter::new(layout);
+    if layout.matrices == MatrixPath::Cooperative {
+        emitter.hmma_pairs = matrix::pairs(code, &blocks);
+    }
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     // Structured control flow where the graph allows, else the dispatch
@@ -416,6 +419,9 @@ struct Emitter {
     atomic_images: BTreeMap<(u8, u16, u8), u32>,
     /// Task and mesh programs' variables.
     mesh: Option<mesh::MeshState>,
+    /// Cooperative HMMA pairs: the first's index to the second's (d, b,
+    /// c), and the seconds' indices (emitted with their first).
+    hmma_pairs: matrix::Pairs,
     /// More variables at a descriptor's binding (by descriptor index).
     descriptor_aliases: Vec<(usize, u32)>,
     /// Each image descriptor's integer-format spec constant id.
@@ -485,6 +491,7 @@ impl Emitter {
             images: BTreeMap::new(),
             atomic_images: BTreeMap::new(),
             mesh: None,
+            hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
             pool_arrays: BTreeMap::new(),
@@ -4472,6 +4479,42 @@ mod tests {
             ..Layout::workgroup([32, 2, 1])
         };
         valid_with(&words, &layout);
+    }
+
+    #[test]
+    fn cooperative_matrix_multiplies_pair_hmmas_that_share_a() {
+        // HMMA.16816.F32 d, R0, b, c: words with those registers.
+        let hmma = |d: u128, b: u128, c: u128| {
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, d),
+                (24, 8, 0),
+                (32, 8, b),
+                (64, 8, c),
+                (75, 1, 1),
+                (76, 1, 1),
+            ])
+        };
+        let layout = Layout {
+            matrices: MatrixPath::Cooperative,
+            ..Layout::workgroup([32, 1, 1])
+        };
+        let multiplies = |words: &[u128]| {
+            let spirv = valid_with(words, &layout).spirv;
+            let mut count = 0;
+            let mut at = 5;
+            while at < spirv.len() {
+                if spirv[at] & 0xffff == u32::from(op::COOPERATIVE_MATRIX_MUL_ADD) {
+                    count += 1;
+                }
+                at += ((spirv[at] >> 16) as usize).max(1);
+            }
+            count
+        };
+        // Columns 0-7 and 8-15 of one product: one multiply.
+        assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(12, 6, 12), EXIT]), 1);
+        // The second reads the first's result: two.
+        assert_eq!(multiplies(&[hmma(8, 4, 8), hmma(16, 8, 16), EXIT]), 2);
     }
 
     #[test]

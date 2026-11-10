@@ -207,6 +207,10 @@ instead writes the lanes' fragments to per-warp workgroup scratch in the
 PTX layout (B's upper eight columns zero), multiplies with
 OpCooperativeMatrixMulAddKHR (a half or 32-bit accumulator) and reads D
 back; the device's matrix units then decide the summation's rounding.
+Two HMMA.16816s in a row that share A and the accumulator type (both
+unguarded, in one block, the second reading nothing the first writes)
+run as one multiply: the second's B and C fill columns 8-15 and its D is
+read from there, halving the multiplies and the scratch traffic.
 With `MatrixPath::Exact` (`Parameters::matrix_mode` `MatrixMode::Exact`)
 the subgroup path sums like the A100's tensor cores as published (Fasi,
 Higham, Mikaitis and Pranesh, 2021; Khattak and Mikaitis, 2025): each
