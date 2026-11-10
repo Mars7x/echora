@@ -1,10 +1,12 @@
 //! Size and compile time of the generated Rust, per emission mode.
 //!
 //! `build.rs` (with the `codesize` feature) writes every program it lifts
-//! through split emission once per mode (flat, structured, inline_vector)
-//! as a crate of its own. This compiles each with rustc as cargo would for
-//! a region of the game build (an rlib, `opt-level` 1, 16 codegen units)
-//! and reports the bytes of Rust per guest instruction and the time.
+//! through split emission once per mode (flat, structured, inline_vector,
+//! fused_flags, whole_vector, fp_locals and the recommended set) as a crate
+//! of its own. This compiles each with rustc as cargo would for a region of
+//! the game build (an rlib, `opt-level` 1, 16 codegen units) and reports
+//! the bytes of Rust per guest instruction, the time, and the machine code
+//! (`.text`, by `size`) per guest instruction.
 //! See `docs/testing.md`.
 //!
 //! ```text
@@ -36,6 +38,19 @@ fn rlib(deps: &Path, name: &str) -> PathBuf {
         .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
         .map(|entry| entry.path())
         .unwrap_or_else(|| panic!("no {prefix}*.rlib in {}", deps.display()))
+}
+
+/// The `.text` bytes of the rlib `compile` left in `scratch` (the sum over
+/// its object files, by binutils' `size`), if `size` runs.
+fn text_bytes(scratch: &Path) -> Option<u64> {
+    let output = Command::new("size")
+        .arg("-t")
+        .arg(scratch.join("libcodesize.rlib"))
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let totals = text.lines().find(|line| line.contains("(TOTALS)"))?;
+    totals.split_whitespace().next()?.parse().ok()
 }
 
 fn compile(source: &Path, deps: &Path, guest: &Path, opt: u32, scratch: &Path) -> Duration {
@@ -93,8 +108,8 @@ fn main() {
     std::fs::create_dir_all(&scratch).expect("scratch directory");
     let list = std::fs::read_to_string(Path::new(SOURCES).join("modes.txt")).expect("modes.txt");
     println!(
-        "{:<14} {:>12} {:>12} {:>10} {:>12} {:>14}",
-        "mode", "instructions", "bytes", "bytes/ins", "rustc s", "us/instruction"
+        "{:<14} {:>12} {:>12} {:>10} {:>12} {:>14} {:>12}",
+        "mode", "instructions", "bytes", "bytes/ins", "rustc s", "us/instruction", "text B/ins"
     );
     for line in list.lines() {
         let mut fields = line.split_whitespace();
@@ -116,8 +131,12 @@ fn main() {
             .map(|_| compile(&source, &deps, &guest, opt, &scratch))
             .min()
             .expect("at least one run");
+        let text = text_bytes(&scratch).map_or_else(
+            || "-".to_owned(),
+            |text| format!("{:.1}", text as f64 / instructions),
+        );
         println!(
-            "{name:<14} {instructions:>12} {bytes:>12} {:>10.1} {:>12.2} {:>14.2}",
+            "{name:<14} {instructions:>12} {bytes:>12} {:>10.1} {:>12.2} {:>14.2} {text:>12}",
             bytes / instructions,
             best.as_secs_f64(),
             best.as_secs_f64() * 1e6 / instructions

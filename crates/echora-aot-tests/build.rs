@@ -154,6 +154,41 @@ fn codesize(out_dir: &std::path::Path) {
                 ..EmitOptions::default()
             },
         ),
+        (
+            "fused_flags",
+            EmitOptions {
+                fused_flags: true,
+                ..EmitOptions::default()
+            },
+        ),
+        (
+            "whole_vector",
+            EmitOptions {
+                inline_vector: true,
+                whole_vector_checks: true,
+                ..EmitOptions::default()
+            },
+        ),
+        (
+            "fp_locals",
+            EmitOptions {
+                inline_vector: true,
+                whole_vector_checks: true,
+                fp_status_locals: true,
+                ..EmitOptions::default()
+            },
+        ),
+        // The set docs/codegen-speed.md recommends for the next rebuild.
+        (
+            "recommended",
+            EmitOptions {
+                inline_vector: true,
+                fused_flags: true,
+                whole_vector_checks: true,
+                fp_status_locals: true,
+                ..EmitOptions::default()
+            },
+        ),
     ];
     let dir = out_dir.join("codesize");
     std::fs::create_dir_all(&dir).expect("codesize directory");
