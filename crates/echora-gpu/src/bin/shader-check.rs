@@ -54,9 +54,12 @@ fn main() {
                 .and_then(<[u8]>::first_chunk::<4>)
                 .map(|b| u32::from_le_bytes(*b))
         };
-        let graphics = bytes
-            .first_chunk::<4>()
-            .is_some_and(|b| matches!(u32::from_le_bytes(*b) & 0x1f, 1 | 2));
+        // Compute programs have no header, so the first instruction can
+        // look like one: ECHORA_CHECK_COMPUTE=1 takes every stage as compute.
+        let graphics = std::env::var_os("ECHORA_CHECK_COMPUTE").is_none()
+            && bytes
+                .first_chunk::<4>()
+                .is_some_and(|b| matches!(u32::from_le_bytes(*b) & 0x1f, 1 | 2));
         if !graphics
             && let (Some(x), Some(y), Some(z)) =
                 (control_word(0x58), control_word(0x5c), control_word(0x60))
