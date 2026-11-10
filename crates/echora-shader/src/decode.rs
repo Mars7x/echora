@@ -528,9 +528,9 @@ pub enum Op {
         address: Address,
         size: u8,
         condition: Pred,
-        /// A strong (coherent) access, bits 77-80 5, 7 or 0xa (.STRONG at
-        /// CTA, GPU or system scope, as Mesa's NAK encodes them for SM 8.x;
-        /// 0 weak, 4 constant).
+        /// A strong access beyond the SM: bits 77-80 7 or 0xa (.STRONG.GPU
+        /// or .STRONG.SYS, as Mesa's NAK encodes them for SM 8.x; 5 is
+        /// .STRONG.SM, 0 weak, 4 constant).
         strong: bool,
     },
     /// STG / STS / STL [address], data; `strong` as LDG's.
@@ -1100,9 +1100,12 @@ pub fn decode_program(bytes: &[u8]) -> Vec<Instruction> {
         .collect()
 }
 
-/// A global access's memory order (bits 77-80) is strong.
+/// A global access's memory order (bits 77-80) is strong beyond the SM:
+/// 7 (.STRONG.GPU) or 0xa (.STRONG.SYS). 5 (.STRONG.SM, NAK's
+/// `Strong(CTA)`) is what compilers give ordinary accesses, ordered within
+/// the workgroup by its barriers; 0 weak, 4 constant.
 fn strong(word: Word) -> bool {
-    matches!(word.bits(77, 4), 5 | 7 | 0xa)
+    matches!(word.bits(77, 4), 7 | 0xa)
 }
 
 fn decode_op(word: Word, opcode: u16) -> Option<Op> {

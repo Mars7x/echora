@@ -40,7 +40,10 @@ fn access(strong: bool) -> u32 {
 
 /// Scopes and memory semantics for barriers.
 const SCOPE_WORKGROUP: u32 = 2;
-const ACQUIRE_RELEASE_WORKGROUP_MEMORY: u32 = 0x8 | 0x100;
+/// BAR orders every memory access in the workgroup (as PTX's bar.sync
+/// does): acquire-release over uniform (buffer and physical), workgroup
+/// and image memory.
+const ACQUIRE_RELEASE_WORKGROUP_MEMORY: u32 = 0x8 | 0x40 | 0x100 | 0x800;
 
 /// Words a load or store of memory type `size` moves (a sub-word access
 /// moves the word that holds it).

@@ -3124,7 +3124,7 @@ mod tests {
     #[test]
     fn strong_global_accesses_are_volatile() {
         // LDG.E.STRONG.GPU R2, [R4.64]; STG.E.STRONG.SYS [R4.64], R2;
-        // LDG.E R3, [R4.64] (weak)
+        // LDG.E.STRONG.SM R3, [R4.64] (the usual order: not volatile)
         let load = |order: u128, d: u128| {
             word(&[
                 (0, 12, 0x381),
@@ -3143,7 +3143,7 @@ mod tests {
             (73, 3, 4),
             (77, 4, 0xa),
         ]);
-        let words = [load(7, 2), store, load(0, 3), EXIT];
+        let words = [load(7, 2), store, load(5, 3), EXIT];
         assert!(matches!(decode(words[0]).op, Op::Load { strong: true, .. }));
         assert!(matches!(
             decode(words[1]).op,
