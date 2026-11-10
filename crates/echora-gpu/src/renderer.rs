@@ -1568,7 +1568,12 @@ impl Renderer {
         self.flushes += 1;
         self.work_items = 0;
         let labels = std::mem::take(&mut self.labels);
+        // The one before stays beside it (`.prev`): with two submissions in
+        // flight, a hang can be in either.
         if let Some(path) = std::env::var_os("ECHORA_LAST_SUBMIT") {
+            let mut previous = path.clone();
+            previous.push(".prev");
+            let _ = std::fs::rename(&path, previous);
             let _ = std::fs::write(path, labels.join("\n"));
         }
         // ECHORA_SUBMIT_LOG=<file> (debugging): every submission's labels
