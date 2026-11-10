@@ -2435,12 +2435,24 @@ impl Machine {
         } else {
             (1u64 << width) - 1
         };
+        let operand_width = match self.scalar(operand) {
+            Ty::Int { width, .. } | Ty::Float { width } => width,
+            _ => 32,
+        };
         let lanes = inputs.first().map_or(1, Vec::len);
         let mut result = Vec::with_capacity(lanes);
         for lane in 0..lanes {
             let x = |n: usize| inputs[n][lane.min(inputs[n].len() - 1)];
             let f = |n: usize| f32::from_bits(x(n) as u32);
             let i = |n: usize| x(n) as u32 as i32;
+            // An operand as a signed integer of its own width.
+            let signed = |value: u64| -> i64 {
+                if operand_width == 64 {
+                    value as i64
+                } else {
+                    i64::from(value as u32 as i32)
+                }
+            };
             let fb = |v: f32| u64::from(v.to_bits());
             let b = |v: bool| u64::from(v);
             let value = match opcode {
@@ -2512,10 +2524,10 @@ impl Machine {
                 op::U_LESS_THAN_EQUAL => b(x(0) <= x(1)),
                 op::U_GREATER_THAN => b(x(0) > x(1)),
                 op::U_GREATER_THAN_EQUAL => b(x(0) >= x(1)),
-                op::S_LESS_THAN => b(self.signed(x(0)) < self.signed(x(1))),
-                op::S_LESS_THAN_EQUAL => b(self.signed(x(0)) <= self.signed(x(1))),
-                op::S_GREATER_THAN => b(self.signed(x(0)) > self.signed(x(1))),
-                op::S_GREATER_THAN_EQUAL => b(self.signed(x(0)) >= self.signed(x(1))),
+                op::S_LESS_THAN => b(signed(x(0)) < signed(x(1))),
+                op::S_LESS_THAN_EQUAL => b(signed(x(0)) <= signed(x(1))),
+                op::S_GREATER_THAN => b(signed(x(0)) > signed(x(1))),
+                op::S_GREATER_THAN_EQUAL => b(signed(x(0)) >= signed(x(1))),
                 op::LOGICAL_AND => b(x(0) != 0 && x(1) != 0),
                 op::LOGICAL_OR => b(x(0) != 0 || x(1) != 0),
                 op::LOGICAL_NOT => b(x(0) == 0),
@@ -2545,21 +2557,38 @@ impl Machine {
                 op::F_UNORD_LESS_THAN_EQUAL => b(!(f(0) > f(1))),
                 op::F_UNORD_GREATER_THAN => b(!(f(0) <= f(1))),
                 op::F_UNORD_GREATER_THAN_EQUAL => b(!(f(0) < f(1))),
+                // To the result's width (32 or 64 bits); out of range is
+                // undefined in SPIR-V.
                 op::CONVERT_F_TO_U => {
                     let v = f(0);
-                    assert!(
-                        v.is_finite() && v > -1.0 && v < 4_294_967_296.0,
-                        "ConvertFToU of {v}"
-                    );
-                    u64::from(v as u32)
+                    let end = if width == 64 {
+                        18_446_744_073_709_551_616.0
+                    } else {
+                        4_294_967_296.0
+                    };
+                    assert!(v.is_finite() && v > -1.0 && v < end, "ConvertFToU of {v}");
+                    if width == 64 {
+                        v as u64
+                    } else {
+                        u64::from(v as u32)
+                    }
                 }
                 op::CONVERT_F_TO_S => {
                     let v = f(0);
+                    let end = if width == 64 {
+                        9_223_372_036_854_775_808.0
+                    } else {
+                        2_147_483_648.0
+                    };
                     assert!(
-                        v.is_finite() && (-2_147_483_648.0..2_147_483_648.0).contains(&v),
+                        v.is_finite() && (-end..end).contains(&v),
                         "ConvertFToS of {v}"
                     );
-                    u64::from(v as i32 as u32)
+                    if width == 64 {
+                        v as i64 as u64
+                    } else {
+                        u64::from(v as i32 as u32)
+                    }
                 }
                 op::CONVERT_U_TO_F => fb(x(0) as u32 as f32),
                 op::CONVERT_S_TO_F => fb(i(0) as f32),
@@ -2616,10 +2645,6 @@ impl Machine {
                 value
             })
             .collect()
-    }
-
-    fn signed(&self, value: u64) -> i64 {
-        value as u32 as i32 as i64
     }
 
     fn extended(&self, ty: u32, instruction: u32, inputs: &[Value]) -> Value {
@@ -5547,6 +5572,129 @@ mod tests {
         assert!(translate(1, Interpolation::Perspective).is_err());
         assert!(translate(2, Interpolation::Constant).is_err());
         assert!(translate(0, Interpolation::Perspective).is_ok());
+    }
+
+    #[test]
+    fn integer_and_float_conversions_round_and_saturate_by_their_modes() {
+        // An exact value rounded to f32 by mode (0 nearest even, 1 down, 2
+        // up, 3 toward zero).
+        let round = |x: f64, mode: u32| -> f32 {
+            let nearest = x as f32;
+            let step = |v: f32, up: bool| {
+                if up {
+                    if v == 0.0 {
+                        f32::from_bits(1)
+                    } else if v > 0.0 {
+                        f32::from_bits(v.to_bits() + 1)
+                    } else {
+                        f32::from_bits(v.to_bits() - 1)
+                    }
+                } else if v == 0.0 {
+                    -f32::from_bits(1)
+                } else if v > 0.0 {
+                    f32::from_bits(v.to_bits() - 1)
+                } else {
+                    f32::from_bits(v.to_bits() + 1)
+                }
+            };
+            let n = f64::from(nearest);
+            match mode {
+                1 if n > x => step(nearest, false),
+                2 if n < x => step(nearest, true),
+                3 if n.abs() > x.abs() => step(nearest, x < 0.0),
+                _ => nearest,
+            }
+        };
+        let list = values(48);
+        for &value in &list {
+            // I2F(.S/.U)(.size).rounding R1, R0 to F32.
+            for (signed, size) in [
+                (false, 2u32),
+                (true, 2),
+                (false, 1),
+                (true, 1),
+                (false, 0),
+                (true, 0),
+            ] {
+                for mode in 0..4u32 {
+                    let i2f = word(&[
+                        (0, 12, 0x306),
+                        (16, 8, 1),
+                        (32, 8, 0),
+                        (74, 1, u128::from(signed)),
+                        (75, 2, 2),
+                        (78, 2, u128::from(mode)),
+                        (84, 2, u128::from(size)),
+                    ]);
+                    let bits = 8 << size;
+                    let raw = if bits == 32 {
+                        value
+                    } else {
+                        value & ((1 << bits) - 1)
+                    };
+                    let exact = if signed {
+                        f64::from(((raw << (32 - bits)) as i32) >> (32 - bits))
+                    } else {
+                        f64::from(raw)
+                    };
+                    let (r, _) = run(&[value], &[i2f]);
+                    assert_eq!(
+                        r[&1],
+                        round(exact, mode).to_bits(),
+                        "I2F signed {signed} size {size} mode {mode}: {value:#x}"
+                    );
+                }
+            }
+        }
+        // F2I(.S32/.U32).rounding R1, R0 from F32: rounded, saturated, NaN 0.
+        let floats = [
+            0.5f32,
+            1.5,
+            2.5,
+            -0.5,
+            -1.5,
+            -2.7,
+            3.9,
+            1.0e10,
+            -1.0e10,
+            4_294_967_040.0,
+            -2_147_483_648.0,
+            2_147_483_520.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -0.0,
+            123_456.78,
+        ];
+        for &x in &floats {
+            for signed in [false, true] {
+                for mode in 0..4u32 {
+                    let f2i = word(&[
+                        (0, 12, 0x305),
+                        (16, 8, 1),
+                        (32, 8, 0),
+                        (72, 1, u128::from(signed)),
+                        (75, 2, 2),
+                        (78, 2, u128::from(mode)),
+                        (84, 2, 2),
+                    ]);
+                    let rounded = match mode {
+                        0 => x.round_ties_even(),
+                        1 => x.floor(),
+                        2 => x.ceil(),
+                        _ => x.trunc(),
+                    };
+                    // Rust's `as` saturates and sends NaN to 0.
+                    let expected = if signed {
+                        rounded as i32 as u32
+                    } else {
+                        rounded as u32
+                    };
+                    let (r, _) = run(&[x.to_bits()], &[f2i]);
+                    assert_eq!(r[&1], expected, "F2I signed {signed} mode {mode}: {x}");
+                }
+            }
+        }
     }
 
     #[test]
