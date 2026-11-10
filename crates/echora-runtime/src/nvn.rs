@@ -2578,6 +2578,20 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        // ECHORA_COMMAND_LOG=FROM-TO (debugging): each command executed
+        // while preparing presents FROM to TO, with its first arguments.
+        if let Ok(range) = debug_var("ECHORA_COMMAND_LOG")
+            && let Some((from, to)) = range.split_once('-')
+            && let (Ok(from), Ok(to)) = (from.parse::<u64>(), to.parse::<u64>())
+            && (from..=to).contains(&self.presented_frames)
+        {
+            eprintln!(
+                "command present {} {} x {:x?}",
+                self.presented_frames,
+                command.name.trim_start_matches("nvnCommandBuffer"),
+                &command.x[1..6]
+            );
+        }
         // A guest memory fault names the command that made it.
         self.execute_command(command, core)
             .map_err(|trap| match trap {
