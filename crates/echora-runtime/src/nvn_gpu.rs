@@ -3971,6 +3971,22 @@ impl Nvn {
         // A page under the largest span shared at once, so a chunk whose
         // file offset is not page-aligned still fits once rounded to pages.
         const CHUNK: u64 = (64 << 20) - PAGE_SIZE;
+        let traced = super::debug_var("ECHORA_POOL_TRACE")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        if let Some(traced) = traced {
+            eprintln!(
+                "pool trace page table (present {}): listed {:x?}, recorded {:x?}, generation {}",
+                self.presented_frames,
+                pools.iter().find(|pool| pool.0 == traced),
+                self.gpu
+                    .as_ref()
+                    .and_then(|backend| backend.shared_pools.get(&traced)),
+                self.gpu
+                    .as_ref()
+                    .map_or(0, |backend| backend.share_generation),
+            );
+        }
         for (base, size, gpu, flags) in pools {
             let host_visible = flags & 6 != 0;
             // A pool shared in pieces: each piece, in chunks.
@@ -4405,6 +4421,30 @@ impl Nvn {
         };
         if backend.renderer.gpu.dma_buf_import.is_none() {
             return;
+        }
+        // ECHORA_POOL_TRACE=<guest base> (debugging): that pool's sharing,
+        // at each present and each page table build.
+        let traced = super::debug_var("ECHORA_POOL_TRACE")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        if let Some(traced) = traced {
+            let object = self.objects.values().find(|object| {
+                object.kind == "MemoryPool"
+                    && object.builder.get("Storage").map(|storage| storage.x[0]) == Some(traced)
+            });
+            eprintln!(
+                "pool trace present {}: object {}, storage {:x?}, recorded {:x?}, pieces {}, whole span {:x?}",
+                self.presented_frames,
+                object.is_some(),
+                object
+                    .and_then(|object| object.builder.get("Storage"))
+                    .map(|storage| (storage.x[0], storage.x[1])),
+                backend.shared_pools.get(&traced),
+                backend.shared_pieces.contains_key(&traced),
+                object
+                    .and_then(|object| object.builder.get("Storage"))
+                    .and_then(|storage| core.memory.shared_span(storage.x[0], storage.x[1])),
+            );
         }
         let pools: Vec<(u64, u64)> = self
             .objects
