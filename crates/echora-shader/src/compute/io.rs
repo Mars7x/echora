@@ -177,6 +177,13 @@ impl Emitter {
         let variable = self.module.global_variable(pointer, storage::OUTPUT);
         self.module
             .decorate(variable, decoration::BUILT_IN, &[builtin]);
+        if builtin == BUILTIN_POSITION {
+            // The same guest math in two programs (a depth prepass and
+            // its lit pass) must give the same position, as on the
+            // console: every float operation is NoContraction, and the
+            // position invariant.
+            self.module.decorate(variable, decoration::INVARIANT, &[]);
+        }
         self.io.builtin_outputs.insert(builtin, variable);
         self.interface.push(variable);
         variable

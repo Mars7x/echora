@@ -229,6 +229,7 @@ pub mod decoration {
     pub const BLOCK: u32 = 2;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const NO_CONTRACTION: u32 = 42;
+    pub const INVARIANT: u32 = 18;
     pub const NON_UNIFORM: u32 = 5300;
     pub const BUILT_IN: u32 = 11;
     pub const BINDING: u32 = 33;

@@ -551,6 +551,9 @@ impl Emitter {
                         let variable = self.output_array(vec4, mesh.max_vertices);
                         self.module
                             .decorate(variable, decoration::BUILT_IN, &[BUILTIN_POSITION]);
+                        // Invariant, as a vertex program's (a depth
+                        // prepass and its lit pass agree).
+                        self.module.decorate(variable, decoration::INVARIANT, &[]);
                         variable
                     });
                     Some((variable, Some((address - 0x70) / 4)))

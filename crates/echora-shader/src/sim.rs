@@ -5217,6 +5217,17 @@ mod tests {
         let translated = crate::compute::translate(&code, &layout).unwrap();
         assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
         let machine = Machine::new(&translated.spirv);
+        // The position is Invariant (OpDecorate %position Invariant).
+        let position = machine
+            .builtins
+            .iter()
+            .find(|&(_, &builtin)| builtin == 0)
+            .map(|(&variable, _)| variable)
+            .unwrap();
+        let words = &translated.spirv;
+        assert!(words.windows(3).any(|w| {
+            w[0] == (3 << 16 | u32::from(op::DECORATE)) && w[1] == position && w[2] == 18
+        }));
         let report = machine.simulate(&Inputs {
             workgroup_count: [1, 1, 1],
             ..Inputs::default()
