@@ -108,6 +108,10 @@ pub struct Backend {
     /// (see `Renderer::import_file`), by guest base: size, file and the
     /// file offset of the base. Learned at presents (`share_new_pools`).
     shared_pools: HashMap<u64, (u64, i32, u64)>,
+    /// Pools no single span shares (some pages unmapped, or their backing
+    /// not contiguous): the pieces that are, by pool base, as (offset,
+    /// length, file, offset in the file).
+    shared_pieces: HashMap<u64, Vec<(u64, u64, i32, u64)>>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -181,6 +185,7 @@ impl Backend {
             page_table_writes: false,
             resident: HashMap::new(),
             shared_pools: HashMap::new(),
+            shared_pieces: HashMap::new(),
             target_index: HashMap::new(),
             target_index_stamp: None,
         }))
@@ -3923,10 +3928,9 @@ impl Nvn {
         // when a pool is shared (one made between presents is mapped from
         // the next present on) or the pools change (`pool_epoch`), not by
         // walking the objects on every dispatch.
-        let shared = self
-            .gpu
-            .as_ref()
-            .map_or(0, |backend| backend.shared_pools.len());
+        let shared = self.gpu.as_ref().map_or(0, |backend| {
+            backend.shared_pools.len() + backend.shared_pieces.len()
+        });
         let key = (shared, self.pool_epoch);
         if let Some((built, table)) = self.gpu.as_ref().and_then(|backend| backend.page_table)
             && built == key
@@ -3962,6 +3966,38 @@ impl Nvn {
         const CHUNK: u64 = 64 << 20;
         for (base, size, gpu, flags) in pools {
             let host_visible = flags & 6 != 0;
+            // A pool shared in pieces: each piece, in chunks.
+            let pieces = self
+                .gpu
+                .as_ref()
+                .and_then(|backend| backend.shared_pieces.get(&base))
+                .filter(|_| host_visible)
+                .cloned();
+            if let Some(pieces) = pieces {
+                for (piece_offset, piece_length, file, at) in pieces {
+                    let mut done = 0;
+                    while done < piece_length {
+                        let length = (piece_length - done).min(CHUNK);
+                        let address = self.gpu.as_mut().unwrap().renderer.address_span(
+                            file,
+                            at + done,
+                            length,
+                        )?;
+                        if let Some(address) = address {
+                            let first_page = (gpu + piece_offset + done) >> PAGE_SHIFT;
+                            for page in 0..length.div_ceil(PAGE_SIZE) {
+                                if let Some(entry) =
+                                    entries.get_mut((first_page + page - first) as usize)
+                                {
+                                    *entry = address + page * PAGE_SIZE;
+                                }
+                            }
+                        }
+                        done += length;
+                    }
+                }
+                continue;
+            }
             let mut offset = 0;
             while offset < size {
                 let length = (size - offset).min(CHUNK);
@@ -4306,7 +4342,10 @@ impl Nvn {
                     .map(|storage| (storage.x[0], storage.x[1]))
             })
             .filter(|&(base, size)| {
-                base != 0 && size != 0 && !backend.shared_pools.contains_key(&base)
+                base != 0
+                    && size != 0
+                    && !backend.shared_pools.contains_key(&base)
+                    && !backend.shared_pieces.contains_key(&base)
             })
             .collect();
         for (base, size) in pools {
@@ -4316,7 +4355,31 @@ impl Nvn {
                     .unwrap()
                     .shared_pools
                     .insert(base, (size, file, offset));
+                continue;
             }
+            // Page by page: runs of pages whose backing follows on.
+            use echora_shader_abi::PAGE_SIZE;
+            let mut pieces: Vec<(u64, u64, i32, u64)> = Vec::new();
+            let mut offset = 0;
+            while offset < size {
+                let length = (size - offset).min(PAGE_SIZE);
+                if let Some((file, at)) = core.memory.shared_span(base + offset, length) {
+                    match pieces.last_mut() {
+                        Some(last)
+                            if last.2 == file
+                                && last.0 + last.1 == offset
+                                && last.3 + last.1 == at =>
+                        {
+                            last.1 += length;
+                        }
+                        _ => pieces.push((offset, length, file, at)),
+                    }
+                }
+                offset += length;
+            }
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat("stat: pools shared in pieces", 1);
+            backend.shared_pieces.insert(base, pieces);
         }
     }
 
