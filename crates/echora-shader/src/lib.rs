@@ -9,6 +9,8 @@
 pub mod compute;
 pub mod decode;
 pub mod header;
+#[cfg(test)]
+mod interp;
 pub mod spirv;
 
 pub use decode::{Instruction, Op, decode, decode_program};

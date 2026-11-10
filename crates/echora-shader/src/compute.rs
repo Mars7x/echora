@@ -187,6 +187,25 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
 /// Translates a compute program (its instructions from the first one) with
 /// workgroup size `workgroup`.
 pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Unsupported> {
+    Ok(emit(code, layout)?.finish())
+}
+
+/// A translation, the variables of its general registers and those of its
+/// predicates (for tests that run it).
+#[cfg(test)]
+pub(crate) type WithRegisters = (Translated, BTreeMap<u8, u32>, BTreeMap<u8, u32>);
+
+#[cfg(test)]
+pub(crate) fn translate_with_registers(
+    code: &[Instruction],
+    layout: &Layout,
+) -> Result<WithRegisters, Unsupported> {
+    let emitter = emit(code, layout)?;
+    let (registers, predicates) = (emitter.registers.clone(), emitter.predicates.clone());
+    Ok((emitter.finish(), registers, predicates))
+}
+
+fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     if code.is_empty() {
         return Err(unsupported(0, "empty program"));
     }
@@ -203,7 +222,7 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
         emitter.program(code, &blocks)?;
     }
     emitter.mesh_end()?;
-    Ok(emitter.finish())
+    Ok(emitter)
 }
 
 mod fetch;
