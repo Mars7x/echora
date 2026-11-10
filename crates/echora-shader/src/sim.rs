@@ -140,6 +140,9 @@ pub struct Inputs {
     pub memory: BTreeMap<u64, Vec<u8>>,
     /// Bound textures and images by (descriptor set, binding).
     pub images: HashMap<(u32, u32), Image>,
+    /// Elements of image arrays (the texture pool) by (descriptor set,
+    /// binding, element), sampled and queried only.
+    pub image_arrays: HashMap<(u32, u32, u32), Image>,
     /// Specialization constants' values by SpecId (else their defaults).
     pub specialization: HashMap<u32, u32>,
     /// Iterations of one loop by one invocation that count as running
@@ -278,6 +281,7 @@ struct Shared {
     variables: HashMap<u32, Value>,
     memory: BTreeMap<u64, Vec<u8>>,
     images: HashMap<(u32, u32), Image>,
+    image_arrays: HashMap<(u32, u32, u32), Image>,
     problems: Vec<String>,
     notes: Vec<String>,
     loop_limit: u32,
@@ -692,7 +696,7 @@ impl Machine {
     }
 
     /// The slots of a value of type `ty` read from `bytes` at `at` (zeros
-    /// past their end).
+    /// past their end; a runtime array as long as they reach).
     fn fill(&self, ty: u32, bytes: &[u8], at: usize, slots: &mut Value) {
         match self.ty(ty) {
             Ty::Vector { component, count } => {
@@ -712,7 +716,13 @@ impl Machine {
                     self.fill(member, bytes, at + self.member_offset(ty, n as u32), slots);
                 }
             }
-            Ty::RuntimeArray { .. } => {}
+            // As many elements as the bytes hold.
+            Ty::RuntimeArray { element } => {
+                let stride = self.stride(ty, element).max(1);
+                for n in 0..bytes.len().saturating_sub(at).div_ceil(stride) {
+                    self.fill(element, bytes, at + n * stride, slots);
+                }
+            }
             _ => {
                 let size = self.scalar_bytes(ty);
                 let mut value = 0u64;
@@ -857,6 +867,7 @@ impl Machine {
             variables: HashMap::new(),
             memory: inputs.memory.clone(),
             images: inputs.images.clone(),
+            image_arrays: inputs.image_arrays.clone(),
             problems: Vec::new(),
             notes: Vec::new(),
             uniform_reads: std::collections::BTreeSet::new(),
@@ -1407,6 +1418,18 @@ impl Machine {
         ))
     }
 
+    /// The (set, binding, element) of an image array's element: its
+    /// handle is the array variable and the element's index.
+    fn array_element(&self, handle: &Value) -> Option<(u32, u32, u32)> {
+        let variable = *handle.first()? as u32;
+        let element = *handle.get(1)? as u32;
+        Some((
+            self.sets.get(&variable).copied().unwrap_or(0),
+            *self.bindings.get(&variable)?,
+            element,
+        ))
+    }
+
     /// An image type's dimension and arrayed flag (through a sampled
     /// image type).
     fn image_shape(&self, ty: u32) -> (u32, bool) {
@@ -1748,9 +1771,13 @@ impl Machine {
                 | op::IMAGE_QUERY_SIZE_LOD
                 | op::IMAGE_QUERY_LEVELS => {
                     let image_type = invocation.value_types[&args[0]];
-                    let image = self
-                        .bound_image(&value(0))
-                        .and_then(|key| shared.images.get(&key).cloned());
+                    let handle = value(0);
+                    let image = match self.bound_image(&handle) {
+                        Some(key) => shared.images.get(&key).cloned(),
+                        None => self
+                            .array_element(&handle)
+                            .and_then(|key| shared.image_arrays.get(&key).cloned()),
+                    };
                     match image {
                         Some(image) => {
                             let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
@@ -1762,10 +1789,7 @@ impl Machine {
                             self.image_read(opcode, image_type, &image, &coordinate, component, ty)
                         }
                         None => {
-                            shared.note(
-                                "reads of textures without dumped data (and texture pool \
-                                 entries) give zeros",
-                            );
+                            shared.note("reads of textures without dumped data give zeros");
                             vec![0; self.size(ty)]
                         }
                     }
@@ -3342,6 +3366,304 @@ mod tests {
         ]);
         let (registers, _) = run(&[0x3c01_3c01, 0x3c01_3c01, 0xbc02_bc02], &[fma]);
         assert_eq!(registers[&3], 0x0010_0010);
+    }
+
+    #[test]
+    fn texture_samples_write_their_components_in_mask_order() {
+        // TEX.LZ (2D, handle c[0x0][0x40]) with x in R0, y in R1, d = R4,
+        // a second destination R8 (or RZ), a mask and packed halves.
+        let sample = |mask: u8, d2: u8, half: bool| {
+            word(&[
+                (0, 12, 0xb60),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 1),
+                (40, 14, 0x10),
+                (54, 5, 0),
+                (61, 3, 1),
+                (64, 8, u128::from(d2)),
+                (72, 4, u128::from(mask)),
+                (79, 1, u128::from(half)),
+                (81, 3, 7),
+                (87, 3, 1),
+            ])
+        };
+        // A 4 x 4 texture whose texel (x, y) holds 1 + x + 4y + 0.25c in
+        // component c (exact in halves).
+        let component = |x: u32, y: u32, c: u32| 1.0 + (x + 4 * y) as f32 + 0.25 * c as f32;
+        let texels: Vec<[u32; 4]> = (0..16u32)
+            .map(|n| [0, 1, 2, 3].map(|c| component(n % 4, n / 4, c).to_bits()))
+            .collect();
+        for mask in 1..16u8 {
+            for d2 in [255u8, 8] {
+                for half in [false, true] {
+                    let program = [
+                        mov(0, 0.625f32.to_bits()),
+                        mov(1, 0.375f32.to_bits()),
+                        sample(mask, d2, half),
+                        EXIT,
+                    ];
+                    let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+                    let layout = Layout::workgroup([1, 1, 1]);
+                    let (translated, registers, _) =
+                        translate_with_registers(&code, &layout).unwrap();
+                    let texture = translated
+                        .descriptors
+                        .iter()
+                        .find(|d| d.cbuf_offset == 0x40)
+                        .unwrap();
+                    let inputs = Inputs {
+                        workgroup_count: [1, 1, 1],
+                        images: HashMap::from([(
+                            (0, texture.binding),
+                            Image {
+                                width: 4,
+                                height: 4,
+                                depth: 1,
+                                layers: 1,
+                                texels: texels.clone(),
+                            },
+                        )]),
+                        ..Inputs::default()
+                    };
+                    let machine = Machine::new(&translated.spirv);
+                    let report = machine.simulate(&inputs);
+                    assert!(report.problems.is_empty(), "{:?}", report.problems);
+                    let variables = &report.invocations[0];
+                    let register = |n: u8| registers.get(&n).map(|v| variables[v][0] as u32);
+                    // Texel (2, 1): the components in mask order, packed
+                    // in pairs when half; the third and fourth words go to
+                    // R8 when it is a destination.
+                    let mut words: Vec<u32> = (0..4u32)
+                        .filter(|c| mask >> c & 1 != 0)
+                        .map(|c| component(2, 1, c).to_bits())
+                        .collect();
+                    if half {
+                        words = words
+                            .chunks(2)
+                            .map(|pair| {
+                                let h = |bits: u32| u32::from(f32_to_f16(f32::from_bits(bits)));
+                                h(pair[0]) | pair.get(1).map_or(0, |&b| h(b)) << 16
+                            })
+                            .collect();
+                    }
+                    for (n, &expected) in words.iter().enumerate() {
+                        let target = if d2 == 255 || n < 2 {
+                            4 + n as u8
+                        } else {
+                            d2 + n as u8 - 2
+                        };
+                        assert_eq!(
+                            register(target),
+                            Some(expected),
+                            "mask {mask:#x} d2 {d2} half {half}: word {n}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn divergent_branches_match_a_per_invocation_model() {
+        // LOP3.LUT Rd, Ra, imm, RZ, a & b.
+        let and = |d: u128, a: u128, imm: u32| {
+            word(&[
+                (0, 12, 0x812),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 32, u128::from(imm)),
+                (64, 8, 255),
+                (72, 8, 0xc0),
+                (81, 3, 7),
+            ])
+        };
+        let program = [
+            // 0: S2R R0, SR_TID.X; 1: R2 = R0 & 7
+            word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]),
+            and(2, 0, 7),
+            // 2: ISETP.LT P0, R1, R2; 3: @!P0 BRA 7
+            less(0, 1, 2),
+            bra(3, 7, 8),
+            // 4: R1 += 1; 5: R3 += 3; 6: BRA 2
+            add(1, 1, 1),
+            add(3, 3, 3),
+            bra(6, 2, 7),
+            // 7: R4 = R0 & 1; 8: ISETP.LT P1, RZ, R4; 9: @P1 BRA 11
+            and(4, 0, 1),
+            less(1, 255, 4),
+            bra(9, 11, 1),
+            // 10: R3 += 100; 11: R3 += 1
+            add(3, 3, 100),
+            add(3, 3, 1),
+        ];
+        // Two subgroups, the second partly filled.
+        let (registers, _, problems) = run_group(40, &[], &program);
+        assert!(problems.is_empty(), "{problems:?}");
+        for (n, registers) in registers.iter().enumerate() {
+            let n = n as u32;
+            // The same control flow, run for one invocation.
+            let mut r3 = 0;
+            for _ in 0..n & 7 {
+                r3 += 3;
+            }
+            if n & 1 == 0 {
+                r3 += 100;
+            }
+            r3 += 1;
+            assert_eq!(registers[&1], n & 7, "invocation {n}: iterations");
+            assert_eq!(registers[&3], r3, "invocation {n}");
+        }
+    }
+
+    #[test]
+    fn texture_queries_give_the_bound_texture_s_dimensions() {
+        // TXQ R4, (handle c[0x0][0x40]), level R0 = 0, a mask.
+        let query = |mask: u8| {
+            word(&[
+                (0, 12, 0xb6f),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 255),
+                (40, 14, 0x10),
+                (54, 5, 0),
+                (64, 8, 255),
+                (72, 4, u128::from(mask)),
+            ])
+        };
+        // Width, height, depth (1 for a 2D texture) and level count.
+        let expected = [6u32, 8, 1, 1];
+        for mask in 1..16u8 {
+            let code: Vec<_> = [mov(0, 0), query(mask), EXIT]
+                .iter()
+                .map(|&raw| decode(raw))
+                .collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let texture = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, texture.binding),
+                    Image {
+                        width: 6,
+                        height: 8,
+                        depth: 1,
+                        layers: 1,
+                        texels: vec![[0; 4]; 48],
+                    },
+                )]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let written: Vec<u32> = (0..4)
+                .filter(|c| mask >> c & 1 != 0)
+                .map(|c| expected[c])
+                .collect();
+            for (n, &value) in written.iter().enumerate() {
+                let variable = registers[&(4 + n as u8)];
+                assert_eq!(
+                    report.invocations[0][&variable][0] as u32, value,
+                    "mask {mask:#x}: word {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bindless_samples_read_the_texture_pool_entry_their_handle_names() {
+        use echora_shader_abi::{
+            SAMPLER_INDEX_SHIFT, TEXTURE_POOL_CAPACITY_SPEC_ID, TEXTURE_POOL_SET, texture_pool,
+        };
+        // TEX.B.LZ R4, R0 (x, y in R0 and R1), R2 (the handle), 2D, xyzw.
+        let sample = word(&[
+            (0, 12, 0x361),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (59, 1, 1),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        // Entries 5 and 6 of the pool's 2D views: 2 x 2 textures whose
+        // texel (x, y) holds the entry, x, y and 7 as floats.
+        let entry = |index: u32| Image {
+            width: 2,
+            height: 2,
+            depth: 1,
+            layers: 1,
+            texels: (0..4u32)
+                .map(|n| [index as f32, (n % 2) as f32, (n / 2) as f32, 7.0].map(f32::to_bits))
+                .collect(),
+        };
+        let image_arrays = HashMap::from([
+            ((TEXTURE_POOL_SET, texture_pool::SAMPLED_2D, 5), entry(5)),
+            ((TEXTURE_POOL_SET, texture_pool::SAMPLED_2D, 6), entry(6)),
+            // Entry 6's unsigned view, read when its flag says integer.
+            (
+                (TEXTURE_POOL_SET, texture_pool::UINT_2D, 6),
+                Image {
+                    width: 2,
+                    height: 2,
+                    depth: 1,
+                    layers: 1,
+                    texels: (0..4u32).map(|n| [60, 61, 62, 60 + n]).collect(),
+                },
+            ),
+        ]);
+        let float = |values: [f32; 4]| values.map(f32::to_bits);
+        // (handle, the pool's capacity, whether entry 6 is integer, the
+        // texel expected at (1, 0)).
+        let cases = [
+            (
+                5 | 3 << SAMPLER_INDEX_SHIFT,
+                16,
+                false,
+                float([5.0, 1.0, 0.0, 7.0]),
+            ),
+            (6, 16, false, float([6.0, 1.0, 0.0, 7.0])),
+            (6, 16, true, [60, 61, 62, 61]),
+            // Past the capacity: zeros.
+            (6, 6, false, [0; 4]),
+        ];
+        for (handle, capacity, integer, expected) in cases {
+            // The flags buffer: a word per entry, bit 0 for integer.
+            let flags: Vec<u8> = (0..16u32)
+                .flat_map(|n| u32::from(integer && n == 6).to_le_bytes())
+                .collect();
+            let program = [
+                mov(0, 0.75f32.to_bits()),
+                mov(1, 0.25f32.to_bits()),
+                mov(2, handle),
+                sample,
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                image_arrays: image_arrays.clone(),
+                uniforms: HashMap::from([((TEXTURE_POOL_SET, texture_pool::FLAGS), flags)]),
+                specialization: HashMap::from([(TEXTURE_POOL_CAPACITY_SPEC_ID, capacity)]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            for (n, value) in expected.iter().enumerate() {
+                let variable = registers[&(4 + n as u8)];
+                assert_eq!(
+                    report.invocations[0][&variable][0] as u32, *value,
+                    "handle {handle:#x} capacity {capacity} integer {integer}: component {n}"
+                );
+            }
+        }
     }
 
     #[test]
