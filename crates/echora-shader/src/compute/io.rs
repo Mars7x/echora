@@ -35,12 +35,16 @@ const DECORATION_NO_PERSPECTIVE: u32 = 13;
 const DECORATION_FLAT: u32 = 14;
 const DECORATION_CENTROID: u32 = 16;
 const DECORATION_LOCATION: u32 = 30;
+const DECORATION_COMPONENT: u32 = 31;
 
 /// A program's inputs and outputs so far.
 #[derive(Debug, Default)]
 pub(super) struct Io {
     /// Generic input and output vectors, by location.
     inputs: BTreeMap<u32, u32>,
+    /// Fragment inputs of a vector whose components the header interpolates
+    /// differently: one scalar per component, by (location, component).
+    component_inputs: BTreeMap<(u32, u32), u32>,
     outputs: BTreeMap<u32, u32>,
     /// Built-in outputs, by built-in.
     builtin_outputs: BTreeMap<u32, u32>,
@@ -81,24 +85,8 @@ impl Emitter {
         self.module
             .decorate(variable, DECORATION_LOCATION, &[location]);
         if !output && self.stage == Stage::Fragment {
-            // The interpolation the header gives the vector's components
-            // (the first one used).
-            let mode = self.header.map_or(Interpolation::Perspective, |header| {
-                (0..4)
-                    .map(|c| header.imap[(location * 4 + c) as usize])
-                    .find(|&mode| mode != Interpolation::Unused)
-                    .unwrap_or(Interpolation::Perspective)
-            });
-            match mode {
-                Interpolation::Constant => {
-                    self.module.decorate(variable, DECORATION_FLAT, &[]);
-                }
-                Interpolation::ScreenLinear => {
-                    self.module
-                        .decorate(variable, DECORATION_NO_PERSPECTIVE, &[]);
-                }
-                _ => {}
-            }
+            let mode = self.vector_mode(location);
+            self.decorate_interpolation(variable, mode);
         }
         self.interface.push(variable);
         if output {
@@ -106,6 +94,77 @@ impl Emitter {
         } else {
             self.io.inputs.insert(location, variable);
         }
+        variable
+    }
+
+    /// The interpolation the header gives a fragment input vector's
+    /// components (the first one used; perspective when none is).
+    fn vector_mode(&self, location: u32) -> Interpolation {
+        self.header.map_or(Interpolation::Perspective, |header| {
+            (0..4)
+                .map(|c| header.imap[(location * 4 + c) as usize])
+                .find(|&mode| mode != Interpolation::Unused)
+                .unwrap_or(Interpolation::Perspective)
+        })
+    }
+
+    /// Whether the header interpolates a fragment input vector's used
+    /// components in more than one way (it maps each component apart).
+    fn mixed_vector(&self, location: u32) -> bool {
+        let Some(header) = self.header.filter(|_| self.stage == Stage::Fragment) else {
+            return false;
+        };
+        let used: Vec<Interpolation> = (0..4)
+            .map(|c| header.imap[(location * 4 + c) as usize])
+            .filter(|&mode| mode != Interpolation::Unused)
+            .collect();
+        used.windows(2).any(|pair| pair[0] != pair[1])
+    }
+
+    /// The interpolation a fragment input component is declared with:
+    /// its own in a mixed vector, else its vector's.
+    fn declared_mode(&self, location: u32, component: u32) -> Interpolation {
+        let own = self
+            .header
+            .map(|header| header.imap[(location * 4 + component) as usize])
+            .filter(|&mode| mode != Interpolation::Unused);
+        match own {
+            Some(mode) if self.mixed_vector(location) => mode,
+            _ => self.vector_mode(location),
+        }
+    }
+
+    fn decorate_interpolation(&mut self, variable: u32, mode: Interpolation) {
+        match mode {
+            Interpolation::Constant => {
+                self.module.decorate(variable, DECORATION_FLAT, &[]);
+            }
+            Interpolation::ScreenLinear => {
+                self.module
+                    .decorate(variable, DECORATION_NO_PERSPECTIVE, &[]);
+            }
+            _ => {}
+        }
+    }
+
+    /// Component `component` of a mixed fragment input vector, as a scalar
+    /// input of its own (Location and Component) with its interpolation.
+    fn component_input(&mut self, location: u32, component: u32) -> u32 {
+        if let Some(&variable) = self.io.component_inputs.get(&(location, component)) {
+            return variable;
+        }
+        let pointer = self.module.pointer(storage::INPUT, self.f32);
+        let variable = self.module.global_variable(pointer, storage::INPUT);
+        self.module
+            .decorate(variable, DECORATION_LOCATION, &[location]);
+        self.module
+            .decorate(variable, DECORATION_COMPONENT, &[component]);
+        let mode = self.declared_mode(location, component);
+        self.decorate_interpolation(variable, mode);
+        self.interface.push(variable);
+        self.io
+            .component_inputs
+            .insert((location, component), variable);
         variable
     }
 
@@ -147,13 +206,22 @@ impl Emitter {
             }
             (_, 0x80..=0x27f) => {
                 let location = (address - 0x80) / 16;
-                let variable = self.generic(location, false);
+                let mixed = self.mixed_vector(location);
+                let variable = if mixed {
+                    self.component_input(location, word)
+                } else {
+                    self.generic(location, false)
+                };
                 if centroid && !self.io.centroid.contains(&variable) {
                     self.module.decorate(variable, DECORATION_CENTROID, &[]);
                     self.io.centroid.push(variable);
                 }
                 self.io.loaded_generics |= 1 << location;
-                let pointer = self.component_pointer(variable, storage::INPUT, word);
+                let pointer = if mixed {
+                    variable
+                } else {
+                    self.component_pointer(variable, storage::INPUT, word)
+                };
                 let value = self.value(op::LOAD, self.f32, &[pointer]);
                 self.value(op::BITCAST, self.u32, &[value])
             }
@@ -323,10 +391,10 @@ impl Emitter {
         if !(0x80..0x280).contains(&address) {
             return value;
         }
-        let mode = self.header.map_or(Interpolation::Perspective, |header| {
-            header.imap[usize::from((address - 0x80) / 4)]
-        });
-        if !matches!(mode, Interpolation::Perspective | Interpolation::Unused) {
+        // As the input is declared (what Vulkan delivered).
+        let component = u32::from((address - 0x80) / 4);
+        let mode = self.declared_mode(component / 4, component % 4);
+        if mode != Interpolation::Perspective {
             return value;
         }
         let vec4 = self.vec4();

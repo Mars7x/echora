@@ -36,6 +36,7 @@ const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
+const DECORATION_COMPONENT: u32 = 31;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
 const DECORATION_OFFSET: u32 = 35;
@@ -304,6 +305,9 @@ pub struct Machine {
     /// Input and output variables' Locations (a fragment program's
     /// attributes and colours), by variable id.
     pub locations: HashMap<u32, u32>,
+    /// Their first Components (a scalar input of one component of a
+    /// location), by variable id.
+    components: HashMap<u32, u32>,
     /// The OpString of the translation's guest instruction lines.
     step_file: Option<u32>,
 }
@@ -559,6 +563,7 @@ impl Machine {
             cooperative: false,
             names: BTreeMap::new(),
             locations: HashMap::new(),
+            components: HashMap::new(),
             step_file: None,
         };
         let mut entry = 0;
@@ -605,6 +610,9 @@ impl Machine {
                         }
                         DECORATION_LOCATION => {
                             machine.locations.insert(target, value);
+                        }
+                        DECORATION_COMPONENT => {
+                            machine.components.insert(target, value);
                         }
                         DECORATION_ARRAY_STRIDE => {
                             machine.strides.insert(target, value);
@@ -1231,13 +1239,17 @@ impl Machine {
                 let located = (class == storage::INPUT)
                     .then(|| self.locations.get(&variable))
                     .flatten()
-                    .and_then(|location| locations.get(location));
+                    .and_then(|location| locations.get(location))
+                    .map(|value| {
+                        let first = self.components.get(&variable).copied().unwrap_or(0);
+                        value.get(first as usize..).unwrap_or_default().to_vec()
+                    });
                 let mut value = self
                     .builtins
                     .get(&variable)
                     .and_then(|builtin| builtins.get(builtin))
-                    .or(located)
                     .cloned()
+                    .or(located)
                     .unwrap_or_else(|| vec![0; self.size(pointee)]);
                 value.resize(self.size(pointee), 0);
                 variables.insert(variable, value);
@@ -4964,6 +4976,60 @@ mod tests {
             let r1 = report.invocations[0][&registers[&1]][0] as u32;
             assert_eq!(f32::from_bits(r1), expected, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn a_vector_mixing_interpolations_reads_each_component_as_its_own() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // IPA R1, a[0x80]; IPA R2, a[0x84]: x perspective, y screen-linear.
+        let ipa = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+            ])
+        };
+        let code: Vec<_> = [ipa(1, 0x80), ipa(2, 0x84), EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let mut imap = [Interpolation::Unused; 128];
+        imap[0] = Interpolation::Perspective;
+        imap[1] = Interpolation::ScreenLinear;
+        let layout = Layout {
+            stage: Stage::Fragment,
+            header: Some(Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            }),
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        // Two scalar inputs at location 0, components 0 and 1, the second
+        // NoPerspective.
+        let machine = Machine::new(&translated.spirv);
+        assert_eq!(machine.locations.values().filter(|&&l| l == 0).count(), 2);
+        let bits = |values: [f32; 4]| values.iter().map(|v| u64::from(v.to_bits())).collect();
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            builtins: HashMap::from([(15, bits([0.5, 0.5, 0.5, 0.25]))]),
+            locations: HashMap::from([(0, bits([2.0, 3.0, 0.0, 0.0]))]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
+        // x: 2.0 * 1/w; y: as delivered.
+        assert_eq!((read(1), read(2)), (0.5, 3.0));
     }
 
     #[test]
