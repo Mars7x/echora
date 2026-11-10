@@ -4287,17 +4287,9 @@ impl Nvn {
                     .gpu_to_guest(gpu, length)
                     .ok()
                     .and_then(|guest| core.memory.shared_span(guest, length));
-                let bytes = match shared {
-                    Some((file, at)) => {
-                        use std::os::unix::fs::FileExt as _;
-                        let mut bytes = vec![0u8; length as usize];
-                        std::fs::File::open(format!("/proc/self/fd/{file}"))
-                            .and_then(|file| file.read_exact_at(&mut bytes, at))
-                            .ok()
-                            .map(|()| bytes)
-                    }
-                    None => self.gpu_bytes(core, gpu, length).ok(),
-                };
+                let bytes = shared
+                    .and_then(|(file, at)| read_file_range(file, at, length))
+                    .or_else(|| self.gpu_bytes(core, gpu, length).ok());
                 if let Some(bytes) = bytes {
                     write(format!("memory-{base:x}.bin"), &bytes)?;
                 }
@@ -6281,4 +6273,22 @@ mod vertex_format_tests {
         assert_eq!(decoded(50), None); // DEPTH16
         assert_eq!(decoded(66), None); // BC1
     }
+}
+
+/// `length` bytes of the file behind descriptor `file` at `at` (debugging
+/// dumps), read without touching any mapping of it.
+#[cfg(unix)]
+fn read_file_range(file: i32, at: u64, length: u64) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+    let mut bytes = vec![0u8; length as usize];
+    std::fs::File::open(format!("/proc/self/fd/{file}"))
+        .and_then(|file| file.read_exact_at(&mut bytes, at))
+        .ok()?;
+    Some(bytes)
+}
+
+/// Elsewhere the caller reads through guest memory instead.
+#[cfg(not(unix))]
+fn read_file_range(_file: i32, _at: u64, _length: u64) -> Option<Vec<u8>> {
+    None
 }

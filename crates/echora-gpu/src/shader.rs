@@ -51,13 +51,15 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
         matrix_mode: match MATRIX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             1 => echora_shader_abi::MatrixMode::Cooperative,
             2 => echora_shader_abi::MatrixMode::Exact,
+            3 => echora_shader_abi::MatrixMode::Cooperative32,
             _ => echora_shader_abi::MatrixMode::Subgroup,
         },
         mesh: parameters.mesh,
     }
 }
 
-/// HMMA's translation (0 subgroup, 1 cooperative, 2 exact), from
+/// HMMA's translation (0 subgroup, 1 cooperative, 2 exact, 3 cooperative
+/// with 32-bit fragment scratch), from
 /// ECHORA_HMMA when the device allows it (`Gpu::new`).
 static MATRIX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -81,6 +83,7 @@ pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) 
     let mode = match std::env::var("ECHORA_HMMA").as_deref() {
         Ok("exact") => 2,
         Ok("subgroup") => 0,
+        Ok("coop32") if cooperative => 3,
         _ if cooperative => 1,
         _ => 0,
     };
