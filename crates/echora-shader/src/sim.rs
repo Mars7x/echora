@@ -3194,6 +3194,156 @@ mod tests {
         }
     }
 
+    /// The half nearest `value` (ties to an even significand), found among
+    /// the finite halves rather than by the simulator's own conversion.
+    fn nearest_half(halves: &[(f64, u16)], value: f64) -> u16 {
+        if value.is_nan() {
+            return 0x7e00;
+        }
+        // Beyond 65504 + half an ulp (32) rounds to infinity.
+        if value.abs() >= 65520.0 {
+            return if value > 0.0 { 0x7c00 } else { 0xfc00 };
+        }
+        let at = halves.partition_point(|&(h, _)| h < value);
+        let candidates = [at.checked_sub(1), Some(at)];
+        let mut best: Option<(f64, u16)> = None;
+        for &(h, bits) in candidates.iter().flatten().filter_map(|&i| halves.get(i)) {
+            let distance = (h - value).abs();
+            best = match best {
+                Some((d, b)) if d < distance || (d == distance && b & 1 == 0) => Some((d, b)),
+                _ => Some((distance, bits)),
+            };
+        }
+        let bits = best.unwrap().1;
+        // Zero keeps the sign of what rounded to it.
+        if bits & 0x7fff == 0 && value.is_sign_negative() {
+            0x8000
+        } else {
+            bits
+        }
+    }
+
+    #[test]
+    fn half_adds_multiplies_and_fused_multiply_adds_round_once() {
+        // Every finite half but -0, sorted.
+        let mut halves: Vec<(f64, u16)> = (0u16..0x7c00)
+            .chain(0x8001..0xfc00)
+            .map(|bits| (f64::from(f16_to_f32(bits)), bits))
+            .collect();
+        halves.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let value = |bits: u16| f64::from(f16_to_f32(bits));
+        // Halves whose magnitudes lie in [2^-10, 2^10] (so a * b + c is
+        // exact in f64), zeros, and halves near the top of the range.
+        let mut state = 0x2545_f491u32;
+        let mut list: Vec<u16> = vec![0x0000, 0x8000, 0x3c00, 0xbc00, 0x7bff, 0x3555, 0xc0f3];
+        while list.len() < 40 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let exponent = 5 + (state >> 8) % 21; // biased 5..=25
+            list.push(((state >> 16) & 0x8000 | exponent << 10 | state & 0x3ff) as u16);
+        }
+        // A source's two halves after its swizzle, absolute value and
+        // negation: the pair (0), the low half (2) or the high half (3).
+        let operand = |word: u32, swizzle: u32, abs: bool, neg: bool| -> [f64; 2] {
+            let (low, high) = (word as u16, (word >> 16) as u16);
+            let pair = match swizzle {
+                0 => [low, high],
+                2 => [low, low],
+                _ => [high, high],
+            };
+            pair.map(|h| {
+                let h = if abs { h & 0x7fff } else { h };
+                value(if neg { h ^ 0x8000 } else { h })
+            })
+        };
+        let pack = |pair: [u16; 2]| u32::from(pair[0]) | u32::from(pair[1]) << 16;
+        let mut case = 0u32;
+        for window in list.windows(6).step_by(2) {
+            let a = pack([window[0], window[1]]);
+            let b = pack([window[2], window[3]]);
+            let c = pack([window[4], window[5]]);
+            for (swizzles, modifiers) in [
+                (0u32, 0u32),
+                (0x2_3, 0b01_10),
+                (0x3_2, 0b10_01),
+                (0x0_0, 0b11_11),
+            ] {
+                case += 1;
+                let (sa, sb) = (swizzles >> 4 & 3, swizzles & 3);
+                let (abs_a, neg_a) = (modifiers & 8 != 0, modifiers & 4 != 0);
+                let (abs_b, neg_b) = (modifiers & 2 != 0, modifiers & 1 != 0);
+                let saturate = case.is_multiple_of(3);
+                let x = operand(a, sa, abs_a, neg_a);
+                let y = operand(b, sb, abs_b, neg_b);
+                let z = operand(c, 0, false, case.is_multiple_of(2));
+                let fields = |opcode: u128| {
+                    vec![
+                        (0, 12, opcode),
+                        (16, 8, 3),
+                        (24, 8, 0),
+                        (32, 8, 1),
+                        (60, 2, u128::from(sb)),
+                        (62, 1, u128::from(abs_b)),
+                        (63, 1, u128::from(neg_b)),
+                        (72, 1, u128::from(neg_a)),
+                        (73, 1, u128::from(abs_a)),
+                        (74, 2, u128::from(sa)),
+                        (77, 1, u128::from(saturate)),
+                    ]
+                };
+                let finish = |exact: [f64; 2]| {
+                    pack(exact.map(|v| {
+                        let v = if saturate { v.clamp(0.0, 1.0) } else { v };
+                        // Saturation sends -0 (and NaN) to +0.
+                        let v = if saturate && (v == 0.0 || v.is_nan()) {
+                            0.0
+                        } else {
+                            v
+                        };
+                        nearest_half(&halves, v)
+                    }))
+                };
+                let mut fma = fields(0x231);
+                fma.extend([(64, 8, 2), (84, 1, u128::from(case.is_multiple_of(2)))]);
+                let checks = [
+                    (
+                        "HADD2",
+                        word(&fields(0x230)),
+                        finish([x[0] + y[0], x[1] + y[1]]),
+                    ),
+                    (
+                        "HMUL2",
+                        word(&fields(0x232)),
+                        finish([x[0] * y[0], x[1] * y[1]]),
+                    ),
+                    (
+                        "HFMA2",
+                        word(&fma),
+                        finish([x[0] * y[0] + z[0], x[1] * y[1] + z[1]]),
+                    ),
+                ];
+                for (name, instruction, expected) in checks {
+                    let (registers, _) = run(&[a, b, c], &[instruction]);
+                    assert_eq!(
+                        registers[&3], expected,
+                        "{name} {a:#010x} {b:#010x} {c:#010x} swizzles {swizzles:#x} \
+                         modifiers {modifiers:#06b} saturate {saturate}"
+                    );
+                }
+            }
+        }
+        // (1 + 2^-10)^2 - (1 + 2^-9) is 2^-20 fused, 0 if the product
+        // were rounded first.
+        let fma = word(&[
+            (0, 12, 0x231),
+            (16, 8, 3),
+            (24, 8, 0),
+            (32, 8, 1),
+            (64, 8, 2),
+        ]);
+        let (registers, _) = run(&[0x3c01_3c01, 0x3c01_3c01, 0xbc02_bc02], &[fma]);
+        assert_eq!(registers[&3], 0x0010_0010);
+    }
+
     #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
