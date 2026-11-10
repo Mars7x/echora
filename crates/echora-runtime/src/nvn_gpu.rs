@@ -3129,6 +3129,8 @@ impl Nvn {
         }
         let mut storage = HashMap::new();
         let mut storage_in_place = HashMap::new();
+        // Each storage binding's GPU range (ECHORA_DUMP_DISPATCH).
+        let mut storage_ranges = Vec::new();
         let mut written_back = Vec::new();
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
@@ -3185,6 +3187,7 @@ impl Nvn {
                         c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
                     }
                     let guest = self.gpu_to_guest(base, length)?;
+                    storage_ranges.push((descriptor.binding, base, length));
                     // ECHORA_GPU_STORAGE_PROBE=<program key> (debugging): each
                     // storage buffer that program binds, its flags and the
                     // path it takes, at every 300th present.
@@ -3535,7 +3538,8 @@ impl Nvn {
             Vec::new()
         };
         // ECHORA_DUMP_DISPATCH=<program key>[,...] (debugging): the first
-        // dispatch of each listed program, for the workgroup simulator.
+        // dispatch of each listed program, for the workgroup simulator
+        // (`dump_dispatch`).
         if let Some(keys) = super::debug_var_os("ECHORA_DUMP_DISPATCH") {
             let wanted = keys
                 .to_string_lossy()
@@ -3549,11 +3553,15 @@ impl Nvn {
                     &stage.spirv,
                     groups,
                     &uniforms,
-                    &storage,
+                    &storage_ranges,
                     page_table,
                 ) {
                     self.gpu_note(format!("dispatch dump {:016x}: {error}", key.0));
                 }
+            }
+            // ECHORA_DUMP_ONLY: listed programs are dumped, never run.
+            if wanted && super::debug_var_os("ECHORA_DUMP_ONLY").is_some() {
+                return Ok(());
             }
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -3902,7 +3910,7 @@ impl Nvn {
         spirv: &[u32],
         groups: [u32; 3],
         uniforms: &HashMap<u32, Vec<u8>>,
-        storage: &HashMap<u32, Vec<u8>>,
+        storage: &[(u32, u64, u64)],
         page_table: echora_shader_abi::PageTable,
     ) -> Result<(), String> {
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
@@ -3939,8 +3947,13 @@ impl Nvn {
         for (binding, bytes) in uniforms {
             write(format!("uniform-0-{binding}.bin"), bytes)?;
         }
-        for (binding, bytes) in storage {
-            write(format!("storage-0-{binding}.bin"), bytes)?;
+        // Storage buffers as guest memory holds them now, from their
+        // 16-byte aligned start (the translation's offsets count from it).
+        for &(binding, base, length) in storage {
+            write(
+                format!("storage-0-{binding}.bin"),
+                &self.gpu_bytes(core, base, length)?,
+            )?;
         }
         let entries = self.gpu.as_ref().unwrap().renderer.page_table_entries();
         if page_table.address == 0 || entries.is_empty() {
