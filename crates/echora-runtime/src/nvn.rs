@@ -2646,6 +2646,9 @@ impl Nvn {
         match command.name.as_str() {
             "nvnCommandBufferSetRenderEnable" => {
                 self.render.render_enable = (command.x[1] & 0xff == 0).then_some((2, 0));
+                if self.gpu().is_some() {
+                    self.gpu_clear_condition();
+                }
                 return Ok(());
             }
             "nvnCommandBufferSetRenderEnableConditional" => {
@@ -2666,7 +2669,20 @@ impl Nvn {
                         word(command.x[2] + 16)
                     );
                 }
-                self.render.render_enable = Some((command.x[1] & 0xffff_ffff, command.x[2]));
+                let (mode, address) = (command.x[1] & 0xffff_ffff, command.x[2]);
+                // On the GPU when the counter is a measured report there;
+                // else (counters the CPU wrote) evaluated here.
+                let on_gpu = self.gpu().is_some()
+                    && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_none()
+                    && self.gpu_condition(core, mode, address).map_err(|message| {
+                        Trap::UnsupportedService {
+                            pc: core.cpu.pc,
+                            service: "nvn".into(),
+                            command_id: None,
+                            message: format!("{}: {message}", command.name),
+                        }
+                    })?;
+                self.render.render_enable = (!on_gpu).then_some((mode, address));
                 return Ok(());
             }
             name if (name.starts_with("nvnCommandBufferDraw")
@@ -3078,9 +3094,10 @@ impl Nvn {
             }
             // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU
             // writes a 16-byte report, a u64 counter then a u64 GPU
-            // timestamp (NVNcounterData; layout inferred from NVN1). Counts
-            // are not measured: 0, or SAMPLES_PASSED's approximation under
-            // ECHORA_OCCLUSION_ASSUME_VISIBLE; the timestamp is the physical counter,
+            // timestamp (NVNcounterData; layout inferred from NVN1).
+            // SAMPLES_PASSED is measured on the GPU (occlusion queries) where
+            // a resident pool holds the report, else written here like the
+            // other counters (0); the timestamp is the physical counter,
             // the domain nvnDeviceGetCurrentTimestampInNanoseconds converts.
             "nvnCommandBufferReportCounter" => {
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -3088,6 +3105,17 @@ impl Nvn {
                 }
                 let to = self.gpu_to_guest(command.x[2], 16).map_err(stop)?;
                 let timestamp = core.counter;
+                // SAMPLES_PASSED, measured with occlusion queries: the GPU
+                // writes the report in command order.
+                if command.x[1] & 0xffff_ffff == 1
+                    && self.gpu().is_some()
+                    && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_none()
+                    && self
+                        .gpu_samples_report(core, command.x[2], timestamp)
+                        .map_err(stop)?
+                {
+                    return Ok(());
+                }
                 let mut report = [0u8; 16];
                 if command.x[1] & 0xffff_ffff == 1 {
                     report[..8].copy_from_slice(&self.render.samples_passed.to_le_bytes());
@@ -3097,10 +3125,16 @@ impl Nvn {
                 Ok(())
             }
             // ResetCounter(cmd, NVNcounterType): sets that counter to 0 (only
-            // SAMPLES_PASSED, 1, is counted; others report 0).
+            // SAMPLES_PASSED, 1, is counted: on the GPU, or approximated
+            // under ECHORA_OCCLUSION_ASSUME_VISIBLE).
             "nvnCommandBufferResetCounter" => {
                 if command.x[1] & 0xffff_ffff == 1 {
                     self.render.samples_passed = 0;
+                    if self.gpu().is_some()
+                        && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_none()
+                    {
+                        self.gpu_samples_reset().map_err(stop)?;
+                    }
                 }
                 Ok(())
             }

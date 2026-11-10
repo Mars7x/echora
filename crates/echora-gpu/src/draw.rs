@@ -810,6 +810,7 @@ impl Renderer {
             _ => None,
         };
         let area = draw.fixed.scissor;
+        self.apply_condition()?;
         self.begin_rendering(
             &draw.colors,
             &draw.color_levels,

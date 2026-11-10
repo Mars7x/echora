@@ -104,6 +104,9 @@ pub struct Backend {
     /// Storage buffers kept on the GPU between dispatches (when guest
     /// memory cannot be imported), by guest address: see `Resident`.
     resident: HashMap<u64, ResidentPool>,
+    /// GPU addresses SAMPLES_PASSED reports were written to on the GPU
+    /// (`gpu_samples_report`): conditions on them are evaluated there.
+    samples_reports: std::collections::HashSet<u64>,
     /// Memory pools the GPU can read in place through guest memory's file
     /// (see `Renderer::import_file`), by guest base: size, file and the
     /// file offset of the base. Learned at presents (`share_new_pools`).
@@ -187,6 +190,7 @@ impl Backend {
             in_place_writes: Vec::new(),
             page_table_writes: false,
             resident: HashMap::new(),
+            samples_reports: std::collections::HashSet::new(),
             shared_pools: HashMap::new(),
             shared_pieces: HashMap::new(),
             share_generation: 0,
@@ -5018,6 +5022,81 @@ impl Nvn {
                 .upload_resident(base, range.start - base, &bytes)?;
         }
         Ok(Some((buffer, guest - base)))
+    }
+
+    /// ResetCounter(SAMPLES_PASSED) on the GPU (`Renderer::samples_reset`).
+    pub(super) fn gpu_samples_reset(&mut self) -> Result<(), String> {
+        self.gpu.as_mut().unwrap().renderer.samples_reset()
+    }
+
+    /// ReportCounter(SAMPLES_PASSED, `address`) on the GPU, into the device
+    /// copy of the resident pool holding the address (later CPU reads of
+    /// it store that back). False when no pool holds it.
+    pub(super) fn gpu_samples_report(
+        &mut self,
+        core: &mut Guest,
+        address: u64,
+        timestamp: u64,
+    ) -> Result<bool, String> {
+        let guest = self.gpu_to_guest(address, 16)?;
+        let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 16)? else {
+            return Ok(false);
+        };
+        let backend = self.gpu.as_mut().unwrap();
+        backend.renderer.samples_report(buffer, offset, timestamp)?;
+        if let Some(pool) = backend
+            .resident
+            .values_mut()
+            .find(|pool| pool.base <= guest && guest + 16 <= pool.base + pool.size)
+        {
+            add_range(&mut pool.gpu_dirty, guest..guest + 16);
+        }
+        backend.samples_reports.insert(address);
+        Ok(true)
+    }
+
+    /// SetRenderEnableConditional(`mode`, `address`) on the GPU when the
+    /// counter there is a SAMPLES_PASSED report (`gpu_samples_report`) and
+    /// the one 16 bytes on is CPU memory holding 0, as the game's
+    /// occlusion conditions are: rendering then holds while the report's
+    /// count is nonzero (mode 1, differ) or zero (mode 0, equal), read on
+    /// the GPU in command order. False otherwise (the CPU evaluates it).
+    pub(super) fn gpu_condition(
+        &mut self,
+        core: &mut Guest,
+        mode: u64,
+        address: u64,
+    ) -> Result<bool, String> {
+        let backend = self.gpu.as_ref().unwrap();
+        if backend.renderer.supports_conditions()
+            && backend.samples_reports.contains(&address)
+            && !backend.samples_reports.contains(&(address + 16))
+            && mode <= 1
+        {
+            let other = self.gpu_to_guest(address + 16, 8)?;
+            if core
+                .memory
+                .read_u64(other)
+                .map_err(|trap| format!("{trap:?}"))?
+                == 0
+            {
+                let guest = self.gpu_to_guest(address, 8)?;
+                if let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 8)? {
+                    let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+                    renderer.set_condition(Some((buffer, offset, mode == 0)));
+                    return Ok(true);
+                }
+            }
+        }
+        self.gpu_clear_condition();
+        Ok(false)
+    }
+
+    /// Rendering is no longer gated on the GPU.
+    pub(super) fn gpu_clear_condition(&mut self) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.renderer.set_condition(None);
+        }
     }
 
     /// Store deferred dispatch results (storage copied back from the GPU)

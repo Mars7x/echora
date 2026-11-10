@@ -299,6 +299,12 @@ pub struct Renderer {
     pub hazard_barriers: u64,
     /// GPU time per submission (ECHORA_GPU_TIME=1).
     timer: Option<crate::timing::GpuTimer>,
+    /// The SAMPLES_PASSED counter and its occlusion queries, once used.
+    pub(crate) occlusion: Option<crate::occlusion::Occlusion>,
+    /// The condition draws and dispatches are gated on (`set_condition`):
+    /// wanted, and active in the command buffer being recorded.
+    condition: Option<(vk::Buffer, u64, bool)>,
+    condition_active: bool,
     /// A failure that must end the run rather than skip one draw (an upload
     /// over MAX_UPLOAD_BYTES): the runtime takes it after each draw and
     /// dispatch and stops with it.
@@ -372,7 +378,7 @@ fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, St
     Ok(descriptor_pool)
 }
 
-fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
+pub(crate) fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
     move |error| format!("{context}: {error}")
 }
 
@@ -523,6 +529,9 @@ impl Renderer {
             spare,
             current_in_flight: false,
             submitted_labels: Vec::new(),
+            occlusion: None,
+            condition: None,
+            condition_active: false,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -531,6 +540,12 @@ impl Renderer {
             | vk::BufferUsageFlags::INDIRECT_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
+        // Render conditions are read from a ring copy (`apply_condition`).
+        let usage = if renderer.gpu.conditional_rendering.is_some() {
+            usage | vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT
+        } else {
+            usage
+        };
         // Addressable, where the device allows: vertex fetch tables are
         // read through their device address.
         let addressable = renderer.gpu.buffer_device_address;
@@ -539,7 +554,7 @@ impl Renderer {
         Ok(renderer)
     }
 
-    fn device(&self) -> &ash::Device {
+    pub(crate) fn device(&self) -> &ash::Device {
         &self.gpu.device
     }
 
@@ -593,8 +608,113 @@ impl Renderer {
                     )
                 };
             }
+            self.occlusion_after_begin(self.commands);
         }
         Ok(self.commands)
+    }
+
+    /// Whether render conditions can be evaluated on the GPU
+    /// (VK_EXT_conditional_rendering).
+    pub fn supports_conditions(&self) -> bool {
+        self.gpu.conditional_rendering.is_some()
+    }
+
+    /// The fences of the two submission slots (they keep their handles
+    /// when the slots swap), and the current one's.
+    pub(crate) fn slot_fences(&self) -> [vk::Fence; 2] {
+        [self.fence, self.spare.fence]
+    }
+
+    pub(crate) fn current_fence(&self) -> vk::Fence {
+        self.fence
+    }
+
+    /// Gate the draws and dispatches recorded from now on on the 32-bit
+    /// word at `offset` in `buffer` (the guest memory's device copy): they
+    /// run while it is nonzero, or zero when `inverted`; None: always.
+    /// The word is copied into the ring when gating starts (the GPU's
+    /// value then, in command order) and conditional rendering begins
+    /// outside a rendering pass, before the next draw or dispatch.
+    pub fn set_condition(&mut self, condition: Option<(vk::Buffer, u64, bool)>) {
+        if self.condition != condition {
+            self.end_condition();
+            self.condition = condition;
+        }
+    }
+
+    /// Begin the wanted condition if it is not active (before recording a
+    /// draw or dispatch; ends an open rendering pass to do so).
+    pub(crate) fn apply_condition(&mut self) -> Result<(), String> {
+        let Some((buffer, offset, inverted)) = self.condition else {
+            return Ok(());
+        };
+        if self.condition_active {
+            return Ok(());
+        }
+        let Some(conditional) = self.gpu.conditional_rendering.clone() else {
+            return Ok(());
+        };
+        let (ring, at) = self.ring_upload(&[0; 4], 4)?;
+        let commands = self.commands()?;
+        let copy = vk::BufferCopy {
+            src_offset: offset,
+            dst_offset: at,
+            size: 4,
+        };
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
+        let begin = vk::ConditionalRenderingBeginInfoEXT::default()
+            .buffer(ring)
+            .offset(at)
+            .flags(if inverted {
+                vk::ConditionalRenderingFlagsEXT::INVERTED
+            } else {
+                vk::ConditionalRenderingFlagsEXT::empty()
+            });
+        // SAFETY: recording, outside rendering; the ranges exist.
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(commands, buffer, ring, &[copy]);
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+            (conditional.fp().cmd_begin_conditional_rendering_ext)(commands, &begin);
+        }
+        self.condition_active = true;
+        Ok(())
+    }
+
+    /// End the active condition (outside a rendering pass).
+    fn end_condition(&mut self) {
+        if !self.condition_active {
+            return;
+        }
+        self.end_pass();
+        if let Some(conditional) = self.gpu.conditional_rendering.as_ref() {
+            // SAFETY: recording; conditional rendering was begun outside a
+            // pass in this command buffer, and the pass just ended.
+            unsafe { (conditional.fp().cmd_end_conditional_rendering_ext)(self.commands) };
+        }
+        self.condition_active = false;
     }
 
     /// Copy `bytes` into the ring at an `alignment`-aligned offset, flushing
@@ -864,6 +984,8 @@ impl Renderer {
     /// under the work being recorded (its set would be stale and its data
     /// overwritten).
     pub(crate) fn reserve(&mut self, bytes: u64, descriptors: [u32; 4]) -> Result<(), String> {
+        // Room for the render condition's word too (`apply_condition`).
+        let bytes = bytes + if self.condition.is_some() { 16 } else { 0 };
         if bytes > RING_SIZE {
             return Err(format!("{bytes} bytes of uploads exceed the ring"));
         }
@@ -1723,6 +1845,8 @@ impl Renderer {
             }
         }
         self.submitted_labels = labels;
+        self.end_condition();
+        self.occlusion_before_submit(self.commands);
         if let Some(timer) = &self.timer {
             timer.end(&self.gpu.device, self.commands, self.fence);
         }
@@ -4236,6 +4360,9 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.flush();
+        if let Some(occlusion) = self.occlusion.take() {
+            occlusion.destroy(&self.gpu.device);
+        }
         if let Some(timer) = self.timer.take() {
             timer.destroy(&self.gpu.device);
         }
