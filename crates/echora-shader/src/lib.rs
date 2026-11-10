@@ -9,8 +9,8 @@
 pub mod compute;
 pub mod decode;
 pub mod header;
-#[cfg(test)]
-mod interp;
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
 pub mod spirv;
 
 pub use decode::{Instruction, Op, decode, decode_program};

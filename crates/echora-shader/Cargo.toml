@@ -8,8 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The workgroup simulator (`sim`) for local tools.
+sim = []
+
 [dependencies]
 echora-shader-abi.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "simulate"
+required-features = ["sim"]

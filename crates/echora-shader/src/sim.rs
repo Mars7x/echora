@@ -1,73 +1,148 @@
-//! A SPIR-V interpreter for tests: it runs a translated program's entry
-//! point for one invocation, over the scalar and vector arithmetic the
-//! translator emits for ALU instructions, and reports its function
-//! variables' final values (the registers). Anything outside that subset,
-//! and anything SPIR-V leaves undefined that the program then uses (a
-//! shift by the width or more, a float conversion out of range), panics,
-//! so a test sees it rather than a guessed value.
+//! A SPIR-V simulator for translated compute programs: it runs every
+//! invocation of a workgroup on the CPU, over the subset of SPIR-V the
+//! translator emits, and reports what would go wrong on a GPU: loops that
+//! run away, barriers some invocations miss or that invocations reach at
+//! different places (a deadlock), reads and writes of device memory no
+//! dumped region covers (a fault), indices past an array, shuffles from
+//! lanes that are not running there, and anything SPIR-V leaves undefined
+//! that a program uses (a shift by the width or more, a float conversion
+//! out of range). It also gives every invocation's final variables, which
+//! the tests use as the registers.
+//!
+//! Invocations run one at a time until each reaches a barrier or a
+//! subgroup operation; a subgroup operation completes when every running
+//! invocation of its subgroup is at it, a barrier when every running
+//! invocation of its scope is. Global memory is the dumped regions of
+//! device memory, addressed through physical pointers as the program
+//! computes them (its page table is in those regions too).
 
 // The unordered comparisons are the negated ordered ones: true on NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::spirv::{glsl, op};
+use crate::spirv::{glsl, op, storage};
 
-/// OpFConvert, OpQuantizeToF16 are not in `op`.
+/// OpFConvert is not in `op`.
 const F_CONVERT: u16 = 115;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Decorations read here.
+const DECORATION_ARRAY_STRIDE: u32 = 6;
+const DECORATION_BUILT_IN: u32 = 11;
+const DECORATION_BINDING: u32 = 33;
+const DECORATION_DESCRIPTOR_SET: u32 = 34;
+const DECORATION_OFFSET: u32 = 35;
+
+/// Built-ins the simulator provides.
+const BUILTIN_NUM_WORKGROUPS: u32 = 24;
+const BUILTIN_WORKGROUP_ID: u32 = 26;
+const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
+const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
+const BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29;
+const BUILTIN_SUBGROUP_SIZE: u32 = 36;
+const BUILTIN_NUM_SUBGROUPS: u32 = 38;
+const BUILTIN_SUBGROUP_ID: u32 = 40;
+const BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
+const BUILTIN_SUBGROUP_EQ_MASK: u32 = 4416;
+
+/// The execution mode LocalSize.
+const EXECUTION_LOCAL_SIZE: u32 = 17;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Ty {
     Void,
     Bool,
     Int { width: u32, signed: bool },
     Float { width: u32 },
     Vector { component: u32, count: u32 },
+    Array { element: u32, length: u32 },
+    RuntimeArray { element: u32 },
+    Struct { members: Vec<u32> },
     Pointer { pointee: u32 },
     Other,
 }
 
-/// A value: one 64-bit slot per component (bits of the component's type).
-type Value = Vec<u64>;
+/// A value: one 64-bit slot per scalar (its bits), flattened.
+pub type Value = Vec<u64>;
 
-/// A pointer: a variable and, for a component of a vector variable, its
-/// index.
+/// A pointer: slots of a variable, or bytes of device memory.
 #[derive(Clone, Copy, Debug)]
-struct Pointer {
-    variable: u32,
-    component: Option<usize>,
+enum Pointer {
+    Logical {
+        variable: u32,
+        offset: usize,
+        pointee: u32,
+    },
+    Physical {
+        address: u64,
+        pointee: u32,
+    },
 }
 
+#[derive(Debug)]
 struct Instruction {
     opcode: u16,
     operands: Vec<u32>,
 }
 
-pub(crate) struct Machine {
+/// What a workgroup runs with.
+#[derive(Clone, Debug, Default)]
+pub struct Inputs {
+    /// The workgroup's id and the dispatch's workgroup counts.
+    pub workgroup_id: [u32; 3],
+    pub workgroup_count: [u32; 3],
+    /// Invocations per subgroup (32 when 0).
+    pub subgroup_size: u32,
+    /// The push constants' bytes.
+    pub push: Vec<u8>,
+    /// Uniform buffers' bytes by (descriptor set, binding).
+    pub uniforms: HashMap<(u32, u32), Vec<u8>>,
+    /// Device memory: regions by their first address.
+    pub memory: BTreeMap<u64, Vec<u8>>,
+    /// Iterations of one loop by one invocation that count as running
+    /// away (1 << 16 when 0).
+    pub loop_limit: u32,
+}
+
+/// What a workgroup's run left.
+#[derive(Debug)]
+pub struct Report {
+    /// Each invocation's variables, by id.
+    pub invocations: Vec<HashMap<u32, Value>>,
+    /// The workgroup barriers passed: the instruction's index in the entry
+    /// function and the invocations still running.
+    pub barriers: Vec<(usize, usize)>,
+    /// What went wrong, in order.
+    pub problems: Vec<String>,
+    /// What is worth knowing but works on the hardware (a barrier met
+    /// after whole subgroups returned).
+    pub notes: Vec<String>,
+    /// Device memory after the run.
+    pub memory: BTreeMap<u64, Vec<u8>>,
+}
+
+/// A loaded module.
+#[derive(Debug)]
+pub struct Machine {
     types: HashMap<u32, Ty>,
-    /// The result type of each id that has one.
+    /// The result type of each constant.
     result_types: HashMap<u32, u32>,
     constants: HashMap<u32, Value>,
-    /// Built-in input variables by id: their decoration, for `inputs`.
+    /// Decorations: built-ins, descriptor sets and bindings by variable;
+    /// array strides by type; member offsets by (struct, member).
     builtins: HashMap<u32, u32>,
-    /// The entry function's instructions.
+    sets: HashMap<u32, u32>,
+    bindings: HashMap<u32, u32>,
+    strides: HashMap<u32, u32>,
+    offsets: HashMap<(u32, u32), u32>,
+    /// Module-level variables: (id, pointer type, storage class).
+    globals: Vec<(u32, u32, u32)>,
+    /// The entry function's instructions and its labels' places.
     body: Vec<Instruction>,
     labels: HashMap<u32, usize>,
     glsl: u32,
-}
-
-/// What a run left: the entry function's variables, by id.
-pub(crate) struct Finished {
-    pub(crate) variables: HashMap<u32, Value>,
-}
-
-/// What a workgroup's run left: each invocation's variables, the
-/// barriers passed (instruction, invocations still running), and what
-/// went wrong.
-pub(crate) struct Workgroup {
-    pub(crate) invocations: Vec<HashMap<u32, Value>>,
-    pub(crate) barriers: Vec<(usize, usize)>,
-    pub(crate) problems: Vec<String>,
+    /// The workgroup size (LocalSize).
+    pub local_size: [u32; 3],
 }
 
 /// One invocation's state.
@@ -76,11 +151,63 @@ struct Invocation {
     values: HashMap<u32, Value>,
     value_types: HashMap<u32, u32>,
     pointers: HashMap<u32, Pointer>,
+    /// Its own variables (function, private, input, output).
     variables: HashMap<u32, Value>,
-    /// Built-in inputs, by variable.
-    globals: HashMap<u32, Value>,
+    /// Loop headers passed, by instruction.
+    loops: HashMap<usize, u32>,
     done: bool,
-    steps: u32,
+    steps: u64,
+}
+
+/// What a workgroup shares: its shared, uniform and push-constant
+/// variables, device memory and the problems found.
+struct Shared {
+    variables: HashMap<u32, Value>,
+    memory: BTreeMap<u64, Vec<u8>>,
+    problems: Vec<String>,
+    notes: Vec<String>,
+    loop_limit: u32,
+}
+
+impl Shared {
+    fn problem(&mut self, problem: String) {
+        if self.problems.len() < 64 && !self.problems.contains(&problem) {
+            self.problems.push(problem);
+        }
+    }
+
+    /// The region holding `count` bytes at `address`, and the offset there.
+    fn region(&mut self, address: u64, count: usize) -> Option<(u64, usize)> {
+        let (&base, bytes) = self.memory.range(..=address).next_back()?;
+        let offset = (address - base) as usize;
+        (offset + count <= bytes.len()).then_some((base, offset))
+    }
+
+    fn read(&mut self, address: u64, count: usize) -> Vec<u8> {
+        match self.region(address, count) {
+            Some((base, offset)) => self.memory[&base][offset..offset + count].to_vec(),
+            None => {
+                self.problem(format!(
+                    "read of {count} bytes at {address:#x}, outside the dumped memory (a fault)"
+                ));
+                vec![0; count]
+            }
+        }
+    }
+
+    fn write(&mut self, address: u64, bytes: &[u8]) {
+        match self.region(address, bytes.len()) {
+            Some((base, offset)) => {
+                if let Some(region) = self.memory.get_mut(&base) {
+                    region[offset..offset + bytes.len()].copy_from_slice(bytes);
+                }
+            }
+            None => self.problem(format!(
+                "write of {} bytes at {address:#x}, outside the dumped memory (a fault)",
+                bytes.len()
+            )),
+        }
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -168,29 +295,58 @@ fn f32_to_f16(value: f32) -> u16 {
 }
 
 impl Machine {
-    pub(crate) fn new(words: &[u32]) -> Self {
+    pub fn new(words: &[u32]) -> Self {
         let mut machine = Self {
             types: HashMap::new(),
             result_types: HashMap::new(),
             constants: HashMap::new(),
             builtins: HashMap::new(),
+            sets: HashMap::new(),
+            bindings: HashMap::new(),
+            strides: HashMap::new(),
+            offsets: HashMap::new(),
+            globals: Vec::new(),
             body: Vec::new(),
             labels: HashMap::new(),
             glsl: 0,
+            local_size: [1, 1, 1],
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
         let mut at = 5;
         while at < words.len() {
             let opcode = (words[at] & 0xffff) as u16;
-            let count = (words[at] >> 16) as usize;
-            let operands = words[at + 1..at + count].to_vec();
+            let count = ((words[at] >> 16) as usize).max(1);
+            let operands = words[at + 1..(at + count).min(words.len())].to_vec();
             at += count;
             match opcode {
                 op::EXT_INST_IMPORT => machine.glsl = operands[0],
                 op::ENTRY_POINT => entry = operands[1],
-                op::DECORATE if operands[1] == 11 => {
-                    machine.builtins.insert(operands[0], operands[2]);
+                op::EXECUTION_MODE if operands[1] == EXECUTION_LOCAL_SIZE => {
+                    machine.local_size = [operands[2], operands[3], operands[4]];
+                }
+                op::DECORATE => {
+                    let (target, value) = (operands[0], operands.get(2).copied().unwrap_or(0));
+                    match operands[1] {
+                        DECORATION_BUILT_IN => {
+                            machine.builtins.insert(target, value);
+                        }
+                        DECORATION_DESCRIPTOR_SET => {
+                            machine.sets.insert(target, value);
+                        }
+                        DECORATION_BINDING => {
+                            machine.bindings.insert(target, value);
+                        }
+                        DECORATION_ARRAY_STRIDE => {
+                            machine.strides.insert(target, value);
+                        }
+                        _ => {}
+                    }
+                }
+                op::MEMBER_DECORATE if operands[2] == DECORATION_OFFSET => {
+                    machine
+                        .offsets
+                        .insert((operands[0], operands[1]), operands[3]);
                 }
                 op::TYPE_VOID => {
                     machine.types.insert(operands[0], Ty::Void);
@@ -221,6 +377,32 @@ impl Machine {
                         },
                     );
                 }
+                op::TYPE_ARRAY => {
+                    let length = machine.constants[&operands[2]][0] as u32;
+                    machine.types.insert(
+                        operands[0],
+                        Ty::Array {
+                            element: operands[1],
+                            length,
+                        },
+                    );
+                }
+                op::TYPE_RUNTIME_ARRAY => {
+                    machine.types.insert(
+                        operands[0],
+                        Ty::RuntimeArray {
+                            element: operands[1],
+                        },
+                    );
+                }
+                op::TYPE_STRUCT => {
+                    machine.types.insert(
+                        operands[0],
+                        Ty::Struct {
+                            members: operands[1..].to_vec(),
+                        },
+                    );
+                }
                 op::TYPE_POINTER => {
                     machine.types.insert(
                         operands[0],
@@ -229,10 +411,7 @@ impl Machine {
                         },
                     );
                 }
-                op::TYPE_ARRAY
-                | op::TYPE_RUNTIME_ARRAY
-                | op::TYPE_STRUCT
-                | op::TYPE_FUNCTION
+                op::TYPE_FUNCTION
                 | op::TYPE_IMAGE
                 | op::TYPE_SAMPLER
                 | op::TYPE_SAMPLED_IMAGE
@@ -240,10 +419,12 @@ impl Machine {
                     machine.types.insert(operands[0], Ty::Other);
                 }
                 op::CONSTANT | op::SPEC_CONSTANT => {
-                    let words = &operands[2..];
-                    let value = words.iter().enumerate().fold(0u64, |value, (n, &word)| {
-                        value | u64::from(word) << (32 * n)
-                    });
+                    let value = operands[2..]
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |value, (n, &word)| {
+                            value | u64::from(word) << (32 * n)
+                        });
                     machine.constants.insert(operands[1], vec![value]);
                     machine.result_types.insert(operands[1], operands[0]);
                 }
@@ -259,6 +440,11 @@ impl Machine {
                         .collect();
                     machine.constants.insert(operands[1], value);
                     machine.result_types.insert(operands[1], operands[0]);
+                }
+                op::VARIABLE if functions.is_empty() => {
+                    machine
+                        .globals
+                        .push((operands[1], operands[0], operands[2]));
                 }
                 op::FUNCTION => functions.push((operands[1], Vec::new())),
                 _ => {
@@ -282,7 +468,7 @@ impl Machine {
     }
 
     fn ty(&self, id: u32) -> Ty {
-        *self.types.get(&id).unwrap_or(&Ty::Other)
+        self.types.get(&id).cloned().unwrap_or(Ty::Other)
     }
 
     /// The scalar type of a value of type `ty` (its components').
@@ -293,74 +479,232 @@ impl Machine {
         }
     }
 
-    /// Runs the entry point alone with built-in inputs `inputs` (by
-    /// built-in).
-    pub(crate) fn run(&self, inputs: &HashMap<u32, Value>) -> Finished {
-        let inputs = inputs.clone();
-        let mut group = self.run_workgroup(1, 1, |_| inputs.clone());
-        assert!(group.problems.is_empty(), "{:?}", group.problems);
-        Finished {
-            variables: group.invocations.remove(0),
+    /// The slots a value of type `ty` takes (0 for a runtime array).
+    fn size(&self, ty: u32) -> usize {
+        match self.ty(ty) {
+            Ty::Vector { count, .. } => count as usize,
+            Ty::Array { element, length } => self.size(element) * length as usize,
+            Ty::RuntimeArray { .. } => 0,
+            Ty::Struct { members } => members.iter().map(|&member| self.size(member)).sum(),
+            _ => 1,
         }
     }
 
-    /// An invocation about to start, with its built-in inputs.
-    fn start(&self, inputs: &HashMap<u32, Value>) -> Invocation {
-        let mut globals = HashMap::new();
-        for (&variable, builtin) in &self.builtins {
-            if let Some(value) = inputs.get(builtin) {
-                globals.insert(variable, value.clone());
+    /// Bytes of a scalar of type `ty`.
+    fn scalar_bytes(&self, ty: u32) -> usize {
+        match self.ty(ty) {
+            Ty::Int { width, .. } | Ty::Float { width } => width as usize / 8,
+            _ => 4,
+        }
+    }
+
+    /// The byte size of a value of type `ty` laid out in memory.
+    fn byte_size(&self, ty: u32) -> usize {
+        match self.ty(ty) {
+            Ty::Vector { component, count } => self.scalar_bytes(component) * count as usize,
+            Ty::Array { element, length } => self.stride(ty, element) * length as usize,
+            Ty::Struct { members } => members
+                .iter()
+                .enumerate()
+                .map(|(n, &member)| self.member_offset(ty, n as u32) + self.byte_size(member))
+                .max()
+                .unwrap_or(0),
+            Ty::RuntimeArray { .. } => 0,
+            _ => self.scalar_bytes(ty),
+        }
+    }
+
+    fn stride(&self, array: u32, element: u32) -> usize {
+        self.strides
+            .get(&array)
+            .map_or_else(|| self.byte_size(element), |&stride| stride as usize)
+    }
+
+    fn member_offset(&self, ty: u32, member: u32) -> usize {
+        self.offsets
+            .get(&(ty, member))
+            .map_or(0, |&offset| offset as usize)
+    }
+
+    /// The slots of a value of type `ty` read from `bytes` at `at` (zeros
+    /// past their end).
+    fn fill(&self, ty: u32, bytes: &[u8], at: usize, slots: &mut Value) {
+        match self.ty(ty) {
+            Ty::Vector { component, count } => {
+                let size = self.scalar_bytes(component);
+                for n in 0..count as usize {
+                    self.fill(component, bytes, at + n * size, slots);
+                }
+            }
+            Ty::Array { element, length } => {
+                let stride = self.stride(ty, element);
+                for n in 0..length as usize {
+                    self.fill(element, bytes, at + n * stride, slots);
+                }
+            }
+            Ty::Struct { members } => {
+                for (n, &member) in members.iter().enumerate() {
+                    self.fill(member, bytes, at + self.member_offset(ty, n as u32), slots);
+                }
+            }
+            Ty::RuntimeArray { .. } => {}
+            _ => {
+                let size = self.scalar_bytes(ty);
+                let mut value = 0u64;
+                for n in 0..size {
+                    value |= u64::from(*bytes.get(at + n).unwrap_or(&0)) << (8 * n);
+                }
+                slots.push(value);
             }
         }
-        // Built-in inputs are variables like the others (for access chains
-        // into vectors).
-        let pointers = globals
-            .keys()
-            .map(|&variable| {
-                (
-                    variable,
-                    Pointer {
-                        variable,
-                        component: None,
-                    },
-                )
-            })
-            .collect();
-        Invocation {
-            at: 0,
-            values: self.constants.clone(),
-            value_types: self.result_types.clone(),
-            pointers,
-            variables: globals,
-            globals: HashMap::new(),
-            done: false,
-            steps: 0,
-        }
     }
 
-    /// Whether `opcode` needs the other invocations (a barrier, or a
-    /// subgroup operation).
-    fn collective(opcode: u16) -> bool {
-        opcode == op::CONTROL_BARRIER || (333..=366).contains(&opcode)
+    /// A value of type `ty` as bytes in memory (scalars and vectors).
+    fn bytes_of(&self, ty: u32, value: &Value) -> Vec<u8> {
+        let size = self.scalar_bytes(match self.ty(ty) {
+            Ty::Vector { component, .. } => component,
+            _ => ty,
+        });
+        value
+            .iter()
+            .flat_map(|&slot| slot.to_le_bytes()[..size].to_vec())
+            .collect()
     }
 
-    /// Runs `count` invocations of a workgroup in subgroups of
-    /// `subgroup` (invocation n has built-ins `inputs(n)`): each runs
-    /// until a barrier or a subgroup operation, which completes when all
-    /// the invocations still running in its scope have reached it.
-    pub(crate) fn run_workgroup(
+    /// Runs the entry point alone with built-in inputs `builtins`: its
+    /// variables.
+    #[cfg(test)]
+    fn run(&self, builtins: &HashMap<u32, Value>) -> HashMap<u32, Value> {
+        let builtins = builtins.clone();
+        let mut report = self.run_workgroup(1, 1, |_| builtins.clone());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        report.invocations.remove(0)
+    }
+
+    /// Runs `count` invocations of a workgroup in subgroups of `subgroup`,
+    /// invocation n with built-ins `builtins(n)`, nothing bound.
+    pub fn run_workgroup(
         &self,
         count: usize,
         subgroup: usize,
-        inputs: impl Fn(usize) -> HashMap<u32, Value>,
-    ) -> Workgroup {
-        let mut invocations: Vec<Invocation> = (0..count).map(|n| self.start(&inputs(n))).collect();
+        builtins: impl Fn(usize) -> HashMap<u32, Value>,
+    ) -> Report {
+        self.run_group(count, subgroup, builtins, &Inputs::default())
+    }
+
+    /// Runs workgroup `inputs.workgroup_id` of a dispatch.
+    pub fn simulate(&self, inputs: &Inputs) -> Report {
+        let [x, y, z] = self.local_size;
+        let count = (x * y * z) as usize;
+        let subgroup = if inputs.subgroup_size == 0 {
+            32
+        } else {
+            inputs.subgroup_size as usize
+        };
+        let id = inputs.workgroup_id;
+        let groups = inputs.workgroup_count;
+        self.run_group(
+            count,
+            subgroup,
+            |n| {
+                let n32 = n as u32;
+                let local = [n32 % x, n32 / x % y, n32 / (x * y)];
+                let global: Vec<u64> = (0..3)
+                    .map(|axis| u64::from(id[axis] * self.local_size[axis] + local[axis]))
+                    .collect();
+                let lane = (n % subgroup) as u64;
+                let mut builtins = HashMap::from([
+                    (
+                        BUILTIN_LOCAL_INVOCATION_ID,
+                        local.iter().map(|&v| u64::from(v)).collect(),
+                    ),
+                    (BUILTIN_LOCAL_INVOCATION_INDEX, vec![n as u64]),
+                    (
+                        BUILTIN_WORKGROUP_ID,
+                        id.iter().map(|&v| u64::from(v)).collect(),
+                    ),
+                    (
+                        BUILTIN_NUM_WORKGROUPS,
+                        groups.iter().map(|&v| u64::from(v)).collect(),
+                    ),
+                    (BUILTIN_GLOBAL_INVOCATION_ID, global),
+                    (BUILTIN_SUBGROUP_SIZE, vec![subgroup as u64]),
+                    (BUILTIN_NUM_SUBGROUPS, vec![count.div_ceil(subgroup) as u64]),
+                    (BUILTIN_SUBGROUP_ID, vec![(n / subgroup) as u64]),
+                    (BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID, vec![lane]),
+                ]);
+                // The eq, ge, gt, le and lt masks.
+                for (k, mask) in [
+                    1u128 << lane,
+                    !0u128 << lane,
+                    !0u128 << lane << 1,
+                    !(!0u128 << lane << 1),
+                    !(!0u128 << lane),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mask = mask
+                        & if subgroup >= 128 {
+                            !0
+                        } else {
+                            (1u128 << subgroup) - 1
+                        };
+                    let words = (0..4).map(|w| (mask >> (32 * w)) as u32 as u64).collect();
+                    builtins.insert(BUILTIN_SUBGROUP_EQ_MASK + k as u32, words);
+                }
+                builtins
+            },
+            inputs,
+        )
+    }
+
+    fn run_group(
+        &self,
+        count: usize,
+        subgroup: usize,
+        builtins: impl Fn(usize) -> HashMap<u32, Value>,
+        inputs: &Inputs,
+    ) -> Report {
+        let mut shared = Shared {
+            variables: HashMap::new(),
+            memory: inputs.memory.clone(),
+            problems: Vec::new(),
+            notes: Vec::new(),
+            loop_limit: if inputs.loop_limit == 0 {
+                1 << 16
+            } else {
+                inputs.loop_limit
+            },
+        };
+        // The workgroup's variables.
+        for &(variable, pointer, class) in &self.globals {
+            let Ty::Pointer { pointee } = self.ty(pointer) else {
+                continue;
+            };
+            let bytes = match class {
+                storage::UNIFORM | storage::STORAGE_BUFFER => {
+                    let key = (
+                        self.sets.get(&variable).copied().unwrap_or(0),
+                        self.bindings.get(&variable).copied().unwrap_or(0),
+                    );
+                    inputs.uniforms.get(&key).cloned().unwrap_or_default()
+                }
+                storage::PUSH_CONSTANT => inputs.push.clone(),
+                storage::WORKGROUP => Vec::new(),
+                _ => continue,
+            };
+            let mut slots = Vec::new();
+            self.fill(pointee, &bytes, 0, &mut slots);
+            shared.variables.insert(variable, slots);
+        }
+        let mut invocations: Vec<Invocation> =
+            (0..count).map(|n| self.start(&builtins(n))).collect();
         let mut barriers = Vec::new();
-        let mut problems = Vec::new();
         loop {
             for invocation in invocations.iter_mut() {
                 if !invocation.done {
-                    self.advance(invocation);
+                    self.advance(invocation, &mut shared);
                 }
             }
             if invocations.iter().all(|invocation| invocation.done) {
@@ -377,12 +721,12 @@ impl Machine {
                     continue;
                 };
                 let at = invocations[lead].at;
-                let opcode = self.body[at].opcode;
-                if opcode == op::CONTROL_BARRIER || members.iter().any(|&n| invocations[n].at != at)
+                if self.body[at].opcode == op::CONTROL_BARRIER
+                    || members.iter().any(|&n| invocations[n].at != at)
                 {
                     continue;
                 }
-                self.subgroup_operation(&mut invocations, first, &members, &mut problems);
+                self.subgroup_operation(&mut invocations, first, &members, &mut shared);
                 progress = true;
             }
             if progress {
@@ -392,15 +736,18 @@ impl Machine {
             // subgroup barrier) at the same one.
             let running: Vec<usize> = (0..count).filter(|&n| !invocations[n].done).collect();
             let at = invocations[running[0]].at;
-            let scope_id = self.body[at].operands[0];
-            let scope = self.constants.get(&scope_id).map_or(2, |value| value[0]);
-            if self.body[at].opcode == op::CONTROL_BARRIER && scope == 3 {
-                // A subgroup barrier: the subgroup's running invocations.
-                let first = running[0] / subgroup * subgroup;
+            let is_barrier = self.body[at].opcode == op::CONTROL_BARRIER;
+            let scope = if is_barrier {
+                let scope_id = self.body[at].operands[0];
+                self.constants.get(&scope_id).map_or(2, |value| value[0])
+            } else {
+                2
+            };
+            if is_barrier && scope == 3 {
                 let members: Vec<usize> = running
                     .iter()
                     .copied()
-                    .filter(|&n| n / subgroup == first / subgroup)
+                    .filter(|&n| n / subgroup == running[0] / subgroup)
                     .collect();
                 if members.iter().all(|&n| invocations[n].at == at) {
                     for &n in &members {
@@ -408,31 +755,83 @@ impl Machine {
                     }
                     continue;
                 }
-            } else if running.iter().all(|&n| invocations[n].at == at)
-                && self.body[at].opcode == op::CONTROL_BARRIER
-            {
+            } else if is_barrier && running.iter().all(|&n| invocations[n].at == at) {
+                if running.len() < count && shared.notes.len() < 64 {
+                    shared.notes.push(format!(
+                        "barrier at instruction {at} reached with {} of {count} invocations \
+                         still running (the others returned)",
+                        running.len()
+                    ));
+                }
                 barriers.push((at, running.len()));
                 for &n in &running {
                     invocations[n].at += 1;
                 }
                 continue;
             }
-            let places: Vec<(usize, usize)> =
+            let mut places: Vec<(usize, usize)> =
                 running.iter().map(|&n| (n, invocations[n].at)).collect();
-            problems.push(format!(
-                "deadlock: invocations wait at different barriers or subgroup operations \
-                 (invocation, instruction): {places:?}"
+            places.dedup_by_key(|place| place.1);
+            shared.problem(format!(
+                "deadlock: running invocations wait at different barriers or subgroup \
+                 operations; (first invocation, instruction): {places:?}"
             ));
             break;
         }
-        Workgroup {
+        Report {
             invocations: invocations
                 .into_iter()
                 .map(|invocation| invocation.variables)
                 .collect(),
             barriers,
-            problems,
+            problems: shared.problems,
+            notes: shared.notes,
+            memory: shared.memory,
         }
+    }
+
+    /// An invocation about to start, with its built-in inputs.
+    fn start(&self, builtins: &HashMap<u32, Value>) -> Invocation {
+        let mut variables = HashMap::new();
+        let mut pointers = HashMap::new();
+        for &(variable, pointer, class) in &self.globals {
+            let Ty::Pointer { pointee } = self.ty(pointer) else {
+                continue;
+            };
+            pointers.insert(
+                variable,
+                Pointer::Logical {
+                    variable,
+                    offset: 0,
+                    pointee,
+                },
+            );
+            if matches!(class, storage::INPUT | storage::OUTPUT | storage::PRIVATE) {
+                let value = self
+                    .builtins
+                    .get(&variable)
+                    .and_then(|builtin| builtins.get(builtin))
+                    .cloned()
+                    .unwrap_or_else(|| vec![0; self.size(pointee)]);
+                variables.insert(variable, value);
+            }
+        }
+        Invocation {
+            at: 0,
+            values: self.constants.clone(),
+            value_types: self.result_types.clone(),
+            pointers,
+            variables,
+            loops: HashMap::new(),
+            done: false,
+            steps: 0,
+        }
+    }
+
+    /// Whether `opcode` needs the other invocations (a barrier, or a
+    /// subgroup operation).
+    fn collective(opcode: u16) -> bool {
+        opcode == op::CONTROL_BARRIER || (333..=366).contains(&opcode)
     }
 
     /// The subgroup operation `members` (running invocations of the
@@ -442,25 +841,32 @@ impl Machine {
         invocations: &mut [Invocation],
         first: usize,
         members: &[usize],
-        problems: &mut Vec<String>,
+        shared: &mut Shared,
     ) {
         let at = invocations[members[0]].at;
         let instruction = &self.body[at];
         let (opcode, operands) = (instruction.opcode, &instruction.operands);
         let (ty, id) = (operands[0], operands[1]);
         let input = |invocation: &Invocation, n: usize| invocation.values[&operands[n]].clone();
+        let all = |n: usize| -> Vec<Value> {
+            members.iter().map(|&m| input(&invocations[m], n)).collect()
+        };
+        let same = |value: Value| vec![value; members.len()];
         let results: Vec<Value> = match opcode {
-            op::GROUP_NON_UNIFORM_ALL | op::GROUP_NON_UNIFORM_ANY => {
-                let votes: Vec<bool> = members
-                    .iter()
-                    .map(|&n| input(&invocations[n], 3)[0] != 0)
-                    .collect();
-                let result = if opcode == op::GROUP_NON_UNIFORM_ALL {
-                    votes.iter().all(|&vote| vote)
-                } else {
-                    votes.iter().any(|&vote| vote)
-                };
-                vec![vec![u64::from(result)]; members.len()]
+            op::GROUP_NON_UNIFORM_ALL => same(vec![u64::from(all(3).iter().all(|v| v[0] != 0))]),
+            op::GROUP_NON_UNIFORM_ANY => same(vec![u64::from(all(3).iter().any(|v| v[0] != 0))]),
+            op::GROUP_NON_UNIFORM_ALL_EQUAL => {
+                let values = all(3);
+                same(vec![u64::from(values.iter().all(|v| *v == values[0]))])
+            }
+            op::GROUP_NON_UNIFORM_BALLOT => {
+                let mut mask = 0u128;
+                for (&m, vote) in members.iter().zip(all(3)) {
+                    if vote[0] != 0 {
+                        mask |= 1 << (m - first);
+                    }
+                }
+                same((0..4).map(|w| (mask >> (32 * w)) as u32 as u64).collect())
             }
             op::GROUP_NON_UNIFORM_SHUFFLE => members
                 .iter()
@@ -469,15 +875,43 @@ impl Machine {
                     match members.iter().find(|&&m| m == first + lane) {
                         Some(&source) => input(&invocations[source], 3),
                         None => {
-                            problems.push(format!(
-                                "invocation {n} shuffles from lane {lane}, which is not running there"
+                            shared.problem(format!(
+                                "instruction {at}: invocation {n} shuffles from lane {lane}, \
+                                 which is not running there"
                             ));
                             vec![0; input(&invocations[n], 3).len()]
                         }
                     }
                 })
                 .collect(),
-            _ => panic!("the interpreter has no subgroup opcode {opcode}"),
+            op::GROUP_NON_UNIFORM_I_ADD
+            | op::GROUP_NON_UNIFORM_U_MIN
+            | op::GROUP_NON_UNIFORM_U_MAX
+            | op::GROUP_NON_UNIFORM_S_MIN
+            | op::GROUP_NON_UNIFORM_S_MAX
+            | op::GROUP_NON_UNIFORM_BITWISE_AND
+            | op::GROUP_NON_UNIFORM_BITWISE_OR
+            | op::GROUP_NON_UNIFORM_BITWISE_XOR => {
+                assert_eq!(operands[3], 0, "only reductions are simulated");
+                let values: Vec<u32> = all(4).iter().map(|v| v[0] as u32).collect();
+                let signed = |v: u32| v as i32;
+                let result = values
+                    .iter()
+                    .copied()
+                    .reduce(|x, y| match opcode {
+                        op::GROUP_NON_UNIFORM_I_ADD => x.wrapping_add(y),
+                        op::GROUP_NON_UNIFORM_U_MIN => x.min(y),
+                        op::GROUP_NON_UNIFORM_U_MAX => x.max(y),
+                        op::GROUP_NON_UNIFORM_S_MIN => signed(x).min(signed(y)) as u32,
+                        op::GROUP_NON_UNIFORM_S_MAX => signed(x).max(signed(y)) as u32,
+                        op::GROUP_NON_UNIFORM_BITWISE_AND => x & y,
+                        op::GROUP_NON_UNIFORM_BITWISE_OR => x | y,
+                        _ => x ^ y,
+                    })
+                    .unwrap_or(0);
+                same(vec![u64::from(result)])
+            }
+            _ => panic!("the simulator has no subgroup opcode {opcode}"),
         };
         for (&n, result) in members.iter().zip(results) {
             let invocation = &mut invocations[n];
@@ -487,126 +921,296 @@ impl Machine {
         }
     }
 
+    /// The value at `pointer`.
+    fn load(&self, invocation: &Invocation, shared: &mut Shared, pointer: Pointer) -> Value {
+        match pointer {
+            Pointer::Logical {
+                variable,
+                offset,
+                pointee,
+            } => {
+                let size = self.size(pointee);
+                let slots = invocation
+                    .variables
+                    .get(&variable)
+                    .or_else(|| shared.variables.get(&variable))
+                    .unwrap_or_else(|| panic!("a load of %{variable}, which holds nothing"));
+                match slots.get(offset..offset + size) {
+                    Some(slots) => slots.to_vec(),
+                    None => {
+                        shared.problem(format!(
+                            "read past %{variable} ({} slots) at slot {offset}",
+                            slots.len()
+                        ));
+                        vec![0; size]
+                    }
+                }
+            }
+            Pointer::Physical { address, pointee } => {
+                let bytes = shared.read(address, self.byte_size(pointee));
+                let mut slots = Vec::new();
+                self.fill(pointee, &bytes, 0, &mut slots);
+                slots
+            }
+        }
+    }
+
+    fn store(
+        &self,
+        invocation: &mut Invocation,
+        shared: &mut Shared,
+        pointer: Pointer,
+        value: &Value,
+    ) {
+        match pointer {
+            Pointer::Logical {
+                variable, offset, ..
+            } => {
+                let slots = match invocation.variables.get_mut(&variable) {
+                    Some(slots) => slots,
+                    None => shared
+                        .variables
+                        .get_mut(&variable)
+                        .unwrap_or_else(|| panic!("a store to %{variable}, which holds nothing")),
+                };
+                let length = slots.len();
+                match slots.get_mut(offset..offset + value.len()) {
+                    Some(target) => target.copy_from_slice(value),
+                    None => shared.problem(format!(
+                        "write past %{variable} ({length} slots) at slot {offset}"
+                    )),
+                }
+            }
+            Pointer::Physical { address, pointee } => {
+                let bytes = self.bytes_of(pointee, value);
+                shared.write(address, &bytes);
+            }
+        }
+    }
+
+    /// The pointer `base` indexed by `indices` (values).
+    fn chain(&self, base: Pointer, indices: &[u64], shared: &mut Shared) -> Pointer {
+        let mut pointer = base;
+        for &index in indices {
+            pointer = match pointer {
+                Pointer::Logical {
+                    variable,
+                    offset,
+                    pointee,
+                } => {
+                    let (step, element, length) = match self.ty(pointee) {
+                        Ty::Struct { members } => {
+                            let skip: usize = members[..index as usize]
+                                .iter()
+                                .map(|&member| self.size(member))
+                                .sum();
+                            (skip, members[index as usize], None)
+                        }
+                        Ty::Array { element, length } => {
+                            (self.size(element) * index as usize, element, Some(length))
+                        }
+                        Ty::RuntimeArray { element } => {
+                            (self.size(element) * index as usize, element, None)
+                        }
+                        Ty::Vector { component, count } => (index as usize, component, Some(count)),
+                        other => panic!("an access chain into {other:?}"),
+                    };
+                    if length.is_some_and(|length| index >= u64::from(length)) {
+                        shared.problem(format!(
+                            "index {index} past an array of {} in %{variable}",
+                            length.unwrap_or(0)
+                        ));
+                    }
+                    Pointer::Logical {
+                        variable,
+                        offset: offset + step,
+                        pointee: element,
+                    }
+                }
+                Pointer::Physical { address, pointee } => {
+                    let (step, element) = match self.ty(pointee) {
+                        Ty::Struct { members } => (
+                            self.member_offset(pointee, index as u32) as u64,
+                            members[index as usize],
+                        ),
+                        Ty::Array { element, .. } | Ty::RuntimeArray { element } => {
+                            (self.stride(pointee, element) as u64 * index, element)
+                        }
+                        Ty::Vector { component, .. } => {
+                            (self.scalar_bytes(component) as u64 * index, component)
+                        }
+                        other => panic!("an access chain into {other:?}"),
+                    };
+                    Pointer::Physical {
+                        address: address.wrapping_add(step),
+                        pointee: element,
+                    }
+                }
+            };
+        }
+        pointer
+    }
+
     /// Runs `invocation` until it ends or reaches a barrier or subgroup
     /// operation (left at it).
-    fn advance(&self, invocation: &mut Invocation) {
-        let Invocation {
-            at,
-            values,
-            value_types,
-            pointers,
-            variables,
-            globals,
-            done,
-            steps,
-        } = invocation;
+    fn advance(&self, invocation: &mut Invocation, shared: &mut Shared) {
         loop {
-            *steps += 1;
-            assert!(*steps < 1_000_000, "the program runs too long");
-            let instruction = &self.body[*at];
+            invocation.steps += 1;
+            if invocation.steps > 1 << 28 {
+                shared.problem("an invocation ran 2^28 instructions".to_string());
+                invocation.done = true;
+                return;
+            }
+            let at = invocation.at;
+            let instruction = &self.body[at];
             if Self::collective(instruction.opcode) {
                 return;
             }
-            *at += 1;
+            invocation.at += 1;
             let operands = &instruction.operands;
             let opcode = instruction.opcode;
             match opcode {
-                op::LABEL | op::SELECTION_MERGE | op::LOOP_MERGE | op::MEMORY_BARRIER => continue,
+                op::LABEL | op::SELECTION_MERGE | op::MEMORY_BARRIER => continue,
+                op::LOOP_MERGE => {
+                    let passes = invocation.loops.entry(at).or_insert(0);
+                    *passes += 1;
+                    if *passes > shared.loop_limit {
+                        let label = self.body[at - 1].operands[0];
+                        shared.problem(format!(
+                            "loop with header %{label} (instruction {at}) ran {} times in one \
+                             invocation (runaway)",
+                            shared.loop_limit
+                        ));
+                        invocation.done = true;
+                        return;
+                    }
+                    continue;
+                }
                 op::VARIABLE => {
-                    let pointee = match self.ty(operands[0]) {
-                        Ty::Pointer { pointee } => pointee,
-                        _ => panic!("a variable of a non-pointer type"),
+                    let Ty::Pointer { pointee } = self.ty(operands[0]) else {
+                        panic!("a variable of a non-pointer type");
                     };
-                    let width = match self.ty(pointee) {
-                        Ty::Vector { count, .. } => count as usize,
-                        _ => 1,
-                    };
-                    let value = operands
-                        .get(3)
-                        .map_or_else(|| vec![0; width], |id| values[id].clone());
-                    variables.insert(operands[1], value);
-                    pointers.insert(
+                    let value = operands.get(3).map_or_else(
+                        || vec![0; self.size(pointee)],
+                        |id| invocation.values[id].clone(),
+                    );
+                    invocation.variables.insert(operands[1], value);
+                    invocation.pointers.insert(
                         operands[1],
-                        Pointer {
+                        Pointer::Logical {
                             variable: operands[1],
-                            component: None,
+                            offset: 0,
+                            pointee,
                         },
                     );
                     continue;
                 }
                 op::BRANCH => {
-                    *at = self.labels[&operands[0]];
+                    invocation.at = self.labels[&operands[0]];
                     continue;
                 }
                 op::BRANCH_CONDITIONAL => {
-                    let taken = values[&operands[0]][0] != 0;
-                    *at = self.labels[&operands[if taken { 1 } else { 2 }]];
+                    let taken = invocation.values[&operands[0]][0] != 0;
+                    invocation.at = self.labels[&operands[if taken { 1 } else { 2 }]];
                     continue;
                 }
                 op::SWITCH => {
-                    let selector = values[&operands[0]][0] as u32;
+                    let selector = invocation.values[&operands[0]][0] as u32;
                     let mut target = operands[1];
                     for pair in operands[2..].chunks(2) {
                         if pair[0] == selector {
                             target = pair[1];
                         }
                     }
-                    *at = self.labels[&target];
+                    invocation.at = self.labels[&target];
                     continue;
                 }
                 op::RETURN => {
-                    *done = true;
+                    invocation.done = true;
                     return;
                 }
-                op::UNREACHABLE => panic!("OpUnreachable reached"),
+                op::UNREACHABLE => {
+                    shared.problem(format!("OpUnreachable reached at instruction {at}"));
+                    invocation.done = true;
+                    return;
+                }
                 op::STORE => {
-                    let pointer = pointers[&operands[0]];
-                    let value = values[&operands[1]].clone();
-                    let target = variables
-                        .get_mut(&pointer.variable)
-                        .expect("a store to a function variable");
-                    match pointer.component {
-                        Some(n) => target[n] = value[0],
-                        None => *target = value,
-                    }
+                    let pointer = invocation.pointers[&operands[0]];
+                    let value = invocation.values[&operands[1]].clone();
+                    self.store(invocation, shared, pointer, &value);
                     continue;
                 }
+                op::FUNCTION_CALL => panic!("the simulator does not call functions"),
                 _ => {}
             }
             // Instructions with a result.
             let (ty, id, args) = (operands[0], operands[1], &operands[2..]);
+            let values = &invocation.values;
             let value = |n: usize| values[&args[n]].clone();
             let result: Value = match opcode {
                 op::LOAD => {
-                    if let Some(global) = globals.get(&args[0]) {
-                        global.clone()
-                    } else {
-                        let pointer = pointers
-                            .get(&args[0])
-                            .unwrap_or_else(|| panic!("a load of %{} (not an input)", args[0]));
-                        let whole = &variables[&pointer.variable];
-                        match pointer.component {
-                            Some(n) => vec![whole[n]],
-                            None => whole.clone(),
-                        }
-                    }
+                    let pointer = invocation.pointers[&args[0]];
+                    self.load(invocation, shared, pointer)
                 }
                 op::ACCESS_CHAIN => {
-                    let base = pointers[&args[0]];
-                    let component = values[&args[1]][0] as usize;
-                    assert!(args.len() == 2 && base.component.is_none());
-                    pointers.insert(
+                    let base = invocation.pointers[&args[0]];
+                    let indices: Vec<u64> = args[1..].iter().map(|a| values[a][0]).collect();
+                    let pointer = self.chain(base, &indices, shared);
+                    invocation.pointers.insert(id, pointer);
+                    continue;
+                }
+                op::CONVERT_U_TO_PTR => {
+                    let Ty::Pointer { pointee } = self.ty(ty) else {
+                        panic!("ConvertUToPtr to a non-pointer type");
+                    };
+                    invocation.pointers.insert(
                         id,
-                        Pointer {
-                            variable: base.variable,
-                            component: Some(component),
+                        Pointer::Physical {
+                            address: value(0)[0],
+                            pointee,
                         },
                     );
                     continue;
                 }
-                op::BITCAST => self.bitcast(value_types[&args[0]], ty, &value(0)),
+                op::ATOMIC_I_ADD
+                | op::ATOMIC_U_MIN
+                | op::ATOMIC_U_MAX
+                | op::ATOMIC_S_MIN
+                | op::ATOMIC_S_MAX
+                | op::ATOMIC_AND
+                | op::ATOMIC_OR
+                | op::ATOMIC_XOR
+                | op::ATOMIC_EXCHANGE
+                | op::ATOMIC_COMPARE_EXCHANGE => {
+                    let pointer = invocation.pointers[&args[0]];
+                    let old = self.load(invocation, shared, pointer)[0] as u32;
+                    let operand = |n: usize| invocation.values[&args[n]][0] as u32;
+                    let new = match opcode {
+                        op::ATOMIC_I_ADD => old.wrapping_add(operand(3)),
+                        op::ATOMIC_U_MIN => old.min(operand(3)),
+                        op::ATOMIC_U_MAX => old.max(operand(3)),
+                        op::ATOMIC_S_MIN => (old as i32).min(operand(3) as i32) as u32,
+                        op::ATOMIC_S_MAX => (old as i32).max(operand(3) as i32) as u32,
+                        op::ATOMIC_AND => old & operand(3),
+                        op::ATOMIC_OR => old | operand(3),
+                        op::ATOMIC_XOR => old ^ operand(3),
+                        op::ATOMIC_EXCHANGE => operand(3),
+                        _ => {
+                            // Value, then comparator, after two semantics.
+                            if old == operand(5) { operand(4) } else { old }
+                        }
+                    };
+                    self.store(invocation, shared, pointer, &vec![u64::from(new)]);
+                    vec![u64::from(old)]
+                }
+                op::READ_CLOCK => vec![invocation.steps],
+                op::BITCAST => self.bitcast(invocation.value_types[&args[0]], ty, &value(0)),
                 op::COMPOSITE_CONSTRUCT => args.iter().flat_map(|a| values[a].clone()).collect(),
-                op::COMPOSITE_EXTRACT => vec![value(0)[args[1] as usize]],
+                op::COMPOSITE_EXTRACT => {
+                    // Flat: the slot of the index path (vectors and flat
+                    // structs of scalars).
+                    vec![value(0)[args[1] as usize]]
+                }
                 op::EXT_INST => {
                     assert_eq!(args[0], self.glsl, "an unknown extended instruction set");
                     let inputs: Vec<Value> = args[2..].iter().map(|a| values[a].clone()).collect();
@@ -617,14 +1221,14 @@ impl Machine {
                     let operand_type = args
                         .iter()
                         .rev()
-                        .find_map(|a| value_types.get(a).copied())
+                        .find_map(|a| invocation.value_types.get(a).copied())
                         .unwrap_or(ty);
                     self.arithmetic(opcode, ty, operand_type, &inputs)
                 }
             };
             self.check(ty, &result);
-            values.insert(id, result);
-            value_types.insert(id, ty);
+            invocation.values.insert(id, result);
+            invocation.value_types.insert(id, ty);
         }
     }
 
@@ -1002,14 +1606,14 @@ mod tests {
         let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
         let (translated, registers, predicates) =
             translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
-        let finished = Machine::new(&translated.spirv).run(&HashMap::new());
+        let variables = Machine::new(&translated.spirv).run(&HashMap::new());
         let registers = registers
             .iter()
-            .map(|(&n, variable)| (n, finished.variables[variable][0] as u32))
+            .map(|(&n, variable)| (n, variables[variable][0] as u32))
             .collect();
         let predicates = predicates
             .iter()
-            .map(|(&n, variable)| (n, finished.variables[variable][0] != 0))
+            .map(|(&n, variable)| (n, variables[variable][0] != 0))
             .collect();
         (registers, predicates)
     }
@@ -1362,5 +1966,124 @@ mod tests {
         assert!(barriers.iter().all(|&(_, running)| running == 32));
         assert_eq!(registers[31][&2], 2);
         assert_eq!(registers[32][&2], 0);
+    }
+
+    #[test]
+    fn workgroups_share_memory_across_barriers_and_read_global_memory_through_the_page_table() {
+        use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
+        let s2r = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]);
+        // IMAD R1, R0, 4, RZ (a byte offset); IADD3 R4, R1, 0x10000, RZ
+        let scale = word(&[
+            (0, 12, 0x824),
+            (16, 8, 1),
+            (24, 8, 0),
+            (32, 32, 4),
+            (64, 8, 255),
+        ]);
+        let address = add(4, 1, 0x10000);
+        // LDG.E R2, [R4.64]; IADD3 R2, R2, 1; STS [R1], R2; BAR
+        let load = word(&[
+            (0, 12, 0x381),
+            (16, 8, 2),
+            (24, 8, 4),
+            (72, 1, 1),
+            (73, 3, 4),
+        ]);
+        let store_shared = word(&[(0, 12, 0x388), (24, 8, 1), (32, 8, 2), (73, 3, 4)]);
+        // LOP3.LUT R6, R1, 0x80, RZ, 0x3c (xor: the other subgroup's
+        // word); LDS R3, [R6]; STG.E [R4.64], R3
+        let other = word(&[
+            (0, 12, 0x812),
+            (16, 8, 6),
+            (24, 8, 1),
+            (32, 32, 0x80),
+            (64, 8, 255),
+            (72, 8, 0x3c),
+            (81, 3, 7),
+        ]);
+        let load_shared = word(&[(0, 12, 0x984), (16, 8, 3), (24, 8, 6), (73, 3, 4)]);
+        let store = word(&[
+            (0, 12, 0x386),
+            (24, 8, 4),
+            (32, 8, 3),
+            (72, 1, 1),
+            (73, 3, 4),
+        ]);
+        let program = [
+            mov(5, 0),
+            s2r,
+            scale,
+            address,
+            load,
+            add(2, 2, 1),
+            store_shared,
+            BAR,
+            other,
+            load_shared,
+            store,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            shared_bytes: Some(256),
+            ..Layout::workgroup([64, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        // Guest page 0x10 at device 0x3000_0000; the table at 0x2000_0000.
+        let (table, page) = (0x2000_0000u64, 0x3000_0000u64);
+        let words: Vec<u8> = (0..1024u32).flat_map(u32::to_le_bytes).collect();
+        let mut push = vec![0u8; 128];
+        let at = PUSH_PAGE_TABLE_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&(0x10000u32 >> PAGE_SHIFT).to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+        let inputs = Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory: BTreeMap::from([(table, page.to_le_bytes().to_vec()), (page, words)]),
+            ..Inputs::default()
+        };
+        let machine = Machine::new(&translated.spirv);
+        assert_eq!(machine.local_size, [64, 1, 1]);
+        let report = machine.simulate(&inputs);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.barriers.len(), 1);
+        let memory = &report.memory[&page];
+        for n in 0..64usize {
+            let word = u32::from_le_bytes(memory[4 * n..4 * n + 4].try_into().unwrap());
+            assert_eq!(word, (n as u32 ^ 32) + 1, "invocation {n}");
+        }
+        // Outside the dumped memory: a fault, reported.
+        let mut missing = inputs.clone();
+        missing.memory.remove(&page);
+        let report = machine.simulate(&missing);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.contains("outside the dumped memory"))
+        );
+    }
+
+    #[test]
+    fn runaway_loops_are_reported() {
+        // 1: IADD3 R0, R0, 1; 2: BRA 1 (forever)
+        let code: Vec<_> = [mov(0, 0), add(0, 0, 1), bra(2, 1, 7), EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let translated = crate::compute::translate(&code, &Layout::workgroup([32, 1, 1])).unwrap();
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            loop_limit: 100,
+            ..Inputs::default()
+        });
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.contains("runaway")),
+            "{:?}",
+            report.problems
+        );
     }
 }

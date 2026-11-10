@@ -239,6 +239,19 @@ exited invocation's later stores and shuffles do not happen; a shuffle
 that reads one gets whatever it last held (the hardware's value there is
 undefined too). Exits anywhere else return as before.
 
+**Simulator.** `echora_shader::sim` (the `sim` feature; the tests use it
+too) runs every invocation of a workgroup of a translated compute
+program on the CPU: invocations run one at a time to each barrier or
+subgroup operation, which completes when every running invocation of its
+scope is there; shared memory is the workgroup's, global memory the
+dumped device memory reached through the program's own page table. It
+reports runaway loops, barriers reached at different places (a
+deadlock) or after other invocations returned, reads and writes outside
+the dumped memory (faults), indices past an array, shuffles from lanes
+not running there, and uses of what SPIR-V leaves undefined. The
+`simulate` example runs it on a dump directory (its documentation gives
+the format).
+
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
 exact: the nearest result's error is computed without rounding (two-sum
