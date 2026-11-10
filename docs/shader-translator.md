@@ -182,7 +182,10 @@ are a workgroup array: per-vertex lines, then per-primitive lines, in
 groups of 32 elements, one 128-byte line per output word its header's
 output map lists (the primitive header, a pass-through geometry
 program's, lists the per-primitive ones). Its map holds the primitive
-count (a word at byte 3) and the vertex indices (bytes from byte 4). At
+count at byte 3 and the vertex indices as bytes from byte 4; a map write
+at byte 3 (of any size, also through a register address) sets the count,
+and a 16- or 32-bit write elsewhere sets two or four index bytes, low
+byte first. At
 the end, after a barrier, the program sets its outputs (all its
 `max_vertices` vertices, the written primitive count capped at
 `max_primitives`) and copies the lines to the position, point size (for
@@ -191,8 +194,10 @@ viewport index, and the indices to the primitive index built-in.
 Per-primitive generic vectors are refused, as the fragment program would
 have to declare them per-primitive; so are 16-bit stage buffer accesses
 and outputs past the generic vectors. The `.SKEW` bit is ignored (NAK
-computes linear addresses with it set). None of this has run on a GPU
-yet.
+computes linear addresses with it set). The simulator runs task and mesh
+programs (their function inlined; a mesh program's outputs shared by the
+workgroup) and reports the mesh output counts, indices and positions or
+the emitted task groups.
 
 **Matrix multiply.** HMMA runs on the subgroup: each lane gathers its A
 row from its own quad and its B columns from the quads of lanes 8t and

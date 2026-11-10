@@ -325,16 +325,57 @@ impl Emitter {
                     attribute_words,
                     data,
                 ),
-                // A primitive's vertex index.
-                (false, true, 0, 0) => {
-                    let mask = self.constant(0xff);
-                    let byte = self.value(op::BITWISE_AND, self.u32, &[data, mask]);
-                    self.bounded_store(map, storage::WORKGROUP, address, map_words, byte)
-                }
-                // The primitive count.
-                (false, true, 0, 2) if a == 255 && offset == 3 => {
-                    self.function.emit(op::STORE, &[count, data]);
-                    Ok(())
+                // The map, by byte: the primitive count at byte 3, the
+                // vertex indices from byte 4 (a U16 or 32-bit write sets
+                // two or four of them, low byte first).
+                (false, true, 0, 0..=2) => {
+                    let bytes = 1u32 << size;
+                    let index_bytes = |e: &mut Self| -> Result<(), Unsupported> {
+                        for n in 0..bytes {
+                            let at = e.constant(n);
+                            let at = e.value(op::I_ADD, e.u32, &[address, at]);
+                            let shift = e.constant(8 * n);
+                            let byte = e.value(op::SHIFT_RIGHT_LOGICAL, e.u32, &[data, shift]);
+                            let mask = e.constant(0xff);
+                            let byte = e.value(op::BITWISE_AND, e.u32, &[byte, mask]);
+                            e.bounded_store(map, storage::WORKGROUP, at, map_words, byte)?;
+                        }
+                        Ok(())
+                    };
+                    let count_value = |e: &mut Self| match size {
+                        0 => {
+                            let mask = e.constant(0xff);
+                            e.value(op::BITWISE_AND, e.u32, &[data, mask])
+                        }
+                        1 => {
+                            let mask = e.constant(0xffff);
+                            e.value(op::BITWISE_AND, e.u32, &[data, mask])
+                        }
+                        _ => data,
+                    };
+                    if a == 255 {
+                        if offset == 3 {
+                            let value = count_value(self);
+                            self.function.emit(op::STORE, &[count, value]);
+                            Ok(())
+                        } else {
+                            index_bytes(self)
+                        }
+                    } else {
+                        // A register address: the count where it is byte 3.
+                        let three = self.constant(3);
+                        let is_count = self.value(op::I_EQUAL, self.bool, &[address, three]);
+                        let mut result = Ok(());
+                        self.choose(is_count, |e, is_count| {
+                            if is_count {
+                                let value = count_value(e);
+                                e.function.emit(op::STORE, &[count, value]);
+                            } else if let Err(error) = index_bytes(e) {
+                                result = Err(error);
+                            }
+                        });
+                        result
+                    }
                 }
                 _ => Err(unsupported(
                     index,
