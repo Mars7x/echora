@@ -6365,11 +6365,18 @@ impl Nvn {
         }
         // ECHORA_DUMP_DRAW also dumps a mesh draw's task and mesh stages
         // (as dispatches, at the end): their inputs, kept here.
-        let stage_dump = (super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
-            wanted
-                .split(',')
-                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
-        }) && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b))
+        // ECHORA_DUMP_DRAW_FROM=N: draws are dumped from present N on.
+        let dump_from = super::debug_var("ECHORA_DUMP_DRAW_FROM")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let stage_dump = (self.presented_frames >= dump_from
+            && super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
+                wanted
+                    .split(',')
+                    .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
+            })
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b))
             && !self.dumped_dispatches.contains(&(keys.1 ^ 0x6d65_7368))
             && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7665_7274)))
         .then(|| {
@@ -6500,7 +6507,8 @@ impl Nvn {
         }
         // ECHORA_DUMP_DRAW=<fragment key>[,...] (debugging): the first draw
         // of each listed fragment program, for the simulator (`dump_draw`).
-        if let Some(wanted) = super::debug_var_os("ECHORA_DUMP_DRAW")
+        if let Some(wanted) =
+            super::debug_var_os("ECHORA_DUMP_DRAW").filter(|_| self.presented_frames >= dump_from)
             && wanted
                 .to_string_lossy()
                 .split(',')
