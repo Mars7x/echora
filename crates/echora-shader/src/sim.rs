@@ -35,6 +35,7 @@ const S_MUL_EXTENDED: u16 = 152;
 const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
+const DECORATION_LOCATION: u32 = 30;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
 const DECORATION_OFFSET: u32 = 35;
@@ -148,6 +149,12 @@ pub struct Inputs {
     /// Iterations of one loop by one invocation that count as running
     /// away (1 << 16 when 0).
     pub loop_limit: u32,
+    /// More built-in inputs, by BuiltIn (e.g. 15, FragCoord, as f32 bits),
+    /// for every invocation: what a fragment program reads of its pixel.
+    pub builtins: HashMap<u32, Vec<u64>>,
+    /// Input variables' values by Location (a fragment program's
+    /// interpolated attributes, as 32-bit words).
+    pub locations: HashMap<u32, Vec<u64>>,
     /// Address ranges (device addresses, or guest addresses through the
     /// page table) whose stores and atomics `Report::writes` lists.
     pub watch: Vec<std::ops::Range<u64>>,
@@ -294,6 +301,9 @@ pub struct Machine {
     /// Debug names (OpName) and the ids they name: the translation names
     /// its register variables R0.., P0.., UR0.., UP0...
     pub names: BTreeMap<String, u32>,
+    /// Input and output variables' Locations (a fragment program's
+    /// attributes and colours), by variable id.
+    pub locations: HashMap<u32, u32>,
     /// The OpString of the translation's guest instruction lines.
     step_file: Option<u32>,
 }
@@ -548,6 +558,7 @@ impl Machine {
             local_size: [1, 1, 1],
             cooperative: false,
             names: BTreeMap::new(),
+            locations: HashMap::new(),
             step_file: None,
         };
         let mut entry = 0;
@@ -591,6 +602,9 @@ impl Machine {
                         }
                         DECORATION_BINDING => {
                             machine.bindings.insert(target, value);
+                        }
+                        DECORATION_LOCATION => {
+                            machine.locations.insert(target, value);
                         }
                         DECORATION_ARRAY_STRIDE => {
                             machine.strides.insert(target, value);
@@ -966,6 +980,7 @@ impl Machine {
                     let words = (0..4).map(|w| (mask >> (32 * w)) as u32 as u64).collect();
                     builtins.insert(BUILTIN_SUBGROUP_EQ_MASK + k as u32, words);
                 }
+                builtins.extend(inputs.builtins.clone());
                 builtins
             },
             |_| HashMap::new(),
@@ -1066,7 +1081,7 @@ impl Machine {
         }
         let mut invocations: Vec<Invocation> = (0..count)
             .map(|n| {
-                let mut invocation = self.start(&builtins(n));
+                let mut invocation = self.start(&builtins(n), &inputs.locations);
                 invocation.number = n;
                 invocation.initial = initial(n);
                 for (&constant, spec_id) in &self.spec_ids {
@@ -1197,7 +1212,7 @@ impl Machine {
     }
 
     /// An invocation about to start, with its built-in inputs.
-    fn start(&self, builtins: &HashMap<u32, Value>) -> Invocation {
+    fn start(&self, builtins: &HashMap<u32, Value>, locations: &HashMap<u32, Value>) -> Invocation {
         let mut variables = HashMap::new();
         let mut pointers = HashMap::new();
         for &(variable, pointer, class) in &self.globals {
@@ -1213,12 +1228,18 @@ impl Machine {
                 },
             );
             if matches!(class, storage::INPUT | storage::OUTPUT | storage::PRIVATE) {
-                let value = self
+                let located = (class == storage::INPUT)
+                    .then(|| self.locations.get(&variable))
+                    .flatten()
+                    .and_then(|location| locations.get(location));
+                let mut value = self
                     .builtins
                     .get(&variable)
                     .and_then(|builtin| builtins.get(builtin))
+                    .or(located)
                     .cloned()
                     .unwrap_or_else(|| vec![0; self.size(pointee)]);
+                value.resize(self.size(pointee), 0);
                 variables.insert(variable, value);
             }
         }
@@ -4877,6 +4898,71 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn interpolated_attributes_read_as_the_hardware_hands_them_over() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // IPA R0, a[0x7c] (1/w); MUFU.RCP R0, R0 (w); IPA R1, a[0x80];
+        // FMUL R1, R1, R0: the program's own perspective division.
+        let ipa = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+            ])
+        };
+        let rcp = word(&[(0, 12, 0x308), (16, 8, 0), (32, 8, 0), (74, 4, 4)]);
+        let multiply = word(&[
+            (0, 12, 0x220),
+            (16, 8, 1),
+            (24, 8, 1),
+            (32, 8, 0),
+            (84, 3, 4),
+        ]);
+        let code: Vec<_> = [ipa(0, 0x7c), rcp, ipa(1, 0x80), multiply, EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        // Attribute 0's x is 2.0 (Vulkan's perspective-corrected value), 1/w
+        // is 0.25: perspective gives 2.0 back, screen-linear 2.0 * 4.
+        for (mode, expected) in [
+            (Interpolation::Perspective, 2.0f32),
+            (Interpolation::ScreenLinear, 8.0),
+        ] {
+            let mut imap = [Interpolation::Unused; 128];
+            imap[..4].fill(mode);
+            let header = Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            };
+            let layout = Layout {
+                stage: Stage::Fragment,
+                header: Some(header),
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let bits = |values: [f32; 4]| values.iter().map(|v| u64::from(v.to_bits())).collect();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                builtins: HashMap::from([(15, bits([10.5, 20.5, 0.5, 0.25]))]),
+                locations: HashMap::from([(0, bits([2.0, 0.0, 0.0, 0.0]))]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let r1 = report.invocations[0][&registers[&1]][0] as u32;
+            assert_eq!(f32::from_bits(r1), expected, "{mode:?}");
         }
     }
 

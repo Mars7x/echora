@@ -308,8 +308,34 @@ impl Emitter {
             return Err(unsupported(index, "IPA at an offset"));
         }
         let value = self.attribute(index, address, location == 1)?;
+        let value = self.as_interpolated(address, value);
         self.write_register(d, value);
         Ok(())
+    }
+
+    /// An input as IPA reads it: a generic the header interpolates with
+    /// perspective (or leaves unused) still multiplied by 1/w (Vulkan's
+    /// FragCoord.w), as the hardware interpolates attr/w linearly and the
+    /// program divides by a[0x7c] itself (as NAK on SM70+ and yuzu read
+    /// it: IPA(attr) * rcp(IPA(w))). Vulkan hands over attr already
+    /// corrected.
+    fn as_interpolated(&mut self, address: u16, value: u32) -> u32 {
+        if !(0x80..0x280).contains(&address) {
+            return value;
+        }
+        let mode = self.header.map_or(Interpolation::Perspective, |header| {
+            header.imap[usize::from((address - 0x80) / 4)]
+        });
+        if !matches!(mode, Interpolation::Perspective | Interpolation::Unused) {
+            return value;
+        }
+        let vec4 = self.vec4();
+        let variable = self.builtin_variable(BUILTIN_FRAG_COORD, vec4);
+        let pointer = self.component_pointer(variable, storage::INPUT, 3);
+        let inverse_w = self.value(op::LOAD, self.f32, &[pointer]);
+        let float = self.value(op::BITCAST, self.f32, &[value]);
+        let product = self.exact(op::F_MUL, &[float, inverse_w]);
+        self.value(op::BITCAST, self.u32, &[product])
     }
 
     /// IPA with the address offset by a uniform register: each generic
@@ -339,6 +365,7 @@ impl Emitter {
             }
             let at = 0x80 + component * 4;
             let read = self.attribute(index, at, location == 1)?;
+            let read = self.as_interpolated(at, read);
             let here = self.constant(u32::from(at));
             let matches = self.value(op::I_EQUAL, self.bool, &[address, here]);
             value = self.value(op::SELECT, self.u32, &[matches, read, value]);
