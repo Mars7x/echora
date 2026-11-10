@@ -433,6 +433,12 @@ pub struct RenderState {
     /// SetRenderEnableConditional(mode, address) (`Some((mode, address))`):
     /// draws, clears and dispatches run only while it holds (`render_enabled`).
     pub render_enable: Option<(u64, u64)>,
+    /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset:
+    /// occlusion counts are not measured, so each draw executed counts as
+    /// one that passed samples (occlusion-culled objects then draw, and
+    /// depth testing hides them as it would have). Gated draws compare two
+    /// reports of it (`render_enabled`).
+    pub samples_passed: u64,
     /// Root tables written by Push{Graphics,Compute}Constants: [graphics,
     /// compute] x 8 tables of 64 words (256 bytes each).
     pub roots: [Vec<[u32; 64]>; 2],
@@ -2659,6 +2665,11 @@ impl Nvn {
                     .or_default() += 1;
                 return Ok(());
             }
+            name if name.starts_with("nvnCommandBufferDraw")
+                || name.starts_with("nvnCommandBufferMultiDraw") =>
+            {
+                self.render.samples_passed += 1;
+            }
             _ => {}
         }
         // Commands that read or write guest memory themselves see earlier
@@ -3050,8 +3061,9 @@ impl Nvn {
             }
             // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU
             // writes a 16-byte report, a u64 counter then a u64 GPU
-            // timestamp (NVNcounterData; layout inferred from NVN1). Counts
-            // are not modeled (0); the timestamp is the physical counter,
+            // timestamp (NVNcounterData; layout inferred from NVN1). Only
+            // SAMPLES_PASSED is counted (`RenderState::samples_passed`),
+            // others report 0; the timestamp is the physical counter,
             // the domain nvnDeviceGetCurrentTimestampInNanoseconds converts.
             "nvnCommandBufferReportCounter" => {
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -3060,14 +3072,21 @@ impl Nvn {
                 let to = self.gpu_to_guest(command.x[2], 16).map_err(stop)?;
                 let timestamp = core.counter;
                 let mut report = [0u8; 16];
+                if command.x[1] & 0xffff_ffff == 1 {
+                    report[..8].copy_from_slice(&self.render.samples_passed.to_le_bytes());
+                }
                 report[8..].copy_from_slice(&timestamp.to_le_bytes());
                 core.memory.write(to, &report)?;
                 Ok(())
             }
-            // ResetCounter(cmd, NVNcounterType): sets that counter to 0. The
-            // counts ReportCounter writes are not modeled and always 0, so
-            // there is nothing to reset.
-            "nvnCommandBufferResetCounter" => Ok(()),
+            // ResetCounter(cmd, NVNcounterType): sets that counter to 0 (only
+            // SAMPLES_PASSED, 1, is counted; others report 0).
+            "nvnCommandBufferResetCounter" => {
+                if command.x[1] & 0xffff_ffff == 1 {
+                    self.render.samples_passed = 0;
+                }
+                Ok(())
+            }
             // ClearBuffer(cmd, NVNbufferAddress, size, u32 value): fills with
             // the 32-bit value (size is a multiple of 4).
             "nvnCommandBufferClearBuffer" => {
