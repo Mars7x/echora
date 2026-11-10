@@ -3681,6 +3681,11 @@ impl Nvn {
                             (*binding, TextureSource::Target(*target))
                         }))
                         .collect();
+                eprintln!(
+                    "dispatch dump {:016x}: {} textures and images to read",
+                    key.0,
+                    read.len()
+                );
                 if let Err(error) = self.dump_images(key.0, &read) {
                     eprintln!("dispatch dump {:016x} images: {error}", key.0);
                     self.gpu_note(format!("dispatch dump {:016x} images: {error}", key.0));
