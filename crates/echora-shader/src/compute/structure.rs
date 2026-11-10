@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use echora_shader_abi::Unsupported;
 
-use super::{Block, Emitter, End, Guard, LOOP_BUDGET};
+use super::{Block, Emitter, End, Guard, loop_budget};
 use crate::decode::{Instruction, Op};
 use crate::spirv::{self, op};
 
@@ -369,7 +369,7 @@ impl Emitter {
         let pending = self
             .function
             .variable(&mut self.module, self.u32_ptr, Some(zero));
-        let budget_value = self.constant(LOOP_BUDGET);
+        let budget_value = self.constant(loop_budget());
         let budget = self
             .function
             .variable(&mut self.module, self.u32_ptr, Some(budget_value));

@@ -30,6 +30,19 @@ use crate::spirv::{
 /// beyond any finite loop a game runs per invocation.
 pub const LOOP_BUDGET: u32 = 1 << 20;
 
+/// The loop budget translations use: LOOP_BUDGET, or ECHORA_LOOP_BUDGET
+/// (debugging: a small budget turns a loop that never ends into a
+/// finished, wrong dispatch).
+pub fn loop_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("ECHORA_LOOP_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(LOOP_BUDGET)
+    })
+}
+
 /// How a block ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum End {
@@ -2565,7 +2578,7 @@ impl Emitter {
         let next = self
             .function
             .variable(&mut self.module, u32_ptr, Some(first));
-        let budget_value = self.constant(LOOP_BUDGET);
+        let budget_value = self.constant(loop_budget());
         let budget = self
             .function
             .variable(&mut self.module, u32_ptr, Some(budget_value));
