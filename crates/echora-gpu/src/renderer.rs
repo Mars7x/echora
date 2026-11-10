@@ -1067,6 +1067,55 @@ impl Renderer {
                 return self.texture_view(&volume, texture_type);
             }
         }
+        // A 3D upload read by a 2D or 2D-array binding (the instruction
+        // decides the type): Vulkan samples no 2D view of a 3D image, so
+        // level 0 is uploaded again as a 2D array whose layers are its
+        // depth slices, under its own cache key. Each slice's copy reads
+        // from the same texels.
+        if let TextureSource::Upload {
+            key,
+            format,
+            shape: ImageShape::D3 { depth },
+            texels,
+            levels,
+            ..
+        } = source
+            && matches!(texture_type, 2 | 3)
+            && !block_compressed(*format)
+            && *depth > 0
+        {
+            let mut layered = source.clone();
+            let base = levels.iter().find(|region| region.level == 0).copied();
+            if let (
+                TextureSource::Upload {
+                    key: alias,
+                    shape,
+                    levels: slices,
+                    ..
+                },
+                Some(base),
+            ) = (&mut layered, base)
+            {
+                let end = levels
+                    .iter()
+                    .map(|region| region.offset)
+                    .filter(|&offset| offset > base.offset)
+                    .min()
+                    .unwrap_or(texels.len() as u64);
+                let slice = (end - base.offset) / u64::from(*depth);
+                *alias = key ^ 1 << 61;
+                *shape = ImageShape::D2 { layers: *depth };
+                *slices = (0..*depth)
+                    .map(|layer| crate::draw::UploadRegion {
+                        layer,
+                        depth: 1,
+                        offset: base.offset + u64::from(layer) * slice,
+                        ..base
+                    })
+                    .collect();
+                return self.texture_view(&layered, texture_type);
+            }
+        }
         // A view of some mip levels and/or array layers (cube faces) of a
         // render target.
         if let TextureSource::TargetView {
