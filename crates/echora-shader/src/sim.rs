@@ -4702,6 +4702,34 @@ mod tests {
     }
 
     #[test]
+    fn mufu_flushes_subnormal_inputs_and_logs_zero_to_minus_infinity() {
+        // MUFU.function R1, R0.
+        let mufu =
+            |function: u128| word(&[(0, 12, 0x308), (16, 8, 1), (32, 8, 0), (74, 4, function)]);
+        let tiny = 1.0e-40f32.to_bits();
+        let negative_tiny = (-1.0e-40f32).to_bits();
+        let cases = [
+            (3, 0, f32::NEG_INFINITY),
+            (3, (-0.0f32).to_bits(), f32::NEG_INFINITY),
+            (3, tiny, f32::NEG_INFINITY),
+            (3, 8.0f32.to_bits(), 3.0),
+            (4, tiny, f32::INFINITY),
+            (4, negative_tiny, f32::NEG_INFINITY),
+            (4, 4.0f32.to_bits(), 0.25),
+            (5, tiny, f32::INFINITY),
+            (2, tiny, 1.0),
+        ];
+        for (function, input, expected) in cases {
+            let (r, _) = run(&[input], &[mufu(function)]);
+            assert_eq!(
+                f32::from_bits(r[&1]),
+                expected,
+                "MUFU {function} of {input:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {

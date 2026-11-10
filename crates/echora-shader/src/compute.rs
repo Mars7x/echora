@@ -2091,6 +2091,17 @@ impl Emitter {
             }
             Op::Mufu { d, function, src } => {
                 let x = self.float(index, src)?;
+                // MUFU flushes a subnormal input to a zero of its sign.
+                let x = {
+                    let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
+                    let smallest = self.float_constant(f32::MIN_POSITIVE);
+                    let tiny = self.value(op::F_ORD_LESS_THAN, self.bool, &[magnitude, smallest]);
+                    let bits = self.value(op::BITCAST, self.u32, &[x]);
+                    let sign = self.constant(0x8000_0000);
+                    let signed_zero = self.value(op::BITWISE_AND, self.u32, &[bits, sign]);
+                    let signed_zero = self.value(op::BITCAST, self.f32, &[signed_zero]);
+                    self.value(op::SELECT, self.f32, &[tiny, signed_zero, x])
+                };
                 let value = match function {
                     // SIN and COS take turns, not radians.
                     0 | 1 => {
@@ -2100,7 +2111,14 @@ impl Emitter {
                         self.glsl(self.f32, f, &[radians])
                     }
                     2 => self.glsl(self.f32, glsl::EXP2, &[x]),
-                    3 => self.glsl(self.f32, glsl::LOG2, &[x]),
+                    // LG2(±0) is -Inf (GLSL leaves Log2(0) undefined).
+                    3 => {
+                        let log = self.glsl(self.f32, glsl::LOG2, &[x]);
+                        let zero = self.float_constant(0.0);
+                        let is_zero = self.value(op::F_ORD_EQUAL, self.bool, &[x, zero]);
+                        let minus_infinity = self.float_constant(f32::NEG_INFINITY);
+                        self.value(op::SELECT, self.f32, &[is_zero, minus_infinity, log])
+                    }
                     4 => {
                         let one = self.float_constant(1.0);
                         self.value(op::F_DIV, self.f32, &[one, x])
