@@ -179,6 +179,22 @@ fn main() {
             }
             println!("  uniform {set}/{binding} read at {first:#x}..={last:#x}");
         }
+        // Guest pages the page table does not map: the program reads 0
+        // from them and its stores there are dropped.
+        let misses: u32 = report.unmapped_pages.values().sum();
+        for (&page, &count) in &report.unmapped_pages {
+            println!(
+                "  note: guest page {:#x} (address {:#x}) is not mapped: {count} accesses",
+                page,
+                page << echora_shader_abi::PAGE_SHIFT
+            );
+        }
+        if misses > 0 {
+            println!(
+                "  note: {misses} accesses to {} unmapped pages",
+                report.unmapped_pages.len()
+            );
+        }
         for note in &report.notes {
             println!("  note: {note}");
         }

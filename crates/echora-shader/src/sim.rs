@@ -212,6 +212,10 @@ pub struct Report {
     /// The uniform buffer bytes the run read: (descriptor set, binding,
     /// byte offset), each a 4-byte word.
     pub uniform_reads: std::collections::BTreeSet<(u32, u32, u32)>,
+    /// Guest pages accessed that the page table does not map (outside it,
+    /// or a zero entry), with how many accesses: the translation reads 0
+    /// from them and drops stores, as on the GPU.
+    pub unmapped_pages: BTreeMap<u64, u32>,
     /// Where each invocation ended: the index of the instruction (in the
     /// entry function) it returned at, or stopped at on a problem.
     pub ends: Vec<usize>,
@@ -254,6 +258,8 @@ struct Invocation {
     variables: HashMap<u32, Value>,
     /// Loop headers passed, by instruction.
     loops: HashMap<usize, u32>,
+    /// Values that are the page table's page count (for page misses).
+    page_counts: HashSet<u32>,
     /// Values, and variables holding them, that come from a shuffle of a
     /// lane not running there (undefined on a GPU): a branch on one is
     /// reported.
@@ -279,6 +285,10 @@ struct Shared {
     uniform_reads: std::collections::BTreeSet<(u32, u32, u32)>,
     /// The uniform buffer variables, with their set and binding.
     uniforms: HashMap<u32, (u32, u32)>,
+    /// The page table from the push constants: its address, first page and
+    /// page count.
+    page_table: Option<(u64, u64, u64)>,
+    unmapped_pages: BTreeMap<u64, u32>,
 }
 
 impl Shared {
@@ -850,6 +860,21 @@ impl Machine {
             problems: Vec::new(),
             notes: Vec::new(),
             uniform_reads: std::collections::BTreeSet::new(),
+            page_table: {
+                let at = echora_shader_abi::PUSH_PAGE_TABLE_OFFSET as usize;
+                let word = |n: usize| {
+                    inputs.push.get(at + 4 * n..at + 4 * n + 4).map(|bytes| {
+                        u64::from(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+                    })
+                };
+                match (word(0), word(1), word(2), word(3)) {
+                    (Some(low), Some(high), Some(first), Some(count)) if low | high != 0 => {
+                        Some((low | high << 32, first, count))
+                    }
+                    _ => None,
+                }
+            },
+            unmapped_pages: BTreeMap::new(),
             uniforms: self
                 .globals
                 .iter()
@@ -994,6 +1019,7 @@ impl Machine {
             memory: shared.memory,
             images: shared.images,
             uniform_reads: shared.uniform_reads,
+            unmapped_pages: shared.unmapped_pages,
         }
     }
 
@@ -1032,6 +1058,7 @@ impl Machine {
             loops: HashMap::new(),
             tainted: HashSet::new(),
             tainted_variables: HashSet::new(),
+            page_counts: HashSet::new(),
             initial: HashMap::new(),
             done: false,
             steps: 0,
@@ -1213,6 +1240,14 @@ impl Machine {
                 let bytes = shared.read(address, self.byte_size(pointee));
                 let mut slots = Vec::new();
                 self.fill(pointee, &bytes, 0, &mut slots);
+                // A page table entry of 0: an unmapped guest page.
+                if let Some((table, first, count)) = shared.page_table {
+                    let inside = address >= table && address < table + 8 * count;
+                    if inside && bytes.len() == 8 && slots == [0] {
+                        let page = first + (address - table) / 8;
+                        *shared.unmapped_pages.entry(page).or_insert(0) += 1;
+                    }
+                }
                 slots
             }
         }
@@ -1328,6 +1363,30 @@ impl Machine {
                 .collect()
         };
         Some((id, ty, result))
+    }
+
+    /// The byte offset of slot `offset` of push-constant variable
+    /// `variable` (a block of scalars), if it is one.
+    fn push_word(&self, variable: u32, offset: usize) -> Option<u32> {
+        let &(_, pointer, _) = self
+            .globals
+            .iter()
+            .find(|&&(id, _, class)| id == variable && class == storage::PUSH_CONSTANT)?;
+        let Ty::Pointer { pointee } = self.ty(pointer) else {
+            return None;
+        };
+        let Ty::Struct { members } = self.ty(pointee) else {
+            return None;
+        };
+        // Slots of scalar members, in order.
+        let mut slot = 0;
+        for (n, &member) in members.iter().enumerate() {
+            if slot == offset {
+                return Some(self.member_offset(pointee, n as u32) as u32);
+            }
+            slot += self.size(member);
+        }
+        None
     }
 
     /// The (descriptor set, binding) of a handle's bound texture or image
@@ -1860,6 +1919,33 @@ impl Machine {
                 }
             };
             self.check(ty, &result);
+            // The page count, and the comparison with it that finds a page
+            // outside the table.
+            match opcode {
+                op::LOAD => {
+                    if let Some(Pointer::Logical {
+                        variable, offset, ..
+                    }) = invocation.pointers.get(&args[0])
+                        && self.push_word(*variable, *offset)
+                            == Some(echora_shader_abi::PUSH_PAGE_TABLE_OFFSET + 12)
+                    {
+                        invocation.page_counts.insert(id);
+                    }
+                }
+                op::U_CONVERT if invocation.page_counts.contains(&args[0]) => {
+                    invocation.page_counts.insert(id);
+                }
+                op::U_GREATER_THAN
+                    if invocation.page_counts.contains(&args[0]) && result == [0] =>
+                {
+                    if let Some((_, first, _)) = shared.page_table {
+                        let relative = invocation.values[&args[1]][0];
+                        let page = relative.wrapping_add(first);
+                        *shared.unmapped_pages.entry(page).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
             let undefined = if opcode == op::LOAD {
                 matches!(invocation.pointers.get(&args[0]), Some(Pointer::Logical { variable, .. })
                     if invocation.tainted_variables.contains(variable))
@@ -3157,5 +3243,50 @@ mod tests {
         assert_eq!(r[&3], (1 << (lane + 1)) - 1, "le");
         assert_eq!(r[&4], !((1u32 << (lane + 1)) - 1), "gt");
         assert_eq!(r[&5], !((1u32 << lane) - 1), "ge");
+    }
+
+    #[test]
+    fn accesses_to_pages_the_table_does_not_map_are_counted() {
+        use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
+        // MOV R4, 0x10000; MOV R5, 0; LDG.E R2, [R4.64]
+        let load = word(&[
+            (0, 12, 0x381),
+            (16, 8, 2),
+            (24, 8, 4),
+            (72, 1, 1),
+            (73, 3, 4),
+        ]);
+        let code: Vec<_> = [mov(4, 0x10000), mov(5, 0), load, EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let translated = crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let machine = Machine::new(&translated.spirv);
+        let table = 0x2000_0000u64;
+        let push = |first: u32, count: u32| {
+            let mut push = vec![0u8; 128];
+            let at = PUSH_PAGE_TABLE_OFFSET as usize;
+            push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+            push[at + 8..at + 12].copy_from_slice(&first.to_le_bytes());
+            push[at + 12..at + 16].copy_from_slice(&count.to_le_bytes());
+            push
+        };
+        let page = 0x10000u64 >> PAGE_SHIFT;
+        // Outside the table (it covers the page after).
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push: push(page as u32 + 1, 1),
+            memory: BTreeMap::from([(table, vec![0; 8])]),
+            ..Inputs::default()
+        });
+        assert_eq!(report.unmapped_pages, BTreeMap::from([(page, 1)]));
+        // In the table with a zero entry.
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push: push(page as u32, 1),
+            memory: BTreeMap::from([(table, vec![0; 8])]),
+            ..Inputs::default()
+        });
+        assert_eq!(report.unmapped_pages, BTreeMap::from([(page, 1)]));
     }
 }
