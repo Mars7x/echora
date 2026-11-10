@@ -5993,6 +5993,14 @@ impl Nvn {
             self.gpu.as_mut().unwrap().note(line);
         }
         // Each traced binding's texture, in binding order.
+        // The depth target's storage and extent, for the trace below.
+        let depth_storage = depth.map(|texture| {
+            (
+                self.texture_storage(texture),
+                self.texture_extent(texture).ok(),
+                self.texture_storage(self.render.depth),
+            )
+        });
         let traced_textures = if super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
             wanted
                 .split(',')
@@ -6089,7 +6097,7 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} depth {:?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
