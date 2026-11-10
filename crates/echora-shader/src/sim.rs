@@ -147,6 +147,9 @@ pub struct Report {
     pub notes: Vec<String>,
     /// Device memory after the run.
     pub memory: BTreeMap<u64, Vec<u8>>,
+    /// Where each invocation ended: the index of the instruction (in the
+    /// entry function) it returned at, or stopped at on a problem.
+    pub ends: Vec<usize>,
 }
 
 /// A loaded module.
@@ -859,7 +862,9 @@ impl Machine {
             ));
             break;
         }
+        let ends = invocations.iter().map(|invocation| invocation.at).collect();
         Report {
+            ends,
             invocations: invocations
                 .into_iter()
                 .map(|invocation| invocation.variables)

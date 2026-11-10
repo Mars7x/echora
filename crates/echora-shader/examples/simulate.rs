@@ -108,6 +108,18 @@ fn main() {
             machine.local_size,
             report.barriers.len()
         );
+        // Where invocations ended, as runs of invocations.
+        let mut start = 0;
+        for n in 1..=report.ends.len() {
+            if n == report.ends.len() || report.ends[n] != report.ends[start] {
+                println!(
+                    "  invocations {start}-{} ended at instruction {}",
+                    n - 1,
+                    report.ends[start]
+                );
+                start = n;
+            }
+        }
         for note in &report.notes {
             println!("  note: {note}");
         }
