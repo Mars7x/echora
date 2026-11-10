@@ -11,6 +11,9 @@
 //!   optionally `subgroup N` (default 32) and `loop_limit N` (iterations
 //!   of one loop by one invocation that count as runaway, default 65536)
 //!   and `spec ID VALUE` (a specialization constant, else its default);
+//!   `builtin ID VALUE` (a built-in input by its SPIR-V number, as a
+//!   vertex program's VertexIndex 42, BaseVertex 4424, InstanceIndex 43,
+//!   BaseInstance 4425);
 //!   for a fragment program (one pixel), `fragcoord X Y Z W` (FragCoord, W
 //!   being 1/w) and `attribute LOCATION X Y Z W` (an interpolated input as
 //!   Vulkan hands it over, perspective-corrected), floats;
@@ -104,6 +107,9 @@ fn main() {
         match (line.split_whitespace().next(), fields.as_slice()) {
             (Some("groups"), &[x, y, z]) => inputs.workgroup_count = [x, y, z],
             (Some("subgroup"), &[size]) => inputs.subgroup_size = size,
+            (Some("builtin"), &[id, value]) => {
+                inputs.builtins.insert(id, vec![u64::from(value)]);
+            }
             (Some("loop_limit"), &[limit]) => inputs.loop_limit = limit,
             (Some("spec"), &[id, value]) => {
                 inputs.specialization.insert(id, value);

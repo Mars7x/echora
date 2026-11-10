@@ -4537,6 +4537,122 @@ impl Nvn {
         }
     }
 
+    /// ECHORA_DUMP_DRAW for an ordinary draw: its vertex stage as a
+    /// dispatch (`dump_dispatch`) of one invocation, the vertex its index
+    /// buffer names first, in a directory named by the fragment key xor
+    /// "vert". The vertex fetch table goes into `memory-` at a made-up
+    /// device address the push constants name, and `dispatch.txt` gives the
+    /// draw's VertexIndex, BaseVertex, InstanceIndex and BaseInstance.
+    #[allow(clippy::too_many_arguments)]
+    fn dump_vertex_stage(
+        &mut self,
+        core: &mut Guest,
+        command: &Command,
+        fragment: u64,
+        stages: &[std::sync::Arc<Translated>],
+        uniforms: &HashMap<(usize, u32), Vec<u8>>,
+        textures: &HashMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
+        page_table: echora_shader_abi::PageTable,
+        (fetch, base_vertex, first_instance): (&[echora_shader_abi::VertexAttribute], i32, u32),
+    ) {
+        let Some((index, stage)) = stages
+            .iter()
+            .enumerate()
+            .find(|(_, stage)| stage.stage == echora_shader_abi::Stage::Vertex)
+        else {
+            return;
+        };
+        let key = fragment ^ 0x7665_7274;
+        self.dumped_dispatches.insert(key);
+        // The first index of an indexed draw (else vertex 0 of the draw).
+        let first = if command.name.starts_with("nvnCommandBufferDrawElements") {
+            let size = match command.x[2] {
+                0 => 1,
+                1 => 2,
+                _ => 4,
+            };
+            self.gpu_bytes(core, command.x[4], size).map_or(0, |bytes| {
+                bytes
+                    .iter()
+                    .rev()
+                    .fold(0u32, |value, &byte| value << 8 | u32::from(byte))
+            })
+        } else {
+            0
+        };
+        let stage_uniforms: HashMap<u32, Vec<u8>> = uniforms
+            .iter()
+            .filter(|((stage_index, _), _)| *stage_index == index)
+            .map(|((_, binding), bytes)| (*binding, bytes.clone()))
+            .collect();
+        if let Err(error) = self.dump_dispatch(
+            core,
+            key,
+            stage,
+            [1, 1, 1],
+            &stage_uniforms,
+            &[],
+            page_table,
+        ) {
+            eprintln!("draw dump {key:016x}: {error}");
+            return;
+        }
+        let read: Vec<(u32, TextureSource)> = textures
+            .iter()
+            .filter(|((stage_index, _), _)| *stage_index == index)
+            .map(|((_, binding), (source, _))| (*binding, source.clone()))
+            .collect();
+        if let Err(error) = self.dump_images(key, &read) {
+            eprintln!("draw dump {key:016x} images: {error}");
+        }
+        let Ok(directory) = self.dump_directory(key) else {
+            return;
+        };
+        // The fetch table at a device address no pool uses.
+        const TABLE: u64 = 0x7f00_0000_0000;
+        let table: Vec<u8> = fetch
+            .iter()
+            .flat_map(|entry| {
+                let mut bytes = Vec::with_capacity(32);
+                bytes.extend(entry.address.to_le_bytes());
+                for word in [entry.stride, entry.divisor, entry.format, entry.size, 0, 0] {
+                    bytes.extend(word.to_le_bytes());
+                }
+                bytes
+            })
+            .collect();
+        let push = echora_shader_abi::PushConstants {
+            vertex_fetch: echora_shader_abi::VertexFetch {
+                table: if fetch.is_empty() { 0 } else { TABLE },
+                base_instance: first_instance,
+                attributes: (1u64 << fetch.len()).wrapping_sub(1) as u32,
+            },
+            resolution_scale: [1.0; 4],
+            page_table,
+            ..Default::default()
+        };
+        let vertex = (first as i64 + i64::from(base_vertex)) as u32;
+        let lines = format!(
+            "builtin 42 {vertex}\nbuiltin 4424 {}\nbuiltin 43 {first_instance}\nbuiltin 4425 {first_instance}\n",
+            base_vertex as u32
+        );
+        let result = std::fs::write(directory.join(format!("memory-{TABLE:x}.bin")), &table)
+            .and_then(|()| std::fs::write(directory.join("push.bin"), push.to_bytes()))
+            .and_then(|()| {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(directory.join("dispatch.txt"))?
+                    .write_all(lines.as_bytes())
+            });
+        match result {
+            Ok(()) => eprintln!(
+                "draw dump {key:016x}: vertex stage, vertex {vertex} (index {first} + base {base_vertex}), instance {first_instance}"
+            ),
+            Err(error) => eprintln!("draw dump {key:016x}: {error}"),
+        }
+    }
+
     /// A dumped draw's fragment program and inputs, for the simulator: as
     /// `dump_dispatch`, with `dispatch.txt` naming the target's middle
     /// pixel (`fragcoord`; its attributes are left to the reader) and each
@@ -6249,14 +6365,13 @@ impl Nvn {
         }
         // ECHORA_DUMP_DRAW also dumps a mesh draw's task and mesh stages
         // (as dispatches, at the end): their inputs, kept here.
-        let stage_dump = (mesh_draw
-            && super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
-                wanted
-                    .split(',')
-                    .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
-            })
-            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b))
-            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x6d65_7368)))
+        let stage_dump = (super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
+            wanted
+                .split(',')
+                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
+        }) && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b))
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x6d65_7368))
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7665_7274)))
         .then(|| {
             (
                 stages.clone(),
@@ -6265,6 +6380,11 @@ impl Nvn {
                 page_table,
             )
         });
+        let vertex_fetch_dump = if stage_dump.is_some() {
+            vertex_fetch.clone()
+        } else {
+            Vec::new()
+        };
         let draw = Draw {
             program: &backend.programs[&keys],
             blends,
@@ -6484,7 +6604,21 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: draw us setup", timings[0]);
         backend.stat("stat: draw us renderer", timings[1]);
-        if let Some((stages, uniforms, textures, page_table)) = stage_dump {
+        if let Some((stages, uniforms, textures, page_table)) = stage_dump.as_ref()
+            && !mesh_draw
+        {
+            self.dump_vertex_stage(
+                core,
+                command,
+                keys.1,
+                stages,
+                uniforms,
+                textures,
+                *page_table,
+                (&vertex_fetch_dump, base_vertex, first_instance),
+            );
+        }
+        if let Some((stages, uniforms, textures, page_table)) = stage_dump.filter(|_| mesh_draw) {
             self.dump_mesh_stages(
                 core, command, keys.1, &stages, &uniforms, &textures, page_table,
             );
