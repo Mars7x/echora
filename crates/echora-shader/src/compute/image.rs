@@ -329,12 +329,7 @@ impl Emitter {
         self.function.emit(op::BRANCH, &[merge]);
         self.dominators.pop();
         self.function.label(merge);
-        let after = self.function.block();
-        for (block, _) in self.known.values_mut() {
-            if *block == before {
-                *block = after;
-            }
-        }
+        self.carry_known(before);
     }
 }
 

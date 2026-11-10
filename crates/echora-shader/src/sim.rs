@@ -3742,6 +3742,36 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_inside_a_branch_reads_its_registers_afresh_each_pass() {
+        // R0 = 0, R1 = 3 (instructions 0 and 1).
+        // 2: ISETP.LT P0, R0, R1; 3: @!P0 BRA 8;
+        // 4: IADD3 R2, R2, R0 (R0 read before this pass writes it);
+        // 5: R0 += 1; 6: ISETP.LT P1, R0, R1; 7: @P1 BRA 4
+        let body = [
+            less(0, 0, 1),
+            bra(3, 8, 8),
+            word(&[
+                (0, 12, 0x210),
+                (16, 8, 2),
+                (24, 8, 2),
+                (32, 8, 0),
+                (64, 8, 255),
+                (77, 3, 7),
+                (81, 3, 7),
+                (84, 3, 7),
+                (87, 3, 7),
+            ]),
+            add(0, 0, 1),
+            less(1, 0, 1),
+            bra(7, 4, 1),
+        ];
+        let (r, _) = run(&[0, 3], &body);
+        assert_eq!((r[&0], r[&2]), (3, 3));
+        let (r, _) = run(&[5, 3], &body);
+        assert_eq!((r[&0], r[&2]), (5, 0));
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {

@@ -692,6 +692,17 @@ impl Emitter {
         (block == self.function.block() || self.dominators.contains(&block)).then_some(value)
     }
 
+    /// Carries the values known in block `from` on into the current block,
+    /// which `from` dominates.
+    fn carry_known(&mut self, from: (u32, u32)) {
+        let to = self.function.block();
+        for (block, _) in self.known.values_mut() {
+            if *block == from {
+                *block = to;
+            }
+        }
+    }
+
     /// Records `value` for `key`, made in the current block.
     fn remember(&mut self, key: Known, value: u32) {
         self.known.insert(key, (self.function.block(), value));

@@ -69,10 +69,17 @@ impl Emitter {
             .emit(op::SELECTION_MERGE, &[merge, crate::spirv::NONE]);
         self.function
             .emit(op::BRANCH_CONDITIONAL, &[condition, then, merge]);
+        // Values known before stay known in the body, and after it unless
+        // the body replaced them.
+        let before = self.function.block();
+        self.dominators.push(before);
         self.function.label(then);
-        body(self)?;
+        let done = body(self);
+        self.dominators.pop();
+        done?;
         self.function.emit(op::BRANCH, &[merge]);
         self.function.label(merge);
+        self.carry_known(before);
         Ok(())
     }
 

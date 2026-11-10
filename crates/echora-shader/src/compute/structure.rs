@@ -486,9 +486,11 @@ impl Emitter {
                 let (stop, go) = (self.module.id(), self.module.id());
                 self.function.emit(op::SELECTION_MERGE, &[go, spirv::NONE]);
                 self.function.emit(op::BRANCH_CONDITIONAL, &[all, stop, go]);
+                let before = self.function.block();
                 self.function.label(stop);
                 self.leave();
                 self.function.label(go);
+                self.carry_known(before);
                 self.statement(code, blocks, rest, state)?;
             }
             Statement::Sequence(statements) => {
@@ -507,10 +509,17 @@ impl Emitter {
                     .emit(op::SELECTION_MERGE, &[merge, spirv::NONE]);
                 self.function
                     .emit(op::BRANCH_CONDITIONAL, &[value, taken, other]);
+                // The arms start where the branch is: values known there
+                // stay known in each until it replaces them.
+                self.dominators.push(self.function.block());
                 self.function.label(taken);
-                self.statement(code, blocks, then, state)?;
-                self.function.label(other);
-                self.statement(code, blocks, otherwise, state)?;
+                let done = self.statement(code, blocks, then, state);
+                if done.is_ok() {
+                    self.function.label(other);
+                }
+                let done = done.and_then(|()| self.statement(code, blocks, otherwise, state));
+                self.dominators.pop();
+                done?;
                 // Both arms leave: the merge is never reached.
                 self.function.label(merge);
                 self.function.emit(op::UNREACHABLE, &[]);
@@ -587,7 +596,12 @@ impl Emitter {
                     continuing,
                     escapes: false,
                 });
-                self.statement(code, blocks, body, state)?;
+                // Inside a construct that may repeat, a value known before
+                // it may have been replaced by an earlier pass through it.
+                let outside = std::mem::take(&mut self.dominators);
+                let done = self.statement(code, blocks, body, state);
+                self.dominators = outside;
+                done?;
                 let closed = state.open.pop().unwrap_or(Open {
                     id: *id,
                     merge,
