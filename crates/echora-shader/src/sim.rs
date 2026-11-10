@@ -57,13 +57,36 @@ const EXECUTION_LOCAL_SIZE: u32 = 17;
 enum Ty {
     Void,
     Bool,
-    Int { width: u32, signed: bool },
-    Float { width: u32 },
-    Vector { component: u32, count: u32 },
-    Array { element: u32, length: u32 },
-    RuntimeArray { element: u32 },
-    Struct { members: Vec<u32> },
-    Pointer { pointee: u32 },
+    Int {
+        width: u32,
+        signed: bool,
+    },
+    Float {
+        width: u32,
+    },
+    Vector {
+        component: u32,
+        count: u32,
+    },
+    Array {
+        element: u32,
+        length: u32,
+    },
+    RuntimeArray {
+        element: u32,
+    },
+    Struct {
+        members: Vec<u32>,
+    },
+    Pointer {
+        pointee: u32,
+    },
+    /// A cooperative matrix: its component type, rows and columns.
+    Matrix {
+        component: u32,
+        rows: u32,
+        columns: u32,
+    },
     Other,
 }
 
@@ -161,6 +184,9 @@ struct Invocation {
     variables: HashMap<u32, Value>,
     /// Loop headers passed, by instruction.
     loops: HashMap<usize, u32>,
+    /// Starting values of function variables, replacing their
+    /// initializers.
+    initial: HashMap<u32, Value>,
     done: bool,
     steps: u64,
 }
@@ -176,6 +202,12 @@ struct Shared {
 }
 
 impl Shared {
+    fn note(&mut self, note: &str) {
+        if !self.notes.iter().any(|known| known == note) {
+            self.notes.push(note.to_string());
+        }
+    }
+
     fn problem(&mut self, problem: String) {
         if self.problems.len() < 64 && !self.problems.contains(&problem) {
             self.problems.push(problem);
@@ -420,7 +452,16 @@ impl Machine {
                 }
                 op::TYPE_COOPERATIVE_MATRIX => {
                     machine.cooperative = true;
-                    machine.types.insert(operands[0], Ty::Other);
+                    let rows = machine.constants[&operands[3]][0] as u32;
+                    let columns = machine.constants[&operands[4]][0] as u32;
+                    machine.types.insert(
+                        operands[0],
+                        Ty::Matrix {
+                            component: operands[1],
+                            rows,
+                            columns,
+                        },
+                    );
                 }
                 op::TYPE_FUNCTION | op::TYPE_IMAGE | op::TYPE_SAMPLER | op::TYPE_SAMPLED_IMAGE => {
                     machine.types.insert(operands[0], Ty::Other);
@@ -498,6 +539,7 @@ impl Machine {
             Ty::Array { element, length } => self.size(element) * length as usize,
             Ty::RuntimeArray { .. } => 0,
             Ty::Struct { members } => members.iter().map(|&member| self.size(member)).sum(),
+            Ty::Matrix { rows, columns, .. } => (rows * columns) as usize,
             _ => 1,
         }
     }
@@ -601,7 +643,27 @@ impl Machine {
         subgroup: usize,
         builtins: impl Fn(usize) -> HashMap<u32, Value>,
     ) -> Report {
-        self.run_group(count, subgroup, builtins, &Inputs::default())
+        self.run_group(
+            count,
+            subgroup,
+            builtins,
+            |_| HashMap::new(),
+            &Inputs::default(),
+        )
+    }
+
+    /// As `run_workgroup`, invocation n's function variables starting
+    /// with the values `initial(n)` gives (by variable id) instead of
+    /// their initializers.
+    #[cfg(test)]
+    fn run_workgroup_with(
+        &self,
+        count: usize,
+        subgroup: usize,
+        builtins: impl Fn(usize) -> HashMap<u32, Value>,
+        initial: impl Fn(usize) -> HashMap<u32, Value>,
+    ) -> Report {
+        self.run_group(count, subgroup, builtins, initial, &Inputs::default())
     }
 
     /// Runs workgroup `inputs.workgroup_id` of a dispatch.
@@ -667,6 +729,7 @@ impl Machine {
                 }
                 builtins
             },
+            |_| HashMap::new(),
             inputs,
         )
     }
@@ -676,6 +739,7 @@ impl Machine {
         count: usize,
         subgroup: usize,
         builtins: impl Fn(usize) -> HashMap<u32, Value>,
+        initial: impl Fn(usize) -> HashMap<u32, Value>,
         inputs: &Inputs,
     ) -> Report {
         let mut shared = Shared {
@@ -710,8 +774,13 @@ impl Machine {
             self.fill(pointee, &bytes, 0, &mut slots);
             shared.variables.insert(variable, slots);
         }
-        let mut invocations: Vec<Invocation> =
-            (0..count).map(|n| self.start(&builtins(n))).collect();
+        let mut invocations: Vec<Invocation> = (0..count)
+            .map(|n| {
+                let mut invocation = self.start(&builtins(n));
+                invocation.initial = initial(n);
+                invocation
+            })
+            .collect();
         let mut barriers = Vec::new();
         loop {
             for invocation in invocations.iter_mut() {
@@ -835,6 +904,7 @@ impl Machine {
             pointers,
             variables,
             loops: HashMap::new(),
+            initial: HashMap::new(),
             done: false,
             steps: 0,
         }
@@ -843,7 +913,14 @@ impl Machine {
     /// Whether `opcode` needs the other invocations (a barrier, or a
     /// subgroup operation).
     fn collective(opcode: u16) -> bool {
-        opcode == op::CONTROL_BARRIER || (333..=366).contains(&opcode)
+        opcode == op::CONTROL_BARRIER
+            || (333..=366).contains(&opcode)
+            || matches!(
+                opcode,
+                op::COOPERATIVE_MATRIX_LOAD
+                    | op::COOPERATIVE_MATRIX_STORE
+                    | op::COOPERATIVE_MATRIX_MUL_ADD
+            )
     }
 
     /// The subgroup operation `members` (running invocations of the
@@ -858,6 +935,26 @@ impl Machine {
         let at = invocations[members[0]].at;
         let instruction = &self.body[at];
         let (opcode, operands) = (instruction.opcode, &instruction.operands);
+        // Cooperative matrix operations run once for the subgroup (each
+        // invocation's operands are the same), as on the hardware.
+        if matches!(
+            opcode,
+            op::COOPERATIVE_MATRIX_LOAD
+                | op::COOPERATIVE_MATRIX_STORE
+                | op::COOPERATIVE_MATRIX_MUL_ADD
+        ) {
+            let lead = members[0];
+            let result = self.matrix_operation(&mut invocations[lead], shared);
+            for &n in members {
+                let invocation = &mut invocations[n];
+                if let Some((id, ty, value)) = &result {
+                    invocation.values.insert(*id, value.clone());
+                    invocation.value_types.insert(*id, *ty);
+                }
+                invocation.at += 1;
+            }
+            return;
+        }
         let (ty, id) = (operands[0], operands[1]);
         let input = |invocation: &Invocation, n: usize| invocation.values[&operands[n]].clone();
         let all = |n: usize| -> Vec<Value> {
@@ -1000,6 +1097,111 @@ impl Machine {
         }
     }
 
+    /// A cooperative matrix operation, run by `invocation` for its
+    /// subgroup: the result (id, type, value), if it has one.
+    fn matrix_operation(
+        &self,
+        invocation: &mut Invocation,
+        shared: &mut Shared,
+    ) -> Option<(u32, u32, Value)> {
+        let instruction = &self.body[invocation.at];
+        let (opcode, operands) = (instruction.opcode, &instruction.operands);
+        if opcode == op::COOPERATIVE_MATRIX_STORE {
+            // Row-major (layout 0) at a stride in elements, from the
+            // pointer's element.
+            let pointer = invocation.pointers[&operands[0]];
+            let matrix = invocation.values[&operands[1]].clone();
+            let stride = invocation.values[&operands[3]][0] as usize;
+            assert_eq!(
+                invocation.values[&operands[2]][0], 0,
+                "a column-major matrix"
+            );
+            let columns = self.matrix_columns(invocation.value_types[&operands[1]]);
+            for (n, &element) in matrix.iter().enumerate() {
+                let at = self.offset(pointer, n / columns * stride + n % columns);
+                self.store(invocation, shared, at, &vec![element]);
+            }
+            return None;
+        }
+        let (ty, id, args) = (operands[0], operands[1], &operands[2..]);
+        let value = |n: usize| invocation.values[&args[n]].clone();
+        let result = if opcode == op::COOPERATIVE_MATRIX_LOAD {
+            let pointer = invocation.pointers[&args[0]];
+            let stride = invocation.values[&args[2]][0] as usize;
+            assert_eq!(invocation.values[&args[1]][0], 0, "a column-major matrix");
+            let (rows, columns) = match self.ty(ty) {
+                Ty::Matrix { rows, columns, .. } => (rows as usize, columns as usize),
+                other => panic!("a matrix load of {other:?}"),
+            };
+            let mut matrix = Vec::with_capacity(rows * columns);
+            for n in 0..rows * columns {
+                let at = self.offset(pointer, n / columns * stride + n % columns);
+                matrix.push(self.load(invocation, shared, at)[0]);
+            }
+            matrix
+        } else {
+            // A x B + C, each element's sum exact, rounded once to the
+            // result's component type.
+            let (a, b, c) = (value(0), value(1), value(2));
+            let a_type = invocation.value_types[&args[0]];
+            let k = self.matrix_columns(a_type);
+            let columns = self.matrix_columns(ty);
+            let rows = a.len() / k;
+            let element = |matrix: u32| match self.ty(matrix) {
+                Ty::Matrix { component, .. } => component,
+                _ => matrix,
+            };
+            let read = |bits: u64, component: u32| match self.ty(component) {
+                Ty::Float { width: 16 } => f64::from(f16_to_f32(bits as u16)),
+                _ => f64::from(f32::from_bits(bits as u32)),
+            };
+            let (a_component, b_component) =
+                (element(a_type), element(invocation.value_types[&args[1]]));
+            let c_component = element(invocation.value_types[&args[2]]);
+            let result_component = element(ty);
+            (0..rows * columns)
+                .map(|n| {
+                    let (row, column) = (n / columns, n % columns);
+                    let sum = (0..k).fold(read(c[n], c_component), |sum, index| {
+                        sum + read(a[row * k + index], a_component)
+                            * read(b[index * columns + column], b_component)
+                    });
+                    match self.ty(result_component) {
+                        Ty::Float { width: 16 } => u64::from(f64_to_f16(sum)),
+                        _ => u64::from((sum as f32).to_bits()),
+                    }
+                })
+                .collect()
+        };
+        Some((id, ty, result))
+    }
+
+    fn matrix_columns(&self, ty: u32) -> usize {
+        match self.ty(ty) {
+            Ty::Matrix { columns, .. } => columns as usize,
+            other => panic!("not a matrix: {other:?}"),
+        }
+    }
+
+    /// `pointer` (to an array element) moved on by `elements` elements.
+    fn offset(&self, pointer: Pointer, elements: usize) -> Pointer {
+        match pointer {
+            Pointer::Logical {
+                variable,
+                offset,
+                pointee,
+            } => Pointer::Logical {
+                variable,
+                offset: offset + elements * self.size(pointee),
+                pointee,
+            },
+            Pointer::Physical { address, pointee } => Pointer::Physical {
+                address: address + (elements * self.byte_size(pointee)) as u64,
+                pointee,
+            },
+        }
+    }
+
     /// The pointer `base` indexed by `indices` (values).
     fn chain(&self, base: Pointer, indices: &[u64], shared: &mut Shared) -> Pointer {
         let mut pointer = base;
@@ -1102,10 +1304,13 @@ impl Machine {
                     let Ty::Pointer { pointee } = self.ty(operands[0]) else {
                         panic!("a variable of a non-pointer type");
                     };
-                    let value = operands.get(3).map_or_else(
-                        || vec![0; self.size(pointee)],
-                        |id| invocation.values[id].clone(),
-                    );
+                    let value = match invocation.initial.get(&operands[1]) {
+                        Some(value) => value.clone(),
+                        None => operands.get(3).map_or_else(
+                            || vec![0; self.size(pointee)],
+                            |id| invocation.values[id].clone(),
+                        ),
+                    };
                     invocation.variables.insert(operands[1], value);
                     invocation.pointers.insert(
                         operands[1],
@@ -1153,6 +1358,10 @@ impl Machine {
                     continue;
                 }
                 op::FUNCTION_CALL => panic!("the simulator does not call functions"),
+                op::IMAGE_WRITE => {
+                    shared.note("image writes are dropped (no image data)");
+                    continue;
+                }
                 _ => {}
             }
             // Instructions with a result.
@@ -1160,6 +1369,24 @@ impl Machine {
             let values = &invocation.values;
             let value = |n: usize| values[&args[n]].clone();
             let result: Value = match opcode {
+                // Images, samplers and sampled images: placeholders (their
+                // reads give zeros).
+                op::LOAD if self.ty(ty) == Ty::Other => vec![0],
+                op::SAMPLED_IMAGE | op::IMAGE => vec![0],
+                op::IMAGE_SAMPLE_IMPLICIT_LOD
+                | op::IMAGE_SAMPLE_EXPLICIT_LOD
+                | op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                | op::IMAGE_FETCH
+                | op::IMAGE_GATHER
+                | op::IMAGE_DREF_GATHER
+                | op::IMAGE_READ
+                | op::IMAGE_QUERY_SIZE_LOD
+                | op::IMAGE_QUERY_LEVELS
+                | op::IMAGE_QUERY_LOD => {
+                    shared.note("texture and image reads give zeros (no image data)");
+                    vec![0; self.size(ty)]
+                }
                 op::LOAD => {
                     let pointer = invocation.pointers[&args[0]];
                     self.load(invocation, shared, pointer)
@@ -1169,6 +1396,24 @@ impl Machine {
                     let indices: Vec<u64> = args[1..].iter().map(|a| values[a][0]).collect();
                     let pointer = self.chain(base, &indices, shared);
                     invocation.pointers.insert(id, pointer);
+                    continue;
+                }
+                // An image texel for an atomic: a word of its own (no image
+                // data), starting at zero.
+                op::IMAGE_TEXEL_POINTER => {
+                    shared.note("image atomics act on scratch words (no image data)");
+                    let Ty::Pointer { pointee } = self.ty(ty) else {
+                        panic!("ImageTexelPointer to a non-pointer type");
+                    };
+                    invocation.variables.insert(id, vec![0]);
+                    invocation.pointers.insert(
+                        id,
+                        Pointer::Logical {
+                            variable: id,
+                            offset: 0,
+                            pointee,
+                        },
+                    );
                     continue;
                 }
                 op::CONVERT_U_TO_PTR => {
@@ -2147,5 +2392,104 @@ mod tests {
             "{:?}",
             report.problems
         );
+    }
+
+    #[test]
+    fn warp_matrix_multiplies_match_the_ptx_layout_on_every_path() {
+        use crate::compute::MatrixPath;
+        // A (16x16) shared by two HMMA.16816.F32s with their own B (16x8)
+        // and C (16x8): small integers, exact in halves and in any sum.
+        let a = |row: usize, k: usize| ((row * 3 + k * 5) % 7) as f64 - 3.0;
+        let b = |n: usize, k: usize, column: usize| ((k * 2 + column * 3 + n) % 5) as f64 - 2.0;
+        let c = |n: usize, row: usize, column: usize| (row + 2 * column + n) as f64;
+        let half = |value: f64| u64::from(f64_to_f16(value));
+        let pair = |low: f64, high: f64| half(low) | half(high) << 16;
+        let hmma = |d: u128, b: u128, c: u128| {
+            word(&[
+                (0, 12, 0x23c),
+                (16, 8, d),
+                (24, 8, 0),
+                (32, 8, b),
+                (64, 8, c),
+                (75, 1, 1),
+                (76, 1, 1),
+            ])
+        };
+        // A in R0-R3; B in R4-R5 and R6-R7; C in R8-R11 and R12-R15.
+        let program = [hmma(16, 4, 8), hmma(20, 6, 12), EXIT];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        for matrices in [
+            MatrixPath::Subgroup,
+            MatrixPath::Cooperative,
+            MatrixPath::Exact,
+        ] {
+            let layout = Layout {
+                matrices,
+                ..Layout::workgroup([32, 1, 1])
+            };
+            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            let machine = Machine::new(&translated.spirv);
+            // Lane l's fragments, by the PTX layout (g = l / 4, t = l % 4).
+            let initial = |lane: usize| {
+                let (g, t) = (lane / 4, lane % 4);
+                let mut values: HashMap<u8, u64> = HashMap::new();
+                for j in 0..4 {
+                    let row = g + 8 * (j & 1);
+                    let k = 2 * t + 8 * (j >> 1);
+                    values.insert(j as u8, pair(a(row, k), a(row, k + 1)));
+                }
+                for n in 0..2 {
+                    for j in 0..2 {
+                        let k = 2 * t + 8 * j;
+                        values.insert((4 + 2 * n + j) as u8, pair(b(n, k, g), b(n, k + 1, g)));
+                    }
+                    for i in 0..4 {
+                        let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                        let value = (c(n, row, column) as f32).to_bits();
+                        values.insert((8 + 4 * n + i) as u8, u64::from(value));
+                    }
+                }
+                values
+                    .into_iter()
+                    .filter_map(|(register, value)| {
+                        registers
+                            .get(&register)
+                            .map(|&variable| (variable, vec![value]))
+                    })
+                    .collect()
+            };
+            let report = machine.run_workgroup_with(
+                32,
+                32,
+                |lane| {
+                    HashMap::from([
+                        (27, vec![lane as u64, 0, 0]),
+                        (29, vec![lane as u64]),
+                        (40, vec![0]),
+                        (41, vec![lane as u64]),
+                    ])
+                },
+                initial,
+            );
+            assert!(
+                report.problems.is_empty(),
+                "{matrices:?}: {:?}",
+                report.problems
+            );
+            for (lane, variables) in report.invocations.iter().enumerate() {
+                let (g, t) = (lane / 4, lane % 4);
+                for n in 0..2 {
+                    for i in 0..4 {
+                        let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                        let expected = (0..16).fold(c(n, row, column), |sum, k| {
+                            sum + a(row, k) * b(n, k, column)
+                        }) as f32;
+                        let register = (16 + 4 * n + i) as u8;
+                        let got = f32::from_bits(variables[&registers[&register]][0] as u32);
+                        assert_eq!(got, expected, "{matrices:?} lane {lane} D{n}[{i}]");
+                    }
+                }
+            }
+        }
     }
 }
