@@ -23,8 +23,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::spirv::{glsl, op, storage};
 
-/// OpFConvert is not in `op`.
+/// Opcodes not in `op`.
 const F_CONVERT: u16 = 115;
+const VECTOR_SHUFFLE: u16 = 79;
+const I_ADD_CARRY: u16 = 149;
+const I_SUB_BORROW: u16 = 150;
+const U_MUL_EXTENDED: u16 = 151;
+const S_MUL_EXTENDED: u16 = 152;
 
 /// Decorations read here.
 const DECORATION_ARRAY_STRIDE: u32 = 6;
@@ -143,6 +148,7 @@ pub struct Machine {
     glsl: u32,
     /// The workgroup size (LocalSize).
     pub local_size: [u32; 3],
+    cooperative: bool,
 }
 
 /// One invocation's state.
@@ -310,6 +316,7 @@ impl Machine {
             labels: HashMap::new(),
             glsl: 0,
             local_size: [1, 1, 1],
+            cooperative: false,
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
@@ -411,11 +418,11 @@ impl Machine {
                         },
                     );
                 }
-                op::TYPE_FUNCTION
-                | op::TYPE_IMAGE
-                | op::TYPE_SAMPLER
-                | op::TYPE_SAMPLED_IMAGE
-                | op::TYPE_COOPERATIVE_MATRIX => {
+                op::TYPE_COOPERATIVE_MATRIX => {
+                    machine.cooperative = true;
+                    machine.types.insert(operands[0], Ty::Other);
+                }
+                op::TYPE_FUNCTION | op::TYPE_IMAGE | op::TYPE_SAMPLER | op::TYPE_SAMPLED_IMAGE => {
                     machine.types.insert(operands[0], Ty::Other);
                 }
                 op::CONSTANT | op::SPEC_CONSTANT => {
@@ -465,6 +472,11 @@ impl Machine {
         }
         machine.body = body;
         machine
+    }
+
+    /// Whether the module has cooperative matrix types (not simulated).
+    pub fn uses_cooperative_matrices(&self) -> bool {
+        self.cooperative
     }
 
     fn ty(&self, id: u32) -> Ty {
@@ -1203,7 +1215,22 @@ impl Machine {
                     self.store(invocation, shared, pointer, &vec![u64::from(new)]);
                     vec![u64::from(old)]
                 }
-                op::READ_CLOCK => vec![invocation.steps],
+                // The clock as a uvec2 (or u64): the steps run so far.
+                op::READ_CLOCK => match self.ty(ty) {
+                    Ty::Vector { .. } => {
+                        vec![invocation.steps & 0xffff_ffff, invocation.steps >> 32]
+                    }
+                    _ => vec![invocation.steps],
+                },
+                // Components of the two vectors by literal index (0xffffffff:
+                // undefined, here 0).
+                VECTOR_SHUFFLE => {
+                    let both: Value = [value(0), value(1)].concat();
+                    args[2..]
+                        .iter()
+                        .map(|&n| both.get(n as usize).copied().unwrap_or(0))
+                        .collect()
+                }
                 op::BITCAST => self.bitcast(invocation.value_types[&args[0]], ty, &value(0)),
                 op::COMPOSITE_CONSTRUCT => args.iter().flat_map(|a| values[a].clone()).collect(),
                 op::COMPOSITE_EXTRACT => {
@@ -1216,7 +1243,37 @@ impl Machine {
                     let inputs: Vec<Value> = args[2..].iter().map(|a| values[a].clone()).collect();
                     self.extended(ty, args[1], &inputs)
                 }
+                // Two results in a struct: the low word or sum, then the high
+                // word or carry (or borrow).
+                I_ADD_CARRY | I_SUB_BORROW | U_MUL_EXTENDED | S_MUL_EXTENDED => {
+                    let (x, y) = (value(0)[0] as u32, value(1)[0] as u32);
+                    let (low, high) = match opcode {
+                        I_ADD_CARRY => {
+                            let (sum, carry) = x.overflowing_add(y);
+                            (sum, u32::from(carry))
+                        }
+                        I_SUB_BORROW => {
+                            let (difference, borrow) = x.overflowing_sub(y);
+                            (difference, u32::from(borrow))
+                        }
+                        U_MUL_EXTENDED => {
+                            let product = u64::from(x) * u64::from(y);
+                            (product as u32, (product >> 32) as u32)
+                        }
+                        _ => {
+                            let product = i64::from(x as i32) * i64::from(y as i32);
+                            (product as u32, (product >> 32) as u32)
+                        }
+                    };
+                    vec![u64::from(low), u64::from(high)]
+                }
                 _ => {
+                    if let Some(missing) = args.iter().find(|a| !values.contains_key(a)) {
+                        panic!(
+                            "the simulator does not run opcode {opcode} (instruction {at}: operand \
+                             {missing} is no value)"
+                        );
+                    }
                     let inputs: Vec<Value> = args.iter().map(|a| values[a].clone()).collect();
                     let operand_type = args
                         .iter()
@@ -1271,7 +1328,9 @@ impl Machine {
             _ => 32,
         };
         // Half operands: computed exactly in f64, rounded once.
-        if matches!(self.scalar(operand), Ty::Float { width: 16 }) && opcode != F_CONVERT {
+        if matches!(self.scalar(operand), Ty::Float { width: 16 })
+            && !matches!(opcode, F_CONVERT | op::SELECT)
+        {
             return self.half_arithmetic(opcode, ty, inputs);
         }
         let mask = if width == 64 {
@@ -1525,6 +1584,9 @@ impl Machine {
                 glsl::SQRT => fb(f(0).sqrt()),
                 glsl::INVERSE_SQRT => fb(1.0 / f(0).sqrt()),
                 glsl::EXP2 => fb(f(0).exp2()),
+                glsl::SIN => fb(f(0).sin()),
+                glsl::COS => fb(f(0).cos()),
+                glsl::TANH => fb(f(0).tanh()),
                 glsl::LOG2 => fb(f(0).log2()),
                 glsl::U_MIN => u64::from(x(0).min(x(1))),
                 glsl::U_MAX => u64::from(x(0).max(x(1))),
@@ -1557,7 +1619,7 @@ impl Machine {
                         31 - v.leading_zeros()
                     })
                 }
-                _ => panic!("the interpreter has no GLSL.std.450 instruction {instruction}"),
+                _ => panic!("the simulator does not run GLSL.std.450 instruction {instruction}"),
             };
             result.push(value);
         }

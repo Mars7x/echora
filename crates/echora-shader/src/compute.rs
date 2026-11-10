@@ -2760,7 +2760,29 @@ mod tests {
         if let Some(problem) = validate(&translated.spirv) {
             panic!("{problem}");
         }
+        simulates(&translated);
         translated
+    }
+
+    /// Runs a compute program without textures, images or cooperative
+    /// matrices in the simulator, nothing bound: every instruction it
+    /// emits must be one the simulator runs (what it then reports, with
+    /// no memory behind it, does not matter here).
+    fn simulates(translated: &Translated) {
+        let images = translated.descriptors.iter().any(|d| d.kind >= 2)
+            || translated.texture_pool_bindings != 0;
+        if translated.stage != Stage::Compute || images {
+            return;
+        }
+        let machine = crate::sim::Machine::new(&translated.spirv);
+        if machine.uses_cooperative_matrices() {
+            return;
+        }
+        machine.simulate(&crate::sim::Inputs {
+            workgroup_count: [1, 1, 1],
+            loop_limit: 64,
+            ..crate::sim::Inputs::default()
+        });
     }
 
     fn bra(from: usize, to: usize, guard: u128) -> u128 {
@@ -3174,6 +3196,7 @@ mod tests {
         if let Some(problem) = validate(&translated.spirv) {
             panic!("{problem}");
         }
+        simulates(&translated);
         translated
     }
 
