@@ -2538,7 +2538,8 @@ impl Machine {
                 op::F_ORD_LESS_THAN_EQUAL => b(f(0) <= f(1)),
                 op::F_ORD_GREATER_THAN => b(f(0) > f(1)),
                 op::F_ORD_GREATER_THAN_EQUAL => b(f(0) >= f(1)),
-                op::F_UNORD_EQUAL => b(!(f(0) != f(1))),
+                // Unordered (either NaN) or equal.
+                op::F_UNORD_EQUAL => b(f(0).is_nan() || f(1).is_nan() || f(0) == f(1)),
                 op::F_UNORD_NOT_EQUAL => b(f(0) != f(1)),
                 op::F_UNORD_LESS_THAN => b(!(f(0) >= f(1))),
                 op::F_UNORD_LESS_THAN_EQUAL => b(!(f(0) > f(1))),
@@ -2605,7 +2606,7 @@ impl Machine {
                     op::F_UNORD_NOT_EQUAL => b(h(0) != h(1)),
                     op::F_UNORD_LESS_THAN => b(!(h(0) >= h(1))),
                     op::F_UNORD_GREATER_THAN => b(!(h(0) <= h(1))),
-                    op::F_UNORD_EQUAL => b(!(h(0) != h(1))),
+                    op::F_UNORD_EQUAL => b(h(0).is_nan() || h(1).is_nan() || h(0) == h(1)),
                     op::F_UNORD_LESS_THAN_EQUAL => b(!(h(0) > h(1))),
                     op::F_UNORD_GREATER_THAN_EQUAL => b(!(h(0) < h(1))),
                     op::SELECT => unreachable!("handled with whole values"),
@@ -5028,6 +5029,7 @@ mod tests {
                 (24, 8, 255),
                 (32, 8, 255),
                 (64, 8, address / 4),
+                (81, 3, 7),
             ])
         };
         let rcp = word(&[(0, 12, 0x308), (16, 8, 0), (32, 8, 0), (74, 4, 4)]);
@@ -5092,6 +5094,7 @@ mod tests {
                 (24, 8, 255),
                 (32, 8, 255),
                 (64, 8, address / 4),
+                (81, 3, 7),
             ])
         };
         let code: Vec<_> = [ipa(1, 0x80), ipa(2, 0x84), EXIT]
@@ -5254,6 +5257,296 @@ mod tests {
             positions,
             vec![0.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0, 1.0, 2.0, 2.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn shifts_permutes_and_bit_counts_match_nak_s_hardware_checked_folds() {
+        // NAK's `fold` for each op (ir.rs), which its hw_tests check
+        // against a GPU, written out for SM70+.
+        let list = values(40);
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        for _ in 0..24 {
+            let (low, high) = (next(), next());
+            let shift = next() % 128;
+            // SHF: the 32 forms of (type, right, wrap, high word).
+            for form in 0..32u32 {
+                let kind = form & 3; // 0 I64, 1 U64, 2 I32, 3 U32
+                let (right, wrap, high_word) = (form & 4 != 0, form & 8 != 0, form & 16 != 0);
+                let shf = word(&[
+                    (0, 12, 0x219),
+                    (16, 8, 3),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (64, 8, 1),
+                    (73, 2, u128::from(kind)),
+                    (75, 1, u128::from(wrap)),
+                    (76, 1, u128::from(right)),
+                    (80, 1, u128::from(high_word)),
+                ]);
+                let bits = if kind < 2 { 64 } else { 32 };
+                let amount = if wrap {
+                    shift & (bits - 1)
+                } else {
+                    shift.min(bits)
+                };
+                let x = u64::from(low) | u64::from(high) << 32;
+                let signed = kind == 0 || kind == 2;
+                let shifted = if right {
+                    if signed {
+                        (x as i64).checked_shr(amount).unwrap_or((x as i64) >> 63) as u64
+                    } else {
+                        x.checked_shr(amount).unwrap_or(0)
+                    }
+                } else {
+                    x.checked_shl(amount).unwrap_or(0)
+                };
+                let expected = if high_word {
+                    (shifted >> 32) as u32
+                } else {
+                    shifted as u32
+                };
+                let (r, _) = run(&[low, high, shift], &[shf]);
+                assert_eq!(
+                    r[&3], expected,
+                    "SHF kind {kind} right {right} wrap {wrap} high {high_word}: \
+                     {low:#x} {high:#x} by {shift}"
+                );
+            }
+            // PRMT (index mode): byte n from nibble n of the selector (a's
+            // bytes 0-3, c's 4-7; bit 3 replicates the byte's sign).
+            let selector = next();
+            let prmt = word(&[
+                (0, 12, 0x216),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 2),
+                (64, 8, 1),
+            ]);
+            let source = u64::from(low) | u64::from(high) << 32;
+            let expected = (0..4).fold(0u32, |out, n| {
+                let nibble = selector >> (4 * n) & 0xf;
+                let byte = (source >> (8 * (nibble & 7))) as u8;
+                let byte = if nibble & 8 != 0 {
+                    if byte & 0x80 != 0 { 0xff } else { 0 }
+                } else {
+                    byte
+                };
+                out | u32::from(byte) << (8 * n)
+            });
+            let (r, _) = run(&[low, high, selector], &[prmt]);
+            assert_eq!(r[&3], expected, "PRMT {low:#x} {high:#x} {selector:#x}");
+        }
+        for &x in &list {
+            // FLO(.S32)(.SH) R3, (~)R0; POPC R3, (~)R0.
+            for (signed, shift_amount, invert) in
+                (0..8).map(|n| (n & 1 != 0, n & 2 != 0, n & 4 != 0))
+            {
+                let flo = word(&[
+                    (0, 12, 0x300),
+                    (16, 8, 3),
+                    (32, 8, 0),
+                    (63, 1, u128::from(invert)),
+                    (73, 1, u128::from(signed)),
+                    (74, 1, u128::from(shift_amount)),
+                ]);
+                let src = if invert { !x } else { x };
+                let leading = if signed && src & 0x8000_0000 != 0 {
+                    (!src).leading_zeros()
+                } else {
+                    src.leading_zeros()
+                };
+                // No bit found: all ones in both forms. NAK's fold gives 32
+                // with .SH, but its lowering of find_lsb (FLO.SH of the
+                // reversed value) relies on all ones, which the Vulkan CTS
+                // checks; its hardware test never feeds 0 or -1.
+                let expected = if leading == 32 {
+                    u32::MAX
+                } else if shift_amount {
+                    leading
+                } else {
+                    31 - leading
+                };
+                let (r, _) = run(&[x], &[flo]);
+                assert_eq!(
+                    r[&3], expected,
+                    "FLO {signed} {shift_amount} {invert} {x:#x}"
+                );
+                let popc = word(&[
+                    (0, 12, 0x309),
+                    (16, 8, 3),
+                    (32, 8, 0),
+                    (63, 1, u128::from(invert)),
+                ]);
+                let (r, _) = run(&[x], &[popc]);
+                assert_eq!(r[&3], src.count_ones(), "POPC {invert} {x:#x}");
+            }
+        }
+        for window in list.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            // IMNMX(.U32) R3, R0, R1, (!)PT: min where PT, max where !PT.
+            for (signed, min) in [(false, true), (false, false), (true, true), (true, false)] {
+                let imnmx = word(&[
+                    (0, 12, 0x217),
+                    (16, 8, 3),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (73, 1, u128::from(signed)),
+                    (87, 4, if min { 7 } else { 15 }),
+                ]);
+                let expected = match (signed, min) {
+                    (false, true) => a.min(b),
+                    (false, false) => a.max(b),
+                    (true, true) => (a as i32).min(b as i32) as u32,
+                    (true, false) => (a as i32).max(b as i32) as u32,
+                };
+                let (r, _) = run(&[a, b], &[imnmx]);
+                assert_eq!(
+                    r[&3], expected,
+                    "IMNMX signed {signed} min {min} {a:#x} {b:#x}"
+                );
+            }
+            // SGXT(.U32) R3, R0, bits (0-40).
+            for signed in [false, true] {
+                let bits = b % 41;
+                let sgxt = word(&[
+                    (0, 12, 0x21a),
+                    (16, 8, 3),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (73, 1, u128::from(signed)),
+                ]);
+                let expected = if bits >= 32 {
+                    a
+                } else if bits == 0 {
+                    0
+                } else {
+                    let shift = 32 - bits;
+                    if signed {
+                        (((a << shift) as i32) >> shift) as u32
+                    } else {
+                        (a << shift) >> shift
+                    }
+                };
+                let (r, _) = run(&[a, bits], &[sgxt]);
+                assert_eq!(r[&3], expected, "SGXT signed {signed} {a:#x} {bits}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_compares_follow_all_sixteen_codes_with_nan() {
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -2.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+        ];
+        for &a in &specials {
+            for &b in &specials {
+                for code in 0..16u32 {
+                    // FSETP.code.AND P0, PT, R0, R1, PT.
+                    let fsetp = word(&[
+                        (0, 12, 0x20b),
+                        (24, 8, 0),
+                        (32, 8, 1),
+                        (76, 4, u128::from(code)),
+                        (81, 3, 0),
+                        (84, 3, 7),
+                        (87, 3, 7),
+                    ]);
+                    let unordered = a.is_nan() || b.is_nan();
+                    let relation = match code & 7 {
+                        0 => false,
+                        1 => a < b,
+                        2 => a == b,
+                        3 => a <= b,
+                        4 => a > b,
+                        5 => a != b && !unordered,
+                        6 => a >= b,
+                        _ => !unordered,
+                    };
+                    // Codes 8-15: the unordered forms (NAN, LTU .. GEU, T).
+                    let expected = match code {
+                        0..=7 => relation,
+                        8 => unordered,
+                        15 => true,
+                        _ => unordered || relation,
+                    };
+                    let (_, p) = run(&[a.to_bits(), b.to_bits()], &[fsetp]);
+                    assert_eq!(p[&0], expected, "FSETP code {code}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forms_without_a_translation_are_refused() {
+        use crate::decode::Op;
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        let unknown = |raw: u128| matches!(decode(raw).op, Op::Unknown { .. });
+        // IMNMX: the 64-bit form (bit 74).
+        let imnmx = word(&[
+            (0, 12, 0x217),
+            (16, 8, 3),
+            (24, 8, 0),
+            (32, 8, 1),
+            (87, 3, 7),
+        ]);
+        assert!(!unknown(imnmx));
+        assert!(unknown(imnmx | 1 << 74));
+        // IPA: a predicate output.
+        let ipa = |frequency: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, 1),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, 0x80 / 4),
+                (78, 2, frequency),
+                (81, 3, 7),
+            ])
+        };
+        assert!(!unknown(ipa(0)));
+        assert!(unknown(ipa(0) & !(7 << 81)));
+        // IPA.CONSTANT: only of a flat input; IPA.STATE not at all.
+        let layout = |mode| {
+            let mut imap = [Interpolation::Unused; 128];
+            imap[0] = mode;
+            Layout {
+                stage: Stage::Fragment,
+                header: Some(Header {
+                    stage: Stage::Fragment,
+                    imap,
+                    targets: 0,
+                    writes_depth: false,
+                    writes_sample_mask: false,
+                    local_bytes: Some(0),
+                    outputs: [0; 5],
+                    outputs_beyond: false,
+                }),
+                ..Layout::workgroup([1, 1, 1])
+            }
+        };
+        let translate = |frequency, mode| {
+            let code: Vec<_> = [ipa(frequency), EXIT]
+                .iter()
+                .map(|&raw| decode(raw))
+                .collect();
+            crate::compute::translate(&code, &layout(mode))
+        };
+        assert!(translate(1, Interpolation::Constant).is_ok());
+        assert!(translate(1, Interpolation::Perspective).is_err());
+        assert!(translate(2, Interpolation::Constant).is_err());
+        assert!(translate(0, Interpolation::Perspective).is_ok());
     }
 
     #[test]
