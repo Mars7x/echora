@@ -405,6 +405,11 @@ struct Emitter {
     /// Whether the texture-pool handles the current texture instruction
     /// uses are within the pool (its results are zeros where not).
     pool_inside: Option<u32>,
+    /// For the current texture instruction's pool texture with a uint
+    /// view: its views and whether the entry is integer.
+    pool_integer: Option<texture::PoolViews>,
+    /// The texture pool's integer flags buffer, once declared.
+    pool_flags: Option<u32>,
     /// Storage images by handle bank, offset and dimension.
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
     /// R32_UINT image descriptors for SURED (by handle and dimension).
@@ -486,6 +491,8 @@ impl Emitter {
             pool_bindings: 0,
             pool_capacity: None,
             pool_inside: None,
+            pool_integer: None,
+            pool_flags: None,
             descriptor_aliases: Vec::new(),
             image_spec_ids: Vec::new(),
             spec_constants: Vec::new(),
@@ -4021,11 +4028,12 @@ mod tests {
         // time: it indexes the texture pool (set 1) instead.
         let computed = valid(&[uldc, uiadd3, bindless, EXIT]);
         assert!(computed.descriptors.iter().all(|d| d.kind != 4));
-        // The 2D images and the samplers.
-        use echora_shader_abi::texture_pool::{SAMPLED_2D, SAMPLERS};
+        // The 2D images (float and uint views), the samplers and the
+        // integer flags.
+        use echora_shader_abi::texture_pool::{FLAGS, SAMPLED_2D, SAMPLERS, UINT_2D};
         assert_eq!(
             computed.texture_pool_bindings,
-            1 << SAMPLERS | 1 << SAMPLED_2D
+            1 << SAMPLERS | 1 << SAMPLED_2D | 1 << UINT_2D | 1 << FLAGS
         );
         // The pool's capacity is a specialization constant.
         let constants: Vec<_> = computed
@@ -4475,10 +4483,10 @@ mod tests {
             ]),
             EXIT,
         ]);
-        use echora_shader_abi::texture_pool::{SAMPLED_2D, SAMPLERS};
+        use echora_shader_abi::texture_pool::{FLAGS, SAMPLED_2D, SAMPLERS, UINT_2D};
         assert_eq!(
             translated.texture_pool_bindings,
-            1 << SAMPLERS | 1 << SAMPLED_2D
+            1 << SAMPLERS | 1 << SAMPLED_2D | 1 << UINT_2D | 1 << FLAGS
         );
         // NonUniform (5300) decorates the register handle's accesses.
         assert!(

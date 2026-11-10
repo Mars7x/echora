@@ -315,7 +315,8 @@ pub struct PageTable {
 /// combines `texture_pool::SAMPLERS[sampler index]` with the image; a
 /// sampler with depth compare comes from the guest's sampler state, so
 /// depth-compare reads need no other binding. Integer textures are read
-/// from the `UINT_*` arrays (a uint view of the same entry).
+/// from the `UINT_*` arrays (a uint view of the same entry), chosen at run
+/// time by the entry's bit in `texture_pool::FLAGS`.
 pub const TEXTURE_POOL_SET: u32 = 1;
 /// The specialization constant id of `SpecMeaning::TexturePoolCapacity`.
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
@@ -343,7 +344,11 @@ pub mod texture_pool {
     pub const UINT_2D: u32 = 11;
     pub const UINT_2D_ARRAY: u32 = 12;
     pub const UINT_3D: u32 = 13;
-    pub const COUNT: u32 = 14;
+    /// A storage buffer of one u32 per texture index (`uint flags[]`):
+    /// bit 0 set when the entry is integer, so programs read it through
+    /// the `UINT_*` view (only 2D, 2D array and 3D have one).
+    pub const FLAGS: u32 = 14;
+    pub const COUNT: u32 = 15;
 }
 
 /// Vertex pulling: a vertex program reads its generic inputs from guest

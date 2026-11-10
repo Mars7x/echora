@@ -16,6 +16,9 @@ use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 /// SPIR-V's SpecId decoration.
 const DECORATION_SPEC_ID: u32 = 1;
 
+/// SPIR-V's NonWritable decoration.
+const DECORATION_NON_WRITABLE: u32 = 24;
+
 const OPERAND_BIAS: u32 = 0x1;
 const OPERAND_LOD: u32 = 0x2;
 const OPERAND_GRAD: u32 = 0x4;
@@ -60,6 +63,20 @@ const FLAG_DEPTH: u32 = 8;
 struct Types {
     sampled: u32,
     image: u32,
+}
+
+/// A pool texture's float and uint views (images and types), its sampler
+/// and whether the entry is integer: each branch makes its own sampled
+/// image, as SPIR-V wants one in the block that uses it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PoolViews {
+    integer: u32,
+    sampler: u32,
+    float_image: u32,
+    float_types: (u32, u32),
+    uint_image: u32,
+    uint_types: (u32, u32),
+    uniform: bool,
 }
 
 impl Emitter {
@@ -178,7 +195,79 @@ impl Emitter {
         if !uniform {
             self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
         }
+        // An integer entry is read through its uint view, where it has one.
+        let uint_binding = match (view.dim, view.arrayed) {
+            (1, false) => Some(texture_pool::UINT_2D),
+            (1, true) => Some(texture_pool::UINT_2D_ARRAY),
+            (2, _) => Some(texture_pool::UINT_3D),
+            _ => None,
+        };
+        self.pool_integer = match uint_binding.filter(|_| !depth) {
+            Some(uint_binding) => {
+                let uint_image = self.module.ty(Type::Image {
+                    sampled_type: self.u32,
+                    dim: view.dim,
+                    depth: 0,
+                    arrayed: view.arrayed,
+                    multisampled: false,
+                    sampled: 1,
+                    format: 0,
+                });
+                let uint_sampled = self.module.ty(Type::SampledImage { image: uint_image });
+                let uint_entry = self.pool_entry(uint_binding, uint_image, texture_index, uniform);
+                let integer = self.pool_flag(texture_index);
+                Some(PoolViews {
+                    integer,
+                    sampler,
+                    float_image: image,
+                    float_types: (types.sampled, types.image),
+                    uint_image: uint_entry,
+                    uint_types: (uint_sampled, uint_image),
+                    uniform,
+                })
+            }
+            None => None,
+        };
         Ok((sampled, types))
+    }
+
+    /// Whether pool entry `index` is integer: bit 0 of its word in the
+    /// flags buffer (`texture_pool::FLAGS`).
+    fn pool_flag(&mut self, index: u32) -> u32 {
+        let variable = match self.pool_flags {
+            Some(variable) => variable,
+            None => {
+                let array = self.module.ty(Type::RuntimeArray { element: self.u32 });
+                self.module.decorate(array, decoration::ARRAY_STRIDE, &[4]);
+                let block = self.module.ty(Type::Struct {
+                    members: vec![array],
+                });
+                self.module.decorate(block, decoration::BLOCK, &[]);
+                self.module
+                    .member_decorate(block, 0, decoration::OFFSET, &[0]);
+                self.module
+                    .member_decorate(block, 0, DECORATION_NON_WRITABLE, &[]);
+                let pointer = self.module.pointer(storage::STORAGE_BUFFER, block);
+                let variable = self
+                    .module
+                    .global_variable(pointer, storage::STORAGE_BUFFER);
+                self.module
+                    .decorate(variable, decoration::DESCRIPTOR_SET, &[TEXTURE_POOL_SET]);
+                self.module
+                    .decorate(variable, decoration::BINDING, &[texture_pool::FLAGS]);
+                self.interface.push(variable);
+                self.pool_bindings |= 1 << texture_pool::FLAGS;
+                self.pool_flags = Some(variable);
+                variable
+            }
+        };
+        let pointer = self.module.pointer(storage::STORAGE_BUFFER, self.u32);
+        let zero = self.constant(0);
+        let word = self.value(op::ACCESS_CHAIN, pointer, &[variable, zero, index]);
+        let word = self.value(op::LOAD, self.u32, &[word]);
+        let one = self.constant(1);
+        let bit = self.value(op::BITWISE_AND, self.u32, &[word, one]);
+        self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero])
     }
 
     /// The texture pool's capacity, a specialization constant
@@ -308,6 +397,7 @@ impl Emitter {
             return Ok(());
         }
         self.pool_inside = None;
+        self.pool_integer = None;
         if texture.handle.is_none()
             && !texture.handle_value
             && usize::from(texture.bank) >= self.cbuf_used_sizes.len()
@@ -580,6 +670,69 @@ impl Emitter {
                 taps.push(self.value(op::BITCAST, self.u32, &[tap_value]));
             }
             return Ok(taps);
+        }
+        // A pool entry that may be integer: its uint view where the flag
+        // says so, the float view otherwise.
+        let integer = self.pool_integer.take().filter(|_| reference.is_none());
+        if let Some(views) = integer {
+            let uvec4 = self.module.ty(Type::Vector {
+                component: self.u32,
+                count: 4,
+            });
+            let words: Vec<u32> = (0..4)
+                .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
+                .collect();
+            self.choose(views.integer, |e, integer| {
+                let (image, (sampled_type, image_type), ty) = if integer {
+                    (views.uint_image, views.uint_types, uvec4)
+                } else {
+                    (views.float_image, views.float_types, vec4)
+                };
+                let sampled = e.value(op::SAMPLED_IMAGE, sampled_type, &[image, views.sampler]);
+                if !views.uniform {
+                    e.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
+                }
+                let result = match texture.op {
+                    TextureOp::Fetch => {
+                        let image = e.value(op::IMAGE, image_type, &[sampled]);
+                        e.value(
+                            op::IMAGE_FETCH,
+                            ty,
+                            &image_operands(vec![image, coordinate]),
+                        )
+                    }
+                    TextureOp::Gather { component } => {
+                        let component = e.constant(u32::from(component));
+                        e.value(
+                            op::IMAGE_GATHER,
+                            ty,
+                            &image_operands(vec![sampled, coordinate, component]),
+                        )
+                    }
+                    _ => e.value(
+                        if implicit {
+                            op::IMAGE_SAMPLE_IMPLICIT_LOD
+                        } else {
+                            op::IMAGE_SAMPLE_EXPLICIT_LOD
+                        },
+                        ty,
+                        &image_operands(vec![sampled, coordinate]),
+                    ),
+                };
+                for (n, &word) in words.iter().enumerate() {
+                    let value = if integer {
+                        e.value(op::COMPOSITE_EXTRACT, e.u32, &[result, n as u32])
+                    } else {
+                        let value = e.value(op::COMPOSITE_EXTRACT, e.f32, &[result, n as u32]);
+                        e.value(op::BITCAST, e.u32, &[value])
+                    };
+                    e.function.emit(op::STORE, &[word, value]);
+                }
+            });
+            return Ok(words
+                .into_iter()
+                .map(|word| self.value(op::LOAD, self.u32, &[word]))
+                .collect());
         }
         let result = match (texture.op, reference) {
             (TextureOp::Fetch, _) => {

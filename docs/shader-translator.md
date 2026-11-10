@@ -107,7 +107,13 @@ bindings a program reads. A texture index at or past the pool's capacity
 (the specialization constant `SpecMeaning::TexturePoolCapacity`, id 31,
 by default 2^20, every index a handle carries) reads entry 0 and gives
 zeros, as an unwritten entry does, so the arrays are never indexed past
-their size. The samplers' 12-bit index needs 4096 entries. TEX.B (0x361) has the handle among its values,
+their size. The samplers' 12-bit index needs 4096 entries. A 2D, 2D
+array or 3D pool texture may be integer: bit 0 of its word in the
+flags buffer (binding 14, one u32 per texture index) says so at run
+time, and the read (fetch, sample or gather, not a depth comparison or
+a per-tap gather) then goes through its uint view (bindings 11-13).
+Texel buffers and storage images through the pool (bindings 8-10) are
+not used yet: the decoder knows no buffer textures or bindless surfaces. TEX.B (0x361) has the handle among its values,
 after the coordinates (all coordinates in Ra unless packed, bit 60, with
 four values or fewer), and always reads the pool. Programs without derivatives sample at an explicit level (a
 bias over level zero is that level). Vulkan takes only constant texel

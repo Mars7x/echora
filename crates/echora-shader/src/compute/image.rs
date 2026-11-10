@@ -311,7 +311,7 @@ impl Emitter {
     }
 
     /// Runs `body(true)` where `condition` holds, else `body(false)`.
-    fn choose(&mut self, condition: u32, mut body: impl FnMut(&mut Self, bool)) {
+    pub(super) fn choose(&mut self, condition: u32, mut body: impl FnMut(&mut Self, bool)) {
         let (yes, no, merge) = (self.module.id(), self.module.id(), self.module.id());
         self.function
             .emit(op::SELECTION_MERGE, &[merge, crate::spirv::NONE]);
