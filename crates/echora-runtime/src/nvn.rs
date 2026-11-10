@@ -2902,6 +2902,12 @@ impl Nvn {
                     let (depth_mask, stencil, stencil_mask) =
                         (command.x[1] != 0, command.x[2] as u32, command.x[3] as u32);
                     let texture = self.render.depth;
+                    if self.depth_traced(texture) {
+                        eprintln!(
+                            "depth trace present {} clear {texture:x} value {depth} write {depth_mask}",
+                            self.presented_frames
+                        );
+                    }
                     if debug_var_os("ECHORA_GPU_FLOW").is_some() {
                         let note = format!(
                             "flow clear depth {texture:x} value {depth} write {depth_mask} stencil {stencil} mask {stencil_mask:#x}"

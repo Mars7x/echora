@@ -2944,11 +2944,31 @@ impl Nvn {
         Ok((width, height))
     }
 
+    /// ECHORA_DEPTH_TRACE=<storage hex> (debugging): whether `texture`'s
+    /// storage is the traced one; draws, clears and copies over it are
+    /// logged.
+    pub(super) fn depth_traced(&self, texture: u64) -> bool {
+        super::debug_var("ECHORA_DEPTH_TRACE").is_ok_and(|wanted| {
+            u64::from_str_radix(wanted.trim_start_matches("0x"), 16).ok()
+                == self.texture_storage(texture)
+        })
+    }
+
     pub(super) fn gpu_copy_texture(
         &mut self,
         _core: &Guest,
         command: &Command,
     ) -> Result<(), String> {
+        if self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]) {
+            eprintln!(
+                "depth trace present {} copy {:x} ({:x?}) -> {:x} ({:x?})",
+                self.presented_frames,
+                command.x[1],
+                self.texture_storage(command.x[1]),
+                command.x[4],
+                self.texture_storage(command.x[4])
+            );
+        }
         // Views of level 0 and layer 0 are the whole texture.
         if command
             .captured
@@ -3449,6 +3469,12 @@ impl Nvn {
                     } else {
                         0
                     };
+                    if self.depth_traced(texture) {
+                        eprintln!(
+                            "depth trace present {} dispatch writes {texture:x} (binding {})",
+                            self.presented_frames, descriptor.binding
+                        );
+                    }
                     images.insert(descriptor.binding, (texture, level));
                     if let Some(view) = self
                         .handle_view_format(handle)
@@ -5809,6 +5835,12 @@ impl Nvn {
                 })
                 .unwrap_or(texture)
         });
+        if let Some(texture) = depth.filter(|&texture| self.depth_traced(texture)) {
+            eprintln!(
+                "depth trace present {} draw {:016x}/{:016x} depth {texture:x} (bound {:x})",
+                self.presented_frames, keys.0, keys.1, self.render.depth
+            );
+        }
         if let Some(texture) = depth {
             extent.get_or_insert(self.ensure_render_target(texture)?);
         }
