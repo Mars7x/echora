@@ -1341,10 +1341,14 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         }
         0x98e | 0x9a8 | 0x3a8 | 0x3a9 | 0x38c | 0x98c | 0x38d => {
             let (space, address) = match opcode {
-                0x98e => (
+                // RED: with a uniform address (bit 91) the register's .E is
+                // bit 90 and the uniform register's 72; with a register
+                // address alone it is bit 72 (as Lichii decodes both).
+                0x98e if word.bit(91) => (
                     Space::Global,
                     word.address(Some(90), Some(64), Some(72), false),
                 ),
+                0x98e => (Space::Global, word.address(Some(72), None, None, false)),
                 0x9a8 => (
                     Space::Global,
                     word.address(Some(70), Some(64), Some(72), false),
