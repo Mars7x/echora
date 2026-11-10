@@ -2623,7 +2623,10 @@ impl Emitter {
                 (0.0, 2f32.powi(bits as i32) - 1.0)
             };
             let (low, high) = (self.float_constant(low), self.float_constant(high));
-            let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+            // NMax/NMin: a NaN gives a bound (FClamp leaves it undefined);
+            // it reads 0 below.
+            let raised = self.glsl(self.f32, glsl::N_MAX, &[x, low]);
+            let clamped = self.glsl(self.f32, glsl::N_MIN, &[raised, high]);
             let opcode = if signed {
                 op::CONVERT_F_TO_S
             } else {
@@ -2650,7 +2653,8 @@ impl Emitter {
             self.float_constant(high),
             self.float_constant(end),
         );
-        let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+        let raised = self.glsl(self.f32, glsl::N_MAX, &[x, low]);
+        let clamped = self.glsl(self.f32, glsl::N_MIN, &[raised, high]);
         let opcode = if signed {
             op::CONVERT_F_TO_S
         } else {
@@ -2683,7 +2687,8 @@ impl Emitter {
             self.float_constant(high),
             self.float_constant(end),
         );
-        let clamped = self.glsl(self.f32, glsl::F_CLAMP, &[x, low, high]);
+        let raised = self.glsl(self.f32, glsl::N_MAX, &[x, low]);
+        let clamped = self.glsl(self.f32, glsl::N_MIN, &[raised, high]);
         let opcode = if signed {
             op::CONVERT_F_TO_S
         } else {
