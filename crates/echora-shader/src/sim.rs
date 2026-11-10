@@ -19,7 +19,7 @@
 // The unordered comparisons are the negated ordered ones: true on NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::spirv::{glsl, op, storage};
 
@@ -246,6 +246,11 @@ struct Invocation {
     variables: HashMap<u32, Value>,
     /// Loop headers passed, by instruction.
     loops: HashMap<usize, u32>,
+    /// Values, and variables holding them, that come from a shuffle of a
+    /// lane not running there (undefined on a GPU): a branch on one is
+    /// reported.
+    tainted: HashSet<u32>,
+    tainted_variables: HashSet<u32>,
     /// Starting values of function variables, replacing their
     /// initializers.
     initial: HashMap<u32, Value>,
@@ -988,6 +993,8 @@ impl Machine {
             pointers,
             variables,
             loops: HashMap::new(),
+            tainted: HashSet::new(),
+            tainted_variables: HashSet::new(),
             initial: HashMap::new(),
             done: false,
             steps: 0,
@@ -1045,6 +1052,14 @@ impl Machine {
             members.iter().map(|&m| input(&invocations[m], n)).collect()
         };
         let same = |value: Value| vec![value; members.len()];
+        // A result is undefined where it reads an undefined value, or (a
+        // shuffle) a lane not running there.
+        let any_undefined = members.iter().any(|&m| {
+            operands[2..]
+                .iter()
+                .any(|a| invocations[m].tainted.contains(a))
+        });
+        let mut undefined: Vec<bool> = vec![any_undefined; members.len()];
         let results: Vec<Value> = match opcode {
             op::GROUP_NON_UNIFORM_ALL => same(vec![u64::from(all(3).iter().all(|v| v[0] != 0))]),
             op::GROUP_NON_UNIFORM_ANY => same(vec![u64::from(all(3).iter().any(|v| v[0] != 0))]),
@@ -1064,11 +1079,17 @@ impl Machine {
             }
             op::GROUP_NON_UNIFORM_SHUFFLE => members
                 .iter()
-                .map(|&n| {
+                .enumerate()
+                .map(|(k, &n)| {
                     let lane = input(&invocations[n], 4)[0] as usize;
                     match members.iter().find(|&&m| m == first + lane) {
-                        Some(&source) => input(&invocations[source], 3),
+                        Some(&source) => {
+                            undefined[k] = invocations[source].tainted.contains(&operands[3])
+                                || invocations[n].tainted.contains(&operands[4]);
+                            input(&invocations[source], 3)
+                        }
                         None => {
+                            undefined[k] = true;
                             shared.problem(format!(
                                 "instruction {at}: invocation {n} shuffles from lane {lane}, \
                                  which is not running there"
@@ -1107,10 +1128,15 @@ impl Machine {
             }
             _ => panic!("the simulator has no subgroup opcode {opcode}"),
         };
-        for (&n, result) in members.iter().zip(results) {
+        for ((&n, result), undefined) in members.iter().zip(results).zip(undefined) {
             let invocation = &mut invocations[n];
             invocation.values.insert(id, result);
             invocation.value_types.insert(id, ty);
+            if undefined {
+                invocation.tainted.insert(id);
+            } else {
+                invocation.tainted.remove(&id);
+            }
             invocation.at += 1;
         }
     }
@@ -1513,11 +1539,23 @@ impl Machine {
                     continue;
                 }
                 op::BRANCH_CONDITIONAL => {
+                    if invocation.tainted.contains(&operands[0]) {
+                        shared.problem(format!(
+                            "instruction {at}: a branch depends on a shuffle from a lane not \
+                             running there (undefined on a GPU)"
+                        ));
+                    }
                     let taken = invocation.values[&operands[0]][0] != 0;
                     invocation.at = self.labels[&operands[if taken { 1 } else { 2 }]];
                     continue;
                 }
                 op::SWITCH => {
+                    if invocation.tainted.contains(&operands[0]) {
+                        shared.problem(format!(
+                            "instruction {at}: a switch depends on a shuffle from a lane not \
+                             running there (undefined on a GPU)"
+                        ));
+                    }
                     let selector = invocation.values[&operands[0]][0] as u32;
                     let mut target = operands[1];
                     for pair in operands[2..].chunks(2) {
@@ -1540,6 +1578,15 @@ impl Machine {
                 op::STORE => {
                     let pointer = invocation.pointers[&operands[0]];
                     let value = invocation.values[&operands[1]].clone();
+                    if let Pointer::Logical { variable, .. } = pointer {
+                        if invocation.tainted.contains(&operands[1]) {
+                            invocation.tainted_variables.insert(variable);
+                        } else if invocation.variables.get(&variable).map(Vec::len)
+                            == Some(value.len())
+                        {
+                            invocation.tainted_variables.remove(&variable);
+                        }
+                    }
                     self.store(invocation, shared, pointer, &value);
                     continue;
                 }
@@ -1770,6 +1817,17 @@ impl Machine {
                 }
             };
             self.check(ty, &result);
+            let undefined = if opcode == op::LOAD {
+                matches!(invocation.pointers.get(&args[0]), Some(Pointer::Logical { variable, .. })
+                    if invocation.tainted_variables.contains(variable))
+            } else {
+                args.iter().any(|a| invocation.tainted.contains(a))
+            };
+            if undefined {
+                invocation.tainted.insert(id);
+            } else {
+                invocation.tainted.remove(&id);
+            }
             invocation.values.insert(id, result);
             invocation.value_types.insert(id, ty);
         }
@@ -2792,5 +2850,60 @@ mod tests {
         let (registers, _, problems) = run_group(32, &[], &[lane, to_uniform, back]);
         assert!(problems.is_empty(), "{problems:?}");
         assert!(registers.iter().all(|registers| registers[&1] == 0));
+    }
+
+    #[test]
+    fn branches_on_shuffles_from_lanes_not_running_are_reported() {
+        // S2R R0, SR_LANEID; ISETP.GE P0, R0, R1 (R1 = 16); @P0 EXIT;
+        // SHFL.IDX R2, R0, R3 (R3 = 20), 0x1f; ISETP.LT P1, R2, R1;
+        // @P1 BRA past the next instruction
+        let lane = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0)]);
+        let at_least = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 0),
+            (32, 8, 1),
+            (76, 3, 6),
+            (81, 3, 0),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let exit = (0x94d | 7 << 12) & !(0xf << 12);
+        let shuffle = word(&[
+            (0, 12, 0x589),
+            (16, 8, 2),
+            (24, 8, 0),
+            (32, 8, 3),
+            (40, 13, 0x1f),
+            (81, 3, 7),
+        ]);
+        let below = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 2),
+            (32, 8, 1),
+            (76, 3, 1),
+            (81, 3, 1),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        // MOVs of R0, R1, R2, R3 are instructions 0-3.
+        let body = [
+            lane,
+            at_least,
+            exit,
+            shuffle,
+            below,
+            bra(9, 11, 1),
+            add(4, 4, 1),
+        ];
+        let (_, _, problems) = run_group(32, &[0, 16, 0, 20], &body);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("a branch depends on a shuffle")),
+            "{problems:?}"
+        );
+        // From a running lane: nothing to report.
+        let (_, _, problems) = run_group(32, &[0, 16, 0, 5], &body);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 }
