@@ -65,16 +65,19 @@ struct Types {
     image: u32,
 }
 
-/// A pool texture's float and uint views (images and types), its sampler
-/// and whether the entry is integer: each branch makes its own sampled
-/// image, as SPIR-V wants one in the block that uses it.
+/// A pool texture's float and uint views (bindings and types), its index,
+/// its sampler and whether the entry is integer. Each branch loads only
+/// its own view's descriptor (an unwritten slot of the other view is never
+/// read) and makes its sampled image, as SPIR-V wants one in the block that
+/// uses it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PoolViews {
     integer: u32,
     sampler: u32,
-    float_image: u32,
+    index: u32,
+    float_binding: u32,
     float_types: (u32, u32),
-    uint_image: u32,
+    uint_binding: u32,
     uint_types: (u32, u32),
     uniform: bool,
 }
@@ -214,14 +217,14 @@ impl Emitter {
                     format: 0,
                 });
                 let uint_sampled = self.module.ty(Type::SampledImage { image: uint_image });
-                let uint_entry = self.pool_entry(uint_binding, uint_image, texture_index, uniform);
                 let integer = self.pool_flag(texture_index);
                 Some(PoolViews {
                     integer,
                     sampler,
-                    float_image: image,
+                    index: texture_index,
+                    float_binding: binding,
                     float_types: (types.sampled, types.image),
-                    uint_image: uint_entry,
+                    uint_binding,
                     uint_types: (uint_sampled, uint_image),
                     uniform,
                 })
@@ -683,11 +686,12 @@ impl Emitter {
                 .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
                 .collect();
             self.choose(views.integer, |e, integer| {
-                let (image, (sampled_type, image_type), ty) = if integer {
-                    (views.uint_image, views.uint_types, uvec4)
+                let (binding, (sampled_type, image_type), ty) = if integer {
+                    (views.uint_binding, views.uint_types, uvec4)
                 } else {
-                    (views.float_image, views.float_types, vec4)
+                    (views.float_binding, views.float_types, vec4)
                 };
+                let image = e.pool_entry(binding, image_type, views.index, views.uniform);
                 let sampled = e.value(op::SAMPLED_IMAGE, sampled_type, &[image, views.sampler]);
                 if !views.uniform {
                     e.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
