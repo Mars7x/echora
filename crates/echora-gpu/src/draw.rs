@@ -777,8 +777,21 @@ impl Renderer {
                 let barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ);
+                // The count an earlier pass wrote is read by the copy.
+                let written = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                 // SAFETY: recording, outside rendering; both ranges exist.
                 unsafe {
+                    self.gpu.device.cmd_pipeline_barrier(
+                        commands,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[written],
+                        &[],
+                        &[],
+                    );
                     self.gpu
                         .device
                         .cmd_copy_buffer(commands, buffer, ring, &[copy]);
