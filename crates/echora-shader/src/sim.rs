@@ -2064,6 +2064,7 @@ impl Machine {
                 | op::ATOMIC_OR
                 | op::ATOMIC_XOR
                 | op::ATOMIC_EXCHANGE
+                | op::ATOMIC_F_ADD
                 | op::ATOMIC_COMPARE_EXCHANGE => {
                     let pointer = invocation.pointers[&args[0]];
                     let old = self.load(invocation, shared, pointer)[0] as u32;
@@ -2078,6 +2079,9 @@ impl Machine {
                         op::ATOMIC_OR => old | operand(3),
                         op::ATOMIC_XOR => old ^ operand(3),
                         op::ATOMIC_EXCHANGE => operand(3),
+                        op::ATOMIC_F_ADD => {
+                            (f32::from_bits(old) + f32::from_bits(operand(3))).to_bits()
+                        }
                         _ => {
                             // Value, then comparator, after two semantics.
                             if old == operand(5) { operand(4) } else { old }
