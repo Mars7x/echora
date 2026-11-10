@@ -399,17 +399,21 @@ fn nvn_stage(stage: Stage) -> u32 {
     }
 }
 
-/// Where NVN stage `nvn`'s storage buffer table sits in the driver
-/// constants c0 (0x110 + 0x100 * this): the hardware's stage order, vertex
-/// (and task), tessellation control, tessellation evaluation (and mesh),
-/// geometry, fragment.
-fn c0_stage_index(nvn: u32) -> u32 {
+/// Where NVN stage `nvn`'s storage buffer table starts in the driver
+/// constants c0 (16 bytes a slot): 0x110 + 0x100 * the hardware's stage
+/// order (vertex, tessellation control, tessellation evaluation,
+/// geometry, fragment); task programs read theirs from 0x670 and mesh
+/// programs from 0x770 (the offsets the game's own task and mesh programs
+/// load their buffer addresses from).
+fn c0_storage_table(nvn: u32) -> u32 {
     match nvn {
-        0 | 6 => 0,
-        3 => 1,
-        4 | 7 => 2,
-        2 => 3,
-        _ => 4,
+        0 => 0x110,
+        3 => 0x210,
+        4 => 0x310,
+        2 => 0x410,
+        6 => 0x670,
+        7 => 0x770,
+        _ => 0x510,
     }
 }
 
@@ -5196,13 +5200,11 @@ impl Nvn {
                     // not returned.
                     DescriptorKind::StorageBuffer
                         if descriptor.cbuf_index == 0
-                            && descriptor.cbuf_offset >= 0x110 + 0x100 * c0_stage_index(nvn)
-                            && descriptor.cbuf_offset
-                                < 0x110 + 0x100 * c0_stage_index(nvn) + 0x100
+                            && descriptor.cbuf_offset >= c0_storage_table(nvn)
+                            && descriptor.cbuf_offset < c0_storage_table(nvn) + 0x100
                             && descriptor.cbuf_offset % 16 == 0 =>
                     {
-                        let slot =
-                            (descriptor.cbuf_offset - 0x110 - 0x100 * c0_stage_index(nvn)) / 16;
+                        let slot = (descriptor.cbuf_offset - c0_storage_table(nvn)) / 16;
                         let bind = self
                             .render
                             .state
@@ -5342,8 +5344,8 @@ impl Nvn {
         }
 
         // Each stage's c0 holds its bound storage buffers' addresses and
-        // sizes (slot i at 0x110 + 0x100 * the stage's hardware index + 16
-        // * i, `c0_stage_index`), as the driver keeps them: a program that
+        // sizes (slot i at the stage's table + 16 * i, `c0_storage_table`),
+        // as the driver keeps them: a program that
         // reaches global memory through the page table reads them there
         // itself, with no storage binding of its own.
         for (index, stage) in stages.iter().enumerate() {
@@ -5357,7 +5359,7 @@ impl Nvn {
                     .state
                     .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
                 {
-                    let offset = 0x110 + 0x100 * u64::from(c0_stage_index(nvn)) + 16 * slot;
+                    let offset = u64::from(c0_storage_table(nvn)) + 16 * slot;
                     storage_entries.push((index, offset as u32, bind.x[3], bind.x[4]));
                 }
             }
@@ -6087,7 +6089,8 @@ impl Nvn {
                     .split(',')
                     .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
             })
-            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b)))
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b))
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x6d65_7368)))
         .then(|| {
             (
                 stages.clone(),
