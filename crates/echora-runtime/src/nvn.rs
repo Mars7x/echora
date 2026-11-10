@@ -2649,6 +2649,23 @@ impl Nvn {
                 return Ok(());
             }
             "nvnCommandBufferSetRenderEnableConditional" => {
+                // ECHORA_CONDITION_LOG (debugging): each condition's counters
+                // as guest memory holds them when it is set.
+                if debug_var_os("ECHORA_CONDITION_LOG").is_some() {
+                    let word = |at: u64| {
+                        self.gpu_to_guest(at, 8)
+                            .ok()
+                            .and_then(|guest| core.memory.read_u64(guest).ok())
+                    };
+                    eprintln!(
+                        "condition present {} mode {} at {:#x}: {:x?} vs {:x?}",
+                        self.presented_frames,
+                        command.x[1],
+                        command.x[2],
+                        word(command.x[2]),
+                        word(command.x[2] + 16)
+                    );
+                }
                 self.render.render_enable = Some((command.x[1] & 0xffff_ffff, command.x[2]));
                 return Ok(());
             }
