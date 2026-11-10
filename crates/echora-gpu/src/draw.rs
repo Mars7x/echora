@@ -585,6 +585,9 @@ impl Renderer {
             Indices::U16(data) | Indices::U32(data) => data.len() as u64 + 16,
         };
         bytes += draw.vertex_fetch.len() as u64 * 32 + 256;
+        if matches!(draw.mesh, Some(MeshGroups::Indirect { .. })) {
+            bytes += 32;
+        }
         self.reserve(bytes, descriptors)?;
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
@@ -757,6 +760,42 @@ impl Renderer {
             })
             .collect();
         self.order_after_rendering(&sampled)?;
+        // An indirect mesh draw's record holds one group count (NVN mesh
+        // draws are one-dimensional: DrawMeshTasks(first, count)), not
+        // Vulkan's three: the count is copied, on the GPU, into a ring slot
+        // whose y and z are 1, before the rendering pass.
+        let mesh_arguments = match draw.mesh {
+            Some(MeshGroups::Indirect { buffer, offset }) => {
+                let words: Vec<u8> = [0u32, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
+                let (ring, at) = self.ring_upload(&words, 16)?;
+                let commands = self.commands()?;
+                let copy = vk::BufferCopy {
+                    src_offset: offset,
+                    dst_offset: at,
+                    size: 4,
+                };
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ);
+                // SAFETY: recording, outside rendering; both ranges exist.
+                unsafe {
+                    self.gpu
+                        .device
+                        .cmd_copy_buffer(commands, buffer, ring, &[copy]);
+                    self.gpu.device.cmd_pipeline_barrier(
+                        commands,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::DRAW_INDIRECT,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+                Some((ring, at))
+            }
+            _ => None,
+        };
         let area = draw.fixed.scissor;
         self.begin_rendering(
             &draw.colors,
@@ -1024,7 +1063,8 @@ impl Renderer {
                 let mesh = self.gpu.mesh_shader.as_ref().expect("checked above");
                 match groups {
                     MeshGroups::Direct([x, y, z]) => mesh.cmd_draw_mesh_tasks(commands, x, y, z),
-                    MeshGroups::Indirect { buffer, offset } => {
+                    MeshGroups::Indirect { .. } => {
+                        let (buffer, offset) = mesh_arguments.expect("prepared above");
                         mesh.cmd_draw_mesh_tasks_indirect(commands, buffer, offset, 1, 12);
                     }
                 }

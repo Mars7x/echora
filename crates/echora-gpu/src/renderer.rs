@@ -528,7 +528,9 @@ impl Renderer {
             | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC;
+            | vk::BufferUsageFlags::INDIRECT_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
         // Addressable, where the device allows: vertex fetch tables are
         // read through their device address.
         let addressable = renderer.gpu.buffer_device_address;
