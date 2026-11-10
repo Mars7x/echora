@@ -3491,6 +3491,7 @@ impl Nvn {
             }
         }
         let image_keys: Vec<u64> = images.values().map(|(key, _)| *key).collect();
+        let images_written = image_keys.clone();
         let volume_mean = |backend: &mut Backend, key: u64| -> Option<f64> {
             let is_volume = backend
                 .renderer
@@ -3734,6 +3735,8 @@ impl Nvn {
             "stat: dispatch renderer microseconds",
             started.elapsed().as_micros() as u64,
         );
+        self.trace_targets(&images_written, &format!("dispatch {:016x}", key.0))?;
+        let backend = self.gpu.as_mut().unwrap();
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             // Volumes a dispatch wrote, as their first slice reads back.
             for (key, before) in image_keys.into_iter().zip(before) {
@@ -4421,6 +4424,60 @@ impl Nvn {
                 format!("{width} {height} 1 1\n"),
             )
             .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// ECHORA_TARGET_TRACE=<target key>[,...] (debugging), from present
+    /// ECHORA_TARGET_TRACE_FROM: after each draw or dispatch that writes
+    /// one of them, its level 0 read back, as its mean colour and how many
+    /// texels are not finite (where a pass first leaves NaN or white).
+    fn trace_targets(&mut self, written: &[u64], what: &str) -> Result<(), String> {
+        let Ok(keys) = super::debug_var("ECHORA_TARGET_TRACE") else {
+            return Ok(());
+        };
+        let from = super::debug_var("ECHORA_TARGET_TRACE_FROM")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if self.presented_frames < from {
+            return Ok(());
+        }
+        let present = self.presented_frames;
+        let backend = self.gpu.as_mut().unwrap();
+        for &key in written {
+            if !keys
+                .split(',')
+                .any(|item| item.trim() == format!("{key:x}"))
+            {
+                continue;
+            }
+            let Some(target) = backend.renderer.existing_target(key) else {
+                continue;
+            };
+            let (width, height, format) = (target.width, target.height, target.format);
+            backend.renderer.flush()?;
+            let Ok(texels) = backend.renderer.read_target_level(key, 0) else {
+                continue;
+            };
+            let count = texels.len().max(1) as f64;
+            let nonfinite = texels
+                .iter()
+                .filter(|texel| texel.iter().any(|part| !part.is_finite()))
+                .count();
+            let mut mean = [0f64; 4];
+            for texel in texels
+                .iter()
+                .filter(|texel| texel.iter().all(|part| part.is_finite()))
+            {
+                for (sum, part) in mean.iter_mut().zip(texel) {
+                    *sum += f64::from(*part) / count;
+                }
+            }
+            eprintln!(
+                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite",
+                mean[0], mean[1], mean[2], mean[3]
+            );
         }
         Ok(())
     }
@@ -5823,6 +5880,7 @@ impl Nvn {
             (setup_end - since).as_micros() as u64,
             setup_end.elapsed().as_micros() as u64,
         ];
+        let draw_label = format!("draw {:016x}/{:016x}", keys.0, keys.1);
         // ECHORA_GPU_UPLOAD_DUMP=<dir> with a traced program: each level of
         // the uploads it samples, once, as upload-<key>-<level>.ppm (RGB)
         // and .pgm (alpha).
@@ -5950,7 +6008,7 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: draw us setup", timings[0]);
         backend.stat("stat: draw us renderer", timings[1]);
-        Ok(())
+        self.trace_targets(&colors_written, &draw_label)
     }
 }
 
