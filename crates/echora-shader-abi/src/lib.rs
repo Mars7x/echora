@@ -322,6 +322,12 @@ pub const TEXTURE_POOL_SET: u32 = 1;
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
+/// Entries per texture array, which the renderer gives programs as
+/// `SpecMeaning::TexturePoolCapacity`. Pools this size cover every pool
+/// the game makes.
+pub const TEXTURE_POOL_CAPACITY: u32 = 1 << 16;
+/// Entries in the sampler array: every 12-bit sampler index.
+pub const SAMPLER_POOL_CAPACITY: u32 = 1 << 12;
 
 /// Set-1 bindings (`TEXTURE_POOL_SET`).
 pub mod texture_pool {

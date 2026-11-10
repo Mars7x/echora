@@ -46,7 +46,8 @@ pub struct Gpu {
     pub cooperative_matrix: Vec<CooperativeMatrixShape>,
     /// The texture pool's descriptor set layout (`echora_shader_abi`
     /// `TEXTURE_POOL_SET`), when the device has the descriptor indexing it
-    /// needs: set 1 of every program that reads the pool.
+    /// needs (with null descriptors, which entries start as): set 1 of
+    /// every program that reads the pool.
     pub texture_pool_layout: Option<vk::DescriptorSetLayout>,
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
@@ -384,7 +385,9 @@ impl Gpu {
             && s12.descriptor_binding_sampled_image_update_after_bind != 0
             && s12.descriptor_binding_storage_image_update_after_bind != 0
             && s12.descriptor_binding_uniform_texel_buffer_update_after_bind != 0
-            && s12.shader_sampled_image_array_non_uniform_indexing != 0)
+            && s12.shader_sampled_image_array_non_uniform_indexing != 0
+            && robustness2
+            && supported_robust.null_descriptor != 0)
             .then(|| texture_pool_layout(&device))
             .transpose()?;
         let cooperative_matrix = if cooperative_matrix {
@@ -599,12 +602,7 @@ pub struct CooperativeMatrixShape {
     pub scope: vk::ScopeKHR,
 }
 
-/// Descriptors per texture pool array: NVN texture indices have 20 bits,
-/// but pools this size cover every pool the game makes (the runtime notes
-/// a larger one).
-pub const TEXTURE_POOL_CAPACITY: u32 = 1 << 16;
-/// NVN sampler indices have 12 bits.
-pub const SAMPLER_POOL_CAPACITY: u32 = 1 << 12;
+pub use echora_shader_abi::{SAMPLER_POOL_CAPACITY, TEXTURE_POOL_CAPACITY};
 
 /// The set layout of `echora_shader_abi::texture_pool`: arrays updated
 /// after bind and partially bound, for every stage.
@@ -614,6 +612,7 @@ fn texture_pool_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, 
         pool::SAMPLERS => vk::DescriptorType::SAMPLER,
         pool::SAMPLED_BUFFER => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
         pool::STORAGE_2D | pool::STORAGE_3D => vk::DescriptorType::STORAGE_IMAGE,
+        pool::FLAGS => vk::DescriptorType::STORAGE_BUFFER,
         _ => vk::DescriptorType::SAMPLED_IMAGE,
     };
     let bindings: Vec<_> = (0..pool::COUNT)
@@ -621,20 +620,26 @@ fn texture_pool_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, 
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
                 .descriptor_type(kind(binding))
-                .descriptor_count(if binding == pool::SAMPLERS {
-                    SAMPLER_POOL_CAPACITY
-                } else {
-                    TEXTURE_POOL_CAPACITY
+                .descriptor_count(match binding {
+                    pool::SAMPLERS => SAMPLER_POOL_CAPACITY,
+                    pool::FLAGS => 1,
+                    _ => TEXTURE_POOL_CAPACITY,
                 })
                 .stage_flags(vk::ShaderStageFlags::ALL)
         })
         .collect();
-    let flags = vec![
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND
-            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
-            | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING;
-        bindings.len()
-    ];
+    // The flags buffer is written once, when the set is made.
+    let flags: Vec<_> = (0..pool::COUNT)
+        .map(|binding| {
+            if binding == pool::FLAGS {
+                vk::DescriptorBindingFlags::empty()
+            } else {
+                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                    | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING
+            }
+        })
+        .collect();
     let mut binding_flags =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
     let info = vk::DescriptorSetLayoutCreateInfo::default()

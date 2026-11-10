@@ -30,6 +30,9 @@ pub struct Program {
     /// Stages that read the ABI push-constant fields (`PUSH_ABI_FIELDS`):
     /// they take the whole block; `push_stages` excludes them.
     pub(crate) abi_stages: vk::ShaderStageFlags,
+    /// A stage reads the texture pool: set 1 is the renderer's pool set
+    /// (`Renderer::bind_pool`).
+    pub(crate) pool: bool,
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -291,6 +294,8 @@ pub struct Draw<'a> {
     /// Vertex pulling (`PUSH_VERTEX_FETCH`): the fetch table entries, one
     /// per generic input location, uploaded with the draw.
     pub vertex_fetch: Vec<echora_shader_abi::VertexAttribute>,
+    /// The texture pool entries a program reading the pool may name.
+    pub pool: Vec<crate::pool::PoolEntry>,
 }
 
 /// The workgroups of a mesh draw.
@@ -330,7 +335,18 @@ impl Renderer {
             }
         }
         let layout = self.gpu.descriptor_set_layout_for(&descriptors)?;
-        let layouts = [layout];
+        let pool = stages.iter().any(|stage| stage.texture_pool_bindings != 0);
+        let mut layouts = vec![layout];
+        if pool {
+            match self.gpu.texture_pool_layout {
+                Some(pool_layout) => layouts.push(pool_layout),
+                None => {
+                    // SAFETY: the layout is not used.
+                    unsafe { self.gpu.device.destroy_descriptor_set_layout(layout, None) };
+                    return Err("the device cannot hold the texture pool".into());
+                }
+            }
+        }
         let push_stages = if !self.resolution_scale().is_one() {
             stages
                 .iter()
@@ -388,7 +404,24 @@ impl Renderer {
             .iter()
             .map(|stage| words_as_bytes(&stage.spirv))
             .collect();
-        // Each stage's constants as 4-byte entries in one data block.
+        // Each stage's constants as 4-byte entries in one data block, with
+        // the texture pool's capacity where a stage reads the pool.
+        let specialization: Vec<Vec<(u32, u32)>> = stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                let mut values = specialization.get(index).cloned().unwrap_or_default();
+                if stage.spec_constants.iter().any(|constant| {
+                    constant.meaning == echora_shader_abi::SpecMeaning::TexturePoolCapacity
+                }) {
+                    values.push((
+                        echora_shader_abi::TEXTURE_POOL_CAPACITY_SPEC_ID,
+                        echora_shader_abi::TEXTURE_POOL_CAPACITY,
+                    ));
+                }
+                values
+            })
+            .collect();
         let constants: Vec<(Vec<vk::SpecializationMapEntry>, Vec<u8>)> = (0..stages.len())
             .map(|index| {
                 let values = specialization.get(index).map_or(&[][..], Vec::as_slice);
@@ -459,7 +492,7 @@ impl Renderer {
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
             &infos,
-            &format!("{descriptors:?} {push_ranges:?} {compute_32} {specialization:?}"),
+            &format!("{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}"),
         )?;
         Ok(Program {
             stages,
@@ -469,6 +502,7 @@ impl Renderer {
             push_stages,
             texture_bits,
             abi_stages,
+            pool,
         })
     }
 
@@ -500,6 +534,12 @@ impl Renderer {
         let scale = self.attachment_scale(&draw.colors, draw.depth)?;
         self.bound_submission()?;
         let program = draw.program;
+        // The texture pool's entries (writing them may flush).
+        let pool = if program.pool {
+            Some(self.bind_pool(&draw.pool)?)
+        } else {
+            None
+        };
         // Textures first: an upload may flush. Then room for everything
         // else, so nothing flushes while this draw is recorded.
         let mut bytes = 0;
@@ -887,6 +927,16 @@ impl Renderer {
                 &[set],
                 &[],
             );
+            if let Some(pool) = pool {
+                device.cmd_bind_descriptor_sets(
+                    commands,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    program.pipeline_layout,
+                    echora_shader_abi::TEXTURE_POOL_SET,
+                    &[pool],
+                    &[],
+                );
+            }
             if let Some(constants) = &rescaling {
                 device.cmd_push_constants(
                     commands,
@@ -1129,6 +1179,7 @@ pub(crate) mod tests {
                 color.iter().flat_map(|value| value.to_le_bytes()).collect(),
             )]),
             textures: HashMap::new(),
+            pool: Vec::new(),
             storage: HashMap::new(),
             storage_in_place: HashMap::new(),
             fixed: Fixed {

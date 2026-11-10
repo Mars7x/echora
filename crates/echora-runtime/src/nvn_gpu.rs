@@ -1024,6 +1024,15 @@ impl Nvn {
             .renderer
             .resolution_scale()
             .terms();
+        // Programs reading the texture pool need the device to hold it.
+        let pool_ready = self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .gpu
+            .texture_pool_layout
+            .is_some();
         let mut notes: Vec<String> = Vec::new();
         let translated = {
             let parameters = Parameters {
@@ -1070,18 +1079,17 @@ impl Nvn {
             // handles (`rust`), or beside the plugin for a report
             // (`compare`); what it does not handle is noted by reason.
             let translator = shader::Translator::from_env();
-            // A program reading the texture pool (set 1) needs the pool
-            // bound, which the renderer does not do yet: such programs stay
-            // with the plugin.
+            // A program reading the texture pool (set 1) needs a device
+            // that holds it; elsewhere such programs stay with the plugin.
             let rust = (translator != shader::Translator::Plugin)
                 .then(|| shader::translate_rust(&code, &parameters))
                 .map(|result| {
                     result.and_then(|translated| {
-                        if translated.texture_pool_bindings == 0 {
+                        if translated.texture_pool_bindings == 0 || pool_ready {
                             Ok(translated)
                         } else {
                             Err(echora_shader_abi::Unsupported {
-                                reason: "texture pool not bound by the renderer yet".into(),
+                                reason: "the device cannot hold the texture pool".into(),
                                 offset: None,
                             })
                         }
@@ -1711,6 +1719,59 @@ impl Nvn {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
         let view = self.views.get(&(pool, (handle & 0xf_ffff) as u32))?;
         vk_format(view.props.get("Format")?.x[0] as u32)
+    }
+
+    /// Texture pool entries for a program stage that reads the pool: the
+    /// textures bound to NVN stage `nvn`. Bound handles are what such
+    /// programs index (they sit in c2 from 0x20, 8 bytes per slot); a
+    /// handle formed elsewhere reads a null entry unless a bound one names
+    /// it. Handles that do not resolve are left out.
+    fn pool_entries(
+        &mut self,
+        core: &mut Guest,
+        nvn: u32,
+    ) -> Result<Vec<echora_gpu::pool::PoolEntry>, String> {
+        // The renderer's counts from earlier pool writes.
+        let backend = self.gpu.as_mut().unwrap();
+        for (name, amount) in backend.renderer.take_stats() {
+            backend.stat(name, amount);
+        }
+        let prefix = format!("BindTexture/{nvn}/");
+        let mut handles: Vec<u64> = self
+            .render
+            .state
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, bind)| bind.x[3])
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        let mut entries = Vec::new();
+        for handle in handles {
+            let Ok(texture) = self.handle_texture(handle) else {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: texture pool handles unresolved", 1);
+                continue;
+            };
+            if let (Some(base), Some(size)) = (
+                self.texture_storage(texture),
+                self.texture_storage_size(texture),
+            ) {
+                self.resolve_storage(core, Some(base..base + size))?;
+            }
+            let source = self.texture_source(core, texture)?;
+            let source = self.through_view(source, handle);
+            let sampler_state = self.binding_sampler(handle, &source);
+            entries.push(echora_gpu::pool::PoolEntry {
+                texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
+                sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
+                source,
+                sampler_state,
+            });
+        }
+        Ok(entries)
     }
 
     /// The sampler a texture binding samples with: the handle's sampler,
@@ -3419,8 +3480,11 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         let mut specialization = Vec::new();
         for constant in &stage.spec_constants {
-            let echora_shader_abi::SpecMeaning::IntegerFormat(binding) = constant.meaning else {
-                return Err(format!("compute spec constant {:?}", constant.meaning));
+            let binding = match constant.meaning {
+                echora_shader_abi::SpecMeaning::IntegerFormat(binding) => binding,
+                // The renderer gives every program the pool's capacity.
+                echora_shader_abi::SpecMeaning::TexturePoolCapacity => continue,
+                other => return Err(format!("compute spec constant {other:?}")),
             };
             let format = match images.get(&binding) {
                 Some((texture, _)) => backend
@@ -3465,6 +3529,11 @@ impl Nvn {
         } else {
             Default::default()
         };
+        let pool = if stage.texture_pool_bindings != 0 {
+            self.pool_entries(core, 5)?
+        } else {
+            Vec::new()
+        };
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
             program: &backend.programs[&key],
@@ -3480,6 +3549,7 @@ impl Nvn {
             images,
             indirect,
             page_table,
+            pool,
         };
         let started = std::time::Instant::now();
         let lengths: HashMap<u32, u64> = dispatch
@@ -4315,6 +4385,13 @@ impl Nvn {
                 bytes[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
             }
         }
+        // Texture pool entries, for stages that read the pool.
+        let mut pool = Vec::new();
+        for (index, stage) in stages.iter().enumerate() {
+            if stage.texture_pool_bindings != 0 {
+                pool.extend(self.pool_entries(core, slots[index])?);
+            }
+        }
         phase(self, "stat: draw us bindings", &mut since);
         {
             let backend = self.gpu.as_mut().unwrap();
@@ -5028,6 +5105,7 @@ impl Nvn {
             fixed,
             page_table,
             vertex_fetch,
+            pool,
         };
         let probe_target = draw.colors.first().copied();
         let colors_written = draw.colors.clone();

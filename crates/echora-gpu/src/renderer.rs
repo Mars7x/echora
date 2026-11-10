@@ -177,6 +177,10 @@ const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
 
 pub struct Renderer {
     pub gpu: Gpu,
+    /// The texture pool's set (`crate::pool`), once a program reads it.
+    pub(crate) texture_pool: Option<crate::pool::TexturePool>,
+    /// Counts for the runtime's statistics (`take_stats`).
+    pub(crate) stats: HashMap<&'static str, u64>,
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
@@ -458,6 +462,8 @@ impl Renderer {
         let timer =
             crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
         let mut renderer = Self {
+            texture_pool: None,
+            stats: HashMap::new(),
             timer,
             shader_cache: None,
             fatal: None,
@@ -1473,11 +1479,15 @@ impl Renderer {
             self.finish_current()?;
             self.swap_slot();
         }
-        if !self.recording {
-            return Ok(());
+        if self.recording {
+            self.submit_current()?;
+            self.finish_current()?;
         }
-        self.submit_current()?;
-        self.finish_current()
+        // No work reads the texture pool any more.
+        if let Some(pool) = self.texture_pool.as_mut() {
+            pool.in_use = false;
+        }
+        Ok(())
     }
 
     /// End of a frame: submit what was recorded without waiting for it, so
@@ -3052,6 +3062,9 @@ impl Renderer {
             }
             other
         });
+        let mut views = extra.clone();
+        views.extend([target.view, target.sampled_view]);
+        self.forget_pool_views(&views);
         // SAFETY: the caller flushed, so no work uses the target.
         unsafe {
             for view in extra {
@@ -4047,6 +4060,7 @@ impl Drop for Renderer {
         ring.destroy(&self.gpu.device);
         let ring = std::mem::replace(&mut self.spare.ring, HostBuffer::empty());
         ring.destroy(&self.gpu.device);
+        self.destroy_texture_pool();
         // SAFETY: all work has completed.
         unsafe {
             for (_, sampler) in std::mem::take(&mut self.samplers) {

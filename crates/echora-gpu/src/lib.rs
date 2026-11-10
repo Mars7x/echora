@@ -11,6 +11,7 @@ pub use ash;
 pub mod compute;
 pub mod draw;
 pub mod loop_guard;
+pub mod pool;
 pub mod present;
 pub mod renderer;
 pub mod shader;

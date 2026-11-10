@@ -33,6 +33,8 @@ pub struct Dispatch<'a> {
     pub indirect: Option<(vk::Buffer, u64)>,
     /// The GPU page table, for a program that reads it.
     pub page_table: echora_shader_abi::PageTable,
+    /// The texture pool entries a program reading the pool may name.
+    pub pool: Vec<crate::pool::PoolEntry>,
 }
 
 impl Renderer {
@@ -50,6 +52,12 @@ impl Renderer {
         self.bound_submission()?;
         let program = dispatch.program;
         let stage = program.stages.first().ok_or("program has no stages")?;
+        // The texture pool's entries (writing them may flush).
+        let pool = if program.pool {
+            Some(self.bind_pool(&dispatch.pool)?)
+        } else {
+            None
+        };
         // Textures first (an upload may flush), then room for the rest, so
         // nothing flushes while this dispatch is recorded.
         let mut bytes = 0;
@@ -300,6 +308,16 @@ impl Renderer {
                 &[set],
                 &[],
             );
+            if let Some(pool) = pool {
+                device.cmd_bind_descriptor_sets(
+                    commands,
+                    vk::PipelineBindPoint::COMPUTE,
+                    program.pipeline_layout,
+                    echora_shader_abi::TEXTURE_POOL_SET,
+                    &[pool],
+                    &[],
+                );
+            }
             match dispatch.indirect {
                 Some((buffer, offset)) => device.cmd_dispatch_indirect(commands, buffer, offset),
                 None => {
@@ -397,6 +415,7 @@ mod tests {
             images: HashMap::new(),
             indirect: None,
             page_table: Default::default(),
+            pool: Vec::new(),
         };
         let results = renderer.dispatch(&dispatch).unwrap();
         assert_eq!(
