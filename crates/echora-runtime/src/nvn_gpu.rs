@@ -3137,6 +3137,26 @@ impl Nvn {
                 c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
             }
         }
+        // The storage buffers' addresses and sizes, every bound slot of the
+        // table: a program reaching global memory through the page table
+        // reads them from c0 itself (a counter's address, for one), with no
+        // storage binding of its own.
+        if stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0 {
+            for slot in 0..u32::from(header[2]) {
+                let entry = (storage_base + slot * 16) as usize;
+                if entry + 12 > texture_base as usize || entry + 12 > c0.len() {
+                    break;
+                }
+                if let Some(bind) = self
+                    .render
+                    .state
+                    .get(&format!("BindStorageBuffer/5/{slot}"))
+                {
+                    c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
+                    c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
+                }
+            }
+        }
         let mut storage = HashMap::new();
         let mut storage_in_place = HashMap::new();
         // Each storage binding's GPU range (ECHORA_DUMP_DISPATCH).
