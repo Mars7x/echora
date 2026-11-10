@@ -11,6 +11,9 @@
 //!   optionally `subgroup N` (default 32) and `loop_limit N` (iterations
 //!   of one loop by one invocation that count as runaway, default 65536)
 //!   and `spec ID VALUE` (a specialization constant, else its default);
+//!   for a fragment program (one pixel), `fragcoord X Y Z W` (FragCoord, W
+//!   being 1/w) and `attribute LOCATION X Y Z W` (an interpolated input as
+//!   Vulkan hands it over, perspective-corrected), floats;
 //! - `push.bin`: the push constants' bytes;
 //! - `uniform-SET-BINDING.bin`: each bound uniform buffer's bytes;
 //! - `memory-ADDRESS.bin` (ADDRESS in hex, no 0x): device memory from that
@@ -73,6 +76,23 @@ fn main() {
     };
     let dispatch = String::from_utf8_lossy(&read("dispatch.txt")).into_owned();
     for line in dispatch.lines() {
+        let floats: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|field| field.parse::<f32>().ok())
+            .map(|value| u64::from(value.to_bits()))
+            .collect();
+        match line.split_whitespace().next() {
+            Some("fragcoord") if floats.len() == 4 => {
+                inputs.builtins.insert(15, floats);
+                continue;
+            }
+            Some("attribute") if floats.len() == 5 => {
+                let location = f32::from_bits(floats[0] as u32) as u32;
+                inputs.locations.insert(location, floats[1..].to_vec());
+                continue;
+            }
+            _ => {}
+        }
         let fields: Vec<u32> = line
             .split_whitespace()
             .skip(1)
@@ -380,6 +400,21 @@ fn main() {
         }
         for problem in &report.problems {
             println!("  PROBLEM: {problem}");
+        }
+        // A one-pixel run (a fragment program): its located variables (the
+        // attributes given and the colours written).
+        if report.invocations.len() == 1 && !machine.locations.is_empty() {
+            let mut located: Vec<(&u32, &u32)> = machine.locations.iter().collect();
+            located.sort_by_key(|&(variable, location)| (*location, *variable));
+            for (variable, location) in located {
+                if let Some(value) = report.invocations[0].get(variable) {
+                    let floats: Vec<String> = value
+                        .iter()
+                        .map(|&word| format!("{}", f32::from_bits(word as u32)))
+                        .collect();
+                    println!("  location {location} (%{variable}): {}", floats.join(" "));
+                }
+            }
         }
         for &n in &shown {
             let Some(variables) = report.invocations.get(n) else {
