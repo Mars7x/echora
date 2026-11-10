@@ -2598,7 +2598,7 @@ impl Nvn {
                 "command present {} {} x {:x?}",
                 self.presented_frames,
                 command.name.trim_start_matches("nvnCommandBuffer"),
-                &command.x[1..9]
+                &command.x[1..8]
             );
         }
         // A guest memory fault names the command that made it.
