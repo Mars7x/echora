@@ -303,7 +303,14 @@ plain structured code, so the output aims for that:
 - fp16 types where the source works on halves;
 - PhysicalStorageBuffer pointers through the page table;
 - cooperative matrices for HMMA, with a subgroup fallback;
-- specialization constants for run-time settings.
+- specialization constants for run-time settings;
+- few loads: a register's, predicate's or uniform register's value is
+  loaded once and reused while the blocks that follow are dominated by
+  where it was loaded or stored: through predicated bodies, branch arms
+  and the selections the translator makes itself, but not into a loop
+  or block construct, which a later pass may enter with another value.
+  A texture pool handle's index, sampler, float view and integer flag
+  are reused in the same way across samples through that handle.
 
 An optional spirv-opt pass (its performance recipe) sits behind a switch
 and is measured against the unoptimised output before it becomes a
