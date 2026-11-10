@@ -225,6 +225,21 @@ two blocks of HMMA.16816 through a 32-bit value, the results past the
 subnormals), or blocks with an infinity or NaN (their plain sum); these
 are inferred, and none of it has been compared with hardware results.
 
+**Dispatch loop reconvergence.** A program the structurizer cannot
+handle runs as one loop over a switch on the next block; each time round
+the subgroup runs the lowest pending block among its invocations
+(lowest-PC first), so they reconverge at joins as a warp's threads do
+before barriers and warp-wide operations.
+
+**Loop tracing.** With the environment variable ECHORA_LOOP_TRACE set at
+translation (debugging only: the translation then depends on the
+environment), each structured loop counts, by atomics on a buffer at the
+device address the specialization constants `LoopTraceLow` and
+`LoopTraceHigh` (ids 29 and 30) give, its iterations, the most of one
+invocation, the times the loop budget ran out there, and its header's
+byte offset plus one (four words per loop, in emission order; nothing
+while the address is 0).
+
 **Exits and barriers.** On the hardware an exited thread stops counting
 toward BAR.SYNC and the others synchronise; in SPIR-V a barrier must sit
 in uniform control flow. So in a program with BAR, an exit whose other
@@ -337,7 +352,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | F2I, I2F, I2FP, FRND | 0x105, 0x106, 0x045, 0x107 | sizes 75-76 and 84-85 (log2 bytes), rounding 78-79, F2I signed 72, I2F 74 |
 | F2IP | 0x243 | `.U8.F32` with the third source RZ and bit 74 set (other mode bits refused); b and a rounded by 78-79, saturated to 0-255 with NaN to 0, packed as b in bits 0-7 and a in 8-15. The saturation and NaN results are inferred from F2I, not measured |
 | FSET.BF | 0x00a | as FSETP, with 1.0 or 0.0 in a register |
-| PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71; tables 64-66 with 72-76, and 16-23 |
+| PLOP3 | 0x81c | inputs 87-90, 77-80, 68-71 (the third a uniform predicate with bit 67, as NAK encodes it); tables 64-66 with 72-76, and 16-23 |
 | CS2R | 0x805 | special register 72-79 (255 SRZ), pair 80 |
 | S2R specials | | 0x13 THREAD_KILL (helper or demoted: 1, else 0), 0x84 VARIABLE_RATE (X rate in bits 8-15, Y in 16-23; always 1x1 here), 0 lane id, 0x21-0x23 thread id, 0x25-0x27 workgroup id, 0x38-0x3c lane masks (EQ, LT, LE, GT, GE, mapped to SPIR-V's Subgroup{Eq,Lt,Le,Gt,Ge}Mask, which SPIR-V numbers eq, ge, gt, le, lt), 0x50-0x51 clock |
 | LDC, ULDC | 0xb82, 0xab9, 0xabb (ULDC indexed by a uniform register) | index register 24, bank 54-58, offset 38-53, size 73-75, LDC mode 78-79; ULDC destination 16-21 |
@@ -362,6 +377,6 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | ERRBAR | 0x9ab | no operands; nothing (it orders no memory) |
 | LDGSTS, LDGDEPBAR | 0xfae, 0x9af | as Lichii decodes it (NAK has none): 16 bytes from [R24.64 + bits 32-43] to shared [R16 + bits 48-63 × 16], or zeros where the enable predicate (87-89, negated by 90, or by 70 in the form with a cache-policy descriptor at 64-69) fails; copied at once, so LDGDEPBAR and DEPBAR wait for nothing |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
-| R2UR | 0x3c2 | uniform destination 16-21, register 24 |
+| R2UR | 0x3c2 | uniform destination 16-21, register 24; the first active invocation's value (OpGroupNonUniformBroadcastFirst), one value for the warp as on the hardware |
 | ISETP.EX | 0x00c bit 72 | the low words' result at 68-71 decides when the high words are equal |
 | BSSY, BSYNC, DEPBAR | 0x945, 0x941, 0x91a | no effect per invocation |
