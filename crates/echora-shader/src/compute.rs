@@ -6,7 +6,10 @@
 //! nested blocks, loops and if/else. A graph that cannot be (irreducible,
 //! or with computed branches) runs through one dispatch loop instead: a
 //! `switch` on the index of the block to run next, so any control-flow
-//! graph is valid SPIR-V. Every
+//! graph is valid SPIR-V. The subgroup runs the lowest pending block of
+//! its invocations each time round (lowest-PC-first, so they reconverge
+//! at joins as a warp's threads do before barriers and warp-wide
+//! operations). Every
 //! iteration spends one unit of the invocation's loop budget, so no
 //! program can hang the GPU: when the budget runs out the invocation
 //! stops. Constant bank `n` is a uniform buffer (64 KiB of `uvec4`),
@@ -2519,20 +2522,45 @@ impl Emitter {
             self.module.id(),
         );
         self.function.emit(op::BRANCH, &[header]);
-        // Header: run while not exited and within budget.
+        // Header: the subgroup runs the lowest next block among its running
+        // invocations (so they reconverge where the warp's threads would:
+        // a barrier's block runs once for all of them, and subgroup
+        // operations see them together), while any runs and within budget
+        // (both the same across the subgroup).
         self.function.label(header);
+        self.module
+            .capability(capability::GROUP_NON_UNIFORM_ARITHMETIC);
         let still = self.value(op::LOAD, self.bool, &[running]);
+        let own = self.value(op::LOAD, self.u32, &[next]);
+        let none = self.constant(u32::MAX);
+        let pending = self.value(op::SELECT, self.u32, &[still, own, none]);
+        let subgroup = self.constant(SCOPE_SUBGROUP);
+        // Group operation 0: reduce.
+        let selector = self.value(
+            op::GROUP_NON_UNIFORM_U_MIN,
+            self.u32,
+            &[subgroup, 0, pending],
+        );
+        let any = self.value(op::I_NOT_EQUAL, self.bool, &[selector, none]);
         let left = self.value(op::LOAD, self.u32, &[budget]);
         let zero = self.constant(0);
         let some_left = self.value(op::U_GREATER_THAN, self.bool, &[left, zero]);
-        let go = self.value(op::LOGICAL_AND, self.bool, &[still, some_left]);
+        let go = self.value(op::LOGICAL_AND, self.bool, &[any, some_left]);
         self.function
             .emit(op::LOOP_MERGE, &[merge, continuing, spirv::NONE]);
         self.function
             .emit(op::BRANCH_CONDITIONAL, &[go, body, merge]);
-        // Body: the switch over blocks.
+        // Body: the invocations at that block run it (the switch over
+        // blocks); the others wait.
         self.function.label(body);
-        let selector = self.value(op::LOAD, self.u32, &[next]);
+        let here = self.value(op::I_EQUAL, self.bool, &[own, selector]);
+        let chosen = self.value(op::LOGICAL_AND, self.bool, &[still, here]);
+        let (run, waiting) = (self.module.id(), self.module.id());
+        self.function
+            .emit(op::SELECTION_MERGE, &[waiting, spirv::NONE]);
+        self.function
+            .emit(op::BRANCH_CONDITIONAL, &[chosen, run, waiting]);
+        self.function.label(run);
         let switch_merge = self.module.id();
         let labels: Vec<u32> = blocks.iter().map(|_| self.module.id()).collect();
         // An index past the blocks stops the invocation.
@@ -2605,6 +2633,8 @@ impl Emitter {
             self.function.emit(op::BRANCH, &[switch_merge]);
         }
         self.function.label(switch_merge);
+        self.function.emit(op::BRANCH, &[waiting]);
+        self.function.label(waiting);
         self.function.emit(op::BRANCH, &[continuing]);
         // Continue: spend one unit of the budget.
         self.function.label(continuing);
