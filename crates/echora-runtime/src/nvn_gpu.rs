@@ -3963,7 +3963,9 @@ impl Nvn {
         // what this model expects.
         let count = (end - first).min(16 << 20) as usize;
         let mut entries = vec![0u64; count];
-        const CHUNK: u64 = 64 << 20;
+        // A page under the largest span shared at once, so a chunk whose
+        // file offset is not page-aligned still fits once rounded to pages.
+        const CHUNK: u64 = (64 << 20) - PAGE_SIZE;
         for (base, size, gpu, flags) in pools {
             let host_visible = flags & 6 != 0;
             // A pool shared in pieces: each piece, in chunks.

@@ -1947,6 +1947,7 @@ impl Renderer {
             return Ok(Some(address + (offset - known)));
         }
         if span > MAX_SHARED_SPAN || !self.gpu.buffer_device_address {
+            self.stat("stat: spans too large to share", 1);
             return Ok(None);
         }
         let Some((buffer, memory)) = self.share_span(file, start, span)? else {
