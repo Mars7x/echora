@@ -1131,9 +1131,12 @@ impl Emitter {
             }
             0x21..=0x23 => self.builtin(BUILTIN_LOCAL_INVOCATION_ID, u32::from(special - 0x21)),
             0x25..=0x27 => self.builtin(BUILTIN_WORKGROUP_ID, u32::from(special - 0x25)),
+            // SR_EQMASK, SR_LTMASK, SR_LEMASK, SR_GTMASK, SR_GEMASK (as Mesa's
+            // NAK numbers them); SPIR-V orders its masks eq, ge, gt, le, lt.
             0x38..=0x3c => {
                 self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
-                let builtin = BUILTIN_SUBGROUP_EQ_MASK + u32::from(special - 0x38);
+                let builtin =
+                    BUILTIN_SUBGROUP_EQ_MASK + [0, 4, 3, 2, 1][usize::from(special - 0x38)];
                 let uvec4 = self.module.ty(Type::Vector {
                     component: self.u32,
                     count: 4,

@@ -2568,7 +2568,21 @@ mod tests {
         let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
         let machine = Machine::new(&translated.spirv);
         let group = machine.run_workgroup(count, 32, |n| {
-            HashMap::from([(27, vec![n as u64, 0, 0]), (41, vec![(n % 32) as u64])])
+            let lane = (n % 32) as u32;
+            // The eq, ge, gt, le and lt masks (SPIR-V's order).
+            let masks = [
+                1u32 << lane,
+                !0u32 << lane,
+                (!0u32 << lane) << 1,
+                !((!0u32 << lane) << 1),
+                !(!0u32 << lane),
+            ];
+            let mut builtins =
+                HashMap::from([(27, vec![n as u64, 0, 0]), (41, vec![u64::from(lane)])]);
+            for (k, mask) in masks.into_iter().enumerate() {
+                builtins.insert(4416 + k as u32, vec![u64::from(mask), 0, 0, 0]);
+            }
+            builtins
         });
         let registers = group
             .invocations
@@ -3126,5 +3140,22 @@ mod tests {
             ..Inputs::default()
         });
         assert!(report.uniform_reads.contains(&(0, bank.binding, 0x10)));
+    }
+
+    #[test]
+    fn lane_masks_match_the_hardware_s_numbering() {
+        // S2R R1, SR_EQMASK .. R5, SR_GEMASK (0x38-0x3c)
+        let masks: Vec<u128> = (0..5u128)
+            .map(|n| word(&[(0, 12, 0x919), (16, 8, 1 + n), (72, 8, 0x38 + n)]))
+            .collect();
+        let (registers, _, problems) = run_group(32, &[], &masks);
+        assert!(problems.is_empty(), "{problems:?}");
+        let lane = 5;
+        let r = &registers[lane];
+        assert_eq!(r[&1], 1 << lane, "eq");
+        assert_eq!(r[&2], (1 << lane) - 1, "lt");
+        assert_eq!(r[&3], (1 << (lane + 1)) - 1, "le");
+        assert_eq!(r[&4], !((1u32 << (lane + 1)) - 1), "gt");
+        assert_eq!(r[&5], !((1u32 << lane) - 1), "ge");
     }
 }
