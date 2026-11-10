@@ -4428,8 +4428,9 @@ impl Nvn {
         Ok(())
     }
 
-    /// ECHORA_TARGET_TRACE=<target key>[,...] (debugging), from present
-    /// ECHORA_TARGET_TRACE_FROM: after each draw or dispatch that writes
+    /// ECHORA_TARGET_TRACE=<target key>[,...] or `all` (debugging), from
+    /// present ECHORA_TARGET_TRACE_FROM to ECHORA_TARGET_TRACE_TO: after
+    /// each draw or dispatch that writes
     /// one of them, its level 0 read back, as its mean colour and how many
     /// texels are not finite (where a pass first leaves NaN or white).
     fn trace_targets(&mut self, written: &[u64], what: &str) -> Result<(), String> {
@@ -4440,15 +4441,20 @@ impl Nvn {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        if self.presented_frames < from {
+        let to = super::debug_var("ECHORA_TARGET_TRACE_TO")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        if !(from..=to).contains(&self.presented_frames) {
             return Ok(());
         }
         let present = self.presented_frames;
         let backend = self.gpu.as_mut().unwrap();
         for &key in written {
-            if !keys
-                .split(',')
-                .any(|item| item.trim() == format!("{key:x}"))
+            if keys != "all"
+                && !keys
+                    .split(',')
+                    .any(|item| item.trim() == format!("{key:x}"))
             {
                 continue;
             }
