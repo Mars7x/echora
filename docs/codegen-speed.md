@@ -169,13 +169,79 @@ every round), `vector` 217/220/219 to 220/222/220. Small but consistent,
 so it stays opt-in for the rebuild. `tests/fp_status.rs` compares it with
 the plain path around MSR, MRS and float helpers.
 
+## Recommended set for the next rebuild (measured 2026-11)
+
+**Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`
+together; leave `structured` off.** `ECHORA_LIFT_OPTIONS` accepts all five
+names.
+
+Correctness: every `echora-aot-tests` suite (22 test binaries, 87 tests:
+the integer, SIMD, FP and SIMD-memory semantic suites against the
+reference interpreters, sequences, loops, switches, calls, exclusives,
+spin, stress, concurrency, structure, `fused_flags`, `fp_status`, golden)
+passes with all four on at once:
+
+```
+cargo test -p echora-aot-tests --features inline-vector,fused-flags,whole-vector-checks,fp-status-locals
+```
+
+(The release profile of this crate, LTO with one codegen unit, needs more
+than 15 GB with two rustc jobs; `-j 1` fits.)
+
+Speed, from `cargo bench -p echora-aot-tests --bench kernels`, best
+Minstr/s against the default (flat) emission, on a shared 4-core x86-64
+container. Two runs of the unchanged flat build differed by up to 21% on
+the integer kernels, so only changes well past that, or repeated in every
+run, count:
+
+| Kernel | flat | inline-vector | recommended (2 runs) | without fused-flags | + structured |
+|---|---|---|---|---|---|
+| vector | 63 | 194 (3.1x) | 333, 340 (5.3x) | 285 (4.5x) | +25% |
+| scalar | 345 | 680 (2.0x) | 753, 907 (2.2-2.6x) | 729 (2.1x) | -4% |
+| memset | 1891 | 1457 | 2186, 2314 (+16-22%) | 1559 (-18%) | -12% |
+| ldst | 3002 | 2467 | 3361, 4264 (+12-42%) | 2577 (-14%) | -13% |
+| arith, memcpy, calls, switch, poll | | within noise | within noise | within noise | -14% to +48% (switch) |
+
+- `inline-vector` with `whole-vector-checks` is the large win (vector
+  kernels about 5x, scalar FP about 2x).
+- `fused-flags` is what moves `memset` and `ldst` (both runs with it are
+  up, the run without it is down), as measured when it was added.
+- `fp-status-locals` adds a little on `scalar`, consistent with its
+  earlier +2-4%.
+- `structured` is mixed and costs size, so not now.
+
+Size and compile time, from `cargo bench -p echora-aot-tests --features
+codesize --bench codesize` (every split test program, 60,728 guest
+instructions, compiled as a game region at `opt-level` 1):
+
+| Mode | Rust bytes/ins | rustc s | `.text` bytes/ins |
+|---|---|---|---|
+| flat | 156.7 | 54.9 | 157.1 |
+| structured | 193.0 | 59.0 | 164.7 |
+| inline_vector | 166.3 | 57.7 | 161.8 |
+| fused_flags | 156.7 | 51.9 | 157.1 |
+| whole_vector | 169.8 | 58.1 | 162.0 |
+| fp_locals | 174.0 | 61.6 | 162.1 |
+| recommended | 174.0 | 57.4 | 162.1 |
+
+The recommended set costs 3% more machine code and about 5% more compile
+time than flat, so the rebuild takes about as long as today's.
+`fused_flags` changes size little on these random programs (only 357 of
+3,757 flag writes in them are dead); in game code compares before a branch
+are the common case.
+
+The `window-memory` and block bookkeeping changes below need
+`echora-guest` and runtime work first. They are not in this set.
+
 ## Order for the rebuild
 
 1. Land the `echora-guest` API and runtime changes with today's emission
    (the generated code still calls `tick_block_at` / `finish_block`, now
    cheaper).
 2. Turn on, in `ECHORA_LIFT_OPTIONS`: `inline-vector`, `fused-flags`,
-   `whole-vector-checks`, `fp-status-locals`, `window-memory`, and the
-   block bookkeeping emission.
+   `whole-vector-checks`, `fp-status-locals` (measured above), and, once
+   they exist, `window-memory` and the block bookkeeping emission. Without
+   the `echora-guest` changes, the four measured options can go in a
+   rebuild on their own.
 3. One full rebuild of the game's translation; compare frames and speed
    with the previous build.
