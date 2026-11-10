@@ -709,7 +709,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     let simd = simd.to_string_lossy().into_owned();
 
     // ECHORA_LIFT_OPTIONS: code generation options, comma-separated
-    // (structured, inline-vector, fused-flags); all off by default.
+    // (structured, inline-vector, fused-flags, whole-vector-checks,
+    // fp-status-locals); all off by default.
     let mut options = EmitOptions::default();
     for option in std::env::var("ECHORA_LIFT_OPTIONS")
         .unwrap_or_default()
@@ -721,6 +722,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "structured" => options.structured = true,
             "inline-vector" => options.inline_vector = true,
             "fused-flags" => options.fused_flags = true,
+            "whole-vector-checks" => options.whole_vector_checks = true,
+            "fp-status-locals" => options.fp_status_locals = true,
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
     }

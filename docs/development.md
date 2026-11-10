@@ -87,7 +87,7 @@ read.
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `structured`, `fused-flags` (a compare and its B.cond test the operands directly where NZCV is dead after them). All are off by default. |
+| `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `structured`, `fused-flags` (a compare and its B.cond test the operands directly where NZCV is dead after them), `whole-vector-checks` (with `inline-vector`: inlined vector float operations check whole vectors before the exact per-lane test), `fp-status-locals` (FPCR and FPSR kept in window locals). All are off by default; [codegen speed](codegen-speed.md) recommends a set for the next full rebuild. |
 | `ECHORA_SHADER_CACHE=dir` | Keep the driver's compiled shader binaries in this folder between runs, so later runs skip compiling them. `echora run` sets it to `shader-cache` in the translation folder. |
 | `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for `translate-dump` and `shader-check` in `echora-gpu`. |
 
