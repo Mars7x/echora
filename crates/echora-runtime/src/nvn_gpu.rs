@@ -3990,6 +3990,17 @@ impl Nvn {
                         .resident_address(base)
                         .map(|address| address + offset)
                 };
+                if address.is_none() {
+                    let note = format!(
+                        "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped{}",
+                        if host_visible {
+                            " (no shared span)"
+                        } else {
+                            " (no resident copy)"
+                        }
+                    );
+                    self.gpu.as_mut().unwrap().note(note);
+                }
                 if let Some(address) = address {
                     let first_page = (gpu + offset) >> PAGE_SHIFT;
                     for page in 0..length.div_ceil(PAGE_SIZE) {
