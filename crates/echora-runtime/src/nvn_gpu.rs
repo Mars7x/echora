@@ -4405,13 +4405,15 @@ impl Nvn {
                     && !backend.shared_pieces.contains_key(&base)
             })
             .collect();
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .stat("stat: pools tried for sharing", pools.len() as u64);
         for (base, size) in pools {
             if let Some((file, offset)) = core.memory.shared_span(base, size) {
-                self.gpu
-                    .as_mut()
-                    .unwrap()
-                    .shared_pools
-                    .insert(base, (size, file, offset));
+                let backend = self.gpu.as_mut().unwrap();
+                backend.stat("stat: pools shared whole", 1);
+                backend.shared_pools.insert(base, (size, file, offset));
                 continue;
             }
             // Page by page: runs of pages whose backing follows on.
