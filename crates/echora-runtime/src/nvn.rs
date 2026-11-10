@@ -429,6 +429,10 @@ pub struct RenderState {
     /// The array layer the depth target's view selects.
     pub depth_layer: u32,
     pub scissor: Option<[i32; 4]>,
+    /// SetRenderEnable(false) (`Some((2, 0))`) or
+    /// SetRenderEnableConditional(mode, address) (`Some((mode, address))`):
+    /// draws, clears and dispatches run only while it holds (`render_enabled`).
+    pub render_enable: Option<(u64, u64)>,
     /// Root tables written by Push{Graphics,Compute}Constants: [graphics,
     /// compute] x 8 tables of 64 words (256 bytes each).
     pub roots: [Vec<[u32; 64]>; 2],
@@ -2609,7 +2613,54 @@ impl Nvn {
             })
     }
 
+    /// Whether rendering is on: SetRenderEnable, or for
+    /// SetRenderEnableConditional(mode, address) the two NVNcounterData
+    /// counters at the address and 16 bytes on, as the GPU released them:
+    /// equal (mode 0) or different (mode 1). The game gates clears with it:
+    /// it writes counter 1 to ask for one, and the report after the clear
+    /// writes 0, so the frame's later gated clears do nothing.
+    fn render_enabled(&self, core: &Guest) -> bool {
+        match self.render.render_enable {
+            None => true,
+            Some((2, _)) => false,
+            Some((mode, address)) => {
+                let counter = |at: u64| {
+                    self.gpu_to_guest(at, 8)
+                        .ok()
+                        .and_then(|guest| core.memory.read_u64(guest).ok())
+                };
+                match (counter(address), counter(address + 16)) {
+                    (Some(first), Some(second)) => (first == second) == (mode == 0),
+                    _ => true,
+                }
+            }
+        }
+    }
+
     fn execute_command(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        match command.name.as_str() {
+            "nvnCommandBufferSetRenderEnable" => {
+                self.render.render_enable = (command.x[1] & 0xff == 0).then_some((2, 0));
+                return Ok(());
+            }
+            "nvnCommandBufferSetRenderEnableConditional" => {
+                self.render.render_enable = Some((command.x[1] & 0xffff_ffff, command.x[2]));
+                return Ok(());
+            }
+            name if (name.starts_with("nvnCommandBufferDraw")
+                || name.starts_with("nvnCommandBufferDispatch")
+                || name.starts_with("nvnCommandBufferClear"))
+                && name != "nvnCommandBufferClearBuffer"
+                && !self.render_enabled(core) =>
+            {
+                *self
+                    .skipped_work
+                    .entry("rendering disabled".into())
+                    .or_default() += 1;
+                return Ok(());
+            }
+            _ => {}
+        }
         // Commands that read or write guest memory themselves see earlier
         // dispatches' results in place (draws and dispatches resolve what
         // they read).
