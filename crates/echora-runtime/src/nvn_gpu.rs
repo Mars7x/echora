@@ -2962,9 +2962,19 @@ impl Nvn {
             std::array::from_fn(|index| command.captured[base + [0, 1, 3, 4][index]] as u32 as i32)
         };
         let (source, destination) = (rect(0), rect(6));
-        if self.gpu().unwrap().renderer.existing_target(from).is_none() {
-            return Err("source is not a render target".into());
-        }
+        // Either end may be another texture object over a render target's
+        // storage (a depth buffer copied for a later pass to test against):
+        // that target.
+        let target = |this: &Self, texture: u64| {
+            let renderer = &this.gpu.as_ref().unwrap().renderer;
+            if renderer.existing_target(texture).is_some() {
+                Some(texture)
+            } else {
+                this.target_sharing_storage(texture)
+            }
+        };
+        let from = target(self, from).ok_or("source is not a render target")?;
+        let to = target(self, to).unwrap_or(to);
         self.ensure_render_target(to)?;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.defined(to);
