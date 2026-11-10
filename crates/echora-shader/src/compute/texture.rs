@@ -896,12 +896,26 @@ impl Emitter {
             texture_type: 2,
             coordinates: 2,
         };
-        let (sampled, types) = self.sampled_image(index, texture, &view, false, None)?;
-        let level = if texture.a.0 == 255 {
-            self.constant(0)
-        } else {
-            self.read_register(texture.a.0)
+        // TXQ.B: the handle in Ra, the level in Ra+1; TXQ: the level in Ra.
+        let value = |e: &mut Self, register: u8| {
+            if register == 255 {
+                e.constant(0)
+            } else {
+                e.read_register(register)
+            }
         };
+        let (handle, level_register) = if texture.handle_value {
+            let next = if texture.a.0 == 255 {
+                255
+            } else {
+                texture.a.0.saturating_add(1)
+            };
+            (Some((value(self, texture.a.0), false)), next)
+        } else {
+            (None, texture.a.0)
+        };
+        let (sampled, types) = self.sampled_image(index, texture, &view, false, handle)?;
+        let level = value(self, level_register);
         let image = self.value(op::IMAGE, types.image, &[sampled]);
         let uvec2 = self.module.ty(Type::Vector {
             component: self.u32,

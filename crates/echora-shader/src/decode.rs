@@ -1406,6 +1406,38 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 half: word.bit(79),
             }));
         }
+        // TXQ.B: the dimensions of the texture whose handle is in Ra, at
+        // the level in Ra+1 (as Lichii decodes it: bit 59 alone of 59-63,
+        // nothing at 32-58, 76-89 or 91).
+        0x370 => {
+            if word.bits(59, 5) != 1
+                || word.bits(32, 27) != 0
+                || word.bits(76, 14) != 0
+                || word.bit(91)
+                || word.bits(72, 4) == 0
+            {
+                return None;
+            }
+            return Some(Op::Tex(Texture {
+                op: TextureOp::Query,
+                d,
+                d2: word.reg(64),
+                a: word.reg(24),
+                b: Reg(255),
+                bank: 0,
+                handle_offset: 0,
+                handle: None,
+                handle_value: true,
+                packed: false,
+                dimension: 1,
+                lod: 0,
+                offsets: false,
+                per_tap: false,
+                depth_compare: false,
+                mask: word.bits(72, 4) as u8,
+                half: false,
+            }));
+        }
         // TEX.B: the handle among the values (bits 40-58 unused, 59 set).
         0x361 => {
             if word.bits(40, 19) != 0 || !word.bit(59) || word.bit(77) || word.bits(81, 3) != 7 {

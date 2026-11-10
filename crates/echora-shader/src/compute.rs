@@ -3397,6 +3397,33 @@ mod tests {
     }
 
     #[test]
+    fn bindless_size_queries_read_the_pool() {
+        // TXQ.B R4, R0 (handle), R1 (level), width and height.
+        let query = word(&[
+            (0, 12, 0x370),
+            (16, 8, 4),
+            (24, 8, 0),
+            (59, 1, 1),
+            (64, 8, 255),
+            (72, 4, 3),
+        ]);
+        assert!(matches!(
+            decode(query).op,
+            Op::Tex(crate::decode::Texture {
+                op: crate::decode::TextureOp::Query,
+                handle_value: true,
+                ..
+            })
+        ));
+        let translated = valid(&[query, EXIT]);
+        use echora_shader_abi::texture_pool::{SAMPLED_2D, SAMPLERS};
+        assert_ne!(translated.texture_pool_bindings & 1 << SAMPLED_2D, 0);
+        assert_ne!(translated.texture_pool_bindings & 1 << SAMPLERS, 0);
+        // A query kind past the dimensions is refused.
+        assert!(matches!(decode(query | 1 << 80).op, Op::Unknown { .. }));
+    }
+
+    #[test]
     fn global_to_shared_copies_validate() {
         // LDGSTS.E.BYPASS.128 [R1+0x40], [R2.64+0x10], P0 (the first form),
         // then with a descriptor (UR4) and !P1; LDGDEPBAR.
