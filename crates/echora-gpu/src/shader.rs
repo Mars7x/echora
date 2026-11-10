@@ -73,13 +73,15 @@ pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) 
                 && shape.scope == ScopeKHR::SUBGROUP
         })
     };
-    // Opt-in (ECHORA_HMMA=cooperative): the first in-game run of these
-    // programs on RADV 25.2 under 32-lane subgroups lost the device.
-    // ECHORA_HMMA=exact: the tensor cores' published arithmetic, on any
-    // device.
+    // Cooperative matrices where the device has both shapes (the device
+    // losses once blamed on them were a mistranslated loop exit);
+    // ECHORA_HMMA=subgroup forces the shuffle path, and ECHORA_HMMA=exact
+    // the tensor cores' published arithmetic, on any device.
+    let cooperative = has(T::FLOAT16) && has(T::FLOAT32);
     let mode = match std::env::var("ECHORA_HMMA").as_deref() {
-        Ok("cooperative") if has(T::FLOAT16) && has(T::FLOAT32) => 1,
         Ok("exact") => 2,
+        Ok("subgroup") => 0,
+        _ if cooperative => 1,
         _ => 0,
     };
     MATRIX_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
