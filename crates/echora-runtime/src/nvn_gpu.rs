@@ -4422,6 +4422,77 @@ impl Nvn {
         dump_directory_at(key, self.presented_frames)
     }
 
+    /// ECHORA_DUMP_DRAW for a mesh draw: its task and mesh stages as
+    /// dispatches (`dump_dispatch`, with the draw's group count; a task
+    /// program's payload is left to the reader), in directories named by
+    /// the fragment key xor "task" or "mesh".
+    #[allow(clippy::too_many_arguments)]
+    fn dump_mesh_stages(
+        &mut self,
+        core: &mut Guest,
+        command: &Command,
+        fragment: u64,
+        stages: &[std::sync::Arc<Translated>],
+        uniforms: &HashMap<(usize, u32), Vec<u8>>,
+        textures: &HashMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
+        page_table: echora_shader_abi::PageTable,
+    ) {
+        let groups = match command.name.as_str() {
+            "nvnCommandBufferDrawMeshTasksIndirect" => {
+                let address = command.x[1];
+                let count = self
+                    .gpu_to_guest(address, 4)
+                    .and_then(|guest| self.resolve_gpu_written(core, guest..guest + 4))
+                    .and_then(|()| self.gpu_bytes(core, address, 4));
+                match count {
+                    Ok(bytes) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    Err(error) => {
+                        eprintln!("draw dump {fragment:016x}: indirect count: {error}");
+                        return;
+                    }
+                }
+            }
+            _ => command.x[2] as u32,
+        };
+        for (index, stage) in stages.iter().enumerate() {
+            let tag: u64 = match stage.stage {
+                echora_shader_abi::Stage::Task => 0x7461_736b,
+                echora_shader_abi::Stage::Mesh => 0x6d65_7368,
+                _ => continue,
+            };
+            let key = fragment ^ tag;
+            self.dumped_dispatches.insert(key);
+            let stage_uniforms: HashMap<u32, Vec<u8>> = uniforms
+                .iter()
+                .filter(|((stage_index, _), _)| *stage_index == index)
+                .map(|((_, binding), bytes)| (*binding, bytes.clone()))
+                .collect();
+            if let Err(error) = self.dump_dispatch(
+                core,
+                key,
+                stage,
+                [groups, 1, 1],
+                &stage_uniforms,
+                &[],
+                page_table,
+            ) {
+                eprintln!("draw dump {key:016x}: {error}");
+            }
+            let read: Vec<(u32, TextureSource)> = textures
+                .iter()
+                .filter(|((stage_index, _), _)| *stage_index == index)
+                .map(|((_, binding), (source, _))| (*binding, source.clone()))
+                .collect();
+            if let Err(error) = self.dump_images(key, &read) {
+                eprintln!("draw dump {key:016x} images: {error}");
+            }
+            eprintln!(
+                "draw dump {key:016x}: {:?} stage, {groups} groups",
+                stage.stage
+            );
+        }
+    }
+
     /// A dumped draw's fragment program and inputs, for the simulator: as
     /// `dump_dispatch`, with `dispatch.txt` naming the target's middle
     /// pixel (`fragcoord`; its attributes are left to the reader) and each
@@ -6008,6 +6079,23 @@ impl Nvn {
             );
             backend.note(line);
         }
+        // ECHORA_DUMP_DRAW also dumps a mesh draw's task and mesh stages
+        // (as dispatches, at the end): their inputs, kept here.
+        let stage_dump = (mesh_draw
+            && super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
+                wanted
+                    .split(',')
+                    .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
+            })
+            && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7461_736b)))
+        .then(|| {
+            (
+                stages.clone(),
+                uniforms.clone(),
+                textures.clone(),
+                page_table,
+            )
+        });
         let draw = Draw {
             program: &backend.programs[&keys],
             blends,
@@ -6227,6 +6315,11 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: draw us setup", timings[0]);
         backend.stat("stat: draw us renderer", timings[1]);
+        if let Some((stages, uniforms, textures, page_table)) = stage_dump {
+            self.dump_mesh_stages(
+                core, command, keys.1, &stages, &uniforms, &textures, page_table,
+            );
+        }
         self.trace_targets(&colors_written, &draw_label)?;
         self.trace_memory(core, &draw_label)
     }
