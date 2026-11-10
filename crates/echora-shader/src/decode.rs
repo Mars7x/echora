@@ -1380,6 +1380,11 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             if word.bit(59) || (word.bit(77) && !per_tap) || fault {
                 return None;
             }
+            // TXQ: only the dimension query, with 76-89 clear (as Lichii
+            // accepts it); other query kinds are not decoded.
+            if op == TextureOp::Query && word.bits(76, 14) != 0 {
+                return None;
+            }
             return Some(Op::Tex(Texture {
                 op,
                 d,

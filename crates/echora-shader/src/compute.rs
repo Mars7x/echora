@@ -3437,6 +3437,10 @@ mod tests {
         assert_ne!(translated.texture_pool_bindings & 1 << SAMPLERS, 0);
         // A query kind past the dimensions is refused.
         assert!(matches!(decode(query | 1 << 80).op, Op::Unknown { .. }));
+        // So is TXQ's (0xb6f).
+        let bound = word(&[(0, 12, 0xb6f), (16, 8, 4), (24, 8, 0), (72, 4, 3)]);
+        assert!(!matches!(decode(bound).op, Op::Unknown { .. }));
+        assert!(matches!(decode(bound | 1 << 80).op, Op::Unknown { .. }));
     }
 
     #[test]
@@ -4061,17 +4065,15 @@ mod tests {
                     (72, 4, 0xf),
                 ],
             ),
-            // TXQ R24, R1 (level), 0xf, c[0][0x50]
-            tex(
-                0xb6f,
-                &[
-                    (16, 8, 24),
-                    (24, 8, 1),
-                    (40, 14, 0x14),
-                    (64, 8, 26),
-                    (72, 4, 0xf),
-                ],
-            ),
+            // TXQ R24, R1 (level), 0xf, c[0][0x50] (no fault predicate)
+            word(&[
+                (0, 12, 0xb6f),
+                (16, 8, 24),
+                (24, 8, 1),
+                (40, 14, 0x14),
+                (64, 8, 26),
+                (72, 4, 0xf),
+            ]),
             EXIT,
         ]);
         let summary: Vec<(u32, u32, u32, u32, u32)> = translated
