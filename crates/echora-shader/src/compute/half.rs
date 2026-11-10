@@ -139,7 +139,11 @@ impl Emitter {
         }
         if saturate {
             let (zero, one) = (self.half_constant(0), self.half_constant(0x3c00));
-            value = self.glsl(pair, glsl::F_CLAMP, &[value, zero, one]);
+            let bool2 = self.module.ty(crate::spirv::Type::Vector {
+                component: self.bool,
+                count: 2,
+            });
+            value = self.saturate(pair, bool2, value, zero, one);
         }
         let mut bits = self.value(op::BITCAST, self.u32, &[value]);
         if let Some(condition) = relu {
@@ -275,7 +279,7 @@ impl Emitter {
         let mut value = self.exact(op::F_ADD, &[a, b]);
         if saturate {
             let (zero, one) = (self.float_constant(0.0), self.float_constant(1.0));
-            value = self.glsl(self.f32, glsl::F_CLAMP, &[value, zero, one]);
+            value = self.saturate(self.f32, self.bool, value, zero, one);
         }
         self.write_float(d.0, value);
         Ok(())

@@ -1138,6 +1138,16 @@ impl Emitter {
         Ok(value)
     }
 
+    /// `.SAT`: `value` (of type `ty`, a float or a vector of them, with
+    /// `bool_type` its comparison type) clamped to [`zero`, `one`], a NaN
+    /// (and -0) giving +0 as the hardware does (FClamp leaves NaN
+    /// undefined).
+    fn saturate(&mut self, ty: u32, bool_type: u32, value: u32, zero: u32, one: u32) -> u32 {
+        let positive = self.value(op::F_ORD_GREATER_THAN, bool_type, &[value, zero]);
+        let capped = self.glsl(ty, glsl::N_MIN, &[value, one]);
+        self.value(op::SELECT, ty, &[positive, capped, zero])
+    }
+
     /// Whether `a` or `b` is a zero factor for a `.DNZ` multiply (NAK's
     /// `fmulz`): ±0, or with `flush` a subnormal too (flushed first).
     fn zero_factor(&mut self, a: u32, b: u32, flush: bool) -> u32 {
@@ -1229,14 +1239,8 @@ impl Emitter {
             _ => value,
         };
         if modes.saturate {
-            let glsl = self.module.glsl();
-            let zero = self.module.constant(self.f32, 0);
-            let one = self.module.constant(self.f32, 1.0f32.to_bits());
-            value = self.value(
-                op::EXT_INST,
-                self.f32,
-                &[glsl, glsl::F_CLAMP, value, zero, one],
-            );
+            let (zero, one) = (self.float_constant(0.0), self.float_constant(1.0));
+            value = self.saturate(self.f32, self.bool, value, zero, one);
         }
         let bits = self.value(op::BITCAST, self.u32, &[value]);
         self.write_register(d, bits);

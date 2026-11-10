@@ -4563,6 +4563,60 @@ mod tests {
     }
 
     #[test]
+    fn saturation_sends_nan_to_zero_and_packing_keeps_specials() {
+        let (inf, nan) = (f32::INFINITY.to_bits(), f32::NAN.to_bits());
+        // FADD.SAT R2, R0, R1.
+        let fadd = word(&[
+            (0, 12, 0x221),
+            (16, 8, 2),
+            (24, 8, 0),
+            (32, 8, 1),
+            (77, 1, 1),
+        ]);
+        for (a, b, expected) in [
+            (inf, (-f32::INFINITY).to_bits(), 0),
+            (nan, 0, 0),
+            ((-0.0f32).to_bits(), 0, 0),
+            ((-2.0f32).to_bits(), 0, 0),
+            (inf, 0, 1.0f32.to_bits()),
+            (0.25f32.to_bits(), 0, 0.25f32.to_bits()),
+        ] {
+            let (r, _) = run(&[a, b], &[fadd]);
+            assert_eq!(r[&2], expected, "FADD.SAT {a:#x} + {b:#x}");
+        }
+        // HADD2.SAT R2, R0, R1: a NaN lane and an Inf lane.
+        let hadd = word(&[
+            (0, 12, 0x230),
+            (16, 8, 2),
+            (24, 8, 0),
+            (32, 8, 1),
+            (77, 1, 1),
+        ]);
+        let (r, _) = run(&[0x7c00_7e00, 0], &[hadd]);
+        assert_eq!(r[&2], 0x3c00_0000, "HADD2.SAT");
+        // F2FP.PACK_AB R2, R0, R1 (round to nearest): NaN stays NaN, ±Inf
+        // stay, 65520 rounds to +Inf, -1e9 to -Inf.
+        let pack = word(&[(0, 12, 0x23e), (16, 8, 2), (24, 8, 0), (32, 8, 1)]);
+        for (high, low, expected_high, expected_low) in [
+            (inf, (-f32::INFINITY).to_bits(), 0x7c00, 0xfc00),
+            (65520.0f32.to_bits(), (-1.0e9f32).to_bits(), 0x7c00, 0xfc00),
+        ] {
+            let (r, _) = run(&[high, low], &[pack]);
+            assert_eq!(
+                r[&2],
+                expected_low | expected_high << 16,
+                "F2FP {high:#x} {low:#x}"
+            );
+        }
+        let (r, _) = run(&[nan, 0], &[pack]);
+        assert!(
+            r[&2] >> 16 & 0x7c00 == 0x7c00 && r[&2] >> 16 & 0x3ff != 0,
+            "{:#x}",
+            r[&2]
+        );
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {
