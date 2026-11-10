@@ -28,8 +28,15 @@ pub(super) struct Memory {
     local: Option<u32>,
 }
 
-/// SPIR-V's memory-access operand for an aligned access.
+/// SPIR-V's memory-access operands for an aligned access, and a volatile
+/// one.
 const ALIGNED: u32 = 2;
+const VOLATILE: u32 = 1;
+
+/// The memory-access operands of a global access (an alignment follows).
+fn access(strong: bool) -> u32 {
+    if strong { VOLATILE | ALIGNED } else { ALIGNED }
+}
 
 /// Scopes and memory semantics for barriers.
 const SCOPE_WORKGROUP: u32 = 2;
@@ -74,6 +81,7 @@ impl Emitter {
             .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn load(
         &mut self,
         index: usize,
@@ -82,10 +90,11 @@ impl Emitter {
         address: Address,
         size: u8,
         condition: Pred,
+        strong: bool,
     ) -> Result<(), Unsupported> {
         let count = words(size).ok_or_else(|| unsupported(index, format!("load size {size}")))?;
         let (values, low_bits) = match space {
-            Space::Global => self.global_load(address, count, condition)?,
+            Space::Global => self.global_load(address, count, condition, strong)?,
             Space::Shared | Space::Local => {
                 if !condition.is_true() {
                     return Err(unsupported(index, "predicated shared or local load"));
@@ -113,6 +122,7 @@ impl Emitter {
         space: Space,
         address: Address,
         size: u8,
+        strong: bool,
     ) -> Result<(), Unsupported> {
         let count = match words(size) {
             Some(_) if size < 4 => return self.narrow_store(index, data, space, address, size),
@@ -129,7 +139,7 @@ impl Emitter {
             })
             .collect();
         match space {
-            Space::Global => self.global_store(address, &values),
+            Space::Global => self.global_store(address, &values, strong),
             Space::Shared | Space::Local => self.array_store(index, space, address, &values),
         }
     }
@@ -617,13 +627,18 @@ impl Emitter {
             .collect()
     }
 
-    /// A global load's words, and the address's low two bits.
+    /// A global load's words, and the address's low two bits. A strong
+    /// load is volatile, so it is neither cached apart from other
+    /// workgroups' stores nor merged or hoisted (a loop that polls memory
+    /// sees the change).
     fn global_load(
         &mut self,
         address: Address,
         count: u32,
         condition: Pred,
+        strong: bool,
     ) -> Result<(Vec<u32>, u32), Unsupported> {
+        let operands = access(strong);
         let va = self.global_address(address);
         let extra = (!condition.is_true()).then(|| self.read_predicate(condition));
         let results = self.result_variables(count);
@@ -637,7 +652,7 @@ impl Emitter {
                 device
             };
             let (pointer, ty) = e.device_pointer(device, count);
-            let value = e.value(op::LOAD, ty, &[pointer, ALIGNED, count * 4]);
+            let value = e.value(op::LOAD, ty, &[pointer, operands, count * 4]);
             for (n, &result) in results.iter().enumerate() {
                 let word = if count == 1 {
                     value
@@ -658,7 +673,13 @@ impl Emitter {
         Ok((values, low_bits))
     }
 
-    fn global_store(&mut self, address: Address, values: &[u32]) -> Result<(), Unsupported> {
+    fn global_store(
+        &mut self,
+        address: Address,
+        values: &[u32],
+        strong: bool,
+    ) -> Result<(), Unsupported> {
+        let operands = access(strong);
         let va = self.global_address(address);
         let count = values.len() as u32;
         self.mapped(va, None, |e, device| {
@@ -674,7 +695,7 @@ impl Emitter {
                 id
             };
             e.function
-                .emit(op::STORE, &[pointer, value, ALIGNED, count * 4]);
+                .emit(op::STORE, &[pointer, value, operands, count * 4]);
             Ok(())
         })
     }

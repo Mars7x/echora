@@ -528,13 +528,18 @@ pub enum Op {
         address: Address,
         size: u8,
         condition: Pred,
+        /// A strong (coherent) access, bits 77-80 5, 7 or 0xa (.STRONG at
+        /// CTA, GPU or system scope, as Mesa's NAK encodes them for SM 8.x;
+        /// 0 weak, 4 constant).
+        strong: bool,
     },
-    /// STG / STS / STL [address], data.
+    /// STG / STS / STL [address], data; `strong` as LDG's.
     Store {
         data: Reg,
         space: Space,
         address: Address,
         size: u8,
+        strong: bool,
     },
     /// RED / ATOMG / ATOMS d, [address], data: `operation` (bits 87-90) 0
     /// add, 1 min, 2 max, 3 increment, 4 decrement, 5 and, 6 or, 7 xor, 8
@@ -1095,6 +1100,11 @@ pub fn decode_program(bytes: &[u8]) -> Vec<Instruction> {
         .collect()
 }
 
+/// A global access's memory order (bits 77-80) is strong.
+fn strong(word: Word) -> bool {
+    matches!(word.bits(77, 4), 5 | 7 | 0xa)
+}
+
 fn decode_op(word: Word, opcode: u16) -> Option<Op> {
     let d = word.reg(16);
     let form = word.form();
@@ -1258,6 +1268,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 address,
                 size: word.bits(73, 3) as u8,
                 condition,
+                strong: space == Space::Global && strong(word),
             });
         }
         0x386 | 0x986 | 0x388 | 0x988 | 0x387 | 0x987 => {
@@ -1279,6 +1290,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 space,
                 address,
                 size: word.bits(73, 3) as u8,
+                strong: space == Space::Global && strong(word),
             });
         }
         0x98e | 0x9a8 | 0x3a8 | 0x3a9 | 0x38c | 0x98c | 0x38d => {

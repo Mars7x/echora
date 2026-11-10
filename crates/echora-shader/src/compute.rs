@@ -2127,13 +2127,15 @@ impl Emitter {
                 address,
                 size,
                 condition,
-            } => self.load(index, d.0, space, address, size, condition)?,
+                strong,
+            } => self.load(index, d.0, space, address, size, condition, strong)?,
             Op::Store {
                 data,
                 space,
                 address,
                 size,
-            } => self.store(index, data.0, space, address, size)?,
+                strong,
+            } => self.store(index, data.0, space, address, size, strong)?,
             Op::Atomic {
                 d,
                 space,
@@ -3117,6 +3119,56 @@ mod tests {
             panic!("{problem}");
         }
         translated
+    }
+
+    #[test]
+    fn strong_global_accesses_are_volatile() {
+        // LDG.E.STRONG.GPU R2, [R4.64]; STG.E.STRONG.SYS [R4.64], R2;
+        // LDG.E R3, [R4.64] (weak)
+        let load = |order: u128, d: u128| {
+            word(&[
+                (0, 12, 0x381),
+                (16, 8, d),
+                (24, 8, 4),
+                (72, 1, 1),
+                (73, 3, 4),
+                (77, 4, order),
+            ])
+        };
+        let store = word(&[
+            (0, 12, 0x386),
+            (24, 8, 4),
+            (32, 8, 2),
+            (72, 1, 1),
+            (73, 3, 4),
+            (77, 4, 0xa),
+        ]);
+        let words = [load(7, 2), store, load(0, 3), EXIT];
+        assert!(matches!(decode(words[0]).op, Op::Load { strong: true, .. }));
+        assert!(matches!(
+            decode(words[1]).op,
+            Op::Store { strong: true, .. }
+        ));
+        assert!(matches!(
+            decode(words[2]).op,
+            Op::Load { strong: false, .. }
+        ));
+        let spirv = valid(&words).spirv;
+        // OpLoad and OpStore with Volatile | Aligned (3), once each.
+        let accesses = |opcode: u32, length: usize| {
+            let mut found = 0;
+            let mut at = 5;
+            while at < spirv.len() {
+                let count = (spirv[at] >> 16) as usize;
+                if spirv[at] & 0xffff == opcode && count == length && spirv[at + length - 2] == 3 {
+                    found += 1;
+                }
+                at += count.max(1);
+            }
+            found
+        };
+        assert_eq!(accesses(61, 6), 1);
+        assert_eq!(accesses(62, 5), 1);
     }
 
     #[test]
