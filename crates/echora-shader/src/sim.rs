@@ -3667,6 +3667,81 @@ mod tests {
     }
 
     #[test]
+    fn samples_through_one_handle_share_its_pool_loads() {
+        use echora_shader_abi::{TEXTURE_POOL_SET, texture_pool};
+        // Four TEX.B.LZ R4.., R0 (x, y in R0 and R1), R2 (the handle), each
+        // at x += 0.5 (as a MOV to R0 between them).
+        let sample = word(&[
+            (0, 12, 0x361),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (59, 1, 1),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        // R8 accumulates each sample's first component.
+        let accumulate = word(&[
+            (0, 12, 0x210),
+            (16, 8, 8),
+            (24, 8, 8),
+            (32, 8, 4),
+            (64, 8, 255),
+            (77, 3, 7),
+            (81, 3, 7),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let mut program = vec![mov(1, 0.25f32.to_bits()), mov(2, 3)];
+        for x in [0.25f32, 0.75, 0.25, 0.75] {
+            program.extend([mov(0, x.to_bits()), sample, accumulate]);
+        }
+        program.push(EXIT);
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        // The handle's sampler, float view and flag are loaded once; each
+        // sample loads the unsigned view in its integer branch.
+        let chains = {
+            let words = &translated.spirv;
+            let mut at = 5;
+            let mut count = 0;
+            while at < words.len() {
+                count += usize::from(words[at] & 0xffff == u32::from(op::ACCESS_CHAIN));
+                at += (words[at] >> 16) as usize;
+            }
+            count
+        };
+        assert_eq!(chains, 3 + 4);
+        // An integer entry 3 holding x + 10 in its first component.
+        let image = Image {
+            width: 2,
+            height: 2,
+            depth: 1,
+            layers: 1,
+            texels: (0..4u32).map(|n| [n % 2 + 10, 0, 0, 0]).collect(),
+        };
+        let flags: Vec<u8> = (0..4u32)
+            .flat_map(|n| u32::from(n == 3).to_le_bytes())
+            .collect();
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            image_arrays: HashMap::from([((TEXTURE_POOL_SET, texture_pool::UINT_2D, 3), image)]),
+            uniforms: HashMap::from([((TEXTURE_POOL_SET, texture_pool::FLAGS), flags)]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(
+            report.invocations[0][&registers[&8]][0] as u32,
+            10 + 11 + 10 + 11
+        );
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {

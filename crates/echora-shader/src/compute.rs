@@ -390,6 +390,23 @@ const SCOPE_SUBGROUP: u32 = 3;
 /// Bytes of a constant bank.
 const BANK_SIZE: u32 = 0x10000;
 
+/// What a value in `Emitter::known` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Known {
+    /// A register, predicate or uniform register variable's value.
+    Variable(u32),
+    /// A texture pool entry: binding, element type, index value, and
+    /// whether the index is uniform.
+    PoolEntry(u32, u32, u32, bool),
+    /// Whether the pool entry at an index value is integer.
+    PoolFlag(u32),
+    /// A pool handle value's texture index (zero past the pool), whether
+    /// it is inside the pool, and its sampler index.
+    PoolIndex(u32),
+    PoolInside(u32),
+    PoolSampler(u32),
+}
+
 /// SPIR-V types and the module-level objects the program uses.
 struct Emitter {
     module: Module,
@@ -459,9 +476,12 @@ struct Emitter {
     atomic_images: BTreeMap<(u8, u16, u8), u32>,
     /// Task and mesh programs' variables.
     mesh: Option<mesh::MeshState>,
-    /// Register, predicate and uniform register variables' values known in
-    /// a block (see `load_variable`).
-    known: BTreeMap<u32, ((u32, u32), u32)>,
+    /// Values known in a block, and the block they were made in (see
+    /// `known`).
+    known: BTreeMap<Known, ((u32, u32), u32)>,
+    /// The blocks that dominate the current one through the selections
+    /// `choose` is emitting.
+    dominators: Vec<(u32, u32)>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
     /// c), and the seconds' indices (emitted with their first).
     hmma_pairs: matrix::Pairs,
@@ -535,6 +555,7 @@ impl Emitter {
             atomic_images: BTreeMap::new(),
             mesh: None,
             known: BTreeMap::new(),
+            dominators: Vec::new(),
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
@@ -664,22 +685,30 @@ impl Emitter {
 
     /// A register-like variable's value: the one stored or loaded earlier
     /// in the same block, else a load.
+    /// The value known for `key`, when it was made in the current block or
+    /// one that dominates it.
+    fn known(&self, key: Known) -> Option<u32> {
+        let &(block, value) = self.known.get(&key)?;
+        (block == self.function.block() || self.dominators.contains(&block)).then_some(value)
+    }
+
+    /// Records `value` for `key`, made in the current block.
+    fn remember(&mut self, key: Known, value: u32) {
+        self.known.insert(key, (self.function.block(), value));
+    }
+
     fn load_variable(&mut self, variable: u32, ty: u32) -> u32 {
-        let block = self.function.block();
-        if let Some(&(known, value)) = self.known.get(&variable)
-            && known == block
-        {
+        if let Some(value) = self.known(Known::Variable(variable)) {
             return value;
         }
         let value = self.value(op::LOAD, ty, &[variable]);
-        self.known.insert(variable, (block, value));
+        self.remember(Known::Variable(variable), value);
         value
     }
 
     fn store_variable(&mut self, variable: u32, value: u32) {
         self.function.emit(op::STORE, &[variable, value]);
-        let block = self.function.block();
-        self.known.insert(variable, (block, value));
+        self.remember(Known::Variable(variable), value);
     }
 
     /// Predicate `pred.index` (8-15: uniform predicate index - 8, as a

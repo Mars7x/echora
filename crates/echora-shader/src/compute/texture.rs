@@ -8,7 +8,7 @@ use echora_shader_abi::{
     TEXTURE_POOL_SET, Unsupported, texture_pool,
 };
 
-use super::{Emitter, unsupported};
+use super::{Emitter, Known, unsupported};
 use crate::decode::{Texture, TextureOp};
 use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 
@@ -175,22 +175,11 @@ impl Emitter {
         // The pool's images take no depth flag: the sampler's state
         // decides a comparison.
         let types = self.texture_types(view, false);
-        let (mask, shift) = (
-            self.constant(TEXTURE_INDEX_MASK),
-            self.constant(SAMPLER_INDEX_SHIFT),
-        );
-        let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
-        // An index past the pool's arrays reads as an unwritten entry: the
-        // access uses entry 0 and the results become zeros.
-        let capacity = self.pool_capacity();
-        let inside = self.value(op::U_LESS_THAN, self.bool, &[texture_index, capacity]);
-        let zero = self.constant(0);
-        let texture_index = self.value(op::SELECT, self.u32, &[inside, texture_index, zero]);
+        let (texture_index, inside, sampler_index) = self.pool_handle(handle);
         self.pool_inside = Some(match self.pool_inside {
             Some(before) => self.value(op::LOGICAL_AND, self.bool, &[before, inside]),
             None => inside,
         });
-        let sampler_index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
         let image = self.pool_entry(binding, types.image, texture_index, uniform);
         let sampler_type = self.module.ty(Type::Sampler);
         let sampler = self.pool_entry(texture_pool::SAMPLERS, sampler_type, sampler_index, uniform);
@@ -234,9 +223,40 @@ impl Emitter {
         Ok((sampled, types))
     }
 
+    /// A pool handle's texture index, whether it is inside the pool, and
+    /// its sampler index. An index past the pool's arrays reads as an
+    /// unwritten entry: the access uses entry 0 and the results become
+    /// zeros.
+    fn pool_handle(&mut self, handle: u32) -> (u32, u32, u32) {
+        if let (Some(index), Some(inside), Some(sampler)) = (
+            self.known(Known::PoolIndex(handle)),
+            self.known(Known::PoolInside(handle)),
+            self.known(Known::PoolSampler(handle)),
+        ) {
+            return (index, inside, sampler);
+        }
+        let (mask, shift) = (
+            self.constant(TEXTURE_INDEX_MASK),
+            self.constant(SAMPLER_INDEX_SHIFT),
+        );
+        let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
+        let capacity = self.pool_capacity();
+        let inside = self.value(op::U_LESS_THAN, self.bool, &[texture_index, capacity]);
+        let zero = self.constant(0);
+        let texture_index = self.value(op::SELECT, self.u32, &[inside, texture_index, zero]);
+        let sampler = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
+        self.remember(Known::PoolIndex(handle), texture_index);
+        self.remember(Known::PoolInside(handle), inside);
+        self.remember(Known::PoolSampler(handle), sampler);
+        (texture_index, inside, sampler)
+    }
+
     /// Whether pool entry `index` is integer: bit 0 of its word in the
     /// flags buffer (`texture_pool::FLAGS`).
     fn pool_flag(&mut self, index: u32) -> u32 {
+        if let Some(flag) = self.known(Known::PoolFlag(index)) {
+            return flag;
+        }
         let variable = match self.pool_flags {
             Some(variable) => variable,
             None => {
@@ -270,7 +290,9 @@ impl Emitter {
         let word = self.value(op::LOAD, self.u32, &[word]);
         let one = self.constant(1);
         let bit = self.value(op::BITWISE_AND, self.u32, &[word, one]);
-        self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero])
+        let flag = self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero]);
+        self.remember(Known::PoolFlag(index), flag);
+        flag
     }
 
     /// The texture pool's capacity, a specialization constant
@@ -296,6 +318,10 @@ impl Emitter {
     /// Entry `index` of texture-pool binding `binding` (an unsized array of
     /// `element`); a non-uniform index unless `uniform`.
     fn pool_entry(&mut self, binding: u32, element: u32, index: u32, uniform: bool) -> u32 {
+        let key = Known::PoolEntry(binding, element, index, uniform);
+        if let Some(value) = self.known(key) {
+            return value;
+        }
         self.module.capability(capability::RUNTIME_DESCRIPTOR_ARRAY);
         if !uniform {
             self.module.capability(capability::SHADER_NON_UNIFORM);
@@ -327,6 +353,7 @@ impl Emitter {
             self.module.decorate(entry, decoration::NON_UNIFORM, &[]);
             self.module.decorate(value, decoration::NON_UNIFORM, &[]);
         }
+        self.remember(key, value);
         value
     }
 

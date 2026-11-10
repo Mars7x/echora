@@ -311,19 +311,30 @@ impl Emitter {
     }
 
     /// Runs `body(true)` where `condition` holds, else `body(false)`.
+    /// Values known before the selection stay known in both bodies, and
+    /// after it unless a body replaced them.
     pub(super) fn choose(&mut self, condition: u32, mut body: impl FnMut(&mut Self, bool)) {
         let (yes, no, merge) = (self.module.id(), self.module.id(), self.module.id());
         self.function
             .emit(op::SELECTION_MERGE, &[merge, crate::spirv::NONE]);
         self.function
             .emit(op::BRANCH_CONDITIONAL, &[condition, yes, no]);
+        let before = self.function.block();
+        self.dominators.push(before);
         self.function.label(yes);
         body(self, true);
         self.function.emit(op::BRANCH, &[merge]);
         self.function.label(no);
         body(self, false);
         self.function.emit(op::BRANCH, &[merge]);
+        self.dominators.pop();
         self.function.label(merge);
+        let after = self.function.block();
+        for (block, _) in self.known.values_mut() {
+            if *block == before {
+                *block = after;
+            }
+        }
     }
 }
 
