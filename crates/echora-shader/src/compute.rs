@@ -1407,8 +1407,18 @@ impl Emitter {
                 self.set_predicates(p, q, result, combine, accumulate);
             }
             Op::R2ur { d, src } => {
+                // The first active invocation's value, the same for the
+                // whole warp (each invocation's own would make the uniform
+                // register, and the branches on it, differ across lanes).
+                self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
                 let value = self.read_register(src.0);
-                self.write_uniform(d.0.min(63), value);
+                let subgroup = self.constant(SCOPE_SUBGROUP);
+                let first = self.value(
+                    op::GROUP_NON_UNIFORM_BROADCAST_FIRST,
+                    self.u32,
+                    &[subgroup, value],
+                );
+                self.write_uniform(d.0.min(63), first);
             }
             Op::S2r { d, special } => {
                 // Thread id (33-35) and workgroup id (37-39), as on Maxwell.

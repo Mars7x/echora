@@ -147,6 +147,7 @@ pub mod op {
     pub const GROUP_NON_UNIFORM_ALL: u16 = 334;
     pub const GROUP_NON_UNIFORM_ANY: u16 = 335;
     pub const GROUP_NON_UNIFORM_ALL_EQUAL: u16 = 336;
+    pub const GROUP_NON_UNIFORM_BROADCAST_FIRST: u16 = 338;
     pub const GROUP_NON_UNIFORM_BALLOT: u16 = 339;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
     pub const GROUP_NON_UNIFORM_I_ADD: u16 = 349;

@@ -1048,6 +1048,7 @@ impl Machine {
         let results: Vec<Value> = match opcode {
             op::GROUP_NON_UNIFORM_ALL => same(vec![u64::from(all(3).iter().all(|v| v[0] != 0))]),
             op::GROUP_NON_UNIFORM_ANY => same(vec![u64::from(all(3).iter().any(|v| v[0] != 0))]),
+            op::GROUP_NON_UNIFORM_BROADCAST_FIRST => same(all(3)[0].clone()),
             op::GROUP_NON_UNIFORM_ALL_EQUAL => {
                 let values = all(3);
                 same(vec![u64::from(values.iter().all(|v| *v == values[0]))])
@@ -2780,5 +2781,16 @@ mod tests {
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         let result = &report.images[&(0, image.binding)];
         assert_eq!(result.texels[2 * 4 + 3], [9, 109, 209, 309]);
+    }
+
+    #[test]
+    fn uniform_registers_take_the_first_active_lane_s_value() {
+        // S2R R0, SR_LANEID; R2UR UR4, R0; MOV R1, UR4
+        let lane = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0)]);
+        let to_uniform = word(&[(0, 12, 0x3c2), (16, 6, 4), (24, 8, 0)]);
+        let back = word(&[(0, 12, 0xc02), (72, 4, 0xf), (16, 8, 1), (32, 6, 4)]);
+        let (registers, _, problems) = run_group(32, &[], &[lane, to_uniform, back]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(registers.iter().all(|registers| registers[&1] == 0));
     }
 }
