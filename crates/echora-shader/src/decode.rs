@@ -490,7 +490,8 @@ pub enum Op {
         combine: Combine,
         accumulate: Pred,
     },
-    /// PLOP3.LUT p, q, a, b, c: two functions of three predicates.
+    /// PLOP3.LUT p, q, a, b, c: two functions of three predicates (c a
+    /// uniform predicate, index 8-15, with bit 67).
     Plop3 {
         p: u8,
         q: u8,
@@ -1257,10 +1258,16 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         0x91a => return Some(Op::Depbar),
         0x81c => {
             // The second function's table sits where a destination would.
+            // Bit 67 makes the third source a uniform predicate (as Mesa's
+            // NAK encodes it), index 8 + n here (15: UPT).
+            let mut third = word.pred(68, 71);
+            if word.bit(67) {
+                third.index += 8;
+            }
             return Some(Op::Plop3 {
                 p: word.bits(81, 3) as u8,
                 q: word.bits(84, 3) as u8,
-                srcs: [word.pred(87, 90), word.pred(77, 80), word.pred(68, 71)],
+                srcs: [word.pred(87, 90), word.pred(77, 80), third],
                 luts: [
                     (word.bits(64, 3) | word.bits(72, 5) << 3) as u8,
                     word.bits(16, 8) as u8,

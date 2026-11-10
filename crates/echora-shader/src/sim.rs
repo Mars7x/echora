@@ -2970,4 +2970,32 @@ mod tests {
         });
         assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
+
+    #[test]
+    fn predicate_logic_reads_a_uniform_predicate_with_bit_67() {
+        // UPLOP3.LUT UP0, UPT, UPT, UPT, UPT, 0xff, 0x0 (UP0 = true);
+        // PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0 (P0 = UP0)
+        let set_uniform = word(&[
+            (0, 12, 0x89c),
+            (64, 3, 7),
+            (68, 3, 7),
+            (72, 5, 0x1f),
+            (77, 3, 7),
+            (81, 3, 0),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let from_uniform = word(&[
+            (0, 12, 0x81c),
+            (67, 1, 1),
+            (68, 3, 0),
+            (72, 5, 0x10),
+            (77, 3, 7),
+            (81, 3, 0),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let (_, predicates) = run(&[], &[set_uniform, from_uniform]);
+        assert!(predicates[&0], "P0 takes UP0's value");
+    }
 }

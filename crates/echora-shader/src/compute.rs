@@ -619,7 +619,8 @@ impl Emitter {
     /// The variable of predicate `n`, in the uniform file (kept as 8-15)
     /// for a uniform instruction.
     fn predicate_variable(&mut self, n: u8) -> u32 {
-        let n = if self.uniform { n + 8 } else { n };
+        // Uniform predicates are 8-15 (a uniform instruction's 0-7).
+        let n = if n < 8 && self.uniform { n + 8 } else { n };
         if let Some(&variable) = self.predicates.get(&n) {
             return variable;
         }
@@ -659,8 +660,10 @@ impl Emitter {
         }
     }
 
+    /// Predicate `pred.index` (8-15: uniform predicate index - 8, as a
+    /// per-invocation instruction reads one; 7 and 15 are true).
     fn read_predicate(&mut self, pred: Pred) -> u32 {
-        if pred.index == 7 {
+        if pred.index == 7 || pred.index == 15 {
             return self.module.bool_constant(!pred.negated);
         }
         let value = {
@@ -675,7 +678,7 @@ impl Emitter {
     }
 
     fn write_predicate(&mut self, n: u8, value: u32) {
-        if n != 7 {
+        if n != 7 && n != 15 {
             let variable = self.predicate_variable(n);
             self.function.emit(op::STORE, &[variable, value]);
         }
