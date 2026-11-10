@@ -132,7 +132,22 @@ constants' inverse resolution scale), 0x80 + 16n generic vector n,
 hint) are dropped.
 Generic vectors between stages are `vec4`s at location n; a fragment
 input's interpolation comes from the SPH's input map (two bits per
-component: constant, perspective, screen-linear), centroid from IPA.
+component: constant, perspective, screen-linear), centroid from IPA. A
+vector whose used components the map interpolates in more than one way
+is declared as one scalar input per component (Location and Component),
+each with its own interpolation. IPA hands a perspective input (or one
+the map leaves unused) over as the hardware does, multiplied by 1/w
+(Vulkan's FragCoord.w): the hardware interpolates attr/w and the program
+divides by a[0x7c] itself (IPA a[0x7c], MUFU.RCP, FMUL), as NAK on SM70+
+and yuzu read it; without it every perspective attribute of a 3D draw
+came out multiplied by w. The position output (vertex and mesh programs)
+is decorated Invariant, and every guest FMUL and FADD is NoContraction
+(FFMA fused): the same guest position math in two programs, a depth
+prepass and its lit pass, gives the same depth, as on the console.
+A compute program's constant bank 0 starts with the dispatch's workgroup
+counts (x, y, z at bytes 0, 4 and 8), which the runtime writes; each
+stage's storage buffer table follows at its own base (see task and mesh
+programs below).
 Vertex inputs are fetched by the program from its vertex buffers through
 the page table, by the draw's fetch table (`VertexFetch` at push constant
 80, one `VertexAttribute` per location: address, stride, divisor, format
