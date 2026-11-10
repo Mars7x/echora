@@ -4587,7 +4587,7 @@ mod fit_tests {
 
 /// The unsigned word format with `format`'s texel size, which a storage
 /// image of it can be viewed as (None: no such size, or compressed).
-pub(crate) fn uint_alias(format: vk::Format) -> Option<vk::Format> {
+pub fn uint_alias(format: vk::Format) -> Option<vk::Format> {
     use vk::Format as F;
     let bytes = match format {
         F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT => 1,

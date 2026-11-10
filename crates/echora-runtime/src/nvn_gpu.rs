@@ -3206,6 +3206,9 @@ impl Nvn {
         let mut uniforms = HashMap::new();
         let mut textures = HashMap::new();
         let mut images = HashMap::new();
+        // The view formats images are written through (see
+        // `Dispatch::image_formats`).
+        let mut image_formats = HashMap::new();
         for descriptor in &stage.descriptors {
             let entry = descriptor.cbuf_offset as usize;
             match descriptor.kind() {
@@ -3417,6 +3420,12 @@ impl Nvn {
                         0
                     };
                     images.insert(descriptor.binding, (texture, level));
+                    if let Some(view) = self
+                        .handle_view_format(handle)
+                        .filter(|view| echora_gpu::renderer::uint_alias(format) == Some(*view))
+                    {
+                        image_formats.insert(descriptor.binding, view);
+                    }
                 }
                 DescriptorKind::UniformBuffer if descriptor.index >= 3 => {
                     let slot = descriptor.index - 3;
@@ -3581,10 +3590,12 @@ impl Nvn {
                 other => return Err(format!("compute spec constant {other:?}")),
             };
             let format = match images.get(&binding) {
-                Some((texture, _)) => backend
-                    .renderer
-                    .existing_target(*texture)
-                    .map(|target| target.format),
+                Some((texture, _)) => image_formats.get(&binding).copied().or_else(|| {
+                    backend
+                        .renderer
+                        .existing_target(*texture)
+                        .map(|target| target.format)
+                }),
                 None => textures
                     .get(&binding)
                     .and_then(|(source, _)| backend.renderer.source_format(source)),
@@ -3718,6 +3729,7 @@ impl Nvn {
             storage_in_place,
             textures,
             images,
+            image_formats,
             indirect,
             page_table,
             pool,

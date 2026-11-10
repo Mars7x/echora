@@ -27,6 +27,10 @@ pub struct Dispatch<'a> {
     pub textures: HashMap<u32, (TextureSource, Sampler)>,
     /// Storage images by binding: the render target each binding writes.
     pub images: HashMap<u32, (u64, u32)>,
+    /// The format of the NVN texture view an image binding writes through,
+    /// when it is the target's unsigned word alias (`uint_alias`) (a program packing
+    /// RGB9E5 or R11G11B10 itself stores words through an R32UI view).
+    pub image_formats: HashMap<u32, vk::Format>,
     /// Indirect: the group counts are three u32 in this buffer at this
     /// offset, read by the GPU when the dispatch runs (after every write
     /// recorded before it); `groups` is then unused.
@@ -117,7 +121,8 @@ impl Renderer {
                     .existing_target(key)
                     .ok_or("compute image is not a target")?
                     .format;
-                let declared = crate::renderer::declared_image_format(descriptor.flags);
+                let declared = crate::renderer::declared_image_format(descriptor.flags)
+                    .or_else(|| dispatch.image_formats.get(&binding).copied());
                 let view_format = self.storage_view_format(format, declared).ok_or_else(|| {
                     format!(
                         "storage image format {format:?} (declared {declared:?}) is not supported"
@@ -413,6 +418,7 @@ mod tests {
             storage_in_place: HashMap::new(),
             textures: HashMap::new(),
             images: HashMap::new(),
+            image_formats: HashMap::new(),
             indirect: None,
             page_table: Default::default(),
             pool: Vec::new(),
