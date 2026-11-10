@@ -405,6 +405,10 @@ enum Known {
     PoolIndex(u32),
     PoolInside(u32),
     PoolSampler(u32),
+    /// A lane's index into the matrix scratch (`matrix::MatrixLane`).
+    MatrixLane(u8),
+    /// A value (the second) reinterpreted as a type (the first).
+    Bitcast(u32, u32),
 }
 
 /// SPIR-V types and the module-level objects the program uses.
@@ -619,6 +623,16 @@ impl Emitter {
     }
 
     fn value(&mut self, opcode: u16, ty: u32, operands: &[u32]) -> u32 {
+        // A value reinterpreted once serves wherever it reaches.
+        if let (op::BITCAST, &[source]) = (opcode, operands) {
+            let key = Known::Bitcast(ty, source);
+            if let Some(value) = self.known(key) {
+                return value;
+            }
+            let value = self.function.value(&mut self.module, opcode, ty, operands);
+            self.remember(key, value);
+            return value;
+        }
         self.function.value(&mut self.module, opcode, ty, operands)
     }
 
@@ -904,6 +918,8 @@ impl Emitter {
 
     fn write_float(&mut self, d: u8, value: u32) {
         let bits = self.value(op::BITCAST, self.u32, &[value]);
+        // Read back as a float, the bits are `value` again.
+        self.remember(Known::Bitcast(self.f32, bits), value);
         self.write_register(d, bits);
     }
 
