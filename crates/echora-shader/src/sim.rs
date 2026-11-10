@@ -36,6 +36,8 @@ const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
+/// OpCopyObject (inlined calls deliver their results with it).
+const COPY_OBJECT: u16 = 83;
 const DECORATION_COMPONENT: u32 = 31;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
@@ -775,12 +777,12 @@ impl Machine {
                 }
             }
         }
-        // Calls of functions without parameters (a task or mesh program's
-        // body) run inline: the callee's instructions in place of the call,
-        // each return a branch to a label after them.
+        // Calls run inline: the callee's instructions in place of the call
+        // (its labels renamed per copy, its parameters replaced by the
+        // arguments), each return a branch to a label after them (a
+        // returned value copied into the call's result first).
         let callees: HashMap<u32, Vec<Instruction>> = functions
             .iter()
-            .filter(|(_, body)| body.iter().all(|i| i.opcode != op::FUNCTION_PARAMETER))
             .map(|(id, body)| (*id, body.clone()))
             .collect();
         let (_, mut body) = functions
@@ -801,19 +803,51 @@ impl Machine {
                     inlined.push(instruction);
                     continue;
                 };
+                let (result_type, result) = (instruction.operands[0], instruction.operands[1]);
+                let arguments = &instruction.operands[3..];
                 let after = next_label;
                 next_label -= 1;
+                // This copy's names: its labels fresh, its parameters the
+                // arguments.
+                let mut names: HashMap<u32, u32> = HashMap::new();
+                let mut parameter = 0;
                 for inner in callee {
-                    if inner.opcode == op::RETURN {
-                        inlined.push(Instruction {
+                    match inner.opcode {
+                        op::LABEL => {
+                            names.insert(inner.operands[0], next_label);
+                            next_label -= 1;
+                        }
+                        op::FUNCTION_PARAMETER => {
+                            names.insert(inner.operands[1], arguments[parameter]);
+                            parameter += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let rename = |id: u32| names.get(&id).copied().unwrap_or(id);
+                for inner in callee {
+                    let operands: Vec<u32> = match inner.opcode {
+                        op::FUNCTION_PARAMETER => continue,
+                        // Labels and ids: every operand renamed (labels and
+                        // parameters are ids no literal here takes).
+                        _ => inner.operands.iter().map(|&o| rename(o)).collect(),
+                    };
+                    match inner.opcode {
+                        op::RETURN => inlined.push(Instruction {
                             opcode: op::BRANCH,
                             operands: vec![after],
-                        });
-                    } else {
-                        inlined.push(Instruction {
-                            opcode: inner.opcode,
-                            operands: inner.operands.clone(),
-                        });
+                        }),
+                        op::RETURN_VALUE => {
+                            inlined.push(Instruction {
+                                opcode: COPY_OBJECT,
+                                operands: vec![result_type, result, operands[0]],
+                            });
+                            inlined.push(Instruction {
+                                opcode: op::BRANCH,
+                                operands: vec![after],
+                            });
+                        }
+                        opcode => inlined.push(Instruction { opcode, operands }),
                     }
                 }
                 inlined.push(Instruction {
@@ -2130,7 +2164,7 @@ impl Machine {
                         Pointer::Physical { .. } => vec![0, 0],
                     }
                 }
-                op::SAMPLED_IMAGE | op::IMAGE => value(0),
+                op::SAMPLED_IMAGE | op::IMAGE | COPY_OBJECT => value(0),
                 op::IMAGE_SAMPLE_IMPLICIT_LOD
                 | op::IMAGE_SAMPLE_EXPLICIT_LOD
                 | op::IMAGE_FETCH
@@ -2459,6 +2493,10 @@ impl Machine {
                 op::I_ADD => x(0).wrapping_add(x(1)) & mask,
                 op::I_SUB => x(0).wrapping_sub(x(1)) & mask,
                 op::I_MUL => x(0).wrapping_mul(x(1)) & mask,
+                op::U_DIV => {
+                    assert!(x(1) != 0, "UDiv by zero (undefined)");
+                    x(0) / x(1)
+                }
                 op::S_NEGATE => x(0).wrapping_neg() & mask,
                 op::BITWISE_AND => x(0) & x(1),
                 op::BITWISE_OR => x(0) | x(1),
@@ -5695,6 +5733,200 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vertex_pulling_decodes_every_format_as_the_abi_defines() {
+        use echora_shader_abi::{
+            PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET, PUSH_VERTEX_FETCH_OFFSET, Stage, VertexAttribute,
+            VertexFormat, VertexLayout as L, VertexNumeric as N,
+        };
+        // ALD R0..R3, a[0x80]: location 0's four words.
+        let ald = word(&[
+            (0, 12, 0x321),
+            (16, 8, 0),
+            (24, 8, 255),
+            (32, 8, 255),
+            (40, 10, 0x80),
+            (74, 2, 3),
+        ]);
+        let code: Vec<_> = [ald, EXIT].iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            stage: Stage::Vertex,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        let machine = Machine::new(&translated.spirv);
+        // Guest page 0x10 (vertex data) at device 0x3000_0000; the page
+        // table at 0x2000_0000; the attribute table at 0x4000_0000.
+        let (page_table, page, table) = (0x2000_0000u64, 0x3000_0000u64, 0x4000_0000u64);
+        let guest = 0x10u64 << PAGE_SHIFT;
+        let data: Vec<u8> = (0..4096u32)
+            .map(|n| (n.wrapping_mul(0x9e) ^ n >> 3) as u8)
+            .collect();
+        let stride = 24u32;
+        let vertex = 5u32;
+        // The CPU decode of the ABI's rules.
+        let element = &data[(vertex * stride) as usize..];
+        let word_at = |at: usize| u32::from_le_bytes(element[at..at + 4].try_into().unwrap());
+        let half = |bits: u32| f16_to_f32(bits as u16);
+        let small = |raw: u32, mantissa: u32| -> f32 {
+            let (e, m) = (raw >> mantissa, raw & ((1 << mantissa) - 1));
+            match e {
+                0 => m as f32 * 2f32.powi(-14 - mantissa as i32),
+                31 => f32::from_bits(0x7f80_0000 | m << (23 - mantissa)),
+                _ => f32::from_bits((e + 112) << 23 | m << (23 - mantissa)),
+            }
+        };
+        let expected = |format: VertexFormat| -> [u32; 4] {
+            let integer = format.integer();
+            let mut out = [0, 0, 0, if integer { 1 } else { 1.0f32.to_bits() }];
+            for c in 0..format.components as usize {
+                let (raw, bits) = match format.layout {
+                    L::Bits8 => (u32::from(element[c]), 8),
+                    L::Bits16 => (
+                        u32::from(u16::from_le_bytes([element[2 * c], element[2 * c + 1]])),
+                        16,
+                    ),
+                    L::Bits32 => (word_at(4 * c), 32),
+                    L::Packed1010102 => {
+                        let (shift, bits) = [(0, 10), (10, 10), (20, 10), (30, 2)][c];
+                        (word_at(0) >> shift & ((1u64 << bits) - 1) as u32, bits)
+                    }
+                    L::Packed111110 => {
+                        let (shift, bits) = [(0, 11), (11, 11), (22, 10), (0, 0)][c];
+                        (word_at(0) >> shift & ((1u32 << bits) - 1), bits)
+                    }
+                };
+                let signed = if bits == 32 {
+                    raw as i32
+                } else {
+                    ((raw << (32 - bits)) as i32) >> (32 - bits)
+                };
+                let largest = |b: u32| ((1u64 << b) - 1) as f32;
+                out[c] = match (format.layout, format.numeric) {
+                    (L::Packed111110, _) => small(raw, bits - 5).to_bits(),
+                    (_, N::Unorm) => (raw as f32 / largest(bits)).to_bits(),
+                    (_, N::Snorm) => (signed as f32 / largest(bits - 1)).max(-1.0).to_bits(),
+                    (_, N::Uint) => raw,
+                    (_, N::Sint) => signed as u32,
+                    (_, N::Uscaled) => (raw as f32).to_bits(),
+                    (_, N::Sscaled) => (signed as f32).to_bits(),
+                    (L::Bits16, N::Float) => half(raw).to_bits(),
+                    (_, N::Float) => raw,
+                };
+            }
+            if format.bgra {
+                out.swap(0, 2);
+            }
+            out
+        };
+        let formats = [
+            (L::Bits8, N::Unorm, 4, false),
+            (L::Bits8, N::Unorm, 4, true),
+            (L::Bits8, N::Snorm, 3, false),
+            (L::Bits8, N::Uint, 2, false),
+            (L::Bits8, N::Sint, 4, false),
+            (L::Bits8, N::Uscaled, 2, false),
+            (L::Bits8, N::Sscaled, 3, false),
+            (L::Bits16, N::Unorm, 2, false),
+            (L::Bits16, N::Snorm, 4, false),
+            (L::Bits16, N::Float, 4, false),
+            (L::Bits16, N::Float, 3, false),
+            (L::Bits16, N::Sint, 2, false),
+            (L::Bits16, N::Uscaled, 4, false),
+            (L::Bits32, N::Float, 3, false),
+            (L::Bits32, N::Float, 1, false),
+            (L::Bits32, N::Uint, 4, false),
+            (L::Bits32, N::Sint, 2, false),
+            (L::Packed1010102, N::Unorm, 4, false),
+            (L::Packed1010102, N::Snorm, 4, false),
+            (L::Packed1010102, N::Uint, 4, true),
+            (L::Packed111110, N::Float, 3, false),
+        ];
+        for (layout, numeric, components, bgra) in formats {
+            let format = VertexFormat {
+                components,
+                layout,
+                numeric,
+                bgra,
+            };
+            let attribute = VertexAttribute {
+                address: guest,
+                stride,
+                divisor: 0,
+                format: format.encode(),
+                size: 4096,
+                reserved: [0; 2],
+            };
+            let mut push = vec![0u8; 128];
+            let at = PUSH_VERTEX_FETCH_OFFSET as usize;
+            push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+            push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+            let at = PUSH_PAGE_TABLE_OFFSET as usize;
+            push[at..at + 8].copy_from_slice(&page_table.to_le_bytes());
+            push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
+            push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+            let report = machine.simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                push,
+                builtins: HashMap::from([(42, vec![u64::from(vertex)]), (43, vec![0])]),
+                memory: BTreeMap::from([
+                    (page_table, page.to_le_bytes().to_vec()),
+                    (page, data.clone()),
+                    (table, attribute.to_bytes().to_vec()),
+                ]),
+                ..Inputs::default()
+            });
+            assert!(
+                report.problems.is_empty(),
+                "{format:?}: {:?}",
+                report.problems
+            );
+            let got: Vec<u32> = (0..4u8)
+                .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                .collect();
+            assert_eq!(got, expected(format), "{format:?}");
+        }
+        // Per instance: base 2, InstanceIndex 7, divisor 3: element 3 (a
+        // 32-bit uint, the first word of element 3).
+        let format = VertexFormat {
+            components: 1,
+            layout: L::Bits32,
+            numeric: N::Uint,
+            bgra: false,
+        };
+        let attribute = VertexAttribute {
+            address: guest,
+            stride,
+            divisor: 3,
+            format: format.encode(),
+            size: 4096,
+            reserved: [0; 2],
+        };
+        let mut push = vec![0u8; 128];
+        let at = PUSH_VERTEX_FETCH_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&2u32.to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+        let at = PUSH_PAGE_TABLE_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&page_table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            builtins: HashMap::from([(42, vec![9]), (43, vec![7])]),
+            memory: BTreeMap::from([
+                (page_table, page.to_le_bytes().to_vec()),
+                (page, data.clone()),
+                (table, attribute.to_bytes().to_vec()),
+            ]),
+            ..Inputs::default()
+        });
+        let at = (3 * stride) as usize;
+        let expected = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        assert_eq!(report.invocations[0][&registers[&0]][0] as u32, expected);
     }
 
     #[test]
