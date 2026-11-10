@@ -179,6 +179,11 @@ pub enum SpecMeaning {
     GenericInputType(u8),
     /// The sampled texture or image at descriptor `binding` is integer.
     IntegerFormat(u32),
+    /// The entries the texture pool's arrays (set `TEXTURE_POOL_SET`)
+    /// hold: a handle whose texture index is this or more reads as an
+    /// unwritten entry (zeros), without indexing past the arrays. Its
+    /// default is `TEXTURE_INDEX_MASK + 1`, every index a handle carries.
+    TexturePoolCapacity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +317,8 @@ pub struct PageTable {
 /// depth-compare reads need no other binding. Integer textures are read
 /// from the `UINT_*` arrays (a uint view of the same entry).
 pub const TEXTURE_POOL_SET: u32 = 1;
+/// The specialization constant id of `SpecMeaning::TexturePoolCapacity`.
+pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 

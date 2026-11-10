@@ -4,8 +4,8 @@
 //! `cbuf_offset`), so a translation holds no texture state.
 
 use echora_shader_abi::{
-    Descriptor, SAMPLER_INDEX_SHIFT, TEXTURE_INDEX_MASK, TEXTURE_POOL_SET, Unsupported,
-    texture_pool,
+    Descriptor, SAMPLER_INDEX_SHIFT, TEXTURE_INDEX_MASK, TEXTURE_POOL_CAPACITY_SPEC_ID,
+    TEXTURE_POOL_SET, Unsupported, texture_pool,
 };
 
 use super::{Emitter, unsupported};
@@ -13,6 +13,9 @@ use crate::decode::{Texture, TextureOp};
 use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 
 /// SPIR-V image operand bits.
+/// SPIR-V's SpecId decoration.
+const DECORATION_SPEC_ID: u32 = 1;
+
 const OPERAND_BIAS: u32 = 0x1;
 const OPERAND_LOD: u32 = 0x2;
 const OPERAND_GRAD: u32 = 0x4;
@@ -157,6 +160,16 @@ impl Emitter {
             self.constant(SAMPLER_INDEX_SHIFT),
         );
         let texture_index = self.value(op::BITWISE_AND, self.u32, &[handle, mask]);
+        // An index past the pool's arrays reads as an unwritten entry: the
+        // access uses entry 0 and the results become zeros.
+        let capacity = self.pool_capacity();
+        let inside = self.value(op::U_LESS_THAN, self.bool, &[texture_index, capacity]);
+        let zero = self.constant(0);
+        let texture_index = self.value(op::SELECT, self.u32, &[inside, texture_index, zero]);
+        self.pool_inside = Some(match self.pool_inside {
+            Some(before) => self.value(op::LOGICAL_AND, self.bool, &[before, inside]),
+            None => inside,
+        });
         let sampler_index = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[handle, shift]);
         let image = self.pool_entry(binding, types.image, texture_index, uniform);
         let sampler_type = self.module.ty(Type::Sampler);
@@ -166,6 +179,26 @@ impl Emitter {
             self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
         }
         Ok((sampled, types))
+    }
+
+    /// The texture pool's capacity, a specialization constant
+    /// (`SpecMeaning::TexturePoolCapacity`).
+    fn pool_capacity(&mut self) -> u32 {
+        if let Some(capacity) = self.pool_capacity {
+            return capacity;
+        }
+        let capacity = self.module.u32_spec_constant(TEXTURE_INDEX_MASK + 1);
+        self.module.decorate(
+            capacity,
+            DECORATION_SPEC_ID,
+            &[TEXTURE_POOL_CAPACITY_SPEC_ID],
+        );
+        self.spec_constants.push(echora_shader_abi::SpecConstant {
+            id: TEXTURE_POOL_CAPACITY_SPEC_ID,
+            meaning: echora_shader_abi::SpecMeaning::TexturePoolCapacity,
+        });
+        self.pool_capacity = Some(capacity);
+        capacity
     }
 
     /// Entry `index` of texture-pool binding `binding` (an unsized array of
@@ -274,6 +307,7 @@ impl Emitter {
         if texture.mask == 0 {
             return Ok(());
         }
+        self.pool_inside = None;
         if texture.handle.is_none()
             && !texture.handle_value
             && usize::from(texture.bank) >= self.cbuf_used_sizes.len()
@@ -285,6 +319,17 @@ impl Emitter {
             TextureOp::LevelQuery => self.texture_level_query(index, texture, &view)?,
             TextureOp::Gradient => self.texture_gradient(index, texture, &view)?,
             _ => self.texture_read(index, texture, &view)?,
+        };
+        // A handle past the texture pool reads zeros.
+        let results = match self.pool_inside.take() {
+            Some(inside) => {
+                let zero = self.constant(0);
+                results
+                    .iter()
+                    .map(|&value| self.value(op::SELECT, self.u32, &[inside, value, zero]))
+                    .collect()
+            }
+            None => results,
         };
         // The written components, in mask order.
         let components: Vec<u32> = (0..4)

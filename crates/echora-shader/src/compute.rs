@@ -399,6 +399,12 @@ struct Emitter {
     /// Texture pool arrays by binding, and the bindings used (bit n).
     pool_arrays: BTreeMap<u32, u32>,
     pool_bindings: u32,
+    /// The texture pool's capacity (a specialization constant), once
+    /// declared.
+    pool_capacity: Option<u32>,
+    /// Whether the texture-pool handles the current texture instruction
+    /// uses are within the pool (its results are zeros where not).
+    pool_inside: Option<u32>,
     /// Storage images by handle bank, offset and dimension.
     images: BTreeMap<(u8, u16, u8), image::ImageViews>,
     /// R32_UINT image descriptors for SURED (by handle and dimension).
@@ -478,6 +484,8 @@ impl Emitter {
             matrices_used: false,
             pool_arrays: BTreeMap::new(),
             pool_bindings: 0,
+            pool_capacity: None,
+            pool_inside: None,
             descriptor_aliases: Vec::new(),
             image_spec_ids: Vec::new(),
             spec_constants: Vec::new(),
@@ -4018,6 +4026,19 @@ mod tests {
         assert_eq!(
             computed.texture_pool_bindings,
             1 << SAMPLERS | 1 << SAMPLED_2D
+        );
+        // The pool's capacity is a specialization constant.
+        let constants: Vec<_> = computed
+            .spec_constants
+            .iter()
+            .map(|constant| (constant.id, constant.meaning))
+            .collect();
+        assert_eq!(
+            constants,
+            [(
+                echora_shader_abi::TEXTURE_POOL_CAPACITY_SPEC_ID,
+                echora_shader_abi::SpecMeaning::TexturePoolCapacity
+            )]
         );
     }
 

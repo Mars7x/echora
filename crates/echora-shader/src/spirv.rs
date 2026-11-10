@@ -34,6 +34,7 @@ pub mod op {
     pub const CONSTANT: u16 = 43;
     pub const CONSTANT_COMPOSITE: u16 = 44;
     pub const SPEC_CONSTANT_FALSE: u16 = 49;
+    pub const SPEC_CONSTANT: u16 = 50;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
@@ -611,6 +612,15 @@ impl Module {
     pub fn u32_constant(&mut self, value: u32) -> u32 {
         let ty = self.u32();
         self.constant(ty, value)
+    }
+
+    /// A u32 specialization constant, `value` by default; the caller
+    /// decorates it with its SpecId.
+    pub fn u32_spec_constant(&mut self, value: u32) -> u32 {
+        let ty = self.u32();
+        let id = self.id();
+        instruction(&mut self.globals, op::SPEC_CONSTANT, &[ty, id, value]);
+        id
     }
 
     /// A boolean specialization constant (false by default); the caller
