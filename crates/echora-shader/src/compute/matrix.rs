@@ -566,27 +566,40 @@ impl Emitter {
                 base.saturating_add(n)
             }
         };
+        // A pair of HMMAs sharing A (see `pairs`) shares A's shuffles.
+        if self.hmma_pairs.seconds.contains(&index) {
+            return Ok(());
+        }
+        let mut halves = vec![(d, b, c)];
+        halves.extend(self.hmma_pairs.firsts.get(&index).copied());
         let a_registers: Vec<u32> = (0..if k16 { 4 } else { 2 })
             .map(|n| self.register_or_zero(next(a, n)))
             .collect();
-        let b_registers: Vec<u32> = (0..if k16 { 2 } else { 1 })
-            .map(|n| self.register_or_zero(next(b, n)))
-            .collect();
-        // The accumulator: rows g, g + 8; columns 2t, 2t + 1.
-        let mut accumulator: Vec<u32> = if single {
-            (0..4)
-                .map(|n| {
-                    let bits = self.register_or_zero(next(c, n));
-                    self.value(op::BITCAST, self.f32, &[bits])
-                })
-                .collect()
-        } else {
-            let low = self.register_or_zero(c);
-            let high = self.register_or_zero(next(c, 1));
-            let [c0, c1] = self.halves(low);
-            let [c2, c3] = self.halves(high);
-            vec![c0, c1, c2, c3]
-        };
+        // Each HMMA's B registers and accumulator: rows g, g + 8; columns
+        // 2t, 2t + 1 (all read before any result is written).
+        let mut b_registers: Vec<Vec<u32>> = Vec::new();
+        let mut accumulators: Vec<Vec<u32>> = Vec::new();
+        for &(_, b, c) in &halves {
+            b_registers.push(
+                (0..if k16 { 2 } else { 1 })
+                    .map(|n| self.register_or_zero(next(b, n)))
+                    .collect(),
+            );
+            accumulators.push(if single {
+                (0..4)
+                    .map(|n| {
+                        let bits = self.register_or_zero(next(c, n));
+                        self.value(op::BITCAST, self.f32, &[bits])
+                    })
+                    .collect()
+            } else {
+                let low = self.register_or_zero(c);
+                let high = self.register_or_zero(next(c, 1));
+                let [c0, c1] = self.halves(low);
+                let [c2, c3] = self.halves(high);
+                vec![c0, c1, c2, c3]
+            });
+        }
         let lane = self.special_register(index, 0)?;
         let (two, three) = (self.constant(2), self.constant(3));
         let group = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
@@ -606,7 +619,7 @@ impl Emitter {
         };
         // Each output's products, in k order (for the exact sums).
         let exact = self.layout.matrices == super::MatrixPath::Exact;
-        let mut products: [Vec<u32>; 4] = Default::default();
+        let mut products: Vec<[Vec<u32>; 4]> = vec![Default::default(); halves.len()];
         for pair in 0..if k16 { 8u32 } else { 4 } {
             // k = 8 * upper + 2 * source + h, h the half.
             let (source, upper) = (pair % 4, (pair / 4) as usize);
@@ -614,57 +627,62 @@ impl Emitter {
             let from_quad = self.value(op::I_ADD, self.u32, &[quad, source]);
             let row_low = shuffle(self, a_registers[2 * upper], from_quad);
             let row_high = shuffle(self, a_registers[2 * upper + 1], from_quad);
-            let first = self.value(op::I_ADD, self.u32, &[column_quad, source]);
-            let column_0 = shuffle(self, b_registers[upper], first);
-            let second = self.value(op::I_ADD, self.u32, &[first, four]);
-            let column_1 = shuffle(self, b_registers[upper], second);
             let [a_g0, a_g1] = self.halves(row_low);
             let [a_h0, a_h1] = self.halves(row_high);
-            let [b00, b01] = self.halves(column_0);
-            let [b10, b11] = self.halves(column_1);
-            // Each output sums its two products of this pair, in k order.
-            let terms = [
-                (0, a_g0, b00, a_g1, b01),
-                (1, a_g0, b10, a_g1, b11),
-                (2, a_h0, b00, a_h1, b01),
-                (3, a_h0, b10, a_h1, b11),
-            ];
-            for (output, x0, y0, x1, y1) in terms {
-                for (x, y) in [(x0, y0), (x1, y1)] {
-                    if exact {
-                        let product = self.exact(op::F_MUL, &[x, y]);
-                        products[output].push(product);
-                    } else {
-                        // A product of two halves is exact in 32 bits, so a
-                        // fused multiply-add rounds as the add after it would
-                        // (fused or not, the result is the same).
-                        accumulator[output] =
-                            self.glsl(self.f32, glsl::FMA, &[x, y, accumulator[output]]);
+            let first = self.value(op::I_ADD, self.u32, &[column_quad, source]);
+            let second = self.value(op::I_ADD, self.u32, &[first, four]);
+            for (n, b_registers) in b_registers.iter().enumerate() {
+                let column_0 = shuffle(self, b_registers[upper], first);
+                let column_1 = shuffle(self, b_registers[upper], second);
+                let [b00, b01] = self.halves(column_0);
+                let [b10, b11] = self.halves(column_1);
+                // Each output sums its two products of this pair, in k order.
+                let terms = [
+                    (0, a_g0, b00, a_g1, b01),
+                    (1, a_g0, b10, a_g1, b11),
+                    (2, a_h0, b00, a_h1, b01),
+                    (3, a_h0, b10, a_h1, b11),
+                ];
+                for (output, x0, y0, x1, y1) in terms {
+                    for (x, y) in [(x0, y0), (x1, y1)] {
+                        if exact {
+                            let product = self.exact(op::F_MUL, &[x, y]);
+                            products[n][output].push(product);
+                        } else {
+                            // A product of two halves is exact in 32 bits,
+                            // so a fused multiply-add rounds as the add after
+                            // it would (fused or not, the result is the same).
+                            accumulators[n][output] =
+                                self.glsl(self.f32, glsl::FMA, &[x, y, accumulators[n][output]]);
+                        }
                     }
                 }
             }
         }
-        if exact {
-            for (output, products) in products.iter().enumerate() {
-                let blocks: Vec<&[u32]> = products.chunks(8).collect();
-                for (n, block) in blocks.iter().enumerate() {
-                    let odd = !single && n + 1 == blocks.len();
-                    accumulator[output] = self.block_sum(accumulator[output], block, odd);
+        for (n, &(d, _, _)) in halves.iter().enumerate() {
+            let mut accumulator = accumulators[n].clone();
+            if exact {
+                for (output, products) in products[n].iter().enumerate() {
+                    let blocks: Vec<&[u32]> = products.chunks(8).collect();
+                    for (m, block) in blocks.iter().enumerate() {
+                        let odd = !single && m + 1 == blocks.len();
+                        accumulator[output] = self.block_sum(accumulator[output], block, odd);
+                    }
                 }
             }
-        }
-        if d == 255 {
-            return Ok(());
-        }
-        if single {
-            for (n, value) in accumulator.into_iter().enumerate() {
-                self.write_float(d.saturating_add(n as u8), value);
+            if d == 255 {
+                continue;
             }
-        } else {
-            let low = self.pack([accumulator[0], accumulator[1]]);
-            let high = self.pack([accumulator[2], accumulator[3]]);
-            self.write_register(d, low);
-            self.write_register(d.saturating_add(1), high);
+            if single {
+                for (m, value) in accumulator.into_iter().enumerate() {
+                    self.write_float(d.saturating_add(m as u8), value);
+                }
+            } else {
+                let low = self.pack([accumulator[0], accumulator[1]]);
+                let high = self.pack([accumulator[2], accumulator[3]]);
+                self.write_register(d, low);
+                self.write_register(d.saturating_add(1), high);
+            }
         }
         Ok(())
     }

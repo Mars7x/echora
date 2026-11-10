@@ -224,9 +224,7 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     }
     let blocks = blocks(code)?;
     let mut emitter = Emitter::new(layout);
-    if layout.matrices == MatrixPath::Cooperative {
-        emitter.hmma_pairs = matrix::pairs(code, &blocks);
-    }
+    emitter.hmma_pairs = matrix::pairs(code, &blocks);
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     // Structured control flow where the graph allows, else the dispatch

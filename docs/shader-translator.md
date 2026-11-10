@@ -225,7 +225,10 @@ papers do not settle the sign-magnitude truncation, the chaining of the
 two blocks of HMMA.16816 through a 32-bit value, the results past the
 32-bit range (the largest finite value) and below it (truncated
 subnormals), or blocks with an infinity or NaN (their plain sum); these
-are inferred, and none of it has been compared with hardware results.
+are inferred, and none of it has been compared with hardware results. On the subgroup path such a pair shares A's
+shuffles, and each product is summed with a fused multiply-add: a product
+of two halves is exact in 32 bits, so it rounds exactly as the add after
+a multiply would.
 
 **Dispatch loop reconvergence.** A program the structurizer cannot
 handle runs as one loop over a switch on the next block; each time round
