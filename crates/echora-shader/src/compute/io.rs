@@ -27,7 +27,6 @@ const BUILTIN_SAMPLE_MASK: u32 = 20;
 const BUILTIN_FRAG_DEPTH: u32 = 22;
 const BUILTIN_VERTEX_INDEX: u32 = 42;
 const BUILTIN_INSTANCE_INDEX: u32 = 43;
-const BUILTIN_BASE_VERTEX: u32 = 4424;
 const BUILTIN_BASE_INSTANCE: u32 = 4425;
 
 /// Decorations.
@@ -232,21 +231,15 @@ impl Emitter {
                 let value = self.value(op::LOAD, self.f32, &[pointer]);
                 self.value(op::BITCAST, self.u32, &[value])
             }
-            (Stage::Vertex, 0x2f8 | 0x2fc) => {
-                // The guest's ids exclude the draw's base.
+            // The hardware's vertex id includes the draw's base vertex (GL's
+            // gl_VertexID; NAK maps NIR's vertex_id to a[0x2fc] unlowered,
+            // yuzu reads Vulkan's VertexIndex), its instance id excludes
+            // the base instance (NAK's instance_id; yuzu subtracts it).
+            (Stage::Vertex, 0x2fc) => self.scalar_builtin(BUILTIN_VERTEX_INDEX),
+            (Stage::Vertex, 0x2f8) => {
                 self.module.capability(capability::DRAW_PARAMETERS);
-                let (index_builtin, base_builtin) = if address == 0x2f8 {
-                    (BUILTIN_INSTANCE_INDEX, BUILTIN_BASE_INSTANCE)
-                } else {
-                    (BUILTIN_VERTEX_INDEX, BUILTIN_BASE_VERTEX)
-                };
-                let id = self.scalar_builtin(index_builtin);
-                // ECHORA_VERTEX_ID_WITH_BASE (debugging, to settle which the
-                // hardware gives): the vertex id keeps the base vertex.
-                if address == 0x2fc && std::env::var_os("ECHORA_VERTEX_ID_WITH_BASE").is_some() {
-                    return Ok(id);
-                }
-                let base = self.scalar_builtin(base_builtin);
+                let id = self.scalar_builtin(BUILTIN_INSTANCE_INDEX);
+                let base = self.scalar_builtin(BUILTIN_BASE_INSTANCE);
                 self.value(op::I_SUB, self.u32, &[id, base])
             }
             (Stage::Fragment, 0x3fc) => {

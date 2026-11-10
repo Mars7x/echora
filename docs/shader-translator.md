@@ -127,7 +127,9 @@ the stage at 10-13) and the code. ALD, AST and IPA address the attribute
 space: 0x6c point size, 0x70-0x7c position (the fragment coordinate in a
 fragment program, scaled back to the guest's resolution by the push
 constants' inverse resolution scale), 0x80 + 16n generic vector n,
-0x2f8 and 0x2fc the instance and vertex ids (without the draw's base),
+0x2f8 the instance id (without the draw's base instance) and 0x2fc the
+vertex id (with the base vertex, GL's gl_VertexID, as NAK and yuzu read
+the hardware's),
 0x3fc front facing (all ones or zero); writes to 0x5c (a per-primitive
 hint) are dropped.
 Generic vectors between stages are `vec4`s at location n; a fragment

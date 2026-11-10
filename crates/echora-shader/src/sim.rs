@@ -5930,6 +5930,46 @@ mod tests {
     }
 
     #[test]
+    fn vertex_ids_include_the_base_vertex_and_instance_ids_exclude_the_base_instance() {
+        use echora_shader_abi::Stage;
+        // ALD R0, a[0x2fc] (vertex id); ALD R1, a[0x2f8] (instance id).
+        let ald = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x321),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (40, 10, address),
+            ])
+        };
+        let code: Vec<_> = [ald(0, 0x2fc), ald(1, 0x2f8), EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let layout = Layout {
+            stage: Stage::Vertex,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        // Index 10 of an indexed draw with base vertex 5494 (Vulkan's
+        // VertexIndex 5504), the first instance of base instance 3.
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            builtins: HashMap::from([
+                (42, vec![5504]),
+                (4424, vec![5494]),
+                (43, vec![3]),
+                (4425, vec![3]),
+            ]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let read = |n: u8| report.invocations[0][&registers[&n]][0] as u32;
+        assert_eq!((read(0), read(1)), (5504, 0));
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {
