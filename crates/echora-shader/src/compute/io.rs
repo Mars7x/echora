@@ -241,6 +241,11 @@ impl Emitter {
                     (BUILTIN_VERTEX_INDEX, BUILTIN_BASE_VERTEX)
                 };
                 let id = self.scalar_builtin(index_builtin);
+                // ECHORA_VERTEX_ID_WITH_BASE (debugging, to settle which the
+                // hardware gives): the vertex id keeps the base vertex.
+                if address == 0x2fc && std::env::var_os("ECHORA_VERTEX_ID_WITH_BASE").is_some() {
+                    return Ok(id);
+                }
                 let base = self.scalar_builtin(base_builtin);
                 self.value(op::I_SUB, self.u32, &[id, base])
             }
