@@ -4059,8 +4059,10 @@ impl Nvn {
                     }
                     let backend = self.gpu.as_mut().unwrap();
                     if runs.is_empty() {
+                        let known = backend.shared_pools.get(&base).map(|&(shared, ..)| shared);
                         backend.note(format!(
-                            "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped (no shared span)"
+                            "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped ({}), guest {base:#x}, recorded size {known:x?}",
+                            if recorded_span { "its recorded span did not import" } else { "no shared span" }
                         ));
                     } else {
                         backend.stat("stat: page table chunks mapped in runs", 1);
