@@ -433,11 +433,10 @@ pub struct RenderState {
     /// SetRenderEnableConditional(mode, address) (`Some((mode, address))`):
     /// draws, clears and dispatches run only while it holds (`render_enabled`).
     pub render_enable: Option<(u64, u64)>,
-    /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset:
+    /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset,
+    /// with ECHORA_OCCLUSION_ASSUME_VISIBLE (debugging, an approximation):
     /// occlusion counts are not measured, so each draw executed counts as
-    /// one that passed samples (occlusion-culled objects then draw, and
-    /// depth testing hides them as it would have). Gated draws compare two
-    /// reports of it (`render_enabled`).
+    /// one that passed samples. Without it the counter reports 0.
     pub samples_passed: u64,
     /// Root tables written by Push{Graphics,Compute}Constants: [graphics,
     /// compute] x 8 tables of 64 words (256 bytes each).
@@ -2665,8 +2664,9 @@ impl Nvn {
                     .or_default() += 1;
                 return Ok(());
             }
-            name if name.starts_with("nvnCommandBufferDraw")
-                || name.starts_with("nvnCommandBufferMultiDraw") =>
+            name if (name.starts_with("nvnCommandBufferDraw")
+                || name.starts_with("nvnCommandBufferMultiDraw"))
+                && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_some() =>
             {
                 self.render.samples_passed += 1;
             }
@@ -3061,9 +3061,9 @@ impl Nvn {
             }
             // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU
             // writes a 16-byte report, a u64 counter then a u64 GPU
-            // timestamp (NVNcounterData; layout inferred from NVN1). Only
-            // SAMPLES_PASSED is counted (`RenderState::samples_passed`),
-            // others report 0; the timestamp is the physical counter,
+            // timestamp (NVNcounterData; layout inferred from NVN1). Counts
+            // are not measured: 0, or SAMPLES_PASSED's approximation under
+            // ECHORA_OCCLUSION_ASSUME_VISIBLE; the timestamp is the physical counter,
             // the domain nvnDeviceGetCurrentTimestampInNanoseconds converts.
             "nvnCommandBufferReportCounter" => {
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() {
