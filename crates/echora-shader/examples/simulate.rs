@@ -9,7 +9,8 @@
 //! - `program.spv`: the SPIR-V (little-endian words);
 //! - `dispatch.txt`: lines `groups X Y Z` (the dispatch's workgroup counts),
 //!   optionally `subgroup N` (default 32) and `loop_limit N` (iterations
-//!   of one loop by one invocation that count as runaway, default 65536);
+//!   of one loop by one invocation that count as runaway, default 65536)
+//!   and `spec ID VALUE` (a specialization constant, else its default);
 //! - `push.bin`: the push constants' bytes;
 //! - `uniform-SET-BINDING.bin`: each bound uniform buffer's bytes;
 //! - `memory-ADDRESS.bin` (ADDRESS in hex, no 0x): device memory from that
@@ -19,7 +20,10 @@
 //!   (or 3D slices) one after another, each texel four little-endian u32:
 //!   the components as the shader reads them (float bits for float, unorm
 //!   and snorm formats, integers for integer ones; missing ones 0, 0, 0,
-//!   1). Textures and images without these read as zeros.
+//!   1). Textures and images without these read as zeros;
+//! - `image-SET-BINDING-ELEMENT.txt` and `.bin`: likewise, element ELEMENT
+//!   of an image array (a texture pool view; its flags buffer is a
+//!   `uniform-` file).
 //!
 //! Each X,Y,Z argument names a workgroup to run (default 0,0,0).
 
@@ -63,12 +67,16 @@ fn main() {
             (Some("groups"), &[x, y, z]) => inputs.workgroup_count = [x, y, z],
             (Some("subgroup"), &[size]) => inputs.subgroup_size = size,
             (Some("loop_limit"), &[limit]) => inputs.loop_limit = limit,
+            (Some("spec"), &[id, value]) => {
+                inputs.specialization.insert(id, value);
+            }
             _ => {}
         }
     }
     let mut uniforms = HashMap::new();
     let mut memory = BTreeMap::new();
     let mut images = HashMap::new();
+    let mut image_arrays = HashMap::new();
     for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = name.strip_suffix(".bin") else {
@@ -92,7 +100,7 @@ fn main() {
                 .split_whitespace()
                 .filter_map(|field| field.parse().ok())
                 .collect();
-            if let ([set, binding], [width, height, depth, layers]) = (&parts[..], &size[..]) {
+            if let [width, height, depth, layers] = size[..] {
                 let texels = read(&name)
                     .as_chunks::<16>()
                     .0
@@ -109,16 +117,22 @@ fn main() {
                         [word(0), word(1), word(2), word(3)]
                     })
                     .collect();
-                images.insert(
-                    (*set, *binding),
-                    Image {
-                        width: *width,
-                        height: *height,
-                        depth: *depth,
-                        layers: *layers,
-                        texels,
-                    },
-                );
+                let image = Image {
+                    width,
+                    height,
+                    depth,
+                    layers,
+                    texels,
+                };
+                match parts[..] {
+                    [set, binding] => {
+                        images.insert((set, binding), image);
+                    }
+                    [set, binding, element] => {
+                        image_arrays.insert((set, binding, element), image);
+                    }
+                    _ => {}
+                }
             }
         } else if let Some(Ok(address)) = stem
             .strip_prefix("memory-")
@@ -130,6 +144,7 @@ fn main() {
     inputs.uniforms = uniforms;
     inputs.memory = memory;
     inputs.images = images;
+    inputs.image_arrays = image_arrays;
     let machine = Machine::new(&words);
     let groups: Vec<[u32; 3]> = if arguments.len() > 1 {
         arguments[1..]
