@@ -3843,6 +3843,34 @@ impl Renderer {
             };
             (width, height, target.format, scaled)
         };
+        // Depth targets cannot be blitted to a color image: their depth
+        // aspect is copied as it is and read as (depth, 0, 0, 1).
+        if is_depth(format) {
+            if level != 0 || (full && scaled != (width, height)) {
+                return Err("a depth target reads back at level 0, unscaled".into());
+            }
+            let bytes = self.read_target_bytes(key, 4)?;
+            let depth = |bytes: &[u8]| match format {
+                vk::Format::D16_UNORM => {
+                    f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0
+                }
+                vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32 => {
+                    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    (word & 0xff_ffff) as f32 / 16_777_215.0
+                }
+                _ => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            };
+            let size = if format == vk::Format::D16_UNORM {
+                2
+            } else {
+                4
+            };
+            let texels = bytes
+                .chunks_exact(size)
+                .map(|texel| [depth(texel), 0.0, 0.0, 1.0])
+                .collect();
+            return Ok((texels, width, height));
+        }
         // Blit to an RGBA32F image so every color format reads back alike.
         let staging_key = u64::MAX;
         self.target(staging_key, width, height, vk::Format::R32G32B32A32_SFLOAT)?;
@@ -3936,10 +3964,16 @@ impl Renderer {
             let target = self.targets.get(&key).ok_or("no such target")?;
             (target.image, target.width, target.height, target.format)
         };
-        // Depth targets: their depth aspect (4 bytes per texel, a float
-        // for the D32 formats used here).
+        // Depth targets: their depth aspect (2 bytes per texel for D16, 4
+        // for the others: a float for the D32 formats, the depth in the
+        // low 24 bits for D24).
         let (aspect_mask, texel_bytes) = if is_depth(format) {
-            (vk::ImageAspectFlags::DEPTH, 4)
+            let bytes = if format == vk::Format::D16_UNORM {
+                2
+            } else {
+                4
+            };
+            (vk::ImageAspectFlags::DEPTH, bytes)
         } else {
             (vk::ImageAspectFlags::COLOR, texel_bytes)
         };

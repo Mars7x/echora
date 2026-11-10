@@ -3743,6 +3743,7 @@ impl Nvn {
             started.elapsed().as_micros() as u64,
         );
         self.trace_targets(&images_written, &format!("dispatch {:016x}", key.0))?;
+        self.trace_memory(core, &format!("dispatch {:016x}", key.0))?;
         let backend = self.gpu.as_mut().unwrap();
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             // Volumes a dispatch wrote, as their first slice reads back.
@@ -4453,6 +4454,58 @@ impl Nvn {
     /// each draw or dispatch that writes
     /// one of them, its level 0 read back, as its mean colour and how many
     /// texels are not finite (where a pass first leaves NaN or white).
+    /// ECHORA_MEMORY_TRACE=START-END (hex GPU addresses, debugging), from
+    /// present ECHORA_MEMORY_TRACE_FROM to ECHORA_MEMORY_TRACE_TO: after
+    /// each draw or dispatch, that range as the guest sees it (GPU writes
+    /// resolved), logged when it changed since the last look: which pass
+    /// (or the CPU, between passes) wrote a buffer. Each look waits for the
+    /// GPU, so keep the presents few.
+    fn trace_memory(&mut self, core: &mut Guest, what: &str) -> Result<(), String> {
+        let Ok(range) = super::debug_var("ECHORA_MEMORY_TRACE") else {
+            return Ok(());
+        };
+        let present = |name: &str, default: u64| {
+            super::debug_var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let (from, to) = (
+            present("ECHORA_MEMORY_TRACE_FROM", 0),
+            present("ECHORA_MEMORY_TRACE_TO", u64::MAX),
+        );
+        if !(from..=to).contains(&self.presented_frames) {
+            return Ok(());
+        }
+        let Some((start, end)) = range.split_once('-').and_then(|(start, end)| {
+            let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+            Some((parse(start)?, parse(end)?))
+        }) else {
+            return Err(format!("ECHORA_MEMORY_TRACE={range}: not START-END"));
+        };
+        self.resolve_gpu_written(core, start..end)?;
+        let bytes = self.gpu_bytes(core, start, end - start)?;
+        if self.memory_trace_last.as_ref() != Some(&bytes) {
+            let words: Vec<String> = bytes
+                .chunks_exact(4)
+                .take(16)
+                .map(|word| {
+                    format!(
+                        "{:08x}",
+                        u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+                    )
+                })
+                .collect();
+            eprintln!(
+                "memory trace present {} after {what}: {start:#x}.. now {}",
+                self.presented_frames,
+                words.join(" ")
+            );
+            self.memory_trace_last = Some(bytes);
+        }
+        Ok(())
+    }
+
     fn trace_targets(&mut self, written: &[u64], what: &str) -> Result<(), String> {
         let Ok(keys) = super::debug_var("ECHORA_TARGET_TRACE") else {
             return Ok(());
@@ -6034,7 +6087,8 @@ impl Nvn {
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: draw us setup", timings[0]);
         backend.stat("stat: draw us renderer", timings[1]);
-        self.trace_targets(&colors_written, &draw_label)
+        self.trace_targets(&colors_written, &draw_label)?;
+        self.trace_memory(core, &draw_label)
     }
 }
 

@@ -291,6 +291,9 @@ pub struct Nvn {
     /// Programs whose dispatch ECHORA_DUMP_DISPATCH wrote (debugging).
     #[serde(skip)]
     pub(super) dumped_dispatches: std::collections::HashSet<u64>,
+    /// The bytes ECHORA_MEMORY_TRACE last saw (debugging).
+    #[serde(skip)]
+    pub(super) memory_trace_last: Option<Vec<u8>>,
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
