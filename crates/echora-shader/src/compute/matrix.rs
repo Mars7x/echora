@@ -183,9 +183,6 @@ impl Emitter {
         variable
     }
 
-    /// A pointer to element `(row, column)` of matrix `which` (0 A, 1 B, 2
-    /// C) of this warp's scratch region at `base`.
-    #[allow(clippy::too_many_arguments)]
     /// Element `lane + offset` of `scratch` (of `component`s), `lane` one
     /// of `matrix_lane`'s values.
     fn scratch_element(&mut self, scratch: u32, component: u32, lane: u32, offset: u32) -> u32 {
