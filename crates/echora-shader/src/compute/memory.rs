@@ -14,7 +14,7 @@ use echora_shader_abi::{
 };
 
 use super::{Emitter, unsupported};
-use crate::decode::{Address, Pred, Space};
+use crate::decode::{Address, Pred, Reg, Space};
 use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 use echora_shader_abi::Unsupported;
 
@@ -82,6 +82,35 @@ impl Emitter {
         let semantics = self.constant(ACQUIRE_RELEASE_ALL_MEMORY);
         self.function
             .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
+    }
+
+    /// LDGSTS: four words from global memory (zeros where `enable` fails,
+    /// without reading) to shared memory, at once.
+    pub(super) fn copy_to_shared(
+        &mut self,
+        index: usize,
+        shared: u8,
+        shared_offset: i32,
+        global: u8,
+        global_offset: i32,
+        enable: Pred,
+    ) -> Result<(), Unsupported> {
+        let source = Address {
+            reg: Reg(global),
+            wide: true,
+            scale: 1,
+            uniform: None,
+            offset: global_offset,
+        };
+        let (values, _) = self.global_load(source, 4, enable, false)?;
+        let target = Address {
+            reg: Reg(shared),
+            wide: false,
+            scale: 1,
+            uniform: None,
+            offset: shared_offset,
+        };
+        self.array_store(index, Space::Shared, target, &values)
     }
 
     /// MEMBAR: a memory barrier over every kind of memory, at the

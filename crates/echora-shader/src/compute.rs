@@ -2298,7 +2298,21 @@ impl Emitter {
                 self.barrier();
             }
             Op::Membar { scope } => self.memory_barrier(scope),
-            Op::Bssy | Op::Bsync | Op::Depbar | Op::Errbar => {}
+            Op::Ldgsts {
+                shared,
+                shared_offset,
+                global,
+                global_offset,
+                enable,
+            } => self.copy_to_shared(
+                index,
+                shared.0,
+                shared_offset,
+                global.0,
+                global_offset,
+                enable,
+            )?,
+            Op::Bssy | Op::Bsync | Op::Depbar | Op::Errbar | Op::Ldgdepbar => {}
             Op::Bra { .. } | Op::Exit | Op::Brx { .. } | Op::Call { .. } | Op::Ret { .. } => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
@@ -3380,6 +3394,58 @@ mod tests {
         assert!(!code[5].uniform && !code[6].uniform);
         let translated = valid(&words);
         assert!(translated.descriptors.is_empty());
+    }
+
+    #[test]
+    fn global_to_shared_copies_validate() {
+        // LDGSTS.E.BYPASS.128 [R1+0x40], [R2.64+0x10], P0 (the first form),
+        // then with a descriptor (UR4) and !P1; LDGDEPBAR.
+        let promoted = word(&[
+            (0, 12, 0xfae),
+            (16, 8, 1),
+            (24, 8, 2),
+            (32, 12, 0x10),
+            (48, 16, 4),
+            (64, 32, 0x0810_1d40),
+        ]);
+        let described = word(&[
+            (0, 12, 0xfae),
+            (16, 8, 1),
+            (24, 8, 2),
+            (64, 32, 0x0c10_1c00 | 4 | 1 << 6 | 1 << 23),
+        ]);
+        assert!(matches!(
+            decode(promoted).op,
+            Op::Ldgsts {
+                shared_offset: 0x40,
+                global_offset: 0x10,
+                enable: Pred {
+                    index: 0,
+                    negated: false
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(described).op,
+            Op::Ldgsts {
+                enable: Pred {
+                    index: 1,
+                    negated: true
+                },
+                ..
+            }
+        ));
+        let layout = Layout {
+            shared_bytes: Some(0x1000),
+            ..Layout::workgroup([32, 1, 1])
+        };
+        valid_with(
+            &[promoted, described, word(&[(0, 12, 0x9af)]), EXIT],
+            &layout,
+        );
+        // An odd global register is refused.
+        assert!(matches!(decode(promoted | 1 << 24).op, Op::Unknown { .. }));
     }
 
     #[test]

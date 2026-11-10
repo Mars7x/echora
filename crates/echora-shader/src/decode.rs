@@ -675,6 +675,24 @@ pub enum Op {
     Bar {
         mode: u8,
     },
+    /// LDGSTS.E.BYPASS.128 [shared], [global.64], enable: 16 bytes from
+    /// global memory to shared memory, or zeros there where `enable`
+    /// fails. As Lichii decodes it (Mesa's NAK has no LDGSTS): the shared
+    /// address register 16-23 plus `shared_offset` (bits 48-63, signed, in
+    /// 16 bytes), the global register pair 24-31 plus `global_offset`
+    /// (bits 32-43, signed); two forms, by bits 64-95: with the enable
+    /// predicate at 87-89 negated by 90, or with a cache-policy
+    /// descriptor (an even uniform register at 64-69, ignored) and the
+    /// negation at 70. LDGDEPBAR (0x9af) commits a copy group; here the
+    /// copies complete at once, so it and DEPBAR do nothing.
+    Ldgsts {
+        shared: Reg,
+        shared_offset: i32,
+        global: Reg,
+        global_offset: i32,
+        enable: Pred,
+    },
+    Ldgdepbar,
     /// MEMBAR: orders this thread's memory accesses at `scope` (bits
     /// 76-78, as Mesa's NAK encodes them: 0 CTA, 1 SM, 2 GPU, 3 system).
     /// Only the plain form (no .MMIO at 72, no other bits but .SC at 80)
@@ -1539,6 +1557,33 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 count: 1 << word.bits(72, 2),
                 transpose: word.bit(78),
             });
+        }
+        0xfae => {
+            let high = word.bits(64, 32) as u32;
+            let promoted = high & !0x0780_003f == 0x0810_1d40;
+            let descriptor = word.bits(64, 6);
+            let with_descriptor =
+                high & !0x0380_007f == 0x0c10_1c00 && descriptor < 63 && descriptor & 1 == 0;
+            let global = word.reg(24);
+            if word.bits(44, 4) != 0 || !(promoted || with_descriptor) || global.0 & 1 != 0 {
+                return None;
+            }
+            return Some(Op::Ldgsts {
+                shared: d,
+                shared_offset: ((word.bits(48, 16) as u32) << 16) as i32 >> 12,
+                global,
+                global_offset: ((word.bits(32, 12) as u32) << 20) as i32 >> 20,
+                enable: Pred {
+                    index: word.bits(87, 3) as u8,
+                    negated: word.bit(if promoted { 90 } else { 70 }),
+                },
+            });
+        }
+        0x9af => {
+            if word.bits(12, 84) != 0x7 {
+                return None;
+            }
+            return Some(Op::Ldgdepbar);
         }
         0x992 => {
             let scope = word.bits(76, 3) as u8;

@@ -328,6 +328,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC); a workgroup control barrier that orders uniform (buffer and physical), workgroup and image memory, as bar.sync orders all memory for the CTA |
 | MEMBAR | 0x992 | scope 76-78 (0 CTA, 1 SM, 2 GPU, 3 system; .MMIO 72 and other bits but .SC 80 refused); OpMemoryBarrier over all memory at the workgroup (CTA, SM) or the device (GPU, system: Vulkan has nothing wider) |
 | ERRBAR | 0x9ab | no operands; nothing (it orders no memory) |
+| LDGSTS, LDGDEPBAR | 0xfae, 0x9af | as Lichii decodes it (NAK has none): 16 bytes from [R24.64 + bits 32-43] to shared [R16 + bits 48-63 × 16], or zeros where the enable predicate (87-89, negated by 90, or by 70 in the form with a cache-policy descriptor at 64-69) fails; copied at once, so LDGDEPBAR and DEPBAR wait for nothing |
 | Uniform ALU | 0x082, 0x087, 0x08c, 0x090-0x092, 0x096, 0x099, 0x09a, 0x0a4, 0x0a5 in forms 1, 2, 4 (UMOV 4, 6); UPLOP3 0x89c | the per-thread operation 0x080 lower, on uniform registers (63 URZ) and uniform predicates (7 UPT), the guard included; ULDC and S2UR (0x9c3) are uniform too |
 | R2UR | 0x3c2 | uniform destination 16-21, register 24 |
 | ISETP.EX | 0x00c bit 72 | the low words' result at 68-71 decides when the high words are equal |
