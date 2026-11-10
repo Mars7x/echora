@@ -32,6 +32,36 @@ fn main() {
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
     let compare = std::env::args().any(|arg| arg == "--compare");
     let mut rust: BTreeMap<String, usize> = BTreeMap::new();
+    // ECHORA_CHECK_MESH=task: captures do not say which task program a
+    // mesh program is drawn with, so a mesh program the translator
+    // refuses alone is tried again with each task program's INIT word
+    // (+0x58 of a vertex-typed stage with threads and no mesh sizes, as the
+    // runtime tells a task program apart), the first that translates kept.
+    let task_inits: Vec<u32> = if std::env::var("ECHORA_CHECK_MESH").as_deref() == Ok("task") {
+        let mut inits: Vec<u32> = std::env::args()
+            .skip(1)
+            .filter(|arg| arg != "--compare")
+            .filter_map(|path| {
+                let code = std::fs::read(&path).ok()?;
+                let control =
+                    std::fs::read(std::path::Path::new(&path).with_extension("control")).ok()?;
+                let word = |offset: usize| {
+                    control
+                        .get(offset..)
+                        .and_then(<[u8]>::first_chunk::<4>)
+                        .map_or(0, |b| u32::from_le_bytes(*b))
+                };
+                let kind = (u32::from_le_bytes(*code.first_chunk::<4>()?) >> 10) & 0xf;
+                (kind == 1 && word(0x60) == 0 && word(0x58) & 0x3f != 0).then(|| word(0x58))
+            })
+            .collect();
+        inits.sort_unstable();
+        inits.dedup();
+        eprintln!("task programs' INIT words: {inits:x?}");
+        inits
+    } else {
+        Vec::new()
+    };
     for path in std::env::args().skip(1).filter(|arg| arg != "--compare") {
         total += 1;
         let Ok(bytes) = std::fs::read(&path) else {
@@ -93,6 +123,29 @@ fn main() {
                     ],
                     primitive_header: None,
                 });
+                let alone = shader::translate_rust(&bytes, &parameters);
+                if let Err(unsupported) = &alone
+                    && !task_inits.is_empty()
+                {
+                    let paired = task_inits.iter().find(|&&init| {
+                        let mut with_task = parameters;
+                        if let Some(mesh) = with_task.mesh.as_mut() {
+                            mesh.registers[2] = init;
+                        }
+                        shader::translate_rust(&bytes, &with_task).is_ok()
+                    });
+                    match paired {
+                        Some(&init) => {
+                            if let Some(mesh) = parameters.mesh.as_mut() {
+                                mesh.registers[2] = init;
+                            }
+                        }
+                        None => eprintln!(
+                            "outcome {path} mesh refused alone and with every task INIT: {}",
+                            unsupported.reason
+                        ),
+                    }
+                }
             } else {
                 continue;
             }
