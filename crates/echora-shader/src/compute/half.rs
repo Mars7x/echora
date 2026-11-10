@@ -75,10 +75,15 @@ impl Emitter {
         c: Option<HalfOperand>,
         saturate: bool,
         relu: Option<Pred>,
+        flush: bool,
     ) -> Result<(), Unsupported> {
         let pair = self.f16_pair();
-        let a = self.half_operand(index, a)?;
-        let b = self.half_operand(index, b)?;
+        let mut a = self.half_operand(index, a)?;
+        let mut b = self.half_operand(index, b)?;
+        if flush {
+            a = self.flush_halves(a);
+            b = self.flush_halves(b);
+        }
         let exact = |e: &mut Self, opcode: u16, operands: &[u32]| {
             let value = e.value(opcode, pair, operands);
             e.module
@@ -89,14 +94,20 @@ impl Emitter {
             HalfOp::Add => exact(self, op::F_ADD, &[a, b]),
             HalfOp::Mul => exact(self, op::F_MUL, &[a, b]),
             HalfOp::Fma => {
-                let c = match c {
+                let mut c = match c {
                     Some(c) => self.half_operand(index, c)?,
                     None => self.half_constant(0),
                 };
+                if flush {
+                    c = self.flush_halves(c);
+                }
                 self.glsl(pair, glsl::FMA, &[a, b, c])
             }
             HalfOp::MinMax { min } => self.half_min_max(min, a, b),
         };
+        if flush {
+            value = self.flush_halves(value);
+        }
         if saturate {
             let (zero, one) = (self.half_constant(0), self.half_constant(0x3c00));
             value = self.glsl(pair, glsl::F_CLAMP, &[value, zero, one]);
@@ -113,6 +124,76 @@ impl Emitter {
         }
         self.write_register(d.0, bits);
         Ok(())
+    }
+
+    /// A pair of halves with each subnormal lane made a zero of its sign
+    /// (`.FTZ`).
+    fn flush_halves(&mut self, value: u32) -> u32 {
+        let pair = self.f16_pair();
+        let bits = self.value(op::BITCAST, self.u32, &[value]);
+        let mut result = self.constant(0);
+        for lane in 0..2u32 {
+            let (shift, sixteen) = (self.constant(lane * 16), self.constant(16));
+            let half = self.value(op::BIT_FIELD_U_EXTRACT, self.u32, &[bits, shift, sixteen]);
+            let exponent_mask = self.constant(0x7c00);
+            let exponent = self.value(op::BITWISE_AND, self.u32, &[half, exponent_mask]);
+            let zero = self.constant(0);
+            let subnormal = self.value(op::I_EQUAL, self.bool, &[exponent, zero]);
+            let sign_mask = self.constant(0x8000);
+            let sign = self.value(op::BITWISE_AND, self.u32, &[half, sign_mask]);
+            let kept = self.value(op::SELECT, self.u32, &[subnormal, sign, half]);
+            let placed = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[kept, shift]);
+            result = self.value(op::BITWISE_OR, self.u32, &[result, placed]);
+        }
+        self.value(op::BITCAST, pair, &[result])
+    }
+
+    /// `float` (32-bit) as a half's bits (in the low 16), rounded by
+    /// `rounding` (0 to nearest even, 1 down, 2 up, 3 toward zero): the
+    /// nearest half, moved one step where it went past `float` the wrong
+    /// way (so too large a value gives the largest finite half where the
+    /// rounding goes toward zero).
+    fn round_to_half(&mut self, float: u32, rounding: u8) -> u32 {
+        let f16 = self.f16();
+        let pair = self.f16_pair();
+        let zero_half = self.module.constant(f16, 0);
+        let nearest = self.value(F_CONVERT, f16, &[float]);
+        let both = self.value(op::COMPOSITE_CONSTRUCT, pair, &[nearest, zero_half]);
+        let bits = self.value(op::BITCAST, self.u32, &[both]);
+        if rounding == 0 {
+            return bits;
+        }
+        let back = self.value(F_CONVERT, self.f32, &[nearest]);
+        let sign_mask = self.constant(0x8000);
+        let sign = self.value(op::BITWISE_AND, self.u32, &[bits, sign_mask]);
+        let zero = self.constant(0);
+        let negative = self.value(op::I_NOT_EQUAL, self.bool, &[sign, zero]);
+        // Whether the nearest half is past `float` in the rounding's
+        // direction, and so must step back by one in magnitude (or, for a
+        // zero that should have moved away from it, forward).
+        let (above, below) = (
+            self.value(op::F_ORD_GREATER_THAN, self.bool, &[back, float]),
+            self.value(op::F_ORD_LESS_THAN, self.bool, &[back, float]),
+        );
+        let one = self.constant(1);
+        let down = self.value(op::I_SUB, self.u32, &[bits, one]);
+        let up = self.value(op::I_ADD, self.u32, &[bits, one]);
+        // Moving toward minus infinity: a positive half shrinks, a negative
+        // one grows in magnitude; toward plus infinity the reverse.
+        let toward_minus = self.value(op::SELECT, self.u32, &[negative, up, down]);
+        let toward_plus = self.value(op::SELECT, self.u32, &[negative, down, up]);
+        let adjusted = match rounding {
+            1 => self.value(op::SELECT, self.u32, &[above, toward_minus, bits]),
+            2 => self.value(op::SELECT, self.u32, &[below, toward_plus, bits]),
+            _ => {
+                let magnitude_above = self.value(op::SELECT, self.bool, &[negative, below, above]);
+                self.value(op::SELECT, self.u32, &[magnitude_above, down, bits])
+            }
+        };
+        // A negative zero from rounding up to -0 and similar stay as they
+        // are: only the 16 bits matter.
+        let mask = self.constant(0xffff);
+        self.value(op::BITWISE_AND, self.u32, &[adjusted, mask])
     }
 
     /// `.RELU` on a register of halves, lane by lane on the bits: a NaN
@@ -221,6 +302,7 @@ impl Emitter {
     }
 
     /// F2FP.PACK_AB: b and a (or c's low half) as halves, b low.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn pack_halves(
         &mut self,
         index: usize,
@@ -229,16 +311,12 @@ impl Emitter {
         b: Operand,
         c: Reg,
         merge: bool,
+        rounding: u8,
     ) -> Result<(), Unsupported> {
-        let f16 = self.f16();
-        // A float's half in the low 16 bits (paired with zero).
-        let pair = self.f16_pair();
-        let zero = self.module.constant(f16, 0);
+        // A float's half in the low 16 bits.
         let half_bits = |e: &mut Self, word: u32| {
             let float = e.value(op::BITCAST, e.f32, &[word]);
-            let half = e.value(F_CONVERT, f16, &[float]);
-            let both = e.value(op::COMPOSITE_CONSTRUCT, pair, &[half, zero]);
-            e.value(op::BITCAST, e.u32, &[both])
+            e.round_to_half(float, rounding)
         };
         let b = self.integer(index, b)?;
         let low = half_bits(self, b);

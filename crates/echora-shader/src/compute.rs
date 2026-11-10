@@ -1672,8 +1672,9 @@ impl Emitter {
                 c,
                 saturate,
                 relu,
+                flush,
                 ..
-            } => self.half(index, op, d, a, b, c, saturate, relu)?,
+            } => self.half(index, op, d, a, b, c, saturate, relu, flush)?,
             Op::Hsetp2 {
                 p,
                 q,
@@ -1683,7 +1684,14 @@ impl Emitter {
                 combine,
                 accumulate,
             } => self.half_set_predicates(index, p, q, a, b, compare, combine, accumulate)?,
-            Op::F2fp { d, a, b, c, merge } => self.pack_halves(index, d, a, b, c, merge)?,
+            Op::F2fp {
+                d,
+                a,
+                b,
+                c,
+                merge,
+                rounding,
+            } => self.pack_halves(index, d, a, b, c, merge, rounding)?,
             Op::Iabs { d, src } => {
                 let x = self.integer(index, src)?;
                 let value = self.glsl(self.u32, glsl::S_ABS, &[x]);

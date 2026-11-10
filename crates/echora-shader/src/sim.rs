@@ -2998,4 +2998,83 @@ mod tests {
         let (_, predicates) = run(&[], &[set_uniform, from_uniform]);
         assert!(predicates[&0], "P0 takes UP0's value");
     }
+
+    #[test]
+    fn float_to_half_packing_rounds_by_its_mode() {
+        // The halves just below and above a value, from every finite half.
+        let around = |value: f32| -> (u16, u16) {
+            let mut finite: Vec<u16> = (0u16..0x7c00).chain(0x8001..0xfc00).collect();
+            finite.sort_by(|&x, &y| f16_to_f32(x).total_cmp(&f16_to_f32(y)));
+            let below = finite
+                .iter()
+                .rev()
+                .copied()
+                .find(|&h| f16_to_f32(h) <= value)
+                .unwrap_or(0xfc00);
+            let above = finite
+                .iter()
+                .copied()
+                .find(|&h| f16_to_f32(h) >= value)
+                .unwrap_or(0x7c00);
+            (below, above)
+        };
+        let reference = |value: f32, rounding: u32| -> u16 {
+            let (below, above) = around(value);
+            match rounding {
+                0 => f64_to_f16(f64::from(value)),
+                1 => below,
+                2 => above,
+                _ => {
+                    if value >= 0.0 {
+                        below
+                    } else {
+                        above
+                    }
+                }
+            }
+        };
+        let values = [
+            1.0001f32, -1.0001, 3.17, -0.1, 65519.0, 70000.0, -70000.0, 1.0e-6, -1.0e-6, 2.0,
+        ];
+        for rounding in 0..4u32 {
+            for pair in values.chunks(2) {
+                let (high, low) = (pair[0], pair[1]);
+                // F2FP.PACK_AB R2, R0, R1 (R1 into the low half)
+                let pack = word(&[
+                    (0, 12, 0x23e),
+                    (16, 8, 2),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (79, 2, u128::from(rounding)),
+                ]);
+                let (registers, _) = run(&[high.to_bits(), low.to_bits()], &[pack]);
+                let expected = u32::from(reference(low, rounding))
+                    | u32::from(reference(high, rounding)) << 16;
+                assert_eq!(
+                    registers[&2], expected,
+                    "rounding {rounding}: {high}, {low}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn half_adds_flush_subnormals_with_ftz() {
+        // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
+        let add = |ftz: u128| {
+            word(&[
+                (0, 12, 0x230),
+                (16, 8, 2),
+                (24, 8, 0),
+                (32, 8, 1),
+                (80, 1, ftz),
+            ])
+        };
+        let input = 0x3c00_8001u32;
+        let (registers, _) = run(&[input, 0], &[add(0)]);
+        assert_eq!(registers[&2], input);
+        // The subnormal flushes to -0, and -0 + +0 is +0.
+        let (registers, _) = run(&[input, 0], &[add(1)]);
+        assert_eq!(registers[&2], 0x3c00_0000);
+    }
 }

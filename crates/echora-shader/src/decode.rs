@@ -318,6 +318,9 @@ pub enum Op {
         /// lane's result clamps a negative value to +0 and a NaN to the
         /// canonical 0x7fff.
         relu: Option<Pred>,
+        /// `.FTZ` (bit 80, as Mesa's NAK encodes HADD2, HMUL2 and HFMA2):
+        /// subnormal inputs and results become zeros of their sign.
+        flush: bool,
     },
     /// HSETP2 p, q, a, b, acc: each lane's comparison of the half pairs, p
     /// lane 0's and q lane 1's, each combined with acc.
@@ -332,13 +335,16 @@ pub enum Op {
     },
     /// F2FP.PACK_AB d, a, b: b and a converted to halves, b in the low
     /// half; with `merge` (MERGE_C, bit 78) the high half is the low half
-    /// of register c instead of a.
+    /// of register c instead of a. Other modifiers (81-90) are refused.
     F2fp {
         d: Reg,
         a: Reg,
         b: Operand,
         c: Reg,
         merge: bool,
+        /// Bits 79-80 (NAK): 0 to nearest even, 1 down, 2 up, 3 toward
+        /// zero.
+        rounding: u8,
     },
     /// IABS d, src: the absolute value of a signed word.
     Iabs {
@@ -1792,17 +1798,20 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
         },
         // HADD2: the second source in the third slot in forms 2 and 3.
         // Bit 78 (a 32-bit result) and 76/79 are not decoded.
-        0x030 if matches!(form, 1..=3) && word.bits(76, 4) & 0b1001 == 0 => Op::Half {
-            op: HalfOp::Add,
-            d,
-            a: word.half(0)?,
-            b: word.half(if form == 1 { 1 } else { 2 })?,
-            c: None,
-            saturate: word.bit(77),
-            single: word.bit(78),
-            relu: None,
-        },
-        0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 => Op::Half {
+        0x030 if matches!(form, 1..=3) && word.bits(76, 4) & 0b1001 == 0 && !word.bit(85) => {
+            Op::Half {
+                op: HalfOp::Add,
+                d,
+                a: word.half(0)?,
+                b: word.half(if form == 1 { 1 } else { 2 })?,
+                c: None,
+                saturate: word.bit(77),
+                single: word.bit(78),
+                relu: None,
+                flush: word.bit(80),
+            }
+        }
+        0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 && !word.bit(85) => Op::Half {
             op: HalfOp::Mul,
             d,
             a: word.half(0)?,
@@ -1811,6 +1820,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             saturate: word.bit(77),
             single: false,
             relu: None,
+            flush: word.bit(80),
         },
         // HFMA2 without its mixed-sign form (86) or 85.
         0x031 if (1..=5).contains(&form) && !word.bit(78) && word.bits(85, 2) == 0 => Op::Half {
@@ -1822,6 +1832,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             saturate: word.bit(77),
             single: false,
             relu: word.bit(79).then(|| word.pred(87, 90)),
+            flush: word.bit(80),
         },
         0x040 if matches!(form, 1 | 4) && word.bits(76, 11) == 0 => Op::Half {
             op: HalfOp::MinMax {
@@ -1834,6 +1845,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             saturate: false,
             single: false,
             relu: None,
+            flush: false,
         },
         // HSETP2 without .H_AND (71).
         0x034 if matches!(form, 1 | 2) && !word.bit(71) => Op::Hsetp2 {
@@ -1850,13 +1862,21 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             },
             accumulate: word.pred(87, 90),
         },
-        0x03e if matches!(form, 1 | 5) && word.bits(73, 5) == 0 && !word.bit(72) => Op::F2fp {
-            d,
-            a: word.reg(24),
-            b: word.source(1)?,
-            c: word.reg(64),
-            merge: word.bit(78),
-        },
+        0x03e
+            if matches!(form, 1 | 5)
+                && word.bits(73, 5) == 0
+                && !word.bit(72)
+                && word.bits(81, 10) == 0 =>
+        {
+            Op::F2fp {
+                d,
+                a: word.reg(24),
+                b: word.source(1)?,
+                c: word.reg(64),
+                merge: word.bit(78),
+                rounding: word.bits(79, 2) as u8,
+            }
+        }
         0x013 if matches!(form, 1 | 4 | 5 | 6) => Op::Iabs {
             d,
             src: word.source(1)?,
