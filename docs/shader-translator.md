@@ -279,7 +279,13 @@ deadlock) or after other invocations returned, reads and writes outside
 the dumped memory (faults), indices past an array, shuffles from lanes
 not running there, and uses of what SPIR-V leaves undefined. The
 `simulate` example runs it on a dump directory (its documentation gives
-the format). Bound textures and images come from dumped level-0 texels:
+the format). Several workgroups run in sequence over one memory image
+(a valid schedule; last-workgroup patterns complete). `watch=` lists every
+store and atomic into a guest or device range; each invocation's guest
+EXIT is reported (the translation marks each EXIT taken with an OpLine,
+file "guest", line its byte offset); and `--registers=` prints chosen
+invocations' registers as they ended (the translation names its register
+variables R0.., P0.., UR0.., UP0..). Bound textures and images come from dumped level-0 texels:
 fetches and storage reads and writes are exact, samples are nearest at
 level 0 (enough for control flow), gathers take the four texels around
 the point; texture pool entries come from `Inputs::image_arrays` (by
@@ -387,7 +393,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDG, STG | 0x381, 0x981, 0x386, 0x986 | address register 24 (pair: bit 72 in 0x3xx, 90 in 0x9xx), uniform register 32 (loads) or 64 (stores) with bit 91 (pair 72), offset 40-63 signed, type 73-75, data 32; 0x981's condition at 64-66 stored as 7 - P (negate 67); memory order 77-80: .STRONG.GPU (7) and .STRONG.SYS (0xa) as Volatile accesses, so they reach memory other workgroups see; .STRONG.SM (5, what compilers emit for ordinary accesses), weak (0) and constant (4) as plain ones |
 | Byte and half-word stores | STG, STS, STL types 0-3 | into the word holding them: global and shared memory clear and set the bytes with an atomic AND and OR, so neighbouring bytes written by others survive; local memory reads, merges and writes |
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
-| RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70); data 32, or compare 32 and data 64 for CAS |
+| RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70; RED's at 72 with a register address alone, at 90 with a uniform register, bit 91, whose own pair flag is 72); data 32, or compare 32 and data 64 for CAS |
 | TXD | 0xb6c | 2D and 2D array; coordinates (x, y, then the layer) from Ra, gradients from Rb as d/dx and d/dy of x, then of y; results as TEX |
 | TEX, TLD.SCR, TLD4, TXQ, TMML | 0xb60, 0xb66, 0xb63, 0xb6f, 0xb69 (bindless 0xf6x) | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit), TLD4 component 87-88, offsets 76 (TLD4 per-tap with 76-77 = 2: signed 6-bit x, y per tap in the bytes of two registers, one gather per tap), TXQ and TMML have no fault predicate at 81-83, TXQ only the dimension query (76-89 clear), depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference) half in Ra and half in Rb up to four, else four and the rest |
 | TXQ.B | 0x370 | as Lichii decodes it: bit 59 alone of 59-63, nothing at 32-58, 76-89 or 91; the handle in Ra, the level in Ra+1, through the texture pool; the dimensions of a 2D view (width, height, 1, levels), as TXQ |
