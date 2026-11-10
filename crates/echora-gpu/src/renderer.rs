@@ -1954,6 +1954,7 @@ impl Renderer {
             return Ok(None);
         };
         let Some(address) = self.buffer_address(buffer) else {
+            self.stat("stat: shared spans without a device address", 1);
             self.retired_shared.push((buffer, memory));
             return Ok(None);
         };
@@ -2010,6 +2011,7 @@ impl Renderer {
                 .ok()
         });
         let Some(udmabuf) = udmabuf else {
+            self.stat("stat: udmabuf device unavailable", 1);
             return Ok(None);
         };
         // struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }

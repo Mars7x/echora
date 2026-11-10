@@ -4003,6 +4003,7 @@ impl Nvn {
             let mut offset = 0;
             while offset < size {
                 let length = (size - offset).min(CHUNK);
+                let mut recorded_span = false;
                 let address = if host_visible {
                     let recorded = self
                         .gpu
@@ -4010,6 +4011,7 @@ impl Nvn {
                         .and_then(|backend| backend.shared_pools.get(&base))
                         .filter(|(shared_size, ..)| *shared_size >= offset + length)
                         .map(|&(_, file, at)| (file, at + offset));
+                    recorded_span = recorded.is_some();
                     match recorded.or_else(|| core.memory.shared_span(base + offset, length)) {
                         Some((file, at)) => self
                             .gpu
@@ -4082,10 +4084,12 @@ impl Nvn {
                 if address.is_none() {
                     let note = format!(
                         "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped{}",
-                        if host_visible {
-                            " (no shared span)"
-                        } else {
+                        if !host_visible {
                             " (no resident copy)"
+                        } else if recorded_span {
+                            " (its recorded span did not import)"
+                        } else {
+                            " (no shared span)"
                         }
                     );
                     self.gpu.as_mut().unwrap().note(note);
