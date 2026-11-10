@@ -273,8 +273,15 @@ not running there, and uses of what SPIR-V leaves undefined. The
 the format). Bound textures and images come from dumped level-0 texels:
 fetches and storage reads and writes are exact, samples are nearest at
 level 0 (enough for control flow), gathers take the four texels around
-the point; depth comparisons, level queries and texture pool entries
-read zeros.
+the point; texture pool entries come from `Inputs::image_arrays` (by
+set, binding and element) and the pool's flags buffer from the buffer
+inputs (a runtime array is as long as its bytes); depth comparisons and
+level queries read zeros. Reference tests check the opcodes the game uses
+most against models written apart from the translator: TEX's mask order,
+second destination and packed halves; TEX.B's pool entry, integer view
+and capacity; TXQ; divergent BRA loops against a per-invocation model;
+HADD2, HMUL2 and HFMA2 (swizzles, modifiers, saturation, a single
+rounding) against halves rounded by search rather than by conversion.
 
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
