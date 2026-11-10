@@ -4581,18 +4581,19 @@ impl Nvn {
                         uniforms.insert((index, descriptor.binding), vec![0; used as usize]);
                     }
                     // Storage buffer i of graphics stage s (NVN numbering):
-                    // its address and size at c0+0x110+0x400*s+16*i
-                    // (inferred: vertex shaders read c0+0x170 and fragment
-                    // shaders c0+0x570 where the application binds slot 6).
+                    // its address and size at c0+0x110+0x100*s+16*i, 16 per
+                    // stage (vertex shaders read c0+0x170 and fragment
+                    // shaders, stage 4, c0+0x570 where the application binds
+                    // slot 6).
                     // The contents are read now; graphics stages' writes are
                     // not returned.
                     DescriptorKind::StorageBuffer
                         if descriptor.cbuf_index == 0
-                            && descriptor.cbuf_offset >= 0x110 + 0x400 * nvn
-                            && descriptor.cbuf_offset < 0x110 + 0x400 * nvn + 0x200
+                            && descriptor.cbuf_offset >= 0x110 + 0x100 * nvn
+                            && descriptor.cbuf_offset < 0x110 + 0x100 * nvn + 0x100
                             && descriptor.cbuf_offset % 16 == 0 =>
                     {
-                        let slot = (descriptor.cbuf_offset - 0x110 - 0x400 * nvn) / 16;
+                        let slot = (descriptor.cbuf_offset - 0x110 - 0x100 * nvn) / 16;
                         let bind = self
                             .render
                             .state
@@ -4732,7 +4733,7 @@ impl Nvn {
         }
 
         // Each stage's c0 holds every bound storage buffer's address and
-        // size (graphics stage s, slot i at 0x110 + 0x400 * s + 16 * i), as
+        // size (graphics stage s, slot i at 0x110 + 0x100 * s + 16 * i), as
         // the driver keeps them: a program that reaches global memory
         // through the page table reads them there itself, with no storage
         // binding of its own.
@@ -4743,7 +4744,7 @@ impl Nvn {
                     .render
                     .state
                     .get(&format!("BindStorageBuffer/{nvn}/{slot}"))?;
-                Some((0x110 + 0x400 * nvn + 16 * slot, bind.x[3], bind.x[4]))
+                Some((0x110 + 0x100 * nvn + 16 * slot, bind.x[3], bind.x[4]))
             })
             .collect();
         for (index, stage) in stages.iter().enumerate() {
