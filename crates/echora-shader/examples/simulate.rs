@@ -25,7 +25,13 @@
 //!   of an image array (a texture pool view; its flags buffer is a
 //!   `uniform-` file).
 //!
-//! Each X,Y,Z argument names a workgroup to run (default 0,0,0).
+//! Each X,Y,Z argument names a workgroup to run (default 0,0,0). Each
+//! `watch=START..END` argument (hex addresses, or a `watch START END` line
+//! in dispatch.txt) lists every store and atomic into that range, guest
+//! (through the page table) or device: the invocation, the instruction
+//! (index in the entry function, as the ends), its SPIR-V opcode and the
+//! bytes before and after; then each watched word's first and last
+//! values.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -69,6 +75,14 @@ fn main() {
             (Some("loop_limit"), &[limit]) => inputs.loop_limit = limit,
             (Some("spec"), &[id, value]) => {
                 inputs.specialization.insert(id, value);
+            }
+            (Some("watch"), _) => {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let [_, start, end] = parts[..]
+                    && let Some(range) = hex_range(&format!("{start}..{end}"))
+                {
+                    inputs.watch.push(range);
+                }
             }
             _ => {}
         }
@@ -146,9 +160,18 @@ fn main() {
     inputs.images = images;
     inputs.image_arrays = image_arrays;
     let machine = Machine::new(&words);
-    let groups: Vec<[u32; 3]> = if arguments.len() > 1 {
-        arguments[1..]
-            .iter()
+    for argument in &arguments[1..] {
+        if let Some(range) = argument.strip_prefix("watch=").and_then(hex_range) {
+            inputs.watch.push(range);
+        }
+    }
+    let group_arguments: Vec<&String> = arguments[1..]
+        .iter()
+        .filter(|argument| !argument.starts_with("watch="))
+        .collect();
+    let groups: Vec<[u32; 3]> = if !group_arguments.is_empty() {
+        group_arguments
+            .into_iter()
             .filter_map(|group| {
                 let parts: Vec<u32> = group
                     .split(',')
@@ -210,6 +233,43 @@ fn main() {
                 report.unmapped_pages.len()
             );
         }
+        // Watched writes, then each watched word's first and last value.
+        let hex = |bytes: &[u8]| -> String {
+            bytes
+                .iter()
+                .rev()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let mut words: BTreeMap<u64, (Vec<u8>, Vec<u8>, usize)> = BTreeMap::new();
+        for write in &report.writes {
+            let guest = write
+                .guest
+                .map_or_else(|| "unmapped".to_string(), |guest| format!("{guest:#x}"));
+            println!(
+                "  write: invocation {} instruction {} (op {}) guest {guest} device {:#x}: \
+                 {} -> {}",
+                write.invocation,
+                write.instruction,
+                write.opcode,
+                write.device,
+                hex(&write.old),
+                hex(&write.new)
+            );
+            let at = write.guest.unwrap_or(write.device);
+            let entry = words
+                .entry(at)
+                .or_insert_with(|| (write.old.clone(), Vec::new(), 0));
+            entry.1.clone_from(&write.new);
+            entry.2 += 1;
+        }
+        for (address, (first, last, count)) in &words {
+            println!(
+                "  watched {address:#x}: {} -> {} ({count} writes)",
+                hex(first),
+                hex(last)
+            );
+        }
         for note in &report.notes {
             println!("  note: {note}");
         }
@@ -219,4 +279,14 @@ fn main() {
         failed |= !report.problems.is_empty();
     }
     std::process::exit(i32::from(failed));
+}
+
+/// `START..END` in hex (with or without 0x).
+fn hex_range(text: &str) -> Option<std::ops::Range<u64>> {
+    let (start, end) = text.trim().split_once("..")?;
+    let number = |text: &str| {
+        let text = text.trim();
+        u64::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
+    };
+    Some(number(start)?..number(end)?)
 }

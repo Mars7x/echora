@@ -148,7 +148,30 @@ pub struct Inputs {
     /// Iterations of one loop by one invocation that count as running
     /// away (1 << 16 when 0).
     pub loop_limit: u32,
+    /// Address ranges (device addresses, or guest addresses through the
+    /// page table) whose stores and atomics `Report::writes` lists.
+    pub watch: Vec<std::ops::Range<u64>>,
 }
+
+/// A store or atomic into a watched range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Write {
+    /// The invocation (local index) and the instruction (index in the
+    /// entry function, as `Report::ends`) that wrote, and its opcode.
+    pub invocation: usize,
+    pub instruction: usize,
+    pub opcode: u16,
+    /// The device address, and the guest address when the page table
+    /// maps the page.
+    pub device: u64,
+    pub guest: Option<u64>,
+    /// The bytes before and after.
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+}
+
+/// Writes past this many are not listed (a note says so).
+const WRITE_LIMIT: usize = 1 << 20;
 
 /// A texture's or image's level 0: `layers` layers (or a 3D image's
 /// `depth` slices) of `width` x `height` texels, each the four components
@@ -222,6 +245,8 @@ pub struct Report {
     /// Where each invocation ended: the index of the instruction (in the
     /// entry function) it returned at, or stopped at on a problem.
     pub ends: Vec<usize>,
+    /// The stores and atomics into `Inputs::watch`, in the order they ran.
+    pub writes: Vec<Write>,
 }
 
 /// A loaded module.
@@ -253,7 +278,11 @@ pub struct Machine {
 
 /// One invocation's state.
 struct Invocation {
+    /// Its local index.
+    number: usize,
     at: usize,
+    /// The instruction running (`at` moves on before it runs).
+    current: usize,
     values: HashMap<u32, Value>,
     value_types: HashMap<u32, u32>,
     pointers: HashMap<u32, Pointer>,
@@ -293,6 +322,10 @@ struct Shared {
     /// page count.
     page_table: Option<(u64, u64, u64)>,
     unmapped_pages: BTreeMap<u64, u32>,
+    watch: Vec<std::ops::Range<u64>>,
+    /// Guest pages by the device page they map to (when watching).
+    guest_pages: HashMap<u64, u64>,
+    writes: Vec<Write>,
 }
 
 impl Shared {
@@ -325,6 +358,44 @@ impl Shared {
                 vec![0; count]
             }
         }
+    }
+
+    /// The guest address `address` (a device address) is mapped from.
+    fn guest(&self, address: u64) -> Option<u64> {
+        use echora_shader_abi::PAGE_SHIFT;
+        let page = self.guest_pages.get(&(address >> PAGE_SHIFT))?;
+        Some(page << PAGE_SHIFT | address & ((1 << PAGE_SHIFT) - 1))
+    }
+
+    /// Lists a write of `new` at `address` when it is watched.
+    fn watch_write(&mut self, at: (usize, usize, u16), address: u64, new: &[u8]) {
+        let guest = self.guest(address);
+        let end = new.len() as u64;
+        let watched = |start: u64| {
+            self.watch
+                .iter()
+                .any(|range| start < range.end && range.start < start + end)
+        };
+        if !(watched(address) || guest.is_some_and(watched)) {
+            return;
+        }
+        if self.writes.len() == WRITE_LIMIT {
+            self.note("more watched writes than are listed");
+            return;
+        }
+        let old = match self.region(address, new.len()) {
+            Some((base, offset)) => self.memory[&base][offset..offset + new.len()].to_vec(),
+            None => Vec::new(),
+        };
+        self.writes.push(Write {
+            invocation: at.0,
+            instruction: at.1,
+            opcode: at.2,
+            device: address,
+            guest,
+            old,
+            new: new.to_vec(),
+        });
     }
 
     fn write(&mut self, address: u64, bytes: &[u8]) {
@@ -886,6 +957,9 @@ impl Machine {
                 }
             },
             unmapped_pages: BTreeMap::new(),
+            watch: inputs.watch.clone(),
+            guest_pages: HashMap::new(),
+            writes: Vec::new(),
             uniforms: self
                 .globals
                 .iter()
@@ -906,6 +980,20 @@ impl Machine {
                 inputs.loop_limit
             },
         };
+        // Guest pages by device page, for the watched writes' guest
+        // addresses.
+        if let (false, Some((table, first, count))) = (shared.watch.is_empty(), shared.page_table) {
+            use echora_shader_abi::PAGE_SHIFT;
+            for n in 0..count {
+                if let Some((base, offset)) = shared.region(table + 8 * n, 8) {
+                    let bytes = &shared.memory[&base][offset..offset + 8];
+                    let entry = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+                    if entry != 0 {
+                        shared.guest_pages.insert(entry >> PAGE_SHIFT, first + n);
+                    }
+                }
+            }
+        }
         // The workgroup's variables.
         for &(variable, pointer, class) in &self.globals {
             let Ty::Pointer { pointee } = self.ty(pointer) else {
@@ -930,6 +1018,7 @@ impl Machine {
         let mut invocations: Vec<Invocation> = (0..count)
             .map(|n| {
                 let mut invocation = self.start(&builtins(n));
+                invocation.number = n;
                 invocation.initial = initial(n);
                 for (&constant, spec_id) in &self.spec_ids {
                     if let Some(&value) = inputs.specialization.get(spec_id) {
@@ -1027,6 +1116,7 @@ impl Machine {
         let ends = invocations.iter().map(|invocation| invocation.at).collect();
         Report {
             ends,
+            writes: shared.writes,
             invocations: invocations
                 .into_iter()
                 .map(|invocation| invocation.variables)
@@ -1078,6 +1168,8 @@ impl Machine {
             tainted_variables: HashSet::new(),
             page_counts: HashSet::new(),
             initial: HashMap::new(),
+            number: 0,
+            current: 0,
             done: false,
             steps: 0,
         }
@@ -1117,6 +1209,7 @@ impl Machine {
                 | op::COOPERATIVE_MATRIX_MUL_ADD
         ) {
             let lead = members[0];
+            invocations[lead].current = at;
             let result = self.matrix_operation(&mut invocations[lead], shared);
             for &n in members {
                 let invocation = &mut invocations[n];
@@ -1299,6 +1392,14 @@ impl Machine {
             }
             Pointer::Physical { address, pointee } => {
                 let bytes = self.bytes_of(pointee, value);
+                if !shared.watch.is_empty() {
+                    let at = invocation.current;
+                    let opcode = self
+                        .body
+                        .get(at)
+                        .map_or(0, |instruction| instruction.opcode);
+                    shared.watch_write((invocation.number, at, opcode), address, &bytes);
+                }
                 shared.write(address, &bytes);
             }
         }
@@ -1660,6 +1761,7 @@ impl Machine {
             if Self::collective(instruction.opcode) {
                 return;
             }
+            invocation.current = at;
             invocation.at += 1;
             let operands = &instruction.operands;
             let opcode = instruction.opcode;
@@ -2857,6 +2959,8 @@ mod tests {
             workgroup_count: [1, 1, 1],
             push,
             memory: BTreeMap::from([(table, page.to_le_bytes().to_vec()), (page, words)]),
+            // Guest words 2-3, and device word 40.
+            watch: vec![0x10008..0x10010, page + 160..page + 161],
             ..Inputs::default()
         };
         let machine = Machine::new(&translated.spirv);
@@ -2864,6 +2968,35 @@ mod tests {
         let report = machine.simulate(&inputs);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.barriers.len(), 1);
+        // The watched stores: invocations 2, 3 and 40, each its word.
+        let listed: Vec<_> = report
+            .writes
+            .iter()
+            .map(|w| {
+                (
+                    w.invocation,
+                    w.device,
+                    w.guest,
+                    w.old.clone(),
+                    w.new.clone(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = [2u32, 3, 40]
+            .iter()
+            .map(|&n| {
+                let at = 4 * u64::from(n);
+                (
+                    n as usize,
+                    page + at,
+                    Some(0x10000 + at),
+                    n.to_le_bytes().to_vec(),
+                    ((n ^ 32) + 1).to_le_bytes().to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(listed, expected);
+        assert!(report.writes.iter().all(|w| w.opcode == op::STORE));
         let memory = &report.memory[&page];
         for n in 0..64usize {
             let word = u32::from_le_bytes(memory[4 * n..4 * n + 4].try_into().unwrap());
