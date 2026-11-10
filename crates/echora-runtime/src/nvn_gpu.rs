@@ -4403,17 +4403,97 @@ impl Nvn {
 
     /// Where `dump_dispatch` writes program `key`'s dispatch this present.
     fn dump_directory(&self, key: u64) -> Result<std::path::PathBuf, String> {
-        let root = match super::debug_var_os("ECHORA_DUMP_DIR") {
-            Some(directory) => std::path::PathBuf::from(directory),
-            None => std::env::var_os("XDG_CACHE_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
-                })
-                .ok_or("no cache directory")?
-                .join("echora/dispatch-dumps"),
+        dump_directory_at(key, self.presented_frames)
+    }
+
+    /// A dumped draw's fragment program and inputs, for the simulator: as
+    /// `dump_dispatch`, with `dispatch.txt` naming the target's middle
+    /// pixel (`fragcoord`; its attributes are left to the reader) and each
+    /// sampled texture's level 0, every slice of a 3D one.
+    fn dump_draw(
+        renderer: &mut echora_gpu::renderer::Renderer,
+        directory: &std::path::Path,
+        draw: &echora_gpu::draw::Draw,
+        target_extent: Option<(u32, u32)>,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let write = |name: String, bytes: &[u8]| {
+            std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
         };
-        Ok(root.join(format!("{key:016x}-{}", self.presented_frames)))
+        let (index, stage) = draw
+            .program
+            .stages
+            .iter()
+            .enumerate()
+            .find(|(_, stage)| stage.stage == echora_shader_abi::Stage::Fragment)
+            .ok_or("no fragment stage")?;
+        let words: Vec<u8> = stage
+            .spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        write("program.spv".into(), &words)?;
+        let (width, height) = target_extent.unwrap_or((1, 1));
+        write(
+            "dispatch.txt".into(),
+            format!(
+                "groups 1 1 1\nfragcoord {}.5 {}.5 0.5 1.0\n",
+                width / 2,
+                height / 2
+            )
+            .as_bytes(),
+        )?;
+        let push = echora_shader_abi::PushConstants {
+            resolution_scale: [1.0; 4],
+            page_table: draw.page_table,
+            ..Default::default()
+        };
+        write("push.bin".into(), &push.to_bytes())?;
+        for ((stage_index, binding), bytes) in &draw.uniforms {
+            if *stage_index == index {
+                write(format!("uniform-0-{binding}.bin"), bytes)?;
+            }
+        }
+        for ((stage_index, binding), (source, _)) in &draw.textures {
+            if *stage_index != index {
+                continue;
+            }
+            let (texels, width, height, depth) = match source {
+                TextureSource::Upload {
+                    key,
+                    width,
+                    height,
+                    shape,
+                    ..
+                } => {
+                    renderer.texture_view_for(source)?;
+                    let depth = match shape {
+                        ImageShape::D3 { depth } => *depth,
+                        _ => 1,
+                    };
+                    let mut texels = Vec::new();
+                    for slice in 0..depth {
+                        texels.extend(renderer.read_upload_slice(*key, 0, slice)?);
+                    }
+                    (texels, *width, *height, depth)
+                }
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                    let target = renderer.existing_target(*key).ok_or("no such target")?;
+                    let (width, height) = (target.width, target.height);
+                    (renderer.read_target_level(*key, 0)?, width, height, 1)
+                }
+            };
+            let bytes: Vec<u8> = texels
+                .iter()
+                .flat_map(|texel| texel.iter().flat_map(|part| part.to_bits().to_le_bytes()))
+                .collect();
+            write(format!("image-0-{binding}.bin"), &bytes)?;
+            write(
+                format!("image-0-{binding}.txt"),
+                format!("{width} {height} {depth} 1\n").as_bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     /// A dumped dispatch's textures and storage images, by binding: level
@@ -6024,6 +6104,25 @@ impl Nvn {
                 }
             }
         }
+        // ECHORA_DUMP_DRAW=<fragment key>[,...] (debugging): the first draw
+        // of each listed fragment program, for the simulator (`dump_draw`).
+        if let Some(wanted) = super::debug_var_os("ECHORA_DUMP_DRAW")
+            && wanted
+                .to_string_lossy()
+                .split(',')
+                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
+            && self.dumped_dispatches.insert(keys.1)
+        {
+            let extent = probe_target
+                .and_then(|key| backend.renderer.existing_target(key))
+                .map(|target| (target.width, target.height));
+            let result = dump_directory_at(keys.1, self.presented_frames).and_then(|directory| {
+                Self::dump_draw(&mut backend.renderer, &directory, &draw, extent)
+            });
+            if let Err(error) = result {
+                eprintln!("draw dump {:016x}: {error}", keys.1);
+            }
+        }
         if let Some((key, directory)) = snap.filter(|snap| Some(snap.0) == probe_target) {
             let sequence = self.sequence;
             let target = backend.renderer.existing_target(key).unwrap();
@@ -6483,4 +6582,20 @@ fn read_file_range(file: i32, at: u64, length: u64) -> Option<Vec<u8>> {
 #[cfg(not(unix))]
 fn read_file_range(_file: i32, _at: u64, _length: u64) -> Option<Vec<u8>> {
     None
+}
+
+/// The directory a dump of program `key` at present `present` goes in:
+/// ECHORA_DUMP_DIR, else the cache's echora/dispatch-dumps.
+fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, String> {
+    let root = match super::debug_var_os("ECHORA_DUMP_DIR") {
+        Some(directory) => std::path::PathBuf::from(directory),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
+            })
+            .ok_or("no cache directory")?
+            .join("echora/dispatch-dumps"),
+    };
+    Ok(root.join(format!("{key:016x}-{present}")))
 }

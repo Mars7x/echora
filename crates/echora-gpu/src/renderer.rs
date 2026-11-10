@@ -3799,10 +3799,22 @@ impl Renderer {
     /// Debugging: read mip level `level` of upload `key` back as RGBA f32
     /// texels (as a target would be).
     pub fn read_upload_level(&mut self, key: u64, level: u32) -> Result<Vec<[f32; 4]>, String> {
+        self.read_upload_slice(key, level, 0)
+    }
+
+    /// Debugging: as `read_upload_level`, slice `slice` of a 3D upload.
+    pub fn read_upload_slice(
+        &mut self,
+        key: u64,
+        level: u32,
+        slice: u32,
+    ) -> Result<Vec<[f32; 4]>, String> {
         let (generation, target) = self.uploads.remove(&key).ok_or("no such upload")?;
         let temporary = u64::MAX - 1;
         self.targets.insert(temporary, target);
-        let texels = self.read_target_level(temporary, level);
+        let texels = self
+            .read_level(temporary, level, false, slice)
+            .map(|(texels, ..)| texels);
         let target = self.targets.remove(&temporary).unwrap();
         self.uploads.insert(key, (generation, target));
         texels
@@ -3811,21 +3823,23 @@ impl Renderer {
     /// Read mip level `level` of a color target back as RGBA f32 texels
     /// (at the guest's resolution).
     pub fn read_target_level(&mut self, key: u64, level: u32) -> Result<Vec<[f32; 4]>, String> {
-        self.read_level(key, level, false)
+        self.read_level(key, level, false, 0)
             .map(|(texels, ..)| texels)
     }
 
     /// Level 0 of a color target at the image's own (scaled) resolution,
     /// with that width and height: the frame as the window shows it.
     pub fn read_target_scaled(&mut self, key: u64) -> Result<(Vec<[f32; 4]>, u32, u32), String> {
-        self.read_level(key, 0, true)
+        self.read_level(key, 0, true, 0)
     }
 
+    /// Level `level` (slice `slice` of a 3D target) as RGBA f32 texels.
     fn read_level(
         &mut self,
         key: u64,
         level: u32,
         full: bool,
+        slice: u32,
     ) -> Result<(Vec<[f32; 4]>, u32, u32), String> {
         let (width, height, format, scaled) = {
             let target = self.targets.get(&key).ok_or("no such target")?;
@@ -3846,7 +3860,7 @@ impl Renderer {
         // Depth targets cannot be blitted to a color image: their depth
         // aspect is copied as it is and read as (depth, 0, 0, 1).
         if is_depth(format) {
-            if level != 0 || (full && scaled != (width, height)) {
+            if level != 0 || slice != 0 || (full && scaled != (width, height)) {
                 return Err("a depth target reads back at level 0, unscaled".into());
             }
             let bytes = self.read_target_bytes(key, 4)?;
@@ -3894,11 +3908,15 @@ impl Renderer {
         let blit = vk::ImageBlit {
             src_subresource: layers,
             src_offsets: [
-                vk::Offset3D::default(),
+                vk::Offset3D {
+                    x: 0,
+                    y: 0,
+                    z: slice as i32,
+                },
                 vk::Offset3D {
                     x: scaled.0 as i32,
                     y: scaled.1 as i32,
-                    z: 1,
+                    z: slice as i32 + 1,
                 },
             ],
             dst_subresource: vk::ImageSubresourceLayers {
