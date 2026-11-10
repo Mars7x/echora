@@ -1594,6 +1594,22 @@ impl Nvn {
             "nvnCommandBufferDrawMeshTasksIndirect" => {
                 let address = command.x[1];
                 let guest = self.gpu_to_guest(address, 12)?;
+                // ECHORA_MESH_LOG (debugging): each indirect mesh draw's
+                // group counts as the GPU wrote them (waits for the GPU).
+                if super::debug_var_os("ECHORA_MESH_LOG").is_some() {
+                    self.resolve_gpu_written(core, guest..guest + 12)?;
+                    let bytes = self.gpu_bytes(core, address, 12)?;
+                    let words: Vec<u32> = bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .collect();
+                    eprintln!(
+                        "mesh indirect present {} at {address:#x}: groups {words:?}",
+                        self.presented_frames
+                    );
+                }
                 if let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 12)? {
                     return Ok(MeshGroups::Indirect { buffer, offset });
                 }
@@ -5978,10 +5994,11 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
+                mesh_groups,
                 colors,
                 attributes
                     .iter()
