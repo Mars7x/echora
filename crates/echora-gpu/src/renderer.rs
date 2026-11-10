@@ -706,6 +706,13 @@ impl Renderer {
         })
     }
 
+    /// The page table's entries as last written (`set_page_table`).
+    pub fn page_table_entries(&self) -> &[u64] {
+        self.page_table
+            .as_ref()
+            .map_or(&[], |(_, entries)| entries.as_slice())
+    }
+
     /// Record a copy of `bytes` into resident buffer `key` at `at` (before
     /// work that reads it, after work that used it). Uploads larger than
     /// the ring go in pieces.

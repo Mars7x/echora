@@ -3534,6 +3534,28 @@ impl Nvn {
         } else {
             Vec::new()
         };
+        // ECHORA_DUMP_DISPATCH=<program key>[,...] (debugging): the first
+        // dispatch of each listed program, for the workgroup simulator.
+        if let Some(keys) = super::debug_var_os("ECHORA_DUMP_DISPATCH") {
+            let wanted = keys
+                .to_string_lossy()
+                .split(',')
+                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(key.0));
+            if wanted && self.dumped_dispatches.insert(key.0) {
+                let groups = [command.x[1], command.x[2], command.x[3]].map(|count| count as u32);
+                if let Err(error) = self.dump_dispatch(
+                    core,
+                    key.0,
+                    &stage.spirv,
+                    groups,
+                    &uniforms,
+                    &storage,
+                    page_table,
+                ) {
+                    self.gpu_note(format!("dispatch dump {:016x}: {error}", key.0));
+                }
+            }
+        }
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
             program: &backend.programs[&key],
@@ -3863,6 +3885,129 @@ impl Nvn {
         );
         backend.page_table = Some((key, table));
         Ok(table)
+    }
+
+    /// Write one dispatch's inputs for the workgroup simulator (`cargo run
+    /// -p echora-shader --features sim --example simulate`) under
+    /// ECHORA_DUMP_DIR (default the cache's dispatch-dumps), one directory
+    /// per program: the SPIR-V, the group counts, the push constants, each
+    /// uniform and storage buffer by binding, the page table and the memory
+    /// behind it of every pool the dispatch can name (one its constant
+    /// buffers hold an address in).
+    #[allow(clippy::too_many_arguments)]
+    fn dump_dispatch(
+        &self,
+        core: &Guest,
+        key: u64,
+        spirv: &[u32],
+        groups: [u32; 3],
+        uniforms: &HashMap<u32, Vec<u8>>,
+        storage: &HashMap<u32, Vec<u8>>,
+        page_table: echora_shader_abi::PageTable,
+    ) -> Result<(), String> {
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        let root = match super::debug_var_os("ECHORA_DUMP_DIR") {
+            Some(directory) => std::path::PathBuf::from(directory),
+            None => std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
+                })
+                .ok_or("no cache directory")?
+                .join("echora/dispatch-dumps"),
+        };
+        let directory = root.join(format!("{key:016x}-{}", self.presented_frames));
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let write = |name: String, bytes: &[u8]| {
+            std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
+        };
+        let words: Vec<u8> = spirv.iter().flat_map(|word| word.to_le_bytes()).collect();
+        write("program.spv".into(), &words)?;
+        write(
+            "dispatch.txt".into(),
+            format!(
+                "groups {} {} {}\nsubgroup 32\n",
+                groups[0], groups[1], groups[2]
+            )
+            .as_bytes(),
+        )?;
+        let push = echora_shader_abi::PushConstants {
+            page_table,
+            ..Default::default()
+        };
+        write("push.bin".into(), &push.to_bytes())?;
+        for (binding, bytes) in uniforms {
+            write(format!("uniform-0-{binding}.bin"), bytes)?;
+        }
+        for (binding, bytes) in storage {
+            write(format!("storage-0-{binding}.bin"), bytes)?;
+        }
+        let entries = self.gpu.as_ref().unwrap().renderer.page_table_entries();
+        if page_table.address == 0 || entries.is_empty() {
+            return Ok(());
+        }
+        let table: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        write(format!("memory-{:x}.bin", page_table.address), &table)?;
+        // Pools an address in the constant buffers falls in.
+        let pools: Vec<(u64, u64)> = self
+            .objects
+            .values()
+            .filter(|object| object.kind == "MemoryPool")
+            .filter_map(|pool| {
+                let size = pool.builder.get("Storage")?.x[1];
+                let gpu = pool.state.get("GpuAddress")?.x[0];
+                (gpu != 0 && size != 0).then_some((gpu, size))
+            })
+            .collect();
+        let mut named: Vec<(u64, u64)> = Vec::new();
+        for bytes in uniforms.values() {
+            for word in bytes.chunks_exact(8) {
+                let address = u64::from_le_bytes(word.try_into().unwrap());
+                if let Some(&pool) = pools
+                    .iter()
+                    .find(|&&(gpu, size)| (gpu..gpu + size).contains(&address))
+                    && !named.contains(&pool)
+                {
+                    named.push(pool);
+                }
+            }
+        }
+        let first = u64::from(page_table.first_page);
+        let mut total = 0u64;
+        for (gpu, size) in named {
+            if total + size > 4 << 30 {
+                return Err(format!("pools past 4 GiB; {gpu:#x} (+{size:#x}) left out"));
+            }
+            total += size;
+            let bytes = self.gpu_bytes(core, gpu, size)?;
+            // Runs of pages whose device addresses follow on.
+            let pages = size.div_ceil(PAGE_SIZE);
+            let mut start = 0;
+            while start < pages {
+                let device = |page: u64| {
+                    ((gpu >> PAGE_SHIFT) + page)
+                        .checked_sub(first)
+                        .and_then(|index| entries.get(index as usize))
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let base = device(start);
+                let mut end = start + 1;
+                while end < pages && base != 0 && device(end) == base + (end - start) * PAGE_SIZE {
+                    end += 1;
+                }
+                if base != 0 {
+                    let from = (start * PAGE_SIZE) as usize;
+                    let to = ((end * PAGE_SIZE) as usize).min(bytes.len());
+                    write(format!("memory-{base:x}.bin"), &bytes[from..to])?;
+                }
+                start = end;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn share_new_pools(&mut self, core: &Guest) {

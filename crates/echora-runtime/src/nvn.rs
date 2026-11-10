@@ -288,6 +288,9 @@ pub struct Nvn {
     /// Bumped when a memory pool is initialized or finalized: the GPU page
     /// table is rebuilt only then (and when pools are shared).
     pub(super) pool_epoch: u64,
+    /// Programs whose dispatch ECHORA_DUMP_DISPATCH wrote (debugging).
+    #[serde(skip)]
+    pub(super) dumped_dispatches: std::collections::HashSet<u64>,
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
