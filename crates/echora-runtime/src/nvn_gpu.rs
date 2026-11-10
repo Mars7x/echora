@@ -4731,6 +4731,29 @@ impl Nvn {
             }
         }
 
+        // Each stage's c0 holds every bound storage buffer's address and
+        // size (graphics stage s, slot i at 0x110 + 0x400 * s + 16 * i), as
+        // the driver keeps them: a program that reaches global memory
+        // through the page table reads them there itself, with no storage
+        // binding of its own.
+        let bound_storage: Vec<(u64, u64, u64)> = (0..5u64)
+            .flat_map(|nvn| (0..16u64).map(move |slot| (nvn, slot)))
+            .filter_map(|(nvn, slot)| {
+                let bind = self
+                    .render
+                    .state
+                    .get(&format!("BindStorageBuffer/{nvn}/{slot}"))?;
+                Some((0x110 + 0x400 * nvn + 16 * slot, bind.x[3], bind.x[4]))
+            })
+            .collect();
+        for (index, stage) in stages.iter().enumerate() {
+            if stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE == 0 {
+                continue;
+            }
+            for &(offset, gpu, size) in &bound_storage {
+                storage_entries.push((index, offset as u32, gpu, size));
+            }
+        }
         // Each stage's c0 holds its storage buffers' addresses and sizes,
         // which translated code reads to find offsets in the buffer.
         for (index, offset, gpu, size) in storage_entries {
