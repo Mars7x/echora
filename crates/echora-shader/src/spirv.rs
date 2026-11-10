@@ -123,6 +123,7 @@ pub mod op {
     pub const BIT_REVERSE: u16 = 204;
     pub const BIT_COUNT: u16 = 205;
     pub const CONTROL_BARRIER: u16 = 224;
+    pub const MEMORY_BARRIER: u16 = 225;
     pub const ATOMIC_EXCHANGE: u16 = 229;
     pub const ATOMIC_COMPARE_EXCHANGE: u16 = 230;
     pub const ATOMIC_I_ADD: u16 = 234;

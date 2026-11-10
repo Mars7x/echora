@@ -675,6 +675,16 @@ pub enum Op {
     Bar {
         mode: u8,
     },
+    /// MEMBAR: orders this thread's memory accesses at `scope` (bits
+    /// 76-78, as Mesa's NAK encodes them: 0 CTA, 1 SM, 2 GPU, 3 system).
+    /// Only the plain form (no .MMIO at 72, no other bits but .SC at 80)
+    /// is accepted.
+    Membar {
+        scope: u8,
+    },
+    /// ERRBAR: waits for earlier memory errors to be reported; no
+    /// ordering of its own.
+    Errbar,
     /// BSSY and BSYNC (convergence barriers) and DEPBAR (scoreboard
     /// waits): nothing for a translation that runs each invocation on its
     /// own.
@@ -1529,6 +1539,20 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 count: 1 << word.bits(72, 2),
                 transpose: word.bit(78),
             });
+        }
+        0x992 => {
+            let scope = word.bits(76, 3) as u8;
+            if word.bits(32, 32) != 0 || word.bits(64, 32) & !(7 << 12 | 1 << 16) != 0 || scope > 3
+            {
+                return None;
+            }
+            return Some(Op::Membar { scope });
+        }
+        0x9ab => {
+            if word.bits(32, 64) != 0 {
+                return None;
+            }
+            return Some(Op::Errbar);
         }
         0xb1d => {
             return Some(Op::Bar {

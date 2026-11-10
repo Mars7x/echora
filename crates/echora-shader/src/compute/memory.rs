@@ -43,7 +43,7 @@ const SCOPE_WORKGROUP: u32 = 2;
 /// BAR orders every memory access in the workgroup (as PTX's bar.sync
 /// does): acquire-release over uniform (buffer and physical), workgroup
 /// and image memory.
-const ACQUIRE_RELEASE_WORKGROUP_MEMORY: u32 = 0x8 | 0x40 | 0x100 | 0x800;
+const ACQUIRE_RELEASE_ALL_MEMORY: u32 = 0x8 | 0x40 | 0x100 | 0x800;
 
 /// Words a load or store of memory type `size` moves (a sub-word access
 /// moves the word that holds it).
@@ -79,12 +79,25 @@ impl Emitter {
     /// A workgroup barrier that also orders shared memory.
     pub(super) fn barrier(&mut self) {
         let scope = self.constant(SCOPE_WORKGROUP);
-        let semantics = self.constant(ACQUIRE_RELEASE_WORKGROUP_MEMORY);
+        let semantics = self.constant(ACQUIRE_RELEASE_ALL_MEMORY);
         self.function
             .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// MEMBAR: a memory barrier over every kind of memory, at the
+    /// workgroup for CTA and SM scope, the device for GPU and system scope
+    /// (Vulkan has nothing wider than the device).
+    pub(super) fn memory_barrier(&mut self, scope: u8) {
+        let scope = self.constant(if scope < 2 {
+            SCOPE_WORKGROUP
+        } else {
+            SCOPE_DEVICE
+        });
+        let semantics = self.constant(ACQUIRE_RELEASE_ALL_MEMORY);
+        self.function.emit(op::MEMORY_BARRIER, &[scope, semantics]);
+    }
+
     pub(super) fn load(
         &mut self,
         index: usize,

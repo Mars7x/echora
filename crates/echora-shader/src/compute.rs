@@ -2290,7 +2290,8 @@ impl Emitter {
                 }
                 self.barrier();
             }
-            Op::Bssy | Op::Bsync | Op::Depbar => {}
+            Op::Membar { scope } => self.memory_barrier(scope),
+            Op::Bssy | Op::Bsync | Op::Depbar | Op::Errbar => {}
             Op::Bra { .. } | Op::Exit | Op::Brx { .. } | Op::Call { .. } | Op::Ret { .. } => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
@@ -3372,6 +3373,21 @@ mod tests {
         assert!(!code[5].uniform && !code[6].uniform);
         let translated = valid(&words);
         assert!(translated.descriptors.is_empty());
+    }
+
+    #[test]
+    fn memory_barriers_validate() {
+        // MEMBAR.SC.CTA; MEMBAR.SC.GPU; MEMBAR.SC.SYS; ERRBAR
+        let membar = |scope: u128| word(&[(0, 12, 0x992), (76, 3, scope)]);
+        valid(&[
+            membar(0),
+            membar(2),
+            membar(3),
+            word(&[(0, 12, 0x9ab)]),
+            EXIT,
+        ]);
+        // .MMIO is refused.
+        assert!(matches!(decode(membar(2) | 1 << 72).op, Op::Unknown { .. }));
     }
 
     #[test]
