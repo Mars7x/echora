@@ -670,6 +670,36 @@ mod tests {
     }
 
     #[test]
+    fn fragment_pool_samples_take_their_level_before_the_integer_branch() {
+        // TEX.B R4, R0 (x, y), R2 (handle), 2D, 0xf, implicit level
+        let mut program = header(2, 5, &[]);
+        program.extend(bytes(&[
+            word(&[
+                (0, 12, 0x361),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 2),
+                (59, 1, 1),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 0xf),
+                (81, 3, 7),
+            ]),
+            EXIT,
+        ]));
+        let translated = validated(&program);
+        // OpImageQueryLod (105) once, and no implicit-level sample (87).
+        let mut opcodes = Vec::new();
+        let mut at = 5;
+        while at < translated.spirv.len() {
+            opcodes.push(translated.spirv[at] & 0xffff);
+            at += ((translated.spirv[at] >> 16) as usize).max(1);
+        }
+        assert_eq!(opcodes.iter().filter(|&&opcode| opcode == 105).count(), 1);
+        assert!(!opcodes.contains(&87));
+    }
+
+    #[test]
     fn graphics_and_endless_programs_are_unsupported() {
         // A geometry program is not translated yet.
         let geometry = header(1, 4, &[]);

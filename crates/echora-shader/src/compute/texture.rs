@@ -685,6 +685,23 @@ impl Emitter {
             let words: Vec<u32> = (0..4)
                 .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
                 .collect();
+            // An implicit level needs derivatives, which a branch on the
+            // integer flag may not keep: the level a sample would use is
+            // queried before it (plus the bias) and both views sample at it
+            // explicitly.
+            let level = (implicit && texture.op == TextureOp::Sample).then(|| {
+                self.module.capability(capability::IMAGE_QUERY);
+                let vec2 = self.module.ty(Type::Vector {
+                    component: self.f32,
+                    count: 2,
+                });
+                let query = self.value(op::IMAGE_QUERY_LOD, vec2, &[sampled, coordinate]);
+                let mut level = self.value(op::COMPOSITE_EXTRACT, self.f32, &[query, 0]);
+                if mask & OPERAND_BIAS != 0 {
+                    level = self.value(op::F_ADD, self.f32, &[level, operands[0]]);
+                }
+                level
+            });
             self.choose(views.integer, |e, integer| {
                 let (binding, (sampled_type, image_type), ty) = if integer {
                     (views.uint_binding, views.uint_types, uvec4)
@@ -713,15 +730,22 @@ impl Emitter {
                             &image_operands(vec![sampled, coordinate, component]),
                         )
                     }
-                    _ => e.value(
-                        if implicit {
-                            op::IMAGE_SAMPLE_IMPLICIT_LOD
-                        } else {
-                            op::IMAGE_SAMPLE_EXPLICIT_LOD
-                        },
-                        ty,
-                        &image_operands(vec![sampled, coordinate]),
-                    ),
+                    _ => match level {
+                        Some(level) => e.value(
+                            op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                            ty,
+                            &[sampled, coordinate, OPERAND_LOD, level],
+                        ),
+                        None => e.value(
+                            if implicit {
+                                op::IMAGE_SAMPLE_IMPLICIT_LOD
+                            } else {
+                                op::IMAGE_SAMPLE_EXPLICIT_LOD
+                            },
+                            ty,
+                            &image_operands(vec![sampled, coordinate]),
+                        ),
+                    },
                 };
                 for (n, &word) in words.iter().enumerate() {
                     let value = if integer {
