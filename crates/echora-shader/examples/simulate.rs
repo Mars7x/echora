@@ -13,14 +13,20 @@
 //! - `push.bin`: the push constants' bytes;
 //! - `uniform-SET-BINDING.bin`: each bound uniform buffer's bytes;
 //! - `memory-ADDRESS.bin` (ADDRESS in hex, no 0x): device memory from that
-//!   address: the page table and every page the dispatch may touch.
+//!   address: the page table and every page the dispatch may touch;
+//! - `image-SET-BINDING.txt` (`WIDTH HEIGHT DEPTH LAYERS`) and
+//!   `image-SET-BINDING.bin`: a bound texture's or image's level 0, layers
+//!   (or 3D slices) one after another, each texel four little-endian u32:
+//!   the components as the shader reads them (float bits for float, unorm
+//!   and snorm formats, integers for integer ones; missing ones 0, 0, 0,
+//!   1). Textures and images without these read as zeros.
 //!
 //! Each X,Y,Z argument names a workgroup to run (default 0,0,0).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use echora_shader::sim::{Inputs, Machine};
+use echora_shader::sim::{Image, Inputs, Machine};
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -62,6 +68,7 @@ fn main() {
     }
     let mut uniforms = HashMap::new();
     let mut memory = BTreeMap::new();
+    let mut images = HashMap::new();
     for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = name.strip_suffix(".bin") else {
@@ -75,6 +82,44 @@ fn main() {
             if let [set, binding] = parts[..] {
                 uniforms.insert((set, binding), read(&name));
             }
+        } else if let Some(key) = stem.strip_prefix("image-") {
+            let parts: Vec<u32> = key
+                .split('-')
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            let header = String::from_utf8_lossy(&read(&format!("image-{key}.txt"))).into_owned();
+            let size: Vec<u32> = header
+                .split_whitespace()
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            if let ([set, binding], [width, height, depth, layers]) = (&parts[..], &size[..]) {
+                let texels = read(&name)
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|texel| {
+                        let word = |n: usize| {
+                            u32::from_le_bytes([
+                                texel[4 * n],
+                                texel[4 * n + 1],
+                                texel[4 * n + 2],
+                                texel[4 * n + 3],
+                            ])
+                        };
+                        [word(0), word(1), word(2), word(3)]
+                    })
+                    .collect();
+                images.insert(
+                    (*set, *binding),
+                    Image {
+                        width: *width,
+                        height: *height,
+                        depth: *depth,
+                        layers: *layers,
+                        texels,
+                    },
+                );
+            }
         } else if let Some(Ok(address)) = stem
             .strip_prefix("memory-")
             .map(|address| u64::from_str_radix(address, 16))
@@ -84,6 +129,7 @@ fn main() {
     }
     inputs.uniforms = uniforms;
     inputs.memory = memory;
+    inputs.images = images;
     let machine = Machine::new(&words);
     let groups: Vec<[u32; 3]> = if arguments.len() > 1 {
         arguments[1..]

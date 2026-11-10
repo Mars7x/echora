@@ -250,7 +250,11 @@ deadlock) or after other invocations returned, reads and writes outside
 the dumped memory (faults), indices past an array, shuffles from lanes
 not running there, and uses of what SPIR-V leaves undefined. The
 `simulate` example runs it on a dump directory (its documentation gives
-the format).
+the format). Bound textures and images come from dumped level-0 texels:
+fetches and storage reads and writes are exact, samples are nearest at
+level 0 (enough for control flow), gathers take the four texels around
+the point; depth comparisons, level queries and texture pool entries
+read zeros.
 
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is

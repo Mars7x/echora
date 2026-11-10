@@ -87,6 +87,16 @@ enum Ty {
         rows: u32,
         columns: u32,
     },
+    /// An image (dim 0 1D, 1 2D, 2 3D, 3 cube, 5 buffer), a sampled image
+    /// of one, a sampler.
+    Image {
+        dim: u32,
+        arrayed: bool,
+    },
+    SampledImage {
+        image: u32,
+    },
+    Sampler,
     Other,
 }
 
@@ -127,9 +137,56 @@ pub struct Inputs {
     pub uniforms: HashMap<(u32, u32), Vec<u8>>,
     /// Device memory: regions by their first address.
     pub memory: BTreeMap<u64, Vec<u8>>,
+    /// Bound textures and images by (descriptor set, binding).
+    pub images: HashMap<(u32, u32), Image>,
     /// Iterations of one loop by one invocation that count as running
     /// away (1 << 16 when 0).
     pub loop_limit: u32,
+}
+
+/// A texture's or image's level 0: `layers` layers (or a 3D image's
+/// `depth` slices) of `width` x `height` texels, each the four components
+/// as the shader reads them (float bits, or integers).
+#[derive(Clone, Debug, Default)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub layers: u32,
+    pub texels: Vec<[u32; 4]>,
+}
+
+impl Image {
+    fn slices(&self) -> u32 {
+        self.depth.max(1) * self.layers.max(1)
+    }
+
+    fn index(&self, x: usize, y: usize, z: usize) -> usize {
+        (z * self.height.max(1) as usize + y) * self.width.max(1) as usize + x
+    }
+
+    /// The texel at (x, y, z), each clamped to the image.
+    fn texel(&self, x: i64, y: i64, z: i64) -> [u32; 4] {
+        let clamp = |value: i64, size: u32| value.clamp(0, i64::from(size.max(1)) - 1) as usize;
+        let (x, y, z) = (
+            clamp(x, self.width),
+            clamp(y, self.height),
+            clamp(z, self.slices()),
+        );
+        self.texels
+            .get(self.index(x, y, z))
+            .copied()
+            .unwrap_or([0, 0, 0, 0])
+    }
+
+    fn texel_mut(&mut self, x: i64, y: i64, z: i64) -> Option<&mut [u32; 4]> {
+        let inside = |value: i64, size: u32| (0..i64::from(size.max(1))).contains(&value);
+        if !(inside(x, self.width) && inside(y, self.height) && inside(z, self.slices())) {
+            return None;
+        }
+        let at = self.index(x as usize, y as usize, z as usize);
+        self.texels.get_mut(at)
+    }
 }
 
 /// What a workgroup's run left.
@@ -147,6 +204,8 @@ pub struct Report {
     pub notes: Vec<String>,
     /// Device memory after the run.
     pub memory: BTreeMap<u64, Vec<u8>>,
+    /// The images after the run.
+    pub images: HashMap<(u32, u32), Image>,
     /// Where each invocation ended: the index of the instruction (in the
     /// entry function) it returned at, or stopped at on a problem.
     pub ends: Vec<usize>,
@@ -199,6 +258,7 @@ struct Invocation {
 struct Shared {
     variables: HashMap<u32, Value>,
     memory: BTreeMap<u64, Vec<u8>>,
+    images: HashMap<(u32, u32), Image>,
     problems: Vec<String>,
     notes: Vec<String>,
     loop_limit: u32,
@@ -466,7 +526,24 @@ impl Machine {
                         },
                     );
                 }
-                op::TYPE_FUNCTION | op::TYPE_IMAGE | op::TYPE_SAMPLER | op::TYPE_SAMPLED_IMAGE => {
+                op::TYPE_IMAGE => {
+                    machine.types.insert(
+                        operands[0],
+                        Ty::Image {
+                            dim: operands[2],
+                            arrayed: operands[4] != 0,
+                        },
+                    );
+                }
+                op::TYPE_SAMPLED_IMAGE => {
+                    machine
+                        .types
+                        .insert(operands[0], Ty::SampledImage { image: operands[1] });
+                }
+                op::TYPE_SAMPLER => {
+                    machine.types.insert(operands[0], Ty::Sampler);
+                }
+                op::TYPE_FUNCTION => {
                     machine.types.insert(operands[0], Ty::Other);
                 }
                 op::CONSTANT | op::SPEC_CONSTANT => {
@@ -748,6 +825,7 @@ impl Machine {
         let mut shared = Shared {
             variables: HashMap::new(),
             memory: inputs.memory.clone(),
+            images: inputs.images.clone(),
             problems: Vec::new(),
             notes: Vec::new(),
             loop_limit: if inputs.loop_limit == 0 {
@@ -873,6 +951,7 @@ impl Machine {
             problems: shared.problems,
             notes: shared.notes,
             memory: shared.memory,
+            images: shared.images,
         }
     }
 
@@ -1181,6 +1260,107 @@ impl Machine {
         Some((id, ty, result))
     }
 
+    /// The (descriptor set, binding) of a handle's bound texture or image
+    /// (not a texture pool entry).
+    fn bound_image(&self, handle: &Value) -> Option<(u32, u32)> {
+        let variable = *handle.first()? as u32;
+        let is_array = self.globals.iter().any(|&(id, pointer, _)| {
+            id == variable
+                && matches!(self.ty(pointer), Ty::Pointer { pointee }
+                    if matches!(self.ty(pointee), Ty::RuntimeArray { .. } | Ty::Array { .. }))
+        });
+        if is_array {
+            return None;
+        }
+        Some((
+            self.sets.get(&variable).copied().unwrap_or(0),
+            *self.bindings.get(&variable)?,
+        ))
+    }
+
+    /// An image type's dimension and arrayed flag (through a sampled
+    /// image type).
+    fn image_shape(&self, ty: u32) -> (u32, bool) {
+        match self.ty(ty) {
+            Ty::Image { dim, arrayed } => (dim, arrayed),
+            Ty::SampledImage { image } => self.image_shape(image),
+            _ => (1, false),
+        }
+    }
+
+    /// Integer coordinates (x, y, then z or the layer).
+    fn integer_coordinates(&self, image_type: u32, coordinate: &Value) -> [i64; 3] {
+        let get = |n: usize| coordinate.get(n).map_or(0, |&v| i64::from(v as u32 as i32));
+        match self.image_shape(image_type) {
+            (0 | 5, false) => [get(0), 0, 0],
+            (0, true) => [get(0), 0, get(1)],
+            (1, false) => [get(0), get(1), 0],
+            _ => [get(0), get(1), get(2)],
+        }
+    }
+
+    /// A read of `image`: a fetch, a nearest sample (level 0, clamped to
+    /// the edge), a gather of `component`, a storage read, or a query.
+    fn image_read(
+        &self,
+        opcode: u16,
+        image_type: u32,
+        image: &Image,
+        coordinate: &Value,
+        component: usize,
+        ty: u32,
+    ) -> Value {
+        let (dim, arrayed) = self.image_shape(image_type);
+        let size = self.size(ty);
+        let words = |texel: [u32; 4]| texel.iter().take(size).map(|&w| u64::from(w)).collect();
+        let float = |n: usize| {
+            f64::from(f32::from_bits(
+                coordinate.get(n).copied().unwrap_or(0) as u32
+            ))
+        };
+        match opcode {
+            op::IMAGE_QUERY_SIZE_LOD => {
+                let mut sizes = vec![u64::from(image.width)];
+                if dim != 0 && dim != 5 {
+                    sizes.push(u64::from(image.height));
+                }
+                if dim == 2 {
+                    sizes.push(u64::from(image.depth));
+                }
+                if arrayed {
+                    sizes.push(u64::from(image.layers));
+                }
+                sizes.truncate(size.max(1));
+                sizes
+            }
+            op::IMAGE_QUERY_LEVELS => vec![1],
+            op::IMAGE_FETCH | op::IMAGE_READ => {
+                let [x, y, z] = self.integer_coordinates(image_type, coordinate);
+                words(image.texel(x, y, z))
+            }
+            _ => {
+                // Normalized coordinates; an array's layer is a float index.
+                let scaled = |n: usize, extent: u32| float(n) * f64::from(extent.max(1));
+                let (u, v) = (scaled(0, image.width), scaled(1, image.height));
+                let z = match (dim, arrayed) {
+                    (1, true) => float(2).round_ties_even() as i64,
+                    (0, true) => float(1).round_ties_even() as i64,
+                    (2, _) => scaled(2, image.depth).floor() as i64,
+                    _ => 0,
+                };
+                if opcode == op::IMAGE_GATHER {
+                    let (i0, j0) = ((u - 0.5).floor() as i64, (v - 0.5).floor() as i64);
+                    [(i0, j0 + 1), (i0 + 1, j0 + 1), (i0 + 1, j0), (i0, j0)]
+                        .iter()
+                        .map(|&(i, j)| u64::from(image.texel(i, j, z)[component.min(3)]))
+                        .collect()
+                } else {
+                    words(image.texel(u.floor() as i64, v.floor() as i64, z))
+                }
+            }
+        }
+    }
+
     fn matrix_columns(&self, ty: u32) -> usize {
         match self.ty(ty) {
             Ty::Matrix { columns, .. } => columns as usize,
@@ -1364,7 +1544,27 @@ impl Machine {
                 }
                 op::FUNCTION_CALL => panic!("the simulator does not call functions"),
                 op::IMAGE_WRITE => {
-                    shared.note("image writes are dropped (no image data)");
+                    let coordinate = invocation.values[&operands[1]].clone();
+                    let texel = invocation.values[&operands[2]].clone();
+                    let image_type = invocation.value_types[&operands[0]];
+                    let handle = invocation.values[&operands[0]].clone();
+                    match self.bound_image(&handle) {
+                        Some(key) if shared.images.contains_key(&key) => {
+                            let [x, y, z] = self.integer_coordinates(image_type, &coordinate);
+                            let image = shared.images.get_mut(&key).expect("checked");
+                            match image.texel_mut(x, y, z) {
+                                Some(target) => {
+                                    for (n, slot) in target.iter_mut().enumerate() {
+                                        *slot = texel.get(n).copied().unwrap_or(0) as u32;
+                                    }
+                                }
+                                None => shared.problem(format!(
+                                    "image write at ({x}, {y}, {z}) outside the image at {key:?}"
+                                )),
+                            }
+                        }
+                        _ => shared.note("writes to images without dumped data are dropped"),
+                    }
                     continue;
                 }
                 _ => {}
@@ -1374,22 +1574,57 @@ impl Machine {
             let values = &invocation.values;
             let value = |n: usize| values[&args[n]].clone();
             let result: Value = match opcode {
-                // Images, samplers and sampled images: placeholders (their
-                // reads give zeros).
-                op::LOAD if self.ty(ty) == Ty::Other => vec![0],
-                op::SAMPLED_IMAGE | op::IMAGE => vec![0],
+                // Images, samplers and sampled images: a handle, the
+                // variable and the element (a texture pool's entry).
+                op::LOAD
+                    if matches!(
+                        self.ty(ty),
+                        Ty::Image { .. } | Ty::SampledImage { .. } | Ty::Sampler | Ty::Other
+                    ) =>
+                {
+                    match invocation.pointers[&args[0]] {
+                        Pointer::Logical {
+                            variable, offset, ..
+                        } => vec![u64::from(variable), offset as u64],
+                        Pointer::Physical { .. } => vec![0, 0],
+                    }
+                }
+                op::SAMPLED_IMAGE | op::IMAGE => value(0),
                 op::IMAGE_SAMPLE_IMPLICIT_LOD
                 | op::IMAGE_SAMPLE_EXPLICIT_LOD
-                | op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
-                | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
                 | op::IMAGE_FETCH
                 | op::IMAGE_GATHER
-                | op::IMAGE_DREF_GATHER
                 | op::IMAGE_READ
                 | op::IMAGE_QUERY_SIZE_LOD
-                | op::IMAGE_QUERY_LEVELS
+                | op::IMAGE_QUERY_LEVELS => {
+                    let image_type = invocation.value_types[&args[0]];
+                    let image = self
+                        .bound_image(&value(0))
+                        .and_then(|key| shared.images.get(&key).cloned());
+                    match image {
+                        Some(image) => {
+                            let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
+                            let component = if opcode == op::IMAGE_GATHER {
+                                value(2)[0] as usize
+                            } else {
+                                0
+                            };
+                            self.image_read(opcode, image_type, &image, &coordinate, component, ty)
+                        }
+                        None => {
+                            shared.note(
+                                "reads of textures without dumped data (and texture pool \
+                                 entries) give zeros",
+                            );
+                            vec![0; self.size(ty)]
+                        }
+                    }
+                }
+                op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                | op::IMAGE_DREF_GATHER
                 | op::IMAGE_QUERY_LOD => {
-                    shared.note("texture and image reads give zeros (no image data)");
+                    shared.note("depth comparisons and level queries give zeros");
                     vec![0; self.size(ty)]
                 }
                 op::LOAD => {
@@ -2496,5 +2731,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn storage_images_read_and_write_the_dumped_texels() {
+        // SULD.P.2D R4, [R0] (x = 1, y = 2), 0xf; MOV R0, 3;
+        // SUST.P.2D [R0], R4, 0xf: texel (1, 2) copied to (3, 2).
+        let surface = |store: bool, data: u128| {
+            word(&[
+                (0, 12, if store { 0xb9b } else { 0xb97 }),
+                (16, 8, if store { 0 } else { data }),
+                (24, 8, 0),
+                (32, 8, if store { data } else { 0 }),
+                (40, 14, 0x18),
+                (54, 5, 0),
+                (61, 3, 3),
+                (72, 4, 0xf),
+                (81, 3, if store { 0 } else { 7 }),
+            ])
+        };
+        let program = [
+            mov(0, 1),
+            mov(1, 2),
+            surface(false, 4),
+            mov(0, 3),
+            surface(true, 4),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let translated = crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let image = translated.descriptors.iter().find(|d| d.kind == 5).unwrap();
+        let texels = (0..16u32).map(|n| [n, n + 100, n + 200, n + 300]).collect();
+        let inputs = Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([(
+                (0, image.binding),
+                Image {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    layers: 1,
+                    texels,
+                },
+            )]),
+            ..Inputs::default()
+        };
+        let report = Machine::new(&translated.spirv).simulate(&inputs);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let result = &report.images[&(0, image.binding)];
+        assert_eq!(result.texels[2 * 4 + 3], [9, 109, 209, 309]);
     }
 }
