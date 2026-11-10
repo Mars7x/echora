@@ -950,10 +950,10 @@ impl Emitter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// `block_sum`'s arithmetic step by step on the CPU (the SPIR-V is
     /// validated, not run, by the tests).
-    fn block_sum(accumulator: f32, products: &[f32], odd: bool) -> f32 {
+    pub(crate) fn block_sum(accumulator: f32, products: &[f32], odd: bool) -> f32 {
         let addends: Vec<f32> = std::iter::once(accumulator)
             .chain(products.iter().copied())
             .collect();

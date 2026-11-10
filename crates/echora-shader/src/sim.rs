@@ -4753,6 +4753,134 @@ mod tests {
     }
 
     #[test]
+    fn exact_matrix_multiplies_match_the_tensor_core_model() {
+        use crate::compute::MatrixPath;
+        use crate::compute::matrix::tests::block_sum;
+        // Halves with exponents from 2^-10 to 2^10 (so alignment truncates)
+        // from a sequence, by matrix and position.
+        let half = |seed: u64, at: u64| -> u16 {
+            let mut state =
+                seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ at.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            state ^= state >> 29;
+            state = state.wrapping_mul(0x94d0_49bb_1331_11eb);
+            state ^= state >> 32;
+            let exponent = 5 + (state >> 20) % 21;
+            ((state >> 8) as u16 & 0x8000) | (exponent as u16) << 10 | (state as u16 & 0x3ff)
+        };
+        let value = |h: u16| f16_to_f32(h);
+        for k16 in [true, false] {
+            for single in [true, false] {
+                let depth = if k16 { 16 } else { 8 };
+                let a = |row: usize, k: usize| half(1, (row * 16 + k) as u64);
+                let b =
+                    |n: usize, k: usize, column: usize| half(2 + n as u64, (k * 8 + column) as u64);
+                let c = |n: usize, row: usize, column: usize| {
+                    half(4 + n as u64, (row * 8 + column) as u64)
+                };
+                let hmma = |d: u128, b: u128, c: u128| {
+                    word(&[
+                        (0, 12, 0x23c),
+                        (16, 8, d),
+                        (24, 8, 0),
+                        (32, 8, b),
+                        (64, 8, c),
+                        (75, 1, u128::from(k16)),
+                        (76, 1, u128::from(single)),
+                    ])
+                };
+                // A in R0-R3; B in R4-R5 and R6-R7; C from R8 and R12; D
+                // from R16 and R20.
+                let program = [hmma(16, 4, 8), hmma(20, 6, 12), EXIT];
+                let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+                let layout = Layout {
+                    matrices: MatrixPath::Exact,
+                    ..Layout::workgroup([32, 1, 1])
+                };
+                let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+                let pair = |low: u16, high: u16| u64::from(low) | u64::from(high) << 16;
+                let initial = |lane: usize| {
+                    let (g, t) = (lane / 4, lane % 4);
+                    let mut values: HashMap<u8, u64> = HashMap::new();
+                    for j in 0..depth / 4 {
+                        let row = g + 8 * (j & 1);
+                        let k = 2 * t + 8 * (j >> 1);
+                        values.insert(j as u8, pair(a(row, k), a(row, k + 1)));
+                    }
+                    for n in 0..2 {
+                        for j in 0..depth / 8 {
+                            let k = 2 * t + 8 * j;
+                            values.insert((4 + 2 * n + j) as u8, pair(b(n, k, g), b(n, k + 1, g)));
+                        }
+                        for i in 0..4 {
+                            let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                            let h = c(n, row, column);
+                            if single {
+                                values.insert((8 + 4 * n + i) as u8, u64::from(value(h).to_bits()));
+                            } else {
+                                let register = (8 + 4 * n + i / 2) as u8;
+                                let old = values.get(&register).copied().unwrap_or(0);
+                                values.insert(register, old | u64::from(h) << (16 * (i & 1)));
+                            }
+                        }
+                    }
+                    values
+                        .into_iter()
+                        .filter_map(|(register, value)| {
+                            registers
+                                .get(&register)
+                                .map(|&variable| (variable, vec![value]))
+                        })
+                        .collect()
+                };
+                let report = Machine::new(&translated.spirv).run_workgroup_with(
+                    32,
+                    32,
+                    |lane| {
+                        HashMap::from([
+                            (27, vec![lane as u64, 0, 0]),
+                            (29, vec![lane as u64]),
+                            (40, vec![0]),
+                            (41, vec![lane as u64]),
+                        ])
+                    },
+                    initial,
+                );
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                for (lane, variables) in report.invocations.iter().enumerate() {
+                    let (g, t) = (lane / 4, lane % 4);
+                    let register = |n: u8| variables[&registers[&n]][0] as u32;
+                    for n in 0..2 {
+                        for i in 0..4 {
+                            let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                            let blocks = depth / 8;
+                            let mut sum = value(c(n, row, column));
+                            for m in 0..blocks {
+                                let products: Vec<f32> = (8 * m..8 * m + 8)
+                                    .map(|k| value(a(row, k)) * value(b(n, k, column)))
+                                    .collect();
+                                sum = block_sum(sum, &products, !single && m + 1 == blocks);
+                            }
+                            let (got, expected) = if single {
+                                (register((16 + 4 * n + i) as u8), sum.to_bits())
+                            } else {
+                                let word = register((16 + 4 * n + i / 2) as u8);
+                                (
+                                    word >> (16 * (i & 1)) & 0xffff,
+                                    u32::from(f64_to_f16(f64::from(sum))),
+                                )
+                            };
+                            assert_eq!(
+                                got, expected,
+                                "k16 {k16} single {single} lane {lane} D{n}[{i}]"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {

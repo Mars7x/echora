@@ -249,7 +249,7 @@ mod fetch;
 mod half;
 mod image;
 mod io;
-mod matrix;
+pub(crate) mod matrix;
 mod memory;
 mod mesh;
 mod structure;
