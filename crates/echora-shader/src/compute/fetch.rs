@@ -341,13 +341,16 @@ impl Emitter {
         let raw_f = self.value(op::CONVERT_U_TO_F, self.f32, &[raw]);
         let unorm = self.value(op::F_DIV, self.f32, &[raw_f, largest_f]);
         let unorm = as_float(self, unorm);
-        let below = self.value(op::I_SUB, self.u32, &[bits, one]);
+        // (A 0-bit component, the packed 11/11/10's fourth, still gives a
+        // defined count.)
+        let at_least_one = self.glsl(self.u32, glsl::U_MAX, &[bits, one]);
+        let below = self.value(op::I_SUB, self.u32, &[at_least_one, one]);
         let largest_s = self.value(op::BIT_FIELD_U_EXTRACT, self.u32, &[all, zero, below]);
         let largest_s = self.value(op::CONVERT_U_TO_F, self.f32, &[largest_s]);
         let signed_f = self.value(op::CONVERT_S_TO_F, self.f32, &[signed]);
         let snorm = self.value(op::F_DIV, self.f32, &[signed_f, largest_s]);
         let minus_one = self.float_constant(-1.0);
-        let snorm = self.glsl(self.f32, glsl::F_MAX, &[snorm, minus_one]);
+        let snorm = self.glsl(self.f32, glsl::N_MAX, &[snorm, minus_one]);
         let snorm = as_float(self, snorm);
         let uscaled = as_float(self, raw_f);
         let sscaled = as_float(self, signed_f);
@@ -380,7 +383,11 @@ impl Emitter {
 
     /// An unsigned 11- or 10-bit float (five exponent bits) as float bits.
     fn small_float(&mut self, raw: u32, bits: u32) -> u32 {
-        let five = self.constant(5);
+        // Every format computes this (only 11 and 10 bits pick it): the
+        // width clamped to 5-11 so each shift stays defined.
+        let (five, eleven) = (self.constant(5), self.constant(11));
+        let bits = self.glsl(self.u32, glsl::U_MIN, &[bits, eleven]);
+        let bits = self.glsl(self.u32, glsl::U_MAX, &[bits, five]);
         let mantissa_bits = self.value(op::I_SUB, self.u32, &[bits, five]);
         let exponent = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[raw, mantissa_bits]);
         let zero = self.constant(0);
