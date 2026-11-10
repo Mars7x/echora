@@ -4479,6 +4479,15 @@ impl Nvn {
             backend.programs.insert(keys, program);
         }
 
+        // ECHORA_GPU_SKIP_DRAW=<stage key>[,...] (debugging): draws whose
+        // program has one of those stages are not recorded.
+        if super::debug_var("ECHORA_GPU_SKIP_DRAW").is_ok_and(|skipped| {
+            skipped.split(',').any(|skip| {
+                skip == format!("{:016x}", keys.0) || skip == format!("{:016x}", keys.1)
+            })
+        }) {
+            return Ok(());
+        }
         let keys_for_note = [keys.0, keys.1];
         // Bindings, through the inferred map.
         let mut uniforms = HashMap::new();
