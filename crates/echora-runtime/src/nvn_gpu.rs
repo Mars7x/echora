@@ -6218,10 +6218,20 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
+                vertex_fetch
+                    .iter()
+                    .map(|entry| (
+                        entry.address,
+                        entry.stride,
+                        entry.divisor,
+                        entry.format,
+                        entry.size
+                    ))
+                    .collect::<Vec<_>>(),
                 mesh_groups,
                 depth,
                 fixed.depth_test,
