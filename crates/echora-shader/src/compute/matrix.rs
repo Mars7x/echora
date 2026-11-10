@@ -604,7 +604,8 @@ impl Emitter {
                 &[subgroup, value, source],
             )
         };
-        // Each output's products, in k order.
+        // Each output's products, in k order (for the exact sums).
+        let exact = self.layout.matrices == super::MatrixPath::Exact;
         let mut products: [Vec<u32>; 4] = Default::default();
         for pair in 0..if k16 { 8u32 } else { 4 } {
             // k = 8 * upper + 2 * source + h, h the half.
@@ -630,21 +631,25 @@ impl Emitter {
             ];
             for (output, x0, y0, x1, y1) in terms {
                 for (x, y) in [(x0, y0), (x1, y1)] {
-                    let product = self.exact(op::F_MUL, &[x, y]);
-                    products[output].push(product);
+                    if exact {
+                        let product = self.exact(op::F_MUL, &[x, y]);
+                        products[output].push(product);
+                    } else {
+                        // A product of two halves is exact in 32 bits, so a
+                        // fused multiply-add rounds as the add after it would
+                        // (fused or not, the result is the same).
+                        accumulator[output] =
+                            self.glsl(self.f32, glsl::FMA, &[x, y, accumulator[output]]);
+                    }
                 }
             }
         }
-        for (output, products) in products.iter().enumerate() {
-            if self.layout.matrices == super::MatrixPath::Exact {
+        if exact {
+            for (output, products) in products.iter().enumerate() {
                 let blocks: Vec<&[u32]> = products.chunks(8).collect();
                 for (n, block) in blocks.iter().enumerate() {
                     let odd = !single && n + 1 == blocks.len();
                     accumulator[output] = self.block_sum(accumulator[output], block, odd);
-                }
-            } else {
-                for &product in products {
-                    accumulator[output] = self.exact(op::F_ADD, &[accumulator[output], product]);
                 }
             }
         }
