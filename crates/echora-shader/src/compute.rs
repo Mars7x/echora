@@ -353,7 +353,7 @@ pub enum MatrixPath {
     #[default]
     Subgroup,
     /// Cooperative matrices (VK_KHR_cooperative_matrix, 16x16x16 at
-    /// subgroup scope) for HMMA.16816, the subgroup path otherwise.
+    /// subgroup scope) for HMMA.16816 and HMMA.1688 (K padded by zeros).
     Cooperative,
     /// The subgroup path with the tensor cores' published arithmetic
     /// (block sums aligned and truncated; see `compute::matrix`).

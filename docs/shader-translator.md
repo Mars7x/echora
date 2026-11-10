@@ -202,12 +202,14 @@ end. Published measurements of NVIDIA's tensor cores (Fasi, Higham,
 Mikaitis and Pranesh, 2021) show an internal summation that aligns and
 truncates, so the last bits of a long sum can differ from the hardware.
 With cooperative matrices (`MatrixPath::Cooperative`,
-VK_KHR_cooperative_matrix at 16x16x16 and subgroup scope), HMMA.16816
+VK_KHR_cooperative_matrix at 16x16x16 and subgroup scope), HMMA
 instead writes the lanes' fragments to per-warp workgroup scratch in the
-PTX layout (B's upper eight columns zero), multiplies with
+PTX layout (B's upper eight columns zero; for HMMA.1688 A's columns 8-15
+and B's rows 8-15 zero too, which leaves the 16x8x8 product exactly),
+multiplies with
 OpCooperativeMatrixMulAddKHR (a half or 32-bit accumulator) and reads D
 back; the device's matrix units then decide the summation's rounding.
-Two HMMA.16816s in a row that share A and the accumulator type (both
+Two HMMAs in a row (both HMMA.16816 or both HMMA.1688) that share A and the accumulator type (both
 unguarded, in one block, the second reading nothing the first writes)
 run as one multiply: the second's B and C fill columns 8-15 and its D is
 read from there, halving the multiplies and the scratch traffic.

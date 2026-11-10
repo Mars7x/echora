@@ -46,7 +46,7 @@ const BUILTIN_SUBGROUP_ID: u32 = 40;
 /// OpFConvert.
 const F_CONVERT: u16 = 115;
 
-/// HMMA.16816s run in pairs on one 16x16x16 multiply: two in a row in a
+/// HMMAs (both HMMA.16816 or both HMMA.1688) run in pairs on one 16x16x16 multiply: two in a row in a
 /// block, both unguarded, with the same A and accumulator type, the second
 /// reading nothing the first writes (its d is not among the second's a, b
 /// and c registers). The first's index maps to the second's (d, b, c).
@@ -78,21 +78,18 @@ pub(super) fn pairs(code: &[Instruction], blocks: &[Block]) -> Pairs {
         let paired = match (first.op, second.op) {
             (
                 Op::Hmma {
-                    d,
-                    a,
-                    k16: true,
-                    single,
-                    ..
+                    d, a, k16, single, ..
                 },
                 Op::Hmma {
                     a: a2,
                     b: b2,
                     c: c2,
-                    k16: true,
+                    k16: k16_2,
                     single: single2,
                     ..
                 },
             ) if a == a2
+                && k16 == k16_2
                 && single == single2
                 && first.guard.is_true()
                 && second.guard.is_true()
@@ -207,7 +204,7 @@ impl Emitter {
             .emit(op::CONTROL_BARRIER, &[scope, scope, semantics]);
     }
 
-    /// HMMA.16816 on a 16x16x16 cooperative matrix multiply: the lanes
+    /// HMMA (HMMA.1688 with K padded by zeros) on a 16x16x16 cooperative matrix multiply: the lanes
     /// write their fragments (PTX layout) to the warp's scratch, the
     /// subgroup multiplies, and each lane reads its part of D back. `halves`
     /// holds one HMMA's (d, b, c), for columns 0-7 (B's upper eight
@@ -217,6 +214,7 @@ impl Emitter {
         index: usize,
         a: u8,
         halves_in: &[(u8, u8, u8)],
+        k16: bool,
         single: bool,
     ) -> Result<(), Unsupported> {
         self.module.capability(capability::COOPERATIVE_MATRIX);
@@ -269,12 +267,19 @@ impl Emitter {
             let n = e.constant(n);
             e.value(op::I_ADD, e.u32, &[value, n])
         };
-        // A: register j, half h at (g + 8 (j & 1), 2t + h + 8 (j >> 1)).
+        // A: register j, half h at (g + 8 (j & 1), 2t + h + 8 (j >> 1)); with
+        // K = 8 (HMMA.1688), columns 8-15 are zero, and so are B's rows 8-15:
+        // the multiply is then exactly the 16x8x8 one.
+        let zero_half = self.module.constant(f16, 0);
         for j in 0..4u32 {
             let row = plus(self, group, 8 * (j & 1));
             for h in 0..2 {
                 let column = plus(self, column_pair, h + 8 * (j >> 1));
-                let value = half_of(self, next(a, j as u8), h);
+                let value = if k16 || j < 2 {
+                    half_of(self, next(a, j as u8), h)
+                } else {
+                    zero_half
+                };
                 let pointer = self.scratch_element(halves, f16, base, 0, row, column);
                 self.function.emit(op::STORE, &[pointer, value]);
             }
@@ -287,7 +292,11 @@ impl Emitter {
             for j in 0..2u32 {
                 for h in 0..2 {
                     let row = plus(self, column_pair, h + 8 * j);
-                    let value = half_of(self, next(b, j as u8), h);
+                    let value = if k16 || j == 0 {
+                        half_of(self, next(b, j as u8), h)
+                    } else {
+                        zero_half
+                    };
                     let pointer = self.scratch_element(halves, f16, base, 1, row, column);
                     self.function.emit(op::STORE, &[pointer, value]);
                 }
@@ -540,13 +549,13 @@ impl Emitter {
         k16: bool,
         single: bool,
     ) -> Result<(), Unsupported> {
-        if k16 && self.layout.matrices == super::MatrixPath::Cooperative {
+        if self.layout.matrices == super::MatrixPath::Cooperative {
             if self.hmma_pairs.seconds.contains(&index) {
                 return Ok(());
             }
             let mut halves = vec![(d, b, c)];
             halves.extend(self.hmma_pairs.firsts.get(&index).copied());
-            return self.cooperative_multiply(index, a, &halves, single);
+            return self.cooperative_multiply(index, a, &halves, k16, single);
         }
         self.module
             .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);

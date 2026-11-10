@@ -2846,89 +2846,96 @@ mod tests {
         let c = |n: usize, row: usize, column: usize| (row + 2 * column + n) as f64;
         let half = |value: f64| u64::from(f64_to_f16(value));
         let pair = |low: f64, high: f64| half(low) | half(high) << 16;
-        let hmma = |d: u128, b: u128, c: u128| {
-            word(&[
-                (0, 12, 0x23c),
-                (16, 8, d),
-                (24, 8, 0),
-                (32, 8, b),
-                (64, 8, c),
-                (75, 1, 1),
-                (76, 1, 1),
-            ])
-        };
-        // A in R0-R3; B in R4-R5 and R6-R7; C in R8-R11 and R12-R15.
-        let program = [hmma(16, 4, 8), hmma(20, 6, 12), EXIT];
-        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
-        for matrices in [
-            MatrixPath::Subgroup,
-            MatrixPath::Cooperative,
-            MatrixPath::Exact,
-        ] {
-            let layout = Layout {
-                matrices,
-                ..Layout::workgroup([32, 1, 1])
+        for k16 in [true, false] {
+            let depth = if k16 { 16 } else { 8 };
+            let hmma = |d: u128, b: u128, c: u128| {
+                word(&[
+                    (0, 12, 0x23c),
+                    (16, 8, d),
+                    (24, 8, 0),
+                    (32, 8, b),
+                    (64, 8, c),
+                    (75, 1, u128::from(k16)),
+                    (76, 1, 1),
+                ])
             };
-            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
-            let machine = Machine::new(&translated.spirv);
-            // Lane l's fragments, by the PTX layout (g = l / 4, t = l % 4).
-            let initial = |lane: usize| {
-                let (g, t) = (lane / 4, lane % 4);
-                let mut values: HashMap<u8, u64> = HashMap::new();
-                for j in 0..4 {
-                    let row = g + 8 * (j & 1);
-                    let k = 2 * t + 8 * (j >> 1);
-                    values.insert(j as u8, pair(a(row, k), a(row, k + 1)));
-                }
-                for n in 0..2 {
-                    for j in 0..2 {
-                        let k = 2 * t + 8 * j;
-                        values.insert((4 + 2 * n + j) as u8, pair(b(n, k, g), b(n, k + 1, g)));
+            // A in R0-R3; B in R4-R5 and R6-R7; C in R8-R11 and R12-R15
+            // (HMMA.1688: A in R0-R1, B in R4 and R6).
+            let program = [hmma(16, 4, 8), hmma(20, 6, 12), EXIT];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            for matrices in [
+                MatrixPath::Subgroup,
+                MatrixPath::Cooperative,
+                MatrixPath::Exact,
+            ] {
+                let layout = Layout {
+                    matrices,
+                    ..Layout::workgroup([32, 1, 1])
+                };
+                let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+                let machine = Machine::new(&translated.spirv);
+                // Lane l's fragments, by the PTX layout (g = l / 4, t = l % 4).
+                let initial = |lane: usize| {
+                    let (g, t) = (lane / 4, lane % 4);
+                    let mut values: HashMap<u8, u64> = HashMap::new();
+                    for j in 0..depth / 4 {
+                        let row = g + 8 * (j & 1);
+                        let k = 2 * t + 8 * (j >> 1);
+                        values.insert(j as u8, pair(a(row, k), a(row, k + 1)));
                     }
-                    for i in 0..4 {
-                        let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
-                        let value = (c(n, row, column) as f32).to_bits();
-                        values.insert((8 + 4 * n + i) as u8, u64::from(value));
+                    for n in 0..2 {
+                        for j in 0..depth / 8 {
+                            let k = 2 * t + 8 * j;
+                            values.insert((4 + 2 * n + j) as u8, pair(b(n, k, g), b(n, k + 1, g)));
+                        }
+                        for i in 0..4 {
+                            let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                            let value = (c(n, row, column) as f32).to_bits();
+                            values.insert((8 + 4 * n + i) as u8, u64::from(value));
+                        }
                     }
-                }
-                values
-                    .into_iter()
-                    .filter_map(|(register, value)| {
-                        registers
-                            .get(&register)
-                            .map(|&variable| (variable, vec![value]))
-                    })
-                    .collect()
-            };
-            let report = machine.run_workgroup_with(
-                32,
-                32,
-                |lane| {
-                    HashMap::from([
-                        (27, vec![lane as u64, 0, 0]),
-                        (29, vec![lane as u64]),
-                        (40, vec![0]),
-                        (41, vec![lane as u64]),
-                    ])
-                },
-                initial,
-            );
-            assert!(
-                report.problems.is_empty(),
-                "{matrices:?}: {:?}",
-                report.problems
-            );
-            for (lane, variables) in report.invocations.iter().enumerate() {
-                let (g, t) = (lane / 4, lane % 4);
-                for n in 0..2 {
-                    for i in 0..4 {
-                        let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
-                        let expected = (0..16).fold(c(n, row, column), |sum, k| {
-                            sum + a(row, k) * b(n, k, column)
-                        }) as f32;
-                        let register = (16 + 4 * n + i) as u8;
-                        let got = f32::from_bits(variables[&registers[&register]][0] as u32);
-                        assert_eq!(got, expected, "{matrices:?} lane {lane} D{n}[{i}]");
+                    values
+                        .into_iter()
+                        .filter_map(|(register, value)| {
+                            registers
+                                .get(&register)
+                                .map(|&variable| (variable, vec![value]))
+                        })
+                        .collect()
+                };
+                let report = machine.run_workgroup_with(
+                    32,
+                    32,
+                    |lane| {
+                        HashMap::from([
+                            (27, vec![lane as u64, 0, 0]),
+                            (29, vec![lane as u64]),
+                            (40, vec![0]),
+                            (41, vec![lane as u64]),
+                        ])
+                    },
+                    initial,
+                );
+                assert!(
+                    report.problems.is_empty(),
+                    "{matrices:?}: {:?}",
+                    report.problems
+                );
+                for (lane, variables) in report.invocations.iter().enumerate() {
+                    let (g, t) = (lane / 4, lane % 4);
+                    for n in 0..2 {
+                        for i in 0..4 {
+                            let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
+                            let expected = (0..depth).fold(c(n, row, column), |sum, k| {
+                                sum + a(row, k) * b(n, k, column)
+                            }) as f32;
+                            let register = (16 + 4 * n + i) as u8;
+                            let got = f32::from_bits(variables[&registers[&register]][0] as u32);
+                            assert_eq!(
+                                got, expected,
+                                "{matrices:?} k16 {k16} lane {lane} D{n}[{i}]"
+                            );
+                        }
                     }
                 }
             }
