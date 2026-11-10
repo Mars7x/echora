@@ -968,33 +968,40 @@ impl Machine {
                 self.subgroup_operation(&mut invocations, first, &members, &mut shared);
                 progress = true;
             }
-            if progress {
-                continue;
-            }
-            // Barriers: every running invocation (of the subgroup for a
-            // subgroup barrier) at the same one.
-            let running: Vec<usize> = (0..count).filter(|&n| !invocations[n].done).collect();
-            let at = invocations[running[0]].at;
-            let is_barrier = self.body[at].opcode == op::CONTROL_BARRIER;
-            let scope = if is_barrier {
+            // Subgroup barriers: every subgroup whose running invocations
+            // all wait at one passes it, all such subgroups in the same
+            // round (their warps run at once on the hardware, so one
+            // warp's memory traffic interleaves with another's).
+            let scope_of = |at: usize| {
                 let scope_id = self.body[at].operands[0];
                 self.constants.get(&scope_id).map_or(2, |value| value[0])
-            } else {
-                2
             };
-            if is_barrier && scope == 3 {
-                let members: Vec<usize> = running
-                    .iter()
-                    .copied()
-                    .filter(|&n| n / subgroup == running[0] / subgroup)
+            for first in (0..count).step_by(subgroup) {
+                let members: Vec<usize> = (first..(first + subgroup).min(count))
+                    .filter(|&n| !invocations[n].done)
                     .collect();
-                if members.iter().all(|&n| invocations[n].at == at) {
+                let Some(&lead) = members.first() else {
+                    continue;
+                };
+                let at = invocations[lead].at;
+                if self.body[at].opcode == op::CONTROL_BARRIER
+                    && scope_of(at) == 3
+                    && members.iter().all(|&n| invocations[n].at == at)
+                {
                     for &n in &members {
                         invocations[n].at += 1;
                     }
-                    continue;
+                    progress = true;
                 }
-            } else if is_barrier && running.iter().all(|&n| invocations[n].at == at) {
+            }
+            if progress {
+                continue;
+            }
+            // Workgroup barriers: every running invocation at the same one.
+            let running: Vec<usize> = (0..count).filter(|&n| !invocations[n].done).collect();
+            let at = invocations[running[0]].at;
+            let is_barrier = self.body[at].opcode == op::CONTROL_BARRIER;
+            if is_barrier && scope_of(at) != 3 && running.iter().all(|&n| invocations[n].at == at) {
                 if running.len() < count && shared.notes.len() < 64 {
                     shared.notes.push(format!(
                         "barrier at instruction {at} reached with {} of {count} invocations \
@@ -2901,9 +2908,13 @@ mod tests {
         use crate::compute::MatrixPath;
         // A (16x16) shared by two HMMA.16816.F32s with their own B (16x8)
         // and C (16x8): small integers, exact in halves and in any sum.
-        let a = |row: usize, k: usize| ((row * 3 + k * 5) % 7) as f64 - 3.0;
+        let a = |row: usize, k: usize, warp: usize| ((row * 3 + k * 5 + warp) % 7) as f64 - 3.0;
         let b = |n: usize, k: usize, column: usize| ((k * 2 + column * 3 + n) % 5) as f64 - 2.0;
-        let c = |n: usize, row: usize, column: usize| (row + 2 * column + n) as f64;
+        // Warp w's C is 100 w more (two warps: their scratch must not
+        // overlap).
+        let c = |n: usize, row: usize, column: usize, warp: usize| {
+            (row + 2 * column + n + 100 * warp) as f64
+        };
         let half = |value: f64| u64::from(f64_to_f16(value));
         let pair = |low: f64, high: f64| half(low) | half(high) << 16;
         for k16 in [true, false] {
@@ -2931,18 +2942,19 @@ mod tests {
             ] {
                 let layout = Layout {
                     matrices,
-                    ..Layout::workgroup([32, 1, 1])
+                    ..Layout::workgroup([64, 1, 1])
                 };
                 let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
                 let machine = Machine::new(&translated.spirv);
                 // Lane l's fragments, by the PTX layout (g = l / 4, t = l % 4).
-                let initial = |lane: usize| {
+                let initial = |invocation: usize| {
+                    let (lane, warp) = (invocation % 32, invocation / 32);
                     let (g, t) = (lane / 4, lane % 4);
                     let mut values: HashMap<u8, u64> = HashMap::new();
                     for j in 0..depth / 4 {
                         let row = g + 8 * (j & 1);
                         let k = 2 * t + 8 * (j >> 1);
-                        values.insert(j as u8, pair(a(row, k), a(row, k + 1)));
+                        values.insert(j as u8, pair(a(row, k, warp), a(row, k + 1, warp)));
                     }
                     for n in 0..2 {
                         for j in 0..depth / 8 {
@@ -2951,7 +2963,7 @@ mod tests {
                         }
                         for i in 0..4 {
                             let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
-                            let value = (c(n, row, column) as f32).to_bits();
+                            let value = (c(n, row, column, warp) as f32).to_bits();
                             values.insert((8 + 4 * n + i) as u8, u64::from(value));
                         }
                     }
@@ -2965,14 +2977,14 @@ mod tests {
                         .collect()
                 };
                 let report = machine.run_workgroup_with(
+                    64,
                     32,
-                    32,
-                    |lane| {
+                    |n| {
                         HashMap::from([
-                            (27, vec![lane as u64, 0, 0]),
-                            (29, vec![lane as u64]),
-                            (40, vec![0]),
-                            (41, vec![lane as u64]),
+                            (27, vec![n as u64, 0, 0]),
+                            (29, vec![n as u64]),
+                            (40, vec![n as u64 / 32]),
+                            (41, vec![n as u64 % 32]),
                         ])
                     },
                     initial,
@@ -2982,19 +2994,20 @@ mod tests {
                     "{matrices:?}: {:?}",
                     report.problems
                 );
-                for (lane, variables) in report.invocations.iter().enumerate() {
+                for (invocation, variables) in report.invocations.iter().enumerate() {
+                    let (lane, warp) = (invocation % 32, invocation / 32);
                     let (g, t) = (lane / 4, lane % 4);
                     for n in 0..2 {
                         for i in 0..4 {
                             let (row, column) = (g + 8 * (i >> 1), 2 * t + (i & 1));
-                            let expected = (0..depth).fold(c(n, row, column), |sum, k| {
-                                sum + a(row, k) * b(n, k, column)
+                            let expected = (0..depth).fold(c(n, row, column, warp), |sum, k| {
+                                sum + a(row, k, warp) * b(n, k, column)
                             }) as f32;
                             let register = (16 + 4 * n + i) as u8;
                             let got = f32::from_bits(variables[&registers[&register]][0] as u32);
                             assert_eq!(
                                 got, expected,
-                                "{matrices:?} k16 {k16} lane {lane} D{n}[{i}]"
+                                "{matrices:?} k16 {k16} warp {warp} lane {lane} D{n}[{i}]"
                             );
                         }
                     }
