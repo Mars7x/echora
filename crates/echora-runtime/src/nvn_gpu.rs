@@ -4262,9 +4262,27 @@ impl Nvn {
                 }
                 let gpu = (first + index as u64) << PAGE_SHIFT;
                 let length = (end - index) as u64 * PAGE_SIZE;
-                // A page the guest cannot read stays out (it reads as
-                // unmapped in the simulator).
-                if let Ok(bytes) = self.gpu_bytes(core, gpu, length) {
+                // Read from the file behind guest memory where there is one
+                // (pread leaves the guest mapping's pages out of this
+                // process's resident set; reading through the mapping
+                // faulted gigabytes in). A page the guest cannot read stays
+                // out (it reads as unmapped in the simulator).
+                let shared = self
+                    .gpu_to_guest(gpu, length)
+                    .ok()
+                    .and_then(|guest| core.memory.shared_span(guest, length));
+                let bytes = match shared {
+                    Some((file, at)) => {
+                        use std::os::unix::fs::FileExt as _;
+                        let mut bytes = vec![0u8; length as usize];
+                        std::fs::File::open(format!("/proc/self/fd/{file}"))
+                            .and_then(|file| file.read_exact_at(&mut bytes, at))
+                            .ok()
+                            .map(|()| bytes)
+                    }
+                    None => self.gpu_bytes(core, gpu, length).ok(),
+                };
+                if let Some(bytes) = bytes {
                     write(format!("memory-{base:x}.bin"), &bytes)?;
                 }
                 index = end;
