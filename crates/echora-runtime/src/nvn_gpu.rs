@@ -5781,7 +5781,24 @@ impl Nvn {
         for texture in &colors {
             extent.get_or_insert(self.ensure_render_target(*texture)?);
         }
-        let depth = (self.render.depth != 0).then_some(self.render.depth);
+        // A depth texture object over the storage of an existing depth
+        // target is that target (the game builds a new object over the
+        // same depth memory for its lit pass, testing EQUAL against what
+        // the prepass wrote).
+        let depth = (self.render.depth != 0).then(|| {
+            let texture = self.render.depth;
+            let renderer = &self.gpu.as_ref().unwrap().renderer;
+            if renderer.existing_target(texture).is_some() {
+                return texture;
+            }
+            self.target_sharing_storage(texture)
+                .filter(|&target| {
+                    renderer
+                        .existing_target(target)
+                        .is_some_and(|target| echora_gpu::renderer::is_depth(target.format))
+                })
+                .unwrap_or(texture)
+        });
         if let Some(texture) = depth {
             extent.get_or_insert(self.ensure_render_target(texture)?);
         }
