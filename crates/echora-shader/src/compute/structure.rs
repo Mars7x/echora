@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use echora_shader_abi::Unsupported;
 
 use super::{Block, Emitter, End, Guard, LOOP_BUDGET};
-use crate::decode::Instruction;
+use crate::decode::{Instruction, Op};
 use crate::spirv::{self, op};
 
 /// A structured statement.
@@ -328,6 +328,9 @@ struct Structured {
     /// The pending target: 0 none, 2 id + 1 an exit, 2 id + 2 a continue.
     pending: u32,
     budget: u32,
+    /// In programs with barriers: the invocation has exited (a bool
+    /// variable). See `statement`'s early exits.
+    exited: Option<u32>,
 }
 
 fn exit_code(id: usize) -> u32 {
@@ -370,10 +373,22 @@ impl Emitter {
         let budget = self
             .function
             .variable(&mut self.module, self.u32_ptr, Some(budget_value));
+        // With barriers, an invocation that exits early keeps going to the
+        // barriers (doing nothing else), so they stay in uniform control
+        // flow; see `statement`.
+        let barriers = code
+            .iter()
+            .any(|instruction| matches!(instruction.op, Op::Bar { .. }));
+        let exited = barriers.then(|| {
+            let no = self.module.bool_constant(false);
+            self.function
+                .variable(&mut self.module, self.bool_ptr, Some(no))
+        });
         let mut state = Structured {
             open: Vec::new(),
             pending,
             budget,
+            exited,
         };
         self.statement(code, blocks, &root, &mut state)?;
         Ok(true)
@@ -389,14 +404,82 @@ impl Emitter {
         match statement {
             Statement::Code(n) => {
                 let block = &blocks[*n];
-                for (index, instruction) in code
+                let body: Vec<(usize, &Instruction)> = code
                     .iter()
                     .enumerate()
                     .take(block.body_end)
                     .skip(block.start)
+                    .collect();
+                let Some(exited) = state.exited else {
+                    for (index, instruction) in body {
+                        self.instruction(index, instruction)?;
+                    }
+                    return Ok(());
+                };
+                // Runs of instructions an exited invocation skips, between
+                // the barriers every invocation reaches.
+                for run in body
+                    .split_inclusive(|(_, instruction)| matches!(instruction.op, Op::Bar { .. }))
                 {
-                    self.instruction(index, instruction)?;
+                    let (barrier, work) = match run.split_last() {
+                        Some((last, work)) if matches!(last.1.op, Op::Bar { .. }) => {
+                            (Some(*last), work)
+                        }
+                        _ => (None, run),
+                    };
+                    if !work.is_empty() {
+                        let gone = self.value(op::LOAD, self.bool, &[exited]);
+                        let live = self.value(op::LOGICAL_NOT, self.bool, &[gone]);
+                        self.when(live, |e| {
+                            for &(index, instruction) in work {
+                                e.instruction(index, instruction)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    if let Some((index, instruction)) = barrier {
+                        self.instruction(index, instruction)?;
+                    }
                 }
+            }
+            // With barriers, an exit with the program going on in the other
+            // arm marks the invocation exited and goes on with it at this
+            // level: it then does nothing but reach the barriers, as the
+            // hardware's exited threads stop counting toward them. A
+            // subgroup whose invocations have all exited returns.
+            Statement::If {
+                condition,
+                then,
+                otherwise,
+            } if state.exited.is_some()
+                && (matches!(**then, Statement::Return)
+                    || matches!(**otherwise, Statement::Return)) =>
+            {
+                let exited = state.exited.unwrap_or_default();
+                let mut value = self.condition(*condition);
+                let rest = if matches!(**then, Statement::Return) {
+                    otherwise
+                } else {
+                    value = self.value(op::LOGICAL_NOT, self.bool, &[value]);
+                    then
+                };
+                let yes = self.module.bool_constant(true);
+                self.when(value, |e| {
+                    e.function.emit(op::STORE, &[exited, yes]);
+                    Ok(())
+                })?;
+                self.module
+                    .capability(spirv::capability::GROUP_NON_UNIFORM_VOTE);
+                let gone = self.value(op::LOAD, self.bool, &[exited]);
+                let subgroup = self.constant(super::SCOPE_SUBGROUP);
+                let all = self.value(op::GROUP_NON_UNIFORM_ALL, self.bool, &[subgroup, gone]);
+                let (stop, go) = (self.module.id(), self.module.id());
+                self.function.emit(op::SELECTION_MERGE, &[go, spirv::NONE]);
+                self.function.emit(op::BRANCH_CONDITIONAL, &[all, stop, go]);
+                self.function.label(stop);
+                self.leave();
+                self.function.label(go);
+                self.statement(code, blocks, rest, state)?;
             }
             Statement::Sequence(statements) => {
                 for statement in statements {
@@ -437,10 +520,16 @@ impl Emitter {
                 self.function.emit(op::BRANCH, &[start]);
                 self.function.label(start);
                 if repeats {
-                    // Each iteration spends the budget; none left stops.
+                    // Each iteration spends the budget; none left stops, as
+                    // does having exited (an exited invocation's stale
+                    // state must not keep it looping).
                     let left = self.value(op::LOAD, self.u32, &[state.budget]);
                     let zero = self.constant(0);
-                    let spent = self.value(op::I_EQUAL, self.bool, &[left, zero]);
+                    let mut spent = self.value(op::I_EQUAL, self.bool, &[left, zero]);
+                    if let Some(exited) = state.exited {
+                        let gone = self.value(op::LOAD, self.bool, &[exited]);
+                        spent = self.value(op::LOGICAL_OR, self.bool, &[spent, gone]);
+                    }
                     let (stop, go) = (self.module.id(), self.module.id());
                     self.function.emit(op::SELECTION_MERGE, &[go, spirv::NONE]);
                     self.function

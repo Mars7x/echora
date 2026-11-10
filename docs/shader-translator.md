@@ -225,6 +225,20 @@ two blocks of HMMA.16816 through a 32-bit value, the results past the
 subnormals), or blocks with an infinity or NaN (their plain sum); these
 are inferred, and none of it has been compared with hardware results.
 
+**Exits and barriers.** On the hardware an exited thread stops counting
+toward BAR.SYNC and the others synchronise; in SPIR-V a barrier must sit
+in uniform control flow. So in a program with BAR, an exit whose other
+arm goes on (`@P EXIT` then more code) sets a per-invocation `exited`
+flag instead of returning, and the program goes on at the same level:
+every run of instructions between barriers is skipped by an exited
+invocation, the barriers are not, so every invocation that has not
+returned reaches each one. A subgroup whose invocations have all exited
+returns at once (a subgroup vote), and an exited invocation leaves any
+loop at its next iteration, so stale state cannot keep it looping. An
+exited invocation's later stores and shuffles do not happen; a shuffle
+that reads one gets whatever it last held (the hardware's value there is
+undefined too). Exits anywhere else return as before.
+
 **Exactness.** Float multiplies and adds are marked NoContraction, as
 the hardware rounds each one. Directed rounding (`.RM`, `.RP`, `.RZ`) is
 exact: the nearest result's error is computed without rounding (two-sum

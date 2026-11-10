@@ -61,6 +61,28 @@ pub(crate) struct Finished {
     pub(crate) variables: HashMap<u32, Value>,
 }
 
+/// What a workgroup's run left: each invocation's variables, the
+/// barriers passed (instruction, invocations still running), and what
+/// went wrong.
+pub(crate) struct Workgroup {
+    pub(crate) invocations: Vec<HashMap<u32, Value>>,
+    pub(crate) barriers: Vec<(usize, usize)>,
+    pub(crate) problems: Vec<String>,
+}
+
+/// One invocation's state.
+struct Invocation {
+    at: usize,
+    values: HashMap<u32, Value>,
+    value_types: HashMap<u32, u32>,
+    pointers: HashMap<u32, Pointer>,
+    variables: HashMap<u32, Value>,
+    /// Built-in inputs, by variable.
+    globals: HashMap<u32, Value>,
+    done: bool,
+    steps: u32,
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exponent = u32::from(bits >> 10 & 0x1f);
@@ -271,34 +293,225 @@ impl Machine {
         }
     }
 
-    /// Runs the entry point with built-in inputs `inputs` (by built-in).
+    /// Runs the entry point alone with built-in inputs `inputs` (by
+    /// built-in).
     pub(crate) fn run(&self, inputs: &HashMap<u32, Value>) -> Finished {
-        let mut values: HashMap<u32, Value> = self.constants.clone();
-        let mut value_types: HashMap<u32, u32> = self.result_types.clone();
-        let mut pointers: HashMap<u32, Pointer> = HashMap::new();
-        let mut variables: HashMap<u32, Value> = HashMap::new();
-        let mut global_values: HashMap<u32, Value> = HashMap::new();
+        let inputs = inputs.clone();
+        let mut group = self.run_workgroup(1, 1, |_| inputs.clone());
+        assert!(group.problems.is_empty(), "{:?}", group.problems);
+        Finished {
+            variables: group.invocations.remove(0),
+        }
+    }
+
+    /// An invocation about to start, with its built-in inputs.
+    fn start(&self, inputs: &HashMap<u32, Value>) -> Invocation {
+        let mut globals = HashMap::new();
         for (&variable, builtin) in &self.builtins {
             if let Some(value) = inputs.get(builtin) {
-                global_values.insert(variable, value.clone());
+                globals.insert(variable, value.clone());
             }
         }
-        let mut at = 0;
-        let mut steps = 0u32;
+        // Built-in inputs are variables like the others (for access chains
+        // into vectors).
+        let pointers = globals
+            .keys()
+            .map(|&variable| {
+                (
+                    variable,
+                    Pointer {
+                        variable,
+                        component: None,
+                    },
+                )
+            })
+            .collect();
+        Invocation {
+            at: 0,
+            values: self.constants.clone(),
+            value_types: self.result_types.clone(),
+            pointers,
+            variables: globals,
+            globals: HashMap::new(),
+            done: false,
+            steps: 0,
+        }
+    }
+
+    /// Whether `opcode` needs the other invocations (a barrier, or a
+    /// subgroup operation).
+    fn collective(opcode: u16) -> bool {
+        opcode == op::CONTROL_BARRIER || (333..=366).contains(&opcode)
+    }
+
+    /// Runs `count` invocations of a workgroup in subgroups of
+    /// `subgroup` (invocation n has built-ins `inputs(n)`): each runs
+    /// until a barrier or a subgroup operation, which completes when all
+    /// the invocations still running in its scope have reached it.
+    pub(crate) fn run_workgroup(
+        &self,
+        count: usize,
+        subgroup: usize,
+        inputs: impl Fn(usize) -> HashMap<u32, Value>,
+    ) -> Workgroup {
+        let mut invocations: Vec<Invocation> = (0..count).map(|n| self.start(&inputs(n))).collect();
+        let mut barriers = Vec::new();
+        let mut problems = Vec::new();
         loop {
-            steps += 1;
-            assert!(steps < 1_000_000, "the program runs too long");
-            let instruction = &self.body[at];
-            at += 1;
+            for invocation in invocations.iter_mut() {
+                if !invocation.done {
+                    self.advance(invocation);
+                }
+            }
+            if invocations.iter().all(|invocation| invocation.done) {
+                break;
+            }
+            let mut progress = false;
+            // Subgroup operations: every running invocation of the
+            // subgroup at the same one.
+            for first in (0..count).step_by(subgroup) {
+                let members: Vec<usize> = (first..(first + subgroup).min(count))
+                    .filter(|&n| !invocations[n].done)
+                    .collect();
+                let Some(&lead) = members.first() else {
+                    continue;
+                };
+                let at = invocations[lead].at;
+                let opcode = self.body[at].opcode;
+                if opcode == op::CONTROL_BARRIER || members.iter().any(|&n| invocations[n].at != at)
+                {
+                    continue;
+                }
+                self.subgroup_operation(&mut invocations, first, &members, &mut problems);
+                progress = true;
+            }
+            if progress {
+                continue;
+            }
+            // Barriers: every running invocation (of the subgroup for a
+            // subgroup barrier) at the same one.
+            let running: Vec<usize> = (0..count).filter(|&n| !invocations[n].done).collect();
+            let at = invocations[running[0]].at;
+            let scope_id = self.body[at].operands[0];
+            let scope = self.constants.get(&scope_id).map_or(2, |value| value[0]);
+            if self.body[at].opcode == op::CONTROL_BARRIER && scope == 3 {
+                // A subgroup barrier: the subgroup's running invocations.
+                let first = running[0] / subgroup * subgroup;
+                let members: Vec<usize> = running
+                    .iter()
+                    .copied()
+                    .filter(|&n| n / subgroup == first / subgroup)
+                    .collect();
+                if members.iter().all(|&n| invocations[n].at == at) {
+                    for &n in &members {
+                        invocations[n].at += 1;
+                    }
+                    continue;
+                }
+            } else if running.iter().all(|&n| invocations[n].at == at)
+                && self.body[at].opcode == op::CONTROL_BARRIER
+            {
+                barriers.push((at, running.len()));
+                for &n in &running {
+                    invocations[n].at += 1;
+                }
+                continue;
+            }
+            let places: Vec<(usize, usize)> =
+                running.iter().map(|&n| (n, invocations[n].at)).collect();
+            problems.push(format!(
+                "deadlock: invocations wait at different barriers or subgroup operations \
+                 (invocation, instruction): {places:?}"
+            ));
+            break;
+        }
+        Workgroup {
+            invocations: invocations
+                .into_iter()
+                .map(|invocation| invocation.variables)
+                .collect(),
+            barriers,
+            problems,
+        }
+    }
+
+    /// The subgroup operation `members` (running invocations of the
+    /// subgroup starting at `first`) have all reached.
+    fn subgroup_operation(
+        &self,
+        invocations: &mut [Invocation],
+        first: usize,
+        members: &[usize],
+        problems: &mut Vec<String>,
+    ) {
+        let at = invocations[members[0]].at;
+        let instruction = &self.body[at];
+        let (opcode, operands) = (instruction.opcode, &instruction.operands);
+        let (ty, id) = (operands[0], operands[1]);
+        let input = |invocation: &Invocation, n: usize| invocation.values[&operands[n]].clone();
+        let results: Vec<Value> = match opcode {
+            op::GROUP_NON_UNIFORM_ALL | op::GROUP_NON_UNIFORM_ANY => {
+                let votes: Vec<bool> = members
+                    .iter()
+                    .map(|&n| input(&invocations[n], 3)[0] != 0)
+                    .collect();
+                let result = if opcode == op::GROUP_NON_UNIFORM_ALL {
+                    votes.iter().all(|&vote| vote)
+                } else {
+                    votes.iter().any(|&vote| vote)
+                };
+                vec![vec![u64::from(result)]; members.len()]
+            }
+            op::GROUP_NON_UNIFORM_SHUFFLE => members
+                .iter()
+                .map(|&n| {
+                    let lane = input(&invocations[n], 4)[0] as usize;
+                    match members.iter().find(|&&m| m == first + lane) {
+                        Some(&source) => input(&invocations[source], 3),
+                        None => {
+                            problems.push(format!(
+                                "invocation {n} shuffles from lane {lane}, which is not running there"
+                            ));
+                            vec![0; input(&invocations[n], 3).len()]
+                        }
+                    }
+                })
+                .collect(),
+            _ => panic!("the interpreter has no subgroup opcode {opcode}"),
+        };
+        for (&n, result) in members.iter().zip(results) {
+            let invocation = &mut invocations[n];
+            invocation.values.insert(id, result);
+            invocation.value_types.insert(id, ty);
+            invocation.at += 1;
+        }
+    }
+
+    /// Runs `invocation` until it ends or reaches a barrier or subgroup
+    /// operation (left at it).
+    fn advance(&self, invocation: &mut Invocation) {
+        let Invocation {
+            at,
+            values,
+            value_types,
+            pointers,
+            variables,
+            globals,
+            done,
+            steps,
+        } = invocation;
+        loop {
+            *steps += 1;
+            assert!(*steps < 1_000_000, "the program runs too long");
+            let instruction = &self.body[*at];
+            if Self::collective(instruction.opcode) {
+                return;
+            }
+            *at += 1;
             let operands = &instruction.operands;
             let opcode = instruction.opcode;
             match opcode {
-                // One invocation: barriers have nothing to wait for.
-                op::LABEL
-                | op::SELECTION_MERGE
-                | op::LOOP_MERGE
-                | op::CONTROL_BARRIER
-                | op::MEMORY_BARRIER => continue,
+                op::LABEL | op::SELECTION_MERGE | op::LOOP_MERGE | op::MEMORY_BARRIER => continue,
                 op::VARIABLE => {
                     let pointee = match self.ty(operands[0]) {
                         Ty::Pointer { pointee } => pointee,
@@ -322,12 +535,12 @@ impl Machine {
                     continue;
                 }
                 op::BRANCH => {
-                    at = self.labels[&operands[0]];
+                    *at = self.labels[&operands[0]];
                     continue;
                 }
                 op::BRANCH_CONDITIONAL => {
                     let taken = values[&operands[0]][0] != 0;
-                    at = self.labels[&operands[if taken { 1 } else { 2 }]];
+                    *at = self.labels[&operands[if taken { 1 } else { 2 }]];
                     continue;
                 }
                 op::SWITCH => {
@@ -338,10 +551,13 @@ impl Machine {
                             target = pair[1];
                         }
                     }
-                    at = self.labels[&target];
+                    *at = self.labels[&target];
                     continue;
                 }
-                op::RETURN => break,
+                op::RETURN => {
+                    *done = true;
+                    return;
+                }
                 op::UNREACHABLE => panic!("OpUnreachable reached"),
                 op::STORE => {
                     let pointer = pointers[&operands[0]];
@@ -362,7 +578,7 @@ impl Machine {
             let value = |n: usize| values[&args[n]].clone();
             let result: Value = match opcode {
                 op::LOAD => {
-                    if let Some(global) = global_values.get(&args[0]) {
+                    if let Some(global) = globals.get(&args[0]) {
                         global.clone()
                     } else {
                         let pointer = pointers
@@ -410,7 +626,6 @@ impl Machine {
             values.insert(id, result);
             value_types.insert(id, ty);
         }
-        Finished { variables }
     }
 
     /// The bits of `value` (of type `from`) as type `to`.
@@ -1077,5 +1292,75 @@ mod tests {
             ],
         );
         assert_eq!((r[&0], r[&2]), (3, 12));
+    }
+
+    /// Each invocation's general registers, the barriers passed and the
+    /// problems found.
+    type GroupRun = (Vec<HashMap<u8, u32>>, Vec<(usize, usize)>, Vec<String>);
+
+    /// Runs `words` (after MOVs of `inputs` into R0..) as a workgroup of
+    /// `count` invocations in subgroups of 32 (invocation n has local id
+    /// (n, 0, 0)): each invocation's general registers, the barriers passed
+    /// and the problems found.
+    fn run_group(count: usize, inputs: &[u32], words: &[u128]) -> GroupRun {
+        let mut program: Vec<u128> = inputs
+            .iter()
+            .enumerate()
+            .map(|(n, &value)| mov(n as u128, value))
+            .collect();
+        program.extend_from_slice(words);
+        program.push(EXIT);
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout::workgroup([count as u32, 1, 1]);
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        let machine = Machine::new(&translated.spirv);
+        let group = machine.run_workgroup(count, 32, |n| {
+            HashMap::from([(27, vec![n as u64, 0, 0]), (41, vec![(n % 32) as u64])])
+        });
+        let registers = group
+            .invocations
+            .iter()
+            .map(|variables| {
+                registers
+                    .iter()
+                    .map(|(&n, variable)| (n, variables[variable][0] as u32))
+                    .collect()
+            })
+            .collect();
+        (registers, group.barriers, group.problems)
+    }
+
+    #[test]
+    fn invocations_that_exit_early_still_meet_the_barriers() {
+        // R1 = the threshold; S2R R0, SR_TID.X; ISETP.GE.U32 P0, R0, R1;
+        // @P0 EXIT; IADD3 R2, R2, 1; BAR; IADD3 R2, R2, 1; BAR
+        let s2r = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]);
+        let at_least = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 0),
+            (32, 8, 1),
+            (76, 3, 6),
+            (81, 3, 0),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        let exit = (0x94d | 7 << 12) & !(0xf << 12);
+        let body = [s2r, at_least, exit, add(2, 2, 1), BAR, add(2, 2, 1), BAR];
+        // Invocations 40-63 exit: the second subgroup goes on partly, its
+        // exited invocations reaching the barriers and doing nothing else.
+        let (registers, barriers, problems) = run_group(64, &[0, 40, 0], &body);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(barriers.len(), 2);
+        assert!(barriers.iter().all(|&(_, running)| running == 64));
+        for (n, registers) in registers.iter().enumerate() {
+            assert_eq!(registers[&2], if n < 40 { 2 } else { 0 }, "invocation {n}");
+        }
+        // Invocations 32-63 exit: the second subgroup has all exited and
+        // returns; the first meets the barriers alone.
+        let (registers, barriers, problems) = run_group(64, &[0, 32, 0], &body);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(barriers.iter().all(|&(_, running)| running == 32));
+        assert_eq!(registers[31][&2], 2);
+        assert_eq!(registers[32][&2], 0);
     }
 }
