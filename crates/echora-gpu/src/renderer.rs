@@ -1322,11 +1322,29 @@ impl Renderer {
             self.fatal = Some(message.clone());
             return Err(message);
         }
+        // Each region's bytes: up to the next region's offset, the last to
+        // the end.
+        let mut by_offset: Vec<&crate::draw::UploadRegion> = levels.iter().collect();
+        by_offset.sort_by_key(|region| region.offset);
+        let region_bytes = |index: usize| {
+            by_offset
+                .get(index + 1)
+                .map_or(texels.len() as u64, |next| next.offset)
+                - by_offset[index].offset
+        };
+        // An upload larger than the ring (a big ASTC array decoded to
+        // RGBA8) whose regions each fit goes through the ring a batch of
+        // regions at a time, with no staging buffer of its own (two of
+        // 852 MiB pushed host memory past its limit).
+        let chunked = texels.len() as u64 > RING_SIZE
+            && (0..by_offset.len()).all(|index| region_bytes(index) <= RING_SIZE);
         // The texels are staged before the image exists, so a failure
-        // leaves nothing behind. Uploads larger than the ring (a big ASTC
-        // array decoded to RGBA8) get a staging buffer of their own,
-        // destroyed with the submission's retired buffers.
-        let (buffer, offset) = if texels.len() as u64 > RING_SIZE {
+        // leaves nothing behind. Other uploads larger than the ring get a
+        // staging buffer of their own, destroyed with the submission's
+        // retired buffers.
+        let (buffer, offset) = if chunked {
+            (vk::Buffer::null(), 0)
+        } else if texels.len() as u64 > RING_SIZE {
             let staging =
                 self.host_buffer(texels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
             staging.write(0, texels);
@@ -1419,14 +1437,60 @@ impl Renderer {
                 &[],
                 &[barrier],
             );
-            device.cmd_copy_buffer_to_image(
-                commands,
-                buffer,
-                target.image,
-                vk::ImageLayout::GENERAL,
-                &copies,
-            );
-            device.cmd_pipeline_barrier(
+            if !chunked {
+                device.cmd_copy_buffer_to_image(
+                    commands,
+                    buffer,
+                    target.image,
+                    vk::ImageLayout::GENERAL,
+                    &copies,
+                );
+            }
+        }
+        if chunked {
+            // Batches of consecutive regions that fill the ring; a batch
+            // may flush first (the barrier above is then submitted before
+            // its copies).
+            let mut start = 0;
+            while start < by_offset.len() {
+                let mut end = start;
+                let mut bytes = 0;
+                while end < by_offset.len() && bytes + region_bytes(end) <= RING_SIZE {
+                    bytes += region_bytes(end);
+                    end += 1;
+                }
+                let first = by_offset[start].offset;
+                let slice = &texels[first as usize..(first + bytes) as usize];
+                let (ring, at) = self.ring_upload(slice, 16)?;
+                let batch: Vec<vk::BufferImageCopy> = copies
+                    .iter()
+                    .filter(|copy| {
+                        let source = copy.buffer_offset - offset;
+                        source >= first && source < first + bytes
+                    })
+                    .map(|copy| vk::BufferImageCopy {
+                        buffer_offset: at + (copy.buffer_offset - offset - first),
+                        ..*copy
+                    })
+                    .collect();
+                let commands = self.commands()?;
+                // SAFETY: recording; the image and ring are live.
+                unsafe {
+                    self.gpu.device.cmd_copy_buffer_to_image(
+                        commands,
+                        ring,
+                        target.image,
+                        vk::ImageLayout::GENERAL,
+                        &batch,
+                    );
+                }
+                start = end;
+            }
+        }
+        let commands = self.commands()?;
+        // SAFETY: recording; the image is live.
+        unsafe {
+            self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
