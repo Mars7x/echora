@@ -4439,6 +4439,90 @@ mod tests {
     }
 
     #[test]
+    fn multiplies_with_dnz_make_zero_factors_give_plus_zero() {
+        let (inf, nan) = (f32::INFINITY.to_bits(), f32::NAN.to_bits());
+        let float = |x: f32| x.to_bits();
+        // FMUL(.DNZ) R3, R0, R1 and FFMA(.DNZ) R3, R0, R1, R2.
+        let fmul = |dnz: u128| {
+            word(&[
+                (0, 12, 0x220),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (76, 1, dnz),
+                (84, 3, 4),
+            ])
+        };
+        let ffma = |dnz: u128| {
+            word(&[
+                (0, 12, 0x223),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (64, 8, 2),
+                (76, 1, dnz),
+            ])
+        };
+        // (a, b, c, a*b with DNZ, a*b + c with DNZ)
+        let cases = [
+            (0, inf, float(2.5), 0, float(2.5)),
+            (inf, float(-0.0), float(-0.0), 0, 0),
+            (0, nan, float(-1.0), 0, float(-1.0)),
+            (float(-0.0), float(3.0), float(1.0), 0, float(1.0)),
+            (
+                float(1.5),
+                float(-2.0),
+                float(0.5),
+                float(-3.0),
+                float(-2.5),
+            ),
+            (inf, float(2.0), float(1.0), inf, inf),
+        ];
+        for (a, b, c, product, sum) in cases {
+            let (r, _) = run(&[a, b, c], &[fmul(1)]);
+            assert_eq!(r[&3], product, "FMUL.DNZ {a:#x} {b:#x}");
+            let (r, _) = run(&[a, b, c], &[ffma(1)]);
+            assert_eq!(r[&3], sum, "FFMA.DNZ {a:#x} {b:#x} {c:#x}");
+        }
+        // Without DNZ, 0 * Inf is NaN.
+        let (r, _) = run(&[0, inf], &[fmul(0)]);
+        assert!(f32::from_bits(r[&3]).is_nan());
+        // HMUL2.DNZ / HFMA2.DNZ R3, R0, R1(, R2), lane by lane: low lanes 0 *
+        // Inf (+ 1.0), high lanes 2.0 * 3.0 (+ 1.0).
+        let pack = |low: u32, high: u32| low | high << 16;
+        let (a, b, c) = (
+            pack(0x0000, 0x4000),
+            pack(0x7c00, 0x4200),
+            pack(0x3c00, 0x3c00),
+        );
+        let hmul = word(&[
+            (0, 12, 0x232),
+            (16, 8, 3),
+            (24, 8, 0),
+            (32, 8, 1),
+            (76, 1, 1),
+        ]);
+        let (r, _) = run(&[a, b, c], &[hmul]);
+        assert_eq!(r[&3], pack(0, 0x4600), "HMUL2.DNZ");
+        let hfma = word(&[
+            (0, 12, 0x231),
+            (16, 8, 3),
+            (24, 8, 0),
+            (32, 8, 1),
+            (64, 8, 2),
+            (76, 1, 1),
+        ]);
+        let (r, _) = run(&[a, b, c], &[hfma]);
+        assert_eq!(r[&3], pack(0x3c00, 0x4700), "HFMA2.DNZ");
+        let code: Vec<_> = [hmul, hfma, ffma(1), fmul(1), EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let translated = crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+    }
+
+    #[test]
     fn half_adds_flush_subnormals_with_ftz() {
         // HADD2(.FTZ) R2, R0, R1: R0 = a subnormal and a normal half, R1 = 0.
         let add = |ftz: u128| {

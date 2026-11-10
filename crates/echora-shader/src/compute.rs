@@ -1126,6 +1126,23 @@ impl Emitter {
         Ok(value)
     }
 
+    /// Whether `a` or `b` is a zero factor for a `.DNZ` multiply (NAK's
+    /// `fmulz`): ±0, or with `flush` a subnormal too (flushed first).
+    fn zero_factor(&mut self, a: u32, b: u32, flush: bool) -> u32 {
+        let zero = |e: &mut Self, x: u32| {
+            if flush {
+                let magnitude = e.glsl(e.f32, glsl::F_ABS, &[x]);
+                let smallest = e.float_constant(f32::MIN_POSITIVE);
+                e.value(op::F_ORD_LESS_THAN, e.bool, &[magnitude, smallest])
+            } else {
+                let zero = e.float_constant(0.0);
+                e.value(op::F_ORD_EQUAL, e.bool, &[x, zero])
+            }
+        };
+        let (a, b) = (zero(self, a), zero(self, b));
+        self.value(op::LOGICAL_OR, self.bool, &[a, b])
+    }
+
     /// A float operation the driver must not fuse with another
     /// (NoContraction): the hardware rounds each one.
     fn exact(&mut self, opcode: u16, operands: &[u32]) -> u32 {
@@ -1423,20 +1440,34 @@ impl Emitter {
                 }
             }
             Op::Ffma {
-                d, a, b, c, modes, ..
+                d,
+                a,
+                b,
+                c,
+                modes,
+                dnz,
             } => {
                 let (a, b, c) = (
                     self.float(index, a)?,
                     self.float(index, b)?,
                     self.float(index, c)?,
                 );
-                let value = self.glsl(self.f32, glsl::FMA, &[a, b, c]);
+                let mut value = self.glsl(self.f32, glsl::FMA, &[a, b, c]);
                 // a*b - value, then + c: the excess's sign.
-                let residual = (modes.rounding != 0).then(|| {
+                let mut residual = (modes.rounding != 0).then(|| {
                     let negated = self.value(op::F_NEGATE, self.f32, &[value]);
                     let part = self.glsl(self.f32, glsl::FMA, &[a, b, negated]);
                     self.exact(op::F_ADD, &[part, c])
                 });
+                if dnz {
+                    // A zero factor: +0 + c, exactly.
+                    let zero = self.zero_factor(a, b, modes.flush_to_zero);
+                    let plus_zero = self.float_constant(0.0);
+                    let sum = self.exact(op::F_ADD, &[plus_zero, c]);
+                    value = self.value(op::SELECT, self.f32, &[zero, sum, value]);
+                    residual =
+                        residual.map(|r| self.value(op::SELECT, self.f32, &[zero, plus_zero, r]));
+                }
                 self.float_result(d.0, value, residual, modes)?;
             }
             Op::Fmul {
@@ -1445,7 +1476,7 @@ impl Emitter {
                 b,
                 modes,
                 scale,
-                ..
+                dnz,
             } => {
                 // The scale: 1-3 divide by 8, 4, 2; 5-7 multiply by 2, 4, 8.
                 if scale == 0 || (scale != 4 && modes.rounding != 0) {
@@ -1458,10 +1489,18 @@ impl Emitter {
                     value = self.exact(op::F_MUL, &[value, factor]);
                 }
                 // The product's error, exactly: a*b - value.
-                let residual = (modes.rounding != 0).then(|| {
+                let mut residual = (modes.rounding != 0).then(|| {
                     let negated = self.value(op::F_NEGATE, self.f32, &[value]);
                     self.glsl(self.f32, glsl::FMA, &[a, b, negated])
                 });
+                if dnz {
+                    // A zero factor: +0, whatever the other (Inf, NaN).
+                    let zero = self.zero_factor(a, b, modes.flush_to_zero);
+                    let plus_zero = self.float_constant(0.0);
+                    value = self.value(op::SELECT, self.f32, &[zero, plus_zero, value]);
+                    residual =
+                        residual.map(|r| self.value(op::SELECT, self.f32, &[zero, plus_zero, r]));
+                }
                 self.float_result(d.0, value, residual, modes)?;
             }
             Op::Fadd { d, a, b, modes } => {
@@ -1769,8 +1808,9 @@ impl Emitter {
                 saturate,
                 relu,
                 flush,
+                dnz,
                 ..
-            } => self.half(index, op, d, a, b, c, saturate, relu, flush)?,
+            } => self.half(index, op, d, a, b, c, saturate, relu, flush, dnz)?,
             Op::Hsetp2 {
                 p,
                 q,

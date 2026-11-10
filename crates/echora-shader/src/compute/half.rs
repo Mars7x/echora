@@ -64,6 +64,21 @@ impl Emitter {
         self.module.composite_constant(pair, &[half, half])
     }
 
+    /// Each lane of `value`, or of `instead` where a or b is ±0 (the
+    /// inputs already flushed when `.FTZ`): `.DNZ`'s zero factors.
+    fn zero_factors(&mut self, a: u32, b: u32, instead: u32, value: u32) -> u32 {
+        let pair = self.f16_pair();
+        let bool2 = self.module.ty(crate::spirv::Type::Vector {
+            component: self.bool,
+            count: 2,
+        });
+        let zero = self.half_constant(0);
+        let a_zero = self.value(op::F_ORD_EQUAL, bool2, &[a, zero]);
+        let b_zero = self.value(op::F_ORD_EQUAL, bool2, &[b, zero]);
+        let either = self.value(op::LOGICAL_OR, bool2, &[a_zero, b_zero]);
+        self.value(op::SELECT, pair, &[either, instead, value])
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn half(
         &mut self,
@@ -76,6 +91,7 @@ impl Emitter {
         saturate: bool,
         relu: Option<Pred>,
         flush: bool,
+        dnz: bool,
     ) -> Result<(), Unsupported> {
         let pair = self.f16_pair();
         let mut a = self.half_operand(index, a)?;
@@ -101,10 +117,23 @@ impl Emitter {
                 if flush {
                     c = self.flush_halves(c);
                 }
-                self.glsl(pair, glsl::FMA, &[a, b, c])
+                let product = self.glsl(pair, glsl::FMA, &[a, b, c]);
+                if dnz {
+                    // A zero factor: +0 + c, exactly.
+                    let zero = self.half_constant(0);
+                    let sum = exact(self, op::F_ADD, &[zero, c]);
+                    self.zero_factors(a, b, sum, product)
+                } else {
+                    product
+                }
             }
             HalfOp::MinMax { min } => self.half_min_max(min, a, b),
         };
+        // HMUL2.DNZ: a zero factor's product is +0.
+        if dnz && operation == HalfOp::Mul {
+            let zero = self.half_constant(0);
+            value = self.zero_factors(a, b, zero, value);
+        }
         if flush {
             value = self.flush_halves(value);
         }

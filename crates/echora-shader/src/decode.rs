@@ -321,6 +321,9 @@ pub enum Op {
         /// `.FTZ` (bit 80, as Mesa's NAK encodes HADD2, HMUL2 and HFMA2):
         /// subnormal inputs and results become zeros of their sign.
         flush: bool,
+        /// HMUL2 and HFMA2 `.DNZ` (bit 76, NAK's `fmulz`/`ffmaz`): a zero
+        /// factor makes the product +0 whatever the other is (Inf, NaN).
+        dnz: bool,
     },
     /// HSETP2 p, q, a, b, acc: each lane's comparison of the half pairs, p
     /// lane 0's and q lane 1's, each combined with acc.
@@ -1813,6 +1816,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 single: word.bit(78),
                 relu: None,
                 flush: word.bit(80),
+                dnz: false,
             }
         }
         0x032 if matches!(form, 1 | 4 | 5) && word.bits(78, 2) == 0 && !word.bit(85) => Op::Half {
@@ -1825,6 +1829,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             single: false,
             relu: None,
             flush: word.bit(80),
+            dnz: word.bit(76),
         },
         // HFMA2 without its mixed-sign form (86) or 85.
         0x031 if (1..=5).contains(&form) && !word.bit(78) && word.bits(85, 2) == 0 => Op::Half {
@@ -1837,6 +1842,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             single: false,
             relu: word.bit(79).then(|| word.pred(87, 90)),
             flush: word.bit(80),
+            dnz: word.bit(76),
         },
         0x040 if matches!(form, 1 | 4) && word.bits(76, 11) == 0 => Op::Half {
             op: HalfOp::MinMax {
@@ -1850,6 +1856,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             single: false,
             relu: None,
             flush: false,
+            dnz: false,
         },
         // HSETP2 without .H_AND (71).
         0x034 if matches!(form, 1 | 2) && !word.bit(71) => Op::Hsetp2 {
