@@ -3125,8 +3125,11 @@ impl Nvn {
                     // dispatches they enable past the movie hang the GPU
                     // (a runaway shader under study), so by default only
                     // uncached pools are read back, as before.
-                    let range = debug_var_os("ECHORA_INDIRECT_EXACT").map(|_| at..at + 12);
-                    if let Err(message) = self.resolve_storage(core, range) {
+                    let resolved = match debug_var_os("ECHORA_INDIRECT_EXACT") {
+                        Some(_) => self.resolve_gpu_written(core, at..at + 12),
+                        None => self.resolve_storage(core, None),
+                    };
+                    if let Err(message) = resolved {
                         return Err(stop(format!("dispatch results: {message}")));
                     }
                     let mut direct = command.clone();

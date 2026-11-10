@@ -97,6 +97,10 @@ pub struct Backend {
     /// over imported guest memory) since the GPU last finished: a CPU read
     /// of one waits for the GPU first (see `resolve_storage`).
     in_place_writes: Vec<std::ops::Range<u64>>,
+    /// A compute program that reaches global memory through the page table
+    /// was dispatched: its stores land in guest memory or a resident pool's
+    /// copy with no range recorded (see `resolve_gpu_written`).
+    page_table_writes: bool,
     /// Storage buffers kept on the GPU between dispatches (when guest
     /// memory cannot be imported), by guest address: see `Resident`.
     resident: HashMap<u64, ResidentPool>,
@@ -174,6 +178,7 @@ impl Backend {
             shadow_quiet: HashMap::new(),
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
+            page_table_writes: false,
             resident: HashMap::new(),
             shared_pools: HashMap::new(),
             target_index: HashMap::new(),
@@ -3585,6 +3590,9 @@ impl Nvn {
         } else {
             Default::default()
         };
+        if page_table.address != 0 {
+            self.gpu.as_mut().unwrap().page_table_writes = true;
+        }
         let pool = if stage.texture_pool_bindings != 0 {
             self.pool_entries(core, 5)?
         } else {
@@ -3739,6 +3747,30 @@ impl Nvn {
         }
         self.resolve_copies(core, range.clone())?;
         self.resolve_resident(core, range)
+    }
+
+    /// A guest range the GPU may have written through the page table (a
+    /// dispatch's arguments a compute program wrote): after such a dispatch
+    /// the work is finished and, where a resident pool holds the range, its
+    /// GPU copy is read back; then `resolve_storage` as usual.
+    pub(super) fn resolve_gpu_written(
+        &mut self,
+        core: &mut Guest,
+        range: std::ops::Range<u64>,
+    ) -> Result<(), String> {
+        if let Some(backend) = self.gpu.as_mut()
+            && backend.page_table_writes
+        {
+            backend.stat("stat: GPU waits for page-table writes", 1);
+            backend.renderer.flush()?;
+            for pool in backend.resident.values_mut() {
+                let piece = range.start.max(pool.base)..range.end.min(pool.base + pool.size);
+                if piece.start < piece.end {
+                    add_range(&mut pool.gpu_dirty, piece);
+                }
+            }
+        }
+        self.resolve_storage(core, Some(range))
     }
 
     /// Copy GPU-newer resident pool ranges back to the guest: what overlaps
