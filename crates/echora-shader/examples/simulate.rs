@@ -33,7 +33,8 @@
 //! the dump. `--quiet` prints only workgroups with problems, unmapped
 //! pages or watched writes. Otherwise each workgroup's report lists
 //! where its invocations ended and which guest EXIT (byte offset) each
-//! took. Each
+//! took. `--registers=N,M` prints those invocations' registers (R, P, UR,
+//! UP) as they ended. Each
 //! `watch=START..END` argument (hex addresses, or a `watch START END` line
 //! in dispatch.txt) lists every store and atomic into that range, guest
 //! (through the page table) or device: the invocation, the instruction
@@ -175,6 +176,31 @@ fn main() {
     }
     let independent = arguments.iter().any(|argument| argument == "--independent");
     let quiet = arguments.iter().any(|argument| argument == "--quiet");
+    // Invocations whose final registers to print.
+    let shown: Vec<usize> = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--registers="))
+        .flat_map(|list| list.split(','))
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    // The register variables by kind and number.
+    let mut registers: Vec<(&str, u32, u32)> = machine
+        .names
+        .iter()
+        .filter_map(|(name, &id)| {
+            let at = name.find(|c: char| c.is_ascii_digit())?;
+            let (kind, number) = name.split_at(at);
+            matches!(kind, "R" | "P" | "UR" | "UP")
+                .then(|| number.parse().ok().map(|number| (kind, number, id)))
+                .flatten()
+        })
+        .collect();
+    registers.sort_by_key(|&(kind, number, _)| {
+        (
+            ["R", "P", "UR", "UP"].iter().position(|k| *k == kind),
+            number,
+        )
+    });
     let group_arguments: Vec<&String> = arguments[1..]
         .iter()
         .filter(|argument| !argument.starts_with("watch=") && !argument.starts_with("--"))
@@ -318,6 +344,26 @@ fn main() {
         }
         for problem in &report.problems {
             println!("  PROBLEM: {problem}");
+        }
+        for &n in &shown {
+            let Some(variables) = report.invocations.get(n) else {
+                continue;
+            };
+            let values: Vec<String> = registers
+                .iter()
+                .filter_map(|&(kind, number, id)| {
+                    let value = *variables.get(&id)?.first()?;
+                    Some(if kind.ends_with('P') {
+                        format!("{kind}{number}={}", u8::from(value != 0))
+                    } else {
+                        format!("{kind}{number}={value:#x}")
+                    })
+                })
+                .collect();
+            println!(
+                "  invocation {n} registers at its end: {}",
+                values.join(" ")
+            );
         }
         failed |= !report.problems.is_empty();
         if !independent {

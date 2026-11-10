@@ -655,6 +655,8 @@ impl Emitter {
         let variable = self
             .function
             .variable(&mut self.module, self.u32_ptr, Some(zero));
+        // Named for debugging (the simulator prints registers by name).
+        self.module.name(variable, &format!("R{n}"));
         self.registers.insert(n, variable);
         variable
     }
@@ -671,6 +673,12 @@ impl Emitter {
         let variable = self
             .function
             .variable(&mut self.module, self.bool_ptr, Some(no));
+        let name = if n < 8 {
+            format!("P{n}")
+        } else {
+            format!("UP{}", n - 8)
+        };
+        self.module.name(variable, &name);
         self.predicates.insert(n, variable);
         variable
     }
@@ -776,6 +784,7 @@ impl Emitter {
         let variable = self
             .function
             .variable(&mut self.module, self.u32_ptr, Some(zero));
+        self.module.name(variable, &format!("UR{n}"));
         self.uniform_registers.insert(n, variable);
         variable
     }

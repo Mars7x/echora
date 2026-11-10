@@ -277,6 +277,9 @@ pub struct Machine {
     /// The workgroup size (LocalSize).
     pub local_size: [u32; 3],
     cooperative: bool,
+    /// Debug names (OpName) and the ids they name: the translation names
+    /// its register variables R0.., P0.., UR0.., UP0...
+    pub names: BTreeMap<String, u32>,
 }
 
 /// One invocation's state.
@@ -520,6 +523,7 @@ impl Machine {
             glsl: 0,
             local_size: [1, 1, 1],
             cooperative: false,
+            names: BTreeMap::new(),
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
@@ -531,6 +535,16 @@ impl Machine {
             at += count;
             match opcode {
                 op::EXT_INST_IMPORT => machine.glsl = operands[0],
+                op::NAME if !operands.is_empty() => {
+                    let bytes: Vec<u8> = operands[1..]
+                        .iter()
+                        .flat_map(|word| word.to_le_bytes())
+                        .take_while(|&byte| byte != 0)
+                        .collect();
+                    machine
+                        .names
+                        .insert(String::from_utf8_lossy(&bytes).into_owned(), operands[0]);
+                }
                 op::ENTRY_POINT => entry = operands[1],
                 op::EXECUTION_MODE if operands[1] == EXECUTION_LOCAL_SIZE => {
                     machine.local_size = [operands[2], operands[3], operands[4]];
