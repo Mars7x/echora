@@ -5976,9 +5976,11 @@ impl Nvn {
             self.gpu.as_mut().unwrap().note(line);
         }
         // Each traced binding's texture, in binding order.
-        let traced_textures = if super::debug_var("ECHORA_GPU_TRACE_PROGRAM")
-            .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1))
-        {
+        let traced_textures = if super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
+            wanted
+                .split(',')
+                .any(|item| item == format!("{:016x}", keys.1))
+        }) {
             let mut bound_textures: Vec<_> = textures.iter().collect();
             bound_textures.sort_by_key(|(key, _)| **key);
             bound_textures
@@ -6002,10 +6004,13 @@ impl Nvn {
             Vec::new()
         };
         let backend = self.gpu.as_mut().unwrap();
-        // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>: also trace that
-        // program's draws, with their fixed-function state.
-        let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM")
-            .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1));
+        // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
+        // programs' draws, with their fixed-function state.
+        let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
+            wanted
+                .split(',')
+                .any(|item| item == format!("{:016x}", keys.1))
+        });
         if traced_program {
             backend.note(format!(
                 "trace textures {:016x}/{:016x} {traced_textures}",
@@ -6067,11 +6072,16 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} mesh {:?} depth {:?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
                 mesh_groups,
+                depth,
+                fixed.depth_test,
+                fixed.depth_write,
+                fixed.depth_compare,
+                fixed.viewport,
                 colors,
                 attributes
                     .iter()
