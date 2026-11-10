@@ -56,6 +56,10 @@ enum MatrixLane {
     PackedWarp,
     Packed,
     PackedPairs,
+    /// The 32-bit accumulator scratch (C only): the warp's base W and W +
+    /// 16g + 2t.
+    WideWarp,
+    WideRows,
 }
 
 /// SPIR-V's SubgroupId built-in.
@@ -181,8 +185,11 @@ impl Emitter {
         let threads: u32 = self.layout.workgroup.iter().product();
         let warps = threads.div_ceil(32).max(1);
         // Packed pairs of halves (coop32) take a word per two elements.
+        // A 32-bit accumulator's scratch holds only C.
         let per_warp = if component == self.u32 {
             PACKED_PER_WARP
+        } else if component == self.f32 {
+            MATRIX_ELEMENTS
         } else {
             MATRIX_ELEMENTS * 3
         };
@@ -222,15 +229,18 @@ impl Emitter {
         if let Some(value) = self.known(key) {
             return Ok(value);
         }
-        let value = if matches!(which, MatrixLane::Warp | MatrixLane::PackedWarp) {
+        let value = if matches!(
+            which,
+            MatrixLane::Warp | MatrixLane::PackedWarp | MatrixLane::WideWarp
+        ) {
             // By subgroup id (Vulkan does not promise that invocation
             // index / 32 names the subgroup).
             self.module.capability(capability::GROUP_NON_UNIFORM);
             let warp = self.scalar_builtin(BUILTIN_SUBGROUP_ID);
-            let size = self.constant(if which == MatrixLane::Warp {
-                MATRIX_ELEMENTS * 3
-            } else {
-                PACKED_PER_WARP
+            let size = self.constant(match which {
+                MatrixLane::Warp => MATRIX_ELEMENTS * 3,
+                MatrixLane::PackedWarp => PACKED_PER_WARP,
+                _ => MATRIX_ELEMENTS,
             });
             self.value(op::I_MUL, self.u32, &[warp, size])
         } else if matches!(which, MatrixLane::Packed | MatrixLane::PackedPairs) {
@@ -248,7 +258,14 @@ impl Emitter {
             };
             self.value(op::I_ADD, self.u32, &[at, base])
         } else {
-            let base = self.matrix_lane(index, MatrixLane::Warp)?;
+            let base = self.matrix_lane(
+                index,
+                if which == MatrixLane::WideRows {
+                    MatrixLane::WideWarp
+                } else {
+                    MatrixLane::Warp
+                },
+            )?;
             let lane = self.special_register(index, 0)?;
             let (one, two, three, four) = (
                 self.constant(1),
@@ -266,7 +283,7 @@ impl Emitter {
                     let group = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
                     let thread = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
                     let pair = self.value(op::I_MUL, self.u32, &[thread, two]);
-                    if which == MatrixLane::RowMajor {
+                    if matches!(which, MatrixLane::RowMajor | MatrixLane::WideRows) {
                         (group, pair)
                     } else {
                         (pair, group)
@@ -313,15 +330,21 @@ impl Emitter {
         });
         let accumulator_type = if single { self.f32 } else { f16 };
         let halves = self.matrix_scratch(f16);
-        let wide = if single {
-            self.matrix_scratch(self.f32)
-        } else {
-            halves
-        };
-        // This warp's region, and this lane's places in it.
+        // This warp's region, and this lane's places in it; a 32-bit C in
+        // a scratch of its own.
         let base = self.matrix_lane(index, MatrixLane::Warp)?;
         let rows = self.matrix_lane(index, MatrixLane::RowMajor)?;
         let transposed = self.matrix_lane(index, MatrixLane::Transposed)?;
+        let (wide, wide_base, wide_rows, c_at) = if single {
+            (
+                self.matrix_scratch(self.f32),
+                self.matrix_lane(index, MatrixLane::WideWarp)?,
+                self.matrix_lane(index, MatrixLane::WideRows)?,
+                0,
+            )
+        } else {
+            (halves, base, rows, 2 * MATRIX_ELEMENTS)
+        };
         // The previous multiply's lanes may still be reading D: wait
         // before writing the fragments.
         self.subgroup_barrier();
@@ -381,14 +404,14 @@ impl Emitter {
         // C: element i at (g + 8 (i >> 1), 2t + (i & 1) + 8 n) for HMMA n.
         for (n, &(_, _, c)) in halves_in.iter().enumerate() {
             for i in 0..4u32 {
-                let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                let offset = c_at + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
                 let value = if single {
                     let bits = self.register_or_zero(next(c, i as u8));
                     self.value(op::BITCAST, self.f32, &[bits])
                 } else {
                     half_of(self, next(c, (i / 2) as u8), i % 2)
                 };
-                let pointer = self.scratch_element(wide, accumulator_type, rows, offset);
+                let pointer = self.scratch_element(wide, accumulator_type, wide_rows, offset);
                 self.function.emit(op::STORE, &[pointer, value]);
             }
         }
@@ -410,7 +433,7 @@ impl Emitter {
         let c_type = matrix(self, accumulator_type, 2);
         let a_pointer = self.scratch_element(halves, f16, base, 0);
         let b_pointer = self.scratch_element(halves, f16, base, MATRIX_ELEMENTS);
-        let c_pointer = self.scratch_element(wide, accumulator_type, base, 2 * MATRIX_ELEMENTS);
+        let c_pointer = self.scratch_element(wide, accumulator_type, wide_base, c_at);
         let load = |e: &mut Self, ty: u32, pointer: u32| {
             e.value(
                 op::COOPERATIVE_MATRIX_LOAD,
@@ -439,8 +462,8 @@ impl Emitter {
             }
             let values: Vec<u32> = (0..4u32)
                 .map(|i| {
-                    let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
-                    let pointer = self.scratch_element(wide, accumulator_type, rows, offset);
+                    let offset = c_at + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                    let pointer = self.scratch_element(wide, accumulator_type, wide_rows, offset);
                     self.value(op::LOAD, accumulator_type, &[pointer])
                 })
                 .collect();
@@ -487,8 +510,8 @@ impl Emitter {
         let (wide, wide_base, rows) = if single {
             (
                 self.matrix_scratch(self.f32),
-                self.matrix_lane(index, MatrixLane::Warp)?,
-                self.matrix_lane(index, MatrixLane::RowMajor)?,
+                self.matrix_lane(index, MatrixLane::WideWarp)?,
+                self.matrix_lane(index, MatrixLane::WideRows)?,
             )
         } else {
             (words, base, lane)
@@ -545,7 +568,7 @@ impl Emitter {
                 for i in 0..4u32 {
                     let bits = self.register_or_zero(next(c, i as u8));
                     let value = self.value(op::BITCAST, self.f32, &[bits]);
-                    let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                    let offset = 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
                     let pointer = self.scratch_element(wide, self.f32, rows, offset);
                     self.function.emit(op::STORE, &[pointer, value]);
                 }
@@ -581,7 +604,7 @@ impl Emitter {
         let a_pointer = self.scratch_element(words, self.u32, base, 0);
         let b_pointer = self.scratch_element(words, self.u32, base, 128);
         let (c_pointer, c_stride) = if single {
-            let pointer = self.scratch_element(wide, self.f32, wide_base, 2 * MATRIX_ELEMENTS);
+            let pointer = self.scratch_element(wide, self.f32, wide_base, 0);
             (pointer, sixteen)
         } else {
             (self.scratch_element(words, self.u32, base, 256), eight)
@@ -619,7 +642,7 @@ impl Emitter {
             }
             if single {
                 for i in 0..4u32 {
-                    let offset = 2 * MATRIX_ELEMENTS + 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
+                    let offset = 16 * 8 * (i >> 1) + (i & 1) + 8 * n as u32;
                     let pointer = self.scratch_element(wide, self.f32, rows, offset);
                     let value = self.value(op::LOAD, self.f32, &[pointer]);
                     self.write_float(d.saturating_add(i as u8), value);
