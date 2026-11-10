@@ -184,6 +184,11 @@ pub enum SpecMeaning {
     /// unwritten entry (zeros), without indexing past the arrays. Its
     /// default is `TEXTURE_INDEX_MASK + 1`, every index a handle carries.
     TexturePoolCapacity,
+    /// Debugging (programs translated with loop tracing): the low and high
+    /// words of the device address of the loop trace buffer (u32 words; 0:
+    /// no tracing). See the translator's documentation of the layout.
+    LoopTraceLow,
+    LoopTraceHigh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,6 +323,10 @@ pub struct PageTable {
 /// from the `UINT_*` arrays (a uint view of the same entry), chosen at run
 /// time by the entry's bit in `texture_pool::FLAGS`.
 pub const TEXTURE_POOL_SET: u32 = 1;
+/// The specialization constant ids of `SpecMeaning::LoopTraceLow` and
+/// `LoopTraceHigh`.
+pub const LOOP_TRACE_LOW_SPEC_ID: u32 = 29;
+pub const LOOP_TRACE_HIGH_SPEC_ID: u32 = 30;
 /// The specialization constant id of `SpecMeaning::TexturePoolCapacity`.
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;

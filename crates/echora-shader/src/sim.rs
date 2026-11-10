@@ -32,6 +32,7 @@ const U_MUL_EXTENDED: u16 = 151;
 const S_MUL_EXTENDED: u16 = 152;
 
 /// Decorations read here.
+const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_BINDING: u32 = 33;
@@ -139,6 +140,8 @@ pub struct Inputs {
     pub memory: BTreeMap<u64, Vec<u8>>,
     /// Bound textures and images by (descriptor set, binding).
     pub images: HashMap<(u32, u32), Image>,
+    /// Specialization constants' values by SpecId (else their defaults).
+    pub specialization: HashMap<u32, u32>,
     /// Iterations of one loop by one invocation that count as running
     /// away (1 << 16 when 0).
     pub loop_limit: u32,
@@ -221,6 +224,8 @@ pub struct Machine {
     /// Decorations: built-ins, descriptor sets and bindings by variable;
     /// array strides by type; member offsets by (struct, member).
     builtins: HashMap<u32, u32>,
+    /// SpecIds by constant.
+    spec_ids: HashMap<u32, u32>,
     sets: HashMap<u32, u32>,
     bindings: HashMap<u32, u32>,
     strides: HashMap<u32, u32>,
@@ -407,6 +412,7 @@ impl Machine {
             result_types: HashMap::new(),
             constants: HashMap::new(),
             builtins: HashMap::new(),
+            spec_ids: HashMap::new(),
             sets: HashMap::new(),
             bindings: HashMap::new(),
             strides: HashMap::new(),
@@ -437,6 +443,9 @@ impl Machine {
                     match operands[1] {
                         DECORATION_BUILT_IN => {
                             machine.builtins.insert(target, value);
+                        }
+                        DECORATION_SPEC_ID => {
+                            machine.spec_ids.insert(target, value);
                         }
                         DECORATION_DESCRIPTOR_SET => {
                             machine.sets.insert(target, value);
@@ -864,6 +873,11 @@ impl Machine {
             .map(|n| {
                 let mut invocation = self.start(&builtins(n));
                 invocation.initial = initial(n);
+                for (&constant, spec_id) in &self.spec_ids {
+                    if let Some(&value) = inputs.specialization.get(spec_id) {
+                        invocation.values.insert(constant, vec![u64::from(value)]);
+                    }
+                }
                 invocation
             })
             .collect();
@@ -2905,5 +2919,55 @@ mod tests {
         // From a running lane: nothing to report.
         let (_, _, problems) = run_group(32, &[0, 16, 0, 5], &body);
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn traced_loops_count_their_iterations_in_the_trace_buffer() {
+        use echora_shader_abi::{LOOP_TRACE_HIGH_SPEC_ID, LOOP_TRACE_LOW_SPEC_ID};
+        // R1 = 10; 2: IADD3 R0, R0, 1; 3: ISETP.LT P0, R0, R1; 4: @P0 BRA 2
+        let program = [
+            mov(0, 0),
+            mov(1, 10),
+            add(0, 0, 1),
+            less(0, 0, 1),
+            bra(4, 2, 0),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            loop_trace: true,
+            ..Layout::workgroup([32, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        if let Some(problem) = crate::spirv::tests::validate(&translated.spirv) {
+            panic!("{problem}");
+        }
+        let buffer = 0x5000u64;
+        let inputs = Inputs {
+            workgroup_count: [1, 1, 1],
+            memory: BTreeMap::from([(buffer, vec![0; 64])]),
+            specialization: HashMap::from([
+                (LOOP_TRACE_LOW_SPEC_ID, buffer as u32),
+                (LOOP_TRACE_HIGH_SPEC_ID, 0),
+            ]),
+            ..Inputs::default()
+        };
+        let report = Machine::new(&translated.spirv).simulate(&inputs);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let words: Vec<u32> = report.memory[&buffer]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| u32::from_le_bytes(word))
+            .collect();
+        // 32 invocations x 10 iterations, 10 at most, the budget never
+        // out, the header at instruction 2 (byte 0x20).
+        assert_eq!(words[..4], [320, 10, 0, 0x21]);
+        // Untraced (address 0): nothing written, nothing read.
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
 }

@@ -64,6 +64,7 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
                 vertex_outputs: header.outputs,
                 ..mesh
             }),
+            loop_trace: loop_trace(),
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {
@@ -88,6 +89,7 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         local_bytes: parameters.local_memory_size,
         matrices: matrix_path(parameters.matrix_mode),
         mesh: None,
+        loop_trace: loop_trace(),
     };
     compute::translate(&code, &layout)
 }
@@ -159,6 +161,14 @@ fn mesh_layout(stage: Stage, parameters: &Parameters) -> Result<compute::MeshLay
         vertex_outputs: [0; 5],
         primitive_outputs,
     })
+}
+
+/// Whether loops count their iterations for debugging (the environment
+/// variable ECHORA_LOOP_TRACE is set; see `compute::Layout::loop_trace`).
+/// The translation then depends on the environment, not only on its
+/// inputs: for debugging only.
+fn loop_trace() -> bool {
+    std::env::var_os("ECHORA_LOOP_TRACE").is_some()
 }
 
 /// The translation of HMMA a mode asks for.

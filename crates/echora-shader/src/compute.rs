@@ -310,6 +310,15 @@ pub struct Layout {
     pub matrices: MatrixPath,
     /// Task and mesh programs: their pipeline state.
     pub mesh: Option<MeshLayout>,
+    /// Debugging: each structured loop counts its iterations in a buffer
+    /// at the device address the specialization constants
+    /// `SpecMeaning::LoopTraceLow` and `LoopTraceHigh` give (nothing while
+    /// it is 0). Loop k (in the order the program's loops are emitted)
+    /// owns words 4k to 4k + 3: the iterations of all invocations, the most
+    /// iterations of one invocation in one entry to the loop, the times
+    /// the loop budget ran out there, and the loop header's byte offset in
+    /// the program plus one (0: no such loop).
+    pub loop_trace: bool,
 }
 
 /// A task or mesh program's pipeline state.
@@ -362,6 +371,7 @@ impl Layout {
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
             mesh: None,
+            loop_trace: false,
         }
     }
 }
@@ -3381,6 +3391,7 @@ mod tests {
             local_bytes: Some(0x40),
             matrices: MatrixPath::Subgroup,
             mesh: None,
+            loop_trace: false,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3633,6 +3644,7 @@ mod tests {
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
             mesh: None,
+            loop_trace: false,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4526,6 +4538,7 @@ mod tests {
             local_bytes: None,
             matrices: MatrixPath::Subgroup,
             mesh: None,
+            loop_trace: false,
         };
         valid_with(&words, &layout);
     }

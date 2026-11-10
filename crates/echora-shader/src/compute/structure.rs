@@ -41,10 +41,12 @@ enum Statement {
         id: usize,
         body: Box<Statement>,
     },
-    /// Construct `id`, repeated; a continue to it runs it again.
+    /// Construct `id`, repeated; a continue to it runs it again. `offset`
+    /// is its header's byte offset in the program.
     Loop {
         id: usize,
         body: Box<Statement>,
+        offset: u32,
     },
     Exit(usize),
     Continue(usize),
@@ -233,6 +235,7 @@ impl Builder<'_> {
             Statement::Loop {
                 id,
                 body: Box::new(body),
+                offset: self.blocks[x].start as u32 * 16,
             }
         } else {
             self.within(x, &merges)
@@ -331,6 +334,10 @@ struct Structured {
     /// In programs with barriers: the invocation has exited (a bool
     /// variable). See `statement`'s early exits.
     exited: Option<u32>,
+    /// Loop tracing: the trace buffer's address (a u64 value; 0 none), and
+    /// the loops emitted so far.
+    trace: Option<u32>,
+    loops: u32,
 }
 
 fn exit_code(id: usize) -> u32 {
@@ -384,11 +391,14 @@ impl Emitter {
             self.function
                 .variable(&mut self.module, self.bool_ptr, Some(no))
         });
+        let trace = self.layout.loop_trace.then(|| self.trace_address());
         let mut state = Structured {
             open: Vec::new(),
             pending,
             budget,
             exited,
+            trace,
+            loops: 0,
         };
         self.statement(code, blocks, &root, &mut state)?;
         Ok(true)
@@ -505,8 +515,23 @@ impl Emitter {
                 self.function.label(merge);
                 self.function.emit(op::UNREACHABLE, &[]);
             }
-            Statement::Block { id, body } | Statement::Loop { id, body } => {
+            Statement::Block { id, body } | Statement::Loop { id, body, .. } => {
                 let repeats = matches!(statement, Statement::Loop { .. });
+                // Loop tracing: this loop's words and its count of
+                // iterations since the invocation entered it.
+                let trace = match (statement, state.trace) {
+                    (Statement::Loop { offset, .. }, Some(address)) => {
+                        let first = state.loops * 4;
+                        state.loops += 1;
+                        let zero = self.constant(0);
+                        let count = self.function.variable(&mut self.module, self.u32_ptr, None);
+                        self.function.emit(op::STORE, &[count, zero]);
+                        let place = self.constant(offset + 1);
+                        self.trace_atomic(address, first + 3, op::ATOMIC_EXCHANGE, place);
+                        Some((address, first, count))
+                    }
+                    _ => None,
+                };
                 let (header, start, continuing, merge) = (
                     self.module.id(),
                     self.module.id(),
@@ -535,8 +560,26 @@ impl Emitter {
                     self.function
                         .emit(op::BRANCH_CONDITIONAL, &[spent, stop, go]);
                     self.function.label(stop);
+                    if let Some((address, first, _)) = trace {
+                        // The budget ran out here (not an exited invocation
+                        // leaving).
+                        let ran_out = self.value(op::I_EQUAL, self.bool, &[left, zero]);
+                        self.when(ran_out, |e| {
+                            let one = e.constant(1);
+                            e.trace_atomic(address, first + 2, op::ATOMIC_I_ADD, one);
+                            Ok(())
+                        })?;
+                    }
                     self.leave();
                     self.function.label(go);
+                    if let Some((address, first, count)) = trace {
+                        let one = self.constant(1);
+                        let before = self.value(op::LOAD, self.u32, &[count]);
+                        let now = self.value(op::I_ADD, self.u32, &[before, one]);
+                        self.function.emit(op::STORE, &[count, now]);
+                        self.trace_atomic(address, first, op::ATOMIC_I_ADD, one);
+                        self.trace_atomic(address, first + 1, op::ATOMIC_U_MAX, now);
+                    }
                 }
                 state.open.push(Open {
                     id: *id,
@@ -601,6 +644,48 @@ impl Emitter {
             Statement::Return => self.leave(),
         }
         Ok(())
+    }
+
+    /// The loop trace buffer's address, from its two specialization
+    /// constants (a u64 value).
+    fn trace_address(&mut self) -> u32 {
+        use echora_shader_abi::{
+            LOOP_TRACE_HIGH_SPEC_ID, LOOP_TRACE_LOW_SPEC_ID, SpecConstant, SpecMeaning,
+        };
+        let mut words = [0; 2];
+        for (word, (id, meaning)) in words.iter_mut().zip([
+            (LOOP_TRACE_LOW_SPEC_ID, SpecMeaning::LoopTraceLow),
+            (LOOP_TRACE_HIGH_SPEC_ID, SpecMeaning::LoopTraceHigh),
+        ]) {
+            let constant = self.module.u32_spec_constant(0);
+            self.module.decorate(constant, 1, &[id]);
+            self.spec_constants.push(SpecConstant { id, meaning });
+            // Used as a value in the function (a spec constant is an id).
+            *word = constant;
+        }
+        self.join(words[0], words[1])
+    }
+
+    /// An atomic `opcode` with `value` on word `word` of the trace buffer
+    /// at `address` (a u64 value), when the address is not 0.
+    fn trace_atomic(&mut self, address: u32, word: u32, opcode: u16, value: u32) {
+        self.memory.physical = true;
+        self.module
+            .capability(spirv::capability::PHYSICAL_STORAGE_BUFFER_ADDRESSES);
+        let zero = self.constant64(0);
+        let traced = self.value(op::I_NOT_EQUAL, self.bool, &[address, zero]);
+        let _ = self.when(traced, |e| {
+            let offset = e.constant64(u64::from(word) * 4);
+            let u64 = e.u64();
+            let at = e.value(op::I_ADD, u64, &[address, offset]);
+            let pointer_type = e
+                .module
+                .pointer(spirv::storage::PHYSICAL_STORAGE_BUFFER, e.u32);
+            let pointer = e.value(op::CONVERT_U_TO_PTR, pointer_type, &[at]);
+            let (device, relaxed) = (e.constant(1), e.constant(0));
+            e.value(opcode, e.u32, &[pointer, device, relaxed, value]);
+            Ok(())
+        });
     }
 
     /// The invocation's end: the fragment outputs, then return.
