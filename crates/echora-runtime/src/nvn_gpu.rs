@@ -392,10 +392,24 @@ fn nvn_stage(stage: Stage) -> u32 {
         Stage::TessControl => 3,
         Stage::TessEval => 4,
         Stage::Compute => 5,
-        // Bound in the vertex and tessellation slots (a mesh program without
-        // a task in the vertex slot: `bound_mesh_program` gives its slot).
-        Stage::Task => 0,
-        Stage::Mesh => 4,
+        // The application binds a task or mesh program's resources at
+        // these stages (the bound uniform buffers show them).
+        Stage::Task => 6,
+        Stage::Mesh => 7,
+    }
+}
+
+/// Where NVN stage `nvn`'s storage buffer table sits in the driver
+/// constants c0 (0x110 + 0x100 * this): the hardware's stage order, vertex
+/// (and task), tessellation control, tessellation evaluation (and mesh),
+/// geometry, fragment.
+fn c0_stage_index(nvn: u32) -> u32 {
+    match nvn {
+        0 | 6 => 0,
+        3 => 1,
+        4 | 7 => 2,
+        2 => 3,
+        _ => 4,
     }
 }
 
@@ -1454,8 +1468,7 @@ impl Nvn {
                 _ => {}
             }
         }
-        let (mesh, mesh_kind) =
-            mesh.ok_or_else(|| format!("no mesh program is bound ({bound})"))?;
+        let (mesh, _) = mesh.ok_or_else(|| format!("no mesh program is bound ({bound})"))?;
         let fragment = fragment.ok_or_else(|| {
             format!("no fragment program is bound with the mesh program ({bound})")
         })?;
@@ -1510,7 +1523,7 @@ impl Nvn {
             base = advance(&stage, base);
             keys = self.stage_code(core, task.x[0]).map_or(0, |(_, key)| key);
             translated.push(stage);
-            slots.push(0);
+            slots.push(6);
             entries.push(task);
         }
         let parameters = MeshParameters {
@@ -1534,7 +1547,7 @@ impl Nvn {
         let stores = stage.stores;
         keys = keys.rotate_left(1) ^ self.stage_code(core, mesh.x[0]).map_or(0, |(_, key)| key);
         translated.push(stage);
-        slots.push(if mesh_kind == 1 { 0 } else { 4 });
+        slots.push(7);
         entries.push(mesh);
         let stage = self.translate_stage(
             core,
@@ -4859,11 +4872,13 @@ impl Nvn {
                     // not returned.
                     DescriptorKind::StorageBuffer
                         if descriptor.cbuf_index == 0
-                            && descriptor.cbuf_offset >= 0x110 + 0x100 * nvn
-                            && descriptor.cbuf_offset < 0x110 + 0x100 * nvn + 0x100
+                            && descriptor.cbuf_offset >= 0x110 + 0x100 * c0_stage_index(nvn)
+                            && descriptor.cbuf_offset
+                                < 0x110 + 0x100 * c0_stage_index(nvn) + 0x100
                             && descriptor.cbuf_offset % 16 == 0 =>
                     {
-                        let slot = (descriptor.cbuf_offset - 0x110 - 0x100 * nvn) / 16;
+                        let slot =
+                            (descriptor.cbuf_offset - 0x110 - 0x100 * c0_stage_index(nvn)) / 16;
                         let bind = self
                             .render
                             .state
@@ -5002,27 +5017,25 @@ impl Nvn {
             }
         }
 
-        // Each stage's c0 holds every bound storage buffer's address and
-        // size (graphics stage s, slot i at 0x110 + 0x100 * s + 16 * i), as
-        // the driver keeps them: a program that reaches global memory
-        // through the page table reads them there itself, with no storage
-        // binding of its own.
-        let bound_storage: Vec<(u64, u64, u64)> = (0..5u64)
-            .flat_map(|nvn| (0..16u64).map(move |slot| (nvn, slot)))
-            .filter_map(|(nvn, slot)| {
-                let bind = self
-                    .render
-                    .state
-                    .get(&format!("BindStorageBuffer/{nvn}/{slot}"))?;
-                Some((0x110 + 0x100 * nvn + 16 * slot, bind.x[3], bind.x[4]))
-            })
-            .collect();
+        // Each stage's c0 holds its bound storage buffers' addresses and
+        // sizes (slot i at 0x110 + 0x100 * the stage's hardware index + 16
+        // * i, `c0_stage_index`), as the driver keeps them: a program that
+        // reaches global memory through the page table reads them there
+        // itself, with no storage binding of its own.
         for (index, stage) in stages.iter().enumerate() {
             if stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE == 0 {
                 continue;
             }
-            for &(offset, gpu, size) in &bound_storage {
-                storage_entries.push((index, offset as u32, gpu, size));
+            let nvn = slots[index];
+            for slot in 0..16u64 {
+                if let Some(bind) = self
+                    .render
+                    .state
+                    .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
+                {
+                    let offset = 0x110 + 0x100 * u64::from(c0_stage_index(nvn)) + 16 * slot;
+                    storage_entries.push((index, offset as u32, bind.x[3], bind.x[4]));
+                }
             }
         }
         // Each stage's c0 holds its storage buffers' addresses and sizes,
