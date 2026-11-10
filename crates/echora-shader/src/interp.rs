@@ -293,7 +293,12 @@ impl Machine {
             let operands = &instruction.operands;
             let opcode = instruction.opcode;
             match opcode {
-                op::LABEL | op::SELECTION_MERGE | op::LOOP_MERGE => continue,
+                // One invocation: barriers have nothing to wait for.
+                op::LABEL
+                | op::SELECTION_MERGE
+                | op::LOOP_MERGE
+                | op::CONTROL_BARRIER
+                | op::MEMORY_BARRIER => continue,
                 op::VARIABLE => {
                     let pointee = match self.ty(operands[0]) {
                         Ty::Pointer { pointee } => pointee,
@@ -990,5 +995,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// BRA from instruction `from` to `to` (indices in the whole program,
+    /// MOVs included) under `guard` (index, plus 8 when negated).
+    fn bra(from: usize, to: usize, guard: u128) -> u128 {
+        let offset = (to as i64 - from as i64 - 1) * 16;
+        let field = (offset as u64 & ((1 << 50) - 1)) as u128;
+        let mut raw = word(&[(0, 12, 0x947), (32, 50, field), (87, 3, 7)]);
+        raw &= !(0xf << 12);
+        raw | guard << 12
+    }
+
+    /// IADD3 Rd, Ra, imm, RZ.
+    fn add(d: u128, a: u128, imm: u32) -> u128 {
+        word(&[
+            (0, 12, 0x810),
+            (16, 8, d),
+            (24, 8, a),
+            (32, 32, u128::from(imm)),
+            (64, 8, 255),
+            (77, 3, 7),
+            (81, 3, 7),
+            (84, 3, 7),
+            (87, 3, 7),
+        ])
+    }
+
+    /// ISETP.LT.U32.AND Pp, PT, Ra, Rb, PT.
+    fn less(p: u128, a: u128, b: u128) -> u128 {
+        word(&[
+            (0, 12, 0x20c),
+            (24, 8, a),
+            (32, 8, b),
+            (76, 3, 1),
+            (81, 3, p),
+            (84, 3, 7),
+            (87, 3, 7),
+        ])
+    }
+
+    const BAR: u128 = 0xb1d | 7 << 12;
+
+    #[test]
+    fn loops_run_their_iterations_and_stop() {
+        // R0 = 0, R1 = 10 (the MOVs are instructions 0 and 1).
+        // 2: IADD3 R0, R0, 1; 3: BAR; 4: ISETP.LT P0, R0, R1; 5: @P0 BRA 2
+        let (r, _) = run(&[0, 10], &[add(0, 0, 1), BAR, less(0, 0, 1), bra(5, 2, 0)]);
+        assert_eq!(r[&0], 10);
+        // An EXIT inside the loop: R2 counts, leaving at R2 == 3.
+        // 3: IADD3 R2, R2, 1; 4: ISETP.LT P1, R2, R1 (R1 = 3);
+        // 5: @!P1 EXIT; 6: IADD3 R0, R0, 1; 7: BRA 3
+        let exit = |guard: u128| (0x94d | 7 << 12) & !(0xf << 12) | guard << 12;
+        let (r, _) = run(
+            &[0, 3, 0],
+            &[
+                add(2, 2, 1),
+                less(1, 2, 1),
+                exit(1 | 8),
+                add(0, 0, 1),
+                bra(7, 3, 7),
+            ],
+        );
+        assert_eq!((r[&2], r[&0]), (3, 2));
+        // Nested: the inner loop 4 times for each of 3 outer iterations.
+        // R0 outer, R1 inner, R2 total; R3 = 3, R4 = 4.
+        // 5: MOV R1, 0; 6: IADD3 R1, R1, 1; 7: IADD3 R2, R2, 1;
+        // 8: ISETP.LT P0, R1, R4; 9: @P0 BRA 6; 10: IADD3 R0, R0, 1;
+        // 11: ISETP.LT P1, R0, R3; 12: @P1 BRA 5
+        let (r, _) = run(
+            &[0, 0, 0, 3, 4],
+            &[
+                mov(1, 0),
+                add(1, 1, 1),
+                add(2, 2, 1),
+                less(0, 1, 4),
+                bra(9, 6, 0),
+                add(0, 0, 1),
+                less(1, 0, 3),
+                bra(12, 5, 1),
+            ],
+        );
+        assert_eq!((r[&0], r[&2]), (3, 12));
     }
 }
