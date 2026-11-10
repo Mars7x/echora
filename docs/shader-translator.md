@@ -169,6 +169,13 @@ most 32 threads: the hardware runs one warp), the output limits (at most
 (the larger of the line counts in SET_MESH_INIT_SHADER bits 12-20 and
 22-30, times 128 bytes). The field widths are Lichii's decoding.
 
+Each stage reads its storage buffer table (16 bytes a slot: address, size)
+from constant bank 0 at its own base, which the runtime fills: vertex
+0x110, tessellation control 0x210, evaluation 0x310, geometry 0x410,
+fragment 0x510, task 0x670, mesh 0x770 (measured over every cached
+program by header type; a mesh table at 0x310 left mesh programs a null
+pointer and an early EXIT).
+
 The programs talk through the internal stage buffer, which ISBERD and
 ISBEWR address by byte, laid out as Mesa's NAK lays it out. A task
 program's output attributes become the task payload (the mesh workgroup
