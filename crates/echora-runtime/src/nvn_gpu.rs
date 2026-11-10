@@ -4402,10 +4402,15 @@ impl Nvn {
                     .get("Storage")
                     .map(|storage| (storage.x[0], storage.x[1]))
             })
+            // A pool at a known base whose size changed (made again over
+            // the same memory, larger) is shared again.
             .filter(|&(base, size)| {
                 base != 0
                     && size != 0
-                    && !backend.shared_pools.contains_key(&base)
+                    && backend
+                        .shared_pools
+                        .get(&base)
+                        .is_none_or(|&(shared, ..)| shared != size)
                     && !backend.shared_pieces.contains_key(&base)
             })
             .collect();
