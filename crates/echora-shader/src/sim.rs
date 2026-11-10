@@ -2372,7 +2372,7 @@ impl Machine {
                 op::CONVERT_F_TO_S => {
                     let v = f(0);
                     assert!(
-                        v.is_finite() && v >= -2_147_483_648.0 && v < 2_147_483_648.0,
+                        v.is_finite() && (-2_147_483_648.0..2_147_483_648.0).contains(&v),
                         "ConvertFToS of {v}"
                     );
                     u64::from(v as i32 as u32)
@@ -4614,6 +4614,64 @@ mod tests {
             "{:#x}",
             r[&2]
         );
+    }
+
+    #[test]
+    fn texel_offsets_move_the_sample_and_never_divide_by_zero() {
+        // TEX.LZ (2D, offsets) R4, R0 (x, y), R2 (packed offsets: x in bits
+        // 0-3, y in 4-7), handle c[0x0][0x40].
+        let sample = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (76, 1, 1),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        // Texel (2, 1), offset by (+1, -1): texel (3, 0).
+        let program = [
+            mov(0, 0.625f32.to_bits()),
+            mov(1, 0.375f32.to_bits()),
+            mov(2, 0x01 | 0xf << 4),
+            sample,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let texture = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap();
+        let texels = (0..16u32).map(|n| [n, 0, 0, 0]).collect();
+        let machine = Machine::new(&translated.spirv);
+        let image = Image {
+            width: 4,
+            height: 4,
+            depth: 1,
+            layers: 1,
+            texels,
+        };
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([((0, texture.binding), image)]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.invocations[0][&registers[&4]][0], 3);
+        // Unbound (size 0): no NaN coordinate.
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            ..Inputs::default()
+        });
+        assert_eq!(report.nonfinite, vec![None]);
     }
 
     #[test]
