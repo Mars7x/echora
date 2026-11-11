@@ -3923,6 +3923,7 @@ impl Nvn {
 
     /// `resolve_storage` for `size` bytes at GPU address `address` (memory
     /// a draw or dispatch is about to read).
+    #[track_caller]
     fn resolve_gpu(&mut self, core: &mut Guest, address: u64, size: u64) -> Result<(), String> {
         if self
             .gpu
@@ -3938,6 +3939,7 @@ impl Nvn {
     /// Store finished dispatch results to guest memory: all of them
     /// (`None`), or, when any overlaps `range`, all of them (results come
     /// back in dispatch order, so an earlier one never lands on a later).
+    #[track_caller]
     pub(super) fn resolve_storage(
         &mut self,
         core: &mut Guest,
@@ -3966,6 +3968,7 @@ impl Nvn {
     /// dispatch's arguments a compute program wrote): after such a dispatch
     /// the work is finished and, where a resident pool holds the range, its
     /// GPU copy is read back; then `resolve_storage` as usual.
+    #[track_caller]
     pub(super) fn resolve_gpu_written(
         &mut self,
         core: &mut Guest,
@@ -3989,6 +3992,7 @@ impl Nvn {
     /// Copy GPU-newer resident pool ranges back to the guest: what overlaps
     /// `range`, or with `None` (a CPU wait) what uncached pools hold (the
     /// CPU must invalidate a cached pool's range before reading it).
+    #[track_caller]
     fn resolve_resident(
         &mut self,
         core: &mut Guest,
@@ -4028,6 +4032,8 @@ impl Nvn {
         let ids: Vec<u64> = tokens.iter().map(|(token, ..)| *token).collect();
         let mut completed = backend.renderer.take_reads(&ids);
         backend.stat("stat: resident ranges copied back", wanted.len() as u64);
+        // Which call site asked (`#[track_caller]` up the resolve chain).
+        backend.stat(caller_stat(std::panic::Location::caller()), 1);
         for (token, base, piece) in tokens {
             let bytes = completed
                 .remove(&token)
@@ -7157,6 +7163,29 @@ impl ResidentPool {
 }
 
 /// Add `range` to a sorted list of disjoint ranges, merging neighbours.
+/// A stat name for a copy-back's call site, made once per site.
+fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::RefCell<HashMap<(&'static str, u32), &'static str>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    NAMES.with(|names| {
+        *names
+            .borrow_mut()
+            .entry((location.file(), location.line()))
+            .or_insert_with(|| {
+                Box::leak(
+                    format!(
+                        "stat: copy-back from {}:{}",
+                        location.file(),
+                        location.line()
+                    )
+                    .into_boxed_str(),
+                )
+            })
+    })
+}
+
 fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
     let mut merged = range;
     ranges.retain(|existing| {
