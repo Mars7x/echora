@@ -1068,6 +1068,8 @@ impl Nvn {
     /// convention (X0..X7, V0..V7); a result goes to X0 (or V0). Returns
     /// Ok(false) when `name` is not implemented, so the caller stops with it.
     pub fn call(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        self.arm_call_watch();
+        call_watch(name, core);
         // Where the CPU may look at what the GPU wrote (after waiting for
         // it, or invalidating its view of a mapped range), deferred
         // dispatch results are stored first; between those points they
@@ -4676,6 +4678,108 @@ fn snapshot_states(bags: &BTreeMap<u64, Bag>, command: &mut Command) {
 
 /// Record NVN call `name` (`nvnCommandBuffer` + `rest`) on a recording
 /// command buffer, with any data NVN reads through pointers captured now.
+/// ECHORA_CALL_WATCH=START-END (hex GPU addresses, debugging), from
+/// present ECHORA_CALL_WATCH_FROM to ECHORA_CALL_WATCH_TO: the range as the
+/// CPU sees it, compared at every NVN call; each change is logged with the
+/// call that saw it and its return address, so the CPU code that wrote it
+/// ran just before that call site.
+struct CallWatch {
+    range: std::ops::Range<u64>,
+    active: bool,
+    last: Option<Vec<u8>>,
+}
+
+static CALL_WATCH: std::sync::Mutex<Option<CallWatch>> = std::sync::Mutex::new(None);
+/// A watch is mapped (no lock taken per call otherwise).
+static CALL_WATCH_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Nvn {
+    /// Map ECHORA_CALL_WATCH's GPU range to guest memory once and follow
+    /// its present window (`call_watch` compares).
+    fn arm_call_watch(&self) {
+        let Ok(range) = debug_var("ECHORA_CALL_WATCH") else {
+            return;
+        };
+        let present = |name: &str, default: u64| {
+            debug_var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let window =
+            present("ECHORA_CALL_WATCH_FROM", 0)..=present("ECHORA_CALL_WATCH_TO", u64::MAX);
+        let active = window.contains(&self.presented_frames);
+        let mut watch = CALL_WATCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(watch) = watch.as_mut() {
+            watch.active = active;
+            return;
+        }
+        let Some((start, end)) = range.split_once('-').and_then(|(start, end)| {
+            let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+            Some((parse(start)?, parse(end)?))
+        }) else {
+            return;
+        };
+        let Ok(guest) = self.gpu_to_guest(start, end - start) else {
+            return;
+        };
+        eprintln!("call watch: GPU {start:#x}..{end:#x} is guest {guest:#x}");
+        CALL_WATCH_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        *watch = Some(CallWatch {
+            range: guest..guest + (end - start),
+            active,
+            last: None,
+        });
+    }
+}
+
+fn call_watch(name: &str, core: &Guest) {
+    if !CALL_WATCH_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut watch = CALL_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(watch) = watch.as_mut().filter(|watch| watch.active) else {
+        return;
+    };
+    let mut bytes = vec![0u8; (watch.range.end - watch.range.start) as usize];
+    if core.memory.read(watch.range.start, &mut bytes).is_err() {
+        return;
+    }
+    if let Some(last) = &watch.last
+        && *last != bytes
+    {
+        let changed: Vec<usize> = (0..bytes.len() / 4)
+            .filter(|word| bytes[word * 4..word * 4 + 4] != last[word * 4..word * 4 + 4])
+            .collect();
+        let word = |data: &[u8], index: usize| {
+            u32::from_le_bytes([
+                data[index * 4],
+                data[index * 4 + 1],
+                data[index * 4 + 2],
+                data[index * 4 + 3],
+            ])
+        };
+        let first = changed[0];
+        eprintln!(
+            "call watch: {} words changed before {name} (lr {:#x}, pc {:#x}), first at +{:#x}: {:08x} -> {:08x}, then {:08x?}",
+            changed.len(),
+            core.cpu.regs[30],
+            core.cpu.pc,
+            first * 4,
+            word(last, first),
+            word(&bytes, first),
+            (first..(first + 8).min(bytes.len() / 4))
+                .map(|index| word(&bytes, index))
+                .collect::<Vec<_>>()
+        );
+    }
+    watch.last = Some(bytes);
+}
+
 fn record_command(
     name: &str,
     rest: &str,
@@ -4684,6 +4788,7 @@ fn record_command(
     recording: &mut Recording,
     mut notes: Option<&mut Vec<String>>,
 ) -> Result<(), Trap> {
+    call_watch(name, core);
     let invalid = |message: String| Trap::InvalidState {
         message: format!("{name}: {message}"),
     };
