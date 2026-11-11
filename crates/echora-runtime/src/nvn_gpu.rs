@@ -2924,6 +2924,12 @@ impl Nvn {
         let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
         let depth = get("Depth").unwrap_or(1).clamp(1, 64);
         match get("Target").unwrap_or(1) {
+            // TARGET_3D: a volume of all its slices (the fog's froxel
+            // volumes are 96 deep), as the dispatch image binding makes it;
+            // one 2D layer would drop every store past slice 0.
+            2 => ImageShape::D3 {
+                depth: get("Depth").unwrap_or(1).max(1),
+            },
             4 => ImageShape::D2 { layers: depth },
             8 | 9 if depth >= 6 => ImageShape::Cube {
                 layers: depth / 6 * 6,

@@ -3165,10 +3165,13 @@ impl Renderer {
         layer: u32,
     ) -> Result<vk::ImageView, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
-        let layers = target.shape.layers();
-        if layers == 1 || matches!(target.shape, ImageShape::D3 { .. }) {
-            return self.level_view(key, level);
-        }
+        // A volume's attachment is one slice of the level (a 3D view is no
+        // attachment), viewed 2D through TYPE_2D_ARRAY_COMPATIBLE.
+        let layers = match target.shape {
+            ImageShape::D3 { depth } => (depth >> level).max(1),
+            shape if shape.layers() == 1 => return self.level_view(key, level),
+            shape => shape.layers(),
+        };
         if level >= target.levels || layer >= layers {
             return Err(format!(
                 "level {level} layer {layer} of a {}-level {layers}-layer target",
@@ -3211,7 +3214,11 @@ impl Renderer {
         let (image_type, flags) = match shape {
             ImageShape::D1 { .. } => (vk::ImageType::TYPE_1D, vk::ImageCreateFlags::empty()),
             ImageShape::D2 { .. } => (vk::ImageType::TYPE_2D, vk::ImageCreateFlags::empty()),
-            ImageShape::D3 { .. } => (vk::ImageType::TYPE_3D, vk::ImageCreateFlags::empty()),
+            // 2D views of its slices are a draw's attachments.
+            ImageShape::D3 { .. } => (
+                vk::ImageType::TYPE_3D,
+                vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE,
+            ),
             ImageShape::Cube { .. } => (
                 vk::ImageType::TYPE_2D,
                 vk::ImageCreateFlags::CUBE_COMPATIBLE,
