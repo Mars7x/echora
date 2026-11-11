@@ -124,6 +124,9 @@ pub struct Fixed {
     /// Polygon offset: constant (units), clamp and slope factors; None
     /// leaves depth unbiased.
     pub depth_bias: Option<[f32; 3]>,
+    /// The depth target is a D24 format held as D32F: polygon offset
+    /// units are D24 steps (2^-24) where the device can force that.
+    pub depth_bias_d24: bool,
 }
 
 /// One face's stencil test and update.
@@ -1038,9 +1041,27 @@ impl Renderer {
                 } else {
                     0.0
                 };
-                self.gpu
-                    .device
-                    .cmd_set_depth_bias(commands, constant, clamp, slope);
+                match self.gpu.depth_bias_control.as_ref() {
+                    Some(control) if fixed.depth_bias_d24 => {
+                        let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
+                            .depth_bias_representation(
+                                vk::DepthBiasRepresentationEXT::LEAST_REPRESENTABLE_VALUE_FORCE_UNORM,
+                            )
+                            .depth_bias_exact(true);
+                        let info = vk::DepthBiasInfoEXT::default()
+                            .depth_bias_constant_factor(constant)
+                            .depth_bias_clamp(clamp)
+                            .depth_bias_slope_factor(slope)
+                            .push_next(&mut representation);
+                        // Recording (the enclosing block's safety); the
+                        // extension is enabled and `info` outlives the call.
+                        (control.fp().cmd_set_depth_bias2_ext)(commands, &info);
+                    }
+                    _ => self
+                        .gpu
+                        .device
+                        .cmd_set_depth_bias(commands, constant, clamp, slope),
+                }
             }
             objects.cmd_set_depth_test_enable(commands, fixed.depth_test && draw.depth.is_some());
             objects.cmd_set_depth_write_enable(commands, fixed.depth_write && draw.depth.is_some());
@@ -1250,6 +1271,7 @@ pub(crate) mod tests {
                 stencil: None,
                 depth_minus_one_to_one: false,
                 depth_bias: None,
+                depth_bias_d24: false,
             },
             blends: vec![Blend::default()],
             mesh: None,

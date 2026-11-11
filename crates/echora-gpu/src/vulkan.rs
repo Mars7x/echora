@@ -47,6 +47,11 @@ pub struct Gpu {
     /// VK_EXT_conditional_rendering: draws and dispatches gated on a word
     /// the GPU wrote (the guest's occlusion-conditioned rendering).
     pub conditional_rendering: Option<ash::ext::conditional_rendering::Device>,
+    /// VK_EXT_depth_bias_control with the forced UNORM representation: a
+    /// D24 depth target held as D32F takes polygon offset units in D24
+    /// steps (2^-24), as the console's D24 does, not in the float format's
+    /// exponent-dependent steps.
+    pub depth_bias_control: Option<ash::ext::depth_bias_control::Device>,
     /// VK_KHR_cooperative_matrix is enabled: the shapes and types the
     /// device multiplies (M, N, K, A, B, C, result, saturating, scope).
     pub cooperative_matrix: Vec<CooperativeMatrixShape>,
@@ -148,6 +153,7 @@ impl Gpu {
         let mut supported_cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut supported_conditional =
             vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let mut supported_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported11)
             .push_next(&mut supported12)
@@ -159,7 +165,8 @@ impl Gpu {
             .push_next(&mut supported_clock)
             .push_next(&mut supported_atomic_float)
             .push_next(&mut supported_cooperative)
-            .push_next(&mut supported_conditional);
+            .push_next(&mut supported_conditional)
+            .push_next(&mut supported_bias);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_features2(physical, &mut supported) };
         let core = supported.features;
@@ -246,6 +253,13 @@ impl Gpu {
             && has(ash::ext::conditional_rendering::NAME);
         if conditional_rendering {
             enabled_extensions.push(ash::ext::conditional_rendering::NAME.as_ptr());
+        }
+        let depth_bias_control = supported_bias.depth_bias_control != 0
+            && supported_bias.least_representable_value_force_unorm_representation != 0
+            && supported_bias.depth_bias_exact != 0
+            && has(ash::ext::depth_bias_control::NAME);
+        if depth_bias_control {
+            enabled_extensions.push(ash::ext::depth_bias_control::NAME.as_ptr());
         }
         // The guest's clock special registers (SPV_KHR_shader_clock) and
         // float atomic adds on storage (SPV_EXT_shader_atomic_float_add).
@@ -372,6 +386,13 @@ impl Gpu {
         if conditional_rendering {
             device_info = device_info.push_next(&mut enable_conditional);
         }
+        let mut enable_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default()
+            .depth_bias_control(true)
+            .least_representable_value_force_unorm_representation(true)
+            .depth_bias_exact(true);
+        if depth_bias_control {
+            device_info = device_info.push_next(&mut enable_bias);
+        }
         let mut enable_clock =
             vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_subgroup_clock(true);
         if subgroup_clock {
@@ -402,6 +423,8 @@ impl Gpu {
             mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
         let conditional_rendering = conditional_rendering
             .then(|| ash::ext::conditional_rendering::Device::new(&instance, &device));
+        let depth_bias_control = depth_bias_control
+            .then(|| ash::ext::depth_bias_control::Device::new(&instance, &device));
         let texture_pool_layout = (s12.runtime_descriptor_array != 0
             && s12.descriptor_binding_partially_bound != 0
             && s12.descriptor_binding_sampled_image_update_after_bind != 0
@@ -454,6 +477,7 @@ impl Gpu {
             dma_buf_import,
             mesh_shader,
             conditional_rendering,
+            depth_bias_control,
             shader_binary_version,
             name,
         })
