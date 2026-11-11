@@ -6541,8 +6541,11 @@ impl Nvn {
             bound_textures.sort_by_key(|(key, _)| **key);
             bound_textures
                 .iter()
-                .map(|(key, (source, _))| {
-                    format!("{key:?}={}", self.describe_sources(std::iter::once(source)))
+                .map(|(key, (source, sampler))| {
+                    format!(
+                        "{key:?}={} sampler {sampler:?}",
+                        self.describe_sources(std::iter::once(source))
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -6568,10 +6571,12 @@ impl Nvn {
                 .any(|item| item == format!("{:016x}", keys.1))
         });
         if traced_program {
-            backend.note(format!(
-                "trace textures {:016x}/{:016x} {traced_textures}",
+            let line = format!(
+                "trace textures {:016x}/{:016x} base {base_vertex} {traced_textures}",
                 keys.0, keys.1
-            ));
+            );
+            eprintln!("{line}");
+            backend.note(line);
             let line = format!(
                 "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} uniforms {:?}",
                 keys.0,
