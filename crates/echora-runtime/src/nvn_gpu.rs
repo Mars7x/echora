@@ -5464,7 +5464,9 @@ impl Nvn {
                     .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                     .collect();
                 for (record, entry) in words.chunks_exact(128).enumerate() {
-                    if entry[0] == 0 {
+                    // Any record written (an invocation that left by an
+                    // early exit has no "reached its end" bit).
+                    if entry.iter().all(|word| *word == 0) {
                         continue;
                     }
                     let position: Vec<f32> = entry[4..8]
