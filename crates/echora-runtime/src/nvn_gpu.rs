@@ -241,6 +241,10 @@ impl Backend {
     }
 }
 
+/// The key bits marking a program's vertex-traced variant
+/// (ECHORA_VERTEX_TRACE_BASE).
+const TRACED_VARIANT: u64 = 0x7472_6163_6564_0000;
+
 /// Stage keys (vertex, fragment) and the stages' translations.
 type BoundProgram = ((u64, u64), Vec<Arc<Translated>>);
 /// Stage key, binding base, previous stage's stores, generic input types,
@@ -5437,10 +5441,31 @@ impl Nvn {
                 }
                 specialization.push(values);
             }
-            let program = backend
-                .renderer
-                .create_program_specialized(stages.clone(), &specialization)?;
+            // ECHORA_VERTEX_TRACE_BASE=N: the program traces nothing; draws
+            // with base vertex N use a variant that does (`traced_variant`),
+            // so each program's records come from the same patch.
+            let untraced: Vec<Vec<(u32, u32)>> = specialization
+                .iter()
+                .map(|values| values.iter().map(|&(id, _)| (id, 0)).collect())
+                .collect();
+            let base_filter = super::debug_var_os("ECHORA_VERTEX_TRACE_BASE").is_some();
+            let program = backend.renderer.create_program_specialized(
+                stages.clone(),
+                if base_filter {
+                    &untraced
+                } else {
+                    &specialization
+                },
+            )?;
             backend.programs.insert(keys, program);
+            if base_filter && specialization.iter().any(|values| !values.is_empty()) {
+                let traced = backend
+                    .renderer
+                    .create_program_specialized(stages.clone(), &specialization)?;
+                backend
+                    .programs
+                    .insert((keys.0, keys.1 ^ TRACED_VARIANT), traced);
+            }
         }
         // ECHORA_VERTEX_TRACE_REPORT=<stage key>[,...]: every 60 presents,
         // the records a traced program's stages wrote (from earlier draws).
@@ -6740,8 +6765,19 @@ impl Nvn {
         } else {
             Vec::new()
         };
+        let traced_variant = (keys.0, keys.1 ^ TRACED_VARIANT);
+        let program_keys = if super::debug_var("ECHORA_VERTEX_TRACE_BASE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            == Some(base_vertex)
+            && backend.programs.contains_key(&traced_variant)
+        {
+            traced_variant
+        } else {
+            keys
+        };
         let draw = Draw {
-            program: &backend.programs[&keys],
+            program: &backend.programs[&program_keys],
             blends,
             mesh: mesh_groups,
             colors,
