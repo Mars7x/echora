@@ -5458,6 +5458,14 @@ impl Nvn {
                 },
             )?;
             backend.programs.insert(keys, program);
+            if base_filter {
+                eprintln!(
+                    "vertex trace program {:016x}/{:016x} trace constants per stage {:?}",
+                    keys.0,
+                    keys.1,
+                    specialization.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+            }
             if base_filter && specialization.iter().any(|values| !values.is_empty()) {
                 let traced = backend
                     .renderer
