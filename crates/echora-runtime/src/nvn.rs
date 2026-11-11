@@ -452,11 +452,15 @@ pub struct RenderState {
 /// updating `RenderState::state`.
 impl Nvn {
     /// A submitted or called list no longer kept: counted, and with
-    /// ECHORA_STALE_LOG (debugging) the first thousand named, with the
+    /// ECHORA_STALE_LOG=<present> (debugging) each from that present on named, with the
     /// present and the list's age (handles count up as lists are recorded).
     fn note_stale(&mut self, handle: u64, place: &str) {
         self.stale_command_submissions += 1;
-        if self.stale_command_submissions <= 1000 && debug_var_os("ECHORA_STALE_LOG").is_some() {
+        if let Ok(from) = debug_var("ECHORA_STALE_LOG")
+            && from
+                .parse::<u64>()
+                .is_ok_and(|from| self.presented_frames >= from)
+        {
             eprintln!(
                 "stale list present {} {place} {handle:#x} (newest kept {:#x?})",
                 self.presented_frames,
