@@ -6097,9 +6097,44 @@ impl Nvn {
         let depth_state = snapshot("BindDepthStencilState");
         let color_state = snapshot("BindColorState");
         let mask_state = snapshot("BindChannelMaskState");
+        // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
+        // index equal to `index` starts a new primitive. Vulkan restarts
+        // at the index type's all-ones value only, so matching indices are
+        // rewritten to it (8-bit indices were widened to 16 bits).
+        let restart = self
+            .render
+            .state
+            .get("SetPrimitiveRestart")
+            .filter(|command| command.x[1] & 0xff != 0)
+            .map(|command| command.x[2] as u32);
+        let strip = matches!(
+            topology,
+            vk::PrimitiveTopology::LINE_STRIP
+                | vk::PrimitiveTopology::TRIANGLE_STRIP
+                | vk::PrimitiveTopology::TRIANGLE_FAN
+        );
+        let primitive_restart = match (restart, &mut indices) {
+            (Some(value), Indices::U16(bytes)) if strip => {
+                for index in bytes.as_chunks_mut::<2>().0 {
+                    if u32::from(u16::from_le_bytes(*index)) == value & 0xffff {
+                        *index = [0xff; 2];
+                    }
+                }
+                true
+            }
+            (Some(value), Indices::U32(bytes)) if strip => {
+                for index in bytes.as_chunks_mut::<4>().0 {
+                    if u32::from_le_bytes(*index) == value {
+                        *index = [0xff; 4];
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
         let fixed = Fixed {
             topology,
-            primitive_restart: false,
+            primitive_restart,
             cull: match arg(&polygon, "CullFace", 0).unwrap_or(0) {
                 1 => vk::CullModeFlags::FRONT,
                 2 => vk::CullModeFlags::BACK,
