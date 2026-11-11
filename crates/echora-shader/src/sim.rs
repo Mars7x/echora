@@ -3779,6 +3779,58 @@ mod tests {
     }
 
     #[test]
+    fn predicate_lookups_follow_nak_s_lut_order_for_both_outputs() {
+        // PLOP3.LUT P3, P4, (!)P0, (!)P1, (!)P2, lut0, lut1 (NAK's SM70
+        // encoding: sources at 87, 77 and 68, each with its not bit; lut0
+        // in 64-66 and 72-76 for the first output, lut1 in 16-23 for the
+        // second); bit x*4 + y*2 + z of a table is its value (LogicOp3).
+        let nonzero = |p: u128, a: u128| {
+            word(&[
+                (0, 12, 0x20c),
+                (24, 8, a),
+                (32, 8, 255),
+                (68, 3, 7),
+                (76, 3, 5),
+                (81, 3, p),
+                (84, 3, 7),
+                (87, 3, 7),
+            ])
+        };
+        let mut state = 0x6c07_8965u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for _ in 0..12 {
+            let (lut0, lut1) = (next() & 0xff, next() & 0xff);
+            let not = [next() & 1 != 0, next() & 1 != 0, next() & 1 != 0];
+            let plop3 = word(&[
+                (0, 12, 0x81c),
+                (16, 8, u128::from(lut1)),
+                (64, 3, u128::from(lut0 & 7)),
+                (68, 3, 2),
+                (71, 1, u128::from(not[2])),
+                (72, 5, u128::from(lut0 >> 3)),
+                (77, 3, 1),
+                (80, 1, u128::from(not[1])),
+                (81, 3, 3),
+                (84, 3, 4),
+                (87, 3, 0),
+                (90, 1, u128::from(not[0])),
+            ]);
+            for inputs in 0..8u32 {
+                let bits = [inputs >> 2 & 1, inputs >> 1 & 1, inputs & 1];
+                let (_, p) = run(&bits, &[nonzero(0, 0), nonzero(1, 1), nonzero(2, 2), plop3]);
+                let [x, y, z] = [0, 1, 2].map(|n| (bits[n] != 0) != not[n]);
+                let entry = u32::from(x) * 4 + u32::from(y) * 2 + u32::from(z);
+                let label = format!("luts {lut0:#04x} {lut1:#04x} not {not:?} inputs {inputs:03b}");
+                assert_eq!(p[&3], lut0 >> entry & 1 != 0, "{label}");
+                assert_eq!(p[&4], lut1 >> entry & 1 != 0, "{label}");
+            }
+        }
+    }
+
+    #[test]
     fn float_adds_multiplies_and_fused_multiply_adds_round_once() {
         let floats = [
             1.0f32,
