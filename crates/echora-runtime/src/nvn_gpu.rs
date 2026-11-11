@@ -38,6 +38,13 @@ pub struct Backend {
     /// counter buffer (`Renderer::debug_buffer` index and address) and the
     /// present it was last reported at.
     loop_traces: HashMap<u64, (usize, u64, u64)>,
+    /// ECHORA_VERTEX_TRACE (debugging): each traced graphics stage's record
+    /// buffer, by (vertex key, fragment key, stage index): its
+    /// `Renderer::debug_buffer` index and the present it was last reported
+    /// at.
+    vertex_traces: HashMap<(u64, u64, usize), (usize, u64)>,
+    /// Each debug buffer's device address, by its index.
+    vertex_trace_addresses: Vec<u64>,
     /// Linked programs by (vertex key, fragment key).
     programs: HashMap<(u64, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
@@ -172,6 +179,8 @@ impl Backend {
             native_programs: Default::default(),
             page_table: None,
             loop_traces: HashMap::new(),
+            vertex_traces: HashMap::new(),
+            vertex_trace_addresses: Vec::new(),
             programs: HashMap::new(),
             notes: BTreeMap::new(),
             traced: 0,
@@ -5332,8 +5341,104 @@ impl Nvn {
             .filter(|_| self.sequencing());
         let backend = self.gpu.as_mut().unwrap();
         if !backend.programs.contains_key(&keys) {
-            let program = backend.renderer.create_program(stages.clone())?;
+            // ECHORA_VERTEX_TRACE: each traced stage's record buffer (64
+            // records of 128 words), its address in the stage's constants.
+            let mut specialization = Vec::new();
+            for (index, stage) in stages.iter().enumerate() {
+                let mut values = Vec::new();
+                for constant in &stage.spec_constants {
+                    let low = match constant.meaning {
+                        echora_shader_abi::SpecMeaning::VertexTraceLow => true,
+                        echora_shader_abi::SpecMeaning::VertexTraceHigh => false,
+                        _ => continue,
+                    };
+                    let trace = (keys.0, keys.1, index);
+                    let address = match backend.vertex_traces.get(&trace) {
+                        Some(&(buffer, _)) => backend.vertex_trace_addresses[buffer],
+                        None => {
+                            let (buffer, address) = backend.renderer.debug_buffer(32 << 10)?;
+                            backend
+                                .vertex_traces
+                                .insert(trace, (buffer, self.presented_frames));
+                            if backend.vertex_trace_addresses.len() <= buffer {
+                                backend.vertex_trace_addresses.resize(buffer + 1, 0);
+                            }
+                            backend.vertex_trace_addresses[buffer] = address;
+                            address
+                        }
+                    };
+                    let half = if low {
+                        address as u32
+                    } else {
+                        (address >> 32) as u32
+                    };
+                    values.push((constant.id, half));
+                }
+                specialization.push(values);
+            }
+            let program = backend
+                .renderer
+                .create_program_specialized(stages.clone(), &specialization)?;
             backend.programs.insert(keys, program);
+        }
+        // ECHORA_VERTEX_TRACE_REPORT=<stage key>[,...]: every 60 presents,
+        // the records a traced program's stages wrote (from earlier draws).
+        if let Ok(wanted) = super::debug_var("ECHORA_VERTEX_TRACE_REPORT")
+            && wanted
+                .split(',')
+                .any(|key| key == format!("{:016x}", keys.0) || key == format!("{:016x}", keys.1))
+        {
+            for index in 0..stages.len() {
+                let trace = (keys.0, keys.1, index);
+                let Some(&(buffer, reported)) = backend.vertex_traces.get(&trace) else {
+                    continue;
+                };
+                if self.presented_frames < reported + 60 {
+                    continue;
+                }
+                let words: Vec<u32> = backend
+                    .renderer
+                    .read_debug_buffer(buffer)
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect();
+                for (record, entry) in words.chunks_exact(128).enumerate() {
+                    if entry[0] == 0 {
+                        continue;
+                    }
+                    let position: Vec<f32> = entry[4..8]
+                        .iter()
+                        .map(|bits| f32::from_bits(*bits))
+                        .collect();
+                    let mut line = format!(
+                        "vertex trace present {} program {:016x}/{:016x} stage {index} record {record}: done {:#x} flags {:#x} ids {} {} position {position:?}",
+                        self.presented_frames,
+                        keys.0,
+                        keys.1,
+                        entry[0],
+                        entry[1],
+                        entry[2],
+                        entry[3]
+                    );
+                    for texture in entry[8..8 + 6 * 16].chunks_exact(6) {
+                        if texture[0] != 0 {
+                            line += &format!(
+                                " | tex at {:#x} x{} {:08x} {:08x} {:08x} {:08x}",
+                                texture[0] - 1,
+                                texture[1],
+                                texture[2],
+                                texture[3],
+                                texture[4],
+                                texture[5]
+                            );
+                        }
+                    }
+                    eprintln!("{line}");
+                }
+                backend
+                    .vertex_traces
+                    .insert(trace, (buffer, self.presented_frames));
+            }
         }
 
         // ECHORA_GPU_SKIP_DRAW=<stage key>[,...] (debugging): draws whose
