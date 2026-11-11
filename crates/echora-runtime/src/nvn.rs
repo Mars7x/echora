@@ -318,7 +318,7 @@ pub struct Nvn {
     /// until memory overlapping either is added to a command buffer again
     /// (NVN writes over it then).
     #[serde(skip)]
-    list_memory: BTreeMap<u64, ([u64; 3], [u64; 2])>,
+    list_memory: BTreeMap<u64, (u64, [u64; 3], [u64; 2])>,
     /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
     /// `COMMAND_LIMIT`) while still valid.
     pub capped_command_lists: u64,
@@ -1378,7 +1378,15 @@ impl Nvn {
                 let reused: Vec<u64> = self
                     .list_memory
                     .iter()
-                    .filter(|(_, (command, control))| {
+                    .filter(|(_, (buffer, command, control))| {
+                        // The command buffer's own earlier memory: others
+                        // reported the same chunks (the application sizes
+                        // its memory by the host's used amounts, which are
+                        // not the driver's), so overlap between buffers says
+                        // nothing about what the GPU would read.
+                        if *buffer != this {
+                            return false;
+                        }
                         if key == "CommandMemory" {
                             command[0] == x[1] && overlaps(command[1], command[2], x[2], x[3])
                         } else {
@@ -1550,6 +1558,7 @@ impl Nvn {
                 self.list_memory.insert(
                     handle,
                     (
+                        this,
                         [
                             command[0],
                             command[1] + command_from,
