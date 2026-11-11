@@ -3545,6 +3545,240 @@ mod tests {
     }
 
     #[test]
+    fn carries_wide_compares_and_lea_match_nak_s_hardware_checked_folds() {
+        // NAK's `fold` for IADD3, IADD3.X, ISETP and LEA(.X) (ir.rs), which
+        // its hw_tests check against a GPU, with its SM70 encodings.
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        // ISETP.NE.U32.AND P(p), PT, R(a), RZ, PT: P = R != 0.
+        let nonzero = |p: u128, a: u128| {
+            word(&[
+                (0, 12, 0x20c),
+                (24, 8, a),
+                (32, 8, 255),
+                (68, 3, 7),
+                (76, 3, 5),
+                (81, 3, p),
+                (84, 3, 7),
+                (87, 3, 7),
+            ])
+        };
+        let edges = [0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+        for round in 0..48u32 {
+            let mut pick = || {
+                let n = next();
+                if n % 4 == 0 {
+                    edges[(n >> 8) as usize % edges.len()]
+                } else {
+                    next()
+                }
+            };
+            let (a, b, c) = (pick(), pick(), pick());
+            let flags = next();
+            // IADD3 R3, (-)R0, (-)R1, (-)R2 with both carry outputs (P0,
+            // P1); a and b not both negated.
+            let negate = [
+                flags & 1 != 0,
+                flags & 2 != 0 && flags & 1 == 0,
+                flags & 4 != 0,
+            ];
+            let iadd3 = word(&[
+                (0, 12, 0x210),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (63, 1, u128::from(negate[1])),
+                (64, 8, 2),
+                (72, 1, u128::from(negate[0])),
+                (75, 1, u128::from(negate[2])),
+                (77, 3, 7),
+                (80, 1, 1),
+                (81, 3, 0),
+                (84, 3, 1),
+                (87, 3, 7),
+                (90, 1, 1),
+            ]);
+            let sum: u64 = [a, b, c]
+                .iter()
+                .zip(negate)
+                .map(|(&x, n)| if n { u64::from(!x) + 1 } else { u64::from(x) })
+                .sum();
+            let (r, p) = run(&[a, b, c], &[iadd3]);
+            let label = format!("IADD3 {a:#x} {b:#x} {c:#x} negate {negate:?}");
+            assert_eq!(r[&3], sum as u32, "{label}");
+            assert_eq!(p[&0], sum >= 1 << 32, "{label}");
+            assert_eq!(p[&1], sum >= 2 << 32, "{label}");
+            // IADD3.X R3, (~)R0, (~)R1, (~)R2, P2, P3 (P2 = R4 != 0, P3 =
+            // R5 != 0), both carry outputs.
+            let (carry0, carry1) = (flags & 8 != 0, flags & 16 != 0);
+            let invert = [
+                flags & 32 != 0,
+                flags & 64 != 0 && flags & 32 == 0,
+                flags & 128 != 0,
+            ];
+            let iadd3x = word(&[
+                (0, 12, 0x210),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (63, 1, u128::from(invert[1])),
+                (64, 8, 2),
+                (72, 1, u128::from(invert[0])),
+                (74, 1, 1),
+                (75, 1, u128::from(invert[2])),
+                (77, 3, 3),
+                (81, 3, 0),
+                (84, 3, 1),
+                (87, 3, 2),
+            ]);
+            let sum: u64 = [a, b, c]
+                .iter()
+                .zip(invert)
+                .map(|(&x, n)| u64::from(if n { !x } else { x }))
+                .sum::<u64>()
+                + u64::from(carry0)
+                + u64::from(carry1);
+            let (r, p) = run(
+                &[a, b, c, 0, u32::from(carry0), u32::from(carry1)],
+                &[nonzero(2, 4), nonzero(3, 5), iadd3x],
+            );
+            let label =
+                format!("IADD3.X {a:#x} {b:#x} {c:#x} invert {invert:?} carries {carry0} {carry1}");
+            assert_eq!(r[&3], sum as u32, "{label}");
+            assert_eq!(p[&0], sum >= 1 << 32, "{label}");
+            assert_eq!(p[&1], sum >= 2 << 32, "{label}");
+            // ISETP.cmp(.S32)(.EX).set P0, PT, R0, R1, P2 (accumulator, R4
+            // != 0), P3 (low compare, R5 != 0). With .EX, equal (high)
+            // words take the low compare.
+            let (x, y) = if round % 3 == 0 { (a, a) } else { (a, b) };
+            for code in 0..8u32 {
+                let signed = flags >> (8 + code) & 1 != 0;
+                let ex = flags >> (16 + code) & 1 != 0;
+                let set = (flags >> (24 + code % 4)) % 3;
+                let (accumulate, low) = (next() & 1 != 0, next() & 1 != 0);
+                let isetp = word(&[
+                    (0, 12, 0x20c),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (68, 3, 3),
+                    (72, 1, u128::from(ex)),
+                    (73, 1, u128::from(signed)),
+                    (74, 2, u128::from(set)),
+                    (76, 3, u128::from(code)),
+                    (81, 3, 0),
+                    (84, 3, 7),
+                    (87, 3, 2),
+                ]);
+                let ordering = if signed {
+                    (x as i32).cmp(&(y as i32))
+                } else {
+                    x.cmp(&y)
+                };
+                use std::cmp::Ordering::{Equal, Greater, Less};
+                let compare = match code {
+                    0 => false,
+                    1 => ordering == Less,
+                    2 => ordering == Equal,
+                    3 => ordering != Greater,
+                    4 => ordering == Greater,
+                    5 => ordering != Equal,
+                    6 => ordering != Less,
+                    _ => true,
+                };
+                let compare = if ex && x == y && !matches!(code, 0 | 7) {
+                    low
+                } else {
+                    compare
+                };
+                let expected = match set {
+                    0 => compare && accumulate,
+                    1 => compare || accumulate,
+                    _ => compare != accumulate,
+                };
+                let (_, p) = run(
+                    &[x, y, 0, 0, u32::from(accumulate), u32::from(low)],
+                    &[nonzero(2, 4), nonzero(3, 5), isetp],
+                );
+                assert_eq!(
+                    p[&0], expected,
+                    "ISETP code {code} signed {signed} ex {ex} set {set} {x:#x} {y:#x} \
+                     accumulate {accumulate} low {low}"
+                );
+            }
+            // LEA(.HI) R3, P0, R0, (-)R1, R2 (high word), shift, with the
+            // shifted value or b negated (not both); LEA.HI.X with ~ and a
+            // carry in (P2).
+            for x_form in [false, true] {
+                let shift = next() % 32;
+                let high = next() & 1 != 0;
+                let (inner, outer) = match next() % 3 {
+                    0 => (false, false),
+                    1 => (true, false),
+                    _ => (false, true),
+                };
+                let carry = next() & 1 != 0;
+                let lea = word(&[
+                    (0, 12, 0x211),
+                    (16, 8, 3),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (63, 1, u128::from(outer)),
+                    (64, 8, if high { 2 } else { 255 }),
+                    (72, 1, u128::from(inner)),
+                    (74, 1, u128::from(x_form)),
+                    (75, 5, u128::from(shift)),
+                    (80, 1, u128::from(high)),
+                    (81, 3, 0),
+                    (87, 3, if x_form { 2 } else { 7 }),
+                ]);
+                let mut shifted = if high {
+                    ((u64::from(c) << 32 | u64::from(a)) >> (32 - shift)) as u32
+                } else {
+                    a << shift
+                };
+                let mut addend = b;
+                let mut overflow = false;
+                if x_form {
+                    if inner {
+                        shifted = !shifted;
+                    }
+                    if outer {
+                        addend = !addend;
+                    }
+                } else {
+                    if inner {
+                        let o;
+                        (shifted, o) = (!shifted).overflowing_add(1);
+                        overflow |= o;
+                    }
+                    if outer {
+                        let o;
+                        (addend, o) = (!addend).overflowing_add(1);
+                        overflow |= o;
+                    }
+                }
+                let (mut result, o) = shifted.overflowing_add(addend);
+                overflow |= o;
+                if x_form {
+                    let o;
+                    (result, o) = result.overflowing_add(u32::from(carry));
+                    overflow |= o;
+                }
+                let (r, p) = run(&[a, b, c, 0, u32::from(carry)], &[nonzero(2, 4), lea]);
+                let label = format!(
+                    "LEA x {x_form} high {high} shift {shift} negate {inner} {outer} \
+                     carry {carry}: {a:#x} {b:#x} {c:#x}"
+                );
+                assert_eq!(r[&3], result, "{label}");
+                assert_eq!(p[&0], overflow, "{label}");
+            }
+        }
+    }
+
+    #[test]
     fn float_adds_multiplies_and_fused_multiply_adds_round_once() {
         let floats = [
             1.0f32,
