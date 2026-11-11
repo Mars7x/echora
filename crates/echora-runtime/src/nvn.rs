@@ -312,10 +312,11 @@ pub struct Nvn {
     /// Command handles by that order (least recently used first).
     #[serde(skip)]
     command_list_use: BTreeMap<u64, u64>,
-    /// The memory each finished list was recorded into: its command buffer's
-    /// command memory (pool, offset, size) and control memory (address,
-    /// size) when it ended. A handle stays valid until memory overlapping
-    /// either is added to a command buffer again (NVN reuses it then).
+    /// The memory each finished list occupies: the command memory (pool,
+    /// offset, size) and control memory (address, size) its recording used,
+    /// by the used amounts the application is told. A handle stays valid
+    /// until memory overlapping either is added to a command buffer again
+    /// (NVN writes over it then).
     #[serde(skip)]
     list_memory: BTreeMap<u64, ([u64; 3], [u64; 2])>,
     /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
@@ -1448,6 +1449,21 @@ impl Nvn {
                 if write_shared(&self.recording).insert(this, fresh).is_some() {
                     return Err(invalid("command buffer is already recording".into()));
                 }
+                // Where the list starts in the memory chunks (the used
+                // amounts the application sees, and which chunks), for the
+                // memory it ends up occupying (`list_memory`).
+                let object = self.objects.get_mut(&this).unwrap();
+                let value = |key: &str| object.state.get(key).map_or([0; 4], |args| args.x);
+                let start = Args {
+                    x: [
+                        value("CommandMemoryUsed")[0],
+                        value("ControlMemoryUsed")[0],
+                        value("CommandMemoryChunk")[1],
+                        value("ControlMemoryChunk")[0],
+                    ],
+                    v: [0; 2],
+                };
+                object.state.insert("ListStart".into(), start);
                 return Ok(true);
             }
             "nvnCommandBufferIsRecording" => {
@@ -1499,16 +1515,34 @@ impl Nvn {
                         commands.len()
                     );
                 }
-                let chunk = |key: &str| {
+                // The memory the list occupies: from where its recording
+                // began to the used amount now, in each chunk (from the
+                // chunk's start when memory was added during the recording).
+                let value = |key: &str| {
                     self.objects
                         .get(&this)
                         .and_then(|object| object.state.get(key))
                         .map_or([0; 4], |args| args.x)
                 };
-                let (command, control) = (chunk("CommandMemoryChunk"), chunk("ControlMemoryChunk"));
+                let (command, control) = (value("CommandMemoryChunk"), value("ControlMemoryChunk"));
+                let start = value("ListStart");
+                let (command_used, control_used) =
+                    (value("CommandMemoryUsed")[0], value("ControlMemoryUsed")[0]);
+                let command_from = if start[2] == command[1] { start[0] } else { 0 };
+                let control_from = if start[3] == control[0] { start[1] } else { 0 };
                 self.list_memory.insert(
                     handle,
-                    ([command[0], command[1], command[2]], [control[0], control[1]]),
+                    (
+                        [
+                            command[0],
+                            command[1] + command_from,
+                            command_used.saturating_sub(command_from),
+                        ],
+                        [
+                            control[0] + control_from,
+                            control_used.saturating_sub(control_from),
+                        ],
+                    ),
                 );
                 self.command_list_clock += 1;
                 self.command_list_commands += commands.len();
