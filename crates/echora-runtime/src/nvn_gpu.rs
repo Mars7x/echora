@@ -6420,7 +6420,20 @@ impl Nvn {
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
                 }),
             depth_write: arg(&depth_state, "DepthWriteEnable", 0).unwrap_or(0) != 0,
-            depth_compare: compare_op(arg(&depth_state, "DepthFunc", 0).unwrap_or(8)),
+            // ECHORA_GPU_EQUAL_AS_LEQUAL=<fragment key>[,...] (debugging):
+            // those programs' EQUAL depth tests as LESS_OR_EQUAL (tells a
+            // depth that differs by rounding from one never written).
+            depth_compare: match compare_op(arg(&depth_state, "DepthFunc", 0).unwrap_or(8)) {
+                vk::CompareOp::EQUAL
+                    if super::debug_var("ECHORA_GPU_EQUAL_AS_LEQUAL").is_ok_and(|keys| {
+                        keys.split(',')
+                            .any(|key| key == format!("{:016x}", keys_for_note[1]))
+                    }) =>
+                {
+                    vk::CompareOp::LESS_OR_EQUAL
+                }
+                op => op,
+            },
             viewport: [
                 viewport[0],
                 viewport[1] + viewport[3],
