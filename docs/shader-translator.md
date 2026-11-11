@@ -334,8 +334,11 @@ or column neighbour, coarse from lanes 0-2) and implicit levels (log2 of
 the coordinates' coarse derivatives in level-0 texels, plus a bias; LOD
 queries too) come from each other; a helper (or a demoted invocation)
 runs on but its buffer, memory and image writes are dropped. Without a
-quad an implicit level is 0. Blending between levels or texels is not
-simulated: samples take the nearest texel of the nearest level. Reference tests check the opcodes the game uses
+quad an implicit level is 0. `Inputs::sampler` sets every sample's
+filtering: bilinear texels (components as floats), linearly blended
+levels (trilinear with both) and repeat addressing; by default the
+nearest texel of the nearest level, clamped to the edge. Depth
+comparisons stay nearest (no filtered PCF). Reference tests check the opcodes the game uses
 most against models written apart from the translator: TEX's mask order,
 second destination and packed halves; TEX.B's pool entry, integer view
 and capacity; TXQ; divergent BRA loops against a per-invocation model;

@@ -181,6 +181,8 @@ pub struct Inputs {
     /// Bound textures' levels past 0 (1, 2, ...), by (descriptor set,
     /// binding): explicit, gradient and fetch levels read them.
     pub mips: HashMap<(u32, u32), Vec<Image>>,
+    /// The samplers' state (one for all samples).
+    pub sampler: Sampler,
     /// Depth comparisons' VkCompareOp (the sampler's; 0 never, 1 less, 2
     /// equal, 3 less or equal, 4 greater, 5 not equal, 6 greater or equal,
     /// 7 always): `None` takes less or equal, with a note.
@@ -191,6 +193,18 @@ pub struct Inputs {
     /// An invocation (local index) and a variable (a register's id) whose
     /// every store `Report::traced` lists.
     pub trace: Option<(usize, u32)>,
+}
+
+/// Sampler state for every sample (`Inputs::sampler`); the default is
+/// nearest filtering and mips, clamped to the edge.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sampler {
+    /// Bilinear (else nearest) texels, components read as floats.
+    pub linear: bool,
+    /// Blending the two nearest levels (else the nearest level).
+    pub mip_linear: bool,
+    /// Repeat (else clamp to the edge) addressing.
+    pub repeat: bool,
 }
 
 /// One pixel of a fragment quad (`Inputs::quad`).
@@ -421,6 +435,7 @@ struct Shared {
     unmapped_pages: BTreeMap<u64, u32>,
     compare_op: Option<u32>,
     mips: HashMap<(u32, u32), Vec<Image>>,
+    sampler: Sampler,
     watch: Vec<std::ops::Range<u64>>,
     trace: Option<(usize, u32)>,
     traced: Vec<(Option<u32>, Value)>,
@@ -1014,6 +1029,45 @@ impl Machine {
                     match image {
                         Some(base) => {
                             let level = self.image_level(opcode, invocation, args, &base, lambda);
+                            // Linear mips: the two levels around λ, blended.
+                            let sample = matches!(
+                                opcode,
+                                op::IMAGE_SAMPLE_IMPLICIT_LOD | op::IMAGE_SAMPLE_EXPLICIT_LOD
+                            );
+                            let lambda_value =
+                                self.sample_lambda(opcode, invocation, args, &base, lambda);
+                            if sample
+                                && shared.sampler.mip_linear
+                                && let Some(lambda_value) = lambda_value
+                            {
+                                let lambda_value = lambda_value.max(0.0);
+                                let low = (lambda_value.floor() as usize).min(chain.len() - 1);
+                                let high = (low + 1).min(chain.len() - 1);
+                                let t = (lambda_value - lambda_value.floor()) as f32;
+                                let coordinate = value(1);
+                                let read = |image: &Image| {
+                                    self.image_read(
+                                        opcode,
+                                        image_type,
+                                        image,
+                                        &coordinate,
+                                        0,
+                                        [0; 2],
+                                        shared.sampler,
+                                        ty,
+                                    )
+                                };
+                                let (a, b) = (read(&chain[low]), read(&chain[high]));
+                                return a
+                                    .iter()
+                                    .zip(&b)
+                                    .map(|(&a, &b)| {
+                                        let (a, b) =
+                                            (f32::from_bits(a as u32), f32::from_bits(b as u32));
+                                        u64::from((a + (b - a) * t).to_bits())
+                                    })
+                                    .collect();
+                            }
                             let image = chain[level.min(chain.len() - 1)].clone();
                             let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
                             let component = if opcode == op::IMAGE_GATHER {
@@ -1033,6 +1087,7 @@ impl Machine {
                                 &coordinate,
                                 component,
                                 offset,
+                                shared.sampler,
                                 ty,
                             )
                         }
@@ -1079,8 +1134,19 @@ impl Machine {
                         } else {
                             op::IMAGE_SAMPLE_EXPLICIT_LOD
                         };
-                        let texels =
-                            self.image_read(read, image_type, &image, &coordinate, 0, offset, ty);
+                        let texels = self.image_read(
+                            read,
+                            image_type,
+                            &image,
+                            &coordinate,
+                            0,
+                            offset,
+                            Sampler {
+                                linear: false,
+                                ..shared.sampler
+                            },
+                            ty,
+                        );
                         let depths: Vec<u64> = if gather {
                             texels
                         } else {
@@ -1116,6 +1182,47 @@ impl Machine {
             }
             _ => unreachable!("not an image access"),
         }
+    }
+
+    /// A sample's λ before rounding: the quad's (`lambda`), an explicit Lod,
+    /// or the one its Grad operands give; `None` otherwise.
+    fn sample_lambda(
+        &self,
+        opcode: u16,
+        invocation: &Invocation,
+        args: &[u32],
+        base: &Image,
+        lambda: Option<f64>,
+    ) -> Option<f64> {
+        if lambda.is_some() || opcode != op::IMAGE_SAMPLE_EXPLICIT_LOD {
+            return lambda;
+        }
+        let value = |n: usize| args.get(n).and_then(|id| invocation.values.get(id));
+        let float = |words: &Value, n: usize| {
+            f64::from(f32::from_bits(words.get(n).copied().unwrap_or(0) as u32))
+        };
+        let mask = *args.get(2)?;
+        let at = 3 + usize::from(mask & 1 != 0);
+        if mask & 2 != 0 {
+            return value(at).map(|lod| float(lod, 0));
+        }
+        if mask & 4 != 0 {
+            let (dx, dy) = (value(at)?, value(at + 1)?);
+            let sizes = [f64::from(base.width.max(1)), f64::from(base.height.max(1))];
+            let length = |gradient: &Value| {
+                (0..gradient.len().min(2))
+                    .map(|n| (float(gradient, n) * sizes[n]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            let rho = length(dx).max(length(dy));
+            return Some(if rho > 0.0 {
+                rho.log2()
+            } else {
+                f64::NEG_INFINITY
+            });
+        }
+        None
     }
 
     /// A gather's texel offset: its image operands after the component or
@@ -1419,6 +1526,7 @@ impl Machine {
             unmapped_pages: BTreeMap::new(),
             compare_op: inputs.compare_op,
             mips: inputs.mips.clone(),
+            sampler: inputs.sampler,
             watch: inputs.watch.clone(),
             trace: inputs.trace,
             traced: Vec::new(),
@@ -2301,8 +2409,9 @@ impl Machine {
         }
     }
 
-    /// A read of `image`: a fetch, a nearest sample (level 0, clamped to
-    /// the edge), a gather of `component`, a storage read, or a query.
+    /// A read of `image`: a fetch, a sample (nearest or bilinear, clamped
+    /// to the edge or repeated, by `sampler`), a gather of `component`, a
+    /// storage read, or a query.
     #[allow(clippy::too_many_arguments)]
     fn image_read(
         &self,
@@ -2312,6 +2421,7 @@ impl Machine {
         coordinate: &Value,
         component: usize,
         offset: [i64; 2],
+        sampler: Sampler,
         ty: u32,
     ) -> Value {
         let (dim, arrayed) = self.image_shape(image_type);
@@ -2352,17 +2462,47 @@ impl Machine {
                     (2, _) => scaled(2, image.depth).floor() as i64,
                     _ => 0,
                 };
+                // A texel by the sampler's address mode (the image clamps).
+                let at = |i: i64, j: i64| {
+                    if sampler.repeat {
+                        let (w, h) = (
+                            i64::from(image.width.max(1)),
+                            i64::from(image.height.max(1)),
+                        );
+                        image.texel(i.rem_euclid(w), j.rem_euclid(h), z)
+                    } else {
+                        image.texel(i, j, z)
+                    }
+                };
+                let (i0, j0) = ((u - 0.5).floor() as i64, (v - 0.5).floor() as i64);
                 if opcode == op::IMAGE_GATHER {
-                    let (i0, j0) = (
-                        (u - 0.5).floor() as i64 + offset[0],
-                        (v - 0.5).floor() as i64 + offset[1],
-                    );
+                    let (i0, j0) = (i0 + offset[0], j0 + offset[1]);
                     [(i0, j0 + 1), (i0 + 1, j0 + 1), (i0 + 1, j0), (i0, j0)]
                         .iter()
-                        .map(|&(i, j)| u64::from(image.texel(i, j, z)[component.min(3)]))
+                        .map(|&(i, j)| u64::from(at(i, j)[component.min(3)]))
                         .collect()
+                } else if sampler.linear {
+                    // Bilinear: the four texels around the point, weighted
+                    // by its fractions (as floats).
+                    let (a, b) = (
+                        ((u - 0.5) - (u - 0.5).floor()) as f32,
+                        ((v - 0.5) - (v - 0.5).floor()) as f32,
+                    );
+                    let corner = |i, j| at(i, j).map(f32::from_bits);
+                    let (t00, t10, t01, t11) = (
+                        corner(i0, j0),
+                        corner(i0 + 1, j0),
+                        corner(i0, j0 + 1),
+                        corner(i0 + 1, j0 + 1),
+                    );
+                    let texel: [u32; 4] = std::array::from_fn(|c| {
+                        let top = t00[c] + (t10[c] - t00[c]) * a;
+                        let bottom = t01[c] + (t11[c] - t01[c]) * a;
+                        (top + (bottom - top) * b).to_bits()
+                    });
+                    words(texel)
                 } else {
-                    words(image.texel(u.floor() as i64, v.floor() as i64, z))
+                    words(at(u.floor() as i64, v.floor() as i64))
                 }
             }
         }
@@ -6875,6 +7015,92 @@ mod tests {
         // 1/16 apart: λ < 0, level 0.
         let level_zero = |u: f32, v: f32| (v * 8.0) as u32 * 8 + (u * 8.0) as u32;
         assert_eq!(run(0.0625)[0], level_zero(0.125, 0.125));
+    }
+
+    #[test]
+    fn samplers_filter_bilinearly_and_between_levels() {
+        // TEX.LL R4, R0 (x, y), R2 (level): component 0.
+        let tex = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 1),
+            (81, 3, 7),
+            (87, 3, 3),
+        ]);
+        // Level 0: 2 x 2, texel (x, y) = x + 2y; level 1: 10.
+        let float_texels =
+            |values: &[f32]| values.iter().map(|&v| [v.to_bits(), 0, 0, 0]).collect();
+        let base = Image {
+            width: 2,
+            height: 2,
+            depth: 1,
+            layers: 1,
+            texels: float_texels(&[0.0, 1.0, 2.0, 3.0]),
+        };
+        let one = Image {
+            width: 1,
+            height: 1,
+            depth: 1,
+            layers: 1,
+            texels: float_texels(&[10.0]),
+        };
+        let sample = |x: f32, y: f32, level: f32, sampler: Sampler| {
+            let program = [
+                mov(0, x.to_bits()),
+                mov(1, y.to_bits()),
+                mov(2, level.to_bits()),
+                tex,
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let binding = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap()
+                .binding;
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([((0, binding), base.clone())]),
+                mips: HashMap::from([((0, binding), vec![one.clone()])]),
+                sampler,
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            f32::from_bits(report.invocations[0][&registers[&4]][0] as u32)
+        };
+        let linear = Sampler {
+            linear: true,
+            ..Sampler::default()
+        };
+        // Nearest, then bilinear at the centre (the four texels' mean) and
+        // at texel (0, 0)'s centre.
+        assert_eq!(sample(0.5, 0.5, 0.0, Sampler::default()), 3.0);
+        assert_eq!(sample(0.5, 0.5, 0.0, linear), 1.5);
+        assert_eq!(sample(0.25, 0.25, 0.0, linear), 0.0);
+        // At the left edge: clamped, x blends texel 0 with itself; repeated,
+        // with texel 1.
+        assert_eq!(sample(0.0, 0.25, 0.0, linear), 0.0);
+        let repeat = Sampler {
+            repeat: true,
+            ..linear
+        };
+        assert_eq!(sample(0.0, 0.25, 0.0, repeat), 0.5);
+        // Trilinear at level 0.5: halfway between 1.5 and 10.
+        let trilinear = Sampler {
+            mip_linear: true,
+            ..linear
+        };
+        assert_eq!(sample(0.5, 0.5, 0.5, trilinear), 5.75);
+        // Nearest mips at 0.5 round up to level 1.
+        assert_eq!(sample(0.5, 0.5, 0.5, linear), 10.0);
     }
 
     #[test]

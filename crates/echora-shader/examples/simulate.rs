@@ -20,7 +20,9 @@
 //!   instead (derivatives and implicit levels across it), per pixel N
 //!   (0 top left, 1 top right, 2 bottom left, 3 bottom right) `quad N
 //!   fragcoord X Y Z W`, `quad N attribute LOCATION X Y Z W` and `quad N
-//!   helper`; `compare_op N` the depth comparisons' VkCompareOp;
+//!   helper`; `compare_op N` the depth comparisons' VkCompareOp; `sampler`
+//!   with any of `linear` (bilinear texels), `mip_linear` (blended levels)
+//!   and `repeat` (else clamped to the edge);
 //! - `push.bin`: the push constants' bytes;
 //! - `payload.bin`: a mesh program's task payload (what its task program
 //!   wrote), if it has one;
@@ -113,6 +115,17 @@ fn main() {
                 }
                 Some(&"helper") => quad.helper = true,
                 _ => {}
+            }
+            continue;
+        }
+        if let ["sampler", rest @ ..] = &fields[..] {
+            for word in rest {
+                match *word {
+                    "linear" => inputs.sampler.linear = true,
+                    "mip_linear" => inputs.sampler.mip_linear = true,
+                    "repeat" => inputs.sampler.repeat = true,
+                    _ => {}
+                }
             }
             continue;
         }
