@@ -33,7 +33,7 @@ fn main() {
         };
         match table.kind.as_str() {
             "RELA" => {
-                for entry in bytes.chunks_exact(24) {
+                for entry in bytes.as_chunks::<24>().0 {
                     if word(entry, 8) as u32 == 1027 {
                         targets.insert(word(entry, 0), word(entry, 16));
                     }
@@ -46,7 +46,7 @@ fn main() {
                         targets.insert(slot, word(value, 0));
                     }
                 };
-                for chunk in bytes.chunks_exact(8) {
+                for chunk in bytes.as_chunks::<8>().0 {
                     let entry = word(chunk, 0);
                     if entry & 1 == 0 {
                         push(entry, &mut targets);

@@ -322,6 +322,10 @@ pub struct Nvn {
     /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
     /// `COMMAND_LIMIT`) while still valid.
     pub capped_command_lists: u64,
+    /// ECHORA_STALE_LOG (debugging): why and when each dropped list went
+    /// (0 memory reused, 1 resource cap), shown when it is asked for.
+    #[serde(skip)]
+    dropped_lists: BTreeMap<u64, (u8, u64)>,
     command_list_clock: u64,
     /// Commands in `command_lists`.
     command_list_commands: usize,
@@ -475,6 +479,10 @@ impl Nvn {
     /// Forget a finished list whose memory the application reuses.
     fn drop_command_list(&mut self, handle: u64) {
         self.list_memory.remove(&handle);
+        if debug_var_os("ECHORA_STALE_LOG").is_some() {
+            self.dropped_lists
+                .insert(handle, (0, self.presented_frames));
+        }
         if let Some((list, used, _)) = self.command_lists.remove(&handle) {
             self.command_list_commands -= list.len();
             self.command_list_use.remove(&used);
@@ -510,9 +518,9 @@ impl Nvn {
                 .is_ok_and(|from| self.presented_frames >= from)
         {
             eprintln!(
-                "stale list present {} {place} {handle:#x} (newest kept {:#x?})",
+                "stale list present {} {place} {handle:#x} dropped {:?}",
                 self.presented_frames,
-                self.command_lists.keys().max()
+                self.dropped_lists.get(&handle)
             );
         }
     }
@@ -560,7 +568,7 @@ fn is_work_command(rest: &str) -> bool {
 /// (`list_memory`): the game records state lists once while loading and
 /// calls them every frame of the scene after the opening movie, so dropping
 /// lists by age left the terrain without its vertex streams.
-const COMMAND_LIST_LIMIT: usize = 32768;
+const COMMAND_LIST_LIMIT: usize = 262_144;
 /// Commands those lists may hold in all.
 const COMMAND_LIMIT: usize = 2_000_000;
 
@@ -1575,6 +1583,9 @@ impl Nvn {
                         }
                     }
                     self.list_memory.remove(&oldest);
+                    if debug_var_os("ECHORA_STALE_LOG").is_some() {
+                        self.dropped_lists.insert(oldest, (1, self.presented_frames));
+                    }
                     if let Some((list, ..)) = self.command_lists.remove(&oldest) {
                         self.capped_command_lists += 1;
                         if debug_var_os("ECHORA_LIST_LOG").is_some()
