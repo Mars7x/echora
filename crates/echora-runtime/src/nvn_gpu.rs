@@ -6320,7 +6320,17 @@ impl Nvn {
         let fixed = Fixed {
             topology,
             primitive_restart,
+            // ECHORA_GPU_NO_CULL=<fragment key>[,...] (debugging): those
+            // programs' draws cull nothing (shows whether culling is what
+            // drops a draw's triangles).
             cull: match arg(&polygon, "CullFace", 0).unwrap_or(0) {
+                _ if super::debug_var("ECHORA_GPU_NO_CULL").is_ok_and(|keys| {
+                    keys.split(',')
+                        .any(|key| key == format!("{:016x}", keys_for_note[1]))
+                }) =>
+                {
+                    vk::CullModeFlags::NONE
+                }
                 1 => vk::CullModeFlags::FRONT,
                 2 => vk::CullModeFlags::BACK,
                 3 => vk::CullModeFlags::FRONT_AND_BACK,
