@@ -450,6 +450,22 @@ pub struct RenderState {
 /// Recorded commands that only change render state (SetRenderTargets,
 /// SetScissor and ClearColor have their own host execution). They execute by
 /// updating `RenderState::state`.
+impl Nvn {
+    /// A submitted or called list no longer kept: counted, and with
+    /// ECHORA_STALE_LOG (debugging) the first thousand named, with the
+    /// present and the list's age (handles count up as lists are recorded).
+    fn note_stale(&mut self, handle: u64, place: &str) {
+        self.stale_command_submissions += 1;
+        if self.stale_command_submissions <= 1000 && debug_var_os("ECHORA_STALE_LOG").is_some() {
+            eprintln!(
+                "stale list present {} {place} {handle:#x} (newest kept {:#x?})",
+                self.presented_frames,
+                self.command_lists.keys().max()
+            );
+        }
+    }
+}
+
 fn is_state_command(rest: &str) -> bool {
     const PREFIXES: &[&str] = &["Set", "Bind", "Push", "Pop", "Insert", "Enable"];
     const OTHERS: &[&str] = &["Barrier", "ShadingRateImagePalette", "OverrideSubtileSize"];
@@ -1452,7 +1468,7 @@ impl Nvn {
                         // application seldom finalizes handles, so lists
                         // are kept by recent use): skipped, counted.
                         if handle >> 48 == 0x4e56 {
-                            self.stale_command_submissions += 1;
+                            self.note_stale(handle, "submit");
                             continue;
                         }
                         return Err(invalid(format!("unknown command handle {handle:#x}")));
@@ -2534,14 +2550,18 @@ impl Nvn {
                     if matches!(rest, "CallCommands" | "CopyCommands") {
                         // The called lists run next, in order, ahead of
                         // the rest of this one (their waits block too).
-                        let work = self.pending.get_mut(&queue).unwrap();
                         for handle in command.captured.iter().rev() {
                             match self.command_lists.get(handle) {
-                                Some((list, ..)) => work.push_front(QueueItem::List {
-                                    commands: list.clone(),
-                                    next: 0,
-                                }),
-                                None => self.stale_command_submissions += 1,
+                                Some((list, ..)) => {
+                                    let list = list.clone();
+                                    self.pending.get_mut(&queue).unwrap().push_front(
+                                        QueueItem::List {
+                                            commands: list,
+                                            next: 0,
+                                        },
+                                    );
+                                }
+                                None => self.note_stale(*handle, "queued call"),
                             }
                         }
                         continue;
@@ -2763,7 +2783,7 @@ impl Nvn {
                 }
                 for handle in command.captured.clone() {
                     let Some((list, ..)) = self.command_lists.get(&handle) else {
-                        self.stale_command_submissions += 1;
+                        self.note_stale(handle, "call");
                         continue;
                     };
                     let list = list.clone();
