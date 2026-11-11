@@ -326,9 +326,16 @@ inputs (a runtime array is as long as its bytes). Depth comparisons
 (samples and gathers) test the reference against component 0 by
 `Inputs::compare_op` (the sampler's VkCompareOp). Levels past 0 come from
 `Inputs::mips`: an explicit level, a fetch's level, or the level TXD's
-gradients give picks the nearest one, and queries report the chain; an
-implicit level (its derivatives) and blending between levels or texels
-are not simulated, and LOD queries read zeros. Reference tests check the opcodes the game uses
+gradients give picks the nearest one, and queries report the chain. A
+fragment program runs as a 2x2 quad when `Inputs::quad` gives four
+pixels (their FragCoord, attributes and whether each is a helper): one
+subgroup, whose derivatives (DPdx, DPdy, Fwidth; fine from a lane's row
+or column neighbour, coarse from lanes 0-2) and implicit levels (log2 of
+the coordinates' coarse derivatives in level-0 texels, plus a bias; LOD
+queries too) come from each other; a helper (or a demoted invocation)
+runs on but its buffer, memory and image writes are dropped. Without a
+quad an implicit level is 0. Blending between levels or texels is not
+simulated: samples take the nearest texel of the nearest level. Reference tests check the opcodes the game uses
 most against models written apart from the translator: TEX's mask order,
 second destination and packed halves; TEX.B's pool entry, integer view
 and capacity; TXQ; divergent BRA loops against a per-invocation model;

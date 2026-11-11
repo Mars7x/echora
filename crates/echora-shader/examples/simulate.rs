@@ -16,7 +16,11 @@
 //!   BaseInstance 4425);
 //!   for a fragment program (one pixel), `fragcoord X Y Z W` (FragCoord, W
 //!   being 1/w) and `attribute LOCATION X Y Z W` (an interpolated input as
-//!   Vulkan hands it over, perspective-corrected), floats;
+//!   Vulkan hands it over, perspective-corrected), floats; for a 2x2 quad
+//!   instead (derivatives and implicit levels across it), per pixel N
+//!   (0 top left, 1 top right, 2 bottom left, 3 bottom right) `quad N
+//!   fragcoord X Y Z W`, `quad N attribute LOCATION X Y Z W` and `quad N
+//!   helper`; `compare_op N` the depth comparisons' VkCompareOp;
 //! - `push.bin`: the push constants' bytes;
 //! - `payload.bin`: a mesh program's task payload (what its task program
 //!   wrote), if it has one;
@@ -87,6 +91,37 @@ fn main() {
             .filter_map(|field| field.parse::<f32>().ok())
             .map(|value| u64::from(value.to_bits()))
             .collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if let ["quad", pixel, rest @ ..] = &fields[..]
+            && let Ok(pixel) = pixel.parse::<usize>()
+            && pixel < 4
+        {
+            if inputs.quad.len() < 4 {
+                inputs
+                    .quad
+                    .resize(4, echora_shader::sim::QuadPixel::default());
+            }
+            let floats: Vec<f32> = rest.iter().filter_map(|f| f.parse().ok()).collect();
+            let quad = &mut inputs.quad[pixel];
+            match rest.first() {
+                Some(&"fragcoord") if floats.len() == 4 => {
+                    quad.frag_coord = [floats[0], floats[1], floats[2], floats[3]];
+                }
+                Some(&"attribute") if floats.len() == 5 => {
+                    let words = floats[1..].iter().map(|v| u64::from(v.to_bits())).collect();
+                    quad.locations.insert(floats[0] as u32, words);
+                }
+                Some(&"helper") => quad.helper = true,
+                _ => {}
+            }
+            continue;
+        }
+        if let ["compare_op", op] = &fields[..]
+            && let Ok(op) = op.parse()
+        {
+            inputs.compare_op = Some(op);
+            continue;
+        }
         match line.split_whitespace().next() {
             Some("fragcoord") if floats.len() == 4 => {
                 inputs.builtins.insert(15, floats);
@@ -446,16 +481,21 @@ fn main() {
         }
         // A one-pixel run (a fragment program): its located variables (the
         // attributes given and the colours written).
-        if report.invocations.len() == 1 && !machine.locations.is_empty() {
+        if report.invocations.len() <= 4 && !machine.locations.is_empty() {
             let mut located: Vec<(&u32, &u32)> = machine.locations.iter().collect();
             located.sort_by_key(|&(variable, location)| (*location, *variable));
-            for (variable, location) in located {
-                if let Some(value) = report.invocations[0].get(variable) {
-                    let floats: Vec<String> = value
-                        .iter()
-                        .map(|&word| format!("{}", f32::from_bits(word as u32)))
-                        .collect();
-                    println!("  location {location} (%{variable}): {}", floats.join(" "));
+            for (n, variables) in report.invocations.iter().enumerate() {
+                for &(variable, location) in &located {
+                    if let Some(value) = variables.get(variable) {
+                        let floats: Vec<String> = value
+                            .iter()
+                            .map(|&word| format!("{}", f32::from_bits(word as u32)))
+                            .collect();
+                        println!(
+                            "  pixel {n} location {location} (%{variable}): {}",
+                            floats.join(" ")
+                        );
+                    }
                 }
             }
         }

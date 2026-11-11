@@ -36,6 +36,19 @@ const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
+/// Derivatives (OpDPdx .. OpFwidthCoarse).
+const DPDX: u16 = 207;
+const DPDY: u16 = 208;
+const FWIDTH: u16 = 209;
+const DPDX_FINE: u16 = 210;
+const DPDY_FINE: u16 = 211;
+const FWIDTH_FINE: u16 = 212;
+const DPDX_COARSE: u16 = 213;
+const DPDY_COARSE: u16 = 214;
+const FWIDTH_COARSE: u16 = 215;
+/// Fragment built-ins.
+const BUILTIN_FRAG_COORD: u32 = 15;
+const BUILTIN_HELPER_INVOCATION: u32 = 23;
 /// OpCopyObject (inlined calls deliver their results with it).
 const COPY_OBJECT: u16 = 83;
 const DECORATION_COMPONENT: u32 = 31;
@@ -160,6 +173,11 @@ pub struct Inputs {
     pub locations: HashMap<u32, Vec<u64>>,
     /// A mesh program's task payload (bytes) from its task program.
     pub payload: Vec<u8>,
+    /// A fragment program's 2x2 quad (top left, top right, bottom left,
+    /// bottom right): four invocations, one subgroup, whose derivatives
+    /// and implicit levels come from each other. Empty: one invocation as
+    /// the other inputs give it.
+    pub quad: Vec<QuadPixel>,
     /// Bound textures' levels past 0 (1, 2, ...), by (descriptor set,
     /// binding): explicit, gradient and fetch levels read them.
     pub mips: HashMap<(u32, u32), Vec<Image>>,
@@ -173,6 +191,17 @@ pub struct Inputs {
     /// An invocation (local index) and a variable (a register's id) whose
     /// every store `Report::traced` lists.
     pub trace: Option<(usize, u32)>,
+}
+
+/// One pixel of a fragment quad (`Inputs::quad`).
+#[derive(Clone, Debug, Default)]
+pub struct QuadPixel {
+    /// FragCoord (x, y, z, 1/w).
+    pub frag_coord: [f32; 4],
+    /// Its interpolated inputs by Location, as `Inputs::locations`.
+    pub locations: HashMap<u32, Vec<u64>>,
+    /// A helper invocation: it runs (for derivatives) but writes nothing.
+    pub helper: bool,
 }
 
 /// A store or atomic into a watched range.
@@ -342,6 +371,9 @@ struct Invocation {
     current: usize,
     /// The guest EXIT it took first (an OpLine's line), if any.
     exit: Option<u32>,
+    /// A helper invocation (demoted, or a quad's helper): its stores and
+    /// image writes are dropped.
+    helper: bool,
     /// The guest instruction running (its line), when marked.
     step: Option<u32>,
     /// The first NaN and infinite float results (see
@@ -878,20 +910,24 @@ impl Machine {
     /// The level an image access reads: a query's or a fetch's level, a
     /// sample's explicit Lod or the level its Grad operands give (log2 of
     /// the larger gradient's length in level-0 texels), rounded to the
-    /// nearest (mipmapMode nearest); 0 otherwise, an implicit level
-    /// included (its derivatives are not simulated).
+    /// nearest (mipmapMode nearest); an implicit level from `lambda` (the
+    /// quad's derivatives), else 0.
     fn image_level(
         &self,
         opcode: u16,
         invocation: &Invocation,
         args: &[u32],
         base: &Image,
+        lambda: Option<f64>,
     ) -> usize {
         let value = |n: usize| args.get(n).and_then(|id| invocation.values.get(id));
         let float = |words: &Value, n: usize| {
             f64::from(f32::from_bits(words.get(n).copied().unwrap_or(0) as u32))
         };
         let from_lambda = |lambda: f64| (lambda + 0.5).floor().max(0.0) as usize;
+        if let Some(lambda) = lambda {
+            return from_lambda(lambda);
+        }
         match opcode {
             op::IMAGE_QUERY_SIZE_LOD => value(1).map_or(0, |words| words[0] as usize),
             op::IMAGE_FETCH | op::IMAGE_SAMPLE_EXPLICIT_LOD if args.len() > 2 => {
@@ -928,6 +964,157 @@ impl Machine {
                 0
             }
             _ => 0,
+        }
+    }
+
+    /// An image access by `invocation` (a sample, fetch, gather, read,
+    /// query or depth comparison), its implicit level (if any) `lambda`.
+    #[allow(clippy::too_many_lines)]
+    fn image_access(
+        &self,
+        invocation: &Invocation,
+        shared: &mut Shared,
+        opcode: u16,
+        ty: u32,
+        args: &[u32],
+        lambda: Option<f64>,
+    ) -> Value {
+        let value = |n: usize| invocation.values[&args[n]].clone();
+        match opcode {
+            op::IMAGE_SAMPLE_IMPLICIT_LOD
+            | op::IMAGE_SAMPLE_EXPLICIT_LOD
+            | op::IMAGE_FETCH
+            | op::IMAGE_GATHER
+            | op::IMAGE_READ
+            | op::IMAGE_QUERY_SIZE_LOD
+            | op::IMAGE_QUERY_LEVELS => {
+                let image_type = invocation.value_types[&args[0]];
+                let handle = value(0);
+                let key = self.bound_image(&handle);
+                let image = match key {
+                    Some(key) => shared.images.get(&key).cloned(),
+                    None => self
+                        .array_element(&handle)
+                        .and_then(|key| shared.image_arrays.get(&key).cloned()),
+                };
+                // Its level chain: level 0, then `Inputs::mips`.
+                let chain: Vec<Image> = image
+                    .iter()
+                    .cloned()
+                    .chain(
+                        key.and_then(|key| shared.mips.get(&key))
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    )
+                    .collect();
+                if opcode == op::IMAGE_QUERY_LEVELS && !chain.is_empty() {
+                    vec![chain.len() as u64]
+                } else {
+                    match image {
+                        Some(base) => {
+                            let level = self.image_level(opcode, invocation, args, &base, lambda);
+                            let image = chain[level.min(chain.len() - 1)].clone();
+                            let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
+                            let component = if opcode == op::IMAGE_GATHER {
+                                value(2)[0] as usize
+                            } else {
+                                0
+                            };
+                            let offset = if opcode == op::IMAGE_GATHER {
+                                self.gather_offset(invocation, args)
+                            } else {
+                                [0; 2]
+                            };
+                            self.image_read(
+                                opcode,
+                                image_type,
+                                &image,
+                                &coordinate,
+                                component,
+                                offset,
+                                ty,
+                            )
+                        }
+                        None => {
+                            shared.note("reads of textures without dumped data give zeros");
+                            vec![0; self.size(ty)]
+                        }
+                    }
+                }
+            }
+            // Depth comparisons: the reference against component 0 of
+            // the nearest texel (a sample) or of the four a gather takes,
+            // by the sampler's compare op: 1.0 where it holds.
+            op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+            | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+            | op::IMAGE_DREF_GATHER => {
+                let image_type = invocation.value_types[&args[0]];
+                let handle = value(0);
+                let image = match self.bound_image(&handle) {
+                    Some(key) => shared.images.get(&key).cloned(),
+                    None => self
+                        .array_element(&handle)
+                        .and_then(|key| shared.image_arrays.get(&key).cloned()),
+                };
+                let compare = match shared.compare_op {
+                    Some(op) => op,
+                    None => {
+                        shared.note("depth comparisons without Inputs::compare_op: less or equal");
+                        3
+                    }
+                };
+                match image {
+                    Some(image) => {
+                        let coordinate = value(1);
+                        let reference = f32::from_bits(value(2)[0] as u32);
+                        let gather = opcode == op::IMAGE_DREF_GATHER;
+                        let offset = if gather {
+                            self.gather_offset(invocation, args)
+                        } else {
+                            [0; 2]
+                        };
+                        let read = if gather {
+                            op::IMAGE_GATHER
+                        } else {
+                            op::IMAGE_SAMPLE_EXPLICIT_LOD
+                        };
+                        let texels =
+                            self.image_read(read, image_type, &image, &coordinate, 0, offset, ty);
+                        let depths: Vec<u64> = if gather {
+                            texels
+                        } else {
+                            texels.into_iter().take(1).collect()
+                        };
+                        depths
+                            .iter()
+                            .map(|&bits| {
+                                let depth = f32::from_bits(bits as u32);
+                                let holds = match compare {
+                                    0 => false,
+                                    1 => reference < depth,
+                                    2 => reference == depth,
+                                    3 => reference <= depth,
+                                    4 => reference > depth,
+                                    5 => reference != depth,
+                                    6 => reference >= depth,
+                                    _ => true,
+                                };
+                                u64::from(if holds { 1.0f32 } else { 0.0 }.to_bits())
+                            })
+                            .collect()
+                    }
+                    None => {
+                        shared.note("reads of textures without dumped data give zeros");
+                        vec![0; self.size(ty)]
+                    }
+                }
+            }
+            op::IMAGE_QUERY_LOD => {
+                shared.note("level queries give zeros");
+                vec![0; self.size(ty)]
+            }
+            _ => unreachable!("not an image access"),
         }
     }
 
@@ -1119,8 +1306,11 @@ impl Machine {
     /// Runs workgroup `inputs.workgroup_id` of a dispatch.
     pub fn simulate(&self, inputs: &Inputs) -> Report {
         let [x, y, z] = self.local_size;
-        let count = (x * y * z) as usize;
-        let subgroup = if inputs.subgroup_size == 0 {
+        let quad = inputs.quad.len() == 4;
+        let count = if quad { 4 } else { (x * y * z) as usize };
+        let subgroup = if quad {
+            4
+        } else if inputs.subgroup_size == 0 {
             32
         } else {
             inputs.subgroup_size as usize
@@ -1178,6 +1368,17 @@ impl Machine {
                     builtins.insert(BUILTIN_SUBGROUP_EQ_MASK + k as u32, words);
                 }
                 builtins.extend(inputs.builtins.clone());
+                if let Some(pixel) = inputs.quad.get(n).filter(|_| quad) {
+                    builtins.insert(
+                        BUILTIN_FRAG_COORD,
+                        pixel
+                            .frag_coord
+                            .iter()
+                            .map(|v| u64::from(v.to_bits()))
+                            .collect(),
+                    );
+                    builtins.insert(BUILTIN_HELPER_INVOCATION, vec![u64::from(pixel.helper)]);
+                }
                 builtins
             },
             |_| HashMap::new(),
@@ -1285,7 +1486,10 @@ impl Machine {
         }
         let mut invocations: Vec<Invocation> = (0..count)
             .map(|n| {
-                let mut invocation = self.start(&builtins(n), &inputs.locations);
+                let pixel = inputs.quad.get(n).filter(|_| inputs.quad.len() == 4);
+                let locations = pixel.map_or(&inputs.locations, |pixel| &pixel.locations);
+                let mut invocation = self.start(&builtins(n), locations);
+                invocation.helper = pixel.is_some_and(|pixel| pixel.helper);
                 invocation.number = n;
                 invocation.initial = initial(n);
                 for (&constant, spec_id) in &self.spec_ids {
@@ -1484,6 +1688,7 @@ impl Machine {
             number: 0,
             current: 0,
             exit: None,
+            helper: false,
             step: None,
             first_nan: None,
             first_infinite: None,
@@ -1497,12 +1702,187 @@ impl Machine {
     fn collective(opcode: u16) -> bool {
         opcode == op::CONTROL_BARRIER
             || (333..=366).contains(&opcode)
+            || Self::quad_wide(opcode)
             || matches!(
                 opcode,
                 op::COOPERATIVE_MATRIX_LOAD
                     | op::COOPERATIVE_MATRIX_STORE
                     | op::COOPERATIVE_MATRIX_MUL_ADD
             )
+    }
+
+    /// Operations across a fragment quad: derivatives and implicit levels.
+    fn quad_wide(opcode: u16) -> bool {
+        (DPDX..=FWIDTH_COARSE).contains(&opcode)
+            || matches!(
+                opcode,
+                op::IMAGE_SAMPLE_IMPLICIT_LOD
+                    | op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                    | op::IMAGE_QUERY_LOD
+            )
+    }
+
+    /// A derivative or implicit-level access the quad's running invocations
+    /// (`members`, of the quad starting at `first`) have all reached: a
+    /// lane's derivative from its row or column neighbour (fine; coarse
+    /// from lanes 0, 1 and 2), a sample's level from the coarse derivatives
+    /// of its coordinates. A missing neighbour (a lane not running) gives
+    /// 0 and an undefined result.
+    fn quad_operation(
+        &self,
+        invocations: &mut [Invocation],
+        first: usize,
+        members: &[usize],
+        shared: &mut Shared,
+    ) {
+        let at = invocations[members[0]].at;
+        let instruction = &self.body[at];
+        let (opcode, operands) = (instruction.opcode, &instruction.operands);
+        let (ty, id, args) = (operands[0], operands[1], &operands[2..]);
+        let lane = |m: usize| (m - first) % 4;
+        let mut by_lane: [Option<usize>; 4] = [None; 4];
+        for &m in members {
+            by_lane[lane(m)] = Some(m);
+        }
+        let operand =
+            |n: usize, l: usize| by_lane[l].map(|m| invocations[m].values[&args[n]].clone());
+        let floats = |value: &Value| -> Vec<f32> {
+            value.iter().map(|&w| f32::from_bits(w as u32)).collect()
+        };
+        let difference = |a: Option<Value>, b: Option<Value>| -> Option<Vec<f32>> {
+            let (a, b) = (floats(&a?), floats(&b?));
+            Some(a.iter().zip(&b).map(|(a, b)| a - b).collect())
+        };
+        // What is differenced: a derivative's operand, an image access's
+        // coordinate.
+        let p = if (DPDX..=FWIDTH_COARSE).contains(&opcode) {
+            0
+        } else {
+            1
+        };
+        let mut results = Vec::new();
+        for &m in members {
+            let l = lane(m);
+            let (fine_x, fine_y) = (
+                difference(operand(p, l | 1), operand(p, l & 2)),
+                difference(operand(p, l | 2), operand(p, l & 1)),
+            );
+            let (coarse_x, coarse_y) = (
+                difference(operand(p, 1), operand(p, 0)),
+                difference(operand(p, 2), operand(p, 0)),
+            );
+            let width = |x: &Option<Vec<f32>>, y: &Option<Vec<f32>>| -> Option<Vec<f32>> {
+                Some(
+                    x.as_ref()?
+                        .iter()
+                        .zip(y.as_ref()?)
+                        .map(|(x, y)| x.abs() + y.abs())
+                        .collect(),
+                )
+            };
+            let derivative = match opcode {
+                DPDX | DPDX_FINE => Some(fine_x.clone()),
+                DPDY | DPDY_FINE => Some(fine_y.clone()),
+                FWIDTH | FWIDTH_FINE => Some(width(&fine_x, &fine_y)),
+                DPDX_COARSE => Some(coarse_x.clone()),
+                DPDY_COARSE => Some(coarse_y.clone()),
+                FWIDTH_COARSE => Some(width(&coarse_x, &coarse_y)),
+                _ => None,
+            };
+            let (value, undefined) = match derivative {
+                Some(Some(values)) => (
+                    values.iter().map(|v| u64::from(v.to_bits())).collect(),
+                    false,
+                ),
+                Some(None) => (vec![0; self.size(ty)], true),
+                None => {
+                    // An implicit level: the coordinates' coarse derivatives
+                    // in level-0 texels, plus a bias operand.
+                    let dref = opcode == op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD;
+                    let invocation = &invocations[m];
+                    let lambda = self.implicit_lambda(
+                        invocation,
+                        shared,
+                        args,
+                        coarse_x.as_deref(),
+                        coarse_y.as_deref(),
+                        if dref { 3 } else { 2 },
+                    );
+                    let value = if opcode == op::IMAGE_QUERY_LOD {
+                        // (The level used, clamped at 0; the unclamped one.)
+                        let lambda = lambda.unwrap_or(0.0) as f32;
+                        vec![
+                            u64::from(lambda.max(0.0).to_bits()),
+                            u64::from(lambda.to_bits()),
+                        ]
+                    } else {
+                        self.image_access(invocation, shared, opcode, ty, args, lambda)
+                    };
+                    (value, lambda.is_none() && opcode == op::IMAGE_QUERY_LOD)
+                }
+            };
+            results.push((value, undefined));
+        }
+        for (&m, (value, undefined)) in members.iter().zip(results) {
+            let invocation = &mut invocations[m];
+            invocation.values.insert(id, value);
+            invocation.value_types.insert(id, ty);
+            if undefined {
+                invocation.tainted.insert(id);
+            } else {
+                invocation.tainted.remove(&id);
+            }
+            invocation.at += 1;
+        }
+    }
+
+    /// λ of an implicit-level access: log2 of the larger of the
+    /// coordinates' x and y derivatives in the image's level-0 texels,
+    /// plus the Bias operand (its mask at `mask_at`); `None` without both
+    /// derivatives or an image.
+    fn implicit_lambda(
+        &self,
+        invocation: &Invocation,
+        shared: &Shared,
+        args: &[u32],
+        dx: Option<&[f32]>,
+        dy: Option<&[f32]>,
+        mask_at: usize,
+    ) -> Option<f64> {
+        let handle = invocation.values.get(&args[0])?;
+        let image = match self.bound_image(handle) {
+            Some(key) => shared.images.get(&key),
+            None => self
+                .array_element(handle)
+                .and_then(|key| shared.image_arrays.get(&key)),
+        }?;
+        let sizes = [
+            f64::from(image.width.max(1)),
+            f64::from(image.height.max(1)),
+        ];
+        let length = |d: &[f32]| {
+            d.iter()
+                .take(2)
+                .zip(sizes)
+                .map(|(&v, size)| (f64::from(v) * size).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let rho = length(dx?).max(length(dy?));
+        let mut lambda = if rho > 0.0 {
+            rho.log2()
+        } else {
+            f64::NEG_INFINITY
+        };
+        if let Some(&mask) = args.get(mask_at)
+            && mask & 1 != 0
+            && let Some(bias) = args
+                .get(mask_at + 1)
+                .and_then(|id| invocation.values.get(id))
+        {
+            lambda += f64::from(f32::from_bits(bias[0] as u32));
+        }
+        Some(lambda)
     }
 
     /// The subgroup operation `members` (running invocations of the
@@ -1517,6 +1897,10 @@ impl Machine {
         let at = invocations[members[0]].at;
         let instruction = &self.body[at];
         let (opcode, operands) = (instruction.opcode, &instruction.operands);
+        if Self::quad_wide(opcode) {
+            self.quad_operation(invocations, first, members, shared);
+            return;
+        }
         // Cooperative matrix operations run once for the subgroup (each
         // invocation's operands are the same), as on the hardware.
         if matches!(
@@ -1692,6 +2076,10 @@ impl Machine {
             Pointer::Logical {
                 variable, offset, ..
             } => {
+                // A helper's stores to shared variables (buffers) are dropped.
+                if invocation.helper && !invocation.variables.contains_key(&variable) {
+                    return;
+                }
                 let slots = match invocation.variables.get_mut(&variable) {
                     Some(slots) => slots,
                     None => shared
@@ -1707,6 +2095,7 @@ impl Machine {
                     )),
                 }
             }
+            Pointer::Physical { .. } if invocation.helper => {}
             Pointer::Physical { address, pointee } => {
                 let bytes = self.bytes_of(pointee, value);
                 if !shared.watch.is_empty() {
@@ -2101,6 +2490,11 @@ impl Machine {
                     return;
                 }
                 // The translation marks each guest EXIT taken with a line.
+                // KILL: the invocation goes on as a helper.
+                op::DEMOTE_TO_HELPER_INVOCATION => {
+                    invocation.helper = true;
+                    continue;
+                }
                 op::LINE => {
                     if self.step_file.is_some() && operands.first() == self.step_file.as_ref() {
                         invocation.step = operands.get(1).copied();
@@ -2206,6 +2600,8 @@ impl Machine {
                     continue;
                 }
                 op::FUNCTION_CALL => panic!("the simulator does not call functions"),
+                // A helper writes nothing.
+                op::IMAGE_WRITE if invocation.helper => continue,
                 op::IMAGE_WRITE => {
                     let coordinate = invocation.values[&operands[1]].clone();
                     let texel = invocation.values[&operands[2]].clone();
@@ -2260,147 +2656,19 @@ impl Machine {
                     }
                 }
                 op::SAMPLED_IMAGE | op::IMAGE | COPY_OBJECT => value(0),
+                op::IS_HELPER_INVOCATION => vec![u64::from(invocation.helper)],
                 op::IMAGE_SAMPLE_IMPLICIT_LOD
                 | op::IMAGE_SAMPLE_EXPLICIT_LOD
                 | op::IMAGE_FETCH
                 | op::IMAGE_GATHER
                 | op::IMAGE_READ
                 | op::IMAGE_QUERY_SIZE_LOD
-                | op::IMAGE_QUERY_LEVELS => {
-                    let image_type = invocation.value_types[&args[0]];
-                    let handle = value(0);
-                    let key = self.bound_image(&handle);
-                    let image = match key {
-                        Some(key) => shared.images.get(&key).cloned(),
-                        None => self
-                            .array_element(&handle)
-                            .and_then(|key| shared.image_arrays.get(&key).cloned()),
-                    };
-                    // Its level chain: level 0, then `Inputs::mips`.
-                    let chain: Vec<Image> = image
-                        .iter()
-                        .cloned()
-                        .chain(
-                            key.and_then(|key| shared.mips.get(&key))
-                                .into_iter()
-                                .flatten()
-                                .cloned(),
-                        )
-                        .collect();
-                    if opcode == op::IMAGE_QUERY_LEVELS && !chain.is_empty() {
-                        vec![chain.len() as u64]
-                    } else {
-                        match image {
-                            Some(base) => {
-                                let level = self.image_level(opcode, invocation, args, &base);
-                                let image = chain[level.min(chain.len() - 1)].clone();
-                                let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
-                                let component = if opcode == op::IMAGE_GATHER {
-                                    value(2)[0] as usize
-                                } else {
-                                    0
-                                };
-                                let offset = if opcode == op::IMAGE_GATHER {
-                                    self.gather_offset(invocation, args)
-                                } else {
-                                    [0; 2]
-                                };
-                                self.image_read(
-                                    opcode,
-                                    image_type,
-                                    &image,
-                                    &coordinate,
-                                    component,
-                                    offset,
-                                    ty,
-                                )
-                            }
-                            None => {
-                                shared.note("reads of textures without dumped data give zeros");
-                                vec![0; self.size(ty)]
-                            }
-                        }
-                    }
-                }
-                // Depth comparisons: the reference against component 0 of
-                // the nearest texel (a sample) or of the four a gather takes,
-                // by the sampler's compare op: 1.0 where it holds.
-                op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                | op::IMAGE_QUERY_LEVELS
+                | op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
                 | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
-                | op::IMAGE_DREF_GATHER => {
-                    let image_type = invocation.value_types[&args[0]];
-                    let handle = value(0);
-                    let image = match self.bound_image(&handle) {
-                        Some(key) => shared.images.get(&key).cloned(),
-                        None => self
-                            .array_element(&handle)
-                            .and_then(|key| shared.image_arrays.get(&key).cloned()),
-                    };
-                    let compare = match shared.compare_op {
-                        Some(op) => op,
-                        None => {
-                            shared.note(
-                                "depth comparisons without Inputs::compare_op: less or equal",
-                            );
-                            3
-                        }
-                    };
-                    match image {
-                        Some(image) => {
-                            let coordinate = value(1);
-                            let reference = f32::from_bits(value(2)[0] as u32);
-                            let gather = opcode == op::IMAGE_DREF_GATHER;
-                            let offset = if gather {
-                                self.gather_offset(invocation, args)
-                            } else {
-                                [0; 2]
-                            };
-                            let read = if gather {
-                                op::IMAGE_GATHER
-                            } else {
-                                op::IMAGE_SAMPLE_EXPLICIT_LOD
-                            };
-                            let texels = self.image_read(
-                                read,
-                                image_type,
-                                &image,
-                                &coordinate,
-                                0,
-                                offset,
-                                ty,
-                            );
-                            let depths: Vec<u64> = if gather {
-                                texels
-                            } else {
-                                texels.into_iter().take(1).collect()
-                            };
-                            depths
-                                .iter()
-                                .map(|&bits| {
-                                    let depth = f32::from_bits(bits as u32);
-                                    let holds = match compare {
-                                        0 => false,
-                                        1 => reference < depth,
-                                        2 => reference == depth,
-                                        3 => reference <= depth,
-                                        4 => reference > depth,
-                                        5 => reference != depth,
-                                        6 => reference >= depth,
-                                        _ => true,
-                                    };
-                                    u64::from(if holds { 1.0f32 } else { 0.0 }.to_bits())
-                                })
-                                .collect()
-                        }
-                        None => {
-                            shared.note("reads of textures without dumped data give zeros");
-                            vec![0; self.size(ty)]
-                        }
-                    }
-                }
-                op::IMAGE_QUERY_LOD => {
-                    shared.note("level queries give zeros");
-                    vec![0; self.size(ty)]
+                | op::IMAGE_DREF_GATHER
+                | op::IMAGE_QUERY_LOD => {
+                    self.image_access(invocation, shared, opcode, ty, args, None)
                 }
                 op::LOAD => {
                     let pointer = invocation.pointers[&args[0]];
@@ -6493,6 +6761,120 @@ mod tests {
             (72, 4, 0xf),
         ]);
         assert_eq!(texture(txq, &[1]), vec![2, 2, 1, 3]);
+    }
+
+    #[test]
+    fn a_quad_s_coordinates_pick_its_implicit_level() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // IPA R0, a[0x80]; IPA R1, a[0x84] (screen-linear); TEX R4, R0, R1
+        // (2D, implicit level, handle c[0x0][0x40]), x only.
+        let ipa = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+                (81, 3, 7),
+            ])
+        };
+        let tex = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 1),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 1),
+            (81, 3, 7),
+        ]);
+        let code: Vec<_> = [ipa(0, 0x80), ipa(1, 0x84), tex, EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let mut imap = [Interpolation::Unused; 128];
+        imap[..2].fill(Interpolation::ScreenLinear);
+        let layout = Layout {
+            stage: Stage::Fragment,
+            header: Some(Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            }),
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        let machine = Machine::new(&translated.spirv);
+        // Level l of an 8 x 8 texture: texel n holds 1000 l + n.
+        let level = |l: u32| {
+            let side = 8 >> l;
+            Image {
+                width: side,
+                height: side,
+                depth: 1,
+                layers: 1,
+                texels: (0..side * side).map(|n| [1000 * l + n, 0, 0, 0]).collect(),
+            }
+        };
+        // Pixel (i, j) of the quad samples (0.125 + i step, 0.125 + j step);
+        // the bottom right one is a helper.
+        let run = |step: f32| {
+            let quad: Vec<QuadPixel> = (0..4u32)
+                .map(|n| {
+                    let (i, j) = ((n % 2) as f32, (n / 2) as f32);
+                    let (u, v) = (0.125 + i * step, 0.125 + j * step);
+                    QuadPixel {
+                        frag_coord: [10.5 + i, 20.5 + j, 0.5, 1.0],
+                        locations: HashMap::from([(
+                            0,
+                            vec![u64::from(u.to_bits()), u64::from(v.to_bits()), 0, 0],
+                        )]),
+                        helper: n == 3,
+                    }
+                })
+                .collect();
+            let report = machine.simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([((0, binding), level(0))]),
+                mips: HashMap::from([((0, binding), vec![level(1), level(2)])]),
+                quad,
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            (0..4)
+                .map(|n| report.invocations[n][&registers[&4]][0] as u32)
+                .collect::<Vec<u32>>()
+        };
+        // 0.5 apart: 4 level-0 texels, λ = 2: level 2 (2 x 2), one texel a
+        // pixel.
+        assert_eq!(run(0.5), vec![2000, 2001, 2002, 2003]);
+        // 0.25 apart: λ = 1, level 1 (4 x 4): texels by (u, v) * 4.
+        let level_one = |u: f32, v: f32| 1000 + (v * 4.0) as u32 * 4 + (u * 4.0) as u32;
+        assert_eq!(
+            run(0.25),
+            vec![
+                level_one(0.125, 0.125),
+                level_one(0.375, 0.125),
+                level_one(0.125, 0.375),
+                level_one(0.375, 0.375)
+            ]
+        );
+        // 1/16 apart: λ < 0, level 0.
+        let level_zero = |u: f32, v: f32| (v * 8.0) as u32 * 8 + (u * 8.0) as u32;
+        assert_eq!(run(0.0625)[0], level_zero(0.125, 0.125));
     }
 
     #[test]
