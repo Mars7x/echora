@@ -4816,7 +4816,8 @@ impl Nvn {
 
     /// A dumped dispatch's textures and storage images, by binding: level
     /// 0 read back from the GPU as RGBA f32 texels (`image-0-B.bin`, layer
-    /// 0) with `WIDTH HEIGHT DEPTH LAYERS` (`image-0-B.txt`). Integer
+    /// 0, every slice of a volume) with `WIDTH HEIGHT DEPTH LAYERS`
+    /// (`image-0-B.txt`). Integer
     /// formats read back as floats here.
     fn dump_images(&mut self, key: u64, read: &[(u32, TextureSource)]) -> Result<(), String> {
         let directory = self.dump_directory(key)?;
@@ -4827,13 +4828,27 @@ impl Nvn {
         for (binding, source) in read {
             eprintln!("dispatch dump {key:016x}: reading binding {binding} from {source:?}");
             let mut one = || -> Result<(), String> {
+                // Every slice of a volume (the simulator reads them all).
+                let depth;
                 let texels = match source {
-                    TextureSource::Upload { key, .. } => {
+                    TextureSource::Upload { key, shape, .. } => {
                         renderer.texture_view_for(source)?;
-                        renderer.read_upload_level(*key, 0)?
+                        depth = shape.depth();
+                        let mut texels = Vec::new();
+                        for slice in 0..depth {
+                            texels.extend(renderer.read_upload_slice(*key, 0, slice)?);
+                        }
+                        texels
                     }
                     TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
-                        renderer.read_target_level(*key, 0)?
+                        depth = renderer
+                            .existing_target(*key)
+                            .map_or(1, |target| target.shape.depth());
+                        let mut texels = Vec::new();
+                        for slice in 0..depth {
+                            texels.extend(renderer.read_target_slice(*key, 0, slice)?);
+                        }
+                        texels
                     }
                 };
                 let (width, height) = match source {
@@ -4843,7 +4858,7 @@ impl Nvn {
                         .map(|target| (target.width, target.height))
                         .ok_or("no such target")?,
                 };
-                let count = (width * height) as usize;
+                let count = (width * height * depth) as usize;
                 let bytes: Vec<u8> = texels
                     .iter()
                     .take(count)
@@ -4853,7 +4868,7 @@ impl Nvn {
                     .map_err(|error| error.to_string())?;
                 std::fs::write(
                     directory.join(format!("image-0-{binding}.txt")),
-                    format!("{width} {height} 1 1\n"),
+                    format!("{width} {height} {depth} 1\n"),
                 )
                 .map_err(|error| error.to_string())
             };
