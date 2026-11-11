@@ -28,6 +28,46 @@ fn main() {
         })
         .collect();
     entries.sort();
+    // A task program's INIT word (+0x58) is the mesh stage's when the two
+    // are bound together; the pairs are not in the dump, so each mesh
+    // program in the task program's slot (header kind 3, which NVN uses
+    // when a task program holds the vertex slot) is translated with the
+    // task program passing the most payload, and each task program
+    // against the first such mesh program's output counts.
+    let (mut task_init, mut paired_sizes) = (None::<u32>, None::<u32>);
+    for path in &entries {
+        let (Ok(code), Ok(control)) = (
+            std::fs::read(path),
+            std::fs::read(path.with_extension("control")),
+        ) else {
+            continue;
+        };
+        let word = |offset: usize| {
+            control
+                .get(offset..)
+                .and_then(|rest| rest.first_chunk::<4>())
+                .map_or(0, |bytes| u32::from_le_bytes(*bytes))
+        };
+        let kind = code
+            .first_chunk::<4>()
+            .map_or(0, |word| (u32::from_le_bytes(*word) >> 10) & 0xf);
+        if !echora_shader::is_graphics(&code) {
+            continue;
+        }
+        if kind == 1 && word(0x60) == 0 && word(0x58) & 0x3f != 0 {
+            let passed = |init: u32| init >> 22 & 0x1ff;
+            if task_init.is_none_or(|init| passed(word(0x58)) > passed(init)) {
+                task_init = Some(word(0x58));
+            }
+        }
+        if kind == 3 && word(0x60) != 0 && paired_sizes.is_none() {
+            paired_sizes = Some(word(0x60));
+        }
+    }
+    let outputs = |sizes: u32| {
+        let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
+        4 | (vertices & 0x1ff) << 4 | (primitives & 0x3ff) << 13
+    };
     for path in entries {
         total += 1;
         let Ok(code) = std::fs::read(&path) else {
@@ -45,9 +85,7 @@ fn main() {
         // Task and mesh programs as the runtime's `bound_mesh_program` tells
         // them apart (header kind, control words): a mesh program has its
         // vertex and primitive counts at +0x60, a task program its threads
-        // at +0x58 bits 5:0. A mesh program is translated as one drawn
-        // without a task program, a task program against a mesh state of
-        // none (its own +0x58 as the init word).
+        // at +0x58 bits 5:0.
         let kind = code
             .first_chunk::<4>()
             .map_or(0, |word| (u32::from_le_bytes(*word) >> 10) & 0xf);
@@ -55,15 +93,14 @@ fn main() {
         let sizes = word(0x60);
         if graphics && matches!(kind, 1 | 3) && sizes != 0 {
             mesh_count += 1;
-            let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
+            let init = match task_init {
+                Some(init) if kind == 3 => init,
+                _ => word(0x58) & !0x3f,
+            };
             parameters.stage_slot = Some(Stage::Mesh);
             parameters.mesh = Some(MeshParameters {
                 task: false,
-                registers: [
-                    4 | (vertices & 0x1ff) << 4 | (primitives & 0x3ff) << 13,
-                    (word(0x58) & 0x3f) << 20,
-                    word(0x58) & !0x3f,
-                ],
+                registers: [outputs(sizes), (word(0x58) & 0x3f) << 20, init],
                 primitive_header: None,
             });
         } else if graphics && kind == 1 && word(0x58) & 0x3f != 0 {
@@ -71,7 +108,7 @@ fn main() {
             parameters.stage_slot = Some(Stage::Task);
             parameters.mesh = Some(MeshParameters {
                 task: true,
-                registers: [4, 0, word(0x58)],
+                registers: [outputs(paired_sizes.unwrap_or(0)), 0, word(0x58)],
                 primitive_header: None,
             });
         } else if graphics && kind == 3 {
