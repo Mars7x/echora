@@ -159,6 +159,40 @@ impl Occlusion {
     /// submission).
     pub(crate) fn slot_reused(&mut self, fence: vk::Fence) {
         let slot = self.slot(fence);
+        // ECHORA_OCCLUSION_LOG (debugging): the slot's finished work, its
+        // segments' sample counts and its reports' sums (zero and not).
+        if std::env::var_os("ECHORA_OCCLUSION_LOG").is_some() && self.next[slot] > 0 {
+            let words = |buffer: &HostBuffer, from: u64, count: u64| -> Vec<u64> {
+                buffer
+                    .read_bytes(((from + count) * 8) as usize)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .skip(from as usize)
+                    .map(|word| u64::from_le_bytes(*word))
+                    .collect()
+            };
+            let segments = words(
+                &self.results,
+                u64::from(slot as u32 * QUERIES),
+                u64::from(self.next[slot]),
+            );
+            let sums = words(
+                &self.sums,
+                u64::from(slot as u32 * PLANS),
+                u64::from(self.plan_next[slot]),
+            );
+            let zero = |values: &[u64]| values.iter().filter(|value| **value == 0).count();
+            eprintln!(
+                "occlusion slot {slot}: {} segments ({} zero) {:?} {} sums ({} zero) {:?}",
+                segments.len(),
+                zero(&segments),
+                &segments[..segments.len().min(12)],
+                sums.len(),
+                zero(&sums),
+                &sums[..sums.len().min(12)]
+            );
+        }
         self.next[slot] = 0;
         self.plan_next[slot] = 0;
         self.batch_from = slot as u32 * QUERIES;

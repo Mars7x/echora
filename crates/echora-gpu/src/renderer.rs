@@ -4314,7 +4314,7 @@ impl HostBuffer {
 
     /// The first `length` bytes as they are now (debugging: work may still
     /// be writing them).
-    fn read_bytes(&self, length: usize) -> Vec<u8> {
+    pub(crate) fn read_bytes(&self, length: usize) -> Vec<u8> {
         let length = length.min(self.size as usize);
         // SAFETY: in bounds of the mapping.
         unsafe { std::slice::from_raw_parts(self.mapped, length) }.to_vec()
