@@ -328,6 +328,8 @@ pub fn vk_format(format: u32) -> Option<vk::Format> {
         "RGBA8_SRGB" => F::R8G8B8A8_SRGB,
         "RGB10A2" => F::A2B10G10R10_UNORM_PACK32,
         "RGB10A2UI" => F::A2B10G10R10_UINT_PACK32,
+        "RGB10A2SN" => F::A2B10G10R10_SNORM_PACK32,
+        "RGB10A2I" => F::A2B10G10R10_SINT_PACK32,
         "R11G11B10F" => F::B10G11R11_UFLOAT_PACK32,
         "RGB9E5F" => F::E5B9G9R9_UFLOAT_PACK32,
         "BC1_UNORM" => F::BC1_RGBA_UNORM_BLOCK,
@@ -367,6 +369,9 @@ pub fn vertex_format(format: u32) -> Option<echora_shader_abi::VertexFormat> {
     match name {
         "RGB10A2" => return Some(packed(4, L::Packed1010102, N::Unorm)),
         "RGB10A2UI" => return Some(packed(4, L::Packed1010102, N::Uint)),
+        // Packed normals and tangents.
+        "RGB10A2SN" => return Some(packed(4, L::Packed1010102, N::Snorm)),
+        "RGB10A2I" => return Some(packed(4, L::Packed1010102, N::Sint)),
         "R11G11B10F" => return Some(packed(3, L::Packed111110, N::Float)),
         "BGRA8" => {
             return Some(VertexFormat {
@@ -7337,6 +7342,7 @@ fn attribute_format_size(format: vk::Format) -> u64 {
         | F::A2B10G10R10_UNORM_PACK32
         | F::A2B10G10R10_SNORM_PACK32
         | F::A2B10G10R10_UINT_PACK32
+        | F::A2B10G10R10_SINT_PACK32
         | F::R32_SFLOAT
         | F::R32_UINT
         | F::R32_SINT
@@ -7485,6 +7491,8 @@ mod vertex_format_tests {
         assert_eq!(decoded(41), Some((4, L::Bits16, N::Float, false))); // RGBA16F
         assert_eq!(decoded(47), Some((4, L::Bits32, N::Uint, false))); // RGBA32UI
         assert_eq!(decoded(61), Some((4, L::Packed1010102, N::Unorm, false)));
+        assert_eq!(decoded(105), Some((4, L::Packed1010102, N::Snorm, false)));
+        assert_eq!(decoded(106), Some((4, L::Packed1010102, N::Sint, false)));
         assert_eq!(decoded(63), Some((3, L::Packed111110, N::Float, false)));
         assert_eq!(decoded(154), Some((4, L::Bits8, N::Unorm, true))); // BGRA8
         assert_eq!(decoded(50), None); // DEPTH16

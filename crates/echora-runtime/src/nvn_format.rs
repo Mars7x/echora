@@ -117,6 +117,10 @@ pub fn info(format: u32) -> Option<FormatInfo> {
         78 => f("BC7_SRGB", 4, 4, 16),
         79 => f("BC6H_SFLOAT", 4, 4, 16),
         80 => f("BC6H_UFLOAT", 4, 4, 16),
+        // After the 24 UI2F/I2F formats (81-104); 107 and 108 are their
+        // RGB10A2 forms, 109-120 the RGBX formats.
+        105 => f("RGB10A2SN", 1, 1, 4),
+        106 => f("RGB10A2I", 1, 1, 4),
         121..=134 => {
             let (w, h) = ASTC[(format - 121) as usize];
             f("ASTC", w, h, 16)
