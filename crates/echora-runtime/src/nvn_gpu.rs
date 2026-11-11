@@ -6369,10 +6369,27 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} indices {:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
+                match &indices {
+                    Indices::U16(bytes) => bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .take(16)
+                        .map(|index| u32::from(u16::from_le_bytes(*index)))
+                        .collect::<Vec<_>>(),
+                    Indices::U32(bytes) => bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .take(16)
+                        .map(|index| u32::from_le_bytes(*index))
+                        .collect(),
+                    Indices::None => Vec::new(),
+                },
                 vertex_fetch
                     .iter()
                     .map(|entry| (
