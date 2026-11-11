@@ -5221,7 +5221,22 @@ impl Nvn {
         // copy here takes the CPU's bytes for the bound range before each
         // binding, after any GPU-newer bytes there are stored back.
         let uncached = flags & 2 != 0 && flags & 4 == 0;
-        if uncached {
+        // A range the GPU wrote last and the CPU has not read back since
+        // (an occlusion report a condition reads) is newest in the GPU
+        // copy already: neither copied back nor uploaded over again (each
+        // round trip is a submission and a wait, hundreds a frame).
+        let gpu_newer = self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .resident
+            .get(&base)
+            .is_some_and(|pool| {
+                pool.gpu_dirty
+                    .iter()
+                    .any(|dirty| dirty.start <= guest && guest + length <= dirty.end)
+            });
+        if uncached && !gpu_newer {
             self.resolve_resident(core, Some(guest..guest + length))?;
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -5246,7 +5261,7 @@ impl Nvn {
                 gpu_dirty: Vec::new(),
             };
         }
-        if uncached {
+        if uncached && !gpu_newer {
             add_range(&mut pool.guest_dirty, guest..guest + length);
         }
         let uploads = std::mem::take(&mut pool.guest_dirty);
