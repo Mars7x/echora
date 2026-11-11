@@ -492,6 +492,20 @@ fn main() {
                 }
             }
         }
+        // A vertex program's position (BuiltIn Position), per invocation.
+        if report.invocations.len() <= 4 {
+            for (n, variables) in report.invocations.iter().enumerate() {
+                for (&variable, value) in variables {
+                    if machine.builtin(variable) == Some(0) && value.len() == 4 {
+                        let floats: Vec<String> = value
+                            .iter()
+                            .map(|&word| format!("{}", f32::from_bits(word as u32)))
+                            .collect();
+                        println!("  invocation {n} position {}", floats.join(" "));
+                    }
+                }
+            }
+        }
         // A one-pixel run (a fragment program): its located variables (the
         // attributes given and the colours written).
         if report.invocations.len() <= 4 && !machine.locations.is_empty() {
