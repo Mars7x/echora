@@ -1807,7 +1807,9 @@ impl Emitter {
                 }
             }
             Op::Fswzadd { d, a, b, pattern } => {
-                // The lane's operation: bits 2n of the pattern for quad lane n.
+                // The lane's operation: bits 6 - 2n of the pattern for quad
+                // lane n (NAK's SM70 encoding, the reverse of SM50's, which
+                // yuzu reads), 0 a + b, 1 a - b, 2 b - a, 3 b.
                 let a = self.read_register(a.0);
                 let b = self.read_register(b.0);
                 let (a, b) = (
@@ -1818,7 +1820,8 @@ impl Emitter {
                 let three = self.constant(3);
                 let quad = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
                 let two = self.constant(2);
-                let shift = self.value(op::I_MUL, self.u32, &[quad, two]);
+                let reversed = self.value(op::BITWISE_XOR, self.u32, &[quad, three]);
+                let shift = self.value(op::I_MUL, self.u32, &[reversed, two]);
                 let pattern = self.constant(u32::from(pattern));
                 let code = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[pattern, shift]);
                 let code = self.value(op::BITWISE_AND, self.u32, &[code, three]);

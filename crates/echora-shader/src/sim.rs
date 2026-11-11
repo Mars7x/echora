@@ -4530,6 +4530,56 @@ mod tests {
     }
 
     #[test]
+    fn swizzled_adds_give_nak_s_fine_derivatives() {
+        // NAK's fine ddx and ddy on SM70+: SHFL.BFLY R3, R1, 1 (or 2),
+        // 0x1c03; FSWZADD R4, R3, R1 with ops [SubLeft, SubRight, SubLeft,
+        // SubRight] (ddx) or [SubLeft, SubLeft, SubRight, SubRight] (ddy),
+        // lane i's op at bits 6 - 2i (SubLeft 1, SubRight 2): 0x66 and
+        // 0x5a. Lane n holds 2^n (R1 = n * 2^23 + 1.0's bits).
+        let lane = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0)]);
+        let value = word(&[
+            (0, 12, 0x824),
+            (16, 8, 1),
+            (24, 8, 0),
+            (32, 32, 0x80_0000),
+            (64, 8, 2),
+        ]);
+        for (distance, pattern) in [(1u32, 0x66u128), (2, 0x5a)] {
+            let butterfly = word(&[
+                (0, 12, 0xf89),
+                (16, 8, 3),
+                (24, 8, 1),
+                (40, 13, 0x1c03),
+                (53, 5, u128::from(distance)),
+                (58, 2, 3),
+                (81, 3, 7),
+            ]);
+            let swizzle = word(&[
+                (0, 12, 0x822),
+                (16, 8, 4),
+                (24, 8, 3),
+                (32, 8, pattern),
+                (64, 8, 1),
+            ]);
+            let (registers, _, problems) = run_group(
+                8,
+                &[0, 0, 1.0f32.to_bits()],
+                &[lane, value, butterfly, swizzle],
+            );
+            assert!(problems.is_empty(), "{problems:?}");
+            for (n, r) in registers.iter().enumerate() {
+                let x = |m: usize| 2f32.powi(m as i32);
+                let expected = x(n | distance as usize) - x(n & !(distance as usize));
+                assert_eq!(
+                    f32::from_bits(r[&4]),
+                    expected,
+                    "distance {distance} lane {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn branches_on_shuffles_from_lanes_not_running_are_reported() {
         // S2R R0, SR_LANEID; ISETP.GE P0, R0, R1 (R1 = 16); @P0 EXIT;
         // SHFL.IDX R2, R0, R3 (R3 = 20), 0x1f; ISETP.LT P1, R2, R1;

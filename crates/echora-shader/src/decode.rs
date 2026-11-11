@@ -825,8 +825,8 @@ pub enum Op {
     Brx {
         target: Src,
     },
-    /// FSWZADD d, a, b, pattern: per quad lane (bits 2n of `pattern` for
-    /// lane n), a + b, a - b, b - a or b.
+    /// FSWZADD d, a, b, pattern: per quad lane (bits 6 - 2n of `pattern`
+    /// for lane n, as NAK encodes it on SM70+), a + b, a - b, b - a or b.
     Fswzadd {
         d: Reg,
         a: Reg,

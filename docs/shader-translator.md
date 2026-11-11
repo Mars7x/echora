@@ -436,7 +436,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | EXIT, NOP | 0x94d, 0x918 | |
 | BRX, BRXU | 0x949, 0x958 | to the byte offset from the code's start in register 24 (BRXU: a uniform register); blocks start after every unconditional transfer, and the dispatcher selects blocks by their first instruction's index |
 | CALL, RET | 0x944, 0x950 | CALL.REL to its 50-bit offset at 32-81 (the return address put in a register by a MOV before it); RET.REL to the byte offset (from the code's start) in register 24, like BRX. A program ends at an unconditional EXIT or RET that no earlier branch or call reaches past |
-| FSWZADD | 0x822 | a 24, b 64, pattern 32-39: per quad lane n, bits 2n give a + b, a - b, b - a or b |
+| FSWZADD | 0x822 | a 24, b 64, pattern 32-39: per quad lane n, bits 6 - 2n (NAK's SM70 order, the reverse of SM50's at 28 + 2n, which yuzu reads) give a + b, a - b, b - a or b; checked by NAK's fine ddx and ddy (patterns 0x66, 0x5a). Codes 0 and 3 are not checked by any reference (yuzu reads them as -a - b and -b on SM50) |
 | IADD3 carries | 0x010 | `.X` 74: negation is inversion and the carries at 87-90, 77-80 add in |
 | IMAD.WIDE, IMAD.HI | 0x025, 0x027 in forms 1-7 | signed 73; C a register pair; carry out 81-83 |
 | IABS | 0x013 | the source in the second slot |
