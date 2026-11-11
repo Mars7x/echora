@@ -4910,8 +4910,23 @@ impl Nvn {
                     *sum += f64::from(*part) / count;
                 }
             }
+            // ECHORA_TARGET_TRACE_PIXEL=<x>,<y> (fractions of the width and
+            // height): also the texel there, the same place in targets of
+            // every size (follows one point of the picture through passes).
+            let pixel = super::debug_var("ECHORA_TARGET_TRACE_PIXEL")
+                .ok()
+                .and_then(|value| {
+                    let (x, y) = value.split_once(',')?;
+                    Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?))
+                })
+                .and_then(|(x, y)| {
+                    let column = ((x * f64::from(width)) as usize).min(width as usize - 1);
+                    let row = ((y * f64::from(height)) as usize).min(height as usize - 1);
+                    texels.get(row * width as usize + column)
+                })
+                .map_or(String::new(), |texel| format!(" pixel {texel:?}"));
             eprintln!(
-                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite",
+                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}",
                 mean[0], mean[1], mean[2], mean[3]
             );
         }

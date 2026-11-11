@@ -4248,8 +4248,14 @@ fn record_command(
     if let Ok(wanted) = debug_var("ECHORA_RECORD_LOG")
         && wanted.split(',').any(|part| rest.contains(part))
     {
+        // The command buffer object's first words: NVN keeps the command
+        // memory's write pointer and end there, where the application can
+        // write GPU methods itself.
+        let head: Vec<u64> = (0..4)
+            .map(|index| core.memory.read_u64(x[0] + 8 * index).unwrap_or(u64::MAX))
+            .collect();
         eprintln!(
-            "record {:#x} {rest} x {:x?} from {:#x}",
+            "record {:#x} {rest} x {:x?} from {:#x} head {head:x?}",
             x[0],
             &x[1..8],
             x[30]
