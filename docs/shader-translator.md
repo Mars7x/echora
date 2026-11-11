@@ -453,7 +453,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | P2R, R2P, UP2UR | 0x803, 0x804, 0x883 | immediate mask 32-63 (P0-P6), byte 76-77; UP2UR is P2R of the uniform predicates into a uniform register |
 | LEA | 0x011 in forms 1-7 | shift 75-79, `.HI` 80, negate shifted 72, `.X` 74, carry out 81, in 87-90 |
 | SHF | 0x019 in forms 1-7 | type 73-74 (S64, U64, S32, U32), wrap 75, right 76, high word 80 |
-| PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74; SGXT signed 73, wrap 75 |
+| PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74 (0 indexed; 1-6 f4e, b4e, rc8, ecl, ecr, rc16 by the selector's low two bits, as PTX's prmt); SGXT signed 73, wrap 75 |
 | SEL, FSEL | 0x007, 0x008 | condition 87-90 |
 | FMNMX, IMNMX | 0x009, 0x017 | minimum when the predicate at 87-90 holds; IMNMX signed 73 |
 | MUFU | 0x108 | function 74-79, f16 73; SIN and COS take turns |

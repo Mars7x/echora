@@ -6724,6 +6724,66 @@ mod tests {
     }
 
     #[test]
+    fn permutes_in_the_fixed_order_modes_pick_bytes_by_the_selector_s_low_bits() {
+        // PRMT.mode R4, R0, R2 (selector), R1 and PRMT.mode R5, R0, imm, R1,
+        // c:a = bytes 0x77..0x00 (byte n is 0x11 * n). The orders: d byte
+        // k = c:a byte orders[selector & 3][k] (PTX's prmt modes).
+        let orders: [[[u32; 4]; 4]; 6] = [
+            [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]],
+            [[0, 7, 6, 5], [1, 0, 7, 6], [2, 1, 0, 7], [3, 2, 1, 0]],
+            [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]],
+            [[0, 1, 2, 3], [1, 1, 2, 3], [2, 2, 2, 3], [3, 3, 3, 3]],
+            [[0, 0, 0, 0], [0, 1, 1, 1], [0, 1, 2, 2], [0, 1, 2, 3]],
+            [[0, 1, 0, 1], [2, 3, 2, 3], [0, 1, 0, 1], [2, 3, 2, 3]],
+        ];
+        for (mode, table) in (1u128..).zip(orders) {
+            for low in 0..4u32 {
+                // High selector bits do not matter in these modes.
+                let selector = 0x8765_43f0 | low;
+                let program = [
+                    mov(0, 0x3322_1100),
+                    mov(1, 0x7766_5544),
+                    mov(2, selector),
+                    word(&[
+                        (0, 12, 0x216),
+                        (16, 8, 4),
+                        (24, 8, 0),
+                        (32, 8, 2),
+                        (64, 8, 1),
+                        (72, 3, mode),
+                    ]),
+                    word(&[
+                        (0, 12, 0x816),
+                        (16, 8, 5),
+                        (24, 8, 0),
+                        (32, 32, u128::from(selector)),
+                        (64, 8, 1),
+                        (72, 3, mode),
+                    ]),
+                    EXIT,
+                ];
+                let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+                let (translated, registers, _) =
+                    translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+                assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+                let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                    workgroup_count: [1, 1, 1],
+                    ..Inputs::default()
+                });
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                let expected = table[low as usize]
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |word, (k, &byte)| word | (0x11 * byte) << (8 * k));
+                for register in [4u8, 5] {
+                    let got = report.invocations[0][&registers[&register]][0] as u32;
+                    assert_eq!(got, expected, "mode {mode} selector {low} R{register}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gathers_pick_their_component_and_offset() {
         // TLD4.c (2D, handle c[0x0][0x40]) R4, R0 (x, then y, or x and y
         // then the packed offsets in R2): component c of the four texels

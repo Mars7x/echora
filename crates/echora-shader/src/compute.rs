@@ -2003,11 +2003,39 @@ impl Emitter {
                 c,
                 mode,
             } => {
-                if mode != 0 {
-                    return Err(unsupported(index, format!("PRMT mode {mode}")));
-                }
+                // The other modes pick by the selector's low two bits a
+                // fixed byte order of c:a (PTX's prmt .f4e, .b4e, .rc8,
+                // .ecl, .ecr and .rc16, in NAK's encoding order; the
+                // orders as GPGPU-Sim's `read_byte` tables give them), so
+                // they are the indexed form with that order's selector.
+                let orders: [[u32; 4]; 4] = match mode {
+                    0 => [[0; 4]; 4],
+                    1 => [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]],
+                    2 => [[0, 7, 6, 5], [1, 0, 7, 6], [2, 1, 0, 7], [3, 2, 1, 0]],
+                    3 => [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]],
+                    4 => [[0, 1, 2, 3], [1, 1, 2, 3], [2, 2, 2, 3], [3, 3, 3, 3]],
+                    5 => [[0, 0, 0, 0], [0, 1, 1, 1], [0, 1, 2, 2], [0, 1, 2, 3]],
+                    6 => [[0, 1, 0, 1], [2, 3, 2, 3], [0, 1, 0, 1], [2, 3, 2, 3]],
+                    _ => return Err(unsupported(index, format!("PRMT mode {mode}"))),
+                };
                 let a = self.read_register(a.0);
                 let selector = self.integer(index, selector)?;
+                let selector = if mode == 0 {
+                    selector
+                } else {
+                    let rows = orders.map(|row| {
+                        self.constant(row.iter().rev().fold(0, |word, &byte| word << 4 | byte))
+                    });
+                    let three = self.constant(3);
+                    let low = self.value(op::BITWISE_AND, self.u32, &[selector, three]);
+                    let mut chosen = rows[0];
+                    for (n, &row) in rows.iter().enumerate().skip(1) {
+                        let n = self.constant(n as u32);
+                        let is = self.value(op::I_EQUAL, self.bool, &[low, n]);
+                        chosen = self.value(op::SELECT, self.u32, &[is, row, chosen]);
+                    }
+                    chosen
+                };
                 let c = self.integer(index, c)?;
                 let (three, four, seven, eight) = (
                     self.constant(3),
