@@ -150,6 +150,16 @@ pub enum HostEntry {
 #[path = "nvn_gpu.rs"]
 mod gpu;
 
+/// One frame's executed commands (each with the queue it ran on) and the
+/// render state when it began (ECHORA_CAPTURE_FRAME).
+#[derive(Debug)]
+struct FrameCapture {
+    commands: Vec<(Option<u64>, Command)>,
+    render: RenderState,
+    queue_render: HashMap<u64, RenderState>,
+    render_queue: Option<u64>,
+}
+
 /// Queued work of one queue (see `Nvn::pending`).
 #[derive(Debug)]
 enum QueueItem {
@@ -178,26 +188,66 @@ fn debug_env() -> &'static HashMap<String, std::ffi::OsString> {
     })
 }
 
-/// `std::env::var_os` for a ECHORA_* switch, from the snapshot.
+/// Switches a frame replay sets over the snapshot (ECHORA_CAPTURE_FRAME):
+/// a name mapped to `None` is unset. Bumping the generation empties the
+/// lookup caches.
+type DebugOverrides = HashMap<String, Option<&'static std::ffi::OsStr>>;
+static DEBUG_OVERRIDES: std::sync::RwLock<Option<DebugOverrides>> = std::sync::RwLock::new(None);
+static DEBUG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace the replay switches (`None` for none). The values are leaked:
+/// replays set a few dozen short strings.
+fn set_debug_overrides(overrides: Option<HashMap<String, Option<String>>>) {
+    let leaked = overrides.map(|overrides| {
+        overrides
+            .into_iter()
+            .map(|(name, value)| {
+                let value = value
+                    .map(|value| &*Box::leak(std::ffi::OsString::from(value).into_boxed_os_str()));
+                (name, value)
+            })
+            .collect()
+    });
+    *DEBUG_OVERRIDES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = leaked;
+    DEBUG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `std::env::var_os` for a ECHORA_* switch, from the snapshot (or a frame
+/// replay's switches).
 pub(crate) fn debug_var_os(name: &str) -> Option<&'static std::ffi::OsStr> {
     // The draw path asks per texture binding; names are literals, so the
     // answer is cached by the name's address (an integer lookup instead
     // of hashing the string into the environment snapshot).
     thread_local! {
-        static CACHE: std::cell::RefCell<Vec<(usize, usize, Option<&'static std::ffi::OsStr>)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static CACHE: std::cell::RefCell<(u64, Vec<(usize, usize, Option<&'static std::ffi::OsStr>)>)> =
+            const { std::cell::RefCell::new((0, Vec::new())) };
     }
     let key = (name.as_ptr() as usize, name.len());
+    let generation = DEBUG_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != generation {
+            *cache = (generation, Vec::new());
+        }
         if let Some(&(_, _, value)) = cache
-            .borrow()
+            .1
             .iter()
             .find(|(address, length, _)| (*address, *length) == key)
         {
             return value;
         }
-        let value = debug_env().get(name).map(|value| value.as_os_str());
-        cache.borrow_mut().push((key.0, key.1, value));
+        let overridden = DEBUG_OVERRIDES
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|overrides| overrides.get(name).copied());
+        let value = match overridden {
+            Some(value) => value,
+            None => debug_env().get(name).map(|value| value.as_os_str()),
+        };
+        cache.1.push((key.0, key.1, value));
         value
     })
 }
@@ -360,6 +410,15 @@ pub struct Nvn {
     /// interleaves queues (`render` holds the running queue's).
     #[serde(skip)]
     queue_render: HashMap<u64, RenderState>,
+    /// ECHORA_CAPTURE_FRAME=N (debugging): the commands present N runs,
+    /// with the render state it began from, replayed on request (see
+    /// `replay_captured_frame`).
+    #[serde(skip)]
+    frame_capture: Option<Box<FrameCapture>>,
+    /// A captured frame is being replayed (its commands are not captured
+    /// again).
+    #[serde(skip)]
+    replaying: bool,
     /// The queue whose state `render` holds.
     #[serde(skip)]
     render_queue: Option<u64>,
@@ -498,6 +557,122 @@ impl Nvn {
         rows.sort_by_key(|row| std::cmp::Reverse(row.3));
         rows.truncate(16);
         rows
+    }
+}
+
+impl Nvn {
+    /// ECHORA_CAPTURE_FRAME (debugging): with the captured frame's work
+    /// done, replay it on request until asked to go on. The directory
+    /// (ECHORA_REPLAY_DIR, default ~/.cache/echora/replay) takes requests
+    /// as `request-<name>.env`, one `NAME=VALUE` switch per line (`NAME=`
+    /// alone unsets it); each replays the frame's commands from the render
+    /// state it began with, under those switches, writes the presented
+    /// image as `replay-<name>.png` and renames the request `done-<name>.env`.
+    /// A `quit` file ends the replays and the run goes on. The guest stays
+    /// stopped meanwhile, its memory as at the frame's end.
+    fn replay_captured_frame(&mut self, core: &mut Guest, texture: u64) -> Result<(), String> {
+        let Some(capture) = self.frame_capture.take() else {
+            return Ok(());
+        };
+        let directory = debug_var_os("ECHORA_REPLAY_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::Path::new(&home).join(".cache/echora/replay"))
+            })
+            .ok_or("no replay directory")?;
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_file(directory.join("quit"));
+        std::fs::write(
+            directory.join("ready"),
+            format!(
+                "present {} commands {}\n",
+                self.presented_frames,
+                capture.commands.len()
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        eprintln!(
+            "replay ready: present {} with {} commands in {}",
+            self.presented_frames,
+            capture.commands.len(),
+            directory.display()
+        );
+        loop {
+            if directory.join("quit").exists() {
+                break;
+            }
+            let mut requests: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+                .map_err(|error| error.to_string())?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("request-") && name.ends_with(".env"))
+                })
+                .collect();
+            requests.sort();
+            let Some(request) = requests.first().cloned() else {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            };
+            let name = request
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("request")
+                .trim_start_matches("request-")
+                .to_string();
+            let text = std::fs::read_to_string(&request).unwrap_or_default();
+            let switches: HashMap<String, Option<String>> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(|line| {
+                    let (name, value) = line.split_once('=')?;
+                    Some((
+                        name.trim().to_string(),
+                        (!value.is_empty()).then(|| value.to_string()),
+                    ))
+                })
+                .collect();
+            set_debug_overrides(Some(switches));
+            eprintln!("replay {name} begins");
+            self.replaying = true;
+            self.render = capture.render.clone();
+            self.queue_render = capture.queue_render.clone();
+            self.render_queue = capture.render_queue;
+            self.binding_serial += 1;
+            let mut failed = None;
+            for (queue, command) in &capture.commands {
+                if let Some(queue) = *queue {
+                    self.switch_render_queue(queue);
+                }
+                if let Err(trap) = self.execute(command, core) {
+                    failed = Some(format!("{} failed: {trap:?}", command.name));
+                    break;
+                }
+            }
+            let image = if self.gpu().is_some() {
+                self.gpu_submit()?;
+                self.gpu_read_back(texture)?
+            } else {
+                None
+            };
+            self.replaying = false;
+            set_debug_overrides(None);
+            if let Some(image) = image {
+                let _ = std::fs::write(directory.join(format!("replay-{name}.png")), image.png());
+            }
+            eprintln!(
+                "replay {name} ends{}",
+                failed
+                    .as_ref()
+                    .map_or(String::new(), |failed| format!(": {failed}"))
+            );
+            let _ = std::fs::rename(&request, directory.join(format!("done-{name}.env")));
+        }
+        let _ = std::fs::remove_file(directory.join("ready"));
+        Ok(())
     }
 }
 
@@ -2204,6 +2379,9 @@ impl Nvn {
                     let note = format!("flow present queue {this:x} texture {texture:x}");
                     self.gpu_note(note);
                 }
+                if !self.replaying && self.frame_capture.is_some() {
+                    self.replay_captured_frame(core, texture).map_err(stop)?;
+                }
                 self.presented_frames += 1;
                 if self.gpu().is_some() {
                     self.gpu_present_window(texture).map_err(stop)?;
@@ -2722,6 +2900,12 @@ impl Nvn {
     /// runs through waits), with that queue's own GPU state. Returns
     /// whether anything ran.
     fn run_queue(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
+        self.switch_render_queue(queue);
+        self.run_queue_work(queue, core, force)
+    }
+
+    /// Make `queue`'s GPU state the current one.
+    fn switch_render_queue(&mut self, queue: u64) {
         if self.render_queue != Some(queue) {
             let incoming = self.queue_render.remove(&queue).unwrap_or_default();
             let outgoing = std::mem::replace(&mut self.render, incoming);
@@ -2732,7 +2916,6 @@ impl Nvn {
             // Resolved texture bindings came from the other queue's state.
             self.binding_serial += 1;
         }
-        self.run_queue_work(queue, core, force)
     }
 
     fn run_queue_work(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
@@ -2843,6 +3026,24 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        // ECHORA_CAPTURE_FRAME=N: present N's commands, from the render
+        // state the first of them met.
+        if !self.replaying
+            && debug_var("ECHORA_CAPTURE_FRAME")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(self.presented_frames)
+        {
+            let capture = self.frame_capture.get_or_insert_with(|| {
+                Box::new(FrameCapture {
+                    commands: Vec::new(),
+                    render: self.render.clone(),
+                    queue_render: self.queue_render.clone(),
+                    render_queue: self.render_queue,
+                })
+            });
+            capture.commands.push((self.render_queue, command.clone()));
+        }
         // ECHORA_COMMAND_LOG=FROM-TO (debugging): each command executed
         // while preparing presents FROM to TO, with its first arguments.
         // ECHORA_COMMAND_LOG_ONLY=<text>[,...]: only commands whose name
