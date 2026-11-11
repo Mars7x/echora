@@ -1068,7 +1068,6 @@ impl Nvn {
     /// convention (X0..X7, V0..V7); a result goes to X0 (or V0). Returns
     /// Ok(false) when `name` is not implemented, so the caller stops with it.
     pub fn call(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
-        self.arm_call_watch();
         call_watch(name, core);
         // Where the CPU may look at what the GPU wrote (after waiting for
         // it, or invalidating its view of a mapped range), deferred
@@ -2405,6 +2404,11 @@ impl Nvn {
                     self.replay_captured_frame(core, texture).map_err(stop)?;
                 }
                 self.presented_frames += 1;
+                self.arm_call_watch();
+                // A line every 500 presents: where a long run is.
+                if self.presented_frames.is_multiple_of(500) {
+                    eprintln!("present {}", self.presented_frames);
+                }
                 if self.gpu().is_some() {
                     self.gpu_present_window(texture).map_err(stop)?;
                     // A frame's work is submitted by its present, windowed or
@@ -4690,12 +4694,13 @@ struct CallWatch {
 }
 
 static CALL_WATCH: std::sync::Mutex<Option<CallWatch>> = std::sync::Mutex::new(None);
-/// A watch is mapped (no lock taken per call otherwise).
-static CALL_WATCH_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The watch is mapped and inside its present window (set once per
+/// present; a call takes no lock otherwise).
+static CALL_WATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Nvn {
-    /// Map ECHORA_CALL_WATCH's GPU range to guest memory once and follow
-    /// its present window (`call_watch` compares).
+    /// At each present: map ECHORA_CALL_WATCH's GPU range to guest memory
+    /// once and follow its present window (`call_watch` compares).
     fn arm_call_watch(&self) {
         let Ok(range) = debug_var("ECHORA_CALL_WATCH") else {
             return;
@@ -4714,6 +4719,7 @@ impl Nvn {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(watch) = watch.as_mut() {
             watch.active = active;
+            CALL_WATCH_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         let Some((start, end)) = range.split_once('-').and_then(|(start, end)| {
@@ -4726,7 +4732,7 @@ impl Nvn {
             return;
         };
         eprintln!("call watch: GPU {start:#x}..{end:#x} is guest {guest:#x}");
-        CALL_WATCH_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        CALL_WATCH_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
         *watch = Some(CallWatch {
             range: guest..guest + (end - start),
             active,
@@ -4736,7 +4742,7 @@ impl Nvn {
 }
 
 fn call_watch(name: &str, core: &Guest) {
-    if !CALL_WATCH_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !CALL_WATCH_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let mut watch = CALL_WATCH
