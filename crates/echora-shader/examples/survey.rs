@@ -35,8 +35,9 @@ fn main() {
         let control = std::fs::read(path.with_extension("control")).unwrap_or_default();
         let word = |offset: usize| {
             control
-                .get(offset..offset + 4)
-                .map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .get(offset..)
+                .and_then(|rest| rest.first_chunk::<4>())
+                .map_or(0, |bytes| u32::from_le_bytes(*bytes))
         };
         let mut parameters = Parameters::default();
         if !echora_shader::is_graphics(&code) {
@@ -80,7 +81,7 @@ fn main() {
         }
     }
     let mut ranked: Vec<_> = reasons.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    ranked.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
     println!("{total} stages, {translated} translated, {unread} unreadable");
     for (reason, (count, example)) in ranked {
         println!("{count:6}  {reason}  (e.g. {example})");
