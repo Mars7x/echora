@@ -1387,6 +1387,15 @@ impl Nvn {
                     })
                     .map(|(handle, _)| *handle)
                     .collect();
+                if debug_var_os("ECHORA_STALE_LOG").is_some() && !reused.is_empty() {
+                    eprintln!(
+                        "memory add present {} cmdbuf {this:#x} {key} {:x?} drops {} lists, first {:x?}",
+                        self.presented_frames,
+                        &x[1..4],
+                        reused.len(),
+                        self.list_memory.get(&reused[0])
+                    );
+                }
                 for handle in reused {
                     self.drop_command_list(handle);
                 }
