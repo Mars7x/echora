@@ -289,8 +289,8 @@ while the address is 0).
 **Vertex tracing.** With ECHORA_VERTEX_TRACE set at translation
 (debugging only, as loop tracing), vertex and mesh programs record what
 their first invocations computed in a buffer at the device address the
-specialization constants `VertexTraceLow` and `VertexTraceHigh` (ids 32
-and 33) give; nothing is written while the address is 0, the default.
+specialization constants `VertexTraceLow` and `VertexTraceHigh` (ids 27
+and 28) give; nothing is written while the address is 0, the default.
 The buffer is 64 records of 128 u32 words (32 KiB), zeroed by the
 runtime. A vertex program writes record `VertexIndex - BaseVertex` (the
 index the draw read; an index of 64 or more is not traced) from the

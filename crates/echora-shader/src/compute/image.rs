@@ -111,7 +111,7 @@ impl Emitter {
         self.descriptor_aliases.push((descriptor, unsigned));
         self.interface.push(unsigned);
         let integer = self.module.bool_spec_constant();
-        let id = self.image_spec_ids.len() as u32 + IMAGE_SPEC_BASE;
+        let id = self.image_spec_ids.len() as u32 + echora_shader_abi::INTEGER_FORMAT_SPEC_BASE;
         self.module.decorate(integer, DECORATION_SPEC_ID, &[id]);
         self.image_spec_ids.push((descriptor, id));
         let views = ImageViews {
@@ -332,6 +332,3 @@ impl Emitter {
         self.carry_known(before);
     }
 }
-
-/// Specialization constant ids for images start here.
-pub(super) const IMAGE_SPEC_BASE: u32 = 32;

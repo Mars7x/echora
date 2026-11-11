@@ -332,16 +332,29 @@ pub struct PageTable {
 /// from the `UINT_*` arrays (a uint view of the same entry), chosen at run
 /// time by the entry's bit in `texture_pool::FLAGS`.
 pub const TEXTURE_POOL_SET: u32 = 1;
+// Specialization constant ids, one table for every program the translator
+// makes (each program's `spec_constants` lists the ones it declares):
+//
+// - 0..27: unused.
+// - 27, 28: `VertexTraceLow`, `VertexTraceHigh` (ECHORA_VERTEX_TRACE).
+// - 29, 30: `LoopTraceLow`, `LoopTraceHigh` (ECHORA_LOOP_TRACE).
+// - 31: `TexturePoolCapacity`.
+// - 32 and up: `IntegerFormat`, one per sampled texture or storage image
+//   binding the program reads, numbered from `INTEGER_FORMAT_SPEC_BASE`
+//   in the order the translation meets them.
+
+/// The specialization constant ids of `SpecMeaning::VertexTraceLow` and
+/// `VertexTraceHigh`.
+pub const VERTEX_TRACE_LOW_SPEC_ID: u32 = 27;
+pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 28;
 /// The specialization constant ids of `SpecMeaning::LoopTraceLow` and
 /// `LoopTraceHigh`.
 pub const LOOP_TRACE_LOW_SPEC_ID: u32 = 29;
 pub const LOOP_TRACE_HIGH_SPEC_ID: u32 = 30;
 /// The specialization constant id of `SpecMeaning::TexturePoolCapacity`.
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
-/// The specialization constant ids of `SpecMeaning::VertexTraceLow` and
-/// `VertexTraceHigh`.
-pub const VERTEX_TRACE_LOW_SPEC_ID: u32 = 32;
-pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 33;
+/// The first `SpecMeaning::IntegerFormat` constant's id; the others follow.
+pub const INTEGER_FORMAT_SPEC_BASE: u32 = 32;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 /// Entries per texture array, which the renderer gives programs as
