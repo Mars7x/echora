@@ -6279,6 +6279,16 @@ impl Nvn {
             props.get(key).map(|args| args.x[index])
         };
         let polygon = snapshot("BindPolygonState");
+        // The polygon state the draw binds (its address) and the props taken
+        // for it, with their element's offset from that address (a nonzero
+        // offset is another object's bag: the bound one has none).
+        let polygon_trace = format!(
+            "polygon bound {:#x?} props {polygon:?}",
+            self.render
+                .state
+                .get("BindPolygonState")
+                .map(|bind| bind.x[1])
+        );
         let depth_state = snapshot("BindDepthStencilState");
         let color_state = snapshot("BindColorState");
         let mask_state = snapshot("BindChannelMaskState");
@@ -6570,7 +6580,7 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} indices {:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {polygon_trace} {:?} count {count} indices {:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,

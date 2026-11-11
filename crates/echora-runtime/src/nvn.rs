@@ -312,6 +312,15 @@ pub struct Nvn {
     /// Command handles by that order (least recently used first).
     #[serde(skip)]
     command_list_use: BTreeMap<u64, u64>,
+    /// The memory each finished list was recorded into: its command buffer's
+    /// command memory (pool, offset, size) and control memory (address,
+    /// size) when it ended. A handle stays valid until memory overlapping
+    /// either is added to a command buffer again (NVN reuses it then).
+    #[serde(skip)]
+    list_memory: BTreeMap<u64, ([u64; 3], [u64; 2])>,
+    /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
+    /// `COMMAND_LIMIT`) while still valid.
+    pub capped_command_lists: u64,
     command_list_clock: u64,
     /// Commands in `command_lists`.
     command_list_commands: usize,
@@ -462,6 +471,23 @@ fn big_vertex_bind(commands: &[Command]) -> Option<(u64, u64, u64)> {
 }
 
 impl Nvn {
+    /// Forget a finished list whose memory the application reuses.
+    fn drop_command_list(&mut self, handle: u64) {
+        self.list_memory.remove(&handle);
+        if let Some((list, used, _)) = self.command_lists.remove(&handle) {
+            self.command_list_commands -= list.len();
+            self.command_list_use.remove(&used);
+            if debug_var_os("ECHORA_LIST_LOG").is_some() && big_vertex_bind(&list).is_some() {
+                eprintln!(
+                    "list memory reused present {} handle {handle:#x}",
+                    self.presented_frames
+                );
+            }
+        }
+    }
+}
+
+impl Nvn {
     /// The device's depth mode (nvnDeviceSetDepthMode): 0 NEAR_IS_MINUS_W,
     /// 1 NEAR_IS_ZERO; NVN's default, 0, until the application sets one.
     pub(crate) fn depth_mode(&self) -> u64 {
@@ -527,10 +553,15 @@ fn is_work_command(rest: &str) -> bool {
     PREFIXES.iter().any(|prefix| rest.starts_with(prefix))
 }
 
-/// Command lists kept for resubmission (least recently used dropped first).
-const COMMAND_LIST_LIMIT: usize = 8192;
+/// A resource cap on the command lists kept for resubmission (least
+/// recently used dropped first, counted in `capped_command_lists`). A list is
+/// otherwise kept until the memory it was recorded into is added again
+/// (`list_memory`): the game records state lists once while loading and
+/// calls them every frame of the scene after the opening movie, so dropping
+/// lists by age left the terrain without its vertex streams.
+const COMMAND_LIST_LIMIT: usize = 32768;
 /// Commands those lists may hold in all.
-const COMMAND_LIMIT: usize = 500_000;
+const COMMAND_LIMIT: usize = 2_000_000;
 
 /// Command-buffer management calls (everything else on a recording command
 /// buffer is recorded).
@@ -1330,7 +1361,39 @@ impl Nvn {
                 } else {
                     ("ControlMemory", x[2])
                 };
+                // The lists recorded into memory this overlaps are invalid
+                // now: the command buffer writes over them.
+                let overlaps = |a: u64, a_size: u64, b: u64, b_size: u64| {
+                    a < b.saturating_add(b_size) && b < a.saturating_add(a_size)
+                };
+                let reused: Vec<u64> = self
+                    .list_memory
+                    .iter()
+                    .filter(|(_, (command, control))| {
+                        if key == "CommandMemory" {
+                            command[0] == x[1] && overlaps(command[1], command[2], x[2], x[3])
+                        } else {
+                            overlaps(control[0], control[1], x[1], x[2])
+                        }
+                    })
+                    .map(|(handle, _)| *handle)
+                    .collect();
+                for handle in reused {
+                    self.drop_command_list(handle);
+                }
                 let object = self.objects.get_mut(&this).unwrap();
+                let chunk = if key == "CommandMemory" {
+                    [x[1], x[2], x[3], 0]
+                } else {
+                    [x[1], x[2], 0, 0]
+                };
+                object.state.insert(
+                    format!("{key}Chunk"),
+                    Args {
+                        x: chunk,
+                        v: [0; 2],
+                    },
+                );
                 let total = object.state.entry(key.into()).or_default();
                 total.x[0] = size;
                 // New memory starts unused.
@@ -1436,6 +1499,17 @@ impl Nvn {
                         commands.len()
                     );
                 }
+                let chunk = |key: &str| {
+                    self.objects
+                        .get(&this)
+                        .and_then(|object| object.state.get(key))
+                        .map_or([0; 4], |args| args.x)
+                };
+                let (command, control) = (chunk("CommandMemoryChunk"), chunk("ControlMemoryChunk"));
+                self.list_memory.insert(
+                    handle,
+                    ([command[0], command[1], command[2]], [control[0], control[1]]),
+                );
                 self.command_list_clock += 1;
                 self.command_list_commands += commands.len();
                 self.command_lists.insert(
@@ -1466,7 +1540,9 @@ impl Nvn {
                             continue;
                         }
                     }
+                    self.list_memory.remove(&oldest);
                     if let Some((list, ..)) = self.command_lists.remove(&oldest) {
+                        self.capped_command_lists += 1;
                         if debug_var_os("ECHORA_LIST_LOG").is_some()
                             && let Some(bind) = big_vertex_bind(&list)
                         {
@@ -1490,6 +1566,7 @@ impl Nvn {
                 };
                 self.command_list_commands -= list.len();
                 self.command_list_use.remove(&used);
+                self.list_memory.remove(&x[1]);
                 return Ok(true);
             }
             // nvnQueueSubmitCommands(NVNqueue*, int count, const
@@ -4082,6 +4159,9 @@ impl Nvn {
             "presented_frames": self.presented_frames,
             "texture_log": self.texture_log,
             "stale_command_submissions": self.stale_command_submissions,
+            "capped_command_lists": self.capped_command_lists,
+            "kept_command_lists": self.command_lists.len(),
+            "kept_commands": self.command_list_commands,
             "skipped_work": self.skipped_work,
             "forced_waits": self.forced_waits,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
