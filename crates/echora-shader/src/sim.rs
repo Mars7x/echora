@@ -25,6 +25,7 @@ use crate::spirv::{execution, glsl, op, storage};
 
 /// Opcodes not in `op`.
 const F_CONVERT: u16 = 115;
+const PHI: u16 = 245;
 const VECTOR_SHUFFLE: u16 = 79;
 const I_ADD_CARRY: u16 = 149;
 const I_SUB_BORROW: u16 = 150;
@@ -992,31 +993,53 @@ impl Machine {
                 let arguments = &instruction.operands[3..];
                 let after = next_label;
                 next_label -= 1;
-                // This copy's names: its labels fresh, its parameters the
-                // arguments.
-                let mut names: HashMap<u32, u32> = HashMap::new();
+                // This copy's labels fresh (renamed only where an operand
+                // is a label, as literals may take any value); its
+                // parameters copies of the arguments.
+                let mut labels: HashMap<u32, u32> = HashMap::new();
                 let mut parameter = 0;
                 for inner in callee {
                     match inner.opcode {
                         op::LABEL => {
-                            names.insert(inner.operands[0], next_label);
+                            labels.insert(inner.operands[0], next_label);
                             next_label -= 1;
                         }
                         op::FUNCTION_PARAMETER => {
-                            names.insert(inner.operands[1], arguments[parameter]);
+                            inlined.push(Instruction {
+                                opcode: COPY_OBJECT,
+                                operands: vec![
+                                    inner.operands[0],
+                                    inner.operands[1],
+                                    arguments[parameter],
+                                ],
+                            });
                             parameter += 1;
                         }
                         _ => {}
                     }
                 }
-                let rename = |id: u32| names.get(&id).copied().unwrap_or(id);
+                let rename = |id: u32| labels.get(&id).copied().unwrap_or(id);
                 for inner in callee {
-                    let operands: Vec<u32> = match inner.opcode {
-                        op::FUNCTION_PARAMETER => continue,
-                        // Labels and ids: every operand renamed (labels and
-                        // parameters are ids no literal here takes).
-                        _ => inner.operands.iter().map(|&o| rename(o)).collect(),
+                    if inner.opcode == op::FUNCTION_PARAMETER {
+                        continue;
+                    }
+                    let mut operands = inner.operands.clone();
+                    let label_slots: Vec<usize> = match inner.opcode {
+                        op::LABEL | op::BRANCH => vec![0],
+                        op::SELECTION_MERGE => vec![0],
+                        op::LOOP_MERGE => vec![0, 1],
+                        op::BRANCH_CONDITIONAL => vec![1, 2],
+                        // Selector, default, then (literal, label) pairs.
+                        op::SWITCH => std::iter::once(1)
+                            .chain((3..operands.len()).step_by(2))
+                            .collect(),
+                        // Type, result, then (value, parent label) pairs.
+                        PHI => (3..operands.len()).step_by(2).collect(),
+                        _ => Vec::new(),
                     };
+                    for slot in label_slots {
+                        operands[slot] = rename(operands[slot]);
+                    }
                     match inner.opcode {
                         op::RETURN => inlined.push(Instruction {
                             opcode: op::BRANCH,
@@ -6814,6 +6837,51 @@ mod tests {
         let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
         // x: 2.0 * 1/w; y: as delivered.
         assert_eq!((read(1), read(2)), (0.5, 3.0));
+    }
+
+    #[test]
+    fn inlined_calls_rename_labels_only_where_operands_are_labels() {
+        // A compute module whose entry calls a function with label %4 that
+        // computes FAbs (GLSL.std.450 instruction 4) of -2.0 into a private
+        // variable: inlining must not take the literal 4 for the label.
+        let string = |text: &str| crate::spirv::string(text);
+        let instruction = |opcode: u32, operands: &[u32]| {
+            let mut words = vec![((operands.len() as u32 + 1) << 16) | opcode];
+            words.extend_from_slice(operands);
+            words
+        };
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 14, 0];
+        words.extend(instruction(17, &[1])); // Capability Shader
+        words.extend(instruction(11, &[vec![1], string("GLSL.std.450")].concat()));
+        words.extend(instruction(14, &[0, 1])); // MemoryModel Logical GLSL450
+        words.extend(instruction(15, &[vec![5, 9], string("main")].concat()));
+        words.extend(instruction(16, &[9, 17, 1, 1, 1])); // LocalSize 1 1 1
+        words.extend(instruction(19, &[2])); // %2 void
+        words.extend(instruction(33, &[3, 2])); // %3 fn void
+        words.extend(instruction(22, &[5, 32])); // %5 float
+        words.extend(instruction(43, &[5, 6, (-2.0f32).to_bits()])); // %6 -2.0
+        words.extend(instruction(32, &[7, 6, 5])); // %7 Private float pointer
+        words.extend(instruction(59, &[7, 8, 6])); // %8 Private variable
+        // %10: the callee, its label %4.
+        words.extend(instruction(54, &[2, 10, 0, 3]));
+        words.extend(instruction(248, &[4]));
+        words.extend(instruction(12, &[5, 11, 1, 4, 6])); // %11 = FAbs %6
+        words.extend(instruction(62, &[8, 11]));
+        words.extend(instruction(253, &[]));
+        words.extend(instruction(56, &[]));
+        // %9: main, calling %10.
+        words.extend(instruction(54, &[2, 9, 0, 3]));
+        words.extend(instruction(248, &[12]));
+        words.extend(instruction(57, &[2, 13, 10]));
+        words.extend(instruction(253, &[]));
+        words.extend(instruction(56, &[]));
+        assert_eq!(crate::spirv::tests::validate(&words), None);
+        let report = Machine::new(&words).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(f32::from_bits(report.invocations[0][&8][0] as u32), 2.0);
     }
 
     #[test]
