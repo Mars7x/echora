@@ -2613,14 +2613,20 @@ impl Nvn {
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
         // ECHORA_COMMAND_LOG=FROM-TO (debugging): each command executed
         // while preparing presents FROM to TO, with its first arguments.
+        // ECHORA_COMMAND_LOG_ONLY=<text>[,...]: only commands whose name
+        // contains one of them.
         if let Ok(range) = debug_var("ECHORA_COMMAND_LOG")
             && let Some((from, to)) = range.split_once('-')
             && let (Ok(from), Ok(to)) = (from.parse::<u64>(), to.parse::<u64>())
             && (from..=to).contains(&self.presented_frames)
+            && debug_var("ECHORA_COMMAND_LOG_ONLY").map_or(true, |only| {
+                only.split(',').any(|part| command.name.contains(part))
+            })
         {
             eprintln!(
-                "command present {} {} x {:x?}",
+                "command present {} queue {:x?} {} x {:x?}",
                 self.presented_frames,
+                self.render_queue,
                 command.name.trim_start_matches("nvnCommandBuffer"),
                 &command.x[1..8]
             );
