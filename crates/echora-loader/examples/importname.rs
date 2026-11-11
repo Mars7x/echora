@@ -25,7 +25,11 @@ fn main() {
     let dynamic = m.mod0.as_ref().and_then(|m| m.dynamic.as_ref()).unwrap();
     let symbols = dynamic.symbol_table.as_ref().unwrap();
     let strings = symbols.string_table_offset.unwrap();
-    for table in dynamic.relocation_tables.iter().filter(|table| table.kind.ends_with("RELA")) {
+    for table in dynamic
+        .relocation_tables
+        .iter()
+        .filter(|table| table.kind.ends_with("RELA"))
+    {
         let Some(bytes) = view(table.memory_offset, table.byte_size) else {
             continue;
         };
@@ -34,7 +38,11 @@ fn main() {
                 continue;
             }
             let info = word(entry, 8);
-            let symbol = view(symbols.memory_offset + (info >> 32) * symbols.entry_size, 24).unwrap();
+            let symbol = view(
+                symbols.memory_offset + (info >> 32) * symbols.entry_size,
+                24,
+            )
+            .unwrap();
             let name_at = strings + u64::from(u32::from_le_bytes(symbol[..4].try_into().unwrap()));
             let name: Vec<u8> = (0..)
                 .map_while(|index| view(name_at + index, 1).map(|byte| byte[0]))
