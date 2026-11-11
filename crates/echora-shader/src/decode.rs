@@ -446,11 +446,14 @@ pub enum Op {
     },
     /// MUFU d, src: `function` (bits 74-79) 0 cos, 1 sin (of turns), 2
     /// exp2, 3 log2, 4 reciprocal, 5 reciprocal square root, 6/7 their
-    /// 64-bit high-word forms, 8 square root, 9 tanh.
+    /// 64-bit high-word forms, 8 square root, 9 tanh. `half` (bit 73,
+    /// .F16; register sources only): the source is the half in bits 60-61's
+    /// lane (0 low, 1 high) and the result a half in the low 16 bits.
     Mufu {
         d: Reg,
         function: u8,
         src: Operand,
+        half: Option<u8>,
     },
     /// F2I d, src: float to integer of `dst_size` (bits 75-76, log2 bytes)
     /// from `src_size` (84-85), `signed` (72), rounded by `rounding`.
@@ -1962,11 +1965,19 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             min: word.pred(87, 90),
             signed: word.bit(73),
         },
-        // Bit 73 selects half precision, not translated yet.
+        // Bit 73 selects half precision (.F16), with a register source
+        // (NAK's encoding: the lane in 60-61).
         0x108 if matches!(form, 1 | 4 | 5 | 6) && !word.bit(73) => Op::Mufu {
             d,
             function: word.bits(74, 6) as u8,
             src: word.source(1)?,
+            half: None,
+        },
+        0x108 if form == 1 && word.bits(60, 2) < 2 => Op::Mufu {
+            d,
+            function: word.bits(74, 6) as u8,
+            src: word.source(1)?,
+            half: Some(word.bits(60, 2) as u8),
         },
         0x105 if matches!(form, 1 | 4 | 5 | 6) => Op::F2i {
             d,

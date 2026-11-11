@@ -2133,8 +2133,33 @@ impl Emitter {
                 let value = self.min_max(self.u32, min, smaller, larger, a, b);
                 self.write_register(d.0, value);
             }
-            Op::Mufu { d, function, src } => {
-                let x = self.float(index, src)?;
+            Op::Mufu {
+                d,
+                function,
+                src,
+                half,
+            } => {
+                let x = match half {
+                    None => self.float(index, src)?,
+                    // A half, exactly as a float, with its modifiers.
+                    Some(lane) => {
+                        let Src::Reg(register) = src.src else {
+                            return Err(unsupported(index, "MUFU.F16 of a non-register"));
+                        };
+                        let bits = self.read_register(register.0);
+                        let x = self.half_to_float(bits, lane);
+                        let x = if src.abs {
+                            self.glsl(self.f32, glsl::F_ABS, &[x])
+                        } else {
+                            x
+                        };
+                        if src.neg {
+                            self.value(op::F_NEGATE, self.f32, &[x])
+                        } else {
+                            x
+                        }
+                    }
+                };
                 // MUFU flushes a subnormal input to a zero of its sign.
                 let x = {
                     let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
@@ -2172,7 +2197,18 @@ impl Emitter {
                     9 => self.glsl(self.f32, glsl::TANH, &[x]),
                     _ => return Err(unsupported(index, format!("MUFU function {function}"))),
                 };
-                self.write_float(d.0, value);
+                match half {
+                    // .F16: the float result rounded toward zero to a half,
+                    // as NAK's hardware test finds it (test_op_mufu_f16_down:
+                    // F2F.F16.RZ of the 32-bit MUFU of the widened half, but
+                    // for Exp2 and Rcp results next to infinity, where the
+                    // hardware may give infinity).
+                    Some(_) => {
+                        let bits = self.round_to_half(value, 3);
+                        self.write_register(d.0, bits);
+                    }
+                    None => self.write_float(d.0, value),
+                }
             }
             Op::F2i {
                 d,

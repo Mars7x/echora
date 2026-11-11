@@ -181,12 +181,22 @@ impl Emitter {
         self.value(op::BITCAST, pair, &[result])
     }
 
+    /// The half in lane `lane` (0 low, 1 high) of `bits`, as a 32-bit float
+    /// (exactly).
+    pub(super) fn half_to_float(&mut self, bits: u32, lane: u8) -> u32 {
+        let pair = self.f16_pair();
+        let f16 = self.f16();
+        let halves = self.value(op::BITCAST, pair, &[bits]);
+        let half = self.value(op::COMPOSITE_EXTRACT, f16, &[halves, u32::from(lane)]);
+        self.value(F_CONVERT, self.f32, &[half])
+    }
+
     /// `float` (32-bit) as a half's bits (in the low 16), rounded by
     /// `rounding` (0 to nearest even, 1 down, 2 up, 3 toward zero): the
     /// nearest half, moved one step where it went past `float` the wrong
     /// way (so too large a value gives the largest finite half where the
     /// rounding goes toward zero).
-    fn round_to_half(&mut self, float: u32, rounding: u8) -> u32 {
+    pub(super) fn round_to_half(&mut self, float: u32, rounding: u8) -> u32 {
         let f16 = self.f16();
         let pair = self.f16_pair();
         let zero_half = self.module.constant(f16, 0);

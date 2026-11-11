@@ -456,7 +456,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | PRMT, SGXT | 0x016, 0x01a | PRMT mode 72-74 (0 indexed; 1-6 f4e, b4e, rc8, ecl, ecr, rc16 by the selector's low two bits, as PTX's prmt); SGXT signed 73, wrap 75 |
 | SEL, FSEL | 0x007, 0x008 | condition 87-90 |
 | FMNMX, IMNMX | 0x009, 0x017 | minimum when the predicate at 87-90 holds; IMNMX signed 73 |
-| MUFU | 0x108 | function 74-79, f16 73; SIN and COS take turns |
+| MUFU | 0x108 | function 74-79; .F16 73 (register source, lane 60-61; the 32-bit result rounded toward zero to a half in the low 16 bits, as NAK's hardware test finds); SIN and COS take turns |
 | F2I, I2F, I2FP, FRND | 0x105, 0x106, 0x045, 0x107 | sizes 75-76 and 84-85 (log2 bytes), rounding 78-79, F2I signed 72, I2F 74 |
 | F2IP | 0x243 | `.U8.F32` with the third source RZ and bit 74 set (other mode bits refused); b and a rounded by 78-79, saturated to 0-255 with NaN to 0, packed as b in bits 0-7 and a in 8-15. The saturation and NaN results are inferred from F2I, not measured |
 | FSET.BF | 0x00a | as FSETP, with 1.0 or 0.0 in a register |

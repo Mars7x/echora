@@ -3830,6 +3830,114 @@ mod tests {
         }
     }
 
+    /// A half's bits as a float, exactly.
+    fn half_to_f32(half: u16) -> f32 {
+        let sign = if half & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+        let exponent = i32::from(half >> 10 & 0x1f);
+        let fraction = f32::from(half & 0x3ff);
+        sign * match exponent {
+            0 => fraction * 2f32.powi(-24),
+            31 if fraction == 0.0 => f32::INFINITY,
+            31 => f32::NAN,
+            _ => (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+        }
+    }
+
+    /// A float as a half's bits, rounded toward zero (a NaN as the NaN
+    /// with the float's sign and top fraction bits, or 0x7e00 if those are
+    /// zero).
+    fn f32_to_half_toward_zero(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let sign = (bits >> 16 & 0x8000) as u16;
+        if x.is_nan() {
+            return sign | 0x7c00 | ((bits >> 13 & 0x3ff) as u16).max(0x200);
+        }
+        if x.is_infinite() {
+            return sign | 0x7c00;
+        }
+        let magnitude = x.abs();
+        if magnitude > 65504.0 {
+            return sign | 0x7bff;
+        }
+        // Count of 2^-24 steps (the smallest subnormal), truncated, below
+        // 2^-14; else the exponent and 10 fraction bits, truncated.
+        if magnitude < 2f32.powi(-14) {
+            return sign | (magnitude * 2f32.powi(24)) as u16;
+        }
+        let exponent = magnitude.log2().floor() as i32;
+        let exponent = if 2f32.powi(exponent) > magnitude {
+            exponent - 1
+        } else {
+            exponent
+        };
+        let fraction = ((magnitude / 2f32.powi(exponent) - 1.0) * 1024.0) as u16;
+        sign | ((exponent + 15) as u16) << 10 | fraction
+    }
+
+    #[test]
+    fn half_mufu_is_the_float_result_rounded_toward_zero() {
+        // MUFU.fn.F16 R1, (-)(|)R0.lane(|) (NAK's SM70 encoding: .F16 at
+        // 73, the lane at 60-61, abs 62, neg 63); MUFU.fn R3, R2 with R2
+        // the widened half. NAK's test_op_mufu_f16_down finds the half
+        // result equal to F2F.F16.RZ of the 32-bit one.
+        let halves: [u16; 12] = [
+            0x0000, 0x8000, 0x0001, 0x03ff, 0x3c00, 0x3555, 0x4248, 0xc000, 0x7bff, 0x7c00, 0xfc00,
+            0x2e66,
+        ];
+        let mufu = |d: u128, a: u128, function: u128, half: Option<(u128, bool, bool)>| {
+            let mut fields = vec![(0, 12, 0x308), (16, 8, d), (32, 8, a), (74, 6, function)];
+            if let Some((lane, abs, neg)) = half {
+                fields.extend([
+                    (60, 2, lane),
+                    (62, 1, u128::from(abs)),
+                    (63, 1, u128::from(neg)),
+                    (73, 1, 1),
+                ]);
+            }
+            word(&fields)
+        };
+        for function in [0u128, 1, 2, 3, 4, 5, 8, 9] {
+            for (n, &half) in halves.iter().enumerate() {
+                let (lane, abs, neg) = (n as u128 % 2, n % 3 == 1, n % 4 == 2);
+                let other = halves[(n + 5) % halves.len()];
+                let register = if lane == 0 {
+                    u32::from(other) << 16 | u32::from(half)
+                } else {
+                    u32::from(half) << 16 | u32::from(other)
+                };
+                let mut widened = half_to_f32(half);
+                if abs {
+                    widened = widened.abs();
+                }
+                if neg {
+                    widened = -widened;
+                }
+                let (r, _) = run(
+                    &[register, 0, widened.to_bits()],
+                    &[
+                        mufu(1, 0, function, Some((lane, abs, neg))),
+                        mufu(3, 2, function, None),
+                    ],
+                );
+                let float = f32::from_bits(r[&3]);
+                let expected = f32_to_half_toward_zero(float);
+                let label = format!(
+                    "function {function} half {half:#06x} lane {lane} abs {abs} neg {neg}: \
+                     {float:e}"
+                );
+                if float.is_nan() {
+                    assert!(
+                        r[&1] & 0x7c00 == 0x7c00 && r[&1] & 0x3ff != 0 && r[&1] >> 16 == 0,
+                        "{label}: {:#x}",
+                        r[&1]
+                    );
+                } else {
+                    assert_eq!(r[&1], u32::from(expected), "{label}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn float_adds_multiplies_and_fused_multiply_adds_round_once() {
         let floats = [
