@@ -596,8 +596,11 @@ fn is_work_command(rest: &str) -> bool {
 /// calls them every frame of the scene after the opening movie, so dropping
 /// lists by age left the terrain without its vertex streams.
 const COMMAND_LIST_LIMIT: usize = 262_144;
-/// Commands those lists may hold in all.
-const COMMAND_LIMIT: usize = 2_000_000;
+/// Commands those lists may hold in all (each carries its state
+/// snapshots: about 3 KiB).
+const COMMAND_LIMIT: usize = 600_000;
+/// Lists of at most this many commands are not dropped for the command cap.
+const SMALL_COMMAND_LIST: usize = 16;
 
 /// Command-buffer management calls (everything else on a recording command
 /// buffer is recorded).
@@ -1609,16 +1612,31 @@ impl Nvn {
                 // recently recorded or submitted lists. Each holds its
                 // commands' state snapshots; gameplay lists hold ~500
                 // commands, and 65536 (later 8192) lists grew to gigabytes.
-                while self.command_lists.len() > COMMAND_LIST_LIMIT
-                    || self.command_list_commands > COMMAND_LIMIT
+                // Lists passed over this time (small ones under the command
+                // cap): once every kept list was, the loop stops.
+                let mut passed = 0usize;
+                while (self.command_lists.len() > COMMAND_LIST_LIMIT
+                    || self.command_list_commands > COMMAND_LIMIT)
+                    && passed <= self.command_lists.len()
                 {
                     let Some((_, oldest)) = self.command_list_use.pop_first() else {
                         break;
                     };
                     // A list submitted more than once is reused by the
                     // application: it gets a second chance (its count
-                    // restarts) before one-shot lists behind it go.
+                    // restarts) before one-shot lists behind it go. Under
+                    // the command cap alone a small list stays (it costs
+                    // little; the state lists loaded once are small).
+                    let under_list_cap = self.command_lists.len() <= COMMAND_LIST_LIMIT;
                     if let Some(entry) = self.command_lists.get_mut(&oldest) {
+                        let small = entry.0.len() <= SMALL_COMMAND_LIST && under_list_cap;
+                        if small {
+                            passed += 1;
+                            self.command_list_clock += 1;
+                            entry.1 = self.command_list_clock;
+                            self.command_list_use.insert(self.command_list_clock, oldest);
+                            continue;
+                        }
                         if entry.2 > 1 {
                             entry.2 = 1;
                             self.command_list_clock += 1;

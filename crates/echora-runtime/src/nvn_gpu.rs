@@ -6631,6 +6631,11 @@ impl Nvn {
                     .collect::<Vec<_>>(),
                 textures.len(),
             );
+            // Also to the log as it is made: a run stopped early (the
+            // watchdog, a hang) never writes the report the notes go to.
+            if traced_program {
+                eprintln!("{line}");
+            }
             backend.note(line);
         }
         // ECHORA_DUMP_DRAW also dumps a mesh draw's task and mesh stages
