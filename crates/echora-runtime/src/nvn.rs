@@ -451,6 +451,16 @@ pub struct RenderState {
 /// SetScissor and ClearColor have their own host execution). They execute by
 /// updating `RenderState::state`.
 impl Nvn {
+    /// The device's depth mode (nvnDeviceSetDepthMode): 0 NEAR_IS_MINUS_W,
+    /// 1 NEAR_IS_ZERO; NVN's default, 0, until the application sets one.
+    pub(crate) fn depth_mode(&self) -> u64 {
+        self.objects
+            .values()
+            .find(|object| object.kind == "Device")
+            .and_then(|device| device.state.get("DepthMode"))
+            .map_or(0, |args| args.x[0])
+    }
+
     /// A submitted or called list no longer kept: counted, and with
     /// ECHORA_STALE_LOG=<present> (debugging) each from that present on named, with the
     /// present and the list's age (handles count up as lists are recorded).
@@ -929,10 +939,10 @@ impl Nvn {
                 return Ok(true);
             }
             // nvnDeviceSetWindowOriginMode / nvnDeviceSetDepthMode (device,
-            // enum). The application passes 1 for both; recorded on the
-            // device. The renderer draws with an upper-left window origin
-            // and [0, 1] depth, the modes 1 select (see nvn_gpu's viewport
-            // and depth range for the evidence).
+            // enum), recorded on the device. The application passes 1
+            // (upper left) for the window origin, which the renderer draws
+            // with, and 0 (NEAR_IS_MINUS_W, the OpenGL [-1, 1] clip depth)
+            // for the depth mode, which draws read (`depth_mode`).
             "nvnDeviceSetWindowOriginMode" | "nvnDeviceSetDepthMode" => {
                 let mode = x[1] as u32;
                 if mode > 1 {

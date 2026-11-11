@@ -6341,11 +6341,11 @@ impl Nvn {
                 depth_range[1],
             ],
             scissor,
-            // The application passes 1 to SetDepthMode: NEAR_IS_ZERO (the
-            // D3D range; its projection maps the near plane to z/w 1 and
-            // about 17700 units to 0, reverse-Z), so clip z in [0, w] is
-            // depth as it is (measured from the intro scene's matrix).
-            depth_minus_one_to_one: false,
+            // The device's depth mode (nvnDeviceSetDepthMode): 0,
+            // NEAR_IS_MINUS_W (the OpenGL range, which this application
+            // sets), maps clip z in [-w, w] to the depth range; 1,
+            // NEAR_IS_ZERO, maps [0, w].
+            depth_minus_one_to_one: self.depth_mode() == 0,
             // PolygonState SetPolygonOffsetEnables (bit 0x4 fill, after
             // point 0x1 and line 0x2, as NVN1; inferred) with the command
             // buffer's SetPolygonOffsetClamp(factor, units, clamp) (S0-S2):
