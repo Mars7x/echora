@@ -322,8 +322,13 @@ fetches and storage reads and writes are exact, samples are nearest at
 level 0 (enough for control flow), gathers take the four texels around
 the point; texture pool entries come from `Inputs::image_arrays` (by
 set, binding and element) and the pool's flags buffer from the buffer
-inputs (a runtime array is as long as its bytes); depth comparisons and
-level queries read zeros. Reference tests check the opcodes the game uses
+inputs (a runtime array is as long as its bytes). Depth comparisons
+(samples and gathers) test the reference against component 0 by
+`Inputs::compare_op` (the sampler's VkCompareOp). Levels past 0 come from
+`Inputs::mips`: an explicit level, a fetch's level, or the level TXD's
+gradients give picks the nearest one, and queries report the chain; an
+implicit level (its derivatives) and blending between levels or texels
+are not simulated, and LOD queries read zeros. Reference tests check the opcodes the game uses
 most against models written apart from the translator: TEX's mask order,
 second destination and packed halves; TEX.B's pool entry, integer view
 and capacity; TXQ; divergent BRA loops against a per-invocation model;

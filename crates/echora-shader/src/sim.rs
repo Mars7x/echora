@@ -160,6 +160,13 @@ pub struct Inputs {
     pub locations: HashMap<u32, Vec<u64>>,
     /// A mesh program's task payload (bytes) from its task program.
     pub payload: Vec<u8>,
+    /// Bound textures' levels past 0 (1, 2, ...), by (descriptor set,
+    /// binding): explicit, gradient and fetch levels read them.
+    pub mips: HashMap<(u32, u32), Vec<Image>>,
+    /// Depth comparisons' VkCompareOp (the sampler's; 0 never, 1 less, 2
+    /// equal, 3 less or equal, 4 greater, 5 not equal, 6 greater or equal,
+    /// 7 always): `None` takes less or equal, with a note.
+    pub compare_op: Option<u32>,
     /// Address ranges (device addresses, or guest addresses through the
     /// page table) whose stores and atomics `Report::writes` lists.
     pub watch: Vec<std::ops::Range<u64>>,
@@ -380,6 +387,8 @@ struct Shared {
     /// page count.
     page_table: Option<(u64, u64, u64)>,
     unmapped_pages: BTreeMap<u64, u32>,
+    compare_op: Option<u32>,
+    mips: HashMap<(u32, u32), Vec<Image>>,
     watch: Vec<std::ops::Range<u64>>,
     trace: Option<(usize, u32)>,
     traced: Vec<(Option<u32>, Value)>,
@@ -866,6 +875,85 @@ impl Machine {
         machine
     }
 
+    /// The level an image access reads: a query's or a fetch's level, a
+    /// sample's explicit Lod or the level its Grad operands give (log2 of
+    /// the larger gradient's length in level-0 texels), rounded to the
+    /// nearest (mipmapMode nearest); 0 otherwise, an implicit level
+    /// included (its derivatives are not simulated).
+    fn image_level(
+        &self,
+        opcode: u16,
+        invocation: &Invocation,
+        args: &[u32],
+        base: &Image,
+    ) -> usize {
+        let value = |n: usize| args.get(n).and_then(|id| invocation.values.get(id));
+        let float = |words: &Value, n: usize| {
+            f64::from(f32::from_bits(words.get(n).copied().unwrap_or(0) as u32))
+        };
+        let from_lambda = |lambda: f64| (lambda + 0.5).floor().max(0.0) as usize;
+        match opcode {
+            op::IMAGE_QUERY_SIZE_LOD => value(1).map_or(0, |words| words[0] as usize),
+            op::IMAGE_FETCH | op::IMAGE_SAMPLE_EXPLICIT_LOD if args.len() > 2 => {
+                let mask = args[2];
+                let mut at = 3;
+                if mask & 1 != 0 {
+                    at += 1;
+                }
+                if mask & 2 != 0 {
+                    let Some(lod) = value(at) else { return 0 };
+                    return if opcode == op::IMAGE_FETCH {
+                        lod[0] as usize
+                    } else {
+                        from_lambda(float(lod, 0))
+                    };
+                }
+                if mask & 4 != 0
+                    && let (Some(dx), Some(dy)) = (value(at), value(at + 1))
+                {
+                    let sizes = [f64::from(base.width.max(1)), f64::from(base.height.max(1))];
+                    let length = |gradient: &Value| {
+                        (0..gradient.len().min(2))
+                            .map(|n| (float(gradient, n) * sizes[n]).powi(2))
+                            .sum::<f64>()
+                            .sqrt()
+                    };
+                    let rho = length(dx).max(length(dy));
+                    return if rho > 0.0 {
+                        from_lambda(rho.log2())
+                    } else {
+                        0
+                    };
+                }
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// A gather's texel offset: its image operands after the component or
+    /// reference (Bias, Lod, Grad (two), then ConstOffset or Offset).
+    fn gather_offset(&self, invocation: &Invocation, args: &[u32]) -> [i64; 2] {
+        let mut offset = [0i64; 2];
+        if args.len() > 3 {
+            let mask = args[3];
+            let mut at = 4;
+            for (bit, count) in [(1u32, 1usize), (2, 1), (4, 2)] {
+                if mask & bit != 0 {
+                    at += count;
+                }
+            }
+            if mask & (0x8 | 0x10) != 0
+                && let Some(words) = args.get(at).and_then(|id| invocation.values.get(id))
+            {
+                for (n, slot) in offset.iter_mut().enumerate() {
+                    *slot = i64::from(words.get(n).copied().unwrap_or(0) as u32 as i32);
+                }
+            }
+        }
+        offset
+    }
+
     /// The BuiltIn a variable is decorated with.
     pub fn builtin(&self, variable: u32) -> Option<u32> {
         self.builtins.get(&variable).copied()
@@ -1128,6 +1216,8 @@ impl Machine {
                 }
             },
             unmapped_pages: BTreeMap::new(),
+            compare_op: inputs.compare_op,
+            mips: inputs.mips.clone(),
             watch: inputs.watch.clone(),
             trace: inputs.trace,
             traced: Vec::new(),
@@ -2179,50 +2269,128 @@ impl Machine {
                 | op::IMAGE_QUERY_LEVELS => {
                     let image_type = invocation.value_types[&args[0]];
                     let handle = value(0);
+                    let key = self.bound_image(&handle);
+                    let image = match key {
+                        Some(key) => shared.images.get(&key).cloned(),
+                        None => self
+                            .array_element(&handle)
+                            .and_then(|key| shared.image_arrays.get(&key).cloned()),
+                    };
+                    // Its level chain: level 0, then `Inputs::mips`.
+                    let chain: Vec<Image> = image
+                        .iter()
+                        .cloned()
+                        .chain(
+                            key.and_then(|key| shared.mips.get(&key))
+                                .into_iter()
+                                .flatten()
+                                .cloned(),
+                        )
+                        .collect();
+                    if opcode == op::IMAGE_QUERY_LEVELS && !chain.is_empty() {
+                        vec![chain.len() as u64]
+                    } else {
+                        match image {
+                            Some(base) => {
+                                let level = self.image_level(opcode, invocation, args, &base);
+                                let image = chain[level.min(chain.len() - 1)].clone();
+                                let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
+                                let component = if opcode == op::IMAGE_GATHER {
+                                    value(2)[0] as usize
+                                } else {
+                                    0
+                                };
+                                let offset = if opcode == op::IMAGE_GATHER {
+                                    self.gather_offset(invocation, args)
+                                } else {
+                                    [0; 2]
+                                };
+                                self.image_read(
+                                    opcode,
+                                    image_type,
+                                    &image,
+                                    &coordinate,
+                                    component,
+                                    offset,
+                                    ty,
+                                )
+                            }
+                            None => {
+                                shared.note("reads of textures without dumped data give zeros");
+                                vec![0; self.size(ty)]
+                            }
+                        }
+                    }
+                }
+                // Depth comparisons: the reference against component 0 of
+                // the nearest texel (a sample) or of the four a gather takes,
+                // by the sampler's compare op: 1.0 where it holds.
+                op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                | op::IMAGE_DREF_GATHER => {
+                    let image_type = invocation.value_types[&args[0]];
+                    let handle = value(0);
                     let image = match self.bound_image(&handle) {
                         Some(key) => shared.images.get(&key).cloned(),
                         None => self
                             .array_element(&handle)
                             .and_then(|key| shared.image_arrays.get(&key).cloned()),
                     };
+                    let compare = match shared.compare_op {
+                        Some(op) => op,
+                        None => {
+                            shared.note(
+                                "depth comparisons without Inputs::compare_op: less or equal",
+                            );
+                            3
+                        }
+                    };
                     match image {
                         Some(image) => {
-                            let coordinate = if args.len() > 1 { value(1) } else { Vec::new() };
-                            let component = if opcode == op::IMAGE_GATHER {
-                                value(2)[0] as usize
+                            let coordinate = value(1);
+                            let reference = f32::from_bits(value(2)[0] as u32);
+                            let gather = opcode == op::IMAGE_DREF_GATHER;
+                            let offset = if gather {
+                                self.gather_offset(invocation, args)
                             } else {
-                                0
+                                [0; 2]
                             };
-                            // A gather's texel offset (image operands after
-                            // the component: Bias, Lod, Grad (two), then
-                            // ConstOffset or Offset).
-                            let mut offset = [0i64; 2];
-                            if opcode == op::IMAGE_GATHER && args.len() > 3 {
-                                let mask = args[3];
-                                let mut at = 4;
-                                for (bit, count) in [(1u32, 1usize), (2, 1), (4, 2)] {
-                                    if mask & bit != 0 {
-                                        at += count;
-                                    }
-                                }
-                                if mask & (0x8 | 0x10) != 0 {
-                                    let words = value(at);
-                                    for (n, slot) in offset.iter_mut().enumerate() {
-                                        *slot = i64::from(
-                                            words.get(n).copied().unwrap_or(0) as u32 as i32,
-                                        );
-                                    }
-                                }
-                            }
-                            self.image_read(
-                                opcode,
+                            let read = if gather {
+                                op::IMAGE_GATHER
+                            } else {
+                                op::IMAGE_SAMPLE_EXPLICIT_LOD
+                            };
+                            let texels = self.image_read(
+                                read,
                                 image_type,
                                 &image,
                                 &coordinate,
-                                component,
+                                0,
                                 offset,
                                 ty,
-                            )
+                            );
+                            let depths: Vec<u64> = if gather {
+                                texels
+                            } else {
+                                texels.into_iter().take(1).collect()
+                            };
+                            depths
+                                .iter()
+                                .map(|&bits| {
+                                    let depth = f32::from_bits(bits as u32);
+                                    let holds = match compare {
+                                        0 => false,
+                                        1 => reference < depth,
+                                        2 => reference == depth,
+                                        3 => reference <= depth,
+                                        4 => reference > depth,
+                                        5 => reference != depth,
+                                        6 => reference >= depth,
+                                        _ => true,
+                                    };
+                                    u64::from(if holds { 1.0f32 } else { 0.0 }.to_bits())
+                                })
+                                .collect()
                         }
                         None => {
                             shared.note("reads of textures without dumped data give zeros");
@@ -2230,11 +2398,8 @@ impl Machine {
                         }
                     }
                 }
-                op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
-                | op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
-                | op::IMAGE_DREF_GATHER
-                | op::IMAGE_QUERY_LOD => {
-                    shared.note("depth comparisons and level queries give zeros");
+                op::IMAGE_QUERY_LOD => {
+                    shared.note("level queries give zeros");
                     vec![0; self.size(ty)]
                 }
                 op::LOAD => {
@@ -6142,6 +6307,192 @@ mod tests {
         // Texel (3, 0): 3.0 and 103.0 in components 0 and 1 (mask 0x3).
         let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
         assert_eq!((read(4), read(5)), (3.0, 103.0));
+    }
+
+    #[test]
+    fn depth_compares_test_the_reference_by_the_sampler_s_op() {
+        // Texel (x, y) of a 4 x 4 depth texture: 0.1 (x + y).
+        let depth = |x: u32, y: u32| 0.1 * (x + y) as f32;
+        let texels: Vec<[u32; 4]> = (0..16u32)
+            .map(|n| [depth(n % 4, n / 4).to_bits(), 0, 0, 0])
+            .collect();
+        // TEX.LZ.DC R4, R0 (x, y), R2 (reference); TLD4.DC R4, R0, R2.
+        let sample = |gather: bool| {
+            word(&[
+                (0, 12, if gather { 0xb63 } else { 0xb60 }),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 2),
+                (40, 14, 0x10),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, if gather { 0xf } else { 0x1 }),
+                (78, 1, 1),
+                (81, 3, 7),
+                (87, 3, if gather { 0 } else { 1 }),
+            ])
+        };
+        let reference = 0.35f32;
+        // (2.0, 1.0) in texels: nearest (2, 1) = 0.3; the gather's (1,1)
+        // (2,1) (2,0) (1,0) = 0.2 0.3 0.2 0.1.
+        let (x, y) = (0.625f32, 0.375f32);
+        for compare in [3u32, 4] {
+            let holds = |d: f32| {
+                let holds = if compare == 3 {
+                    reference <= d
+                } else {
+                    reference > d
+                };
+                if holds { 1.0f32 } else { 0.0 }
+            };
+            for gather in [false, true] {
+                let (x, y) = if gather { (0.5f32, 0.25f32) } else { (x, y) };
+                let program = [
+                    mov(0, x.to_bits()),
+                    mov(1, y.to_bits()),
+                    mov(2, reference.to_bits()),
+                    sample(gather),
+                    EXIT,
+                ];
+                let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+                let (translated, registers, _) =
+                    translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+                assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+                let texture = translated
+                    .descriptors
+                    .iter()
+                    .find(|d| d.cbuf_offset == 0x40)
+                    .unwrap();
+                let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                    workgroup_count: [1, 1, 1],
+                    images: HashMap::from([(
+                        (0, texture.binding),
+                        Image {
+                            width: 4,
+                            height: 4,
+                            depth: 1,
+                            layers: 1,
+                            texels: texels.clone(),
+                        },
+                    )]),
+                    compare_op: Some(compare),
+                    ..Inputs::default()
+                });
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
+                if gather {
+                    let expected = [depth(1, 1), depth(2, 1), depth(2, 0), depth(1, 0)].map(holds);
+                    assert_eq!(
+                        [read(4), read(5), read(6), read(7)],
+                        expected,
+                        "gather, op {compare}"
+                    );
+                } else {
+                    assert_eq!(read(4), holds(depth(2, 1)), "sample, op {compare}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_and_gradient_levels_pick_their_mip() {
+        // Level l of a 4 x 4 texture: (4 >> l)^2 texels, texel n holding
+        // 1000 l + n.
+        let level = |l: u32| {
+            let side = 4 >> l;
+            Image {
+                width: side,
+                height: side,
+                depth: 1,
+                layers: 1,
+                texels: (0..side * side).map(|n| [1000 * l + n, 0, 0, 0]).collect(),
+            }
+        };
+        let texture = |raw: u128, registers: &[u32]| {
+            let mut program: Vec<u128> = registers
+                .iter()
+                .enumerate()
+                .map(|(n, &value)| mov(n as u128, value))
+                .collect();
+            program.extend([raw, EXIT]);
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let binding = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap()
+                .binding;
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([((0, binding), level(0))]),
+                mips: HashMap::from([((0, binding), vec![level(1), level(2)])]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            (0..4u8)
+                .map(|n| {
+                    registers
+                        .get(&(4 + n))
+                        .map_or(0, |v| report.invocations[0][v][0] as u32)
+                })
+                .collect::<Vec<u32>>()
+        };
+        let common = |opcode: u128, mask: u128, lod: u128| {
+            word(&[
+                (0, 12, opcode),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 2),
+                (40, 14, 0x10),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, mask),
+                (81, 3, 7),
+                (87, 3, lod),
+            ])
+        };
+        let (x, y) = (0.6f32.to_bits(), 0.6f32.to_bits());
+        // TEX.LL R4, R0 (x, y), R2 (level): 1.4 is level 1's texel (1, 1),
+        // 1.6 level 2's only texel.
+        assert_eq!(
+            texture(common(0xb60, 1, 3), &[x, y, 1.4f32.to_bits()])[0],
+            1003
+        );
+        assert_eq!(
+            texture(common(0xb60, 1, 3), &[x, y, 1.6f32.to_bits()])[0],
+            2000
+        );
+        // TXD R4, R0 (x, y), R2.. (gradients of 0.5: two level-0 texels,
+        // level 1).
+        let txd = word(&[
+            (0, 12, 0xb6c),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 1),
+            (81, 3, 7),
+        ]);
+        let half = 0.5f32.to_bits();
+        assert_eq!(texture(txd, &[x, y, half, 0, 0, half])[0], 1003);
+        // TLD.LL R4, R0 (x, y integer), R2 (level 1): texel (1, 0) there.
+        assert_eq!(texture(common(0xb66, 1, 3), &[1, 0, 1])[0], 1001);
+        // TXQ R4, level R0 = 1: 2 x 2, three levels.
+        let txq = word(&[
+            (0, 12, 0xb6f),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 255),
+            (40, 14, 0x10),
+            (64, 8, 255),
+            (72, 4, 0xf),
+        ]);
+        assert_eq!(texture(txq, &[1]), vec![2, 2, 1, 3]);
     }
 
     #[test]
