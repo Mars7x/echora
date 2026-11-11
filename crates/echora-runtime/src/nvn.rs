@@ -253,6 +253,13 @@ pub(crate) fn debug_var_os(name: &str) -> Option<&'static std::ffi::OsStr> {
 }
 
 /// `std::env::var` for a ECHORA_* switch, from the snapshot.
+/// Render targets have their mip levels, and draws, clears and views
+/// reach each level, as the game renders pyramids level by level
+/// (ECHORA_GPU_NO_MIPS, debugging: every level is level 0, as before).
+pub(crate) fn mip_targets() -> bool {
+    debug_var_os("ECHORA_GPU_NO_MIPS").is_none()
+}
+
 pub(crate) fn debug_var(name: &str) -> Result<String, std::env::VarError> {
     let value = debug_var_os(name).ok_or(std::env::VarError::NotPresent)?;
     value
@@ -3368,7 +3375,7 @@ impl Nvn {
                         );
                     }
                 }
-                if level != 0 && debug_var_os("ECHORA_GPU_MIPS").is_none() {
+                if level != 0 && !mip_targets() {
                     return Ok(());
                 }
                 if self.gpu().is_some() {
@@ -3405,7 +3412,7 @@ impl Nvn {
                     );
                     self.gpu_note(note);
                 }
-                if level != 0 && debug_var_os("ECHORA_GPU_MIPS").is_none() {
+                if level != 0 && !mip_targets() {
                     // Without mip-level targets, only level 0 exists.
                     return Ok(());
                 }

@@ -1947,13 +1947,13 @@ impl Nvn {
     }
 
     /// A render target sampled through a handle whose view selects array
-    /// layers (or cube faces) samples only those, and with
-    /// ECHORA_GPU_MIPS, a view's mip levels only those.
+    /// layers (or cube faces) samples only those, and a view's mip levels
+    /// only those (`mip_targets`).
     fn through_view(&self, source: TextureSource, handle: u64) -> TextureSource {
         let TextureSource::Target(key) = source else {
             return source;
         };
-        let (base_level, level_count) = if super::debug_var_os("ECHORA_GPU_MIPS").is_some() {
+        let (base_level, level_count) = if super::mip_targets() {
             self.handle_view_levels(handle).unwrap_or((0, 0))
         } else {
             (0, 0)
@@ -1981,10 +1981,9 @@ impl Nvn {
     }
 
     /// Mip levels a texture object was built with, for its render target
-    /// (1 unless ECHORA_GPU_MIPS is set: rendering into mip levels is
-    /// still being validated; without it every level renders into level 0).
+    /// (1 with ECHORA_GPU_NO_MIPS, where every level renders into level 0).
     fn texture_levels(&self, texture: u64) -> u32 {
-        if super::debug_var_os("ECHORA_GPU_MIPS").is_none() {
+        if !super::mip_targets() {
             return 1;
         }
         self.objects
@@ -2062,14 +2061,14 @@ impl Nvn {
     /// is, as a GPU texture cache resolves addresses: the target itself,
     /// another target at the same address and size, or a target whose mip
     /// level `level` starts at this storage with this size (a separate
-    /// texture object per level, as bloom chains use). With
-    /// ECHORA_GPU_MIPS for levels above 0.
+    /// texture object per level, as bloom chains use; levels above 0 as
+    /// `mip_targets` allows).
     fn resolve_target(&self, texture: u64) -> Option<(u64, u32)> {
         let renderer = &self.gpu.as_ref()?.renderer;
         if renderer.existing_target(texture).is_some() {
             return Some((texture, 0));
         }
-        let mips = super::debug_var_os("ECHORA_GPU_MIPS").is_some();
+        let mips = super::mip_targets();
         if !mips {
             return self.target_sharing_storage(texture).map(|key| (key, 0));
         }
@@ -3541,7 +3540,7 @@ impl Nvn {
                             self.presented_frames
                         );
                     }
-                    let level = if super::debug_var_os("ECHORA_GPU_MIPS").is_some() {
+                    let level = if super::mip_targets() {
                         self.handle_view_levels(handle).map_or(0, |(base, _)| base)
                     } else {
                         0
@@ -6317,23 +6316,27 @@ impl Nvn {
             .unwrap()
             .stat("stat: draw geometry bytes", geometry_bytes as u64);
         // Targets: the bound colors and depth, created at their sizes.
-        let colors: Vec<u64> = self
+        // Each color keeps its NVN target index as its attachment location
+        // (a fragment program writes target n's registers to location n);
+        // an unbound target between bound ones is a gap (0), trailing ones
+        // are dropped.
+        let bound = self
             .render
             .colors
             .iter()
-            .copied()
-            .filter(|texture| *texture != 0)
-            .collect();
-        // Each color target's mip level (with ECHORA_GPU_MIPS) and array
+            .rposition(|texture| *texture != 0)
+            .map_or(0, |last| last + 1);
+        let colors: Vec<u64> = self.render.colors[..bound].to_vec();
+        // Each color target's mip level (`mip_targets`) and array
         // layer, from its view.
         let (color_levels, color_layers): (Vec<u32>, Vec<u32>) = self
             .render
             .colors
             .iter()
             .zip(self.render.color_levels.iter().chain(std::iter::repeat(&0)))
-            .filter(|(texture, _)| **texture != 0)
+            .take(bound)
             .map(|(_, view)| {
-                let level = if super::debug_var_os("ECHORA_GPU_MIPS").is_none() {
+                let level = if !super::mip_targets() {
                     0
                 } else {
                     *view as u32
@@ -6347,12 +6350,12 @@ impl Nvn {
             .iter()
             .zip(color_levels)
             .map(|(texture, level)| match self.resolve_target(*texture) {
-                Some((key, base)) if key != *texture => (key, base + level),
+                Some((key, base)) if *texture != 0 && key != *texture => (key, base + level),
                 _ => (*texture, level),
             })
             .unzip();
         let mut extent = None;
-        for texture in &colors {
+        for texture in colors.iter().filter(|texture| **texture != 0) {
             extent.get_or_insert(self.ensure_render_target(*texture)?);
         }
         // A depth texture object over the storage of an existing depth
@@ -6644,7 +6647,7 @@ impl Nvn {
                 keys.0,
                 keys.1,
                 self.describe_sources(textures.values().map(|(source, _)| source)),
-                self.describe_targets(colors.iter().copied()),
+                self.describe_targets(colors.iter().copied().filter(|key| *key != 0)),
                 color_levels,
                 color_layers,
                 depth_layer,
@@ -6904,8 +6907,13 @@ impl Nvn {
             vertex_fetch,
             pool,
         };
-        let probe_target = draw.colors.first().copied();
-        let colors_written = draw.colors.clone();
+        let probe_target = draw.colors.iter().copied().find(|key| *key != 0);
+        let colors_written: Vec<u64> = draw
+            .colors
+            .iter()
+            .copied()
+            .filter(|key| *key != 0)
+            .collect();
         let (draw_count, draw_instances) = (draw.count, draw.instances);
         let probe_level = draw.color_levels.first().copied().unwrap_or(0);
         let setup_end = std::time::Instant::now();

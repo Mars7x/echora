@@ -2842,6 +2842,7 @@ impl Renderer {
                 .chain(depth.iter())
                 .filter_map(|key| self.targets.get(key).map(|target| target.scale))
         };
+        let colors: Vec<u64> = colors.iter().copied().filter(|key| *key != 0).collect();
         let first = scales().next().unwrap_or(Scale::ONE);
         if scales().all(|scale| scale == first) {
             return Ok(first);
@@ -3706,7 +3707,8 @@ impl Renderer {
     }
 
     /// Begin dynamic rendering into color targets `colors` and an optional
-    /// depth target, limited to `area`.
+    /// depth target, limited to `area`. A color key of 0 is a gap: no
+    /// attachment at that location (a fragment output there is dropped).
     /// Each color target renders into its mip level in `levels` and its
     /// layer in `layers` (0 when missing); the depth target into layer
     /// `depth_layer`.
@@ -3721,6 +3723,10 @@ impl Renderer {
         let level = |index: usize| levels.get(index).copied().unwrap_or(0);
         let mut views = Vec::with_capacity(colors.len());
         for (index, key) in colors.iter().enumerate() {
+            if *key == 0 {
+                views.push(vk::ImageView::null());
+                continue;
+            }
             let layer = layers.get(index).copied().unwrap_or(0);
             views.push(self.attachment_view(*key, level(index), layer)?);
         }
@@ -3738,6 +3744,7 @@ impl Renderer {
         let (smallest_width, smallest_height) = colors
             .iter()
             .enumerate()
+            .filter(|(_, key)| **key != 0)
             .map(|(index, key)| extent(key, level(index)))
             .chain(depth.iter().map(|key| extent(key, 0)))
             .fold((i32::MAX, i32::MAX), |(w, h), (tw, th)| {
@@ -3754,15 +3761,18 @@ impl Renderer {
             return Ok(());
         }
         self.end_pass();
-        for key in colors.iter().chain(depth.iter()) {
+        let present: Vec<u64> = colors
+            .iter()
+            .copied()
+            .filter(|key| *key != 0)
+            .chain(depth)
+            .collect();
+        for key in &present {
             self.transition(*key, vk::ImageLayout::GENERAL)?;
         }
         // Another pass's writes to these attachments come first.
-        let attachments: Vec<vk::Image> = colors
-            .iter()
-            .chain(depth.iter())
-            .map(|key| self.targets[key].image)
-            .collect();
+        let attachments: Vec<vk::Image> =
+            present.iter().map(|key| self.targets[key].image).collect();
         if attachments != self.last_attachments {
             self.order_after_rendering(&attachments)?;
         }
