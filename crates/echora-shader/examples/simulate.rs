@@ -20,9 +20,17 @@
 //!   instead (derivatives and implicit levels across it), per pixel N
 //!   (0 top left, 1 top right, 2 bottom left, 3 bottom right) `quad N
 //!   fragcoord X Y Z W`, `quad N attribute LOCATION X Y Z W` and `quad N
-//!   helper`; `compare_op N` the depth comparisons' VkCompareOp; `sampler`
-//!   with any of `linear` (bilinear texels), `mip_linear` (blended levels)
-//!   and `repeat` (else clamped to the edge);
+//!   helper`; `compare_op N` the depth comparisons' VkCompareOp where a
+//!   sampler gives none; `sampler KEYS` the state of every sample whose
+//!   binding has none of its own, `sampler SET BINDING KEYS` a combined
+//!   image sampler's (or sampler variable's) and `sampler SET BINDING
+//!   ELEMENT KEYS` a sampler array element's (the sampler pool, set 1
+//!   binding 0, by the handle's sampler index), each from the defaults
+//!   (nearest, clamped to the edge, no compare op), the keys any of
+//!   `linear`/`nearest`, `mip_linear`/`mip_nearest`, `repeat`,
+//!   `address=U[,V[,W]]` (VkSamplerAddressMode numbers or names; a missing
+//!   axis takes the last), `border=W0,W1,W2,W3` (hex words as the shader
+//!   reads texels) and `compare=N` (VkCompareOp);
 //! - `push.bin`: the push constants' bytes;
 //! - `payload.bin`: a mesh program's task payload (what its task program
 //!   wrote), if it has one;
@@ -59,7 +67,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use echora_shader::sim::{Image, Inputs, Machine};
+use echora_shader::sim::{Address, Image, Inputs, Machine, Sampler};
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -119,12 +127,28 @@ fn main() {
             continue;
         }
         if let ["sampler", rest @ ..] = &fields[..] {
-            for word in rest {
-                match *word {
-                    "linear" => inputs.sampler.linear = true,
-                    "mip_linear" => inputs.sampler.mip_linear = true,
-                    "repeat" => inputs.sampler.repeat = true,
-                    _ => {}
+            // `sampler [SET BINDING [ELEMENT]] KEYS`: a binding's (or a
+            // sampler array element's) own state, else every other's.
+            let numbers: Vec<u32> = rest.iter().map_while(|word| word.parse().ok()).collect();
+            let keys = &rest[numbers.len()..];
+            let parse = |state: Result<Sampler, String>| {
+                state.unwrap_or_else(|error| {
+                    eprintln!("dispatch.txt: {error}");
+                    std::process::exit(2)
+                })
+            };
+            match numbers[..] {
+                [set, binding] => {
+                    let state = parse(sampler_state(keys, Sampler::default()));
+                    inputs.samplers.insert((set, binding), state);
+                }
+                [set, binding, element] => {
+                    let state = parse(sampler_state(keys, Sampler::default()));
+                    inputs.sampler_arrays.insert((set, binding, element), state);
+                }
+                [] => inputs.sampler = parse(sampler_state(keys, inputs.sampler)),
+                _ => {
+                    parse(Err(format!("sampler line `{line}`: SET BINDING [ELEMENT]")));
                 }
             }
             continue;
@@ -570,4 +594,62 @@ fn hex_range(text: &str) -> Option<std::ops::Range<u64>> {
         u64::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
     };
     Some(number(start)?..number(end)?)
+}
+
+/// A `sampler` line's keys on `state`: `linear` or `nearest`, `mip_linear`
+/// or `mip_nearest`, `repeat` (every axis), `address=U[,V[,W]]`
+/// (VkSamplerAddressMode numbers, or `repeat`, `mirrored_repeat`,
+/// `clamp_to_edge`, `clamp_to_border`, `mirror_clamp_to_edge`; a missing
+/// axis takes the last given), `border=W0,W1,W2,W3` (the border texel's
+/// words as the shader reads them, hex) and `compare=N` (VkCompareOp).
+fn sampler_state(keys: &[&str], mut state: Sampler) -> Result<Sampler, String> {
+    let mode = |name: &str| {
+        Ok(match name {
+            "0" | "repeat" => Address::Repeat,
+            "1" | "mirrored_repeat" => Address::MirroredRepeat,
+            "2" | "clamp_to_edge" => Address::ClampToEdge,
+            "3" | "clamp_to_border" => Address::ClampToBorder,
+            "4" | "mirror_clamp_to_edge" => Address::MirrorClampToEdge,
+            _ => return Err(format!("sampler address mode `{name}`")),
+        })
+    };
+    for key in keys {
+        match key.split_once('=') {
+            None => match *key {
+                "linear" => state.linear = true,
+                "nearest" => state.linear = false,
+                "mip_linear" => state.mip_linear = true,
+                "mip_nearest" => state.mip_linear = false,
+                "repeat" => state = state.repeat(),
+                _ => return Err(format!("sampler key `{key}`")),
+            },
+            Some(("address", modes)) => {
+                let modes = modes.split(',').map(mode).collect::<Result<Vec<_>, _>>()?;
+                let last = *modes.last().ok_or("an empty address list")?;
+                state.address = std::array::from_fn(|n| modes.get(n).copied().unwrap_or(last));
+            }
+            Some(("border", words)) => {
+                let words: Vec<u32> = words
+                    .split(',')
+                    .map(|word| u32::from_str_radix(word.trim_start_matches("0x"), 16))
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| format!("sampler border `{words}`: {error}"))?;
+                if words.len() != 4 {
+                    return Err(format!(
+                        "sampler border needs four words, not {}",
+                        words.len()
+                    ));
+                }
+                state.border = [words[0], words[1], words[2], words[3]];
+            }
+            Some(("compare", op)) => {
+                state.compare = Some(
+                    op.parse()
+                        .map_err(|_| format!("sampler compare op `{op}`"))?,
+                );
+            }
+            _ => return Err(format!("sampler key `{key}`")),
+        }
+    }
+    Ok(state)
 }

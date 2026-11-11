@@ -350,8 +350,9 @@ level 0 (enough for control flow), gathers take the four texels around
 the point; texture pool entries come from `Inputs::image_arrays` (by
 set, binding and element) and the pool's flags buffer from the buffer
 inputs (a runtime array is as long as its bytes). Depth comparisons
-(samples and gathers) test the reference against component 0 by
-`Inputs::compare_op` (the sampler's VkCompareOp). Levels past 0 come from
+(samples and gathers) test the reference against component 0 by the
+sampler's compare op (`Sampler::compare`, else `Inputs::compare_op`).
+Levels past 0 come from
 `Inputs::mips`: an explicit level, a fetch's level, or the level TXD's
 gradients give picks the nearest one, and queries report the chain. A
 fragment program runs as a 2x2 quad when `Inputs::quad` gives four
@@ -361,11 +362,19 @@ or column neighbour, coarse from lanes 0-2) and implicit levels (log2 of
 the coordinates' coarse derivatives in level-0 texels, plus a bias; LOD
 queries too) come from each other; a helper (or a demoted invocation)
 runs on but its buffer, memory and image writes are dropped. Without a
-quad an implicit level is 0. `Inputs::sampler` sets every sample's
-filtering: bilinear texels (components as floats), linearly blended
-levels (trilinear with both) and repeat addressing; by default the
-nearest texel of the nearest level, clamped to the edge. Depth
-comparisons stay nearest (no filtered PCF). Reference tests check the opcodes the game uses
+quad an implicit level is 0. Each sample takes its sampler's state: a
+sampled image carries its sampler's handle, so a texture pool sample
+reads `Inputs::sampler_arrays` by the sampler array element its handle
+names, and a combined image sampler (or a sampler variable) reads
+`Inputs::samplers` by its set and binding; others take
+`Inputs::sampler`. A state gives bilinear texels (components as floats)
+or the nearest, linearly blended levels (trilinear with both) or the
+nearest, each axis's VkSamplerAddressMode (repeat, mirrored repeat,
+clamp to the edge, clamp to the border, mirror clamp to the edge; an
+array's layer is clamped), the border texel and the compare op; the
+default is the nearest texel of the nearest level, clamped to the edge.
+Depth comparisons stay nearest (no filtered PCF); no anisotropy, LOD
+bias or clamps. Reference tests check the opcodes the game uses
 most against models written apart from the translator: TEX's mask order,
 second destination and packed halves; TEX.B's pool entry, integer view
 and capacity; TXQ; divergent BRA loops against a per-invocation model;

@@ -181,11 +181,19 @@ pub struct Inputs {
     /// Bound textures' levels past 0 (1, 2, ...), by (descriptor set,
     /// binding): explicit, gradient and fetch levels read them.
     pub mips: HashMap<(u32, u32), Vec<Image>>,
-    /// The samplers' state (one for all samples).
+    /// The sampler state of samples whose binding `samplers` or
+    /// `sampler_arrays` does not give.
     pub sampler: Sampler,
-    /// Depth comparisons' VkCompareOp (the sampler's; 0 never, 1 less, 2
-    /// equal, 3 less or equal, 4 greater, 5 not equal, 6 greater or equal,
-    /// 7 always): `None` takes less or equal, with a note.
+    /// Sampler state by the (descriptor set, binding) of a combined image
+    /// sampler or a sampler variable.
+    pub samplers: HashMap<(u32, u32), Sampler>,
+    /// Sampler state by (descriptor set, binding, element) of a sampler
+    /// array's element (the sampler pool).
+    pub sampler_arrays: HashMap<(u32, u32, u32), Sampler>,
+    /// Depth comparisons' VkCompareOp where the sampler state has none (0
+    /// never, 1 less, 2 equal, 3 less or equal, 4 greater, 5 not equal, 6
+    /// greater or equal, 7 always): `None` takes less or equal, with a
+    /// note.
     pub compare_op: Option<u32>,
     /// Address ranges (device addresses, or guest addresses through the
     /// page table) whose stores and atomics `Report::writes` lists.
@@ -195,16 +203,63 @@ pub struct Inputs {
     pub trace: Option<(usize, u32)>,
 }
 
-/// Sampler state for every sample (`Inputs::sampler`); the default is
-/// nearest filtering and mips, clamped to the edge.
-#[derive(Clone, Copy, Debug, Default)]
+/// A sampler's state (`Inputs::sampler`, `samplers`, `sampler_arrays`);
+/// the default is nearest filtering and mips, clamped to the edge, without
+/// a compare op.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sampler {
     /// Bilinear (else nearest) texels, components read as floats.
     pub linear: bool,
     /// Blending the two nearest levels (else the nearest level).
     pub mip_linear: bool,
-    /// Repeat (else clamp to the edge) addressing.
-    pub repeat: bool,
+    /// The address modes of u, v and w.
+    pub address: [Address; 3],
+    /// The texel a `ClampToBorder` coordinate outside the image reads, as
+    /// the shader reads texels (float bits, or integers).
+    pub border: [u32; 4],
+    /// Depth comparisons' VkCompareOp (compare enabled), else
+    /// `Inputs::compare_op`.
+    pub compare: Option<u32>,
+}
+
+impl Sampler {
+    /// Repeat addressing on every axis.
+    pub fn repeat(self) -> Self {
+        Self {
+            address: [Address::Repeat; 3],
+            ..self
+        }
+    }
+}
+
+/// A sampler address mode (VkSamplerAddressMode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Address {
+    Repeat,
+    MirroredRepeat,
+    #[default]
+    ClampToEdge,
+    ClampToBorder,
+    MirrorClampToEdge,
+}
+
+impl Address {
+    /// Texel `i` of `extent` by this mode: the index read, or `None` for
+    /// the border.
+    fn apply(self, i: i64, extent: u32) -> Option<i64> {
+        let n = i64::from(extent.max(1));
+        Some(match self {
+            Address::Repeat => i.rem_euclid(n),
+            Address::MirroredRepeat => {
+                let m = i.rem_euclid(2 * n);
+                if m >= n { 2 * n - 1 - m } else { m }
+            }
+            Address::ClampToEdge => i.clamp(0, n - 1),
+            Address::ClampToBorder if !(0..n).contains(&i) => return None,
+            Address::ClampToBorder => i,
+            Address::MirrorClampToEdge => (if i < 0 { -1 - i } else { i }).clamp(0, n - 1),
+        })
+    }
 }
 
 /// One pixel of a fragment quad (`Inputs::quad`).
@@ -436,6 +491,8 @@ struct Shared {
     compare_op: Option<u32>,
     mips: HashMap<(u32, u32), Vec<Image>>,
     sampler: Sampler,
+    samplers: HashMap<(u32, u32), Sampler>,
+    sampler_arrays: HashMap<(u32, u32, u32), Sampler>,
     watch: Vec<std::ops::Range<u64>>,
     trace: Option<(usize, u32)>,
     traced: Vec<(Option<u32>, Value)>,
@@ -1005,6 +1062,7 @@ impl Machine {
             | op::IMAGE_QUERY_LEVELS => {
                 let image_type = invocation.value_types[&args[0]];
                 let handle = value(0);
+                let sampler = self.sampler_of(shared, &handle);
                 let key = self.bound_image(&handle);
                 let image = match key {
                     Some(key) => shared.images.get(&key).cloned(),
@@ -1037,7 +1095,7 @@ impl Machine {
                             let lambda_value =
                                 self.sample_lambda(opcode, invocation, args, &base, lambda);
                             if sample
-                                && shared.sampler.mip_linear
+                                && sampler.mip_linear
                                 && let Some(lambda_value) = lambda_value
                             {
                                 let lambda_value = lambda_value.max(0.0);
@@ -1053,7 +1111,7 @@ impl Machine {
                                         &coordinate,
                                         0,
                                         [0; 2],
-                                        shared.sampler,
+                                        sampler,
                                         ty,
                                     )
                                 };
@@ -1087,7 +1145,7 @@ impl Machine {
                                 &coordinate,
                                 component,
                                 offset,
-                                shared.sampler,
+                                sampler,
                                 ty,
                             )
                         }
@@ -1106,16 +1164,20 @@ impl Machine {
             | op::IMAGE_DREF_GATHER => {
                 let image_type = invocation.value_types[&args[0]];
                 let handle = value(0);
+                let sampler = self.sampler_of(shared, &handle);
                 let image = match self.bound_image(&handle) {
                     Some(key) => shared.images.get(&key).cloned(),
                     None => self
                         .array_element(&handle)
                         .and_then(|key| shared.image_arrays.get(&key).cloned()),
                 };
-                let compare = match shared.compare_op {
+                let compare = match sampler.compare.or(shared.compare_op) {
                     Some(op) => op,
                     None => {
-                        shared.note("depth comparisons without Inputs::compare_op: less or equal");
+                        shared.note(
+                            "depth comparisons without a compare op (Sampler::compare, \
+                             Inputs::compare_op): less or equal",
+                        );
                         3
                     }
                 };
@@ -1143,7 +1205,7 @@ impl Machine {
                             offset,
                             Sampler {
                                 linear: false,
-                                ..shared.sampler
+                                ..sampler
                             },
                             ty,
                         );
@@ -1527,6 +1589,8 @@ impl Machine {
             compare_op: inputs.compare_op,
             mips: inputs.mips.clone(),
             sampler: inputs.sampler,
+            samplers: inputs.samplers.clone(),
+            sampler_arrays: inputs.sampler_arrays.clone(),
             watch: inputs.watch.clone(),
             trace: inputs.trace,
             traced: Vec::new(),
@@ -2362,12 +2426,7 @@ impl Machine {
     /// (not a texture pool entry).
     fn bound_image(&self, handle: &Value) -> Option<(u32, u32)> {
         let variable = *handle.first()? as u32;
-        let is_array = self.globals.iter().any(|&(id, pointer, _)| {
-            id == variable
-                && matches!(self.ty(pointer), Ty::Pointer { pointee }
-                    if matches!(self.ty(pointee), Ty::RuntimeArray { .. } | Ty::Array { .. }))
-        });
-        if is_array {
+        if self.is_array_variable(variable) {
             return None;
         }
         Some((
@@ -2386,6 +2445,47 @@ impl Machine {
             *self.bindings.get(&variable)?,
             element,
         ))
+    }
+
+    /// The sampler state of a sample through `handle`: its sampler's
+    /// (words 2 and 3 of a sampled image's handle: a sampler variable or a
+    /// sampler array's element), else its combined image sampler's binding,
+    /// else `Inputs::sampler`.
+    fn sampler_of(&self, shared: &Shared, handle: &Value) -> Sampler {
+        let binding = |variable: u32| {
+            Some((
+                self.sets.get(&variable).copied().unwrap_or(0),
+                *self.bindings.get(&variable)?,
+            ))
+        };
+        let state = match handle.get(2..4) {
+            Some(&[variable, element]) => {
+                let variable = variable as u32;
+                if self.is_array_variable(variable) {
+                    binding(variable).and_then(|(set, binding)| {
+                        shared
+                            .sampler_arrays
+                            .get(&(set, binding, element as u32))
+                            .copied()
+                    })
+                } else {
+                    binding(variable).and_then(|key| shared.samplers.get(&key).copied())
+                }
+            }
+            _ => self
+                .bound_image(handle)
+                .and_then(|key| shared.samplers.get(&key).copied()),
+        };
+        state.unwrap_or(shared.sampler)
+    }
+
+    /// Whether `variable` is an array (of images or samplers).
+    fn is_array_variable(&self, variable: u32) -> bool {
+        self.globals.iter().any(|&(id, pointer, _)| {
+            id == variable
+                && matches!(self.ty(pointer), Ty::Pointer { pointee }
+                    if matches!(self.ty(pointee), Ty::RuntimeArray { .. } | Ty::Array { .. }))
+        })
     }
 
     /// An image type's dimension and arrayed flag (through a sampled
@@ -2456,22 +2556,27 @@ impl Machine {
                 // Normalized coordinates; an array's layer is a float index.
                 let scaled = |n: usize, extent: u32| float(n) * f64::from(extent.max(1));
                 let (u, v) = (scaled(0, image.width), scaled(1, image.height));
+                // An array's layer is clamped; a 3D texture's w addressed.
                 let z = match (dim, arrayed) {
-                    (1, true) => float(2).round_ties_even() as i64,
-                    (0, true) => float(1).round_ties_even() as i64,
-                    (2, _) => scaled(2, image.depth).floor() as i64,
-                    _ => 0,
+                    (1, true) => Some(float(2).round_ties_even() as i64),
+                    (0, true) => Some(float(1).round_ties_even() as i64),
+                    (2, _) => {
+                        sampler.address[2].apply(scaled(2, image.depth).floor() as i64, image.depth)
+                    }
+                    _ => Some(0),
                 };
-                // A texel by the sampler's address mode (the image clamps).
+                // A texel by the sampler's address modes: the border's
+                // outside the image where a mode clamps to it.
                 let at = |i: i64, j: i64| {
-                    if sampler.repeat {
-                        let (w, h) = (
-                            i64::from(image.width.max(1)),
-                            i64::from(image.height.max(1)),
-                        );
-                        image.texel(i.rem_euclid(w), j.rem_euclid(h), z)
+                    let u = sampler.address[0].apply(i, image.width);
+                    let v = if dim == 0 {
+                        Some(0)
                     } else {
-                        image.texel(i, j, z)
+                        sampler.address[1].apply(j, image.height)
+                    };
+                    match (u, v, z) {
+                        (Some(i), Some(j), Some(z)) => image.texel(i, j, z),
+                        _ => sampler.border,
                     }
                 };
                 let (i0, j0) = ((u - 0.5).floor() as i64, (v - 0.5).floor() as i64);
@@ -2795,7 +2900,10 @@ impl Machine {
                         Pointer::Physical { .. } => vec![0, 0],
                     }
                 }
-                op::SAMPLED_IMAGE | op::IMAGE | COPY_OBJECT => value(0),
+                // A sampled image: the image's handle, then the sampler's.
+                op::SAMPLED_IMAGE => [value(0), value(1)].concat(),
+                op::IMAGE => value(0).into_iter().take(2).collect(),
+                COPY_OBJECT => value(0),
                 op::IS_HELPER_INVOCATION => vec![u64::from(invocation.helper)],
                 op::IMAGE_SAMPLE_IMPLICIT_LOD
                 | op::IMAGE_SAMPLE_EXPLICIT_LOD
@@ -5254,6 +5362,42 @@ mod tests {
                 );
             }
         }
+        // The sampler the handle names (its high 12 bits, an element of the
+        // pool's sampler array) by `Inputs::sampler_arrays`: sampler 3
+        // clamps to a border of 9.0, sampler 4 has no state of its own
+        // (clamped to the edge). Past the right edge (x 1.25).
+        for (sampler, expected) in [(3u32, [9.0f32; 4]), (4, [5.0, 1.0, 0.0, 7.0])] {
+            let program = [
+                mov(0, 1.25f32.to_bits()),
+                mov(1, 0.25f32.to_bits()),
+                mov(2, 5 | sampler << SAMPLER_INDEX_SHIFT),
+                sample,
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                image_arrays: image_arrays.clone(),
+                sampler_arrays: HashMap::from([(
+                    (TEXTURE_POOL_SET, texture_pool::SAMPLERS, 3),
+                    Sampler {
+                        address: [Address::ClampToBorder; 3],
+                        border: [9.0f32.to_bits(); 4],
+                        ..Sampler::default()
+                    },
+                )]),
+                uniforms: HashMap::from([((TEXTURE_POOL_SET, texture_pool::FLAGS), vec![0; 64])]),
+                specialization: HashMap::from([(TEXTURE_POOL_CAPACITY_SPEC_ID, 16)]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let got: Vec<f32> = (4..8u8)
+                .map(|n| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32))
+                .collect();
+            assert_eq!(got, expected, "sampler {sampler}");
+        }
     }
 
     #[test]
@@ -7703,6 +7847,99 @@ mod tests {
     }
 
     #[test]
+    fn each_binding_samples_by_its_own_sampler_state() {
+        // TEX.LL R4 / R8 / R12, R0 (x, y), R2 (level 0) through handles
+        // c[0x0][0x40], 0x44 and 0x48, each a binding of the same 2 x 2
+        // texture (texel (x, y) = x + 2y). 0x40: bilinear, repeated; 0x44:
+        // nearest, clamped to a border of 7.0; 0x48 has no state of its
+        // own: `Inputs::sampler`, nearest, mirrored.
+        let tex = |d: u128, handle: u128| {
+            word(&[
+                (0, 12, 0xb60),
+                (16, 8, d),
+                (24, 8, 0),
+                (32, 8, 2),
+                (40, 14, handle),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 1),
+                (81, 3, 7),
+                (87, 3, 3),
+            ])
+        };
+        let image = Image {
+            width: 2,
+            height: 2,
+            depth: 1,
+            layers: 1,
+            texels: [0.0f32, 1.0, 2.0, 3.0]
+                .iter()
+                .map(|&v| [v.to_bits(), 0, 0, 0])
+                .collect(),
+        };
+        let sample = |x: f32, y: f32| {
+            let program = [
+                mov(0, x.to_bits()),
+                mov(1, y.to_bits()),
+                mov(2, 0),
+                tex(4, 0x10),
+                tex(8, 0x11),
+                tex(12, 0x12),
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let binding = |offset: u32| {
+                translated
+                    .descriptors
+                    .iter()
+                    .find(|d| d.cbuf_offset == offset)
+                    .unwrap()
+                    .binding
+            };
+            let (a, b, c) = (binding(0x40), binding(0x44), binding(0x48));
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: [a, b, c].map(|n| ((0, n), image.clone())).into(),
+                samplers: HashMap::from([
+                    (
+                        (0, a),
+                        Sampler {
+                            linear: true,
+                            ..Sampler::default()
+                        }
+                        .repeat(),
+                    ),
+                    (
+                        (0, b),
+                        Sampler {
+                            address: [Address::ClampToBorder; 3],
+                            border: [7.0f32.to_bits(), 0, 0, 0],
+                            ..Sampler::default()
+                        },
+                    ),
+                ]),
+                sampler: Sampler {
+                    address: [Address::MirroredRepeat; 3],
+                    ..Sampler::default()
+                },
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            [4u8, 8, 12].map(|n| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32))
+        };
+        // The left edge: bilinear and repeated blends texels 0 and 1 (0.5);
+        // nearest reads texel 0 in both others.
+        assert_eq!(sample(0.0, 0.25), [0.5, 0.0, 0.0]);
+        // Past the right edge (u 2.5, texel 2): repeated, texel 0 (its
+        // weight is all on it); the border; mirrored, texel 1.
+        assert_eq!(sample(1.25, 0.25), [0.0, 7.0, 1.0]);
+        // Inside: bilinear at the centre is the mean, nearest texel 3.
+        assert_eq!(sample(0.5, 0.5), [1.5, 3.0, 3.0]);
+    }
+
+    #[test]
     fn samplers_filter_bilinearly_and_between_levels() {
         // TEX.LL R4, R0 (x, y), R2 (level): component 0.
         let tex = word(&[
@@ -7774,7 +8011,7 @@ mod tests {
         // with texel 1.
         assert_eq!(sample(0.0, 0.25, 0.0, linear), 0.0);
         let repeat = Sampler {
-            repeat: true,
+            address: [Address::Repeat; 3],
             ..linear
         };
         assert_eq!(sample(0.0, 0.25, 0.0, repeat), 0.5);
