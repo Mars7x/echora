@@ -240,6 +240,60 @@ impl Renderer {
                 .iter()
                 .any(|(array, index, _)| pool.written.contains_key(&(*array, *index)));
         if rewrites && pool.in_use {
+            // ECHORA_POOL_REWRITE_LOG (debugging): the first rewrites of
+            // entries work in flight may read, with what each entry asks.
+            if std::env::var_os("ECHORA_POOL_REWRITE_LOG").is_some()
+                && self
+                    .stats
+                    .get("stat: texture pool flushes for rewritten entries")
+                    .copied()
+                    .unwrap_or(0)
+                    < 300
+            {
+                for (array, index, handle) in &changed {
+                    if let Some(old) = pool.written.get(&(*array, *index)) {
+                        let asked: Vec<String> = entries
+                            .iter()
+                            .filter(|entry| {
+                                if *array == binding::SAMPLERS {
+                                    entry.sampler == *index
+                                } else {
+                                    entry.texture == *index
+                                }
+                            })
+                            .map(|entry| {
+                                let source = match &entry.source {
+                                    TextureSource::Upload {
+                                        key,
+                                        generation,
+                                        width,
+                                        height,
+                                        shape,
+                                        format,
+                                        ..
+                                    } => format!(
+                                        "upload {key:x} gen {generation} {width}x{height} {shape:?} {format:?}"
+                                    ),
+                                    other => format!("{other:?}"),
+                                };
+                                format!(
+                                    "texture {} sampler {} {source} components {:?} format {:?}",
+                                    entry.texture,
+                                    entry.sampler,
+                                    entry.sampler_state.components,
+                                    entry.sampler_state.format
+                                )
+                            })
+                            .collect();
+                        eprintln!(
+                            "pool rewrite array {array} index {index}: {old:#x} -> {handle:#x} for {asked:?}"
+                        );
+                    }
+                }
+                for (index, integer) in &flips {
+                    eprintln!("pool rewrite flag index {index}: integer -> {integer}");
+                }
+            }
             self.stat("stat: texture pool flushes for rewritten entries", 1);
             self.flush()?;
         }
