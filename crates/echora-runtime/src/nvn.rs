@@ -476,6 +476,33 @@ fn big_vertex_bind(commands: &[Command]) -> Option<(u64, u64, u64)> {
 }
 
 impl Nvn {
+    /// The kept lists by the command buffer that recorded them (the 16 that
+    /// hold the most captured bytes): lists, commands, captured bytes.
+    fn kept_lists_by_buffer(&self) -> Vec<(String, u64, u64, u64)> {
+        let mut by: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+        for (handle, (list, ..)) in &self.command_lists {
+            let buffer = self.list_memory.get(handle).map_or(0, |memory| memory.0);
+            let entry = by.entry(buffer).or_default();
+            entry.0 += 1;
+            entry.1 += list.len() as u64;
+            entry.2 += list
+                .iter()
+                .map(|command| (command.captured.len() * 8) as u64)
+                .sum::<u64>();
+        }
+        let mut rows: Vec<_> = by
+            .into_iter()
+            .map(|(buffer, (lists, commands, bytes))| {
+                (format!("{buffer:#x}"), lists, commands, bytes)
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.3));
+        rows.truncate(16);
+        rows
+    }
+}
+
+impl Nvn {
     /// Forget a finished list whose memory the application reuses.
     fn drop_command_list(&mut self, handle: u64) {
         self.list_memory.remove(&handle);
@@ -4225,6 +4252,7 @@ impl Nvn {
             "capped_command_lists": self.capped_command_lists,
             "kept_command_lists": self.command_lists.len(),
             "kept_commands": self.command_list_commands,
+            "kept_lists_by_buffer": self.kept_lists_by_buffer(),
             "skipped_work": self.skipped_work,
             "forced_waits": self.forced_waits,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
