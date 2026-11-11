@@ -5717,6 +5717,31 @@ impl Nvn {
                 bytes[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
             }
         }
+        // The driver's other words in each stage's c0: the largest point
+        // size (0x610, the hardware's 2047; GLSLC clamps gl_PointSize to
+        // it) and the draw's base instance (0x644; DrawElementsInstanced's
+        // and DrawArraysInstanced's, 0 for other direct draws). Programs
+        // read the base instance there to find per-instance data.
+        let base_instance = match command.name.as_str() {
+            "nvnCommandBufferDrawArraysInstanced" => command.x[4] as u32,
+            "nvnCommandBufferDrawElementsInstanced" => command.x[6] as u32,
+            _ => 0,
+        };
+        for (index, stage) in stages.iter().enumerate() {
+            let Some(c0) = stage.descriptors.iter().find(|descriptor| {
+                descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0
+            }) else {
+                continue;
+            };
+            if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
+                for (offset, word) in [(0x610, 2047.0f32.to_bits()), (0x644, base_instance)] {
+                    if bytes.len() < offset + 4 {
+                        bytes.resize((offset + 4).next_multiple_of(16), 0);
+                    }
+                    bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
         // Texture pool entries, for stages that read the pool.
         let mut pool = Vec::new();
         for (index, stage) in stages.iter().enumerate() {
