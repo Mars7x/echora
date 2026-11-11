@@ -3018,9 +3018,46 @@ impl Nvn {
             );
         }
         self.ensure_render_target(to)?;
+        let traced = self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]);
+        let present = self.presented_frames;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.defined(to);
-        renderer.copy_target(from, source, to, destination)
+        renderer.copy_target(from, source, to, destination)?;
+        // A traced copy: both ends read back after it, and how many texels
+        // differ (a depth copy a later EQUAL test relies on must be exact).
+        if traced {
+            renderer.flush()?;
+            let formats = (
+                renderer.existing_target(from).map(|target| target.format),
+                renderer.existing_target(to).map(|target| target.format),
+            );
+            let (a, b) = (
+                renderer.read_target_level(from, 0),
+                renderer.read_target_level(to, 0),
+            );
+            match (a, b) {
+                (Ok(a), Ok(b)) => {
+                    let mean = |texels: &[[f32; 4]]| {
+                        texels.iter().map(|texel| f64::from(texel[0])).sum::<f64>()
+                            / texels.len().max(1) as f64
+                    };
+                    let differ = a.iter().zip(&b).filter(|(x, y)| x[0] != y[0]).count();
+                    eprintln!(
+                        "depth trace present {present} copy check formats {formats:?} means {:.6} {:.6} texels {} {} differ {differ}",
+                        mean(&a),
+                        mean(&b),
+                        a.len(),
+                        b.len()
+                    );
+                }
+                (a, b) => eprintln!(
+                    "depth trace present {present} copy check unreadable {:?} {:?}",
+                    a.err(),
+                    b.err()
+                ),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn gpu_dispatch(
