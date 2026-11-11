@@ -8095,6 +8095,90 @@ mod tests {
     }
 
     #[test]
+    fn vertex_programs_sample_at_explicit_levels_and_fetch_texels_exactly() {
+        use echora_shader_abi::Stage;
+        // An R32F 2 x 2 texture (texel (x, y) = x + 2y; level 1 holds 10)
+        // bound with a bilinear sampler, read by a vertex program:
+        // TEX (implicit level) R10 and TEX.LZ R11 at (0.5, 0.5) (x in R0,
+        // y in R1); TEX.LL R12 at (0.5, 0.5) level 1.0 (R2); TLD.LZ R13
+        // and TLD.LL R14 (level 1 in R8) at texel (1, 0) (R6, R7). Outside
+        // fragment programs an implicit level is level 0 (an explicit Lod
+        // of 0, not an implicit sample), and a fetch never filters.
+        let tex = |opcode: u128, d: u128, a: u128, b: u128, lod: u128| {
+            word(&[
+                (0, 12, opcode),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 8, b),
+                (40, 14, 0x10),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 1),
+                (81, 3, 7),
+                (87, 3, lod),
+            ])
+        };
+        let program = [
+            mov(0, 0.5f32.to_bits()),
+            mov(1, 0.5f32.to_bits()),
+            mov(2, 1.0f32.to_bits()),
+            mov(6, 1),
+            mov(7, 0),
+            mov(8, 1),
+            tex(0xb60, 10, 0, 1, 0),
+            tex(0xb60, 11, 0, 1, 1),
+            tex(0xb60, 12, 0, 2, 3),
+            tex(0xb66, 13, 6, 7, 1),
+            tex(0xb66, 14, 6, 8, 3),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            stage: Stage::Vertex,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        // No implicit-level sample in a vertex program.
+        let words = &translated.spirv;
+        let mut at = 5;
+        while at < words.len() {
+            let (count, opcode) = ((words[at] >> 16) as usize, words[at] as u16);
+            assert_ne!(opcode, op::IMAGE_SAMPLE_IMPLICIT_LOD);
+            at += count.max(1);
+        }
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        let image = |side: u32, values: &[f32]| Image {
+            width: side,
+            height: side,
+            depth: 1,
+            layers: 1,
+            texels: values.iter().map(|&v| [v.to_bits(), 0, 0, 0]).collect(),
+        };
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([((0, binding), image(2, &[0.0, 1.0, 2.0, 3.0]))]),
+            mips: HashMap::from([((0, binding), vec![image(1, &[10.0])])]),
+            samplers: HashMap::from([((0, binding), Sampler::default().linear())]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
+        // Bilinear at the centre of level 0: the mean; level 1's one texel.
+        assert_eq!(read(10), 1.5);
+        assert_eq!(read(11), 1.5);
+        assert_eq!(read(12), 10.0);
+        // Fetches: the texel itself, at its level.
+        assert_eq!(read(13), 1.0);
+        assert_eq!(read(14), 10.0);
+    }
+
+    #[test]
     fn each_binding_samples_by_its_own_sampler_state() {
         // TEX.LL R4 / R8 / R12, R0 (x, y), R2 (level 0) through handles
         // c[0x0][0x40], 0x44 and 0x48, each a binding of the same 2 x 2
