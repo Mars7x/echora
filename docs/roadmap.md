@@ -11,8 +11,8 @@ when the code for it does.
 | 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.3 million instructions) is translated and runs on Linux. |
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan and the internal render scale is applied; shader translation is moving to Echora's own Rust translator, and the resolution planner is not connected yet. |
-| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler; to be reached again with Echora's own shader translator. |
-| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie and draws its first 3D scene, but that scene's lighting passes don't run yet. |
+| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler; to be reached again with Echora's own shader translator alone. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie and draws its first 3D scene, but that scene is washed out and its ground is missing. |
 | 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
@@ -23,15 +23,15 @@ when the code for it does.
 
 ## Next steps
 
-1. Finish Echora's own shader translator (`echora-shader`, in Rust). It
-   handles about nine in ten of the shaders seen in runs so far; what's left
-   is mesh and task programs and the remaining instruction forms, then
-   checking each scene's output against the old recompiler on the
-   developer's machine. See [shader-translator.md](shader-translator.md).
-2. Get the first scene after the New Game movie right: its lighting passes
-   take their sizes from GPU-written indirect arguments and don't run yet.
-   Then check what it draws (including the mesh and task pipelines) and carry
-   on to gameplay.
+1. Get the first scene after the New Game movie right. It should be a dark
+   forest with a lit, mossy hill and water; here it is washed out, the
+   ground is missing, and sky shows where mist and a tree should be. Then
+   carry on to gameplay.
+2. Finish Echora's own shader translator (`echora-shader`, in Rust). It
+   handles about 98% of the shader stages seen in runs so far; what's left
+   is the remaining instruction forms and mesh programs in the
+   tessellation slot, then checking each scene's output.
+   See [shader-translator.md](shader-translator.md).
 3. Make each thread faster in the 3D scene: profile it, then cut the cost of
    the translated code and of each GPU command, which now limit speed more
    than the number of cores.

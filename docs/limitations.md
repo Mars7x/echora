@@ -6,20 +6,21 @@ to be missing or incomplete.
 
 ## Gameplay and graphics
 
-- The game gets past the New Game movie into its first 3D scene, but that
-  scene's lighting passes don't run yet (their sizes are written by the GPU
-  and read too early), so it shows little more than outlines. No gameplay has
-  been reached yet.
+- The game gets past the New Game movie into its first 3D scene. Its sky,
+  plants and water are drawn, but the picture is washed out where it should
+  be dark, and the ground is missing (the terrain's vertices all read the
+  same position). No gameplay has been reached yet.
   Every unimplemented operation still stops the run with a report.
-- Mesh and task pipelines (`DrawMeshTasks`) are drawn through
-  `VK_EXT_mesh_shader`, but have not yet been checked against the console's
-  output.
+- Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
+  conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
+  `VK_EXT_conditional_rendering`), but have not yet been checked against the
+  console's output.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
-- The Rust shader translator handles about nine in ten of the shaders seen
-  in runs so far. Without an external translator plugin
-  ([shader-plugin.md](shader-plugin.md)) the run stops at the first program
-  it does not handle, naming the reason.
+- The Rust shader translator handles about 98% of the 6,215 shader stages
+  the game has used in test runs. Without an external translator
+  plugin ([shader-plugin.md](shader-plugin.md)) a run stops at the first
+  program it does not handle, naming the reason.
 
 ## Performance
 
