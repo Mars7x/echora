@@ -367,14 +367,20 @@ sampled image carries its sampler's handle, so a texture pool sample
 reads `Inputs::sampler_arrays` by the sampler array element its handle
 names, and a combined image sampler (or a sampler variable) reads
 `Inputs::samplers` by its set and binding; others take
-`Inputs::sampler`. A state gives bilinear texels (components as floats)
-or the nearest, linearly blended levels (trilinear with both) or the
+`Inputs::sampler`. A sample's λ (the quad's, with the shader's bias; an
+explicit Lod; the gradients') gets the sampler's LOD bias and is then
+clamped to its minimum and maximum LOD, as Vulkan computes it; λ ≤ 0
+(or no λ: level 0) magnifies, by the mag filter, λ > 0 minifies, by the
+min filter. A state gives each filter (bilinear texels, components as
+floats, or the nearest), linearly blended levels (trilinear) or the
 nearest, each axis's VkSamplerAddressMode (repeat, mirrored repeat,
 clamp to the edge, clamp to the border, mirror clamp to the edge; an
 array's layer is clamped), the border texel and the compare op; the
-default is the nearest texel of the nearest level, clamped to the edge.
-Depth comparisons stay nearest (no filtered PCF); no anisotropy, LOD
-bias or clamps. Reference tests check the opcodes the game uses
+default is the nearest texel of the nearest level, clamped to the edge,
+without bias or clamps. A depth comparison by a bilinear filter weights
+its four texels' results bilinearly (PCF), a gather takes them apart; it
+reads level 0. Anisotropy is only recorded (`max_anisotropy`, with a
+note): samples stay isotropic. Reference tests check the opcodes the game uses
 most against models written apart from the translator: TEX's mask order,
 second destination and packed halves; TEX.B's pool entry, integer view
 and capacity; TXQ; divergent BRA loops against a per-invocation model;

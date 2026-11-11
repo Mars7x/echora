@@ -205,13 +205,26 @@ pub struct Inputs {
 
 /// A sampler's state (`Inputs::sampler`, `samplers`, `sampler_arrays`);
 /// the default is nearest filtering and mips, clamped to the edge, without
-/// a compare op.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// a compare op, bias or level clamps.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampler {
-    /// Bilinear (else nearest) texels, components read as floats.
-    pub linear: bool,
+    /// Bilinear (else nearest) texels when magnifying (λ ≤ 0, or no λ),
+    /// components read as floats; a depth comparison's 2x2 results
+    /// weighted alike (PCF).
+    pub mag_linear: bool,
+    /// Likewise when minifying (λ > 0).
+    pub min_linear: bool,
     /// Blending the two nearest levels (else the nearest level).
     pub mip_linear: bool,
+    /// The sampler's LOD bias, added to every sample's λ (with a shader
+    /// bias, an explicit Lod or the gradients').
+    pub lod_bias: f32,
+    /// The λ range a sample's λ is clamped to (after the bias).
+    pub min_lod: f32,
+    pub max_lod: f32,
+    /// Anisotropic filtering's maxAnisotropy (above 1: enabled). Only
+    /// recorded: samples stay isotropic, with a note.
+    pub max_anisotropy: f32,
     /// The address modes of u, v and w.
     pub address: [Address; 3],
     /// The texel a `ClampToBorder` coordinate outside the image reads, as
@@ -222,7 +235,49 @@ pub struct Sampler {
     pub compare: Option<u32>,
 }
 
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            mag_linear: false,
+            min_linear: false,
+            mip_linear: false,
+            lod_bias: 0.0,
+            min_lod: 0.0,
+            max_lod: f32::INFINITY,
+            max_anisotropy: 0.0,
+            address: [Address::ClampToEdge; 3],
+            border: [0; 4],
+            compare: None,
+        }
+    }
+}
+
 impl Sampler {
+    /// Bilinear filtering for magnification and minification.
+    pub fn linear(self) -> Self {
+        Self {
+            mag_linear: true,
+            min_linear: true,
+            ..self
+        }
+    }
+
+    /// A sample's λ (`base`, its level of detail before the sampler)
+    /// with the sampler's bias and clamps, as Vulkan computes it.
+    fn lod(&self, base: f64) -> f64 {
+        (base + f64::from(self.lod_bias))
+            .max(f64::from(self.min_lod))
+            .min(f64::from(self.max_lod))
+    }
+
+    /// Whether a sample at `lod` (none: magnified) filters bilinearly.
+    fn filters_linearly(&self, lod: Option<f64>) -> bool {
+        match lod {
+            Some(lod) if lod > 0.0 => self.min_linear,
+            _ => self.mag_linear,
+        }
+    }
+
     /// Repeat addressing on every axis.
     pub fn repeat(self) -> Self {
         Self {
@@ -1086,17 +1141,41 @@ impl Machine {
                 } else {
                     match image {
                         Some(base) => {
-                            let level = self.image_level(opcode, invocation, args, &base, lambda);
-                            // Linear mips: the two levels around λ, blended.
                             let sample = matches!(
                                 opcode,
                                 op::IMAGE_SAMPLE_IMPLICIT_LOD | op::IMAGE_SAMPLE_EXPLICIT_LOD
                             );
-                            let lambda_value =
-                                self.sample_lambda(opcode, invocation, args, &base, lambda);
-                            if sample
-                                && sampler.mip_linear
-                                && let Some(lambda_value) = lambda_value
+                            // A sample's λ: the quad's, an explicit Lod or
+                            // the gradients', with the sampler's bias and
+                            // clamps; none without them (level 0,
+                            // magnified).
+                            let lod = if sample {
+                                self.sample_lambda(
+                                    opcode == op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                                    invocation,
+                                    args,
+                                    2,
+                                    &base,
+                                    lambda,
+                                )
+                                .map(|base| sampler.lod(base))
+                            } else {
+                                None
+                            };
+                            let linear = sample && sampler.filters_linearly(lod);
+                            if sample && sampler.max_anisotropy > 1.0 {
+                                shared.note(
+                                    "anisotropic samplers are sampled isotropically \
+                                     (Sampler::max_anisotropy is only recorded)",
+                                );
+                            }
+                            let level = match lod {
+                                Some(lod) => (lod + 0.5).floor().max(0.0) as usize,
+                                None => self.image_level(opcode, invocation, args, &base, lambda),
+                            };
+                            // Linear mips: the two levels around λ, blended.
+                            if sampler.mip_linear
+                                && let Some(lambda_value) = lod
                             {
                                 let lambda_value = lambda_value.max(0.0);
                                 let low = (lambda_value.floor() as usize).min(chain.len() - 1);
@@ -1111,7 +1190,7 @@ impl Machine {
                                         &coordinate,
                                         0,
                                         [0; 2],
-                                        sampler,
+                                        (sampler, linear),
                                         ty,
                                     )
                                 };
@@ -1145,7 +1224,7 @@ impl Machine {
                                 &coordinate,
                                 component,
                                 offset,
-                                sampler,
+                                (sampler, linear),
                                 ty,
                             )
                         }
@@ -1186,51 +1265,95 @@ impl Machine {
                         let coordinate = value(1);
                         let reference = f32::from_bits(value(2)[0] as u32);
                         let gather = opcode == op::IMAGE_DREF_GATHER;
+                        let holds = |bits: u64| {
+                            let depth = f32::from_bits(bits as u32);
+                            let holds = match compare {
+                                0 => false,
+                                1 => reference < depth,
+                                2 => reference == depth,
+                                3 => reference <= depth,
+                                4 => reference > depth,
+                                5 => reference != depth,
+                                6 => reference >= depth,
+                                _ => true,
+                            };
+                            if holds { 1.0f32 } else { 0.0 }
+                        };
+                        // A sample's filter by its λ (as a sample's; level
+                        // 0 is read): bilinear weights the 2x2 results
+                        // (PCF), nearest takes one.
+                        let lod = if gather {
+                            None
+                        } else {
+                            self.sample_lambda(
+                                opcode == op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+                                invocation,
+                                args,
+                                3,
+                                &image,
+                                lambda,
+                            )
+                            .map(|base| sampler.lod(base))
+                        };
+                        let linear = !gather && sampler.filters_linearly(lod);
                         let offset = if gather {
                             self.gather_offset(invocation, args)
                         } else {
                             [0; 2]
                         };
-                        let read = if gather {
-                            op::IMAGE_GATHER
-                        } else {
-                            op::IMAGE_SAMPLE_EXPLICIT_LOD
-                        };
-                        let texels = self.image_read(
-                            read,
-                            image_type,
-                            &image,
-                            &coordinate,
-                            0,
-                            offset,
-                            Sampler {
-                                linear: false,
-                                ..sampler
-                            },
-                            ty,
-                        );
-                        let depths: Vec<u64> = if gather {
-                            texels
-                        } else {
-                            texels.into_iter().take(1).collect()
-                        };
-                        depths
-                            .iter()
-                            .map(|&bits| {
-                                let depth = f32::from_bits(bits as u32);
-                                let holds = match compare {
-                                    0 => false,
-                                    1 => reference < depth,
-                                    2 => reference == depth,
-                                    3 => reference <= depth,
-                                    4 => reference > depth,
-                                    5 => reference != depth,
-                                    6 => reference >= depth,
-                                    _ => true,
+                        if gather || linear {
+                            // The four texels around the point, in a
+                            // gather's order: (i0, j1), (i1, j1), (i1, j0),
+                            // (i0, j0).
+                            let texels = self.image_read(
+                                op::IMAGE_GATHER,
+                                image_type,
+                                &image,
+                                &coordinate,
+                                0,
+                                offset,
+                                (sampler, false),
+                                ty,
+                            );
+                            let results: Vec<f32> =
+                                texels.iter().map(|&bits| holds(bits)).collect();
+                            if gather {
+                                results.iter().map(|r| u64::from(r.to_bits())).collect()
+                            } else {
+                                let fraction = |n: usize, extent: u32| {
+                                    let x = f64::from(f32::from_bits(
+                                        coordinate.get(n).copied().unwrap_or(0) as u32,
+                                    )) * f64::from(extent.max(1))
+                                        - 0.5;
+                                    (x - x.floor()) as f32
                                 };
-                                u64::from(if holds { 1.0f32 } else { 0.0 }.to_bits())
-                            })
-                            .collect()
+                                let (a, b) = (fraction(0, image.width), fraction(1, image.height));
+                                let weights =
+                                    [(1.0 - a) * b, a * b, a * (1.0 - b), (1.0 - a) * (1.0 - b)];
+                                let filtered: f32 =
+                                    results.iter().zip(weights).map(|(r, w)| r * w).sum();
+                                let mut words = vec![u64::from(filtered.to_bits())];
+                                words.resize(self.size(ty).max(1), 0);
+                                words.truncate(self.size(ty).max(1));
+                                words
+                            }
+                        } else {
+                            let texels = self.image_read(
+                                op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                                image_type,
+                                &image,
+                                &coordinate,
+                                0,
+                                offset,
+                                (sampler, false),
+                                ty,
+                            );
+                            texels
+                                .into_iter()
+                                .take(1)
+                                .map(|bits| u64::from(holds(bits).to_bits()))
+                                .collect()
+                        }
                     }
                     None => {
                         shared.note("reads of textures without dumped data give zeros");
@@ -1250,21 +1373,22 @@ impl Machine {
     /// or the one its Grad operands give; `None` otherwise.
     fn sample_lambda(
         &self,
-        opcode: u16,
+        explicit: bool,
         invocation: &Invocation,
         args: &[u32],
+        mask_at: usize,
         base: &Image,
         lambda: Option<f64>,
     ) -> Option<f64> {
-        if lambda.is_some() || opcode != op::IMAGE_SAMPLE_EXPLICIT_LOD {
+        if lambda.is_some() || !explicit {
             return lambda;
         }
         let value = |n: usize| args.get(n).and_then(|id| invocation.values.get(id));
         let float = |words: &Value, n: usize| {
             f64::from(f32::from_bits(words.get(n).copied().unwrap_or(0) as u32))
         };
-        let mask = *args.get(2)?;
-        let at = 3 + usize::from(mask & 1 != 0);
+        let mask = *args.get(mask_at)?;
+        let at = mask_at + 1 + usize::from(mask & 1 != 0);
         if mask & 2 != 0 {
             return value(at).map(|lod| float(lod, 0));
         }
@@ -2521,7 +2645,7 @@ impl Machine {
         coordinate: &Value,
         component: usize,
         offset: [i64; 2],
-        sampler: Sampler,
+        (sampler, linear): (Sampler, bool),
         ty: u32,
     ) -> Value {
         let (dim, arrayed) = self.image_shape(image_type);
@@ -2586,7 +2710,7 @@ impl Machine {
                         .iter()
                         .map(|&(i, j)| u64::from(at(i, j)[component.min(3)]))
                         .collect()
-                } else if sampler.linear {
+                } else if linear {
                     // Bilinear: the four texels around the point, weighted
                     // by its fractions (as floats).
                     let (a, b) = (
@@ -7547,6 +7671,95 @@ mod tests {
     }
 
     #[test]
+    fn linear_depth_compares_weight_the_four_results() {
+        // TEX.LZ.DC R4, R0 (x, y), R2 (reference): level 0 (λ 0, the mag
+        // filter). Texel (x, y) of a 4 x 4 depth texture: 0.1 (x + y). At
+        // (0.5, 0.25), texel coordinates (2, 1): the four around are (1, 0)
+        // 0.1, (2, 0) 0.2, (1, 1) 0.2 and (2, 1) 0.3, each weighted 1/4;
+        // reference 0.25 by less or equal holds for (2, 1) only.
+        let depth = |x: u32, y: u32| 0.1 * (x + y) as f32;
+        let texels: Vec<[u32; 4]> = (0..16u32)
+            .map(|n| [depth(n % 4, n / 4).to_bits(), 0, 0, 0])
+            .collect();
+        let sample = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0x1),
+            (78, 1, 1),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        let program = [
+            mov(0, 0.5f32.to_bits()),
+            mov(1, 0.25f32.to_bits()),
+            mov(2, 0.25f32.to_bits()),
+            sample,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        let run = |sampler: Sampler| {
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, binding),
+                    Image {
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        layers: 1,
+                        texels: texels.clone(),
+                    },
+                )]),
+                samplers: HashMap::from([((0, binding), sampler)]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            f32::from_bits(report.invocations[0][&registers[&4]][0] as u32)
+        };
+        let compare = Sampler {
+            compare: Some(3),
+            ..Sampler::default()
+        };
+        // Nearest: texel (2, 1) alone.
+        assert_eq!(run(compare), 1.0);
+        // Bilinear (PCF): a quarter.
+        let pcf = Sampler {
+            mag_linear: true,
+            ..compare
+        };
+        assert_eq!(run(pcf), 0.25);
+        // A minimum λ of 1 minifies: the (nearest) min filter.
+        assert_eq!(
+            run(Sampler {
+                min_lod: 1.0,
+                ..pcf
+            }),
+            1.0
+        );
+        assert_eq!(
+            run(Sampler {
+                min_lod: 1.0,
+                min_linear: true,
+                ..pcf
+            }),
+            0.25
+        );
+    }
+
+    #[test]
     fn depth_compares_test_the_reference_by_the_sampler_s_op() {
         // Texel (x, y) of a 4 x 4 depth texture: 0.1 (x + y).
         let depth = |x: u32, y: u32| 0.1 * (x + y) as f32;
@@ -7800,7 +8013,7 @@ mod tests {
         };
         // Pixel (i, j) of the quad samples (0.125 + i step, 0.125 + j step);
         // the bottom right one is a helper.
-        let run = |step: f32| {
+        let run_with = |step: f32, sampler: Sampler| {
             let quad: Vec<QuadPixel> = (0..4u32)
                 .map(|n| {
                     let (i, j) = ((n % 2) as f32, (n / 2) as f32);
@@ -7820,13 +8033,16 @@ mod tests {
                 images: HashMap::from([((0, binding), level(0))]),
                 mips: HashMap::from([((0, binding), vec![level(1), level(2)])]),
                 quad,
+                sampler,
                 ..Inputs::default()
             });
             assert!(report.problems.is_empty(), "{:?}", report.problems);
-            (0..4)
+            let values = (0..4)
                 .map(|n| report.invocations[n][&registers[&4]][0] as u32)
-                .collect::<Vec<u32>>()
+                .collect::<Vec<u32>>();
+            (values, report.notes)
         };
+        let run = |step: f32| run_with(step, Sampler::default()).0;
         // 0.5 apart: 4 level-0 texels, λ = 2: level 2 (2 x 2), one texel a
         // pixel.
         assert_eq!(run(0.5), vec![2000, 2001, 2002, 2003]);
@@ -7844,6 +8060,38 @@ mod tests {
         // 1/16 apart: λ < 0, level 0.
         let level_zero = |u: f32, v: f32| (v * 8.0) as u32 * 8 + (u * 8.0) as u32;
         assert_eq!(run(0.0625)[0], level_zero(0.125, 0.125));
+        // The sampler's bias and clamps on the implicit λ: 0.25 apart (λ 1)
+        // biased by 1 reads level 2; 0.5 apart (λ 2) held to 1 reads level
+        // 1.
+        let biased = Sampler {
+            lod_bias: 1.0,
+            ..Sampler::default()
+        };
+        assert_eq!(run_with(0.25, biased).0, vec![2000, 2000, 2000, 2000]);
+        let held = Sampler {
+            max_lod: 1.0,
+            ..Sampler::default()
+        };
+        assert_eq!(
+            run_with(0.5, held).0,
+            vec![
+                level_one(0.125, 0.125),
+                level_one(0.625, 0.125),
+                level_one(0.125, 0.625),
+                level_one(0.625, 0.625)
+            ]
+        );
+        // Anisotropy is only recorded: the same texels, and a note.
+        let anisotropic = Sampler {
+            max_anisotropy: 16.0,
+            ..Sampler::default()
+        };
+        let (values, notes) = run_with(0.5, anisotropic);
+        assert_eq!(values, vec![2000, 2001, 2002, 2003]);
+        assert!(
+            notes.iter().any(|note| note.contains("anisotropic")),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -7903,14 +8151,7 @@ mod tests {
                 workgroup_count: [1, 1, 1],
                 images: [a, b, c].map(|n| ((0, n), image.clone())).into(),
                 samplers: HashMap::from([
-                    (
-                        (0, a),
-                        Sampler {
-                            linear: true,
-                            ..Sampler::default()
-                        }
-                        .repeat(),
-                    ),
+                    ((0, a), Sampler::default().linear().repeat()),
                     (
                         (0, b),
                         Sampler {
@@ -7998,10 +8239,7 @@ mod tests {
             assert!(report.problems.is_empty(), "{:?}", report.problems);
             f32::from_bits(report.invocations[0][&registers[&4]][0] as u32)
         };
-        let linear = Sampler {
-            linear: true,
-            ..Sampler::default()
-        };
+        let linear = Sampler::default().linear();
         // Nearest, then bilinear at the centre (the four texels' mean) and
         // at texel (0, 0)'s centre.
         assert_eq!(sample(0.5, 0.5, 0.0, Sampler::default()), 3.0);
@@ -8015,6 +8253,39 @@ mod tests {
             ..linear
         };
         assert_eq!(sample(0.0, 0.25, 0.0, repeat), 0.5);
+        // The mag filter at λ 0, the min filter above it (level 0 either
+        // way below λ 0.5).
+        let mag_only = Sampler {
+            mag_linear: true,
+            ..Sampler::default()
+        };
+        let min_only = Sampler {
+            min_linear: true,
+            ..Sampler::default()
+        };
+        assert_eq!(sample(0.5, 0.5, 0.0, mag_only), 1.5);
+        assert_eq!(sample(0.5, 0.5, 0.25, mag_only), 3.0);
+        assert_eq!(sample(0.5, 0.5, 0.0, min_only), 3.0);
+        assert_eq!(sample(0.5, 0.5, 0.25, min_only), 1.5);
+        // The sampler's bias moves λ (Lod 0 + 1: level 1; Lod 1 - 1: level
+        // 0), then its clamps hold it (min 1: level 1; max 0: level 0, and
+        // magnified).
+        let biased = |lod_bias: f32| Sampler {
+            lod_bias,
+            ..Sampler::default()
+        };
+        assert_eq!(sample(0.5, 0.5, 0.0, biased(1.0)), 10.0);
+        assert_eq!(sample(0.5, 0.5, 1.0, biased(-1.0)), 3.0);
+        let at_least_one = Sampler {
+            min_lod: 1.0,
+            ..Sampler::default()
+        };
+        assert_eq!(sample(0.5, 0.5, 0.0, at_least_one), 10.0);
+        let at_most_zero = Sampler {
+            max_lod: 0.0,
+            ..mag_only
+        };
+        assert_eq!(sample(0.5, 0.5, 1.0, at_most_zero), 1.5);
         // Trilinear at level 0.5: halfway between 1.5 and 10.
         let trilinear = Sampler {
             mip_linear: true,

@@ -27,7 +27,9 @@
 //!   ELEMENT KEYS` a sampler array element's (the sampler pool, set 1
 //!   binding 0, by the handle's sampler index), each from the defaults
 //!   (nearest, clamped to the edge, no compare op), the keys any of
-//!   `linear`/`nearest`, `mip_linear`/`mip_nearest`, `repeat`,
+//!   `linear`/`nearest`, `min=`/`mag=` (`linear` or `nearest`),
+//!   `mip_linear`/`mip_nearest`, `lod_bias=`, `min_lod=`, `max_lod=`,
+//!   `anisotropy=` (recorded only), `repeat`,
 //!   `address=U[,V[,W]]` (VkSamplerAddressMode numbers or names; a missing
 //!   axis takes the last), `border=W0,W1,W2,W3` (hex words as the shader
 //!   reads texels) and `compare=N` (VkCompareOp);
@@ -596,8 +598,11 @@ fn hex_range(text: &str) -> Option<std::ops::Range<u64>> {
     Some(number(start)?..number(end)?)
 }
 
-/// A `sampler` line's keys on `state`: `linear` or `nearest`, `mip_linear`
-/// or `mip_nearest`, `repeat` (every axis), `address=U[,V[,W]]`
+/// A `sampler` line's keys on `state`: `linear` or `nearest` (both
+/// filters), `min=` and `mag=` (`linear` or `nearest`, one filter),
+/// `mip_linear` or `mip_nearest`, `lod_bias=`, `min_lod=` and `max_lod=`
+/// (floats; a sample's λ gets the bias, then the clamps), `anisotropy=`
+/// (maxAnisotropy, recorded only), `repeat` (every axis), `address=U[,V[,W]]`
 /// (VkSamplerAddressMode numbers, or `repeat`, `mirrored_repeat`,
 /// `clamp_to_edge`, `clamp_to_border`, `mirror_clamp_to_edge`; a missing
 /// axis takes the last given), `border=W0,W1,W2,W3` (the border texel's
@@ -616,8 +621,8 @@ fn sampler_state(keys: &[&str], mut state: Sampler) -> Result<Sampler, String> {
     for key in keys {
         match key.split_once('=') {
             None => match *key {
-                "linear" => state.linear = true,
-                "nearest" => state.linear = false,
+                "linear" => state = state.linear(),
+                "nearest" => (state.mag_linear, state.min_linear) = (false, false),
                 "mip_linear" => state.mip_linear = true,
                 "mip_nearest" => state.mip_linear = false,
                 "repeat" => state = state.repeat(),
@@ -641,6 +646,29 @@ fn sampler_state(keys: &[&str], mut state: Sampler) -> Result<Sampler, String> {
                     ));
                 }
                 state.border = [words[0], words[1], words[2], words[3]];
+            }
+            Some((which @ ("min" | "mag"), filter)) => {
+                let linear = match filter {
+                    "linear" => true,
+                    "nearest" => false,
+                    _ => return Err(format!("sampler {which} filter `{filter}`")),
+                };
+                if which == "min" {
+                    state.min_linear = linear;
+                } else {
+                    state.mag_linear = linear;
+                }
+            }
+            Some((which @ ("lod_bias" | "min_lod" | "max_lod" | "anisotropy"), number)) => {
+                let number: f32 = number
+                    .parse()
+                    .map_err(|_| format!("sampler {which} `{number}`"))?;
+                match which {
+                    "lod_bias" => state.lod_bias = number,
+                    "min_lod" => state.min_lod = number,
+                    "max_lod" => state.max_lod = number,
+                    _ => state.max_anisotropy = number,
+                }
             }
             Some(("compare", op)) => {
                 state.compare = Some(
