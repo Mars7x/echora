@@ -6470,6 +6470,17 @@ impl Nvn {
                 {
                     vk::CompareOp::LESS_OR_EQUAL
                 }
+                // ECHORA_GPU_LESS_AS_LEQUAL=<fragment key>[,...] (debugging):
+                // the same for LESS (tells whether a pass meets depth an
+                // earlier pass already wrote exactly).
+                vk::CompareOp::LESS
+                    if super::debug_var("ECHORA_GPU_LESS_AS_LEQUAL").is_ok_and(|keys| {
+                        keys.split(',')
+                            .any(|key| key == format!("{:016x}", keys_for_note[1]))
+                    }) =>
+                {
+                    vk::CompareOp::LESS_OR_EQUAL
+                }
                 op => op,
             },
             viewport: [

@@ -1143,6 +1143,9 @@ pub struct Services {
     video_device: Option<Option<std::sync::Arc<echora_gpu::video::VideoDevice>>>,
     /// Pictures decoded and when the first was (ECHORA_MOVIE_RATE).
     av1_pictures: (u64, Option<std::time::Instant>, std::time::Instant),
+    /// ECHORA_MOVIE_SKIP_DECODE (debugging): the first picture decoded,
+    /// given back for every later submission without decoding.
+    skip_decode_picture: Option<Box<crate::av1::Picture>>,
     av1_errors: Vec<String>,
     /// The last 600 video decoder requests: command and leading argument
     /// bytes (hex); GetFrame (213) and syncpoint waits add what they did.
@@ -1280,6 +1283,7 @@ impl Default for Services {
             gpu_movie_failed: false,
             video_device: None,
             av1_pictures: (0, None, std::time::Instant::now()),
+            skip_decode_picture: None,
             av1_errors: Vec::new(),
             video_log: Default::default(),
             library_applets: Vec::new(),
@@ -4560,6 +4564,24 @@ impl Services {
     /// first use): the last picture it completes, if any. Failures are
     /// recorded (the first 16) and give no picture.
     fn decode_av1(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
+        // ECHORA_MOVIE_SKIP_DECODE (debugging, to reach the scene after the
+        // opening movie sooner): after the first picture, each submission
+        // gives back that picture without decoding. The application's
+        // decoder calls, fences and timing are unchanged; only the pictures
+        // it shows stop changing.
+        let skip = crate::nvn::debug_var_os("ECHORA_MOVIE_SKIP_DECODE").is_some();
+        if skip && let Some(picture) = &self.skip_decode_picture {
+            return Some(picture.clone());
+        }
+        let picture = self.decode_av1_decoded(bytes);
+        if skip && self.skip_decode_picture.is_none() {
+            self.skip_decode_picture.clone_from(&picture);
+        }
+        picture
+    }
+
+    /// `decode_av1` without ECHORA_MOVIE_SKIP_DECODE.
+    fn decode_av1_decoded(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
         let gpu = match self.decode_av1_gpu(bytes) {
             Some(Ok(pictures)) => Some(Ok(pictures)),
             Some(Err(error)) => {
