@@ -312,11 +312,10 @@ pub struct Nvn {
     /// Command handles by that order (least recently used first).
     #[serde(skip)]
     command_list_use: BTreeMap<u64, u64>,
-    /// The memory each finished list occupies: the command memory (pool,
-    /// offset, size) and control memory (address, size) its recording used,
-    /// by the used amounts the application is told. A handle stays valid
-    /// until memory overlapping either is added to a command buffer again
-    /// (NVN writes over it then).
+    /// The memory each finished list occupies by the host's model: its
+    /// command buffer, the command memory (pool, offset, size) and control
+    /// memory (address, size) its recording used, by the used amounts the
+    /// application is told (reported, not used to drop lists).
     #[serde(skip)]
     list_memory: BTreeMap<u64, (u64, [u64; 3], [u64; 2])>,
     /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
@@ -503,22 +502,16 @@ impl Nvn {
 }
 
 impl Nvn {
-    /// Forget a finished list whose memory the application reuses.
-    fn drop_command_list(&mut self, handle: u64) {
-        self.list_memory.remove(&handle);
-        if debug_var_os("ECHORA_STALE_LOG").is_some() {
-            self.dropped_lists
-                .insert(handle, (0, self.presented_frames));
-        }
-        if let Some((list, used, _)) = self.command_lists.remove(&handle) {
-            self.command_list_commands -= list.len();
-            self.command_list_use.remove(&used);
-            if debug_var_os("ECHORA_LIST_LOG").is_some() && big_vertex_bind(&list).is_some() {
-                eprintln!(
-                    "list memory reused present {} handle {handle:#x}",
-                    self.presented_frames
-                );
-            }
+    /// A list run again (submitted or called): most recently used, and
+    /// counted as reused (the resource cap's second chance).
+    fn touch_command_list(&mut self, handle: u64) {
+        if let Some((_, used, submits)) = self.command_lists.get_mut(&handle) {
+            *submits = submits.saturating_add(1);
+            self.command_list_clock += 1;
+            let previous = std::mem::replace(used, self.command_list_clock);
+            self.command_list_use.remove(&previous);
+            self.command_list_use
+                .insert(self.command_list_clock, handle);
         }
     }
 }
@@ -590,15 +583,15 @@ fn is_work_command(rest: &str) -> bool {
 }
 
 /// A resource cap on the command lists kept for resubmission (least
-/// recently used dropped first, counted in `capped_command_lists`). A list is
-/// otherwise kept until the memory it was recorded into is added again
-/// (`list_memory`): the game records state lists once while loading and
-/// calls them every frame of the scene after the opening movie, so dropping
-/// lists by age left the terrain without its vertex streams.
+/// recently submitted or called dropped first, counted in
+/// `capped_command_lists`); otherwise a list is kept until its handle is
+/// finalized. The game records state lists once while loading and calls
+/// them every frame of the scene after the opening movie, so dropping lists
+/// by age left the terrain without its vertex streams.
 const COMMAND_LIST_LIMIT: usize = 262_144;
 /// Commands those lists may hold in all (each carries its state
 /// snapshots: about 3 KiB).
-const COMMAND_LIMIT: usize = 600_000;
+const COMMAND_LIMIT: usize = 400_000;
 /// Lists of at most this many commands are not dropped for the command cap.
 const SMALL_COMMAND_LIST: usize = 16;
 
@@ -1400,43 +1393,12 @@ impl Nvn {
                 } else {
                     ("ControlMemory", x[2])
                 };
-                // The lists recorded into memory this overlaps are invalid
-                // now: the command buffer writes over them.
-                let overlaps = |a: u64, a_size: u64, b: u64, b_size: u64| {
-                    a < b.saturating_add(b_size) && b < a.saturating_add(a_size)
-                };
-                let reused: Vec<u64> = self
-                    .list_memory
-                    .iter()
-                    .filter(|(_, (buffer, command, control))| {
-                        // The command buffer's own earlier memory: others
-                        // reported the same chunks (the application sizes
-                        // its memory by the host's used amounts, which are
-                        // not the driver's), so overlap between buffers says
-                        // nothing about what the GPU would read.
-                        if *buffer != this {
-                            return false;
-                        }
-                        if key == "CommandMemory" {
-                            command[0] == x[1] && overlaps(command[1], command[2], x[2], x[3])
-                        } else {
-                            overlaps(control[0], control[1], x[1], x[2])
-                        }
-                    })
-                    .map(|(handle, _)| *handle)
-                    .collect();
-                if debug_var_os("ECHORA_STALE_LOG").is_some() && !reused.is_empty() {
-                    eprintln!(
-                        "memory add present {} cmdbuf {this:#x} {key} {:x?} drops {} lists, first {:x?}",
-                        self.presented_frames,
-                        &x[1..4],
-                        reused.len(),
-                        self.list_memory.get(&reused[0])
-                    );
-                }
-                for handle in reused {
-                    self.drop_command_list(handle);
-                }
+                // Lists recorded into memory this overlaps are kept: the
+                // application calls lists whose memory the host's model says
+                // it added again (the host's used amounts are not the
+                // driver's, so the model cannot say what the GPU would
+                // read). A list keeps its commands until it is finalized or
+                // the resource cap drops it.
                 let object = self.objects.get_mut(&this).unwrap();
                 let chunk = if key == "CommandMemory" {
                     [x[1], x[2], x[3], 0]
@@ -2789,6 +2751,7 @@ impl Nvn {
                             match self.command_lists.get(handle) {
                                 Some((list, ..)) => {
                                     let list = list.clone();
+                                    self.touch_command_list(*handle);
                                     if debug_var_os("ECHORA_LIST_LOG").is_some()
                                         && let Some(bind) = big_vertex_bind(&list)
                                     {
@@ -3036,6 +2999,7 @@ impl Nvn {
                         continue;
                     };
                     let list = list.clone();
+                    self.touch_command_list(handle);
                     self.call_depth += 1;
                     let result = list
                         .iter()
