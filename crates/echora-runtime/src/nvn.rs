@@ -1497,8 +1497,38 @@ impl Nvn {
                 if !commands.is_empty() {
                     self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
                 }
+                // NVN's handle is the list's place in control memory: a list
+                // recorded at the same place later has the same handle, and
+                // a stored handle runs whatever was recorded there last.
+                // The place is the control chunk's address plus the amount
+                // used when the recording began (from the chunk's start when
+                // memory was added during it), by the host's used amounts,
+                // which are the ones the application allocates by.
+                let state = |key: &str| {
+                    self.objects
+                        .get(&this)
+                        .and_then(|object| object.state.get(key))
+                        .map_or([0; 4], |args| args.x)
+                };
+                let (control_chunk, list_start) = (state("ControlMemoryChunk"), state("ListStart"));
+                let place = if control_chunk[0] == 0 {
+                    None
+                } else if list_start[3] == control_chunk[0] {
+                    Some(control_chunk[0] + list_start[1])
+                } else {
+                    Some(control_chunk[0])
+                };
                 self.next_command_handle += 1;
-                let handle = 0x4e56_0000_0000_0000 | self.next_command_handle;
+                let handle = 0x4e56_0000_0000_0000
+                    | place.map_or(self.next_command_handle, |place| {
+                        0x8000_0000_0000 | (place & 0x7fff_ffff_ffff)
+                    });
+                // The list recorded there before is replaced.
+                if let Some((old, used, _)) = self.command_lists.remove(&handle) {
+                    self.command_list_commands -= old.len();
+                    self.command_list_use.remove(&used);
+                    self.list_memory.remove(&handle);
+                }
                 // Only in a sequenced present: lists are recorded by the
                 // dozen per frame.
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() && self.sequencing() {
