@@ -3968,6 +3968,17 @@ impl Renderer {
             .map(|(texels, ..)| texels)
     }
 
+    /// As `read_target_level`, slice `slice` of a 3D target.
+    pub fn read_target_slice(
+        &mut self,
+        key: u64,
+        level: u32,
+        slice: u32,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.read_level(key, level, false, slice)
+            .map(|(texels, ..)| texels)
+    }
+
     /// Level 0 of a color target at the image's own (scaled) resolution,
     /// with that width and height: the frame as the window shows it.
     pub fn read_target_scaled(&mut self, key: u64) -> Result<(Vec<[f32; 4]>, u32, u32), String> {

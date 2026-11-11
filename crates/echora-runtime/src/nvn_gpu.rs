@@ -4792,7 +4792,13 @@ impl Nvn {
                 TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                     let target = renderer.existing_target(*key).ok_or("no such target")?;
                     let (width, height) = (target.width, target.height);
-                    (renderer.read_target_level(*key, 0)?, width, height, 1)
+                    // Every slice of a volume (the simulator reads them all).
+                    let depth = target.shape.depth();
+                    let mut texels = Vec::new();
+                    for slice in 0..depth {
+                        texels.extend(renderer.read_target_slice(*key, 0, slice)?);
+                    }
+                    (texels, width, height, depth)
                 }
             };
             let bytes: Vec<u8> = texels
@@ -4948,9 +4954,25 @@ impl Nvn {
                 continue;
             };
             let (width, height, format) = (target.width, target.height, target.format);
+            let depth = target.shape.depth();
             backend.renderer.flush()?;
             let Ok(texels) = backend.renderer.read_target_level(key, 0) else {
                 continue;
+            };
+            // A volume: also the mean first channel of a few slices
+            // (the trace's other figures are slice 0's).
+            let slices = if depth > 1 {
+                let mut means = Vec::new();
+                for slice in [1, depth / 8, depth / 2, depth - 1] {
+                    let Ok(texels) = backend.renderer.read_target_slice(key, 0, slice) else {
+                        continue;
+                    };
+                    let sum: f64 = texels.iter().map(|texel| f64::from(texel[0])).sum();
+                    means.push(format!("{slice}:{:.4}", sum / texels.len().max(1) as f64));
+                }
+                format!(" depth {depth} slices {}", means.join(" "))
+            } else {
+                String::new()
             };
             let count = texels.len().max(1) as f64;
             let nonfinite = texels
@@ -4982,7 +5004,7 @@ impl Nvn {
                 })
                 .map_or(String::new(), |texel| format!(" pixel {texel:?}"));
             eprintln!(
-                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}",
+                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}{slices}",
                 mean[0], mean[1], mean[2], mean[3]
             );
         }
