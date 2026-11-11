@@ -201,6 +201,10 @@ pub struct Inputs {
     /// An invocation (local index) and a variable (a register's id) whose
     /// every store `Report::traced` lists.
     pub trace: Option<(usize, u32)>,
+    /// 32-bit float operations flush denormal operands and results to a
+    /// zero of their sign, as RADV and NVK do in a module that declares no
+    /// denormal mode (else they are kept, IEEE's results).
+    pub flush_denormals32: bool,
 }
 
 /// A sampler's state (`Inputs::sampler`, `samplers`, `sampler_arrays`);
@@ -449,6 +453,9 @@ pub struct Report {
 /// A loaded module.
 #[derive(Debug)]
 pub struct Machine {
+    /// 32-bit float operations flush denormal operands and results
+    /// (`Inputs::flush_denormals32`, for the run in progress).
+    flush32: std::cell::Cell<bool>,
     types: HashMap<u32, Ty>,
     /// The result type of each constant.
     result_types: HashMap<u32, u32>,
@@ -643,6 +650,15 @@ impl Shared {
     }
 }
 
+/// `value` with a denormal flushed to a zero of its sign, when `flush`.
+fn flushed(value: f32, flush: bool) -> f32 {
+    if flush && value.is_subnormal() {
+        0.0f32.copysign(value)
+    } else {
+        value
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exponent = u32::from(bits >> 10 & 0x1f);
@@ -750,6 +766,7 @@ impl Machine {
             components: HashMap::new(),
             model: 0,
             step_file: None,
+            flush32: std::cell::Cell::new(false),
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
@@ -1598,6 +1615,7 @@ impl Machine {
 
     /// Runs workgroup `inputs.workgroup_id` of a dispatch.
     pub fn simulate(&self, inputs: &Inputs) -> Report {
+        self.flush32.set(inputs.flush_denormals32);
         let [x, y, z] = self.local_size;
         let quad = inputs.quad.len() == 4;
         let count = if quad { 4 } else { (x * y * z) as usize };
@@ -3312,11 +3330,18 @@ impl Machine {
             Ty::Int { width, .. } | Ty::Float { width } => width,
             _ => 32,
         };
+        if (matches!(scalar, Ty::Float { width: 64 })
+            || matches!(self.scalar(operand), Ty::Float { width: 64 }))
+            && !matches!(opcode, op::BITCAST | op::SELECT)
+        {
+            return self.double_arithmetic(opcode, width, operand, inputs);
+        }
         let lanes = inputs.first().map_or(1, Vec::len);
         let mut result = Vec::with_capacity(lanes);
+        let flush = self.flush32.get();
         for lane in 0..lanes {
             let x = |n: usize| inputs[n][lane.min(inputs[n].len() - 1)];
-            let f = |n: usize| f32::from_bits(x(n) as u32);
+            let f = |n: usize| flushed(f32::from_bits(x(n) as u32), flush);
             let i = |n: usize| x(n) as u32 as i32;
             // An operand as a signed integer of its own width.
             let signed = |value: u64| -> i64 {
@@ -3326,7 +3351,7 @@ impl Machine {
                     i64::from(value as u32 as i32)
                 }
             };
-            let fb = |v: f32| u64::from(v.to_bits());
+            let fb = |v: f32| u64::from(flushed(v, flush).to_bits());
             let b = |v: bool| u64::from(v);
             let value = match opcode {
                 op::I_ADD => x(0).wrapping_add(x(1)) & mask,
@@ -3488,6 +3513,61 @@ impl Machine {
         result
     }
 
+    /// An operation on or to 64-bit floats (a 32-bit float operand or
+    /// result, as `arithmetic`'s, flushed by `Inputs::flush_denormals32`).
+    fn double_arithmetic(&self, opcode: u16, width: u32, operand: u32, inputs: &[Value]) -> Value {
+        let flush = self.flush32.get();
+        let operand_float = match self.scalar(operand) {
+            Ty::Float { width } => Some(width),
+            _ => None,
+        };
+        let lanes = inputs.first().map_or(1, Vec::len);
+        (0..lanes)
+            .map(|lane| {
+                let x = |n: usize| inputs[n][lane.min(inputs[n].len() - 1)];
+                let d = |n: usize| match operand_float {
+                    Some(64) => f64::from_bits(x(n)),
+                    _ => f64::from(flushed(f32::from_bits(x(n) as u32), flush)),
+                };
+                let out = |v: f64| {
+                    if width == 64 {
+                        v.to_bits()
+                    } else {
+                        u64::from(flushed(v as f32, flush).to_bits())
+                    }
+                };
+                let b = |v: bool| u64::from(v);
+                match opcode {
+                    op::F_ADD => out(d(0) + d(1)),
+                    op::F_SUB => out(d(0) - d(1)),
+                    op::F_MUL => out(d(0) * d(1)),
+                    op::F_DIV => out(d(0) / d(1)),
+                    op::F_NEGATE => out(-d(0)),
+                    F_CONVERT => out(d(0)),
+                    op::CONVERT_U_TO_F => out(f64::from(x(0) as u32)),
+                    op::CONVERT_S_TO_F => out(f64::from(x(0) as u32 as i32)),
+                    op::CONVERT_F_TO_U => {
+                        let v = d(0);
+                        assert!(
+                            v.is_finite() && v > -1.0 && v < 4_294_967_296.0,
+                            "ConvertFToU of {v}"
+                        );
+                        u64::from(v as u32)
+                    }
+                    op::IS_NAN => b(d(0).is_nan()),
+                    op::IS_INF => b(d(0).is_infinite()),
+                    op::F_ORD_EQUAL => b(d(0) == d(1)),
+                    op::F_ORD_NOT_EQUAL => b(!d(0).is_nan() && !d(1).is_nan() && d(0) != d(1)),
+                    op::F_ORD_LESS_THAN => b(d(0) < d(1)),
+                    op::F_ORD_LESS_THAN_EQUAL => b(d(0) <= d(1)),
+                    op::F_ORD_GREATER_THAN => b(d(0) > d(1)),
+                    op::F_ORD_GREATER_THAN_EQUAL => b(d(0) >= d(1)),
+                    _ => panic!("the interpreter has no 64-bit float opcode {opcode}"),
+                }
+            })
+            .collect()
+    }
+
     fn half_arithmetic(&self, opcode: u16, ty: u32, inputs: &[Value]) -> Value {
         let lanes = inputs[0].len();
         let half_result = matches!(self.scalar(ty), Ty::Float { width: 16 });
@@ -3569,10 +3649,27 @@ impl Machine {
                 })
                 .collect();
         }
+        if matches!(self.scalar(ty), Ty::Float { width: 64 }) {
+            return (0..lanes)
+                .map(|lane| {
+                    let d = |n: usize| f64::from_bits(inputs[n][lane.min(inputs[n].len() - 1)]);
+                    match instruction {
+                        glsl::F_ABS => d(0).abs().to_bits(),
+                        glsl::N_MIN => d(0).min(d(1)).to_bits(),
+                        glsl::ROUND_EVEN => d(0).round_ties_even().to_bits(),
+                        glsl::FMA => d(0).mul_add(d(1), d(2)).to_bits(),
+                        _ => panic!(
+                            "the interpreter has no 64-bit GLSL.std.450 instruction {instruction}"
+                        ),
+                    }
+                })
+                .collect();
+        }
+        let flush = self.flush32.get();
         for lane in 0..lanes {
             let x = |n: usize| inputs[n][lane.min(inputs[n].len() - 1)] as u32;
-            let f = |n: usize| f32::from_bits(x(n));
-            let fb = |v: f32| u64::from(v.to_bits());
+            let f = |n: usize| flushed(f32::from_bits(x(n)), flush);
+            let fb = |v: f32| u64::from(flushed(v, flush).to_bits());
             let value = match instruction {
                 glsl::ROUND_EVEN => fb(f(0).round_ties_even()),
                 glsl::TRUNC => fb(f(0).trunc()),
@@ -4213,6 +4310,170 @@ mod tests {
                     assert_eq!(r[&5], (a * b).to_bits(), "FMUL {a} {b}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn non_ftz_float_operations_keep_denormals_on_a_host_that_flushes_them() {
+        // FFMA R3, R0, R1, R2; FADD R4, R0, R1; FMUL R5, R0, R1; FADD.SAT
+        // R7, R0, R1; and the same with .FTZ (bit 80) into R8-R10. Translated with f64
+        // (`Layout::float64`) and run on a host that flushes 32-bit
+        // denormals: without .FTZ, IEEE results (denormals kept, one
+        // rounding); with it, operands and results flushed.
+        let ops = |ftz: u128, base: u128| {
+            vec![
+                word(&[
+                    (0, 12, 0x223),
+                    (16, 8, base),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (64, 8, 2),
+                    (80, 1, ftz),
+                ]),
+                word(&[
+                    (0, 12, 0x221),
+                    (16, 8, base + 1),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (80, 1, ftz),
+                ]),
+                word(&[
+                    (0, 12, 0x220),
+                    (16, 8, base + 2),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (80, 1, ftz),
+                    (84, 3, 4),
+                ]),
+            ]
+        };
+        let mut program: Vec<u128> = ops(0, 3);
+        program.push(word(&[
+            (0, 12, 0x221),
+            (16, 8, 7),
+            (24, 8, 0),
+            (32, 8, 1),
+            (77, 1, 1),
+        ]));
+        program.extend(ops(1, 8));
+        let run_with = |inputs: [u32; 3], float64: bool| {
+            let mut words: Vec<u128> = inputs
+                .iter()
+                .enumerate()
+                .map(|(n, &value)| mov(n as u128, value))
+                .collect();
+            words.extend_from_slice(&program);
+            words.push(EXIT);
+            let code: Vec<_> = words.iter().map(|&raw| decode(raw)).collect();
+            let layout = Layout {
+                float64,
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                flush_denormals32: true,
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            move |n: u8| report.invocations[0][&registers[&n]][0] as u32
+        };
+        let flush = |x: f32| {
+            if x.is_subnormal() {
+                0.0f32.copysign(x)
+            } else {
+                x
+            }
+        };
+        let same = |got: u32, expected: f32| {
+            if expected.is_nan() {
+                f32::from_bits(got).is_nan()
+            } else {
+                got == expected.to_bits()
+            }
+        };
+        let values = [
+            f32::from_bits(1),
+            -f32::from_bits(3),
+            f32::from_bits(0x007f_ffff),
+            -f32::from_bits(0x0040_0001),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            2f32.powi(-75),
+            -3.0e-20,
+            0.5,
+            -1.0,
+            1.0 + f32::EPSILON,
+            3.0,
+            0.0,
+            -0.0,
+            1.0e30,
+            f32::INFINITY,
+        ];
+        let mut lost = 0;
+        for (n, &a) in values.iter().enumerate() {
+            for &b in &values {
+                let c = values[(n * 7 + 3) % values.len()];
+                let r = run_with([a.to_bits(), b.to_bits(), c.to_bits()], true);
+                let label = format!("{a:e} {b:e} {c:e}");
+                assert!(same(r(3), a.mul_add(b, c)), "FFMA {label}: {:#x}", r(3));
+                assert!(same(r(4), a + b), "FADD {label}: {:#x}", r(4));
+                assert!(same(r(5), a * b), "FMUL {label}: {:#x}", r(5));
+                let saturated = {
+                    let sum = a + b;
+                    if sum.is_nan() || sum <= 0.0 {
+                        0.0
+                    } else {
+                        sum.min(1.0)
+                    }
+                };
+                assert!(same(r(7), saturated), "FADD.SAT {label}: {:#x}", r(7));
+                let (fa, fb, fc) = (flush(a), flush(b), flush(c));
+                assert!(same(r(8), flush(fa.mul_add(fb, fc))), "FFMA.FTZ {label}");
+                assert!(same(r(9), flush(fa + fb)), "FADD.FTZ {label}");
+                assert!(same(r(10), flush(fa * fb)), "FMUL.FTZ {label}");
+                // Without f64 the host's flush shows where denormals meet.
+                let old = run_with([a.to_bits(), b.to_bits(), c.to_bits()], false);
+                if old(4) != r(4) || old(5) != r(5) {
+                    lost += 1;
+                }
+            }
+        }
+        assert!(
+            lost > 0,
+            "the old path should lose some denormals on this host"
+        );
+        // Random FFMAs near the denormal range and near rounding ties: one
+        // rounding of the exact a * b + c.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..400 {
+            let bits = |exponent: u64, word: u64| {
+                (word & 0x8000_0000) as u32
+                    | ((exponent as u32) << 23)
+                    | (word as u32 & 0x007f_ffff)
+            };
+            let w = next();
+            let a = f32::from_bits(bits(40 + w % 40, next()));
+            let b = f32::from_bits(bits(40 + (w >> 8) % 40, next()));
+            // c near -a*b (cancellation) or tiny (exponent 0..3).
+            let c = if w >> 16 & 1 == 0 {
+                -(a * b) * (1.0 + f32::EPSILON * ((w >> 20) % 8) as f32)
+            } else {
+                f32::from_bits(bits((w >> 24) % 3, next()))
+            };
+            let r = run_with([a.to_bits(), b.to_bits(), c.to_bits()], true);
+            assert!(
+                same(r(3), a.mul_add(b, c)),
+                "FFMA {a:e} {b:e} {c:e}: {:#x}",
+                r(3)
+            );
         }
     }
 
@@ -4916,6 +5177,7 @@ mod tests {
         let layout = Layout {
             loop_trace: true,
             vertex_trace: false,
+            float64: false,
             ..Layout::workgroup([32, 1, 1])
         };
         let translated = crate::compute::translate(&code, &layout).unwrap();

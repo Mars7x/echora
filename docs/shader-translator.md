@@ -395,6 +395,30 @@ ulp where its sign says the exact value lies. Lane ids, lane masks and the
 warp operations assume 32-lane subgroups, which the runtime requests
 (VK_EXT_subgroup_size_control) for every translated program.
 
+**Denormals.** The hardware keeps 32-bit denormals in float operations
+without `.FTZ` (bit 80) and flushes operands and results to a zero of their
+sign with it. Hosts that declare no float-controls mode flush 32-bit
+denormals: RADV (ACO starts with `denorm32` flushed) and NVK (NAK's
+"default FTZ on fp32"); the proprietary NVIDIA driver documents nothing.
+The translation declares no mode, so the 99.98% of the game's FADD, FMUL
+and FFMA that carry `.FTZ` (42.8M of 42.8M + 9,201, in 1,409 of 6,215
+programs) are exact on those hosts. With `Layout::float64` (the device runs
+64-bit floats) the others keep denormals: each is computed in 32 bits as
+before, and where an operand is a denormal (tested on its bits) or the
+result is below the smallest normal (or zero) again exactly through f64:
+denormal operands from their bits (mantissa times 2^-149), FMUL exact in
+f64, FADD rounded in f64 then to 32 bits (innocuous double rounding: 53 >=
+2 x 24 + 2), FFMA as the exact product plus c rounded to odd in f64 (by the
+two-sum's error) then to 32 bits (Boldo and Melquiond), the result below
+the smallest normal rounded to the 2^-149 grid with integers and `.SAT`
+applied to the bits, so no 32-bit float operation meets a denormal. FMUL
+with a scale, `.DNZ` and directed rounding stay as before. Each such
+instruction adds about 70 (FADD, FMUL) or 110 (FFMA) SPIR-V instructions,
+of which only the 32-bit operation and about 20 integer tests run without
+denormals. The flag is off until the runtime says the device has
+`shaderFloat64`. The simulator models a flushing host with
+`Inputs::flush_denormals32` and runs 64-bit floats.
+
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
 plain structured code, so the output aims for that:
 

@@ -66,6 +66,7 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             }),
             loop_trace: loop_trace(),
             vertex_trace: vertex_trace(),
+            float64: false,
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {
@@ -92,6 +93,7 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         mesh: None,
         loop_trace: loop_trace(),
         vertex_trace: false,
+        float64: false,
     };
     compute::translate(&code, &layout)
 }

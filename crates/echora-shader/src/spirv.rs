@@ -193,6 +193,7 @@ pub mod storage {
 pub mod capability {
     pub const SHADER: u32 = 1;
     pub const FLOAT16: u32 = 9;
+    pub const FLOAT64: u32 = 10;
     pub const INT64: u32 = 11;
     pub const IMAGE_GATHER_EXTENDED: u32 = 25;
     pub const SAMPLED_1D: u32 = 43;

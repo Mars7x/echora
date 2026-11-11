@@ -245,6 +245,7 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     Ok(emitter)
 }
 
+mod denormal;
 mod fetch;
 mod half;
 mod image;
@@ -332,6 +333,10 @@ pub struct Layout {
     /// `SpecMeaning::VertexTraceLow` and `VertexTraceHigh` give; see
     /// `vertex_trace` for the layout.
     pub vertex_trace: bool,
+    /// The device runs 64-bit floats (shaderFloat64): non-`.FTZ` FADD,
+    /// FMUL and FFMA keep denormals exactly through f64 (see `denormal`),
+    /// whatever the host does with 32-bit denormals.
+    pub float64: bool,
 }
 
 /// A task or mesh program's pipeline state.
@@ -389,6 +394,7 @@ impl Layout {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            float64: false,
         }
     }
 }
@@ -1489,6 +1495,16 @@ impl Emitter {
                 c,
                 modes,
                 dnz,
+            } if !dnz && self.keeps_denormals(modes) => {
+                self.keeping_denormals(index, d.0, denormal::Fused::Fma, &[a, b, c], modes)?
+            }
+            Op::Ffma {
+                d,
+                a,
+                b,
+                c,
+                modes,
+                dnz,
             } => {
                 let (a, b, c) = (
                     self.float(index, a)?,
@@ -1512,6 +1528,16 @@ impl Emitter {
                         residual.map(|r| self.value(op::SELECT, self.f32, &[zero, plus_zero, r]));
                 }
                 self.float_result(d.0, value, residual, modes)?;
+            }
+            Op::Fmul {
+                d,
+                a,
+                b,
+                modes,
+                scale,
+                dnz,
+            } if scale == 4 && !dnz && self.keeps_denormals(modes) => {
+                self.keeping_denormals(index, d.0, denormal::Fused::Mul, &[a, b], modes)?
             }
             Op::Fmul {
                 d,
@@ -1545,6 +1571,9 @@ impl Emitter {
                         residual.map(|r| self.value(op::SELECT, self.f32, &[zero, plus_zero, r]));
                 }
                 self.float_result(d.0, value, residual, modes)?;
+            }
+            Op::Fadd { d, a, b, modes } if self.keeps_denormals(modes) => {
+                self.keeping_denormals(index, d.0, denormal::Fused::Add, &[a, b], modes)?
             }
             Op::Fadd { d, a, b, modes } => {
                 let (a, b) = (self.float(index, a)?, self.float(index, b)?);
@@ -3682,6 +3711,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            float64: false,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3936,6 +3966,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            float64: false,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4831,6 +4862,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            float64: false,
         };
         valid_with(&words, &layout);
     }
