@@ -905,6 +905,12 @@ impl Renderer {
         let length = length.min(size.saturating_sub(at));
         let (target, offset) = self.ring_alloc(length, 16)?;
         let commands = self.commands()?;
+        // Reports still pending are written first (they come before this
+        // read in command order; the batch is otherwise resolved only at
+        // submission, after the copy). A condition gating the resolve's
+        // dispatch ends first; the next draw begins it again.
+        self.end_condition();
+        self.occlusion_resolve(commands);
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
