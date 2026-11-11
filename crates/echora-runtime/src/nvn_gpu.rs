@@ -2934,8 +2934,11 @@ impl Nvn {
                 depth: get("Depth").unwrap_or(1).max(1),
             },
             4 => ImageShape::D2 { layers: depth },
-            8 | 9 if depth >= 6 => ImageShape::Cube {
-                layers: depth / 6 * 6,
+            // TARGET_CUBEMAP (and arrays): six faces even when Depth is
+            // left at 1, as the upload path makes cubes; one 2D layer
+            // left a cube sample nothing to read.
+            8 | 9 => ImageShape::Cube {
+                layers: depth.max(6) / 6 * 6,
             },
             _ => ImageShape::D2 { layers: 1 },
         }
