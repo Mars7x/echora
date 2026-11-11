@@ -1163,6 +1163,12 @@ impl Nvn {
                 let ticks = core.memory.read_u64(x[1] + 8)?;
                 let nanoseconds = u128::from(ticks) * 1_000_000_000
                     / u128::from(echora_guest::PHYSICAL_COUNTER_FREQUENCY_HZ);
+                if debug_var_os("ECHORA_TIMESTAMP_LOG").is_some() {
+                    eprintln!(
+                        "timestamp read {:#x} ticks {ticks} ns {nanoseconds} lr {:#x}",
+                        x[1], core.cpu.regs[30]
+                    );
+                }
                 core.cpu.regs[0] = nanoseconds as u64;
                 return Ok(true);
             }
@@ -3579,6 +3585,13 @@ impl Nvn {
                         .map_err(stop)?
                 {
                     return Ok(());
+                }
+                if debug_var_os("ECHORA_TIMESTAMP_LOG").is_some() && command.x[1] & 0xffff_ffff != 1
+                {
+                    eprintln!(
+                        "timestamp report type {:#x} to {:#x} ticks {timestamp}",
+                        command.x[1], command.x[2]
+                    );
                 }
                 let mut report = [0u8; 16];
                 if command.x[1] & 0xffff_ffff == 1 {
