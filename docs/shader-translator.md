@@ -286,6 +286,33 @@ invocation, the times the loop budget ran out there, and its header's
 byte offset plus one (four words per loop, in emission order; nothing
 while the address is 0).
 
+**Vertex tracing.** With ECHORA_VERTEX_TRACE set at translation
+(debugging only, as loop tracing), vertex and mesh programs record what
+their first invocations computed in a buffer at the device address the
+specialization constants `VertexTraceLow` and `VertexTraceHigh` (ids 32
+and 33) give; nothing is written while the address is 0, the default.
+The buffer is 64 records of 128 u32 words (32 KiB), zeroed by the
+runtime. A vertex program writes record `VertexIndex - BaseVertex` (the
+index the draw read; an index of 64 or more is not traced) from the
+draw's first instance (`InstanceIndex == BaseInstance`); a mesh program
+writes record n from invocation n of workgroup (0, 0, 0). Record words:
+
+| words | contents |
+|---|---|
+| 0 | bit 0: the invocation reached its end; bit 1 (mesh): the workgroup wrote its outputs |
+| 1 | flags: bit 0 the position has a NaN component, bit 1 an infinite one, bit 8 + k texture entry k's result has a NaN word (as a float) |
+| 2, 3 | vertex: VertexIndex and InstanceIndex (raw); mesh: LocalInvocationIndex and WorkgroupId.x |
+| 4..8 | the position as written (x, y, z, w float bits); mesh: output vertex n's, from the stage buffer |
+| 8 + 6k .. 14 + 6k | texture entry k (k < 16): the instruction's byte offset in the code (after the 0x50-byte header) plus one (0: no entry), the times the invocation ran it, and the four result words of its last run (before the mask picks the written components; integer bits) |
+
+Entries are numbered by texture instruction (TEX, TLD, TLD4, TXD, TXQ,
+TMML) in the order the translation emits them, which is the same for
+every invocation of a program; the offset in each entry says which
+instruction it is. Writes are atomics on the invocation's own record, so
+later draws with the same program overwrite earlier ones. Stores from a
+vertex stage need the device feature vertexPipelineStoresAndAtomics (and
+bufferDeviceAddress, as loop tracing).
+
 **Exits and barriers.** On the hardware an exited thread stops counting
 toward BAR.SYNC and the others synchronise; in SPIR-V a barrier must sit
 in uniform control flow. So in a program with BAR, an exit whose other

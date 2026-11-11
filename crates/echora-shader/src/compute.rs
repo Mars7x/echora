@@ -254,6 +254,7 @@ mod memory;
 mod mesh;
 mod structure;
 mod texture;
+mod vertex_trace;
 
 /// The uniform registers that only ever hold one constant-bank word (each
 /// write a ULDC of that same word), by register: the bank and offset. A
@@ -326,6 +327,11 @@ pub struct Layout {
     /// the loop budget ran out there, and the loop header's byte offset in
     /// the program plus one (0: no such loop).
     pub loop_trace: bool,
+    /// Debugging: vertex and mesh programs record their first invocations'
+    /// positions and texture results in a buffer at the device address
+    /// `SpecMeaning::VertexTraceLow` and `VertexTraceHigh` give; see
+    /// `vertex_trace` for the layout.
+    pub vertex_trace: bool,
 }
 
 /// A task or mesh program's pipeline state.
@@ -382,6 +388,7 @@ impl Layout {
             matrices: MatrixPath::Subgroup,
             mesh: None,
             loop_trace: false,
+            vertex_trace: false,
         }
     }
 }
@@ -500,6 +507,12 @@ struct Emitter {
     dominators: Vec<(u32, u32)>,
     /// The OpString naming guest code in exit OpLines.
     guest_file: Option<u32>,
+    /// Vertex tracing: the buffer address's two specialization constants,
+    /// the invocation's record in the current function (a u64 value) and
+    /// the texture instructions with entries (`vertex_trace`).
+    vertex_trace_constants: Option<(u32, u32)>,
+    vertex_trace_record: Option<u32>,
+    vertex_trace_entries: Vec<usize>,
     /// The OpString naming guest instructions (`guest_lines`).
     step_file: Option<u32>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
@@ -577,6 +590,9 @@ impl Emitter {
             known: BTreeMap::new(),
             dominators: Vec::new(),
             guest_file: None,
+            vertex_trace_constants: None,
+            vertex_trace_record: None,
+            vertex_trace_entries: Vec::new(),
             step_file: None,
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
@@ -2795,6 +2811,7 @@ impl Emitter {
     /// directly; a target that starts no block stops the invocation).
     fn program(&mut self, code: &[Instruction], blocks: &[Block]) -> Result<(), Unsupported> {
         self.vertex_prologue(code);
+        self.vertex_trace_begin();
         let starts: BTreeSet<usize> = blocks.iter().map(|block| block.start).collect();
         let u32_ptr = self.u32_ptr;
         let bool_ptr = self.bool_ptr;
@@ -2939,6 +2956,7 @@ impl Emitter {
         self.function.emit(op::STORE, &[budget, less]);
         self.function.emit(op::BRANCH, &[header]);
         self.function.label(merge);
+        self.vertex_trace_end();
         self.fragment_outputs();
         self.function.emit(op::RETURN, &[]);
         Ok(())
@@ -3596,6 +3614,7 @@ mod tests {
             matrices: MatrixPath::Subgroup,
             mesh: None,
             loop_trace: false,
+            vertex_trace: false,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3849,6 +3868,7 @@ mod tests {
             matrices: MatrixPath::Subgroup,
             mesh: None,
             loop_trace: false,
+            vertex_trace: false,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4743,6 +4763,7 @@ mod tests {
             matrices: MatrixPath::Subgroup,
             mesh: None,
             loop_trace: false,
+            vertex_trace: false,
         };
         valid_with(&words, &layout);
     }

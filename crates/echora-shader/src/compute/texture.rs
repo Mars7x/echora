@@ -451,6 +451,7 @@ impl Emitter {
             }
             None => results,
         };
+        self.vertex_trace_texture(index, &results);
         // The written components, in mask order.
         let components: Vec<u32> = (0..4)
             .filter(|n| texture.mask >> n & 1 != 0)

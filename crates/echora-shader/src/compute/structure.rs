@@ -375,6 +375,7 @@ impl Emitter {
         };
         let root = builder.tree(0);
         self.vertex_prologue(code);
+        self.vertex_trace_begin();
         let zero = self.constant(0);
         let pending = self
             .function
@@ -691,7 +692,7 @@ impl Emitter {
 
     /// An atomic `opcode` with `value` on word `word` of the trace buffer
     /// at `address` (a u64 value), when the address is not 0.
-    fn trace_atomic(&mut self, address: u32, word: u32, opcode: u16, value: u32) {
+    pub(super) fn trace_atomic(&mut self, address: u32, word: u32, opcode: u16, value: u32) {
         self.memory.physical = true;
         self.module
             .capability(spirv::capability::PHYSICAL_STORAGE_BUFFER_ADDRESSES);
@@ -731,6 +732,7 @@ impl Emitter {
 
     /// The invocation's end: the fragment outputs, then return.
     fn leave(&mut self) {
+        self.vertex_trace_end();
         self.fragment_outputs();
         self.function.emit(op::RETURN, &[]);
     }

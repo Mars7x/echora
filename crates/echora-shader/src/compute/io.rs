@@ -168,7 +168,7 @@ impl Emitter {
     }
 
     /// A built-in output variable of type `ty`, declared once.
-    fn builtin_output(&mut self, builtin: u32, ty: u32) -> u32 {
+    pub(super) fn builtin_output(&mut self, builtin: u32, ty: u32) -> u32 {
         if let Some(&variable) = self.io.builtin_outputs.get(&builtin) {
             return variable;
         }

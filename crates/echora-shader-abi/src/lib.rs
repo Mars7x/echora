@@ -193,6 +193,11 @@ pub enum SpecMeaning {
     /// no tracing). See the translator's documentation of the layout.
     LoopTraceLow,
     LoopTraceHigh,
+    /// Debugging (programs translated with vertex tracing): the low and
+    /// high words of the device address of the vertex trace buffer (0: no
+    /// tracing). See the translator's documentation of the layout.
+    VertexTraceLow,
+    VertexTraceHigh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +338,10 @@ pub const LOOP_TRACE_LOW_SPEC_ID: u32 = 29;
 pub const LOOP_TRACE_HIGH_SPEC_ID: u32 = 30;
 /// The specialization constant id of `SpecMeaning::TexturePoolCapacity`.
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
+/// The specialization constant ids of `SpecMeaning::VertexTraceLow` and
+/// `VertexTraceHigh`.
+pub const VERTEX_TRACE_LOW_SPEC_ID: u32 = 32;
+pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 33;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 /// Entries per texture array, which the renderer gives programs as

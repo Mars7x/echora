@@ -4205,6 +4205,7 @@ mod tests {
         let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
         let layout = Layout {
             loop_trace: true,
+            vertex_trace: false,
             ..Layout::workgroup([32, 1, 1])
         };
         let translated = crate::compute::translate(&code, &layout).unwrap();
@@ -5927,6 +5928,49 @@ mod tests {
             positions,
             vec![0.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0, 1.0, 2.0, 2.0, 0.0, 1.0]
         );
+        // Traced (ECHORA_VERTEX_TRACE): record n holds invocation n's end
+        // and output vertex n's position, read from the stage buffer.
+        use echora_shader_abi::{VERTEX_TRACE_HIGH_SPEC_ID, VERTEX_TRACE_LOW_SPEC_ID};
+        let traced = crate::compute::translate(
+            &code,
+            &Layout {
+                vertex_trace: true,
+                ..layout
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::spirv::tests::validate(&traced.spirv), None);
+        let buffer = 0x8000u64;
+        let report = Machine::new(&traced.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            memory: BTreeMap::from([(buffer, vec![0; 64 * 512])]),
+            specialization: HashMap::from([
+                (VERTEX_TRACE_LOW_SPEC_ID, buffer as u32),
+                (VERTEX_TRACE_HIGH_SPEC_ID, 0),
+            ]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let words: Vec<u32> = report.memory[&buffer]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| u32::from_le_bytes(word))
+            .collect();
+        for n in 0..32usize {
+            let record = &words[n * 128..n * 128 + 8];
+            let position: Vec<f32> = if n < 3 {
+                vec![n as f32, 2.0, 0.0, 1.0]
+            } else {
+                vec![0.0; 4]
+            };
+            let expected: Vec<u32> = [3, 0, n as u32, 0]
+                .into_iter()
+                .chain(position.iter().map(|value| value.to_bits()))
+                .collect();
+            assert_eq!(record, expected, "record {n}");
+        }
+        assert!(words[32 * 128..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -6574,6 +6618,109 @@ mod tests {
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         let read = |n: u8| report.invocations[0][&registers[&n]][0] as u32;
         assert_eq!((read(0), read(1)), (5504, 0));
+    }
+
+    #[test]
+    fn traced_vertex_programs_record_their_position_and_texture_results() {
+        use echora_shader_abi::{Stage, VERTEX_TRACE_HIGH_SPEC_ID, VERTEX_TRACE_LOW_SPEC_ID};
+        // TLD4.R (2D, handle c[0x0][0x40]) R4, R0; AST.128 a[0x70], R4;
+        // AST a[0x7c], R8 (w = NaN).
+        let gather = word(&[
+            (0, 12, 0xb63),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 1),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+        ]);
+        let ast = |data: u128, address: u128, count: u128| {
+            word(&[
+                (0, 12, 0x322),
+                (24, 8, 255),
+                (32, 8, data),
+                (40, 10, address),
+                (64, 8, 255),
+                (74, 2, count - 1),
+            ])
+        };
+        let program = [
+            mov(0, 0.5f32.to_bits()),
+            mov(1, 0.25f32.to_bits()),
+            mov(8, f32::NAN.to_bits()),
+            gather,
+            ast(4, 0x70, 4),
+            ast(8, 0x7c, 1),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            stage: Stage::Vertex,
+            vertex_trace: true,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let texture = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap();
+        let texels: Vec<[u32; 4]> = (0..16u32).map(|n| [n, 0, 0, 0]).collect();
+        let buffer = 0x8000u64;
+        let run = |instance: u64| {
+            Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, texture.binding),
+                    Image {
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        layers: 1,
+                        texels: texels.clone(),
+                    },
+                )]),
+                // Index 10 of a draw with base vertex 5494.
+                builtins: HashMap::from([
+                    (42, vec![5504]),
+                    (4424, vec![5494]),
+                    (43, vec![instance]),
+                    (4425, vec![3]),
+                ]),
+                memory: BTreeMap::from([(buffer, vec![0; 64 * 512])]),
+                specialization: HashMap::from([
+                    (VERTEX_TRACE_LOW_SPEC_ID, buffer as u32),
+                    (VERTEX_TRACE_HIGH_SPEC_ID, 0),
+                ]),
+                ..Inputs::default()
+            })
+        };
+        let report = run(3);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let words: Vec<u32> = report.memory[&buffer]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| u32::from_le_bytes(word))
+            .collect();
+        let record = &words[10 * 128..11 * 128];
+        // Component 0 of the texels around (2.0, 1.0): (1,1) (2,1) (2,0)
+        // (1,0), texel n = 4y + x.
+        let gathered = [5, 6, 2, 1];
+        assert_eq!(record[..4], [1, 1, 5504, 3]);
+        assert_eq!(record[4..7], gathered[..3]);
+        assert!(f32::from_bits(record[7]).is_nan());
+        // The gather at instruction 3 (byte 0x30), run once.
+        assert_eq!(record[8..14], [0x31, 1, 5, 6, 2, 1]);
+        assert!(record[14..].iter().all(|&word| word == 0));
+        assert!(words[..10 * 128].iter().all(|&word| word == 0));
+        // Another instance: not traced.
+        let report = run(4);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.memory[&buffer].iter().all(|&byte| byte == 0));
     }
 
     #[test]

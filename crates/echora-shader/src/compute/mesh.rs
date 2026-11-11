@@ -221,6 +221,16 @@ impl Emitter {
             self.function
                 .emit(op::EMIT_MESH_TASKS_EXT, &[count, one, one, payload]);
         } else {
+            self.vertex_trace_record = None;
+            let state = self.mesh.as_ref().expect("mesh variables");
+            let (attributes, attribute_words) = (state.attributes, state.attribute_words);
+            let vertex_lines = lines(&mesh.vertex_outputs);
+            self.vertex_trace_mesh_outputs(
+                attributes,
+                attribute_words,
+                &vertex_lines,
+                mesh.max_vertices,
+            );
             self.mesh_outputs(&mesh)?;
             self.function.emit(op::RETURN, &[]);
         }
@@ -244,7 +254,7 @@ impl Emitter {
     }
 
     /// Word `index` (a value) of an array of `length` words, 0 past it.
-    fn bounded_word(&mut self, array: u32, class: u32, index: u32, length: u32) -> u32 {
+    pub(super) fn bounded_word(&mut self, array: u32, class: u32, index: u32, length: u32) -> u32 {
         let last = self.constant(length - 1);
         let clamped = self.glsl(self.u32, glsl::U_MIN, &[index, last]);
         let value = self.word_at(array, class, clamped);
@@ -496,7 +506,13 @@ impl Emitter {
 
     /// Element `element` of the lines starting at word `start`: its index
     /// in the stage buffer's attributes, line `rank`.
-    fn line_index(&mut self, start: u32, line_count: u32, element: u32, rank: u32) -> u32 {
+    pub(super) fn line_index(
+        &mut self,
+        start: u32,
+        line_count: u32,
+        element: u32,
+        rank: u32,
+    ) -> u32 {
         let five = self.constant(5);
         let group = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[element, five]);
         let group_words = self.constant(line_count * GROUP);
