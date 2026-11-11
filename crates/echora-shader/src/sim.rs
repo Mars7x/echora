@@ -1824,6 +1824,7 @@ impl Machine {
 
     /// A read of `image`: a fetch, a nearest sample (level 0, clamped to
     /// the edge), a gather of `component`, a storage read, or a query.
+    #[allow(clippy::too_many_arguments)]
     fn image_read(
         &self,
         opcode: u16,
@@ -1831,6 +1832,7 @@ impl Machine {
         image: &Image,
         coordinate: &Value,
         component: usize,
+        offset: [i64; 2],
         ty: u32,
     ) -> Value {
         let (dim, arrayed) = self.image_shape(image_type);
@@ -1872,7 +1874,10 @@ impl Machine {
                     _ => 0,
                 };
                 if opcode == op::IMAGE_GATHER {
-                    let (i0, j0) = ((u - 0.5).floor() as i64, (v - 0.5).floor() as i64);
+                    let (i0, j0) = (
+                        (u - 0.5).floor() as i64 + offset[0],
+                        (v - 0.5).floor() as i64 + offset[1],
+                    );
                     [(i0, j0 + 1), (i0 + 1, j0 + 1), (i0 + 1, j0), (i0, j0)]
                         .iter()
                         .map(|&(i, j)| u64::from(image.texel(i, j, z)[component.min(3)]))
@@ -2188,7 +2193,36 @@ impl Machine {
                             } else {
                                 0
                             };
-                            self.image_read(opcode, image_type, &image, &coordinate, component, ty)
+                            // A gather's texel offset (image operands after
+                            // the component: Bias, Lod, Grad (two), then
+                            // ConstOffset or Offset).
+                            let mut offset = [0i64; 2];
+                            if opcode == op::IMAGE_GATHER && args.len() > 3 {
+                                let mask = args[3];
+                                let mut at = 4;
+                                for (bit, count) in [(1u32, 1usize), (2, 1), (4, 2)] {
+                                    if mask & bit != 0 {
+                                        at += count;
+                                    }
+                                }
+                                if mask & (0x8 | 0x10) != 0 {
+                                    let words = value(at);
+                                    for (n, slot) in offset.iter_mut().enumerate() {
+                                        *slot = i64::from(
+                                            words.get(n).copied().unwrap_or(0) as u32 as i32,
+                                        );
+                                    }
+                                }
+                            }
+                            self.image_read(
+                                opcode,
+                                image_type,
+                                &image,
+                                &coordinate,
+                                component,
+                                offset,
+                                ty,
+                            )
                         }
                         None => {
                             shared.note("reads of textures without dumped data give zeros");
@@ -5967,6 +6001,147 @@ mod tests {
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         let read = |n: u8| report.invocations[0][&registers[&n]][0] as u32;
         assert_eq!((read(0), read(1)), (5504, 0));
+    }
+
+    #[test]
+    fn gathers_pick_their_component_and_offset() {
+        // TLD4.c (2D, handle c[0x0][0x40]) R4, R0 (x, then y, or x and y
+        // then the packed offsets in R2): component c of the four texels
+        // around the point, in Vulkan's order (i0,j1) (i1,j1) (i1,j0)
+        // (i0,j0).
+        let gather = |component: u128, offsets: bool| {
+            word(&[
+                (0, 12, 0xb63),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, if offsets { 2 } else { 1 }),
+                (40, 14, 0x10),
+                (61, 3, 1),
+                (64, 8, 255),
+                (72, 4, 0xf),
+                (76, 1, u128::from(offsets)),
+                (81, 3, 7),
+                (87, 2, component),
+            ])
+        };
+        // Texel (x, y), component c: 100c + 10y + x.
+        let texels: Vec<[u32; 4]> = (0..16u32)
+            .map(|n| [0, 1, 2, 3].map(|c| 100 * c + 10 * (n / 4) + n % 4))
+            .collect();
+        // (2.0, 1.0) in texels: i0 = 1, j0 = 0.
+        let (x, y) = (0.5f32, 0.25f32);
+        for (component, offsets, (dx, dy)) in [
+            (1u32, false, (0i64, 0i64)),
+            (2, false, (0, 0)),
+            (1, true, (1, -1)),
+        ] {
+            let packed = (dx as u32 & 0xff) | (dy as u32 & 0xff) << 8;
+            let program = [
+                mov(0, x.to_bits()),
+                mov(1, y.to_bits()),
+                mov(2, packed),
+                gather(u128::from(component), offsets),
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let texture = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, texture.binding),
+                    Image {
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        layers: 1,
+                        texels: texels.clone(),
+                    },
+                )]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let (i0, j0) = (1 + dx, dy);
+            let value = |i: i64, j: i64| {
+                let (i, j) = (i.clamp(0, 3) as u32, j.clamp(0, 3) as u32);
+                100 * component + 10 * j + i
+            };
+            let expected = [
+                value(i0, j0 + 1),
+                value(i0 + 1, j0 + 1),
+                value(i0 + 1, j0),
+                value(i0, j0),
+            ];
+            let got: Vec<u32> = (4..8u8)
+                .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                .collect();
+            assert_eq!(got, expected, "component {component} offsets ({dx}, {dy})");
+        }
+    }
+
+    #[test]
+    fn explicit_gradient_samples_read_their_coordinates() {
+        // TXD (2D, handle c[0x0][0x40]) R4, R0 (x, y), R2 (dx/dx, dx/dy,
+        // dy/dx, dy/dy): the simulator samples level 0 nearest, so the
+        // texel at the coordinates whatever the gradients.
+        let txd = word(&[
+            (0, 12, 0xb6c),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0x3),
+            (81, 3, 7),
+        ]);
+        let texels: Vec<[u32; 4]> = (0..16u32)
+            .map(|n| [n, n + 100, 0, 0].map(|v| (v as f32).to_bits()))
+            .collect();
+        let gradient = (1.0f32 / 4.0).to_bits();
+        let program = [
+            mov(0, 0.875f32.to_bits()),
+            mov(1, 0.125f32.to_bits()),
+            mov(2, gradient),
+            mov(3, 0),
+            mov(5, 0),
+            mov(6, gradient),
+            txd,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let texture = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap();
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([(
+                (0, texture.binding),
+                Image {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    layers: 1,
+                    texels,
+                },
+            )]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        // Texel (3, 0): 3.0 and 103.0 in components 0 and 1 (mask 0x3).
+        let read = |n: u8| f32::from_bits(report.invocations[0][&registers[&n]][0] as u32);
+        assert_eq!((read(4), read(5)), (3.0, 103.0));
     }
 
     #[test]
