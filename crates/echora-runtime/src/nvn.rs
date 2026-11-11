@@ -1164,9 +1164,23 @@ impl Nvn {
                 let nanoseconds = u128::from(ticks) * 1_000_000_000
                     / u128::from(echora_guest::PHYSICAL_COUNTER_FREQUENCY_HZ);
                 if debug_var_os("ECHORA_TIMESTAMP_LOG").is_some() {
+                    // x19 is the caller's object where it keeps one
+                    // (main+0x3b4eb50 stores its frame timing at +0x108..0x150).
+                    let object = core.cpu.regs[19];
+                    let fields: Vec<String> = [0x108u64, 0x140, 0x148, 0x150]
+                        .iter()
+                        .map(|offset| {
+                            core.memory
+                                .read_u64(object + offset)
+                                .map_or("-".into(), |value| format!("{:#x}", value))
+                        })
+                        .collect();
                     eprintln!(
-                        "timestamp read {:#x} ticks {ticks} ns {nanoseconds} lr {:#x}",
-                        x[1], core.cpu.regs[30]
+                        "timestamp read {:#x} ticks {ticks} ns {nanoseconds} lr {:#x} now {} x19 {object:#x} {}",
+                        x[1],
+                        core.cpu.regs[30],
+                        core.counter,
+                        fields.join(" ")
                     );
                 }
                 core.cpu.regs[0] = nanoseconds as u64;
