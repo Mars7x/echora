@@ -6021,6 +6021,46 @@ impl Nvn {
                 data,
             });
         }
+        // ECHORA_FETCH_BEYOND=<stage key>[,...] (debugging): each bound
+        // stream's bytes at the draw's first vertex (base vertex and first
+        // index applied), whether or not they are inside the bound size.
+        if super::debug_var("ECHORA_FETCH_BEYOND").is_ok_and(|wanted| {
+            wanted
+                .split(',')
+                .any(|key| key == format!("{:016x}", keys.0) || key == format!("{:016x}", keys.1))
+        }) {
+            for index in 0..16 {
+                let (Some(bind), Some(props)) = (
+                    self.render.state.get(&format!("BindVertexBuffer/{index}")),
+                    stream_states.get(index),
+                ) else {
+                    continue;
+                };
+                let stride = value(props, "Stride");
+                if bind.x[2] == 0 {
+                    continue;
+                }
+                let vertex = (i64::from(first) + i64::from(base_vertex)).max(0) as u64;
+                let at = bind.x[2] + vertex * stride;
+                let words: Vec<f32> = self
+                    .gpu_bytes(core, at, 64)
+                    .unwrap_or_default()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| f32::from_le_bytes(*word))
+                    .collect();
+                eprintln!(
+                    "fetch beyond present {} {:016x}/{:016x} stream {index} at {:#x} size {:#x} stride {stride} vertex {vertex} -> {at:#x}: {words:?} state {props:?}",
+                    self.presented_frames, keys.0, keys.1, bind.x[2], bind.x[3]
+                );
+            }
+            eprintln!(
+                "fetch beyond present {} attributes {:?}",
+                self.presented_frames,
+                attribute_states.iter().take(4).collect::<Vec<_>>()
+            );
+        }
         if shifted {
             if matches!(indices, Indices::None) {
                 first -= vertex_start as u32;

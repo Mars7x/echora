@@ -656,6 +656,8 @@ impl Renderer {
         };
         let (ring, at) = self.ring_upload(&[0; 4], 4)?;
         let commands = self.commands()?;
+        // Reports not yet written are, before the condition reads one.
+        self.occlusion_resolve(commands);
         let copy = vk::BufferCopy {
             src_offset: offset,
             dst_offset: at,
@@ -704,7 +706,7 @@ impl Renderer {
     }
 
     /// End the active condition (outside a rendering pass).
-    fn end_condition(&mut self) {
+    pub(crate) fn end_condition(&mut self) {
         if !self.condition_active {
             return;
         }
@@ -1782,6 +1784,8 @@ impl Renderer {
     /// End and submit the current slot's command buffer.
     fn submit_current(&mut self) -> Result<(), String> {
         self.end_pass();
+        self.end_condition();
+        self.occlusion_before_submit(self.commands);
         // Ring bytes the host reads back (storage a draw wrote) are made
         // visible to it once the submission completes.
         if !self.pending_reads.is_empty() {
@@ -1845,8 +1849,6 @@ impl Renderer {
             }
         }
         self.submitted_labels = labels;
-        self.end_condition();
-        self.occlusion_before_submit(self.commands);
         if let Some(timer) = &self.timer {
             timer.end(&self.gpu.device, self.commands, self.fence);
         }
