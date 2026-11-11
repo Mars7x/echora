@@ -22,6 +22,9 @@ pub struct Gpu {
     /// VK_EXT_depth_clip_control is enabled: draws can take clip-space Z
     /// in [-1, 1] (OpenGL style) instead of [0, 1].
     pub depth_clip_control: bool,
+    /// occlusionQueryPrecise is enabled: occlusion queries count samples
+    /// (QUERY_CONTROL_PRECISE) rather than only whether any passed.
+    pub occlusion_query_precise: bool,
     /// The depthBiasClamp feature is enabled (otherwise a polygon offset's
     /// clamp must be 0).
     pub depth_bias_clamp: bool,
@@ -265,6 +268,7 @@ impl Gpu {
 
         let features = vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(core.robust_buffer_access != 0)
+            .occlusion_query_precise(core.occlusion_query_precise != 0)
             .shader_int64(core.shader_int64 != 0)
             .shader_int16(core.shader_int16 != 0)
             .shader_float64(core.shader_float64 != 0)
@@ -440,6 +444,7 @@ impl Gpu {
             shader_object,
             swapchain,
             depth_clip_control,
+            occlusion_query_precise: core.occlusion_query_precise != 0,
             depth_bias_clamp: core.depth_bias_clamp != 0,
             compute_subgroup_32,
             buffer_device_address,

@@ -69,6 +69,9 @@ pub(crate) struct Occlusion {
     sums_address: u64,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// PRECISE where the device enables occlusionQueryPrecise (counts, as
+    /// SAMPLES_PASSED reports them); else none.
+    control: vk::QueryControlFlags,
 }
 
 /// Plan entries each slot may use: every report and one accumulator entry
@@ -146,6 +149,11 @@ impl Occlusion {
             sums,
             layout,
             pipeline,
+            control: if renderer.gpu.occlusion_query_precise {
+                vk::QueryControlFlags::PRECISE
+            } else {
+                vk::QueryControlFlags::empty()
+            },
         })
     }
 
@@ -217,7 +225,7 @@ impl Occlusion {
         // and unused since the slot's queries were last freed.
         unsafe {
             device.cmd_reset_query_pool(commands, self.pool, query, 1);
-            device.cmd_begin_query(commands, self.pool, query, vk::QueryControlFlags::PRECISE);
+            device.cmd_begin_query(commands, self.pool, query, self.control);
         }
         self.active = Some(query);
     }
