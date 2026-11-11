@@ -4577,6 +4577,40 @@ mod tests {
                 );
             }
         }
+        // Mesa codegen's manual TXD on GV100 (GM107LoweringPass, emitted by
+        // CodeEmitterGV100 with codes 1 and 2 swapped, lane 0 at bits 6-7):
+        // QUADOP(MOV2, ADD, MOV2, ADD) 0xcc and QUADOP(MOV2, MOV2, ADD, ADD)
+        // 0xf0, ADD a + b and MOV2 b; then the game's other patterns.
+        // FSWZADD R4, R5 (a = 0.5), R1.
+        for pattern in [0xccu32, 0xf0, 0xeb, 0x1e, 0x4a, 0x9f] {
+            let swizzle = word(&[
+                (0, 12, 0x822),
+                (16, 8, 4),
+                (24, 8, 5),
+                (32, 8, u128::from(pattern)),
+                (64, 8, 1),
+            ]);
+            let (registers, _, problems) = run_group(
+                8,
+                &[0, 0, 1.0f32.to_bits(), 0, 0, 0.5f32.to_bits()],
+                &[lane, value, swizzle],
+            );
+            assert!(problems.is_empty(), "{problems:?}");
+            for (n, r) in registers.iter().enumerate() {
+                let (a, b) = (0.5f32, 2f32.powi(n as i32));
+                let expected = match pattern >> (6 - 2 * (n % 4)) & 3 {
+                    0 => a + b,
+                    1 => a - b,
+                    2 => b - a,
+                    _ => b,
+                };
+                assert_eq!(
+                    f32::from_bits(r[&4]),
+                    expected,
+                    "pattern {pattern:#x} lane {n}"
+                );
+            }
+        }
     }
 
     #[test]
