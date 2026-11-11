@@ -450,6 +450,17 @@ pub struct RenderState {
 /// Recorded commands that only change render state (SetRenderTargets,
 /// SetScissor and ClearColor have their own host execution). They execute by
 /// updating `RenderState::state`.
+/// ECHORA_LIST_LOG (debugging): a list's first vertex buffer bind of 64 KiB
+/// or more (slot, address, size), which marks the lists worth following.
+fn big_vertex_bind(commands: &[Command]) -> Option<(u64, u64, u64)> {
+    commands
+        .iter()
+        .find(|command| {
+            command.name == "nvnCommandBufferBindVertexBuffer" && command.x[3] >= 0x1_0000
+        })
+        .map(|command| (command.x[1], command.x[2], command.x[3]))
+}
+
 impl Nvn {
     /// The device's depth mode (nvnDeviceSetDepthMode): 0 NEAR_IS_MINUS_W,
     /// 1 NEAR_IS_ZERO; NVN's default, 0, until the application sets one.
@@ -1416,6 +1427,15 @@ impl Nvn {
                     );
                     self.gpu_note(note);
                 }
+                if debug_var_os("ECHORA_LIST_LOG").is_some()
+                    && let Some(bind) = big_vertex_bind(&commands)
+                {
+                    eprintln!(
+                        "list recorded present {} cmdbuf {this:#x} handle {handle:#x} commands {} bind {bind:x?}",
+                        self.presented_frames,
+                        commands.len()
+                    );
+                }
                 self.command_list_clock += 1;
                 self.command_list_commands += commands.len();
                 self.command_lists.insert(
@@ -1447,6 +1467,14 @@ impl Nvn {
                         }
                     }
                     if let Some((list, ..)) = self.command_lists.remove(&oldest) {
+                        if debug_var_os("ECHORA_LIST_LOG").is_some()
+                            && let Some(bind) = big_vertex_bind(&list)
+                        {
+                            eprintln!(
+                                "list evicted present {} handle {oldest:#x} bind {bind:x?}",
+                                self.presented_frames
+                            );
+                        }
                         self.command_list_commands -= list.len();
                     }
                 }
@@ -1489,6 +1517,14 @@ impl Nvn {
                     };
                     *submits = submits.saturating_add(1);
                     let list = list.clone();
+                    if debug_var_os("ECHORA_LIST_LOG").is_some()
+                        && let Some(bind) = big_vertex_bind(&list)
+                    {
+                        eprintln!(
+                            "list submitted present {} handle {handle:#x} bind {bind:x?}",
+                            self.presented_frames
+                        );
+                    }
                     // Submitted again: most recently used.
                     self.command_list_clock += 1;
                     let previous = std::mem::replace(used, self.command_list_clock);
@@ -2568,6 +2604,14 @@ impl Nvn {
                             match self.command_lists.get(handle) {
                                 Some((list, ..)) => {
                                     let list = list.clone();
+                                    if debug_var_os("ECHORA_LIST_LOG").is_some()
+                                        && let Some(bind) = big_vertex_bind(&list)
+                                    {
+                                        eprintln!(
+                                            "list called present {} handle {handle:#x} bind {bind:x?}",
+                                            self.presented_frames
+                                        );
+                                    }
                                     self.pending.get_mut(&queue).unwrap().push_front(
                                         QueueItem::List {
                                             commands: list,

@@ -6339,8 +6339,14 @@ impl Nvn {
             // NVN's FrontFace: 0 clockwise, 1 counter-clockwise, in window
             // coordinates (the upper-left origin's, as Vulkan's; the other
             // way the Pokedex showed its back cover and Ditto its inside).
-            front_face: match arg(&polygon, "FrontFace", 0).unwrap_or(1) {
-                0 => vk::FrontFace::CLOCKWISE,
+            // ECHORA_GPU_INVERT_FACE (debugging): every draw's front face
+            // the other way (tests the facing convention against the
+            // picture).
+            front_face: match (
+                arg(&polygon, "FrontFace", 0).unwrap_or(1),
+                super::debug_var_os("ECHORA_GPU_INVERT_FACE").is_some(),
+            ) {
+                (0, false) | (1.., true) => vk::FrontFace::CLOCKWISE,
                 _ => vk::FrontFace::COUNTER_CLOCKWISE,
             },
             polygon_mode: match arg(&polygon, "PolygonMode", 0).unwrap_or(2) {
