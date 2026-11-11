@@ -2961,9 +2961,12 @@ impl Nvn {
     /// storage is the traced one; draws, clears and copies over it are
     /// logged.
     pub(super) fn depth_traced(&self, texture: u64) -> bool {
+        // ECHORA_DEPTH_TRACE=<storage>[,...].
         super::debug_var("ECHORA_DEPTH_TRACE").is_ok_and(|wanted| {
-            u64::from_str_radix(wanted.trim_start_matches("0x"), 16).ok()
-                == self.texture_storage(texture)
+            let storage = self.texture_storage(texture);
+            wanted.split(',').any(|item| {
+                u64::from_str_radix(item.trim().trim_start_matches("0x"), 16).ok() == storage
+            })
         })
     }
 
@@ -3008,6 +3011,12 @@ impl Nvn {
         };
         let from = target(self, from).ok_or("source is not a render target")?;
         let to = target(self, to).unwrap_or(to);
+        if self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]) {
+            eprintln!(
+                "depth trace present {} copy resolved {from:x} -> {to:x} source {source:?} destination {destination:?}",
+                self.presented_frames
+            );
+        }
         self.ensure_render_target(to)?;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.defined(to);
