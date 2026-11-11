@@ -3196,12 +3196,13 @@ impl Nvn {
         }
         // Commands that read or write guest memory themselves see earlier
         // dispatches' results in place (draws and dispatches resolve what
-        // they read).
+        // they read; ReportCounter resolves only the report it writes on
+        // the CPU, as a resolve of everything here was a submission and a
+        // wait per counted object).
         if matches!(
             command.name.as_str(),
             "nvnCommandBufferCopyBufferToTexture"
                 | "nvnCommandBufferCopyTextureToTexture"
-                | "nvnCommandBufferReportCounter"
                 | "nvnCommandBufferClearBuffer"
         ) {
             if let Err(message) = self.resolve_storage(core, None) {
@@ -3613,6 +3614,10 @@ impl Nvn {
                         command.x[1], command.x[2]
                     );
                 }
+                // Written on the CPU: earlier GPU writes to the slot land
+                // first, so this one is the newest.
+                self.resolve_storage(core, Some(to..to + 16))
+                    .map_err(|message| stop(format!("{}: {message}", command.name)))?;
                 let mut report = [0u8; 16];
                 if command.x[1] & 0xffff_ffff == 1 {
                     report[..8].copy_from_slice(&self.render.samples_passed.to_le_bytes());
