@@ -3254,13 +3254,17 @@ impl Nvn {
             )
         };
         let mut c0 = vec![0u8; (table_end as usize).max(0x100)];
-        // The 16-byte head: the dispatch's workgroup counts (x, y, z), which
-        // programs read to size their work (a reduction's 1 / invocation
-        // count). An indirect dispatch arrives here with the counts already
-        // read; one the GPU reads itself (`indirect` below) keeps zeros.
+        // The 16-byte head: the table's byte length, then the dispatch's
+        // workgroup counts (x, y, z), which programs read to size their
+        // work (a reduction's 1 / invocation count). The SDK's own buffers
+        // under Lichii read [0xb0, 8, 9, 12] for an 8x9x12 dispatch whose
+        // tables end at 0xb0. An indirect dispatch the GPU reads itself
+        // (`indirect` below) keeps zero counts.
+        c0[..4].copy_from_slice(&table_end.to_le_bytes());
         if !command.name.ends_with("DispatchComputeIndirect") {
             for (axis, count) in command.x[1..4].iter().enumerate() {
-                c0[axis * 4..axis * 4 + 4].copy_from_slice(&(*count as u32).to_le_bytes());
+                let at = 4 + axis * 4;
+                c0[at..at + 4].copy_from_slice(&(*count as u32).to_le_bytes());
             }
         }
         // After the head: root tables 0-7 (words pushed with
