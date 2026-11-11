@@ -6693,7 +6693,14 @@ impl Nvn {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        // ECHORA_DUMP_DRAW_BASE=N: only draws with base vertex N (the same
+        // patch drawn by two programs, compared in the simulator).
+        let base_wanted = super::debug_var("ECHORA_DUMP_DRAW_BASE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .is_none_or(|wanted| wanted == base_vertex);
         let stage_dump = (self.presented_frames >= dump_from
+            && base_wanted
             && super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
                 wanted
                     .split(',')
@@ -6830,8 +6837,8 @@ impl Nvn {
         }
         // ECHORA_DUMP_DRAW=<fragment key>[,...] (debugging): the first draw
         // of each listed fragment program, for the simulator (`dump_draw`).
-        if let Some(wanted) =
-            super::debug_var_os("ECHORA_DUMP_DRAW").filter(|_| self.presented_frames >= dump_from)
+        if let Some(wanted) = super::debug_var_os("ECHORA_DUMP_DRAW")
+            .filter(|_| self.presented_frames >= dump_from && base_wanted)
             && wanted
                 .to_string_lossy()
                 .split(',')
