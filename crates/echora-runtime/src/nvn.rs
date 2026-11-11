@@ -4231,6 +4231,20 @@ fn record_command(
         states: Default::default(),
     };
     capture(&mut command, core)?;
+    // ECHORA_RECORD_LOG=<text>[,...] (debugging): each recorded command
+    // whose name contains one of them, as the application records it: the
+    // command buffer, the arguments and the guest's return address (the
+    // code that issued it).
+    if let Ok(wanted) = debug_var("ECHORA_RECORD_LOG")
+        && wanted.split(',').any(|part| rest.contains(part))
+    {
+        eprintln!(
+            "record {:#x} {rest} x {:x?} from {:#x}",
+            x[0],
+            &x[1..8],
+            x[30]
+        );
+    }
     // CallCommands / CopyCommands(cmd, int count, const
     // NVNcommandHandle* handles): the handles are read now.
     if matches!(rest, "CallCommands" | "CopyCommands") {
