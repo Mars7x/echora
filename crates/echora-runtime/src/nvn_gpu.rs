@@ -5479,7 +5479,12 @@ impl Nvn {
                 let Some(&(buffer, reported)) = backend.vertex_traces.get(&trace) else {
                     continue;
                 };
-                if self.presented_frames < reported + 60 {
+                // ECHORA_VERTEX_TRACE_REPORT_EVERY=N presents (60).
+                let every = super::debug_var("ECHORA_VERTEX_TRACE_REPORT_EVERY")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(60);
+                if self.presented_frames < reported + every {
                     continue;
                 }
                 let words: Vec<u32> = backend
