@@ -6369,7 +6369,7 @@ impl Nvn {
                 .collect();
             uniform_summary.sort();
             let line = format!(
-                "trace draw {:016x}/{:016x} {:?} count {count} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {:?} count {count} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
@@ -6395,6 +6395,7 @@ impl Nvn {
                 fixed.depth_write,
                 fixed.depth_compare,
                 fixed.viewport,
+                fixed.scissor,
                 colors,
                 attributes
                     .iter()
