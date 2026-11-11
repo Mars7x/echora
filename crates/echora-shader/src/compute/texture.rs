@@ -560,16 +560,19 @@ impl Emitter {
         // Texel offsets: a gather takes them as an operand; a fetch adds
         // them to its coordinates, and a sample adds them scaled by the
         // level's size (Vulkan takes only constant offsets there).
+        // Packed signed offsets: 8 bits a component for TLD4, 4 for the
+        // others (as NAK packs them: nak_nir_lower_tex.c).
+        let gather = matches!(texture.op, TextureOp::Gather { .. });
+        let field = if gather { 8 } else { 4 };
         let offsets: Option<Vec<u32>> = packed_offsets.map(|packed| {
-            let four = self.constant(4);
+            let width = self.constant(field);
             (0..spatial as u32)
                 .map(|n| {
-                    let at = self.constant(n * 4);
-                    self.value(op::BIT_FIELD_S_EXTRACT, self.u32, &[packed, at, four])
+                    let at = self.constant(n * field);
+                    self.value(op::BIT_FIELD_S_EXTRACT, self.u32, &[packed, at, width])
                 })
                 .collect()
         });
-        let gather = matches!(texture.op, TextureOp::Gather { .. });
         // Only fragment programs have derivatives for an implicit level.
         let implicit =
             self.stage == echora_shader_abi::Stage::Fragment && matches!(texture.lod, 0 | 2);
