@@ -146,12 +146,8 @@ impl Renderer {
                     .textures
                     .get(&binding)
                     .ok_or_else(|| format!("no texture for compute binding {binding}"))?;
-                let image_view = self.texture_view_swizzled(
-                    source,
-                    descriptor.texture_type,
-                    sampler.components,
-                    sampler.format,
-                )?;
+                let image_view =
+                    self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
                 let sampler = self.sampler(sampler)?;
                 images.push((
                     binding,

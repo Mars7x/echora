@@ -1080,11 +1080,15 @@ impl Renderer {
         &mut self,
         source: &crate::draw::TextureSource,
         texture_type: u32,
-        components: vk::ComponentMapping,
-        format: Option<vk::Format>,
+        sampler: &crate::draw::Sampler,
     ) -> Result<vk::ImageView, String> {
         use ash::vk::Handle;
+        let (components, format) = (sampler.components, sampler.format);
         let plain = self.texture_view(source, texture_type)?;
+        let plain = match sampler.view_levels {
+            Some((base, count)) if count > 0 => self.level_view_of(plain, base, count)?,
+            _ => plain,
+        };
         let identity = |part: vk::ComponentSwizzle| part == vk::ComponentSwizzle::IDENTITY;
         let Some(info) = self.view_infos.get(&plain).copied() else {
             return Ok(plain);
@@ -1122,6 +1126,45 @@ impl Renderer {
             .map_err(vk_error("vkCreateImageView"))?;
         self.extra_views.insert(cache, view);
         Ok(view)
+    }
+
+    /// A view of levels `base`.. (`count` of them) of what `view` shows,
+    /// as an NVN texture view selecting them: its level 0 is `base`.
+    fn level_view_of(
+        &mut self,
+        view: vk::ImageView,
+        base: u32,
+        count: u32,
+    ) -> Result<vk::ImageView, String> {
+        let Some(info) = self.view_infos.get(&view).copied() else {
+            return Ok(view);
+        };
+        let levels = info.range.level_count.max(1);
+        let base = base.min(levels - 1);
+        let count = count.min(levels - base);
+        if base == 0 && count == levels {
+            return Ok(view);
+        }
+        let packed = base | count << 5 | (info.view_type.as_raw() as u32) << 10;
+        let cache = (info.image, -(1 << 29) - packed as i32);
+        if let Some(existing) = self.extra_views.get(&cache) {
+            return Ok(*existing);
+        }
+        let create = vk::ImageViewCreateInfo::default()
+            .image(info.image)
+            .view_type(info.view_type)
+            .format(info.format)
+            .subresource_range(vk::ImageSubresourceRange {
+                base_mip_level: info.range.base_mip_level + base,
+                level_count: count,
+                ..info.range
+            });
+        // SAFETY: the image is live; the view is destroyed with it.
+        let selected = unsafe { self.gpu.device.create_image_view(&create, None) }
+            .map_err(vk_error("vkCreateImageView"))?;
+        self.extra_views.insert(cache, selected);
+        self.view_infos.insert(selected, ViewInfo::of(&create));
+        Ok(selected)
     }
 
     /// Note how a new target's own views were made (see `view_infos`).

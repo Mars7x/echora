@@ -208,12 +208,9 @@ impl Renderer {
             kinds.push((entry.texture, integer));
             for (kind, array) in arrays(shape, integer) {
                 // A type the texture has no view of stays null.
-                let Ok(view) = self.texture_view_swizzled(
-                    &entry.source,
-                    kind,
-                    entry.sampler_state.components,
-                    entry.sampler_state.format,
-                ) else {
+                let Ok(view) =
+                    self.texture_view_swizzled(&entry.source, kind, &entry.sampler_state)
+                else {
                     continue;
                 };
                 wanted.push((array, entry.texture, view.as_raw()));

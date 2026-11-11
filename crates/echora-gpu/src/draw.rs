@@ -234,6 +234,9 @@ pub struct Sampler {
     /// A texture view's format, when it differs from the texture's (its
     /// sRGB twin); not part of the Vulkan sampler.
     pub format: Option<vk::Format>,
+    /// A texture view's mip levels (base, count) of an upload; not part of
+    /// the Vulkan sampler (one guest sampler serves textures of any size).
+    pub view_levels: Option<(u32, u32)>,
 }
 
 impl Default for Sampler {
@@ -247,6 +250,7 @@ impl Default for Sampler {
             lod: [0.0, vk::LOD_CLAMP_NONE, 0.0],
             components: vk::ComponentMapping::default(),
             format: None,
+            view_levels: None,
         }
     }
 }
@@ -666,12 +670,8 @@ impl Renderer {
                                 descriptor.binding
                             ));
                         };
-                        let view = self.texture_view_swizzled(
-                            source,
-                            descriptor.texture_type,
-                            sampler.components,
-                            sampler.format,
-                        )?;
+                        let view =
+                            self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
                         let sampler = self.sampler(sampler)?;
                         writes.push((
                             descriptor.binding,

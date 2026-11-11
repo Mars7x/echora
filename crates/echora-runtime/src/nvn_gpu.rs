@@ -1860,8 +1860,9 @@ impl Nvn {
 
     /// The sampler a texture binding samples with: the handle's sampler,
     /// its view's swizzle and format and, for uploads, its view's levels
-    /// as a level of detail clamp (sampling levels base..base+count of the
-    /// whole image picks what a view of those levels picks).
+    /// (a view of those levels: its level 0 is the base, as on the
+    /// console; the guest sampler itself stays as the game set it, one
+    /// Vulkan sampler for every texture paired with it).
     fn binding_sampler(&self, handle: u64, source: &TextureSource) -> Sampler {
         let mut sampler = self.handle_sampler(handle);
         sampler.components = self.handle_components(handle);
@@ -1892,9 +1893,7 @@ impl Nvn {
             (source, self.handle_view_levels(handle))
         {
             if count > 0 {
-                let (base, last) = (base as f32, (base + count - 1) as f32);
-                sampler.lod[0] = sampler.lod[0].max(base).min(last);
-                sampler.lod[1] = sampler.lod[1].clamp(base, last);
+                sampler.view_levels = Some((base, count));
             }
         }
         sampler
