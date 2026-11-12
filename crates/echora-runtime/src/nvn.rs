@@ -402,6 +402,10 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// Work skipped as "rendering disabled" before the last present: the
+    /// capture log shows each captured frame's own.
+    #[serde(skip)]
+    disabled_before_present: u64,
     /// Nesting of command lists running through CallCommands.
     #[serde(skip)]
     call_depth: u32,
@@ -2435,6 +2439,11 @@ impl Nvn {
                     debug_var_os("ECHORA_CAPTURE_DIR"),
                 ) {
                     let every = every.parse::<u64>().unwrap_or(0);
+                    let disabled = self
+                        .skipped_work
+                        .get("rendering disabled")
+                        .copied()
+                        .unwrap_or(0);
                     if every != 0
                         && (self.presented_frames == 1 || self.presented_frames.is_multiple_of(every))
                     {
@@ -2445,13 +2454,14 @@ impl Nvn {
                         };
                         if let Some(image) = image {
                             eprintln!(
-                                "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?}",
+                                "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?} disabled this frame {}",
                                 self.presented_frames,
                                 image.width,
                                 image.height,
                                 image.texels.iter().map(|texel| texel[0] + texel[1] + texel[2]).sum::<f32>()
                                     / (3 * image.texels.len().max(1)) as f32,
-                                self.forced_waits
+                                self.forced_waits,
+                                disabled - self.disabled_before_present
                             );
                             let directory = std::path::Path::new(&directory);
                             std::fs::create_dir_all(directory).map_err(|error| {
@@ -2465,6 +2475,11 @@ impl Nvn {
                         }
                     }
                 }
+                self.disabled_before_present = self
+                    .skipped_work
+                    .get("rendering disabled")
+                    .copied()
+                    .unwrap_or(0);
                 if self.gpu().is_some() {
                     self.gpu_dump_targets().map_err(stop)?;
                 }
