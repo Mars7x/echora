@@ -281,6 +281,10 @@ pub struct Draw<'a> {
     pub color_levels: Vec<u32>,
     /// The array layer (or cube face) each color target renders into.
     pub color_layers: Vec<u32>,
+    /// The format each color target is rendered as, when its view names
+    /// one (the target's sRGB or UNORM twin: an sRGB view encodes what is
+    /// written).
+    pub color_formats: Vec<Option<vk::Format>>,
     pub depth: Option<u64>,
     /// The array layer the depth target renders into.
     pub depth_layer: u32,
@@ -831,6 +835,7 @@ impl Renderer {
             &draw.colors,
             &draw.color_levels,
             &draw.color_layers,
+            &draw.color_formats,
             draw.depth,
             draw.depth_layer,
             area,
@@ -1242,6 +1247,7 @@ pub(crate) mod tests {
             colors: vec![7],
             color_levels: vec![0],
             color_layers: vec![0],
+            color_formats: Vec::new(),
             depth: None,
             depth_layer: 0,
             attributes: vec![VertexAttribute {

@@ -517,6 +517,9 @@ pub struct RenderState {
     /// The mip level each color target renders into (low 32 bits) and
     /// the array layer or cube face (high 32 bits), from its view.
     pub color_levels: Vec<u64>,
+    /// The NVN format each color target's view renders it as (0: the
+    /// texture's own), as an RGBA8_SRGB view of an RGBA8 texture.
+    pub color_formats: Vec<u32>,
     pub depth: u64,
     /// The array layer the depth target's view selects.
     pub depth_layer: u32,
@@ -3360,6 +3363,9 @@ impl Nvn {
                     .map(|index| views.get(index).copied().unwrap_or(0))
                     .collect();
                 self.render.depth_layer = views.get(count).map_or(0, |view| (view >> 32) as u32);
+                self.render.color_formats = (0..count)
+                    .map(|index| views.get(count + 1 + index).copied().unwrap_or(0) as u32)
+                    .collect();
                 // The depth-stencil target (X4) is validated and kept; depth
                 // testing needs draws, which are not rendered yet.
                 if command.x[4] != 0 {
@@ -5078,13 +5084,18 @@ fn record_command(
         // Views are resolved now (NVN reads them at record time)
         // to the mip level (low 32 bits) and base layer (high
         // 32 bits) they select (0 without a view). The depth
-        // view (X5) is appended after the color views.
+        // view (X5) is appended after the color views, then each color
+        // view's format (0 without one).
         let count = command.x[1] as usize;
         let mut views: Vec<u64> = command.captured[count..].to_vec();
         views.push(command.x[5]);
+        let mut formats = vec![0; count];
         for (index, view) in views.iter_mut().enumerate() {
             if *view != 0 {
                 let bag = bag_in(bags, *view, "TextureView").map_err(invalid)?;
+                if let (Some(format), Some(slot)) = (bag.get("Format"), formats.get_mut(index)) {
+                    *slot = format.x[0];
+                }
                 if let (Some(format), Some(notes)) = (bag.get("Format"), notes.as_mut()) {
                     let texture = command.captured.get(index).copied().unwrap_or(0);
                     notes.push(format!(
@@ -5099,6 +5110,7 @@ fn record_command(
         }
         command.captured.truncate(count);
         command.captured.extend(views);
+        command.captured.extend(formats);
     }
     recording.commands.push(command);
     recording.command_memory += COMMAND_MEMORY_PER_COMMAND;

@@ -6687,6 +6687,18 @@ impl Nvn {
                 (level, (*view >> 32) as u32)
             })
             .unzip();
+        // The format each color view renders its target as (an sRGB view
+        // of a UNORM texture encodes).
+        let color_formats: Vec<Option<vk::Format>> = (0..bound)
+            .map(|index| {
+                self.render
+                    .color_formats
+                    .get(index)
+                    .copied()
+                    .filter(|format| *format != 0)
+                    .and_then(vk_format)
+            })
+            .collect();
         // A color texture that is a mip level of another render target (by
         // address) renders into that target's level.
         let (colors, color_levels): (Vec<u64>, Vec<u32>) = colors
@@ -7310,6 +7322,7 @@ impl Nvn {
             colors,
             color_levels,
             color_layers,
+            color_formats,
             depth,
             depth_layer,
             attributes,

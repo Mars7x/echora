@@ -3274,6 +3274,51 @@ impl Renderer {
         Ok(view)
     }
 
+    /// `attachment_view` in `format`, the target's sRGB (or UNORM) twin
+    /// its image was created to allow: an sRGB attachment encodes what
+    /// draws write, as rendering through an NVN RGBA8_SRGB view of an
+    /// RGBA8 texture does. Other formats keep the target's own view.
+    pub(crate) fn attachment_view_as(
+        &mut self,
+        key: u64,
+        level: u32,
+        layer: u32,
+        format: vk::Format,
+    ) -> Result<vk::ImageView, String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if format == target.format
+            || srgb_twin(target.format) != Some(format)
+            || target.shape.layers() != 1
+            || level >= target.levels
+            || layer != 0
+        {
+            return self.attachment_view(key, level, layer);
+        }
+        // Keyed apart from the other views' entries (level_view's near
+        // i32::MAX, the attachments' and twins' near i32::MIN).
+        let cache = (
+            target.image,
+            (1 << 28) + format.as_raw() * 32 + level as i32,
+        );
+        if let Some(view) = self.extra_views.get(&cache) {
+            return Ok(*view);
+        }
+        let info = vk::ImageViewCreateInfo::default()
+            .image(target.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                base_mip_level: level,
+                level_count: 1,
+                ..range(target.format)
+            });
+        // SAFETY: the image is live; the view is destroyed with it.
+        let view = unsafe { self.gpu.device.create_image_view(&info, None) }
+            .map_err(vk_error("vkCreateImageView"))?;
+        self.extra_views.insert(cache, view);
+        Ok(view)
+    }
+
     #[track_caller]
     fn create_shaped_image(
         &self,
@@ -3727,7 +3772,7 @@ impl Renderer {
             return Ok(());
         }
         // A partial clear runs as an attachment clear in a render pass.
-        self.begin_rendering(&[key], &[level], &[layer], None, 0, [0; 4])?;
+        self.begin_rendering(&[key], &[level], &[layer], &[], None, 0, [0; 4])?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -3783,7 +3828,7 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
-        self.begin_rendering(&[], &[], &[], Some(key), layer, [0; 4])?;
+        self.begin_rendering(&[], &[], &[], &[], Some(key), layer, [0; 4])?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: aspects,
@@ -3819,13 +3864,15 @@ impl Renderer {
     /// depth target, limited to `area`. A color key of 0 is a gap: no
     /// attachment at that location (a fragment output there is dropped).
     /// Each color target renders into its mip level in `levels` and its
-    /// layer in `layers` (0 when missing); the depth target into layer
-    /// `depth_layer`.
+    /// layer in `layers` (0 when missing), as the format in `formats`
+    /// (its own when missing); the depth target into layer `depth_layer`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_rendering(
         &mut self,
         colors: &[u64],
         levels: &[u32],
         layers: &[u32],
+        formats: &[Option<vk::Format>],
         depth: Option<u64>,
         depth_layer: u32,
         area: [i32; 4],
@@ -3838,7 +3885,11 @@ impl Renderer {
                 continue;
             }
             let layer = layers.get(index).copied().unwrap_or(0);
-            views.push(self.attachment_view(*key, level(index), layer)?);
+            let view = match formats.get(index).copied().flatten() {
+                Some(format) => self.attachment_view_as(*key, level(index), layer, format)?,
+                None => self.attachment_view(*key, level(index), layer)?,
+            };
+            views.push(view);
         }
         let depth_view = match depth {
             Some(key) => Some(self.attachment_view(key, 0, depth_layer)?),
