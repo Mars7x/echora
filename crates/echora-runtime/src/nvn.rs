@@ -3736,6 +3736,21 @@ impl Nvn {
                 }
                 let to = self.gpu_to_guest(command.x[2], 16).map_err(stop)?;
                 let timestamp = core.counter;
+                // ECHORA_SAMPLES_PASSED_FORCE=N (debugging): every
+                // SAMPLES_PASSED report says N (which consumer reads them).
+                if command.x[1] & 0xffff_ffff == 1
+                    && let Some(forced) = debug_var("ECHORA_SAMPLES_PASSED_FORCE")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                {
+                    self.resolve_storage(core, Some(to..to + 16))
+                        .map_err(|message| stop(format!("{}: {message}", command.name)))?;
+                    let mut report = [0u8; 16];
+                    report[..8].copy_from_slice(&forced.to_le_bytes());
+                    report[8..].copy_from_slice(&timestamp.to_le_bytes());
+                    core.memory.write(to, &report)?;
+                    return Ok(());
+                }
                 // SAMPLES_PASSED, measured with occlusion queries: the GPU
                 // writes the report in command order.
                 if command.x[1] & 0xffff_ffff == 1
