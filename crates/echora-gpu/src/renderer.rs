@@ -314,7 +314,16 @@ pub struct Renderer {
     pub(crate) shader_cache: Option<std::path::PathBuf>,
 }
 
-type SamplerKey = (i32, i32, i32, bool, [i32; 3], [u32; 3]);
+type SamplerKey = (
+    i32,
+    i32,
+    i32,
+    bool,
+    [i32; 3],
+    [u32; 3],
+    Option<i32>,
+    [u32; 4],
+);
 
 /// What one submission owns until the GPU finishes it: its command
 /// buffer and fence, the ring its uploads went to, its descriptor pool,
@@ -1743,6 +1752,8 @@ impl Renderer {
             sampler.base_level_only,
             sampler.address.map(|mode| mode.as_raw()),
             sampler.lod.map(f32::to_bits),
+            sampler.compare.map(|op| op.as_raw()),
+            sampler.border,
         );
         if let Some(existing) = self.samplers.get(&key) {
             return Ok(*existing);
@@ -1760,7 +1771,10 @@ impl Renderer {
             } else {
                 sampler.lod[1].max(sampler.lod[0])
             })
-            .mip_lod_bias(sampler.lod[2]);
+            .mip_lod_bias(sampler.lod[2])
+            .compare_enable(sampler.compare.is_some())
+            .compare_op(sampler.compare.unwrap_or(vk::CompareOp::ALWAYS))
+            .border_color(border_color(sampler.border));
         // SAFETY: valid create info; destroyed in Drop.
         let created = unsafe { self.gpu.device.create_sampler(&info, None) }
             .map_err(vk_error("vkCreateSampler"))?;
@@ -4632,6 +4646,21 @@ impl ViewInfo {
             format: info.format,
             range: info.subresource_range,
         }
+    }
+}
+
+/// The built-in border colour nearest `rgba` (float bits): transparent
+/// black, opaque black or opaque white. Other colours (custom border
+/// colours are not enabled) take the nearest of these by alpha and
+/// brightness.
+fn border_color(rgba: [u32; 4]) -> vk::BorderColor {
+    let [r, g, b, a] = rgba.map(f32::from_bits);
+    if a < 0.5 {
+        vk::BorderColor::FLOAT_TRANSPARENT_BLACK
+    } else if (r + g + b) / 3.0 < 0.5 {
+        vk::BorderColor::FLOAT_OPAQUE_BLACK
+    } else {
+        vk::BorderColor::FLOAT_OPAQUE_WHITE
     }
 }
 

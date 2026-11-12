@@ -2826,6 +2826,19 @@ impl Nvn {
                 sampler.lod[2] = bias.clamp(-16.0, 16.0);
             }
         }
+        // SetCompare(builder, mode, function): mode 1 (compare R to the
+        // texture) makes a shadow-map sampler; the function in the depth
+        // test's numbering.
+        if let Some(args) = props.get("Compare")
+            && args.x[0] != 0
+        {
+            sampler.compare = Some(compare_op(args.x[1]));
+        }
+        // SetBorderColor (floats): the colour clamp-to-border reads outside
+        // the texture (1.0 for the game's shadow maps: outside is lit).
+        if let Some(args) = props.get("BorderColor") {
+            sampler.border = args.x.map(|word| word as u32);
+        }
         sampler
     }
 

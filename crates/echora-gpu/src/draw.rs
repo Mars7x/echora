@@ -228,6 +228,11 @@ pub struct Sampler {
     pub address: [vk::SamplerAddressMode; 3],
     /// Level of detail clamp (minimum, maximum) and bias.
     pub lod: [f32; 3],
+    /// Depth comparison (a shadow-map sampler): the reference is compared
+    /// with the texel by this function, giving 0 or 1.
+    pub compare: Option<vk::CompareOp>,
+    /// Border colour for clamp-to-border addressing, as float bits (RGBA).
+    pub border: [u32; 4],
     /// Channel sources (a texture view's swizzle); not part of the
     /// Vulkan sampler.
     pub components: vk::ComponentMapping,
@@ -248,6 +253,8 @@ impl Default for Sampler {
             base_level_only: true,
             address: [vk::SamplerAddressMode::CLAMP_TO_EDGE; 3],
             lod: [0.0, vk::LOD_CLAMP_NONE, 0.0],
+            compare: None,
+            border: [0; 4],
             components: vk::ComponentMapping::default(),
             format: None,
             view_levels: None,
