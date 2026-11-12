@@ -5441,6 +5441,44 @@ impl Nvn {
                     }
                 }
             }
+            // ECHORA_TARGET_TRACE_PGM=<x>,<y>,<w>,<h>,<step>[;...] with
+            // ECHORA_DUMP_DIR: those regions' first channels (every step-th
+            // texel, 0..1 as 0..65535) as 16-bit PGM images,
+            // trace-<key>-<present>-<x>-<y>.pgm (a shadow map's casters).
+            if let (Ok(regions), Some(directory)) = (
+                super::debug_var("ECHORA_TARGET_TRACE_PGM"),
+                super::debug_var_os("ECHORA_DUMP_DIR"),
+            ) {
+                for region in regions.split(';') {
+                    let values: Vec<usize> = region
+                        .split(',')
+                        .filter_map(|value| value.trim().parse().ok())
+                        .collect();
+                    let [x, y, w, h, step] = values[..] else {
+                        continue;
+                    };
+                    let step = step.max(1);
+                    if x + w > width as usize || y + h > height as usize {
+                        continue;
+                    }
+                    let (columns, rows) = (w / step, h / step);
+                    let mut image = format!("P5\n{columns} {rows}\n65535\n").into_bytes();
+                    for row in 0..rows {
+                        for column in 0..columns {
+                            let texel =
+                                texels[(y + row * step) * width as usize + x + column * step][0];
+                            let value = (texel.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            image.extend_from_slice(&value.to_be_bytes());
+                        }
+                    }
+                    let directory = std::path::Path::new(&directory);
+                    let _ = std::fs::create_dir_all(directory);
+                    let _ = std::fs::write(
+                        directory.join(format!("trace-{key:x}-{present}-{x}-{y}.pgm")),
+                        image,
+                    );
+                }
+            }
             let count = texels.len().max(1) as f64;
             let nonfinite = texels
                 .iter()
