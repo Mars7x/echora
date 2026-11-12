@@ -2444,6 +2444,14 @@ impl Nvn {
                             self.images.get(&texture).cloned()
                         };
                         if let Some(image) = image {
+                            eprintln!(
+                                "capture present {} window texture {texture:#x} {}x{} mean {:.4}",
+                                self.presented_frames,
+                                image.width,
+                                image.height,
+                                image.texels.iter().map(|texel| texel[0] + texel[1] + texel[2]).sum::<f32>()
+                                    / (3 * image.texels.len().max(1)) as f32
+                            );
                             let directory = std::path::Path::new(&directory);
                             std::fs::create_dir_all(directory).map_err(|error| {
                                 invalid(format!("create {}: {error}", directory.display()))
