@@ -2444,8 +2444,16 @@ impl Nvn {
                         .get("rendering disabled")
                         .copied()
                         .unwrap_or(0);
+                    // ECHORA_CAPTURE_FROM=N (debugging): only from present N
+                    // (dense captures of one scene).
+                    let from = debug_var("ECHORA_CAPTURE_FROM")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
                     if every != 0
-                        && (self.presented_frames == 1 || self.presented_frames.is_multiple_of(every))
+                        && (self.presented_frames == 1
+                            || (self.presented_frames >= from
+                                && self.presented_frames.is_multiple_of(every)))
                     {
                         let image = if self.gpu().is_some() {
                             self.gpu_read_back(texture).map_err(stop)?
