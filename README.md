@@ -26,36 +26,40 @@ game.
 
 ## Status
 
-In short: Echora runs the game's code, but on its own it can't draw
-everything yet, because its own shader translator doesn't handle every
-shader the game uses.
+In short: Echora runs the game's code and draws its first 3D scene with its
+own shader translator, close to how the console draws it, but slowly and
+without sound.
 
 What works today:
 
 - Echora reads and checks your NUP file or dump, and translates the whole
   game, 17.3 million instructions, into native code. The first start takes
   about an hour; after that it starts straight away.
-- The translated game runs. With the old shader recompiler loaded for the
-  shaders Echora's translator doesn't handle yet, which I only do on my own
-  machine for testing, it boots through the system services, plays its
-  sound, takes input, and gets through New Game and the opening movie into
-  its first 3D scene. Its sky, plants and water are drawn.
-- Echora's own shader translator, written in Rust, handles about 98% of the
-  6,215 shader stages the game has used in test runs so far.
+- The translated game runs. It boots through the system services, takes
+  input, and gets through New Game and the opening movie into its first 3D
+  scene.
+- Echora's own shader translator, written in Rust, translates all 6,215
+  shader stages the game has used in test runs so far. The old shader
+  recompiler is no longer needed.
+- The first 3D scene is drawn: the forest floor with its ground cover,
+  plants, mist with shafts of light, the canopy, and the Great Deku Tree,
+  lit and shadowed by the game's own passes.
 - The game's threads run on up to six CPU cores by default.
 - The launcher installs the game, changes settings and starts it, with a
   mouse, keyboard or controller.
 
 What doesn't work yet:
 
-- The first 3D scene looks wrong. Its sky, plants and water are there, but
-  the picture is washed out where it should be dark, and the ground is
-  missing. Nothing past that scene has been reached.
-- Drawing on its own. Without the old recompiler, a run stops at the first
-  shader Echora's translator can't handle yet and says which one.
+- The first 3D scene still has faults. Part of the tree's roots show a
+  magenta placeholder pattern where their texture should be, the tree is
+  darker than it should be, subtitles and the speaker's name are not drawn,
+  and now and then a frame comes out black. Nothing past that scene has been
+  reached.
+- Sound. The game's audio renderer is not mixed or played yet, so there is
+  no sound.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, now decoded on the GPU, averages about 30 pictures per second, and
-  the first 3D scene runs at about 6.
+  movie, decoded on the GPU, averages about 30 pictures per second, and the
+  first 3D scene runs at about 2.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
@@ -66,12 +70,12 @@ RX 9070 XT. The [roadmap](docs/roadmap.md) and
 ## What I'm working on
 
 The game's GPU programs are written for the Switch 2's NVIDIA GPU and have to
-be translated into shaders your PC's GPU can run. Until now Echora used a C++
+be translated into shaders your PC's GPU can run. Echora first used a C++
 shader recompiler from the Switch emulator world. It got the title screen and
 the opening movie on screen, but after the movie it turned out to be the
-source of the hardest bugs so far: it guessed where shaders keep their data,
-and the wrong guesses fed the game's own programs bad data and hung the GPU.
-So I'm writing Echora's own translator in Rust, for four reasons:
+source of the hardest bugs: it guessed where shaders keep their data, and the
+wrong guesses fed the game's own programs bad data and hung the GPU. So I
+wrote Echora's own translator in Rust, for four reasons:
 
 - Shaders reach the game's real memory through a page table, the way the
   console's GPU sees it, instead of guesses.
@@ -82,19 +86,24 @@ So I'm writing Echora's own translator in Rust, for four reasons:
 - The whole project shares one language and one design.
 
 It is a new design, with the details of each instruction checked against
-public references and models of the hardware, and its output compared with
-the old recompiler's on my own machine. The old recompiler is no longer part
-of Echora; I only load it there, for the shaders the new translator doesn't
-handle yet.
+public references and models of the hardware. It comes with a simulator that
+runs a translated program on recorded inputs, which is how the translator's
+output is checked against a reference without running the game.
+
+That translator now handles every shader the game has used so far, and the
+work has moved on to the first 3D scene: making each of the game's graphics
+calls do what it does on the console. Most of the scene's faults turned out
+to be small differences of that kind, such as how textures with several
+layers are laid out in memory, which blend factors exist, or how a sampler
+compares depths.
 
 Much of this work is general rather than specific to Ocarina of Time. The
 translator handles the Switch 2's GPU instructions on their own terms, and
-once it covers this game it will move to its own repository so other Switch 2
-recompilation projects can use it.
+it will move to its own repository so other Switch 2 recompilation projects
+can use it.
 
-Once the translator handles the rest, the next steps are getting the first
-3D scene right, reaching gameplay, and making each CPU thread do less work
-than it does now.
+The next steps are finishing the first 3D scene, sound, and then speed:
+the opening movie and that scene at the console's 60 frames per second.
 
 ## Approach
 
@@ -165,8 +174,7 @@ target/release/echora-launcher
 
 Choose your game and press Play. The first start translates and builds the
 whole game, which takes about an hour. After that it starts straight away.
-While the shader translator is unfinished, a run stops at the first shader
-it can't translate yet (see [Status](#status)).
+See [Status](#status) for how far a run gets.
 
 ## Documentation
 

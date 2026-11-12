@@ -6,27 +6,40 @@ to be missing or incomplete.
 
 ## Gameplay and graphics
 
-- The game gets past the New Game movie into its first 3D scene. Its sky,
-  plants and water are drawn, but the picture is washed out where it should
-  be dark, and the ground is missing (the terrain's vertices all read the
-  same position). No gameplay has been reached yet.
-  Every unimplemented operation still stops the run with a report.
+- The game gets past the New Game movie into its first 3D scene, which is
+  drawn with its ground cover, plants, mist, canopy and the Great Deku Tree.
+  Known faults there: part of the tree's roots show a magenta placeholder
+  pattern (a texture the game fills piece by piece is left incomplete), the
+  tree is darker than on the console, subtitles and the speaker's name are
+  not drawn, and some presented frames are black. No gameplay has been
+  reached yet. Every unimplemented operation still stops the run with a
+  report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
   console's output.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
-- The Rust shader translator handles about 98% of the 6,215 shader stages
-  the game has used in test runs. Without an external translator
-  plugin ([shader-plugin.md](shader-plugin.md)) a run stops at the first
-  program it does not handle, naming the reason.
+- The Rust shader translator translates all 6,215 shader stages the game
+  has used in test runs. A few instruction forms no program has used yet
+  are still refused, naming the reason
+  ([shader-translator.md](shader-translator.md)).
+- Blending with two source colours (NVN's SRC1 factors) is not wired up in
+  the renderer: such a target is drawn unblended, with a note. No program
+  has asked for it so far.
+- A sampler's border colour is mapped to the nearest of Vulkan's built-in
+  ones (transparent black, opaque black, opaque white).
+
+## Sound
+
+- There is no sound. The game's audio renderer is tracked (voices advance
+  through their buffers in real time) but nothing is mixed or played yet.
 
 ## Performance
 
 - Runs are far below full speed. The console runs the game at 60 frames per
   second; here the opening movie averages about 30 pictures per second and
-  the first 3D scene runs at about 6 frames per second.
+  the first 3D scene runs at about 2 frames per second.
 - Guest threads run on up to six host threads by default, one per
   application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   On six cores the first 3D scene runs about 2.9 times as fast as on one, and

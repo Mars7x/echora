@@ -10,31 +10,27 @@ when the code for it does.
 | 2. Content processing | The NUP is validated and inventoried, and its ExeFS cached, without manual extraction; NUP and folder input give the same result. | Done for the supported input. Overlaying update RomFS on a base is not needed yet. |
 | 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.3 million instructions) is translated and runs on Linux. |
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
-| 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan and the internal render scale is applied; shader translation is moving to Echora's own Rust translator, and the resolution planner is not connected yet. |
-| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler; to be reached again with Echora's own shader translator alone. |
-| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game and its audio plays; the game gets past the New Game movie and draws its first 3D scene, but that scene is washed out and its ground is missing. |
+| 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with Echora's own Rust shader translator, and the internal render scale is applied; the resolution planner is not connected yet. |
+| 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler, and again on 2026-11-12 with Echora's own shader translator alone. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game; it gets past the New Game movie and draws its first 3D scene close to the console's, with a few faults left ([limitations](limitations.md)). There is no sound yet. |
 | 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 12. Performance | Reproducible measurements show gains without regressions. | In progress. With six cores and the movies decoded on the GPU, the opening movie averages about 30 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 6 frames per second, about 2.9 times one core. |
+| 12. Performance | Reproducible measurements show gains without regressions. | In progress. With six cores and the movies decoded on the GPU, the opening movie averages about 30 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 2 frames per second now that all of it is drawn. |
 | 13. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 14. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
 ## Next steps
 
-1. Get the first scene after the New Game movie right. It should be a dark
-   forest with a lit, mossy hill and water; here it is washed out, the
-   ground is missing, and sky shows where mist and a tree should be. Then
-   carry on to gameplay.
-2. Finish Echora's own shader translator (`echora-shader`, in Rust). It
-   handles about 98% of the shader stages seen in runs so far; what's left
-   is the remaining instruction forms and mesh programs in the
-   tessellation slot, then checking each scene's output.
-   See [shader-translator.md](shader-translator.md).
-3. Make each thread faster in the 3D scene: profile it, then cut the cost of
-   the translated code and of each GPU command, which now limit speed more
-   than the number of cores.
+1. Finish the first scene after the New Game movie: the placeholder pattern
+   on the tree's roots, the tree's brightness, subtitles, and the frames
+   that come out black. Then carry on to gameplay.
+2. Sound: mix and play the game's audio renderer (voices, mixes, effects
+   and the output device).
+3. Speed, until the opening movie and the first scene run at the console's
+   60 frames per second: fewer and cheaper GPU submissions, less work per
+   NVN command, then the cost of the translated code.
 4. Turn on the faster code generation in game builds once it is checked in
    game: inline vector arithmetic, branches that skip unused flags and
    floating-point status kept in locals, then structured control flow once
