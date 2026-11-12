@@ -5123,6 +5123,16 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
                 .map(|word| core.memory.read_u32(command.x[4] + word * 4).map(u64::from))
                 .collect::<Result<_, _>>()?;
         }
+        // SetBlendColor(cmd, const float rgba[4]).
+        "nvnCommandBufferSetBlendColor" => {
+            command.captured = (0..4)
+                .map(|channel| {
+                    core.memory
+                        .read_u32(command.x[1] + channel * 4)
+                        .map(u64::from)
+                })
+                .collect::<Result<_, _>>()?;
+        }
         "nvnCommandBufferClearColor" => {
             command.captured = (0..4)
                 .map(|channel| {

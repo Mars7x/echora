@@ -488,10 +488,11 @@ fn stencil_op(value: u64) -> vk::StencilOp {
 
 /// NVN blend factors: GL order from 1 (inferred; the game's UI blends with
 /// 5/6, source alpha over one minus source alpha).
-fn blend_factor(value: u64) -> vk::BlendFactor {
+fn blend_factor(value: u64) -> Option<vk::BlendFactor> {
     use vk::BlendFactor as F;
-    match value {
+    Some(match value {
         1 => F::ZERO,
+        2 => F::ONE,
         3 => F::SRC_COLOR,
         4 => F::ONE_MINUS_SRC_COLOR,
         5 => F::SRC_ALPHA,
@@ -501,8 +502,15 @@ fn blend_factor(value: u64) -> vk::BlendFactor {
         9 => F::DST_COLOR,
         10 => F::ONE_MINUS_DST_COLOR,
         11 => F::SRC_ALPHA_SATURATE,
-        _ => F::ONE,
-    }
+        // 0x10..0x13 are the dual-source factors (SRC1_COLOR ..
+        // ONE_MINUS_SRC1_ALPHA): programs do not write a second source
+        // yet, so they are refused (`None`).
+        0x61 => F::CONSTANT_COLOR,
+        0x62 => F::ONE_MINUS_CONSTANT_COLOR,
+        0x63 => F::CONSTANT_ALPHA,
+        0x64 => F::ONE_MINUS_CONSTANT_ALPHA,
+        _ => return None,
+    })
 }
 
 /// NVN blend equations: add, subtract, reverse subtract, min, max from 1
@@ -6673,6 +6681,16 @@ impl Nvn {
                 0,
             )
             .is_some_and(|enable| enable != 0),
+            // SetBlendColor(cmd, const float rgba[4]): the four floats
+            // captured at record time; NVN's default is zero.
+            blend_constants: self
+                .render
+                .state
+                .get("SetBlendColor")
+                .filter(|bind| bind.captured.len() == 4)
+                .map_or([0.0; 4], |bind| {
+                    std::array::from_fn(|channel| f32::from_bits(bind.captured[channel] as u32))
+                }),
             // DEPTH24_STENCIL8 (NVN format 53) is held as D32F_S8 (`vk_format`).
             depth_bias_d24: self
                 .object(self.render.depth, "Texture")
@@ -6695,6 +6713,7 @@ impl Nvn {
                 .split(',')
                 .any(|item| item.trim() == format!("{:016x}", keys.1))
         });
+        let mut unknown_factors = Vec::new();
         let blends: Vec<Blend> = (0..colors.len())
             .map(|target| {
                 let mut blend = Blend::default();
@@ -6704,10 +6723,15 @@ impl Nvn {
                 }
                 let blend_state = snapshot(&format!("BindBlendState/{target}"));
                 if let Some(func) = blend_state.get("BlendFunc") {
-                    blend.color.0 = blend_factor(func.x[0]);
-                    blend.color.1 = blend_factor(func.x[1]);
-                    blend.alpha.0 = blend_factor(func.x[2]);
-                    blend.alpha.1 = blend_factor(func.x[3]);
+                    let factors = func.x.map(blend_factor);
+                    if let [Some(src), Some(dst), Some(src_alpha), Some(dst_alpha)] = factors {
+                        blend.color.0 = src;
+                        blend.color.1 = dst;
+                        blend.alpha.0 = src_alpha;
+                        blend.alpha.1 = dst_alpha;
+                    } else {
+                        unknown_factors.push(func.x);
+                    }
                 }
                 if let Some(equation) = blend_state.get("BlendEquation") {
                     blend.color.2 = blend_op(equation.x[0]);
@@ -6735,6 +6759,14 @@ impl Nvn {
                 blend
             })
             .collect();
+        // A target with factors NVN defines but the device path does not
+        // map keeps the default (ONE, ZERO), never a guessed factor.
+        for factors in unknown_factors {
+            self.gpu.as_mut().unwrap().note(format!(
+                "blend factors {factors:#x?} not supported: target drawn unblended (program {:016x})",
+                keys.1
+            ));
+        }
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let line = format!(
                 "flow draw {:016x}/{:016x} count {count} reads {} writes {} level {:?} layers {:?} depth layer {} viewport {:?} depth {:x?} blend {:?} masks {:?} factors {:?}",

@@ -131,6 +131,8 @@ pub struct Fixed {
     /// is kept where its target 0 alpha covers it (leaf and grass cards'
     /// cut-out).
     pub alpha_to_coverage: bool,
+    /// The blend constant (SetBlendColor) the CONSTANT factors read.
+    pub blend_constants: [f32; 4],
 }
 
 /// One face's stencil test and update.
@@ -1045,6 +1047,7 @@ impl Renderer {
             objects.cmd_set_rasterization_samples(commands, vk::SampleCountFlags::TYPE_1);
             objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
             objects.cmd_set_alpha_to_coverage_enable(commands, fixed.alpha_to_coverage);
+            device.cmd_set_blend_constants(commands, &fixed.blend_constants);
             objects.cmd_set_depth_bias_enable(commands, fixed.depth_bias.is_some());
             if let Some([constant, clamp, slope]) = fixed.depth_bias {
                 let clamp = if self.gpu.depth_bias_clamp {
@@ -1284,6 +1287,7 @@ pub(crate) mod tests {
                 depth_bias: None,
                 depth_bias_d24: false,
                 alpha_to_coverage: false,
+                blend_constants: [0.0; 4],
             },
             blends: vec![Blend::default()],
             mesh: None,
