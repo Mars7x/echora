@@ -47,15 +47,19 @@ Echora can load an external shader translator at run time
 ([docs/shader-plugin.md](docs/shader-plugin.md)). None is stored in or
 built by this repository; a plugin is distributed under its own license.
 
-## Sources of facts
+## Reference implementations
 
-`crates/echora-shader` decodes Ampere instructions with encodings learned
-from these projects; no code is taken from them:
+Echora's behaviour was checked against these projects. Layouts, constants
+and rules were learned from them and written anew in Rust; the pinned
+revisions are the ones the source comments cite.
 
-| Source | Used for | License |
+| Project | Used for | License |
 |---|---|---|
+| [Eden](https://git.eden-emu.dev/eden-emu/eden), with the Switch 2 patch set the source comments call Eden-NS2 (`1a6d7d4`) | System service behaviour, kernel checks, the graphics driver interface, display, input, and the audio renderer's layouts and rules | GPL-3.0-or-later |
+| yuzu (as carried in Eden) | The audio renderer's processing rules and resampling filter taps, file system result numbering, shader input and output conventions | GPL-2.0-or-later |
 | [Lichii](https://github.com/zortos293/Lichii) `c215653`, `src/shader_recompiler/frontend/ampere` | Ampere instruction encodings and semantics | GPL-3.0-or-later |
 | Mesa's NAK `979c6d1`, `src/nouveau/compiler/nak/sm70_encode.rs` | Ampere bit layouts (cross-checks) | MIT |
+| [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) `6b0c077` | Kernel behaviour: memory mapping checks, IPC and synchronization | GPL-2.0 |
 
 ## Test data
 
