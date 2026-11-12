@@ -112,6 +112,9 @@ pub fn translate_with_needs(
                     *site = site.map(|offset| offset + header);
                 }
                 needs.store = needs.store.map(|site| site.map(|offset| offset + header));
+                for (_, offset) in &mut needs.txq_fallbacks {
+                    *offset += header;
+                }
                 (translated, needs)
             })
             .map_err(|mut error| {

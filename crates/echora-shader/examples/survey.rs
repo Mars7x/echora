@@ -23,6 +23,9 @@ fn main() {
     let mut needs: BTreeMap<&'static str, (u32, &'static str, String)> = BTreeMap::new();
     // TXQs whose view came from the handle's other uses, and the rest.
     let (mut txq_inferred, mut txq_fallback) = (0u32, 0u32);
+    // The fallbacks by component mask, and some reading component 2.
+    let mut fallback_masks: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut fallback_third: Vec<String> = Vec::new();
     let (mut total, mut translated, mut unread) = (0u32, 0u32, 0u32);
     let (mut mesh_count, mut task_count) = (0u32, 0u32);
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
@@ -140,6 +143,12 @@ fn main() {
                 translated += 1;
                 txq_inferred += program_needs.txq_views.0;
                 txq_fallback += program_needs.txq_views.1;
+                for &(mask, offset) in &program_needs.txq_fallbacks {
+                    *fallback_masks.entry(mask).or_insert(0) += 1;
+                    if mask & 4 != 0 && fallback_third.len() < 5 {
+                        fallback_third.push(format!("{key} at {offset:#x} (mask {mask:#x})"));
+                    }
+                }
                 let list =
                     echora_shader::requirements::requirements(&program, &program_needs, &options);
                 for requirement in list {
@@ -189,6 +198,12 @@ fn main() {
     println!(
         "TXQ views: {txq_inferred} from the handle's other uses, {txq_fallback} queried as 2D arrays"
     );
+    for (mask, count) in &fallback_masks {
+        println!("{count:6}  fallback TXQ mask {mask:#x}");
+    }
+    for example in &fallback_third {
+        println!("        fallback reading component 2: {example}");
+    }
     println!("device features needed beyond core Vulkan 1.3:");
     for (feature, (count, reason, example)) in needed {
         println!("{count:6}  {feature}: {reason}  (e.g. {example})");

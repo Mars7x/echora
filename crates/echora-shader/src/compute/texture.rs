@@ -1043,6 +1043,8 @@ impl Emitter {
                 }
                 _ => {
                     self.txq_views.1 += 1;
+                    let offset = u32::try_from(index * 16).unwrap_or(u32::MAX);
+                    self.txq_fallbacks.push((texture.mask, offset));
                     5
                 }
             }

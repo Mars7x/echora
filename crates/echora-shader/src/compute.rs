@@ -223,6 +223,9 @@ pub struct Needs {
     /// TXQs whose view type came from the handle's other uses, and those
     /// queried through a 2D array view.
     pub txq_views: (u32, u32),
+    /// Each TXQ queried through a 2D array view: its component mask and
+    /// its guest instruction (byte offset).
+    pub txq_fallbacks: Vec<(u8, u32)>,
 }
 
 /// `translate`, with what the program needs (`Needs`).
@@ -235,6 +238,7 @@ pub fn translate_with_needs(
         capabilities: emitter.module.capability_sites().to_vec(),
         store: emitter.module.store_site(),
         txq_views: emitter.txq_views,
+        txq_fallbacks: emitter.txq_fallbacks.clone(),
     };
     Ok((emitter.finish(), needs))
 }
@@ -540,6 +544,8 @@ struct Emitter {
     /// TXQs whose view came from the handle's other uses, and those
     /// queried through a 2D array view instead.
     txq_views: (u32, u32),
+    /// The fallback TXQs' masks and guest instructions (byte offsets).
+    txq_fallbacks: Vec<(u8, u32)>,
     frag_colors: u32,
     push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
@@ -657,6 +663,7 @@ impl Emitter {
             handle_words: BTreeMap::new(),
             texture_views: BTreeMap::new(),
             txq_views: (0, 0),
+            txq_fallbacks: Vec::new(),
             frag_colors: 0,
             push_fields: 0,
             banks: BTreeMap::new(),
