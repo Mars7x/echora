@@ -2349,9 +2349,13 @@ impl Nvn {
             let derived = crate::nvn_format::base_block_shape(info, height, depth, layers);
             if shape != derived {
                 layout_note = Some(format!(
-                    "layout shape {shape:?} instead of {derived:?}: {} {width}x{height}x{depth} layers {layers} levels {levels_set} target {:?}",
+                    "layout shape {shape:?} instead of {derived:?}: {} {width}x{height}x{depth} layers {layers} levels {levels_set} target {:?} packaged {:016x}",
                     info.name,
-                    get("Target")
+                    get("Target"),
+                    object
+                        .builder
+                        .get("PackagedTextureLayout")
+                        .map_or(0, |value| value.x[1])
                 ));
             }
         }
