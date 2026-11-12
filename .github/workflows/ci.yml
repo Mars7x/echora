@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v6
       # The release the translations are built with; a newer clippy's
       # lints are taken up when the pin moves.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
