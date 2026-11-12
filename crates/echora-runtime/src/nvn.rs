@@ -3142,6 +3142,34 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        // ECHORA_READBACK_LOG (debugging; ECHORA_READBACK_LOG_FROM/_TO
+        // presents): each copy, report, counter or query command as it
+        // runs, with its arguments and captured words (what the GPU hands
+        // the CPU, a meter's luminance, say).
+        if debug_var_os("ECHORA_READBACK_LOG").is_some() {
+            let present = |name: &str, default: u64| {
+                debug_var(name)
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(default)
+            };
+            let window = present("ECHORA_READBACK_LOG_FROM", 0)
+                ..=present("ECHORA_READBACK_LOG_TO", u64::MAX);
+            let rest = command.name.trim_start_matches("nvnCommandBuffer");
+            if window.contains(&self.presented_frames)
+                && ["Copy", "Report", "Counter", "Query"]
+                    .iter()
+                    .any(|word| rest.contains(word))
+            {
+                eprintln!(
+                    "readback present {} {} x {:x?} captured {:x?}",
+                    self.presented_frames,
+                    rest,
+                    &command.x[..6],
+                    &command.captured[..command.captured.len().min(16)]
+                );
+            }
+        }
         // ECHORA_CAPTURE_FRAME=N[,M...]: present N's commands, from the
         // render state the first of them met (each listed present is held
         // for replays in turn).

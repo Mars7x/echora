@@ -3650,19 +3650,29 @@ impl Nvn {
                     };
                     let base = gpu & !15;
                     let length = gpu - base + size;
-                    // ECHORA_STORAGE_WRITE_LOG=<gpu start>-<end>[,...]
-                    // (debugging): each dispatch binding a storage buffer
-                    // it writes over that range, with the present.
+                    // ECHORA_STORAGE_WRITE_LOG=<gpu start>-<end>[,...] or
+                    // `all` (buffers up to 64 KiB) (debugging): each
+                    // dispatch binding a storage buffer it writes over that
+                    // range, with the present.
                     if let Ok(ranges) = super::debug_var("ECHORA_STORAGE_WRITE_LOG")
                         && descriptor.flags & 1 != 0
-                        && ranges.split(',').any(|range| {
+                        && super::debug_var("ECHORA_STORAGE_WRITE_LOG_FROM")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .is_none_or(|from| self.presented_frames >= from)
+                        && super::debug_var("ECHORA_STORAGE_WRITE_LOG_TO")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .is_none_or(|to| self.presented_frames <= to)
+                        && (ranges == "all" && size <= 0x10000
+                            || ranges.split(',').any(|range| {
                             range.split_once('-').is_some_and(|(start, end)| {
                                 let parse = |text: &str| {
                                     u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
                                 };
                                 matches!((parse(start), parse(end)), (Some(start), Some(end)) if gpu < end && start < gpu + size)
                             })
-                        })
+                        }))
                     {
                         eprintln!(
                             "storage write present {} dispatch {:016x} binding {} gpu {gpu:#x}+{size:#x}",
