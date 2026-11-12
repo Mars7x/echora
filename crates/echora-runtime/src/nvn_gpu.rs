@@ -5535,6 +5535,23 @@ impl Nvn {
             for (index, stage) in stages.iter().enumerate() {
                 let mut values = Vec::new();
                 for constant in &stage.spec_constants {
+                    // ECHORA_FRAGMENT_TRACE_PIXEL=X,Y (debugging): the
+                    // pixel a traced fragment program records (none
+                    // without it).
+                    if constant.meaning == echora_shader_abi::SpecMeaning::FragmentTracePixel {
+                        let pixel = super::debug_var("ECHORA_FRAGMENT_TRACE_PIXEL")
+                            .ok()
+                            .and_then(|value| {
+                                let (x, y) = value.split_once(',')?;
+                                Some(
+                                    x.trim().parse::<u32>().ok()?
+                                        | y.trim().parse::<u32>().ok()? << 16,
+                                )
+                            })
+                            .unwrap_or(u32::MAX);
+                        values.push((constant.id, pixel));
+                        continue;
+                    }
                     let low = match constant.meaning {
                         echora_shader_abi::SpecMeaning::VertexTraceLow => true,
                         echora_shader_abi::SpecMeaning::VertexTraceHigh => false,
@@ -5644,6 +5661,16 @@ impl Nvn {
                         entry[2],
                         entry[3]
                     );
+                    // A fragment program's registers r0..r3 at its end.
+                    if entry[104..108].iter().any(|word| *word != 0) {
+                        line += &format!(
+                            " | out {:?}",
+                            entry[104..108]
+                                .iter()
+                                .map(|bits| f32::from_bits(*bits))
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     for texture in entry[8..8 + 6 * 16].chunks_exact(6) {
                         if texture[0] != 0 {
                             line += &format!(

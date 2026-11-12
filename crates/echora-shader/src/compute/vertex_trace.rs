@@ -25,11 +25,18 @@
 //!   ran it, and the four result words the last run produced (before the
 //!   instruction's mask picks the written components; integer bits).
 //!
-//! Words 104..128 are unused. Nothing is written while the address is 0;
+//! A fragment program records into record 0 only, from its invocation at
+//! the pixel `SpecMeaning::FragmentTracePixel` names: words 2, 3 are that
+//! invocation's FragCoord x and y (float bits), 4..8 unused, and at its
+//! end words 104..108 hold registers r0..r3 (target 0's colour when the
+//! header enables it).
+//!
+//! Words 108..128 are unused. Nothing is written while the address is 0;
 //! the runtime zeroes the buffer before the draw it traces.
 
 use echora_shader_abi::{
-    SpecConstant, SpecMeaning, VERTEX_TRACE_HIGH_SPEC_ID, VERTEX_TRACE_LOW_SPEC_ID,
+    FRAGMENT_TRACE_PIXEL_SPEC_ID, SpecConstant, SpecMeaning, VERTEX_TRACE_HIGH_SPEC_ID,
+    VERTEX_TRACE_LOW_SPEC_ID,
 };
 
 use super::{Emitter, Stage};
@@ -51,6 +58,9 @@ const BUILTIN_VERTEX_INDEX: u32 = 42;
 const BUILTIN_INSTANCE_INDEX: u32 = 43;
 const BUILTIN_BASE_VERTEX: u32 = 4424;
 const BUILTIN_BASE_INSTANCE: u32 = 4425;
+const BUILTIN_FRAG_COORD: u32 = 15;
+/// A fragment program's output registers recorded at its end.
+const FRAGMENT_OUTPUT_START: u32 = 104;
 
 impl Emitter {
     /// Whether this program records a vertex trace.
@@ -58,7 +68,7 @@ impl Emitter {
         self.layout.vertex_trace
             && match self.layout.mesh {
                 Some(mesh) => !mesh.task,
-                None => self.stage == Stage::Vertex,
+                None => matches!(self.stage, Stage::Vertex | Stage::Fragment),
             }
     }
 
@@ -88,7 +98,24 @@ impl Emitter {
     /// This invocation's record (a u64 address; 0: not traced) and its
     /// slot.
     fn vertex_trace_slot(&mut self) -> (u32, u32) {
-        let (slot, first) = if self.layout.mesh.is_some() {
+        let (slot, first) = if self.stage == Stage::Fragment {
+            // Record 0, from the invocation at the chosen pixel.
+            let pixel = self.module.u32_spec_constant(u32::MAX);
+            self.module
+                .decorate(pixel, 1, &[FRAGMENT_TRACE_PIXEL_SPEC_ID]);
+            self.spec_constants.push(SpecConstant {
+                id: FRAGMENT_TRACE_PIXEL_SPEC_ID,
+                meaning: SpecMeaning::FragmentTracePixel,
+            });
+            let (x, y) = self.frag_coord_xy();
+            let column = self.value(op::CONVERT_F_TO_U, self.u32, &[x]);
+            let row = self.value(op::CONVERT_F_TO_U, self.u32, &[y]);
+            let sixteen = self.constant(16);
+            let row = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[row, sixteen]);
+            let here = self.value(op::BITWISE_OR, self.u32, &[column, row]);
+            let first = self.value(op::I_EQUAL, self.bool, &[here, pixel]);
+            (self.constant(0), first)
+        } else if self.layout.mesh.is_some() {
             let slot = self.scalar_builtin(BUILTIN_LOCAL_INVOCATION_INDEX);
             let zero = self.constant(0);
             let mut first = self.module.bool_constant(true);
@@ -132,7 +159,13 @@ impl Emitter {
         }
         let (record, slot) = self.vertex_trace_slot();
         self.vertex_trace_record = Some(record);
-        let (first, second) = if self.layout.mesh.is_some() {
+        let (first, second) = if self.stage == Stage::Fragment {
+            let (x, y) = self.frag_coord_xy();
+            (
+                self.value(op::BITCAST, self.u32, &[x]),
+                self.value(op::BITCAST, self.u32, &[y]),
+            )
+        } else if self.layout.mesh.is_some() {
             (slot, self.builtin(BUILTIN_WORKGROUP_ID, 0))
         } else {
             // Declared here so that every exit can read it.
@@ -184,7 +217,17 @@ impl Emitter {
         let Some(record) = self.vertex_trace_record else {
             return;
         };
-        if self.layout.mesh.is_none() {
+        if self.stage == Stage::Fragment {
+            for n in 0..4u8 {
+                let word = self.read_register(n);
+                self.trace_atomic(
+                    record,
+                    FRAGMENT_OUTPUT_START + u32::from(n),
+                    op::ATOMIC_EXCHANGE,
+                    word,
+                );
+            }
+        } else if self.layout.mesh.is_none() {
             let vec4 = self.vec4();
             let variable = self.builtin_output(BUILTIN_POSITION, vec4);
             let value = self.value(op::LOAD, vec4, &[variable]);
@@ -198,6 +241,17 @@ impl Emitter {
         }
         let one = self.constant(1);
         self.trace_atomic(record, 0, op::ATOMIC_OR, one);
+    }
+
+    /// A fragment invocation's FragCoord x and y (floats).
+    fn frag_coord_xy(&mut self) -> (u32, u32) {
+        let vec4 = self.vec4();
+        let variable = self.builtin_variable(BUILTIN_FRAG_COORD, vec4);
+        let value = self.value(op::LOAD, vec4, &[variable]);
+        (
+            self.value(op::COMPOSITE_EXTRACT, self.f32, &[value, 0]),
+            self.value(op::COMPOSITE_EXTRACT, self.f32, &[value, 1]),
+        )
     }
 
     /// The position words (u32 bits) and their flags.

@@ -198,6 +198,10 @@ pub enum SpecMeaning {
     /// tracing). See the translator's documentation of the layout.
     VertexTraceLow,
     VertexTraceHigh,
+    /// Debugging (fragment programs translated with vertex tracing): the
+    /// pixel whose invocation records, x | y << 16 in the target's pixels
+    /// (all ones: none).
+    FragmentTracePixel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,7 +339,8 @@ pub const TEXTURE_POOL_SET: u32 = 1;
 // Specialization constant ids, one table for every program the translator
 // makes (each program's `spec_constants` lists the ones it declares):
 //
-// - 0..27: unused.
+// - 0..26: unused.
+// - 26: `FragmentTracePixel` (ECHORA_VERTEX_TRACE).
 // - 27, 28: `VertexTraceLow`, `VertexTraceHigh` (ECHORA_VERTEX_TRACE).
 // - 29, 30: `LoopTraceLow`, `LoopTraceHigh` (ECHORA_LOOP_TRACE).
 // - 31: `TexturePoolCapacity`.
@@ -346,6 +351,8 @@ pub const TEXTURE_POOL_SET: u32 = 1;
 /// The specialization constant ids of `SpecMeaning::VertexTraceLow` and
 /// `VertexTraceHigh`.
 pub const VERTEX_TRACE_LOW_SPEC_ID: u32 = 27;
+/// The specialization constant id of `SpecMeaning::FragmentTracePixel`.
+pub const FRAGMENT_TRACE_PIXEL_SPEC_ID: u32 = 26;
 pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 28;
 /// The specialization constant ids of `SpecMeaning::LoopTraceLow` and
 /// `LoopTraceHigh`.
