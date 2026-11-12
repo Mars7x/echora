@@ -2867,13 +2867,28 @@ impl Nvn {
         // since registration: the descriptor still names the texture it
         // held then.
         let registered = (entry.x[2], entry.x[3]);
-        if registered.0 != 0 && self.texture_identity(entry.x[0]) != Some(registered) {
+        let current = self.texture_identity(entry.x[0]);
+        let mut resolved = entry.x[0];
+        if registered.0 != 0 && current != Some(registered) {
             let retired = super::retired_texture(registered);
             if self.objects.contains_key(&retired) {
-                return Ok(retired);
+                resolved = retired;
             }
         }
-        Ok(entry.x[0])
+        // ECHORA_HANDLE_LOG=<storage hex>[,...] (debugging): each lookup of
+        // a descriptor registered over that storage, with the identity
+        // (storage, format) registered and the object's now.
+        if super::debug_var("ECHORA_HANDLE_LOG").is_ok_and(|wanted| {
+            wanted.split(',').any(|item| {
+                u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(registered.0)
+            })
+        }) {
+            eprintln!(
+                "handle present {} id {id} object {:x} registered {:x?} now {current:x?} at {} resolves {resolved:x}",
+                self.presented_frames, entry.x[0], registered, entry.x[4]
+            );
+        }
+        Ok(resolved)
     }
 
     /// The filters and wrap modes of the sampler a texture handle names
