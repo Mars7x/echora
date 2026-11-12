@@ -6774,7 +6774,7 @@ impl Nvn {
         }
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let line = format!(
-                "flow draw {:016x}/{:016x} count {count} reads {} writes {} level {:?} layers {:?} depth layer {} viewport {:?} depth {:x?} blend {:?} masks {:?} factors {:?}",
+                "flow draw {:016x}/{:016x} count {count} reads {} writes {} level {:?} layers {:?} depth layer {} viewport {:?} depth {:x?} blend {:?} masks {:?} factors {:?} constants {:?}",
                 keys.0,
                 keys.1,
                 self.describe_sources(textures.values().map(|(source, _)| source)),
@@ -6792,7 +6792,8 @@ impl Nvn {
                 blends
                     .iter()
                     .map(|blend| (blend.color, blend.alpha))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                fixed.blend_constants
             );
             self.sequence_note(&line);
             self.gpu.as_mut().unwrap().note(line);
