@@ -6,14 +6,17 @@
 //! frame decodes the started voices' wave buffers at their pitch, filters
 //! and scales them, mixes them into their mixes' buffers, mixes those down
 //! to the final mix and hands its buffers to the device sink
-//! (`audio_mix` holds the signal processing). Not yet processed: effects
-//! other than the buffer mixer, splitter routing, the depop fade of
+//! (`audio_mix` holds the signal processing). A mix's buffer mixer, Reverb,
+//! I3DL2 reverb and aux effects run on its buffers in their processing
+//! order (`audio_effects` holds the reverbs). Not yet processed: the delay,
+//! biquad, limiter, capture and compressor effects, the depop fade of
 //! stopped voices and the performance counters; the survey in the run
 //! report counts what the application asks for.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::audio_effects::{self as effects, I3dl2, I3dl2Parameters, Reverb, ReverbParameters};
 use crate::audio_mix::{self as mix, AdpcmContext, BiquadState, Format, Quality, Source};
 
 /// UpdateDataHeader size; input and output both start with one.
@@ -176,6 +179,261 @@ struct BufferMixer {
     mix: u32,
     order: u32,
     pairs: Vec<(usize, usize, f32)>,
+}
+
+/// An effect's ParameterState: the reverbs build their state on
+/// Initialized, take parameters on Updating and then stand at Updated.
+const STATE_INITIALIZED: u8 = 0;
+const STATE_UPDATING: u8 = 1;
+const STATE_UPDATED: u8 = 2;
+
+/// The sizes of an aux buffer's two info blocks (the application's, then
+/// the renderer's); the samples follow them.
+const AUX_INFO_SIZE: u64 = 0x40;
+const AUX_BUFFER_AT: u64 = 0x80;
+
+/// An effect with signal processing of its own, on its mix.
+#[derive(Clone, Debug)]
+struct Effect {
+    mix: u32,
+    order: u32,
+    enabled: bool,
+    processor: Processor,
+}
+
+#[derive(Clone, Debug)]
+enum Processor {
+    Reverb {
+        parameters: ReverbParameters,
+        pending: u8,
+        state: Option<Box<Reverb>>,
+    },
+    I3dl2 {
+        parameters: I3dl2Parameters,
+        pending: u8,
+        state: Option<Box<I3dl2>>,
+    },
+    /// The application's own processing: each input goes out through the
+    /// send buffer and each output comes back from the return buffer, both
+    /// rings of `count_max` samples in its memory.
+    Aux {
+        pairs: Vec<(usize, usize)>,
+        count_max: u32,
+        send: u64,
+        back: u64,
+    },
+}
+
+impl Processor {
+    /// The same effect type (its state carries over an update).
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Aux { .. } => 2,
+            Self::Reverb { .. } => 4,
+            Self::I3dl2 { .. } => 5,
+        }
+    }
+}
+
+/// Zero an aux buffer's read and write positions and its sample total.
+fn reset_aux(memory: &dyn Source, info: u64) {
+    let mut bytes = [0u8; 0x10];
+    if info != 0 && memory.read(info, &mut bytes) {
+        bytes[..8].fill(0);
+        bytes[0xc..].fill(0);
+        memory.write(info, &bytes);
+    }
+}
+
+/// Write `input` into the send ring `offset` samples after its write
+/// position, which then moves on by `update`.
+fn write_aux(
+    memory: &dyn Source,
+    base: u64,
+    count_max: u32,
+    input: &[i32],
+    offset: u32,
+    update: u32,
+) {
+    let info = base + AUX_INFO_SIZE;
+    let mut position = [0u8; 4];
+    if count_max == 0 || input.len() > count_max as usize || !memory.read(info + 4, &mut position) {
+        return;
+    }
+    let position = u32::from_le_bytes(position);
+    let mut target = position.wrapping_add(offset);
+    if target > count_max {
+        return;
+    }
+    let mut done = 0;
+    while done < input.len() {
+        let run = ((count_max - target) as usize).min(input.len() - done);
+        let bytes: Vec<u8> = input[done..done + run]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        memory.write(base + AUX_BUFFER_AT + u64::from(target) * 4, &bytes);
+        target = (target + run as u32) % count_max;
+        done += run;
+    }
+    if update != 0 {
+        let next = position.wrapping_add(update) % count_max;
+        memory.write(info + 4, &next.to_le_bytes());
+    }
+}
+
+/// Fill `output` from the return ring `offset` samples after its read
+/// position, which then moves on by `update`. Returns whether it was read.
+fn read_aux(
+    memory: &dyn Source,
+    base: u64,
+    count_max: u32,
+    output: &mut [i32],
+    offset: u32,
+    update: u32,
+) -> bool {
+    let info = base + AUX_INFO_SIZE;
+    let mut position = [0u8; 4];
+    if count_max == 0 || output.len() > count_max as usize || !memory.read(info, &mut position) {
+        return false;
+    }
+    let position = u32::from_le_bytes(position);
+    let mut target = position.wrapping_add(offset);
+    if target > count_max {
+        return false;
+    }
+    let mut done = 0;
+    while done < output.len() {
+        let run = ((count_max - target) as usize).min(output.len() - done);
+        let mut bytes = vec![0u8; run * 4];
+        if !memory.read(base + AUX_BUFFER_AT + u64::from(target) * 4, &mut bytes) {
+            bytes.fill(0);
+        }
+        for (sample, bytes) in output[done..done + run]
+            .iter_mut()
+            .zip(bytes.chunks_exact(4))
+        {
+            *sample = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        target = (target + run as u32) % count_max;
+        done += run;
+    }
+    if update != 0 {
+        let next = position.wrapping_add(update) % count_max;
+        memory.write(info, &next.to_le_bytes());
+    }
+    true
+}
+
+impl Effect {
+    /// Run on its mix's buffers for one frame of `count` samples.
+    fn process(
+        &mut self,
+        buffers: &mut [Vec<i32>],
+        count: usize,
+        memory: &dyn Source,
+        long_pre_delay: bool,
+    ) {
+        match &mut self.processor {
+            Processor::Reverb {
+                parameters,
+                pending,
+                state,
+            } => {
+                if self.enabled {
+                    match (*pending, state.as_deref_mut()) {
+                        (STATE_UPDATING, Some(state)) => state.update(parameters),
+                        (STATE_INITIALIZED, _) | (_, None) => {
+                            *state = Some(Box::new(Reverb::new(parameters, long_pre_delay)));
+                        }
+                        _ => {}
+                    }
+                    if let Some(state) = state {
+                        state.process(parameters, buffers, count);
+                    }
+                } else {
+                    let channels = parameters.channels.min(6);
+                    effects::bypass(
+                        buffers,
+                        &parameters.inputs[..channels],
+                        &parameters.outputs[..channels],
+                    );
+                }
+                *pending = STATE_UPDATED;
+            }
+            Processor::I3dl2 {
+                parameters,
+                pending,
+                state,
+            } => {
+                if self.enabled {
+                    match (*pending, state.as_deref_mut()) {
+                        (STATE_UPDATING, Some(state)) => state.update(parameters),
+                        (STATE_INITIALIZED, _) | (_, None) => {
+                            *state = Some(Box::new(I3dl2::new(parameters)));
+                        }
+                        _ => {}
+                    }
+                    if let Some(state) = state {
+                        state.process(parameters, buffers, count);
+                    }
+                } else {
+                    let channels = parameters.channels.min(6);
+                    effects::bypass(
+                        buffers,
+                        &parameters.inputs[..channels],
+                        &parameters.outputs[..channels],
+                    );
+                }
+                *pending = STATE_UPDATED;
+            }
+            Processor::Aux {
+                pairs,
+                count_max,
+                send,
+                back,
+            } => {
+                if *send == 0 || *back == 0 {
+                    return;
+                }
+                if !self.enabled {
+                    reset_aux(memory, *send + AUX_INFO_SIZE);
+                    reset_aux(memory, *back + AUX_INFO_SIZE);
+                    let (inputs, outputs): (Vec<usize>, Vec<usize>) = pairs.iter().copied().unzip();
+                    effects::bypass(buffers, &inputs, &outputs);
+                    return;
+                }
+                // Channel after channel in the rings; the last one moves
+                // their positions past the whole frame.
+                let total = (pairs.len() * count) as u32;
+                for (channel, &(input, output)) in pairs.iter().enumerate() {
+                    if input >= buffers.len() || output >= buffers.len() {
+                        continue;
+                    }
+                    let offset = (channel * count) as u32;
+                    let update = if channel + 1 == pairs.len() { total } else { 0 };
+                    write_aux(
+                        memory,
+                        *send,
+                        *count_max,
+                        &buffers[input][..count],
+                        offset,
+                        update,
+                    );
+                    if !read_aux(
+                        memory,
+                        *back,
+                        *count_max,
+                        &mut buffers[output][..count],
+                        offset,
+                        update,
+                    ) {
+                        buffers[output][..count].fill(0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 const MAX_MIX_BUFFERS: usize = 24;
@@ -441,6 +699,8 @@ pub struct Renderer {
     resources: BTreeMap<u32, ChannelResource>,
     mixes: BTreeMap<i32, Mix>,
     mixers: BTreeMap<usize, BufferMixer>,
+    /// The effect slots with signal processing of their own.
+    processors: BTreeMap<usize, Effect>,
     /// Each splitter's destination ids, in order.
     splitters: BTreeMap<i32, Vec<i32>>,
     destinations: BTreeMap<i32, Destination>,
@@ -470,6 +730,7 @@ impl Renderer {
             resources: BTreeMap::new(),
             mixes: BTreeMap::new(),
             mixers: BTreeMap::new(),
+            processors: BTreeMap::new(),
             splitters: BTreeMap::new(),
             destinations: BTreeMap::new(),
             device: None,
@@ -627,8 +888,8 @@ impl Renderer {
             }
             voice.previous_volume = voice.volume;
         }
-        if memory.is_some() {
-            self.mix_down(&mut buffers, count);
+        if let Some(memory) = memory {
+            self.mix_down(&mut buffers, count, memory);
             if mixed {
                 self.mixed_frames += 1;
             }
@@ -641,7 +902,12 @@ impl Renderer {
 
     /// Each mix into its destination, farthest from the final mix first;
     /// then the final mix's volume and the device sink.
-    fn mix_down(&mut self, buffers: &mut BTreeMap<i32, Vec<Vec<i32>>>, count: usize) {
+    fn mix_down(
+        &mut self,
+        buffers: &mut BTreeMap<i32, Vec<Vec<i32>>>,
+        count: usize,
+        memory: &dyn Source,
+    ) {
         // A mix's distance from the final mix (0); unconnected ones last.
         let distance = |mut id: i32| {
             let mut steps = 0;
@@ -669,28 +935,41 @@ impl Renderer {
         };
         let mut order: Vec<(i32, i32)> = self.mixes.keys().map(|&id| (distance(id), id)).collect();
         order.sort_unstable_by(|a, b| b.cmp(a));
+        // Revision 3 lengthened the Reverb's pre-delay line.
+        let long_pre_delay = (self.parameters.revision >> 24).saturating_sub(u32::from(b'0')) >= 3;
         for (steps, id) in order {
-            let mix = &self.mixes[&id];
             // The mix's own effects, in their processing order.
-            let mut mixers: Vec<&BufferMixer> = self
+            let mut slots: Vec<(u32, usize)> = self
                 .mixers
-                .values()
-                .filter(|mixer| mixer.mix as i32 == id)
+                .iter()
+                .filter(|(_, mixer)| mixer.mix as i32 == id)
+                .map(|(&slot, mixer)| (mixer.order, slot))
+                .chain(
+                    self.processors
+                        .iter()
+                        .filter(|(_, effect)| effect.mix as i32 == id)
+                        .map(|(&slot, effect)| (effect.order, slot)),
+                )
                 .collect();
-            mixers.sort_by_key(|mixer| mixer.order);
+            slots.sort_unstable();
             if let Some(own) = buffers.get_mut(&id) {
-                for mixer in mixers {
-                    for &(input, output, volume) in &mixer.pairs {
-                        if input < own.len() && output < own.len() && input != output {
-                            let source = own[input].clone();
-                            mix::mix(&mut own[output], &source, volume);
+                for (_, slot) in slots {
+                    if let Some(mixer) = self.mixers.get(&slot) {
+                        for &(input, output, volume) in &mixer.pairs {
+                            if input < own.len() && output < own.len() && input != output {
+                                let source = own[input].clone();
+                                mix::mix(&mut own[output], &source, volume);
+                            }
                         }
+                    } else if let Some(effect) = self.processors.get_mut(&slot) {
+                        effect.process(own, count, memory, long_pre_delay);
                     }
                 }
             }
             if id == FINAL_MIX || steps == i32::MAX {
                 continue;
             }
+            let mix = &self.mixes[&id];
             let Some(source) = buffers.get(&id).cloned() else {
                 continue;
             };
@@ -913,6 +1192,95 @@ impl Renderer {
                 );
             } else {
                 self.mixers.remove(&index);
+            }
+            let specific = &entry[0x20..EFFECT_IN];
+            let kept = self
+                .processors
+                .get(&index)
+                .is_some_and(|effect| effect.processor.kind() == kind && !new);
+            // What the reverb's next frame does: build its state, or take
+            // the parameters when the application marks them changed.
+            let pending = |kept: Option<u8>, wanted: u8| match kept {
+                Some(STATE_UPDATED) => wanted,
+                Some(pending) => pending,
+                None => STATE_INITIALIZED,
+            };
+            let processor = match (kind, self.processors.remove(&index).filter(|_| kept)) {
+                (4, old) => {
+                    let (was, state) = match old.map(|effect| effect.processor) {
+                        Some(Processor::Reverb { pending, state, .. }) => (Some(pending), state),
+                        _ => (None, None),
+                    };
+                    Some(Processor::Reverb {
+                        parameters: ReverbParameters::parse(specific),
+                        pending: pending(was, specific[0x40]),
+                        state,
+                    })
+                }
+                (5, old) => {
+                    let (was, state) = match old.map(|effect| effect.processor) {
+                        Some(Processor::I3dl2 { pending, state, .. }) => (Some(pending), state),
+                        _ => (None, None),
+                    };
+                    Some(Processor::I3dl2 {
+                        parameters: I3dl2Parameters::parse(specific),
+                        pending: pending(was, specific[0x48]),
+                        state,
+                    })
+                }
+                (2, _) => {
+                    let word = |at: usize| crate::bytes::le_u32(&specific[at..at + 4]);
+                    let address = |at: usize| crate::bytes::le_u64(&specific[at..at + 8]);
+                    Some(Processor::Aux {
+                        pairs: (0..word(0x30).min(24) as usize)
+                            .map(|pair| (specific[pair] as usize, specific[0x18 + pair] as usize))
+                            .collect(),
+                        count_max: word(0x38),
+                        send: address(0x40),
+                        back: address(0x50),
+                    })
+                }
+                _ => None,
+            };
+            // The parameters' shape, for the run report.
+            let shape = match &processor {
+                Some(Processor::Reverb { parameters, .. }) => Some(format!(
+                    "reverb channels {} rate {:#x} early mode {} late mode {} decay {:#x}",
+                    parameters.channels,
+                    parameters.sample_rate,
+                    parameters.early_mode,
+                    parameters.late_mode,
+                    parameters.decay_time
+                )),
+                Some(Processor::I3dl2 { parameters, .. }) => Some(format!(
+                    "I3DL2 reverb channels {} rate {} decay {} s",
+                    parameters.channels, parameters.sample_rate, parameters.late_reverb_decay_time
+                )),
+                Some(Processor::Aux {
+                    pairs,
+                    count_max,
+                    send,
+                    back,
+                }) => Some(format!(
+                    "aux buffers {} ring {count_max} mapped {}",
+                    pairs.len(),
+                    *send != 0 && *back != 0
+                )),
+                None => None,
+            };
+            if let Some(shape) = shape.filter(|_| enabled) {
+                *self.survey.entry(shape).or_default() += 1;
+            }
+            if let Some(processor) = processor {
+                self.processors.insert(
+                    index,
+                    Effect {
+                        mix: crate::bytes::le_u32(&entry[4..8]),
+                        order: crate::bytes::le_u32(&entry[0x18..0x1c]),
+                        enabled,
+                        processor,
+                    },
+                );
             }
             let usage = self.effects.entry(index).or_insert((kind, new, enabled));
             if usage.0 != kind || new {
@@ -1436,5 +1804,78 @@ mod tests {
     fn output_sizes_must_match_a_layout() {
         let mut renderer = Renderer::new(parameters(1));
         assert!(renderer.update(&input(&[0u8; 0x188]), 0x1000).is_err());
+    }
+
+    /// Guest memory from address 0 for the aux effect's rings.
+    struct Ram(std::cell::RefCell<Vec<u8>>);
+
+    impl Source for Ram {
+        fn read(&self, address: u64, out: &mut [u8]) -> bool {
+            let ram = self.0.borrow();
+            let Some(bytes) = ram.get(address as usize..address as usize + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(bytes);
+            true
+        }
+
+        fn write(&self, address: u64, bytes: &[u8]) -> bool {
+            let mut ram = self.0.borrow_mut();
+            let Some(to) = ram.get_mut(address as usize..address as usize + bytes.len()) else {
+                return false;
+            };
+            to.copy_from_slice(bytes);
+            true
+        }
+    }
+
+    #[test]
+    fn aux_sends_inputs_and_takes_the_return() {
+        // Two rings of six samples: send at 0x100, return at 0x200.
+        let ram = Ram(std::cell::RefCell::new(vec![0u8; 0x300]));
+        let word = |address: u64| {
+            let mut bytes = [0u8; 4];
+            assert!(ram.read(address, &mut bytes));
+            i32::from_le_bytes(bytes)
+        };
+        for (index, sample) in [10i32, 20, 30, 40, 50, 60].into_iter().enumerate() {
+            ram.write(0x280 + index as u64 * 4, &sample.to_le_bytes());
+        }
+        let mut effect = Effect {
+            mix: 0,
+            order: 0,
+            enabled: true,
+            processor: Processor::Aux {
+                pairs: vec![(0, 0), (1, 1)],
+                count_max: 6,
+                send: 0x100,
+                back: 0x200,
+            },
+        };
+        let mut buffers = vec![vec![1, 2], vec![3, 4]];
+        effect.process(&mut buffers, 2, &ram, true);
+        // Both channels went out one after the other and came back so.
+        assert_eq!(
+            [word(0x180), word(0x184), word(0x188), word(0x18c)],
+            [1, 2, 3, 4]
+        );
+        assert_eq!(buffers, vec![vec![10, 20], vec![30, 40]]);
+        // The renderer's write and read positions moved past the frame.
+        assert_eq!((word(0x144), word(0x240)), (4, 4));
+        // The next frame wraps around both rings.
+        let mut buffers = vec![vec![5, 6], vec![7, 8]];
+        effect.process(&mut buffers, 2, &ram, true);
+        assert_eq!(
+            [word(0x190), word(0x194), word(0x180), word(0x184)],
+            [5, 6, 7, 8]
+        );
+        assert_eq!(buffers, vec![vec![50, 60], vec![10, 20]]);
+        assert_eq!((word(0x144), word(0x240)), (2, 2));
+        // Disabled, it passes through and rewinds the rings.
+        effect.enabled = false;
+        let mut buffers = vec![vec![9, 9], vec![8, 8]];
+        effect.process(&mut buffers, 2, &ram, true);
+        assert_eq!(buffers, vec![vec![9, 9], vec![8, 8]]);
+        assert_eq!((word(0x144), word(0x240)), (0, 0));
     }
 }

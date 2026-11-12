@@ -1446,11 +1446,15 @@ fn downmix_to_stereo(samples: &[i16]) -> Vec<i16> {
 }
 
 /// Guest memory as the audio renderer decodes wave buffers from it.
-struct GuestAudio<'a>(&'a Memory);
+struct GuestAudio<'a>(std::cell::RefCell<&'a mut Memory>);
 
 impl crate::audio_mix::Source for GuestAudio<'_> {
     fn read(&self, address: u64, out: &mut [u8]) -> bool {
-        self.0.read(address, out).is_ok()
+        self.0.borrow().read(address, out).is_ok()
+    }
+
+    fn write(&self, address: u64, bytes: &[u8]) -> bool {
+        self.0.borrow_mut().write(address, bytes).is_ok()
     }
 }
 
@@ -5886,9 +5890,9 @@ impl Services {
 
     /// Release finished audio-out buffers and signal their events. Returns
     /// whether any event was signaled.
-    pub(crate) fn advance_audio(&mut self, now: std::time::Instant, memory: &Memory) -> bool {
+    pub(crate) fn advance_audio(&mut self, now: std::time::Instant, memory: &mut Memory) -> bool {
         let mut signaled = false;
-        let source = GuestAudio(memory);
+        let source = GuestAudio(std::cell::RefCell::new(memory));
         for id in 0..self.audio_renderers.len() {
             let (renderer, event) = &mut self.audio_renderers[id];
             if renderer.advance(now, Some(&source)) {
@@ -5966,9 +5970,10 @@ impl Services {
         const SERVICE: &str = "aud:u:audio_renderer";
         let now = std::time::Instant::now();
         let command = call.request.command_id;
-        self.audio_renderers[id]
-            .0
-            .advance(now, Some(&GuestAudio(&*call.memory)));
+        self.audio_renderers[id].0.advance(
+            now,
+            Some(&GuestAudio(std::cell::RefCell::new(&mut *call.memory))),
+        );
         self.play_renderer(id);
         let renderer = &mut self.audio_renderers[id].0;
         let parameters = renderer.parameters;

@@ -771,7 +771,7 @@ impl Machine {
         // re-evaluated, so a waiter sees their completion events.
         self.services.refresh_syncpoint_cache(&mut self.memory)?;
         let now = std::time::Instant::now();
-        self.services.advance_audio(now, &self.memory);
+        self.services.advance_audio(now, &mut self.memory);
         let mut woke = self.time_out_mutex_waits(now)?;
         for (id, record) in self.synchronization_waits.waiters() {
             let mut completion = None;

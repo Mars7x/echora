@@ -11,6 +11,12 @@ use crate::audio_tables::{HIGH_0, HIGH_1, HIGH_2, NORMAL_0, NORMAL_1, NORMAL_2};
 /// readable (the samples then decode as nothing).
 pub trait Source {
     fn read(&self, address: u64, out: &mut [u8]) -> bool;
+
+    /// Write `bytes` at `address` (the aux effect's buffers); false where
+    /// the memory is not writable.
+    fn write(&self, _address: u64, _bytes: &[u8]) -> bool {
+        false
+    }
 }
 
 /// NVN-independent sample formats of a voice's wave buffers.
