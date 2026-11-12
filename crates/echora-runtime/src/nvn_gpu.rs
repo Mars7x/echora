@@ -2090,7 +2090,25 @@ impl Nvn {
     /// `mip_targets` allows).
     fn resolve_target(&self, texture: u64) -> Option<(u64, u32)> {
         let renderer = &self.gpu.as_ref()?.renderer;
-        if renderer.existing_target(texture).is_some() {
+        let extent = self.texture_extent(texture).ok();
+        // Its own format (or its sRGB twin): a texture object
+        // reinterpreting the memory in another format (RGB9E5 over the HDR
+        // scene's R11G11B10) is not the same target.
+        let format = self.target_shape(texture).ok().map(|(_, _, format)| format);
+        let same_format = |target_format: vk::Format| {
+            format.is_some_and(|format| {
+                target_format == format
+                    || echora_gpu::renderer::srgb_twin(target_format) == Some(format)
+            })
+        };
+        // The object's own target, while the object still describes it:
+        // applications rotate texture objects through a ring and initialize
+        // one again over other storage or in another format (the target
+        // the object last named is then another texture).
+        if renderer.existing_target(texture).is_some_and(|target| {
+            (format.is_none() || same_format(target.format))
+                && extent.is_none_or(|extent| (target.width, target.height) == extent)
+        }) {
             return Some((texture, 0));
         }
         let mips = super::mip_targets();
@@ -2098,11 +2116,7 @@ impl Nvn {
             return self.target_sharing_storage(texture).map(|key| (key, 0));
         }
         let base = self.texture_storage(texture)?;
-        let extent = self.texture_extent(texture).ok()?;
-        // Its own format (or its sRGB twin): a texture object
-        // reinterpreting the memory in another format (RGB9E5 over the HDR
-        // scene's R11G11B10) is not the same target.
-        let format = self.target_shape(texture).ok().map(|(_, _, format)| format);
+        let extent = extent?;
         for key in renderer.target_keys() {
             let Some(target) = renderer.existing_target(key) else {
                 continue;
@@ -2112,10 +2126,7 @@ impl Nvn {
             };
             if target_base == base
                 && (target.width, target.height) == extent
-                && format.is_some_and(|format| {
-                    target.format == format
-                        || echora_gpu::renderer::srgb_twin(target.format) == Some(format)
-                })
+                && same_format(target.format)
             {
                 return Some((key, 0));
             }
