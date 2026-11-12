@@ -818,7 +818,7 @@ pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
         .map(|&word| u32::from_le_bytes(word))
         .collect();
     let mut lines = Vec::new();
-    for (record, entry) in words.chunks_exact(128).enumerate() {
+    for (record, entry) in words.as_chunks::<128>().0.iter().enumerate() {
         if entry.iter().all(|&word| word == 0) {
             continue;
         }
@@ -837,7 +837,7 @@ pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
                 .collect();
             line += &format!(" | out {out:?}");
         }
-        for texture in entry[8..8 + 6 * 16].chunks_exact(6) {
+        for texture in entry[8..8 + 6 * 16].as_chunks::<6>().0 {
             if texture[0] != 0 {
                 line += &format!(
                     " | tex at {:#x} x{} {:08x} {:08x} {:08x} {:08x}",
