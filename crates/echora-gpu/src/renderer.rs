@@ -4035,7 +4035,8 @@ impl Renderer {
             .map(|(texels, ..)| texels)
     }
 
-    /// As `read_target_level`, slice `slice` of a 3D target.
+    /// As `read_target_level`, slice `slice` of a 3D target (array layer
+    /// `slice` of any other).
     pub fn read_target_slice(
         &mut self,
         key: u64,
@@ -4113,10 +4114,13 @@ impl Renderer {
         let size = u64::from(width) * u64::from(height) * 16;
         let buffer = self.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let commands = self.commands()?;
+        // `slice` is a depth slice of a volume, else an array layer.
+        let volume = matches!(self.targets[&key].shape, crate::draw::ImageShape::D3 { .. });
+        let (slice, layer) = if volume { (slice, 0) } else { (0, slice) };
         let layers = vk::ImageSubresourceLayers {
             aspect_mask: aspect(format),
             mip_level: level,
-            base_array_layer: 0,
+            base_array_layer: layer,
             layer_count: 1,
         };
         let corner = vk::Offset3D {
@@ -4141,6 +4145,7 @@ impl Renderer {
             dst_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
+                base_array_layer: 0,
                 ..layers
             },
             dst_offsets: [vk::Offset3D::default(), corner],

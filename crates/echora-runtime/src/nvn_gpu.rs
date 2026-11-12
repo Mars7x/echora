@@ -3933,7 +3933,7 @@ impl Nvn {
             "stat: dispatch renderer microseconds",
             started.elapsed().as_micros() as u64,
         );
-        self.trace_targets(&images_written, &format!("dispatch {:016x}", key.0))?;
+        self.trace_targets(&images_written, &[], &format!("dispatch {:016x}", key.0))?;
         self.trace_memory(core, &format!("dispatch {:016x}", key.0))?;
         let backend = self.gpu.as_mut().unwrap();
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -4994,7 +4994,12 @@ impl Nvn {
         Ok(())
     }
 
-    fn trace_targets(&mut self, written: &[u64], what: &str) -> Result<(), String> {
+    fn trace_targets(
+        &mut self,
+        written: &[u64],
+        places: &[(u32, u32)],
+        what: &str,
+    ) -> Result<(), String> {
         let Ok(keys) = super::debug_var("ECHORA_TARGET_TRACE") else {
             return Ok(());
         };
@@ -5011,7 +5016,10 @@ impl Nvn {
         }
         let present = self.presented_frames;
         let backend = self.gpu.as_mut().unwrap();
-        for &key in written {
+        for (index, &key) in written.iter().enumerate() {
+            // The (level, layer) a draw rendered into (level 0, layer 0
+            // otherwise).
+            let (level, layer) = places.get(index).copied().unwrap_or((0, 0));
             if keys != "all"
                 && !keys
                     .split(',')
@@ -5023,9 +5031,10 @@ impl Nvn {
                 continue;
             };
             let (width, height, format) = (target.width, target.height, target.format);
+            let (width, height) = ((width >> level).max(1), (height >> level).max(1));
             let depth = target.shape.depth();
             backend.renderer.flush()?;
-            let Ok(texels) = backend.renderer.read_target_level(key, 0) else {
+            let Ok(texels) = backend.renderer.read_target_slice(key, level, layer) else {
                 continue;
             };
             // A volume: also the mean first channel of a few slices
@@ -5073,7 +5082,7 @@ impl Nvn {
                 })
                 .map_or(String::new(), |texel| format!(" pixel {texel:?}"));
             eprintln!(
-                "target trace present {present} {what} wrote {key:x} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}{slices}",
+                "target trace present {present} {what} wrote {key:x} level {level} layer {layer} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}{slices}",
                 mean[0], mean[1], mean[2], mean[3]
             );
         }
@@ -6962,6 +6971,18 @@ impl Nvn {
             .copied()
             .filter(|key| *key != 0)
             .collect();
+        let color_places: Vec<(u32, u32)> = draw
+            .colors
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| **key != 0)
+            .map(|(index, _)| {
+                (
+                    draw.color_levels.get(index).copied().unwrap_or(0),
+                    draw.color_layers.get(index).copied().unwrap_or(0),
+                )
+            })
+            .collect();
         let (draw_count, draw_instances) = (draw.count, draw.instances);
         let probe_level = draw.color_levels.first().copied().unwrap_or(0);
         let setup_end = std::time::Instant::now();
@@ -7173,7 +7194,7 @@ impl Nvn {
                 core, command, keys.1, &stages, &uniforms, &textures, page_table,
             );
         }
-        self.trace_targets(&colors_written, &draw_label)?;
+        self.trace_targets(&colors_written, &color_places, &draw_label)?;
         self.trace_memory(core, &draw_label)
     }
 }
