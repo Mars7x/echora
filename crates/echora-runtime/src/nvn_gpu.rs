@@ -7283,6 +7283,37 @@ impl Nvn {
                 &format!("sampled by draw {:016x}/{:016x}", keys.0, keys.1),
             )?;
         }
+        // ECHORA_DRAW_UNIFORM_DUMP=<fragment key hex>[,...] with
+        // ECHORA_DUMP_DIR (debugging): each draw of those programs writes
+        // its uniform buffers whole, as uniforms-<key>-<present>-<n>-<stage>-
+        // <binding>.bin (n counting draws within the present), from present
+        // ECHORA_DRAW_UNIFORM_DUMP_FROM on (as ECHORA_DISPATCH_UNIFORM_DUMP).
+        if let (Ok(wanted), Some(directory)) = (
+            super::debug_var("ECHORA_DRAW_UNIFORM_DUMP"),
+            super::debug_var_os("ECHORA_DUMP_DIR"),
+        ) && wanted
+            .split(',')
+            .any(|item| item.trim() == format!("{:016x}", keys.1))
+            && super::debug_var("ECHORA_DRAW_UNIFORM_DUMP_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|from| self.presented_frames >= from)
+        {
+            let directory = std::path::Path::new(&directory);
+            let _ = std::fs::create_dir_all(directory);
+            let prefix = format!("uniforms-{:016x}-{}", keys.1, self.presented_frames);
+            let mut index = 0;
+            while directory.join(format!("{prefix}-{index}.done")).exists() {
+                index += 1;
+            }
+            for ((stage, binding), bytes) in &uniforms {
+                let _ = std::fs::write(
+                    directory.join(format!("{prefix}-{index}-{stage}-{binding}.bin")),
+                    bytes,
+                );
+            }
+            let _ = std::fs::write(directory.join(format!("{prefix}-{index}.done")), []);
+        }
         let backend = self.gpu.as_mut().unwrap();
         // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
         // programs' draws, with their fixed-function state.
