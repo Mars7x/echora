@@ -5922,6 +5922,28 @@ impl Services {
             return;
         }
         let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
+        // ECHORA_AUDIO_DUMP=<file> (debugging): the device sink's samples
+        // as they were mixed (interleaved 16-bit little endian), appended
+        // to the file; `<file>.txt` holds the rate and channel count.
+        if let Some(path) = crate::nvn::debug_var_os("ECHORA_AUDIO_DUMP") {
+            use std::io::Write;
+            let path = std::path::Path::new(path);
+            let note = path.with_extension("txt");
+            if !note.exists() {
+                let _ = std::fs::write(&note, format!("rate {rate} channels {channels}\n"));
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let bytes: Vec<u8> = samples
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect();
+                let _ = file.write_all(&bytes);
+            }
+        }
         // The device's own channel count where the host can play it;
         // else six channels are mixed down to two, as the console does for
         // a stereo output.
