@@ -53,8 +53,10 @@ pub fn translate_with_requirements(
     Ok((translated, list))
 }
 
-/// The translation and its needs, sites from the program's start.
-fn translate_with_needs(
+/// The translation and what it needs (`compute::Needs`: capabilities and
+/// stores by the instruction first needing them, how TXQ's views were
+/// found), sites from the program's start.
+pub fn translate_with_needs(
     program: &[u8],
     parameters: &Parameters,
     options: &Options,

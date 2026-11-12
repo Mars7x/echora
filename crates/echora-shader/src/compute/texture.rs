@@ -1020,16 +1020,34 @@ impl Emitter {
             .collect())
     }
 
-    /// TXQ: width, height, depth or layers, and the level count. The
-    /// instruction names no view type, so the texture is read as 2D.
+    /// TXQ (the dimension query): the texture's size, as textureSize gives
+    /// it, in components 0-2 (width, height, then layers or depth: 1D
+    /// arrays have their layers second), 1 where it has none, and the level
+    /// count in component 3 (NAK's build_txq_size and build_txq_levels).
+    /// The instruction names no view type: a bound handle's comes from the
+    /// program's other uses of it (`texture_views`), else it is queried as
+    /// a 2D array, which the runtime binds for it (a 2D texture as one
+    /// layer); a bindless handle is queried as 2D.
     fn texture_query(&mut self, index: usize, texture: &Texture) -> Result<Vec<u32>, Unsupported> {
         self.module.capability(capability::IMAGE_QUERY);
-        let view = View {
-            dim: 1,
-            arrayed: false,
-            texture_type: 2,
-            coordinates: 2,
+        let dimension = if texture.handle_value {
+            1
+        } else {
+            match self
+                .texture_views
+                .get(&(texture.bank, texture.handle_offset))
+            {
+                Some(&Some(dimension)) if view(dimension).is_some() => {
+                    self.txq_views.0 += 1;
+                    dimension
+                }
+                _ => {
+                    self.txq_views.1 += 1;
+                    5
+                }
+            }
         };
+        let view = view(dimension).expect("a known dimension");
         // TXQ.B: the handle in Ra, the level in Ra+1; TXQ: the level in Ra.
         let value = |e: &mut Self, register: u8| {
             if register == 255 {
@@ -1051,15 +1069,32 @@ impl Emitter {
         let (sampled, types) = self.sampled_image(index, texture, &view, false, handle)?;
         let level = value(self, level_register);
         let image = self.value(op::IMAGE, types.image, &[sampled]);
-        let uvec2 = self.module.ty(Type::Vector {
-            component: self.u32,
-            count: 2,
-        });
-        let size = self.value(op::IMAGE_QUERY_SIZE_LOD, uvec2, &[image, level]);
-        let width = self.value(op::COMPOSITE_EXTRACT, self.u32, &[size, 0]);
-        let height = self.value(op::COMPOSITE_EXTRACT, self.u32, &[size, 1]);
-        let levels = self.value(op::IMAGE_QUERY_LEVELS, self.u32, &[image]);
+        // textureSize's components: 1D 1, 1D array and 2D and cube 2, the
+        // rest 3.
+        let count = match (view.dim, view.arrayed) {
+            (0, false) => 1,
+            (0, true) | (1, false) | (3, false) => 2,
+            _ => 3,
+        };
+        let size_type = if count == 1 {
+            self.u32
+        } else {
+            self.module.ty(Type::Vector {
+                component: self.u32,
+                count,
+            })
+        };
+        let size = self.value(op::IMAGE_QUERY_SIZE_LOD, size_type, &[image, level]);
         let one = self.constant(1);
-        Ok(vec![width, height, one, levels])
+        let mut results: Vec<u32> = (0..3)
+            .map(|n| match (n < count, count) {
+                (false, _) => one,
+                (true, 1) => size,
+                (true, _) => self.value(op::COMPOSITE_EXTRACT, self.u32, &[size, n]),
+            })
+            .collect();
+        let levels = self.value(op::IMAGE_QUERY_LEVELS, self.u32, &[image]);
+        results.push(levels);
+        Ok(results)
     }
 }

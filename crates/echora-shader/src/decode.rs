@@ -1405,7 +1405,10 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             }
             // TXQ: only the dimension query, with 76-89 clear (as Lichii
             // accepts it); other query kinds are not decoded.
-            if op == TextureOp::Query && word.bits(76, 14) != 0 {
+            // TXQ: the query type at 62-63 (NAK's SM70 encoding: 0
+            // dimensions, 1 texture type, 2 sampler position); only the
+            // dimension query is decoded.
+            if op == TextureOp::Query && (word.bits(76, 14) != 0 || word.bits(62, 2) != 0) {
                 return None;
             }
             return Some(Op::Tex(Texture {

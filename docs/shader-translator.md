@@ -172,6 +172,25 @@ program that writes no colour 1 gives zeros there (what the hardware reads
 then is not documented). KILL demotes the invocation to a helper. A graphics program's local memory size is the SPH's ShaderLocalMemoryLowSize (common word 1, bits 0-23); a nonzero high size (common word 2, bits 32 and up of the size) is refused. `stores` has bit
 (address / 4) set for every attribute word written.
 
+**Texture size queries.** TXQ's dimension query gives textureSize's
+components first (width, height, then an array's layers, a 3D texture's
+depth or a cube array's cube count; a 1D array's layers second), 1 where
+the texture has none, and the level count in component 3 (NAK's
+build_txq_size and build_txq_levels). The instruction names no view type,
+so a bound handle is queried through the view the program's other texture
+instructions on the same handle use (the same constant-bank word, or a
+uniform register holding only that word), sharing their descriptor; a
+handle no other instruction uses, or used with different dimensions, is
+queried through a 2D array view. Runtime contract for that fallback: the
+descriptor says 2D array (`texture_type` 3), and the runtime binds the
+handle's texture as a 2D array view of all its layers: a 2D texture as one
+layer, an array as itself, a 3D texture as its depth slices (which needs
+the image created 2D_ARRAY_COMPATIBLE; that view holds one level, so the
+level count reads 1), a cube as its six faces per cube (which gives 6 or 6n
+where the hardware gives 1 or n). A bindless TXQ.B is queried as 2D (its
+pool entry's view type is not known). The survey example counts the two
+kinds over a dump.
+
 **Storage images.** A formatted image access (SULD.P, SUST.P) is typeless
 (the bound image's format, no format in the SPIR-V). Whether the image is
 integer is run-time state, so each image has a float and an unsigned view
@@ -532,7 +551,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | LDS, STS, LDL, STL | 0x984, 0x388/0x988, 0x983, 0x387/0x987 | as global, 32-bit; shared register scale 78-79 (1, 4, 8, 16) |
 | RED, ATOMG, ATOMS | 0x98e, 0x9a8/0x3a8, 0x38c/0x98c; CAS 0x3a9, 0x38d | operation 87-90 (RED 87-89), type 73-75; address as loads (ATOMG 0x9a8's pair flag at 70; RED's at 72 with a register address alone, at 90 with a uniform register, bit 91, whose own pair flag is 72); data 32, or compare 32 and data 64 for CAS |
 | TXD | 0xb6c | 1D, 2D, 3D, cube and their arrays (NAK's layout): the coordinates then an array's layer (bits 0-15) from Ra, each coordinate's d/dx and d/dy in turn from Rb; results as TEX. With offsets (which share the layer's register, bits 16-31) it is refused: they move the sample by texels of the level the gradients pick, which Vulkan only takes as constant offsets |
-| TEX, TLD.SCR, TLD4, TXQ, TMML | 0xb60, 0xb66, 0xb63, 0xb6f, 0xb69 (bindless 0xf6x) | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit, implicit with a least level .LC, biased with one .LB.LC: NAK's SM70 numbering 0-5; the least level is 8.8 fixed point in bits 16-31 of the register an array's layer takes, bits 0-15, or of its own before the coordinates, unpacked as NAK lays it out, a MinLod operand in fragment programs and the floor of the level elsewhere), TLD4 component 87-88, offsets 76 (TLD4 per-tap with 76-77 = 2: signed 6-bit x, y per tap in the bytes of two registers, one gather per tap), TXQ and TMML have no fault predicate at 81-83, TMML only in fragment programs (an array's layer first, left out of the query), TXQ only the dimension query (76-89 clear), depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference): packed (bit 60 set, NAK's SM70 scalar form) half in Ra and half in Rb up to four, else four and the rest; unpacked (bit 60 clear) the array index and coordinates in Ra and the rest in Rb, as NAK lays them out (the game's one unpacked form, a 3D TEX.LL with offsets, writes its level and offsets to Rb and nothing to Ra's fourth register) |
+| TEX, TLD.SCR, TLD4, TXQ, TMML | 0xb60, 0xb66, 0xb63, 0xb6f, 0xb69 (bindless 0xf6x) | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, 2D, 3D, cube, 1D array, 2D array, -, cube array), level mode 87-89 (implicit, zero, bias, explicit, implicit with a least level .LC, biased with one .LB.LC: NAK's SM70 numbering 0-5; the least level is 8.8 fixed point in bits 16-31 of the register an array's layer takes, bits 0-15, or of its own before the coordinates, unpacked as NAK lays it out, a MinLod operand in fragment programs and the floor of the level elsewhere), TLD4 component 87-88, offsets 76 (TLD4 per-tap with 76-77 = 2: signed 6-bit x, y per tap in the bytes of two registers, one gather per tap), TXQ and TMML have no fault predicate at 81-83, TXQ's query type 62-63 must be 0 (the dimension query; NAK's encoding: 1 texture type, 2 sampler position), TMML only in fragment programs (an array's layer first, left out of the query), TXQ only the dimension query (76-89 clear), depth compare 78, half results 79, mask 72-75, second destination 64; values (array index first, coordinates, level, offsets, reference): packed (bit 60 set, NAK's SM70 scalar form) half in Ra and half in Rb up to four, else four and the rest; unpacked (bit 60 clear) the array index and coordinates in Ra and the rest in Rb, as NAK lays them out (the game's one unpacked form, a 3D TEX.LL with offsets, writes its level and offsets to Rb and nothing to Ra's fourth register) |
 | TXQ.B | 0x370 | as Lichii decodes it: bit 59 alone of 59-63, nothing at 32-58, 76-89 or 91; the handle in Ra, the level in Ra+1, through the texture pool; the dimensions of a 2D view (width, height, 1, levels), as TXQ |
 | SULD.P, SUST.P | 0xb97, 0xb9b | handle word c[54-58][40-53 × 4], dimension 61-63 (1D, buffer, -, 2D, 2D array, 3D), component mask 72-75, coordinates from register 24, SULD destination 16, SUST data 32 |
 | SURED | 0x59f | `.D.U32` (bits 64-95 other than the operation exactly `0x0010e000`), buffer or 2D; handle and coordinates as SULD, data 32, operation 87-89 (0 add, 1 min, 2 max, 5 and, 6 or, 7 xor; 3 and 4 refused); an atomic on its own R32_UINT descriptor |

@@ -5941,6 +5941,84 @@ mod tests {
     }
 
     #[test]
+    fn texture_queries_take_the_view_of_the_handle_s_other_uses() {
+        // TEX.LZ R8, R1 (dimension d, handle c[0x0][0x40]) then TXQ R4,
+        // level R0 = 0, mask 0xf: the size in the view the sample uses
+        // (layers or depth third, a 1D array's layers second) and the
+        // level count; without a sample, as a 2D array.
+        let tex = |dimension: u128| {
+            word(&[
+                (0, 12, 0xb60),
+                (16, 8, 8),
+                (24, 8, 1),
+                (32, 8, 255),
+                (40, 14, 0x10),
+                (61, 3, dimension),
+                (64, 8, 255),
+                (72, 4, 1),
+                (81, 3, 7),
+                (87, 3, 1),
+            ])
+        };
+        let txq = word(&[
+            (0, 12, 0xb6f),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 255),
+            (40, 14, 0x10),
+            (64, 8, 255),
+            (72, 4, 0xf),
+        ]);
+        let image = |width: u32, height: u32, depth: u32, layers: u32| Image {
+            width,
+            height,
+            depth,
+            layers,
+            texels: vec![[0; 4]; (width * height * depth * layers) as usize].into(),
+        };
+        // (the sample's dimension, if any; level 0; further levels; the
+        // query's results).
+        type Case = (Option<u128>, Image, Vec<Image>, [u32; 4]);
+        let cases: [Case; 4] = [
+            (
+                Some(5),
+                image(4, 2, 1, 3),
+                vec![image(2, 1, 1, 3)],
+                [4, 2, 3, 2],
+            ),
+            (Some(2), image(4, 2, 5, 1), Vec::new(), [4, 2, 5, 1]),
+            (Some(4), image(8, 1, 1, 3), Vec::new(), [8, 3, 1, 1]),
+            (None, image(4, 2, 1, 3), Vec::new(), [4, 2, 3, 1]),
+        ];
+        for (dimension, base, mips, expected) in cases {
+            let mut program = vec![mov(0, 0), mov(1, 0), mov(2, 0), mov(3, 0)];
+            program.extend(dimension.map(tex));
+            program.extend([txq, EXIT]);
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let bindings: Vec<u32> = translated
+                .descriptors
+                .iter()
+                .filter(|d| d.cbuf_offset == 0x40)
+                .map(|d| d.binding)
+                .collect();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: bindings.iter().map(|&b| ((0, b), base.clone())).collect(),
+                mips: bindings.iter().map(|&b| ((0, b), mips.clone())).collect(),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let got: Vec<u32> = (4..8u8)
+                .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                .collect();
+            assert_eq!(got, expected, "dimension {dimension:?}");
+        }
+    }
+
+    #[test]
     fn texture_queries_give_the_bound_texture_s_dimensions() {
         // TXQ R4, (handle c[0x0][0x40]), level R0 = 0, a mask.
         let query = |mask: u8| {

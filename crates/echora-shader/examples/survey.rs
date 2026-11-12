@@ -21,6 +21,8 @@ fn main() {
     let mut reasons: BTreeMap<String, (u32, String)> = BTreeMap::new();
     // Feature: (programs, reason, an example key and offset).
     let mut needs: BTreeMap<&'static str, (u32, &'static str, String)> = BTreeMap::new();
+    // TXQs whose view came from the handle's other uses, and the rest.
+    let (mut txq_inferred, mut txq_fallback) = (0u32, 0u32);
     let (mut total, mut translated, mut unread) = (0u32, 0u32, 0u32);
     let (mut mesh_count, mut task_count) = (0u32, 0u32);
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
@@ -133,9 +135,13 @@ fn main() {
             .trim_start_matches("stage-")
             .to_string();
         let options = echora_shader_abi::Options::default();
-        match echora_shader::translate_with_requirements(&code, &parameters, &options) {
-            Ok((_, list)) => {
+        match echora_shader::translate_with_needs(&code, &parameters, &options) {
+            Ok((program, program_needs)) => {
                 translated += 1;
+                txq_inferred += program_needs.txq_views.0;
+                txq_fallback += program_needs.txq_views.1;
+                let list =
+                    echora_shader::requirements::requirements(&program, &program_needs, &options);
                 for requirement in list {
                     let entry = needs.entry(requirement.feature).or_insert_with(|| {
                         let at = requirement
@@ -180,6 +186,9 @@ fn main() {
     }
     let mut needed: Vec<_> = needs.into_iter().collect();
     needed.sort_by_key(|(_, (count, _, _))| std::cmp::Reverse(*count));
+    println!(
+        "TXQ views: {txq_inferred} from the handle's other uses, {txq_fallback} queried as 2D arrays"
+    );
     println!("device features needed beyond core Vulkan 1.3:");
     for (feature, (count, reason, example)) in needed {
         println!("{count:6}  {feature}: {reason}  (e.g. {example})");

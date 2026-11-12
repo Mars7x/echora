@@ -220,6 +220,9 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
 pub struct Needs {
     pub capabilities: Vec<(u32, Option<u32>)>,
     pub store: Option<Option<u32>>,
+    /// TXQs whose view type came from the handle's other uses, and those
+    /// queried through a 2D array view.
+    pub txq_views: (u32, u32),
 }
 
 /// `translate`, with what the program needs (`Needs`).
@@ -231,6 +234,7 @@ pub fn translate_with_needs(
     let needs = Needs {
         capabilities: emitter.module.capability_sites().to_vec(),
         store: emitter.module.store_site(),
+        txq_views: emitter.txq_views,
     };
     Ok((emitter.finish(), needs))
 }
@@ -259,6 +263,7 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     emitter.hmma_pairs = matrix::pairs(code, &blocks);
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
+    emitter.texture_views = texture_views(code, &emitter.handle_words);
     // Structured control flow where the graph allows, else the dispatch
     // loop.
     if !emitter.structured(code, &blocks)? {
@@ -283,6 +288,42 @@ mod vertex_trace;
 /// The uniform registers that only ever hold one constant-bank word (each
 /// write a ULDC of that same word), by register: the bank and offset. A
 /// bindless texture whose handle is in one binds like a bound one.
+/// Each constant-bank texture handle's dimension (TEX's 61-63 numbering),
+/// from the program's samples, fetches, gathers, gradient samples and level
+/// queries through it (a uniform register holding one handle word counts
+/// as that word); `None` where two disagree. A TXQ, which names no
+/// dimension, queries the texture through it.
+fn texture_views(
+    code: &[Instruction],
+    handle_words: &BTreeMap<u8, (u8, u16)>,
+) -> BTreeMap<(u8, u16), Option<u8>> {
+    let mut views: BTreeMap<(u8, u16), Option<u8>> = BTreeMap::new();
+    for instruction in code {
+        let Op::Tex(texture) = instruction.op else {
+            continue;
+        };
+        if texture.op == crate::decode::TextureOp::Query || texture.handle_value {
+            continue;
+        }
+        let key = match texture.handle {
+            Some(register) => match handle_words.get(&register.0) {
+                Some(&key) => key,
+                None => continue,
+            },
+            None => (texture.bank, texture.handle_offset),
+        };
+        views
+            .entry(key)
+            .and_modify(|view| {
+                if *view != Some(texture.dimension) {
+                    *view = None;
+                }
+            })
+            .or_insert(Some(texture.dimension));
+    }
+    views
+}
+
 fn handle_words(code: &[Instruction]) -> BTreeMap<u8, (u8, u16)> {
     let mut words: BTreeMap<u8, Option<(u8, u16)>> = BTreeMap::new();
     let mut note = |register: u8, word: Option<(u8, u16)>| {
@@ -493,6 +534,12 @@ struct Emitter {
     fetched: BTreeMap<u32, u32>,
     /// Uniform registers holding a fixed constant-bank word.
     handle_words: BTreeMap<u8, (u8, u16)>,
+    /// Each constant-bank texture handle's dimension from its other uses
+    /// (`texture_views`), for TXQ.
+    texture_views: BTreeMap<(u8, u16), Option<u8>>,
+    /// TXQs whose view came from the handle's other uses, and those
+    /// queried through a 2D array view instead.
+    txq_views: (u32, u32),
     frag_colors: u32,
     push_fields: u32,
     /// Uniform buffer of each constant bank used, by bank.
@@ -608,6 +655,8 @@ impl Emitter {
             io: io::Io::default(),
             fetched: BTreeMap::new(),
             handle_words: BTreeMap::new(),
+            texture_views: BTreeMap::new(),
+            txq_views: (0, 0),
             frag_colors: 0,
             push_fields: 0,
             banks: BTreeMap::new(),
