@@ -2232,32 +2232,119 @@ impl Emitter {
                     let signed_zero = self.value(op::BITCAST, self.f32, &[signed_zero]);
                     self.value(op::SELECT, self.f32, &[tiny, signed_zero, x])
                 };
+                // The edges the hardware gives where GLSL.std.450 and OpFDiv
+                // leave the result undefined or loose (IEEE's limits;
+                // LOG2, RSQ and SQRT of a negative NaN): `special(e, cases,
+                // value)` picks the first case that holds.
+                let zero = self.float_constant(0.0);
+                let bits = self.value(op::BITCAST, self.u32, &[x]);
+                let sign_mask = self.constant(0x8000_0000);
+                let sign = self.value(op::BITWISE_AND, self.u32, &[bits, sign_mask]);
+                let signed = |e: &mut Self, magnitude: f32| {
+                    let magnitude = e.constant(magnitude.to_bits());
+                    let bits = e.value(op::BITWISE_OR, e.u32, &[sign, magnitude]);
+                    e.value(op::BITCAST, e.f32, &[bits])
+                };
+                let is_zero = self.value(op::F_ORD_EQUAL, self.bool, &[x, zero]);
+                let negative = self.value(op::F_ORD_LESS_THAN, self.bool, &[x, zero]);
+                let positive_infinity = self.float_constant(f32::INFINITY);
+                let is_plus_infinity =
+                    self.value(op::F_ORD_EQUAL, self.bool, &[x, positive_infinity]);
+                let nan = self.float_constant(f32::NAN);
+                let pick = |e: &mut Self, cases: &[(u32, u32)], value: u32| {
+                    cases
+                        .iter()
+                        .rev()
+                        .fold(value, |value, &(condition, special)| {
+                            e.value(op::SELECT, e.f32, &[condition, special, value])
+                        })
+                };
+                let is_nan = self.value(op::IS_NAN, self.bool, &[x]);
                 let value = match function {
-                    // SIN and COS take turns, not radians.
+                    // SIN and COS take turns, reduced exactly to [-0.5, 0.5]
+                    // (GLSL's precision holds in [-pi, pi]); Inf gives NaN.
                     0 | 1 => {
+                        let whole = self.glsl(self.f32, glsl::ROUND_EVEN, &[x]);
+                        let turns = self.exact(op::F_SUB, &[x, whole]);
                         let turn = self.float_constant(std::f32::consts::TAU);
-                        let radians = self.value(op::F_MUL, self.f32, &[x, turn]);
+                        let radians = self.value(op::F_MUL, self.f32, &[turns, turn]);
                         let f = if function == 0 { glsl::COS } else { glsl::SIN };
-                        self.glsl(self.f32, f, &[radians])
+                        let value = self.glsl(self.f32, f, &[radians]);
+                        let unordered = self.value(op::IS_NAN, self.bool, &[turns]);
+                        pick(self, &[(unordered, nan)], value)
                     }
                     2 => self.glsl(self.f32, glsl::EXP2, &[x]),
-                    // LG2(±0) is -Inf (GLSL leaves Log2(0) undefined).
+                    // LG2(±0) is -Inf, of a negative NaN, of +Inf +Inf.
                     3 => {
                         let log = self.glsl(self.f32, glsl::LOG2, &[x]);
-                        let zero = self.float_constant(0.0);
-                        let is_zero = self.value(op::F_ORD_EQUAL, self.bool, &[x, zero]);
                         let minus_infinity = self.float_constant(f32::NEG_INFINITY);
-                        self.value(op::SELECT, self.f32, &[is_zero, minus_infinity, log])
+                        pick(
+                            self,
+                            &[
+                                (is_zero, minus_infinity),
+                                (negative, nan),
+                                (is_plus_infinity, positive_infinity),
+                            ],
+                            log,
+                        )
                     }
+                    // RCP(±0) is ±Inf, of ±Inf ±0; past 2^126 the result is
+                    // a denormal, which MUFU flushes (OpFDiv's precision
+                    // holds for |x| in [2^-126, 2^126]).
                     4 => {
                         let one = self.float_constant(1.0);
-                        self.value(op::F_DIV, self.f32, &[one, x])
+                        let quotient = self.value(op::F_DIV, self.f32, &[one, x]);
+                        let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
+                        let largest = self.float_constant(2f32.powi(126));
+                        let huge =
+                            self.value(op::F_ORD_GREATER_THAN, self.bool, &[magnitude, largest]);
+                        let infinity = signed(self, f32::INFINITY);
+                        let signed_zero = signed(self, 0.0);
+                        pick(self, &[(is_zero, infinity), (huge, signed_zero)], quotient)
                     }
-                    5 => self.glsl(self.f32, glsl::INVERSE_SQRT, &[x]),
-                    8 => self.glsl(self.f32, glsl::SQRT, &[x]),
-                    9 => self.glsl(self.f32, glsl::TANH, &[x]),
+                    // RSQ(±0) is ±Inf, of +Inf +0, of a negative NaN.
+                    5 => {
+                        let root = self.glsl(self.f32, glsl::INVERSE_SQRT, &[x]);
+                        let infinity = signed(self, f32::INFINITY);
+                        pick(
+                            self,
+                            &[
+                                (is_zero, infinity),
+                                (negative, nan),
+                                (is_plus_infinity, zero),
+                            ],
+                            root,
+                        )
+                    }
+                    // SQRT(±0) is ±0, of +Inf +Inf, of a negative NaN.
+                    8 => {
+                        let root = self.glsl(self.f32, glsl::SQRT, &[x]);
+                        pick(
+                            self,
+                            &[
+                                (is_zero, x),
+                                (negative, nan),
+                                (is_plus_infinity, positive_infinity),
+                            ],
+                            root,
+                        )
+                    }
+                    // TANH is ±1 where it rounds to it (GLSL's, through
+                    // exponentials, may give Inf / Inf there).
+                    9 => {
+                        let tanh = self.glsl(self.f32, glsl::TANH, &[x]);
+                        let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
+                        let ten = self.float_constant(10.0);
+                        let large =
+                            self.value(op::F_ORD_GREATER_THAN_EQUAL, self.bool, &[magnitude, ten]);
+                        let one = signed(self, 1.0);
+                        pick(self, &[(large, one)], tanh)
+                    }
                     _ => return Err(unsupported(index, format!("MUFU function {function}"))),
                 };
+                // A NaN gives NaN (Vulkan guarantees no NaN through these
+                // without float controls).
+                let value = pick(self, &[(is_nan, nan)], value);
                 match half {
                     // .F16: the float result rounded toward zero to a half,
                     // as NAK's hardware test finds it (test_op_mufu_f16_down:

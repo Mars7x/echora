@@ -581,6 +581,11 @@ pub struct Report {
     /// task program's OpEmitMeshTasksEXT group counts.
     pub mesh_outputs: Option<(u32, u32)>,
     pub mesh_tasks: Option<[u32; 3]>,
+    /// Each invocation's variables holding an undefined value at its end:
+    /// from a result Vulkan leaves undefined (InverseSqrt or Log2 of x <= 0,
+    /// Sqrt of x < 0, Sin and Cos outside [-pi, pi], OpFDiv by a divisor
+    /// outside [2^-126, 2^126]) or a shuffle from a lane not running.
+    pub undefined: Vec<HashSet<u32>>,
     /// The workgroup's own outputs after the run, by variable id: a mesh
     /// program's output arrays (shared by the workgroup), a task
     /// program's payload.
@@ -1851,6 +1856,45 @@ impl Machine {
         self.spec_ids.values().any(|&spec_id| spec_id == id)
     }
 
+    /// Whether an operation's result is one Vulkan leaves undefined (or
+    /// without its precision guarantee) for these operands: 32-bit
+    /// InverseSqrt or Log2 of x <= 0, Sqrt of x < 0, Sin or Cos outside
+    /// [-pi, pi], OpFDiv by a divisor outside [2^-126, 2^126].
+    fn undefined_math(
+        &self,
+        opcode: u16,
+        ty: u32,
+        args: &[u32],
+        values: &HashMap<u32, Value>,
+    ) -> bool {
+        if !matches!(self.scalar(ty), Ty::Float { width: 32 }) {
+            return false;
+        }
+        let floats = |id: u32| -> Vec<f32> {
+            values
+                .get(&id)
+                .map(|value| value.iter().map(|&w| f32::from_bits(w as u32)).collect())
+                .unwrap_or_default()
+        };
+        match opcode {
+            op::F_DIV => floats(args[1])
+                .iter()
+                .any(|&y| !(2f32.powi(-126)..=2f32.powi(126)).contains(&y.abs())),
+            op::EXT_INST if args.len() >= 3 && args[0] == self.glsl => {
+                let x = floats(args[2]);
+                match args[1] {
+                    glsl::INVERSE_SQRT | glsl::LOG2 => x.iter().any(|&v| !(v > 0.0)),
+                    glsl::SQRT => x.iter().any(|&v| v < 0.0 || v.is_nan()),
+                    glsl::SIN | glsl::COS => x
+                        .iter()
+                        .any(|&v| !(v.abs() <= std::f32::consts::PI * (1.0 + 1.0e-6))),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// An invocation's output variables with a Location (a fragment
     /// program's colours) by (Location, Index), from `Report::invocations`.
     pub fn located_outputs(&self, variables: &HashMap<u32, Value>) -> BTreeMap<(u32, u32), Value> {
@@ -2163,7 +2207,12 @@ impl Machine {
             .iter()
             .map(|invocation| invocation.first_infinite)
             .collect();
+        let undefined = invocations
+            .iter()
+            .map(|invocation| invocation.tainted_variables.clone())
+            .collect();
         Report {
+            undefined,
             ends,
             exits,
             first_nan,
@@ -3512,8 +3561,22 @@ impl Machine {
             let undefined = if opcode == op::LOAD {
                 matches!(invocation.pointers.get(&args[0]), Some(Pointer::Logical { variable, .. })
                     if invocation.tainted_variables.contains(variable))
+            } else if opcode == op::SELECT && args.len() == 3 {
+                // The operand chosen (a scalar condition) decides.
+                let chosen = match invocation.values.get(&args[0]) {
+                    Some(condition) if condition.len() == 1 && condition[0] != 0 => args[1],
+                    Some(condition) if condition.len() == 1 => args[2],
+                    _ => 0,
+                };
+                invocation.tainted.contains(&args[0])
+                    || if chosen == 0 {
+                        args[1..].iter().any(|a| invocation.tainted.contains(a))
+                    } else {
+                        invocation.tainted.contains(&chosen)
+                    }
             } else {
                 args.iter().any(|a| invocation.tainted.contains(a))
+                    || self.undefined_math(opcode, ty, args, &invocation.values)
             };
             if undefined {
                 invocation.tainted.insert(id);
@@ -7602,6 +7665,75 @@ mod tests {
     }
 
     #[test]
+    fn float_min_max_takes_the_number_and_set_writes_one_or_zero() {
+        // FMNMX R2, R0, R1, (!)PT: min where PT, max where !PT; the hardware
+        // takes the operand that is a number when one is NaN (IEEE minNum,
+        // maxNum; SPIR-V NMin and NMax). FSET.code.AND R3, R0, R1, PT: 1.0
+        // where the compare holds, else 0.0 (NAK's fsign adds two FSETs as
+        // floats).
+        let specials = [
+            0.0f32,
+            1.0,
+            -2.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+        ];
+        for &a in &specials {
+            for &b in &specials {
+                for max in [false, true] {
+                    let fmnmx = word(&[
+                        (0, 12, 0x209),
+                        (16, 8, 2),
+                        (24, 8, 0),
+                        (32, 8, 1),
+                        (87, 3, 7),
+                        (90, 1, u128::from(max)),
+                    ]);
+                    let (r, _) = run(&[a.to_bits(), b.to_bits()], &[fmnmx]);
+                    let expected = if max { a.max(b) } else { a.min(b) };
+                    let got = f32::from_bits(r[&2]);
+                    assert!(
+                        got == expected || (got.is_nan() && expected.is_nan()),
+                        "FMNMX max {max}: {a} {b} gave {got}"
+                    );
+                }
+                for code in 0..16u32 {
+                    let fset = word(&[
+                        (0, 12, 0x20a),
+                        (16, 8, 3),
+                        (24, 8, 0),
+                        (32, 8, 1),
+                        (76, 4, u128::from(code)),
+                        (87, 3, 7),
+                    ]);
+                    let unordered = a.is_nan() || b.is_nan();
+                    let relation = match code & 7 {
+                        0 => false,
+                        1 => a < b,
+                        2 => a == b,
+                        3 => a <= b,
+                        4 => a > b,
+                        5 => a != b && !unordered,
+                        6 => a >= b,
+                        _ => !unordered,
+                    };
+                    let holds = match code {
+                        0..=7 => relation,
+                        8 => unordered,
+                        15 => true,
+                        _ => unordered || relation,
+                    };
+                    let (r, _) = run(&[a.to_bits(), b.to_bits()], &[fset]);
+                    let expected = if holds { 1.0f32 } else { 0.0 };
+                    assert_eq!(r[&3], expected.to_bits(), "FSET code {code}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn forms_without_a_translation_are_refused() {
         use crate::decode::Op;
         use crate::header::{Header, Interpolation};
@@ -7783,6 +7915,158 @@ mod tests {
                     assert_eq!(r[&1], expected, "F2I signed {signed} mode {mode}: {x}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn wide_conversions_saturate_and_rounding_keeps_the_sign_of_zero() {
+        // F2I(.S64/.U64).rounding R2 (and R3), R0: rounded, saturated at
+        // both ends, NaN 0 (Rust's `as`).
+        let floats = [
+            2.5f32,
+            -2.5,
+            1.0e19,
+            -1.0e19,
+            9.3e18,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -0.0,
+        ];
+        for &x in &floats {
+            for signed in [false, true] {
+                for mode in 0..4u32 {
+                    let f2i = word(&[
+                        (0, 12, 0x305),
+                        (16, 8, 2),
+                        (32, 8, 0),
+                        (72, 1, u128::from(signed)),
+                        (75, 2, 3),
+                        (78, 2, u128::from(mode)),
+                        (84, 2, 2),
+                    ]);
+                    let rounded = match mode {
+                        0 => x.round_ties_even(),
+                        1 => x.floor(),
+                        2 => x.ceil(),
+                        _ => x.trunc(),
+                    };
+                    let expected = if signed {
+                        rounded as i64 as u64
+                    } else {
+                        rounded as u64
+                    };
+                    let (r, _) = run(&[x.to_bits()], &[f2i]);
+                    let got = u64::from(r[&2]) | u64::from(r[&3]) << 32;
+                    assert_eq!(got, expected, "F2I.64 signed {signed} mode {mode}: {x}");
+                }
+            }
+        }
+        // FRND.rounding R1, R0: an integral float, the sign of a zero kept.
+        for &x in &[
+            2.5f32,
+            -2.5,
+            3.5,
+            -0.4,
+            0.4,
+            -0.0,
+            1.0e30,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            for mode in 0..4u32 {
+                let frnd = word(&[
+                    (0, 12, 0x307),
+                    (16, 8, 1),
+                    (32, 8, 0),
+                    (75, 2, 2),
+                    (78, 2, u128::from(mode)),
+                    (84, 2, 2),
+                ]);
+                let expected = match mode {
+                    0 => x.round_ties_even(),
+                    1 => x.floor(),
+                    2 => x.ceil(),
+                    _ => x.trunc(),
+                };
+                let (r, _) = run(&[x.to_bits()], &[frnd]);
+                let got = f32::from_bits(r[&1]);
+                assert!(
+                    got.to_bits() == expected.to_bits() || (got.is_nan() && expected.is_nan()),
+                    "FRND mode {mode}: {x} gave {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mufu_gives_ieee_s_limits_where_glsl_leaves_them_undefined() {
+        // MUFU.fn R1, R0 (functions 0 COS, 1 SIN in turns, 3 LG2, 4 RCP,
+        // 5 RSQ, 8 SQRT, 9 TANH) on its edges.
+        let inf = f32::INFINITY;
+        let cases: [(u128, f32, f32); 36] = [
+            (4, 0.0, inf),
+            (4, -0.0, -inf),
+            (4, inf, 0.0),
+            (4, -inf, -0.0),
+            (4, 2f32.powi(127), 0.0),
+            (4, -2f32.powi(127), -0.0),
+            (4, 4.0, 0.25),
+            (5, 0.0, inf),
+            (5, -0.0, -inf),
+            (5, -1.0, f32::NAN),
+            (5, inf, 0.0),
+            (5, 4.0, 0.5),
+            (8, 0.0, 0.0),
+            (8, -0.0, -0.0),
+            (8, -4.0, f32::NAN),
+            (8, inf, inf),
+            (8, 4.0, 2.0),
+            (3, 0.0, -inf),
+            (3, -0.0, -inf),
+            (3, -1.0, f32::NAN),
+            (3, inf, inf),
+            (3, 8.0, 3.0),
+            // Turns: whole turns land on 0 however large.
+            (1, 0.25, 1.0),
+            (1, 1.0e9, 0.0),
+            (0, 1.0e9, 1.0),
+            (0, -3.0, 1.0),
+            (1, 2.75, -1.0),
+            (1, inf, f32::NAN),
+            (0, -inf, f32::NAN),
+            (1, f32::NAN, f32::NAN),
+            (9, 20.0, 1.0),
+            (9, -20.0, -1.0),
+            (9, 1.0e30, 1.0),
+            (9, 0.0, 0.0),
+            (9, f32::NAN, f32::NAN),
+            (2, -inf, 0.0),
+        ];
+        for (function, x, expected) in cases {
+            let mufu = word(&[(0, 12, 0x308), (16, 8, 1), (32, 8, 0), (74, 6, function)]);
+            let program = [mov(0, x.to_bits()), mufu, EXIT];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                ..Inputs::default()
+            });
+            // No value Vulkan leaves undefined reaches the result.
+            assert!(
+                !report.undefined[0].contains(&registers[&1]),
+                "MUFU {function} of {x}: an undefined result"
+            );
+            let got = f32::from_bits(report.invocations[0][&registers[&1]][0] as u32);
+            let ok = if expected.is_nan() {
+                got.is_nan()
+            } else if expected == 0.0 || expected.is_infinite() {
+                got.to_bits() == expected.to_bits()
+            } else {
+                (got - expected).abs() <= 1.0e-6 * expected.abs()
+            };
+            assert!(ok, "MUFU {function} of {x}: {got} (expected {expected})");
         }
     }
 
