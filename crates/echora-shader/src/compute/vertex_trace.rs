@@ -185,6 +185,16 @@ impl Emitter {
         let Some(record) = self.vertex_trace_record else {
             return;
         };
+        // ECHORA_FRAGMENT_TRACE_FROM=<byte offset hex> (debugging): only
+        // texture instructions at or after that offset take entries, so a
+        // long program's later samples fit the record.
+        let from = std::env::var("ECHORA_FRAGMENT_TRACE_FROM")
+            .ok()
+            .and_then(|value| usize::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        if index * 16 < from {
+            return;
+        }
         let entry = match self.vertex_trace_entries.iter().position(|&i| i == index) {
             Some(entry) => entry,
             None if self.vertex_trace_entries.len() < ENTRIES => {
