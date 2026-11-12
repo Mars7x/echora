@@ -187,6 +187,7 @@ impl Emitter {
                     (views.float, views.float_type, float_texel)
                 };
                 let image = e.value(op::LOAD, ty, &[variable]);
+                e.module.note_store();
                 e.function
                     .emit(op::IMAGE_WRITE, &[image, coordinate, texel]);
             });
@@ -233,6 +234,7 @@ impl Emitter {
         dimension: u8,
         operation: u8,
     ) -> Result<(), Unsupported> {
+        self.module.note_store();
         let opcode = match operation {
             0 => op::ATOMIC_I_ADD,
             1 => op::ATOMIC_U_MIN,

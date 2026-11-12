@@ -377,6 +377,14 @@ pub struct Module {
     constants64: HashMap<(u32, u64), u32>,
     composites: HashMap<Vec<u32>, u32>,
     glsl: Option<u32>,
+    /// The guest instruction (byte offset) being translated, which
+    /// `capability_sites` and `store_site` name.
+    pub site: Option<u32>,
+    /// Each capability declared, with the guest instruction first needing
+    /// it.
+    capability_sites: Vec<(u32, Option<u32>)>,
+    /// The first buffer or image store or atomic, by guest instruction.
+    store_site: Option<Option<u32>>,
 }
 
 /// One instruction's words: word count and opcode, then the operands.
@@ -414,7 +422,25 @@ impl Module {
         let (declared, _) = self.capabilities.as_chunks::<2>();
         if declared.iter().all(|&[_, existing]| existing != capability) {
             instruction(&mut self.capabilities, op::CAPABILITY, &[capability]);
+            self.capability_sites.push((capability, self.site));
         }
+    }
+
+    /// The capabilities declared, each with the guest instruction (byte
+    /// offset) that first needed it.
+    pub fn capability_sites(&self) -> &[(u32, Option<u32>)] {
+        &self.capability_sites
+    }
+
+    /// Notes a store or atomic to a buffer or image (once, by its guest
+    /// instruction).
+    pub fn note_store(&mut self) {
+        self.store_site.get_or_insert(self.site);
+    }
+
+    /// The first buffer or image store or atomic, by guest instruction.
+    pub fn store_site(&self) -> Option<Option<u32>> {
+        self.store_site
     }
 
     /// Declares an extension (once).

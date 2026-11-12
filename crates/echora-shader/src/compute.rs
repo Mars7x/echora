@@ -212,6 +212,29 @@ pub fn translate(code: &[Instruction], layout: &Layout) -> Result<Translated, Un
     Ok(emit(code, layout)?.finish())
 }
 
+/// What a translation needs of the device beyond core Vulkan, before the
+/// requirements report reads it: each capability with the guest
+/// instruction (byte offset in the code) first needing it, and the first
+/// buffer or image store or atomic.
+#[derive(Clone, Debug, Default)]
+pub struct Needs {
+    pub capabilities: Vec<(u32, Option<u32>)>,
+    pub store: Option<Option<u32>>,
+}
+
+/// `translate`, with what the program needs (`Needs`).
+pub fn translate_with_needs(
+    code: &[Instruction],
+    layout: &Layout,
+) -> Result<(Translated, Needs), Unsupported> {
+    let emitter = emit(code, layout)?;
+    let needs = Needs {
+        capabilities: emitter.module.capability_sites().to_vec(),
+        store: emitter.module.store_site(),
+    };
+    Ok((emitter.finish(), needs))
+}
+
 /// A translation, the variables of its general registers and those of its
 /// predicates (for tests that run it).
 #[cfg(test)]
@@ -1413,7 +1436,9 @@ impl Emitter {
         }
         let op = instruction.op;
         self.uniform = instruction.uniform;
+        self.module.site = Some(u32::try_from(index * 16).unwrap_or(u32::MAX));
         let result = self.guarded(instruction.guard, |e| e.operation(index, op));
+        self.module.site = None;
         self.uniform = false;
         result
     }

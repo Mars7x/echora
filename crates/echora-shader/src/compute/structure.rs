@@ -693,6 +693,7 @@ impl Emitter {
     /// An atomic `opcode` with `value` on word `word` of the trace buffer
     /// at `address` (a u64 value), when the address is not 0.
     pub(super) fn trace_atomic(&mut self, address: u32, word: u32, opcode: u16, value: u32) {
+        self.module.note_store();
         self.memory.physical = true;
         self.module
             .capability(spirv::capability::PHYSICAL_STORAGE_BUFFER_ADDRESSES);

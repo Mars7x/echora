@@ -8,7 +8,9 @@
 //! and prints each refusal reason (numbers dropped) with how many
 //! programs it stopped. Task and mesh programs are told apart as the
 //! runtime does and translated against the state their own control
-//! section gives.
+//! section gives. Then the device features the translated programs need
+//! beyond core Vulkan (`echora_shader::requirements`), each with how many
+//! programs need it and one that does (key and instruction offset).
 
 use std::collections::BTreeMap;
 
@@ -17,6 +19,8 @@ use echora_shader_abi::{MeshParameters, Parameters, Stage};
 fn main() {
     let directory = std::env::args().nth(1).expect("usage: survey DIR");
     let mut reasons: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    // Feature: (programs, reason, an example key and offset).
+    let mut needs: BTreeMap<&'static str, (u32, &'static str, String)> = BTreeMap::new();
     let (mut total, mut translated, mut unread) = (0u32, 0u32, 0u32);
     let (mut mesh_count, mut task_count) = (0u32, 0u32);
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
@@ -128,8 +132,20 @@ fn main() {
             .unwrap_or("")
             .trim_start_matches("stage-")
             .to_string();
-        match echora_shader::translate(&code, &parameters) {
-            Ok(_) => translated += 1,
+        let options = echora_shader_abi::Options::default();
+        match echora_shader::translate_with_requirements(&code, &parameters, &options) {
+            Ok((_, list)) => {
+                translated += 1;
+                for requirement in list {
+                    let entry = needs.entry(requirement.feature).or_insert_with(|| {
+                        let at = requirement
+                            .first_use
+                            .map_or_else(String::new, |offset| format!(" at {offset:#x}"));
+                        (0, requirement.reason, format!("{key}{at}"))
+                    });
+                    entry.0 += 1;
+                }
+            }
             Err(error) => {
                 if std::env::var_os("SURVEY_RAW").is_some() {
                     eprintln!("{key} {} at {:?}", error.reason, error.offset);
@@ -161,5 +177,11 @@ fn main() {
     );
     for (reason, (count, example)) in ranked {
         println!("{count:6}  {reason}  (e.g. {example})");
+    }
+    let mut needed: Vec<_> = needs.into_iter().collect();
+    needed.sort_by_key(|(_, (count, _, _))| std::cmp::Reverse(*count));
+    println!("device features needed beyond core Vulkan 1.3:");
+    for (feature, (count, reason, example)) in needed {
+        println!("{count:6}  {feature}: {reason}  (e.g. {example})");
     }
 }

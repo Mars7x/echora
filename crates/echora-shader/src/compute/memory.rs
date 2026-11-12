@@ -284,6 +284,9 @@ impl Emitter {
         operation: u8,
         kind: u8,
     ) -> Result<(), Unsupported> {
+        if space == Space::Global {
+            self.module.note_store();
+        }
         let float = kind == 3;
         let opcode = match (compare.is_some(), operation, kind) {
             (true, _, 0 | 1) => op::ATOMIC_COMPARE_EXCHANGE,
@@ -731,6 +734,7 @@ impl Emitter {
         values: &[u32],
         strong: bool,
     ) -> Result<(), Unsupported> {
+        self.module.note_store();
         let operands = access(strong);
         let va = self.global_address(address);
         let count = values.len() as u32;

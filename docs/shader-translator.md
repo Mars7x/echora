@@ -310,7 +310,7 @@ writes record n from invocation n of workgroup (0, 0, 0). Record words:
 | 1 | flags: bit 0 the position has a NaN component, bit 1 an infinite one, bit 8 + k texture entry k's result has a NaN word (as a float) |
 | 2, 3 | vertex: VertexIndex and InstanceIndex (raw); mesh: LocalInvocationIndex and WorkgroupId.x |
 | 4..8 | the position as written (x, y, z, w float bits); mesh: output vertex n's, from the stage buffer |
-| 8 + 6k .. 14 + 6k | texture entry k (k < 16): the instruction's byte offset in the code (after the 0x50-byte header) plus one (0: no entry), the times the invocation ran it, and the four result words of its last run (before the mask picks the written components; integer bits) |
+| 8 + 6k .. 14 + 6k | texture entry k (k < 16): the instruction's byte offset in the code (after the 128-byte program header) plus one (0: no entry), the times the invocation ran it, and the four result words of its last run (before the mask picks the written components; integer bits) |
 
 Entries are numbered by texture instruction (TEX, TLD, TLD4, TXD, TXQ,
 TMML) in the order the translation emits them, which is the same for
@@ -401,6 +401,23 @@ for an add, a fused multiply-add for a product) and the result steps one
 ulp where its sign says the exact value lies. Lane ids, lane masks and the
 warp operations assume 32-lane subgroups, which the runtime requests
 (VK_EXT_subgroup_size_control) for every translated program.
+
+**Device requirements.** `translate_with_requirements` also returns what
+the program needs of the device beyond core Vulkan 1.3
+(`requirements::Requirement`: the `VkPhysicalDevice*Features` member, or
+the `subgroupSupportedOperations` bit, what needs it, and the guest
+instruction first needing it, by byte offset from the program's start).
+Each SPIR-V capability the translation declares is recorded with the
+instruction being translated then (MinLod: shaderResourceMinLod; Float64:
+shaderFloat64; SampledCubeArray: imageCubeArray; the typeless storage
+image capabilities; DemoteToHelperInvocation; DrawParameters; the
+subgroup operations; ...), as is the first buffer or image store or
+atomic (vertexPipelineStoresAndAtomics, fragmentStoresAndAtomics), and
+`Options::dual_source_blend` needs dualSrcBlend. `requirements::missing`
+turns the first feature a device lacks into a refusal naming it, so the
+runtime can refuse such a program before pipeline creation instead of
+failing validation; the survey example totals the requirements over a
+dump.
 
 **Denormals.** The hardware keeps 32-bit denormals in float operations
 without `.FTZ` (bit 80) and flushes operands and results to a zero of their

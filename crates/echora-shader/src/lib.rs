@@ -9,6 +9,7 @@
 pub mod compute;
 pub mod decode;
 pub mod header;
+pub mod requirements;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod spirv;
@@ -35,6 +36,29 @@ pub fn translate_with_options(
     parameters: &Parameters,
     options: &Options,
 ) -> Result<Translated, Unsupported> {
+    translate_with_needs(program, parameters, options).map(|(translated, _)| translated)
+}
+
+/// `translate_with_options`, with what the program needs of the device
+/// beyond core Vulkan (`requirements::Requirement`), each with the
+/// instruction first needing it: `requirements::missing` turns those the
+/// device lacks into a refusal.
+pub fn translate_with_requirements(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+) -> Result<(Translated, Vec<requirements::Requirement>), Unsupported> {
+    let (translated, needs) = translate_with_needs(program, parameters, options)?;
+    let list = requirements::requirements(&translated, &needs, options);
+    Ok((translated, list))
+}
+
+/// The translation and its needs, sites from the program's start.
+fn translate_with_needs(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+) -> Result<(Translated, compute::Needs), Unsupported> {
     let mesh = match parameters.stage_slot {
         None => None,
         Some(stage @ (Stage::Task | Stage::Mesh)) => Some(mesh_layout(stage, parameters)?),
@@ -78,13 +102,20 @@ pub fn translate_with_options(
             float64: options.float64,
             dual_source_blend: options.dual_source_blend,
         };
-        // Offsets in errors are from the program's start.
-        return compute::translate(&code, &layout).map_err(|mut error| {
-            error.offset = error
-                .offset
-                .map(|offset| offset + GRAPHICS_HEADER_SIZE as u32);
-            error
-        });
+        // Offsets in errors and needs are from the program's start.
+        let header = GRAPHICS_HEADER_SIZE as u32;
+        return compute::translate_with_needs(&code, &layout)
+            .map(|(translated, mut needs)| {
+                for (_, site) in &mut needs.capabilities {
+                    *site = site.map(|offset| offset + header);
+                }
+                needs.store = needs.store.map(|site| site.map(|offset| offset + header));
+                (translated, needs)
+            })
+            .map_err(|mut error| {
+                error.offset = error.offset.map(|offset| offset + header);
+                error
+            });
     }
     if mesh.is_some() {
         return Err(whole("a task or mesh program without a header".into()));
@@ -106,7 +137,7 @@ pub fn translate_with_options(
         float64: options.float64,
         dual_source_blend: false,
     };
-    compute::translate(&code, &layout)
+    compute::translate_with_needs(&code, &layout)
 }
 
 /// A task or mesh program's layout from the pipeline's mesh registers (the
@@ -400,6 +431,62 @@ mod tests {
             translated.push_fields,
             echora_shader_abi::PUSH_VERTEX_FETCH | echora_shader_abi::PUSH_PAGE_TABLE
         );
+    }
+
+    #[test]
+    fn requirements_name_the_feature_and_the_instruction_needing_it() {
+        use requirements::{Requirement, missing};
+        // A vertex program: ALD R0, a[0x2f8] (the instance id, through
+        // DrawParameters' BaseInstance); EXIT.
+        let mut program = header(1, 1, &[]);
+        program.extend(bytes(&[
+            word(&[
+                (0, 12, 0x321),
+                (16, 8, 0),
+                (24, 8, 255),
+                (32, 8, 255),
+                (40, 10, 0x2f8),
+            ]),
+            EXIT,
+        ]));
+        let (_, list) =
+            translate_with_requirements(&program, &Parameters::default(), &Options::default())
+                .unwrap();
+        let draw = list
+            .iter()
+            .find(|r| r.feature == "shaderDrawParameters")
+            .unwrap();
+        // (Offsets from the program's start: the code follows the 128-byte
+        // header.)
+        assert_eq!(draw.first_use, Some(0x80));
+        // A fragment program writing target 0: NOP; KILL (demote, at 0x90);
+        // EXIT; with dual-source blending asked for.
+        let mut program = header(2, 5, &[576, 577, 578, 579]);
+        program.extend(bytes(&[NOP, word(&[(0, 12, 0x95b), (87, 3, 7)]), EXIT]));
+        let options = Options {
+            dual_source_blend: true,
+            ..Options::default()
+        };
+        let (translated, list) =
+            translate_with_requirements(&program, &Parameters::default(), &options).unwrap();
+        assert_eq!(spirv::tests::validate(&translated.spirv), None);
+        let demote = list
+            .iter()
+            .find(|r| r.feature == "shaderDemoteToHelperInvocation")
+            .unwrap();
+        assert_eq!(demote.first_use, Some(0x90));
+        assert!(list.iter().any(|r| r.feature == "dualSrcBlend"));
+        // A device without demotion refuses it by name, at the KILL.
+        let refused =
+            missing(&list, |feature| feature != "shaderDemoteToHelperInvocation").unwrap_err();
+        assert_eq!(refused.offset, Some(0x90));
+        assert!(
+            refused.reason.contains("shaderDemoteToHelperInvocation"),
+            "{}",
+            refused.reason
+        );
+        assert_eq!(missing(&list, |_| true), Ok(()));
+        let _: &[Requirement] = &list;
     }
 
     #[test]
