@@ -5389,8 +5389,14 @@ impl Nvn {
             let (width, height) = ((width >> level).max(1), (height >> level).max(1));
             let depth = target.shape.depth();
             backend.renderer.flush()?;
-            let Ok(texels) = backend.renderer.read_target_slice(key, level, layer) else {
-                continue;
+            let texels = match backend.renderer.read_target_slice(key, level, layer) {
+                Ok(texels) => texels,
+                Err(error) => {
+                    eprintln!(
+                        "target trace present {present} {what} wrote {key:x} level {level} layer {layer} {width}x{height} {format:?}: not read back: {error}"
+                    );
+                    continue;
+                }
             };
             // A volume: also the mean first channel of a few slices
             // (the trace's other figures are slice 0's).
