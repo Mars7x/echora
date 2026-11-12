@@ -9,7 +9,9 @@
 #![allow(missing_debug_implementations, clippy::all)]
 
 pub mod audio;
-pub mod audio_renderer;
+pub mod audio_mix;
+mod audio_renderer;
+mod audio_tables;
 pub mod av1;
 pub mod bootstrap;
 mod bytes;
