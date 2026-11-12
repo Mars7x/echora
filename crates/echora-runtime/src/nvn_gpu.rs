@@ -3843,7 +3843,13 @@ impl Nvn {
                 .to_string_lossy()
                 .split(',')
                 .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(key.0));
-            if wanted && self.dumped_dispatches.insert(key.0) {
+            // ECHORA_DUMP_DISPATCH_FROM=N: from present N on (a temporal
+            // pass's live frame, not its first run).
+            let from = super::debug_var("ECHORA_DUMP_DISPATCH_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if wanted && self.presented_frames >= from && self.dumped_dispatches.insert(key.0) {
                 let groups = [command.x[1], command.x[2], command.x[3]].map(|count| count as u32);
                 if let Err(error) = self.dump_dispatch(
                     core,
