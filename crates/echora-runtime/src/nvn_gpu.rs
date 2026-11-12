@@ -716,6 +716,12 @@ impl Nvn {
         identity: Option<(u64, u64)>,
     ) {
         self.texture_epoch += 1;
+        if self.depth_traced(texture) {
+            eprintln!(
+                "depth trace present {} texture {texture:x} now {identity:x?} (was {previous:x?}): targets move",
+                self.presented_frames
+            );
+        }
         if let Some(backend) = self.gpu.as_mut() {
             backend.textures.remove(&texture);
             backend.texture_checked.remove(&texture);
@@ -3131,7 +3137,20 @@ impl Nvn {
 
     /// The render target of texture `texture`, created at its size,
     /// format, levels and layers.
+    #[track_caller]
     fn ensure_render_target(&mut self, texture: u64) -> Result<(u32, u32), String> {
+        if self.depth_traced(texture)
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|backend| backend.renderer.existing_target(texture).is_none())
+        {
+            eprintln!(
+                "depth trace present {} target {texture:x} created from {}",
+                self.presented_frames,
+                std::panic::Location::caller()
+            );
+        }
         if self.target_shapes.0 != self.texture_epoch {
             self.target_shapes = (self.texture_epoch, HashMap::new());
         }
