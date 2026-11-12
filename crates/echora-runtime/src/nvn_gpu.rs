@@ -6380,6 +6380,11 @@ impl Nvn {
         } else {
             Default::default()
         };
+        // Stages store through the table (a vertex program writing texels
+        // back for the CPU): later CPU reads of those ranges wait for them.
+        if page_table.address != 0 {
+            self.gpu.as_mut().unwrap().page_table_writes = true;
+        }
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams
             .iter()
@@ -6474,9 +6479,17 @@ impl Nvn {
             extent.get_or_insert(self.ensure_render_target(texture)?);
         }
         let depth_layer = self.render.depth_layer;
+        // With no target bound the draw still runs its vertex stage (the
+        // game reads texels back into a buffer from a vertex program, with
+        // a fragment program that only exits): the area is the viewport's.
+        let extent = extent.or_else(|| {
+            let bind = self.render.state.get("SetViewport")?;
+            let (width, height) = (bind.x[3] as i32, bind.x[4] as i32);
+            (width > 0 && height > 0).then_some((width as u32, height as u32))
+        });
         let (width, height) = extent.ok_or_else(|| {
             format!(
-                "draw without render targets ({:016x}/{:016x})",
+                "draw without render targets or viewport ({:016x}/{:016x})",
                 keys.0, keys.1
             )
         })?;

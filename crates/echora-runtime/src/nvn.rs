@@ -1443,9 +1443,11 @@ impl Nvn {
                         backend.stat("stat: pool flush bytes", x[2]);
                     }
                     self.gpu_invalidate(start..start + x[2], None);
-                } else if let Err(message) = self.resolve_storage(core, Some(start..start + x[2])) {
+                } else if let Err(message) = self.resolve_gpu_written(core, start..start + x[2]) {
                     // The CPU is about to read the range: GPU results in it
-                    // come back first.
+                    // come back first, stores programs made through the
+                    // page table included (a vertex program writing texels
+                    // back for the CPU).
                     return Err(Trap::InvalidState {
                         message: format!("{name}: dispatch results: {message}"),
                     });

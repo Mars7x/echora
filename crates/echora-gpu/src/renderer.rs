@@ -3727,7 +3727,7 @@ impl Renderer {
             return Ok(());
         }
         // A partial clear runs as an attachment clear in a render pass.
-        self.begin_rendering(&[key], &[level], &[layer], None, 0)?;
+        self.begin_rendering(&[key], &[level], &[layer], None, 0, [0; 4])?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -3783,7 +3783,7 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
-        self.begin_rendering(&[], &[], &[], Some(key), layer)?;
+        self.begin_rendering(&[], &[], &[], Some(key), layer, [0; 4])?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: aspects,
@@ -3828,6 +3828,7 @@ impl Renderer {
         layers: &[u32],
         depth: Option<u64>,
         depth_layer: u32,
+        area: [i32; 4],
     ) -> Result<(), String> {
         let level = |index: usize| levels.get(index).copied().unwrap_or(0);
         let mut views = Vec::with_capacity(colors.len());
@@ -3859,7 +3860,13 @@ impl Renderer {
             .fold((i32::MAX, i32::MAX), |(w, h), (tw, th)| {
                 (w.min(tw), h.min(th))
             });
-        let whole = [0, 0, smallest_width, smallest_height];
+        // A pass with no attachments renders over `area` (the draw's
+        // scissor): only its vertex stage's stores have effect.
+        let whole = if smallest_width == i32::MAX {
+            area
+        } else {
+            [0, 0, smallest_width, smallest_height]
+        };
         if self
             .open_pass
             .as_ref()

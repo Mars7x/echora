@@ -833,6 +833,7 @@ impl Renderer {
             &draw.color_layers,
             draw.depth,
             draw.depth_layer,
+            area,
         )?;
         let commands = self.recording_commands()?;
         let objects = self.gpu.shader_objects()?.clone();
