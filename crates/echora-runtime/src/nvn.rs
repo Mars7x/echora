@@ -435,7 +435,7 @@ pub struct Nvn {
     /// interleaves queues (`render` holds the running queue's).
     #[serde(skip)]
     queue_render: HashMap<u64, RenderState>,
-    /// ECHORA_CAPTURE_FRAME=N (debugging): the commands present N runs,
+    /// ECHORA_CAPTURE_FRAME=N[,M...] (debugging): the commands present N runs,
     /// with the render state it began from, replayed on request (see
     /// `replay_captured_frame`).
     #[serde(skip)]
@@ -3142,13 +3142,15 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
-        // ECHORA_CAPTURE_FRAME=N: present N's commands, from the render
-        // state the first of them met.
+        // ECHORA_CAPTURE_FRAME=N[,M...]: present N's commands, from the
+        // render state the first of them met (each listed present is held
+        // for replays in turn).
         if !self.replaying
-            && debug_var("ECHORA_CAPTURE_FRAME")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                == Some(self.presented_frames)
+            && debug_var("ECHORA_CAPTURE_FRAME").is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|item| item.trim().parse::<u64>().ok() == Some(self.presented_frames))
+            })
         {
             let capture = self.frame_capture.get_or_insert_with(|| {
                 Box::new(FrameCapture {
