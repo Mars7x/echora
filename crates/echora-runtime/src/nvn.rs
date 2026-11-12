@@ -4629,9 +4629,12 @@ pub(crate) fn texture_layout_layers(
     let flags = props.get("Flags").map_or(0, |value| value.x[0]);
     // SetPackagedTextureLayout's eight bytes, captured when it was called
     // (in X1).
+    // ECHORA_IGNORE_PACKAGED_LAYOUT=1 (debugging): the extent's shape
+    // instead, for comparison.
     let packaged = props
         .get("PackagedTextureLayout")
         .filter(|value| value.x[0] != 0)
+        .filter(|_| debug_var_os("ECHORA_IGNORE_PACKAGED_LAYOUT").is_none())
         .map(|value| value.x[1] as u8);
     crate::nvn_format::texture_layers(info, width, height, depth, layers, levels, flags, packaged)
 }

@@ -2342,6 +2342,19 @@ impl Nvn {
             layers,
             levels_set,
         );
+        // Shapes a texture's own layout gives that the extent alone would
+        // not: noted by shape, so a report shows which textures they are.
+        let mut layout_note = None;
+        if let Some(shape) = layout.shape {
+            let derived = crate::nvn_format::base_block_shape(info, height, depth, layers);
+            if shape != derived {
+                layout_note = Some(format!(
+                    "layout shape {shape:?} instead of {derived:?}: {} {width}x{height}x{depth} layers {layers} levels {levels_set} target {:?}",
+                    info.name,
+                    get("Target")
+                ));
+            }
+        }
         let storage_size = if stride != 0 {
             stride * u64::from(height.div_ceil(info.block_height))
         } else {
@@ -2762,6 +2775,9 @@ impl Nvn {
         }
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: texture uploads", 1);
+        if let Some(note) = layout_note {
+            backend.note(note);
+        }
         // ECHORA_UPLOAD_LOG (debugging): uploads counted by shape, to find
         // textures re-uploaded every present.
         if super::debug_var_os("ECHORA_UPLOAD_LOG").is_some() {
