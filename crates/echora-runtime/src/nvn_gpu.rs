@@ -6474,7 +6474,12 @@ impl Nvn {
             extent.get_or_insert(self.ensure_render_target(texture)?);
         }
         let depth_layer = self.render.depth_layer;
-        let (width, height) = extent.ok_or("draw without render targets")?;
+        let (width, height) = extent.ok_or_else(|| {
+            format!(
+                "draw without render targets ({:016x}/{:016x})",
+                keys.0, keys.1
+            )
+        })?;
         self.initialize_new_targets(core);
         let viewport = self
             .render
