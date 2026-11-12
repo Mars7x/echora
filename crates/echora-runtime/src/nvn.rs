@@ -406,6 +406,10 @@ pub struct Nvn {
     /// shows the presented texture's).
     #[serde(skip)]
     frame_target_draws: HashMap<u64, u64>,
+    /// ECHORA_DISPATCH_SOURCE_LOG: the program (fragment or compute key)
+    /// and present that last wrote each target.
+    #[serde(skip)]
+    target_writers: HashMap<u64, (u64, u64)>,
     /// Work skipped as "rendering disabled" before the last present: the
     /// capture log shows each captured frame's own.
     #[serde(skip)]

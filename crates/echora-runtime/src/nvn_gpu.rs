@@ -3770,6 +3770,48 @@ impl Nvn {
             }
         }
         let image_keys: Vec<u64> = images.values().map(|(key, _)| *key).collect();
+        // ECHORA_DISPATCH_SOURCE_LOG=<program key hex>[,...] (debugging):
+        // each dispatch of those programs logs the textures it reads, with
+        // the program and present that last wrote each, and its images.
+        if let Ok(wanted) = super::debug_var("ECHORA_DISPATCH_SOURCE_LOG") {
+            if wanted
+                .split(',')
+                .any(|item| item.trim() == format!("{:016x}", key.0))
+            {
+                let mut bound: Vec<_> = textures.iter().collect();
+                bound.sort_by_key(|(binding, _)| **binding);
+                let reads: Vec<String> = bound
+                    .iter()
+                    .map(|(binding, (source, _))| {
+                        let writer = match source {
+                            TextureSource::Target(target)
+                            | TextureSource::TargetView { key: target, .. } => self
+                                .target_writers
+                                .get(target)
+                                .map_or("never written".to_string(), |(program, present)| {
+                                    format!("written by {program:016x} at {present}")
+                                }),
+                            _ => "upload".to_string(),
+                        };
+                        format!(
+                            "{binding}={} ({writer})",
+                            self.describe_sources(std::iter::once(source))
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "dispatch sources present {} {:016x}: reads {} writes {}",
+                    self.presented_frames,
+                    key.0,
+                    reads.join(", "),
+                    self.describe_targets(image_keys.iter().copied())
+                );
+            }
+            for target in &image_keys {
+                self.target_writers
+                    .insert(*target, (key.0, self.presented_frames));
+            }
+        }
         let images_written = image_keys.clone();
         let volume_mean = |backend: &mut Backend, key: u64| -> Option<f64> {
             let is_volume = backend
@@ -7225,6 +7267,12 @@ impl Nvn {
             .collect();
         for key in &colors_written {
             *self.frame_target_draws.entry(*key).or_default() += 1;
+        }
+        if super::debug_var_os("ECHORA_DISPATCH_SOURCE_LOG").is_some() {
+            for key in &colors_written {
+                self.target_writers
+                    .insert(*key, (keys.1, self.presented_frames));
+            }
         }
         let color_places: Vec<(u32, u32)> = draw
             .colors
