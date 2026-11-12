@@ -117,6 +117,7 @@ struct Voice {
     volume: f32,
     previous_volume: f32,
     mix: i32,
+    splitter: i32,
     quality: Quality,
     /// Each of the two filters: enabled, numerator, denominator.
     biquads: [(bool, [f32; 3], [f32; 2]); 2],
@@ -152,8 +153,21 @@ struct Mix {
     volume: f32,
     buffers: usize,
     destination: i32,
+    splitter: i32,
     /// Volume from each of its buffers into each destination buffer.
     volumes: Vec<[f32; MAX_MIX_BUFFERS]>,
+}
+
+/// A splitter destination: a mix and the volume into each of its buffers
+/// (`previous` is where this frame's ramp starts).
+#[derive(Clone, Copy, Debug, Default)]
+struct Destination {
+    in_use: bool,
+    mix: i32,
+    volumes: [f32; MAX_MIX_BUFFERS],
+    previous: [f32; MAX_MIX_BUFFERS],
+    /// Mixed into this frame: `previous` then follows `volumes`.
+    touched: bool,
 }
 
 /// A buffer mixer effect: (input, output, volume) per pair, on its mix.
@@ -166,6 +180,9 @@ struct BufferMixer {
 
 const MAX_MIX_BUFFERS: usize = 24;
 const FINAL_MIX: i32 = 0;
+/// A voice or mix with no mix (or splitter) to go to.
+const UNUSED_MIX: i32 = i32::MAX;
+const UNUSED_SPLITTER: i32 = -1;
 /// The decoder's scratch size: a frame never reads more input samples.
 const TEMP_BUFFER_SIZE: u64 = 0x3f00;
 /// At most this many interleaved samples wait for the host device.
@@ -424,6 +441,9 @@ pub struct Renderer {
     resources: BTreeMap<u32, ChannelResource>,
     mixes: BTreeMap<i32, Mix>,
     mixers: BTreeMap<usize, BufferMixer>,
+    /// Each splitter's destination ids, in order.
+    splitters: BTreeMap<i32, Vec<i32>>,
+    destinations: BTreeMap<i32, Destination>,
     /// The device sink's inputs: the final mix buffer of each channel.
     device: Option<Vec<usize>>,
     /// Interleaved 16-bit samples rendered for the device and not yet
@@ -450,6 +470,8 @@ impl Renderer {
             resources: BTreeMap::new(),
             mixes: BTreeMap::new(),
             mixers: BTreeMap::new(),
+            splitters: BTreeMap::new(),
+            destinations: BTreeMap::new(),
             device: None,
             output: Vec::new(),
             output_channels: 0,
@@ -557,21 +579,51 @@ impl Renderer {
                     }
                 }
                 mix::volume_ramp(&mut samples, voice.previous_volume, voice.volume);
-                let Some(resource) = self.resources.get_mut(&voice.resources[channel]) else {
-                    continue;
-                };
-                if let Some(target) = buffers.get_mut(&voice.mix) {
-                    for (index, buffer) in target.iter_mut().enumerate() {
-                        mix::mix_ramp(
-                            buffer,
-                            &samples,
-                            resource.previous[index],
-                            resource.volumes[index],
-                        );
+                if voice.mix != UNUSED_MIX {
+                    let Some(resource) = self.resources.get_mut(&voice.resources[channel]) else {
+                        continue;
+                    };
+                    if let Some(target) = buffers.get_mut(&voice.mix) {
+                        for (index, buffer) in target.iter_mut().enumerate() {
+                            mix::mix_ramp(
+                                buffer,
+                                &samples,
+                                resource.previous[index],
+                                resource.volumes[index],
+                            );
+                        }
+                        mixed = true;
                     }
-                    mixed = true;
+                    resource.previous = resource.volumes;
+                } else if voice.splitter != UNUSED_SPLITTER {
+                    // Channel c feeds the splitter's destinations c,
+                    // c + channels, c + 2 channels, ...
+                    let ids = self
+                        .splitters
+                        .get(&voice.splitter)
+                        .cloned()
+                        .unwrap_or_default();
+                    for id in ids.iter().skip(channel).step_by(channels) {
+                        let Some(destination) = self.destinations.get_mut(id) else {
+                            continue;
+                        };
+                        if !destination.in_use || destination.mix == UNUSED_MIX {
+                            continue;
+                        }
+                        if let Some(target) = buffers.get_mut(&destination.mix) {
+                            for (index, buffer) in target.iter_mut().enumerate() {
+                                mix::mix_ramp(
+                                    buffer,
+                                    &samples,
+                                    destination.previous[index],
+                                    destination.volumes[index],
+                                );
+                            }
+                            destination.touched = true;
+                            mixed = true;
+                        }
+                    }
                 }
-                resource.previous = resource.volumes;
             }
             voice.previous_volume = voice.volume;
         }
@@ -595,6 +647,19 @@ impl Renderer {
             let mut steps = 0;
             while id != FINAL_MIX {
                 match self.mixes.get(&id) {
+                    // Through a splitter: its first destination's mix.
+                    Some(mix) if steps < 64 && mix.destination == UNUSED_MIX => {
+                        let next = self
+                            .splitters
+                            .get(&mix.splitter)
+                            .and_then(|ids| ids.first())
+                            .and_then(|id| self.destinations.get(id))
+                            .map(|destination| destination.mix);
+                        match next {
+                            Some(next) if next != UNUSED_MIX => id = next,
+                            _ => return i32::MAX,
+                        }
+                    }
                     Some(mix) if steps < 64 => id = mix.destination,
                     _ => return i32::MAX,
                 }
@@ -629,6 +694,33 @@ impl Renderer {
             let Some(source) = buffers.get(&id).cloned() else {
                 continue;
             };
+            if mix.destination == UNUSED_MIX {
+                // Through a splitter: destination d takes this mix's buffer
+                // d modulo its buffer count.
+                if mix.splitter == UNUSED_SPLITTER || source.is_empty() {
+                    continue;
+                }
+                let ids = self
+                    .splitters
+                    .get(&mix.splitter)
+                    .cloned()
+                    .unwrap_or_default();
+                for (index, destination_id) in ids.iter().enumerate() {
+                    let Some(destination) = self.destinations.get(destination_id) else {
+                        continue;
+                    };
+                    if !destination.in_use || destination.mix == UNUSED_MIX {
+                        continue;
+                    }
+                    let samples = &source[index % source.len()];
+                    if let Some(target) = buffers.get_mut(&destination.mix) {
+                        for (to, buffer) in target.iter_mut().enumerate() {
+                            mix::mix(buffer, samples, mix.volume * destination.volumes[to]);
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(target) = buffers.get_mut(&mix.destination) else {
                 continue;
             };
@@ -636,6 +728,12 @@ impl Renderer {
                 for (to, buffer) in target.iter_mut().enumerate() {
                     mix::mix(buffer, samples, mix.volume * mix.volumes[from][to]);
                 }
+            }
+        }
+        // Destinations mixed into this frame start the next from here.
+        for destination in self.destinations.values_mut() {
+            if destination.in_use && std::mem::take(&mut destination.touched) {
+                destination.previous = destination.volumes;
             }
         }
         let (Some(mix), Some(device)) = (self.mixes.get(&FINAL_MIX), self.device.as_ref()) else {
@@ -828,12 +926,78 @@ impl Renderer {
         out += effect_count * effect_out;
         // Mixes (0x930 each, after a 0x20 dirty-count header in later
         // revisions) and sinks, surveyed only.
-        let mixes_at = at + effects;
+        // The splitter section follows the effects: a header ("SNDH", info
+        // count, destination count), each splitter ("SNDI", id, rate, its
+        // destination ids) and each destination ("SNDD", id, mix volumes,
+        // mix; 0x70 bytes, or 0x90 or 0xa8 with biquads).
+        let splitter_at = at + effects;
+        if splitter_size >= 0x20 {
+            let section = &input[splitter_at..splitter_at + splitter_size];
+            let word = |at: usize| {
+                section
+                    .get(at..at + 4)
+                    .map_or(0, |bytes| crate::bytes::le_u32(bytes))
+            };
+            let (infos, destinations) = (word(4) as usize, word(8) as usize);
+            let mut offset = 0x20;
+            for _ in 0..infos.min(1024) {
+                if word(offset) != u32::from_le_bytes(*b"SNDI") {
+                    break;
+                }
+                let count = (word(offset + 0xc) as usize).min(256);
+                let ids = (0..count)
+                    .map(|index| word(offset + 0x10 + index * 4) as i32)
+                    .collect();
+                self.splitters.insert(word(offset + 4) as i32, ids);
+                offset += 0x1c + count * 4;
+            }
+            if destinations != 0 && section.len() > offset {
+                let stride = (section.len() - offset) / destinations;
+                if matches!(stride, 0x70 | 0x90 | 0xa8) {
+                    for index in 0..destinations {
+                        let at = offset + index * stride;
+                        if word(at) != u32::from_le_bytes(*b"SNDD") {
+                            continue;
+                        }
+                        let in_use =
+                            section[at + stride - if stride == 0x70 { 4 } else { 12 }] != 0;
+                        let destination = self.destinations.entry(word(at + 4) as i32).or_default();
+                        for (buffer, volume) in destination.volumes.iter_mut().enumerate() {
+                            *volume = f32::from_bits(word(at + 8 + buffer * 4));
+                        }
+                        destination.mix = word(at + 0x68) as i32;
+                        if !destination.in_use && in_use {
+                            destination.previous = destination.volumes;
+                        }
+                        destination.in_use = in_use;
+                    }
+                } else {
+                    *self
+                        .survey
+                        .entry(format!(
+                            "splitter destinations of {stride:#x} bytes not read"
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+        // Mixes (0x930 each). Later revisions send only the changed ones,
+        // after a 0x20 header with their count; each names its own id.
+        let mixes_at = splitter_at + splitter_size;
         let header = mixes % 0x930;
-        for index in 0..mixes / 0x930 {
+        let listed = if header == 0x20 {
+            (crate::bytes::le_u32(&input[mixes_at + 4..][..4]) as usize).min(mixes / 0x930)
+        } else {
+            mixes / 0x930
+        };
+        for index in 0..listed {
             let entry = &input[mixes_at + header + index * 0x930..][..0x930];
             let field = |at: usize| crate::bytes::le_u32(&entry[at..at + 4]);
-            let id = field(0x10) as i32;
+            let id = if header == 0x20 {
+                field(0x10) as i32
+            } else {
+                index as i32
+            };
             if entry[0xc] == 0 {
                 self.mixes.remove(&id);
                 continue;
@@ -845,6 +1009,7 @@ impl Renderer {
                     volume: f32::from_bits(field(0)),
                     buffers: count,
                     destination: field(0x924) as i32,
+                    splitter: field(0x928) as i32,
                     volumes: (0..count)
                         .map(|from| {
                             std::array::from_fn(|to| {
@@ -979,6 +1144,7 @@ impl Renderer {
         voice.channels = word(0x18).min(6);
         voice.volume = f32::from_bits(word(0x20));
         voice.mix = word(mix_at) as i32;
+        voice.splitter = word(mix_at + 4) as i32;
         voice.quality = Quality::from_raw(entry[flush_at + 5]);
         voice.coefficients = (
             crate::bytes::le_u64(&entry[mix_at - 0x10..][..8]),
@@ -1137,10 +1303,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_voice_is_decoded_mixed_and_sent_to_the_device() {
-        let mut renderer = Renderer::new(parameters(1));
-        // A mono PCM16 voice into the final mix through channel resource 7.
+    /// An update with one mono PCM16 voice (480 samples at 0x2000), a
+    /// two-buffer final mix and a stereo device sink. The voice reaches
+    /// the mix through channel resource 7 (volumes 1 and 0.5), or with
+    /// `splitter` through splitter 3's destination 5 (volumes 1 and 0.25).
+    fn scene(splitter: bool) -> Vec<u8> {
         let mut voice = [0u8; 0x188];
         voice[8] = 1;
         voice[9] = 1;
@@ -1149,7 +1316,9 @@ mod tests {
         voice[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
         voice[0x1c..0x20].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
         voice[0x20..0x24].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
-        voice[0x70..0x74].copy_from_slice(&0u32.to_le_bytes());
+        let (mix, to) = if splitter { (i32::MAX, 3i32) } else { (0, -1) };
+        voice[0x70..0x74].copy_from_slice(&mix.to_le_bytes());
+        voice[0x74..0x78].copy_from_slice(&to.to_le_bytes());
         voice[0x158..0x15c].copy_from_slice(&7u32.to_le_bytes());
         voice[0x176] = 2; // low quality: samples pass through at pitch 1
         for index in 1..4 {
@@ -1157,6 +1326,27 @@ mod tests {
         }
         voice[0x78..0x80].copy_from_slice(&0x2000u64.to_le_bytes());
         voice[0x78 + 0x14..0x78 + 0x18].copy_from_slice(&480u32.to_le_bytes());
+        let mut section = Vec::new();
+        if splitter {
+            section.extend(b"SNDH");
+            section.extend(1u32.to_le_bytes()); // one splitter
+            section.extend(1u32.to_le_bytes()); // one destination
+            section.extend([0u8; 0x14]);
+            section.extend(b"SNDI");
+            section.extend(3u32.to_le_bytes());
+            section.extend(48_000u32.to_le_bytes());
+            section.extend(1u32.to_le_bytes());
+            section.extend(5u32.to_le_bytes()); // its destination's id
+            section.extend([0u8; 12]);
+            let mut destination = [0u8; 0xa8];
+            destination[..4].copy_from_slice(b"SNDD");
+            destination[4..8].copy_from_slice(&5u32.to_le_bytes());
+            destination[8..12].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+            destination[12..16].copy_from_slice(&0.25f32.to_bits().to_le_bytes());
+            destination[0x68..0x6c].copy_from_slice(&0u32.to_le_bytes());
+            destination[0x9c] = 1;
+            section.extend(destination);
+        }
         let mut input = vec![0u8; HEADER_SIZE];
         input[..4].copy_from_slice(b"REv@");
         let sizes = [
@@ -1165,6 +1355,7 @@ mod tests {
             (0x10, 0x70),
             (0x18, 0x930),
             (0x1c, SINK_IN),
+            (0x24, section.len()),
         ];
         for (offset, size) in sizes {
             input[offset..offset + 4].copy_from_slice(&(size as u32).to_le_bytes());
@@ -1177,11 +1368,11 @@ mod tests {
         resource[0x64] = 1;
         input.extend(resource);
         input.extend(voice);
+        input.extend(section);
         let mut mix = vec![0u8; 0x930];
         mix[..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
         mix[8..12].copy_from_slice(&2u32.to_le_bytes()); // two buffers
         mix[0xc] = 1;
-        mix[0x10..0x14].copy_from_slice(&0u32.to_le_bytes()); // the final mix
         input.extend(mix);
         let mut sink = [0u8; SINK_IN];
         sink[0] = 1; // device
@@ -1190,14 +1381,25 @@ mod tests {
         sink[0x124] = 0;
         sink[0x125] = 1;
         input.extend(sink);
+        input
+    }
+
+    /// Two frames of `scene` over a wave counting up in tens.
+    fn play(splitter: bool) -> (Renderer, Vec<i16>) {
+        let mut renderer = Renderer::new(parameters(1));
         let size = HEADER_SIZE + 0x10 + SINK_OUT + PERFORMANCE_OUT + BEHAVIOR_OUT + RENDER_INFO_OUT;
-        renderer.update(&input, size).unwrap();
-        // 480 samples counting up in tens.
+        renderer.update(&scene(splitter), size).unwrap();
         let wave = Wave((0..480i16).flat_map(|n| (n * 10).to_le_bytes()).collect());
         let start = Instant::now();
         renderer.set_started(true, start);
         renderer.advance(start + Duration::from_millis(10), Some(&wave));
         let output = renderer.take_output();
+        (renderer, output)
+    }
+
+    #[test]
+    fn a_voice_is_decoded_mixed_and_sent_to_the_device() {
+        let (renderer, output) = play(false);
         assert_eq!(renderer.output_channels, 2);
         assert_eq!(output.len(), 2 * 480);
         // The second frame plays at the settled volumes: left whole, right
@@ -1210,6 +1412,20 @@ mod tests {
         // The first frame ramps both volumes up from silence.
         assert_eq!(output[0], 0);
         assert!(output[2 * 120] > 0 && output[2 * 120] < 1200);
+        assert_eq!(renderer.mixed_frames, 2);
+    }
+
+    #[test]
+    fn a_voice_reaches_its_mix_through_a_splitter() {
+        let (renderer, output) = play(true);
+        assert_eq!(output.len(), 2 * 480);
+        // A destination that comes into use starts at its volumes: no
+        // ramp from silence, apart from the voice's own volume ramp.
+        for n in 240..480usize {
+            let sample = (n as i16 - 4) * 10;
+            assert_eq!(output[2 * n], sample, "left {n}");
+            assert_eq!(output[2 * n + 1], sample / 4, "right {n}");
+        }
         assert_eq!(renderer.mixed_frames, 2);
     }
 
