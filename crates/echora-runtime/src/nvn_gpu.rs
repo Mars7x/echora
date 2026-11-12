@@ -6347,7 +6347,7 @@ impl Nvn {
         }
         // Each stage's c0 holds its storage buffers' addresses and sizes,
         // which translated code reads to find offsets in the buffer.
-        for (index, offset, gpu, size) in storage_entries {
+        for &(index, offset, gpu, size) in &storage_entries {
             let Some(c0) = stages[index].descriptors.iter().find(|descriptor| {
                 descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0
             }) else {
@@ -7345,8 +7345,24 @@ impl Nvn {
                     bytes,
                 );
             }
+            // Its storage buffers too, as the draw reads them, named by
+            // stage and constant-buffer offset (with their GPU address in
+            // a listing).
             if index < most {
-                let _ = std::fs::write(directory.join(format!("{prefix}-{index}.done")), []);
+                let mut listing = String::new();
+                for &(stage, offset, gpu, size) in &storage_entries {
+                    if let Ok(bytes) = self.gpu_bytes(core, gpu, size) {
+                        let _ = std::fs::write(
+                            directory
+                                .join(format!("{prefix}-{index}-storage-{stage}-{offset:x}.bin")),
+                            bytes,
+                        );
+                    }
+                    listing.push_str(&format!(
+                        "stage {stage} c0+{offset:#x} gpu {gpu:#x} size {size:#x}\n"
+                    ));
+                }
+                let _ = std::fs::write(directory.join(format!("{prefix}-{index}.done")), listing);
             }
         }
         let backend = self.gpu.as_mut().unwrap();
