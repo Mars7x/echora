@@ -2080,6 +2080,10 @@ impl Nvn {
         }
         let base = self.texture_storage(texture)?;
         let extent = self.texture_extent(texture).ok()?;
+        // Its own format (or its sRGB twin): a texture object
+        // reinterpreting the memory in another format (RGB9E5 over the HDR
+        // scene's R11G11B10) is not the same target.
+        let format = self.target_shape(texture).ok().map(|(_, _, format)| format);
         for key in renderer.target_keys() {
             let Some(target) = renderer.existing_target(key) else {
                 continue;
@@ -2087,7 +2091,13 @@ impl Nvn {
             let Some(target_base) = self.texture_storage(key) else {
                 continue;
             };
-            if target_base == base && (target.width, target.height) == extent {
+            if target_base == base
+                && (target.width, target.height) == extent
+                && format.is_some_and(|format| {
+                    target.format == format
+                        || echora_gpu::renderer::srgb_twin(target.format) == Some(format)
+                })
+            {
                 return Some((key, 0));
             }
             if !mips || target.levels == 1 || base <= target_base {
