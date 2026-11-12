@@ -7306,13 +7306,20 @@ impl Nvn {
             while directory.join(format!("{prefix}-{index}.done")).exists() {
                 index += 1;
             }
-            for ((stage, binding), bytes) in &uniforms {
+            // ECHORA_DRAW_UNIFORM_DUMP_MAX=N: the first N draws per present.
+            let most = super::debug_var("ECHORA_DRAW_UNIFORM_DUMP_MAX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            for ((stage, binding), bytes) in uniforms.iter().filter(|_| index < most) {
                 let _ = std::fs::write(
                     directory.join(format!("{prefix}-{index}-{stage}-{binding}.bin")),
                     bytes,
                 );
             }
-            let _ = std::fs::write(directory.join(format!("{prefix}-{index}.done")), []);
+            if index < most {
+                let _ = std::fs::write(directory.join(format!("{prefix}-{index}.done")), []);
+            }
         }
         let backend = self.gpu.as_mut().unwrap();
         // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
