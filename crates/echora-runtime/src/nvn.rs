@@ -2834,6 +2834,17 @@ impl Nvn {
                     }
                     bag.props.insert(format!("{property}/{}", args.x[0]), args);
                 }
+                let mut args = args;
+                // SetPackagedTextureLayout(builder, const
+                // NVNpackagedTextureLayout*): its eight bytes now, in X1
+                // (the structure may not outlive the call).
+                if kind == "TextureBuilder" && property == "PackagedTextureLayout" {
+                    args.x[1] = if args.x[0] != 0 {
+                        core.memory.read_u64(args.x[0])?
+                    } else {
+                        0
+                    };
+                }
                 bag.props.insert(property.into(), args);
                 let props = bag.props.clone();
                 drop(bags);
@@ -4600,14 +4611,17 @@ pub(crate) fn texture_layout_layers(
     levels: u32,
 ) -> crate::nvn_format::Layers {
     let flags = props.get("Flags").map_or(0, |value| value.x[0]);
-    crate::nvn_format::texture_layers(info, width, height, depth, layers, levels, flags)
+    // SetPackagedTextureLayout's eight bytes, captured when it was called
+    // (in X1).
+    let packaged = props
+        .get("PackagedTextureLayout")
+        .filter(|value| value.x[0] != 0)
+        .map(|value| value.x[1] as u8);
+    crate::nvn_format::texture_layers(info, width, height, depth, layers, levels, flags, packaged)
 }
 
 fn texture_storage(props: &BTreeMap<String, Args>) -> Result<(u64, u64), String> {
     let get = |key: &str| props.get(key).map(|value| value.x[0] as u32);
-    if props.contains_key("PackagedTextureLayout") {
-        return Err("packaged texture layouts are not modeled".into());
-    }
     let format = get("Format").ok_or("texture format was never set")?;
     let info = crate::nvn_format::info(format)
         .ok_or_else(|| format!("texture format {format} is not modeled"))?;

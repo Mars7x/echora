@@ -161,32 +161,33 @@ pub struct BlockShape {
     pub z: u32,
 }
 
-/// A texture's array layers and whether the driver gave it one-GOB blocks
-/// (see `texture_layers`). A plain layer count converts with one-GOB
-/// blocks off.
+/// A texture's array layers and, where the driver does not derive it
+/// from the extent, its level 0 block shape (see `texture_layers`). A
+/// plain layer count converts with the derived shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layers {
     pub count: u32,
-    pub one_gob: bool,
+    pub shape: Option<BlockShape>,
 }
 
 impl From<u32> for Layers {
     fn from(count: u32) -> Self {
-        Layers {
-            count,
-            one_gob: false,
-        }
+        Layers { count, shape: None }
     }
 }
 
 /// NVN texture flag MINIMAL_LAYOUT.
 pub const TEXTURE_FLAG_MINIMAL_LAYOUT: u64 = 0x200;
 
-/// The layers of a texture with NVN texture `flags`: with MINIMAL_LAYOUT
-/// the driver compares the storage the usual block shape needs with one
-/// GOB high and deep blocks, and takes the one-GOB blocks when that
-/// differs (they never need more). The roots' 192x768 ASTC 5x5 material
-/// texture de-tiles to one continuous image only this way.
+/// The layers of a texture with NVN texture `flags` and, when the
+/// application set one, the first byte of its packaged texture layout
+/// (SetPackagedTextureLayout: the game's packaged textures carry their
+/// block height in its low nibble and, for 3D textures, the block depth in
+/// its high one; the roots' 192x768 ASTC material texture de-tiles to one
+/// continuous image only this way). Without one, MINIMAL_LAYOUT makes the
+/// driver compare the storage the usual block shape needs with one GOB
+/// high and deep blocks and take those when that differs.
+#[allow(clippy::too_many_arguments)]
 pub fn texture_layers(
     format: FormatInfo,
     width: u32,
@@ -195,14 +196,25 @@ pub fn texture_layers(
     layers: u32,
     levels: u32,
     flags: u64,
+    packaged: Option<u8>,
 ) -> Layers {
+    if let Some(layout) = packaged {
+        let z = if depth > 1 { u32::from(layout >> 4) } else { 0 };
+        return Layers {
+            count: layers,
+            shape: Some(BlockShape {
+                y: u32::from(layout & 0xf),
+                z,
+            }),
+        };
+    }
     let usual = Layers::from(layers);
     if flags & TEXTURE_FLAG_MINIMAL_LAYOUT == 0 {
         return usual;
     }
     let minimal = Layers {
         count: layers,
-        one_gob: true,
+        shape: Some(BlockShape { y: 0, z: 0 }),
     };
     let size = |layers| block_linear_size(format, width, height, depth, layers, levels).0;
     if size(minimal) != size(usual) {
@@ -229,8 +241,8 @@ pub fn base_block_shape(
     layers: impl Into<Layers>,
 ) -> BlockShape {
     let layers = layers.into();
-    if layers.one_gob {
-        return BlockShape { y: 0, z: 0 };
+    if let Some(shape) = layers.shape {
+        return shape;
     }
     let rows = u64::from(height.max(1).div_ceil(format.block_height));
     if depth <= 1 && layers.count > 1 {
@@ -585,8 +597,8 @@ mod tests {
         // ASTC 5x5, 192x768: 154 block rows pick 16-GOB blocks (256 rows
         // stored); one-GOB blocks store 160.
         let astc = info(123).unwrap();
-        let minimal = texture_layers(astc, 192, 768, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT);
-        assert!(minimal.one_gob);
+        let minimal = texture_layers(astc, 192, 768, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT, None);
+        assert_eq!(minimal.shape, Some(BlockShape { y: 0, z: 0 }));
         assert_eq!(
             base_block_shape(astc, 768, 1, minimal),
             BlockShape { y: 0, z: 0 }
@@ -595,11 +607,20 @@ mod tests {
             block_linear_size(astc, 192, 768, 1, minimal, 1).0,
             640 * 160
         );
-        let usual = texture_layers(astc, 192, 768, 1, 1, 1, 0);
-        assert!(!usual.one_gob);
+        let usual = texture_layers(astc, 192, 768, 1, 1, 1, 0, None);
+        assert_eq!(usual.shape, None);
+        // A packaged layout's byte 0 gives the block height.
+        let packaged = texture_layers(astc, 192, 768, 1, 1, 10, 4, Some(0));
+        assert_eq!(
+            base_block_shape(astc, 768, 1, packaged),
+            BlockShape { y: 0, z: 0 }
+        );
         assert_eq!(block_linear_size(astc, 192, 768, 1, usual, 1).0, 640 * 256);
         // 64 rows of RGBA8 fill their 8-GOB block: the flag changes nothing.
         let rgba8 = info(37).unwrap();
-        assert!(!texture_layers(rgba8, 16, 64, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT).one_gob);
+        assert_eq!(
+            texture_layers(rgba8, 16, 64, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT, None).shape,
+            None
+        );
     }
 }
