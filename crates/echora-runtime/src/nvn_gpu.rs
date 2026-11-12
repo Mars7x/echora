@@ -4430,8 +4430,9 @@ impl Nvn {
         // ECHORA_DUMP_MEMORY=all: every mapped page, in runs whose device
         // addresses follow on (the GPU addresses do too), at most 64 MiB a
         // file.
-        // ECHORA_DUMP_MEMORY=START-END (hex guest GPU addresses): only the
-        // mapped pages in that range.
+        // ECHORA_DUMP_MEMORY=START-END (hex guest GPU addresses): also the
+        // mapped pages in that range (memory the program reaches through a
+        // pointer it loads), beside the pools its constant buffers name.
         let mode = super::debug_var("ECHORA_DUMP_MEMORY").ok();
         let range = mode.as_deref().and_then(|mode| {
             let (start, end) = mode.split_once('-')?;
@@ -4481,7 +4482,9 @@ impl Nvn {
                 }
                 index = end;
             }
-            return Ok(());
+            if range.is_none() {
+                return Ok(());
+            }
         }
         // Pools an address in the constant buffers falls in.
         let pools: Vec<(u64, u64)> = self
