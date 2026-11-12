@@ -2462,6 +2462,32 @@ impl Nvn {
                 sum as f64 / raw.len().max(1) as f64
             );
         }
+        // ECHORA_GPU_RAW_DUMP=<storage hex>[,...] with ECHORA_DUMP_DIR
+        // (debugging): those textures' storage bytes as read for upload,
+        // with the builder properties that decide their layout.
+        if let (Ok(wanted), Some(directory)) = (
+            super::debug_var("ECHORA_GPU_RAW_DUMP"),
+            super::debug_var_os("ECHORA_DUMP_DIR"),
+        ) && wanted
+            .split(',')
+            .any(|item| u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(base))
+        {
+            let directory = std::path::Path::new(&directory);
+            let _ = std::fs::create_dir_all(directory);
+            let _ = std::fs::write(directory.join(format!("raw-{base:x}-{frame}.bin")), &raw);
+            let _ = std::fs::write(
+                directory.join(format!("raw-{base:x}-{frame}.txt")),
+                format!(
+                    "{} block {}x{} bytes {} storage {storage_size:#x} levels {level_count} shape {shape:?} stride {stride} pool flags {pool_flags:#x}\n{:?}\n",
+                    info.name,
+                    info.block_width,
+                    info.block_height,
+                    info.bytes_per_block,
+                    self.object(texture, "Texture")
+                        .map(|object| &object.builder)
+                ),
+            );
+        }
         let storage_hashes: Vec<u64> = raw.chunks(STORAGE_CHUNK as usize).map(hash_bytes).collect();
         let raw_copy = if uncached && storage_size <= SHADOW_LIMIT {
             raw.clone()
