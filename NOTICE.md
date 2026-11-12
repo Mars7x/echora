@@ -37,6 +37,7 @@ these separately; preserve their notices when redistributing builds.
 | `tracing` | 0.1.44 | MIT |
 | `tracing-subscriber` | 0.3.23 | MIT |
 | `winit` | 0.30.13 | Apache-2.0 |
+| `unsafe-libopus` | 0.2.0 | BSD-3-Clause (libopus, transpiled to Rust) |
 | `yaxpeax-arch` | 0.3.3 | 0BSD |
 | `yaxpeax-arm` | 0.4.0 | 0BSD |
 | `zstd` | 0.13.4 | MIT (bundles zstd, BSD-3-Clause OR GPL-2.0) |

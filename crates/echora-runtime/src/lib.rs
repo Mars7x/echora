@@ -33,6 +33,7 @@ pub mod nvdrv;
 pub mod nvn;
 #[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod nvn_format;
+mod opus;
 pub mod romfs;
 pub mod runtime;
 #[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks

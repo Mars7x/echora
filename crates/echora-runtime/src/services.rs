@@ -756,8 +756,9 @@ enum ServiceObject {
     /// nn::prepo::detail::ipc::IAsyncContext, from a report sent with
     /// command 10500 (SDK 22's PlayReport::Send).
     PlayReportContext,
-    /// IHardwareOpusDecoder: decodes packets to silence of the right length.
+    /// IHardwareOpusDecoder; its decoder is `Services::opus_decoders[id]`.
     OpusDecoder {
+        id: usize,
         sample_rate: u32,
         channels: u32,
     },
@@ -1060,6 +1061,8 @@ pub struct Services {
     /// Each renderer's host stream, opened when its device sink first
     /// produces samples (None inside: no host audio).
     audio_renderer_hosts: BTreeMap<usize, Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    /// The hardware Opus decoders opened so far, by `OpusDecoder::id`.
+    opus_decoders: Vec<crate::opus::Decoder>,
     /// IAudioDevice output volume auto-tune setting (commands 19/20).
     audio_volume_auto_tune: bool,
     /// IAudioDevice output volumes by device name (f32 bits).
@@ -1249,6 +1252,7 @@ impl Default for Services {
             audio_outs: Vec::new(),
             audio_renderers: Vec::new(),
             audio_renderer_hosts: BTreeMap::new(),
+            opus_decoders: Vec::new(),
             audio_volume_auto_tune: false,
             audio_device_volumes: BTreeMap::new(),
             audio_device_list_requests: BTreeSet::new(),
@@ -4060,11 +4064,12 @@ impl Services {
             (ServiceObject::OpusDecoderManager, 0..=8) => self.opus_manager(call),
             (
                 ServiceObject::OpusDecoder {
+                    id,
                     sample_rate,
                     channels,
                 },
                 _,
-            ) => self.opus_decode(*sample_rate, *channels, call),
+            ) => self.opus_decode(*id, *sample_rate, *channels, call),
             // IHardwareOpusDecoderManager GetWorkBufferSizeForMultiStreamExEx
             // (9, Switchbrew numbering): OpusMultiStreamParametersEx {u32
             // sample_rate, u32 channel_count, u32 total_stream_count, u32
@@ -5747,14 +5752,46 @@ impl Services {
                 Ok(Outcome::success())
             }
             // Open* (0, 2, 4, 6): the work buffer arrives as transfer memory
-            // (copied handle); it is not used.
+            // (copied handle); the decoder's state lives on the host. The
+            // multi-stream forms (2, 6) carry OpusMultiStreamParameters(Ex)
+            // {u32 sample_rate, u32 channel_count, u32 total_stream_count,
+            // u32 stereo_stream_count, u8 mappings[256]}.
             _ => {
                 if call.request.copy_handles.len() != 1 {
                     return Err(call.unsupported(SERVICE, "Opus open without work-buffer memory"));
                 }
+                let decoder = if matches!(command, 2 | 6) {
+                    let input = call
+                        .request
+                        .input_buffer
+                        .clone()
+                        .ok_or_else(|| call.unsupported(SERVICE, "missing Opus parameters"))?;
+                    if input.size < 16 + u64::from(channels) {
+                        return Err(call.unsupported(SERVICE, "short Opus stream parameters"));
+                    }
+                    let mut bytes = vec![0u8; 16 + channels as usize];
+                    call.memory.read(input.address, &mut bytes)?;
+                    crate::opus::Decoder::new(
+                        sample_rate,
+                        channels,
+                        Some(crate::opus::Layout {
+                            streams: crate::bytes::le_u32(&bytes[8..12]),
+                            coupled: crate::bytes::le_u32(&bytes[12..16]),
+                            mapping: &bytes[16..],
+                        }),
+                    )
+                } else {
+                    crate::opus::Decoder::new(sample_rate, channels, None)
+                };
+                let decoder = decoder.map_err(|message| Trap::InvalidState {
+                    message: format!("{SERVICE}: {message}"),
+                })?;
+                let id = self.opus_decoders.len();
+                self.opus_decoders.push(decoder);
                 self.reply_new_object(
                     call,
                     ServiceObject::OpusDecoder {
+                        id,
                         sample_rate,
                         channels,
                     },
@@ -5766,12 +5803,12 @@ impl Services {
 
     /// IHardwareOpusDecoder decode commands (0, 2, 4-9): the input holds
     /// OpusPacketHeader {u32 size (big-endian), u32 final_range} and the
-    /// packet. The output receives the packet's duration of interleaved
-    /// PCM16 silence; no audio is produced anywhere, so decoded content is
-    /// unobservable. Replies u32 consumed bytes and u32 samples per channel,
-    /// plus u64 decode time for the "Perf" forms (4-9).
+    /// packet. The output receives the decoded interleaved PCM16. Replies
+    /// u32 consumed bytes and u32 samples per channel, plus u64 decode time
+    /// for the "Perf" forms (4-9).
     fn opus_decode(
         &mut self,
+        id: usize,
         sample_rate: u32,
         channels: u32,
         call: &mut Call<'_>,
@@ -5799,15 +5836,26 @@ impl Services {
         if size == 0 || 8 + size > input.size {
             return Err(call.unsupported(SERVICE, "Opus packet exceeds its input buffer"));
         }
-        let mut packet = vec![0u8; size.min(2) as usize];
+        let mut packet = vec![0u8; size as usize];
         call.memory.read(input.address + 8, &mut packet)?;
-        let samples = opus_packet_samples(&packet, sample_rate)
+        opus_packet_samples(&packet, sample_rate)
             .ok_or_else(|| call.unsupported(SERVICE, "malformed Opus packet"))?;
+        let decoder = self
+            .opus_decoders
+            .get_mut(id)
+            .ok_or_else(|| call.unsupported(SERVICE, "decode on a closed decoder"))?;
+        let pcm = decoder
+            .decode(&packet)
+            .map_err(|message| Trap::InvalidState {
+                message: format!("{SERVICE}: {message}"),
+            })?;
+        let samples = pcm.len() as u64 / u64::from(channels);
         let bytes = samples * u64::from(channels) * 2;
         if bytes > capacity {
             return Err(call.unsupported(SERVICE, "Opus output buffer too small"));
         }
-        call.memory.write(output, &vec![0u8; bytes as usize])?;
+        let pcm: Vec<u8> = pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        call.memory.write(output, &pcm)?;
         let mut reply = Vec::with_capacity(16);
         reply.extend_from_slice(&((8 + size) as u32).to_le_bytes());
         reply.extend_from_slice(&(samples as u32).to_le_bytes());
@@ -5815,7 +5863,6 @@ impl Services {
             reply.extend_from_slice(&0u64.to_le_bytes());
         }
         call.reply(0, None, AOC_INTERFACE_ID, &reply)?;
-        self.provisional_commands.insert(SERVICE);
         Ok(Outcome::success())
     }
 
