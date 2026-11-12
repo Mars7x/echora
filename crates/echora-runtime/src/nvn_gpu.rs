@@ -5413,6 +5413,34 @@ impl Nvn {
             } else {
                 String::new()
             };
+            // ECHORA_TARGET_TRACE_RECT=<x>,<y>,<w>,<h>[;...] (texels): also
+            // those rectangles' first channels, row by row, in targets that
+            // hold them (a shadow map's texels around a lookup).
+            if let Ok(rects) = super::debug_var("ECHORA_TARGET_TRACE_RECT") {
+                for rect in rects.split(';') {
+                    let values: Vec<usize> = rect
+                        .split(',')
+                        .filter_map(|value| value.trim().parse().ok())
+                        .collect();
+                    let [x, y, w, h] = values[..] else {
+                        continue;
+                    };
+                    if x + w > width as usize || y + h > height as usize {
+                        continue;
+                    }
+                    for row in y..y + h {
+                        let line: Vec<String> = (x..x + w)
+                            .map(|column| {
+                                format!("{:.6}", texels[row * width as usize + column][0])
+                            })
+                            .collect();
+                        eprintln!(
+                            "target trace present {present} {what} {key:x} row {row} from {x}: {}",
+                            line.join(" ")
+                        );
+                    }
+                }
+            }
             let count = texels.len().max(1) as f64;
             let nonfinite = texels
                 .iter()
