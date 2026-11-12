@@ -951,34 +951,37 @@ impl Renderer {
                 self.splitters.insert(word(offset + 4) as i32, ids);
                 offset += 0x1c + count * 4;
             }
-            if destinations != 0 && section.len() > offset {
-                let stride = (section.len() - offset) / destinations;
-                if matches!(stride, 0x70 | 0x90 | 0xa8) {
-                    for index in 0..destinations {
-                        let at = offset + index * stride;
-                        if word(at) != u32::from_le_bytes(*b"SNDD") {
-                            continue;
-                        }
-                        let in_use =
-                            section[at + stride - if stride == 0x70 { 4 } else { 12 }] != 0;
-                        let destination = self.destinations.entry(word(at + 4) as i32).or_default();
-                        for (buffer, volume) in destination.volumes.iter_mut().enumerate() {
-                            *volume = f32::from_bits(word(at + 8 + buffer * 4));
-                        }
-                        destination.mix = word(at + 0x68) as i32;
-                        if !destination.in_use && in_use {
-                            destination.previous = destination.volumes;
-                        }
-                        destination.in_use = in_use;
-                    }
-                } else {
-                    *self
-                        .survey
-                        .entry(format!(
-                            "splitter destinations of {stride:#x} bytes not read"
-                        ))
-                        .or_default() += 1;
+            // Each destination's size shows in where the next one starts
+            // (the section may end in padding).
+            let magic = u32::from_le_bytes(*b"SNDD");
+            for _ in 0..destinations.min(4096) {
+                if word(offset) != magic {
+                    break;
                 }
+                let stride = [0x70usize, 0x90, 0xa8].into_iter().find(|size| {
+                    let next = offset + size;
+                    next == section.len() || (next + 4 <= section.len() && word(next) == magic)
+                });
+                let Some(stride) = stride.or_else(|| {
+                    // The last one, before padding: the largest that fits.
+                    [0xa8usize, 0x90, 0x70]
+                        .into_iter()
+                        .find(|size| offset + size <= section.len())
+                }) else {
+                    break;
+                };
+                let at = offset;
+                let in_use = section[at + stride - if stride == 0x70 { 4 } else { 12 }] != 0;
+                let destination = self.destinations.entry(word(at + 4) as i32).or_default();
+                for (buffer, volume) in destination.volumes.iter_mut().enumerate() {
+                    *volume = f32::from_bits(word(at + 8 + buffer * 4));
+                }
+                destination.mix = word(at + 0x68) as i32;
+                if !destination.in_use && in_use {
+                    destination.previous = destination.volumes;
+                }
+                destination.in_use = in_use;
+                offset += stride;
             }
         }
         // Mixes (0x930 each). Later revisions send only the changed ones,

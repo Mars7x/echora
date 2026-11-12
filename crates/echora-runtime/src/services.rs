@@ -1060,7 +1060,7 @@ pub struct Services {
     audio_renderers: Vec<(crate::audio_renderer::Renderer, Option<ReadableEventId>)>,
     /// Each renderer's host stream, opened when its device sink first
     /// produces samples (None inside: no host audio).
-    audio_renderer_hosts: BTreeMap<usize, Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    audio_renderer_hosts: BTreeMap<usize, Option<(std::sync::mpsc::Sender<Vec<u8>>, u32)>>,
     /// The hardware Opus decoders opened so far, by `OpusDecoder::id`.
     opus_decoders: Vec<crate::opus::Decoder>,
     /// IAudioDevice output volume auto-tune setting (commands 19/20).
@@ -1425,6 +1425,24 @@ fn service_name(arguments: &[u8]) -> Result<String, Trap> {
         ));
     }
     Ok(String::from_utf8(arguments[..length].to_vec()).expect("checked to be ASCII above"))
+}
+
+/// Six interleaved channels (front left, front right, centre, low
+/// frequency, back left, back right) as two, with the console's stereo
+/// downmix weights: centre 0.596, low frequency 0.354, back 0.707.
+fn downmix_to_stereo(samples: &[i16]) -> Vec<i16> {
+    let mut stereo = Vec::with_capacity(samples.len() / 3);
+    for frame in samples.as_chunks::<6>().0 {
+        let [left, right, centre, low, back_left, back_right] = frame.map(f32::from);
+        let shared = centre * 0.596 + low * 0.354;
+        for side in [
+            left + shared + back_left * 0.707,
+            right + shared + back_right * 0.707,
+        ] {
+            stereo.push(side.clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    stereo
 }
 
 /// Guest memory as the audio renderer decodes wave buffers from it.
@@ -5900,11 +5918,25 @@ impl Services {
             return;
         }
         let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
-        let host = self
-            .audio_renderer_hosts
-            .entry(id)
-            .or_insert_with(|| crate::audio::open(rate, channels));
-        if let Some(host) = host {
+        // The device's own channel count where the host can play it;
+        // else six channels are mixed down to two, as the console does for
+        // a stereo output.
+        let host = self.audio_renderer_hosts.entry(id).or_insert_with(|| {
+            crate::audio::open(rate, channels)
+                .map(|host| (host, channels))
+                .or_else(|| {
+                    (channels == 6)
+                        .then(|| crate::audio::open(rate, 2))
+                        .flatten()
+                        .map(|host| (host, 2))
+                })
+        });
+        if let Some((host, host_channels)) = host {
+            let samples = if *host_channels == 2 && channels == 6 {
+                downmix_to_stereo(&samples)
+            } else {
+                samples
+            };
             let mut pcm: Vec<u8> = samples
                 .iter()
                 .flat_map(|sample| sample.to_le_bytes())
@@ -9621,6 +9653,21 @@ mod tests {
         assert_eq!(opus_packet_samples(&[(3 << 3) | 3, 3], 48_000), None);
         assert_eq!(opus_packet_samples(&[(16 << 3) | 3, 0], 48_000), None);
         assert_eq!(opus_packet_samples(&[], 48_000), None);
+    }
+
+    #[test]
+    fn six_channels_mix_down_to_two_with_the_console_s_weights() {
+        // Front pair alone, then centre alone, then the back pair.
+        let frames = [
+            [1000, -1000, 0, 0, 0, 0],
+            [0, 0, 1000, 0, 0, 0],
+            [0, 0, 0, 0, 1000, 2000],
+        ];
+        let samples: Vec<i16> = frames.into_iter().flatten().collect();
+        assert_eq!(
+            downmix_to_stereo(&samples),
+            [1000, -1000, 596, 596, 707, 1414]
+        );
     }
 
     #[test]
