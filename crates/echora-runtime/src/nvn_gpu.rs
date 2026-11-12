@@ -1446,11 +1446,16 @@ impl Nvn {
         &mut self,
         core: &Guest,
     ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
+        // The graphics stages' programs: the COMPUTE bit's (5, NVN's
+        // 0x20) is not one. A program bound for every bit (0xff, as the
+        // game binds its tile classifier) stays in the compute slot while
+        // later graphics binds (0xdf) replace the rest; its fragment stage
+        // then drew every following mesh draw.
         let programs: Vec<u64> = self
             .render
             .state
             .iter()
-            .filter(|(key, _)| key.starts_with("BindProgram@"))
+            .filter(|(key, _)| key.starts_with("BindProgram@") && *key != "BindProgram@5")
             .map(|(_, bind)| bind.x[1])
             .collect();
         // For the skip reasons: each bound bit's program and its stages'
