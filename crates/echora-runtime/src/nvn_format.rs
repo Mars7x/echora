@@ -161,6 +161,57 @@ pub struct BlockShape {
     pub z: u32,
 }
 
+/// A texture's array layers and whether the driver gave it one-GOB blocks
+/// (see `texture_layers`). A plain layer count converts with one-GOB
+/// blocks off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layers {
+    pub count: u32,
+    pub one_gob: bool,
+}
+
+impl From<u32> for Layers {
+    fn from(count: u32) -> Self {
+        Layers {
+            count,
+            one_gob: false,
+        }
+    }
+}
+
+/// NVN texture flag MINIMAL_LAYOUT.
+pub const TEXTURE_FLAG_MINIMAL_LAYOUT: u64 = 0x200;
+
+/// The layers of a texture with NVN texture `flags`: with MINIMAL_LAYOUT
+/// the driver compares the storage the usual block shape needs with one
+/// GOB high and deep blocks, and takes the one-GOB blocks when that
+/// differs (they never need more). The roots' 192x768 ASTC 5x5 material
+/// texture de-tiles to one continuous image only this way.
+pub fn texture_layers(
+    format: FormatInfo,
+    width: u32,
+    height: u32,
+    depth: u32,
+    layers: u32,
+    levels: u32,
+    flags: u64,
+) -> Layers {
+    let usual = Layers::from(layers);
+    if flags & TEXTURE_FLAG_MINIMAL_LAYOUT == 0 {
+        return usual;
+    }
+    let minimal = Layers {
+        count: layers,
+        one_gob: true,
+    };
+    let size = |layers| block_linear_size(format, width, height, depth, layers, levels).0;
+    if size(minimal) != size(usual) {
+        minimal
+    } else {
+        usual
+    }
+}
+
 /// The block shape the console's NVN driver gives level 0 (no packaged
 /// layout): 2D textures by 1.5 times their rows of format blocks against
 /// the thresholds 16/32/64/128 GOB rows; 3D textures one GOB high and 16
@@ -171,9 +222,18 @@ pub struct BlockShape {
 /// depth for the block height: the fog's 1360x1000 8-layer height map
 /// de-tiles to the console's image only this way, 0.95 correlation
 /// against 0.15-0.21 for the 2D rule's heights).
-pub fn base_block_shape(format: FormatInfo, height: u32, depth: u32, layers: u32) -> BlockShape {
+pub fn base_block_shape(
+    format: FormatInfo,
+    height: u32,
+    depth: u32,
+    layers: impl Into<Layers>,
+) -> BlockShape {
+    let layers = layers.into();
+    if layers.one_gob {
+        return BlockShape { y: 0, z: 0 };
+    }
     let rows = u64::from(height.max(1).div_ceil(format.block_height));
-    if depth <= 1 && layers > 1 {
+    if depth <= 1 && layers.count > 1 {
         return BlockShape { y: 0, z: 0 };
     }
     if depth > 1 {
@@ -201,9 +261,10 @@ pub fn level_block_shape(
     format: FormatInfo,
     height: u32,
     depth: u32,
-    layers: u32,
+    layers: impl Into<Layers>,
     level: u32,
 ) -> BlockShape {
+    let layers: Layers = layers.into();
     let base = base_block_shape(format, height, depth, layers);
     let mut z = base.z;
     for step in 1..=level {
@@ -226,19 +287,20 @@ pub fn block_linear_size(
     width: u32,
     height: u32,
     depth: u32,
-    layers: u32,
+    layers: impl Into<Layers>,
     levels: u32,
 ) -> (u64, u64) {
+    let layers: Layers = layers.into();
     let (layer_size, base) = levels_size(format, width, height, depth, layers, levels);
     let (height_shift, depth_shift) = (base.y, base.z);
     // Array layers start on a whole level-0 block.
     let block = GOB_SIZE << (height_shift + depth_shift);
-    let layer_stride = if layers > 1 {
+    let layer_stride = if layers.count > 1 {
         align(layer_size, block)
     } else {
         layer_size
     };
-    (layer_stride * u64::from(layers.max(1)), GOB_SIZE)
+    (layer_stride * u64::from(layers.count.max(1)), GOB_SIZE)
 }
 
 /// One layer's bytes for mip levels 0..`levels`, each padded to its
@@ -248,9 +310,10 @@ fn levels_size(
     width: u32,
     height: u32,
     depth: u32,
-    layers: u32,
+    layers: impl Into<Layers>,
     levels: u32,
 ) -> (u64, BlockShape) {
+    let layers: Layers = layers.into();
     let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
     let base = base_block_shape(format, height, depth, layers);
     let mut layer_size = 0;
@@ -279,9 +342,10 @@ pub fn block_linear_level_offset(
     width: u32,
     height: u32,
     depth: u32,
-    layers: u32,
+    layers: impl Into<Layers>,
     level: u32,
 ) -> u64 {
+    let layers: Layers = layers.into();
     if level == 0 {
         return 0;
     }
@@ -302,11 +366,12 @@ pub fn block_linear_offset(
     width: u32,
     height: u32,
     depth: u32,
-    layers: u32,
+    layers: impl Into<Layers>,
     x: u32,
     y: u32,
     z: u32,
 ) -> u64 {
+    let layers: Layers = layers.into();
     let shape = base_block_shape(format, height, depth, layers);
     block_linear_offset_in(format, width, height, shape, x, y, z)
 }
@@ -513,5 +578,28 @@ mod tests {
             block_linear_offset(r16, 1360, 1000, 1, 8, 0, 8, 0),
             2752 * 8
         );
+    }
+
+    #[test]
+    fn minimal_layout_takes_one_gob_blocks_when_smaller() {
+        // ASTC 5x5, 192x768: 154 block rows pick 16-GOB blocks (256 rows
+        // stored); one-GOB blocks store 160.
+        let astc = info(123).unwrap();
+        let minimal = texture_layers(astc, 192, 768, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT);
+        assert!(minimal.one_gob);
+        assert_eq!(
+            base_block_shape(astc, 768, 1, minimal),
+            BlockShape { y: 0, z: 0 }
+        );
+        assert_eq!(
+            block_linear_size(astc, 192, 768, 1, minimal, 1).0,
+            640 * 160
+        );
+        let usual = texture_layers(astc, 192, 768, 1, 1, 1, 0);
+        assert!(!usual.one_gob);
+        assert_eq!(block_linear_size(astc, 192, 768, 1, usual, 1).0, 640 * 256);
+        // 64 rows of RGBA8 fill their 8-GOB block: the flag changes nothing.
+        let rgba8 = info(37).unwrap();
+        assert!(!texture_layers(rgba8, 16, 64, 1, 1, 1, TEXTURE_FLAG_MINIMAL_LAYOUT).one_gob);
     }
 }

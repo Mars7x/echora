@@ -1794,7 +1794,13 @@ impl Nvn {
                 get("Width").unwrap_or(1),
                 get("Height").unwrap_or(1),
                 depth,
-                layers,
+                super::texture_layout_layers(
+                    &object.builder,
+                    info,
+                    [get("Width").unwrap_or(1), get("Height").unwrap_or(1), depth],
+                    layers,
+                    get("Levels").unwrap_or(1),
+                ),
                 get("Levels").unwrap_or(1),
             )
             .0,
@@ -2127,7 +2133,13 @@ impl Nvn {
                     target.width,
                     target.height,
                     depth,
-                    target.shape.layers(),
+                    super::texture_layout_layers(
+                        &object.builder,
+                        info,
+                        [target.width, target.height, depth],
+                        target.shape.layers(),
+                        target.levels,
+                    ),
                     level,
                 );
                 let level_extent = (
@@ -2323,10 +2335,17 @@ impl Nvn {
         };
         let (depth, layers) = (shape.depth(), shape.layers());
         let levels_set = get("Levels").unwrap_or(1);
+        let layout = super::texture_layout_layers(
+            &object.builder,
+            info,
+            [width, height, depth],
+            layers,
+            levels_set,
+        );
         let storage_size = if stride != 0 {
             stride * u64::from(height.div_ceil(info.block_height))
         } else {
-            crate::nvn_format::block_linear_size(info, width, height, depth, layers, levels_set).0
+            crate::nvn_format::block_linear_size(info, width, height, depth, layout, levels_set).0
         };
         let check_started = std::time::Instant::now();
         let shadowed = self.gpu.as_ref().unwrap().shadows.contains_key(&texture);
@@ -2551,10 +2570,10 @@ impl Nvn {
                 level_height.div_ceil(info.block_height),
             );
             let level_offset = crate::nvn_format::block_linear_level_offset(
-                info, width, height, depth, layers, level,
+                info, width, height, depth, layout, level,
             );
             let level_shape =
-                crate::nvn_format::level_block_shape(info, height, depth, layers, level);
+                crate::nvn_format::level_block_shape(info, height, depth, layout, level);
             let row_bytes = columns as usize * block;
             for layer in 0..layers {
                 let layer_base = u64::from(layer) * layer_stride + level_offset;

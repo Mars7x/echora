@@ -4039,9 +4039,17 @@ impl Nvn {
             }
             _ => 1,
         };
+        let levels = get("Levels").unwrap_or(1);
+        let layout = texture_layout_layers(
+            &texture.builder,
+            info,
+            [width, height, depth],
+            layers,
+            levels,
+        );
         let layer_stride = if layers > 1 {
-            let levels = get("Levels").unwrap_or(1);
-            crate::nvn_format::block_linear_size(info, width, height, 1, 2, levels).0 / 2
+            let pair = crate::nvn_format::Layers { count: 2, ..layout };
+            crate::nvn_format::block_linear_size(info, width, height, 1, pair, levels).0 / 2
         } else {
             0
         };
@@ -4091,8 +4099,8 @@ impl Nvn {
             && bytes != 0
             && 16 % bytes == 0
         {
-            let shape = crate::nvn_format::level_block_shape(info, height, 1, 1, 0);
-            let size = crate::nvn_format::block_linear_size(info, width, height, 1, 1, 1).0;
+            let shape = crate::nvn_format::level_block_shape(info, height, 1, layout, 0);
+            let size = crate::nvn_format::block_linear_size(info, width, height, 1, layout, 1).0;
             let mut tiled = vec![0u8; size as usize];
             core.memory
                 .read(base, &mut tiled)
@@ -4165,7 +4173,7 @@ impl Nvn {
                                 width,
                                 height,
                                 depth,
-                                layers,
+                                layout,
                                 x,
                                 ry / bh + row,
                                 z,
@@ -4582,6 +4590,19 @@ fn read_prefix(core: &Guest, address: u64, length: u64) -> Vec<u8> {
     bytes
 }
 
+/// `layers` array layers of the texture `props` describe, with the block
+/// shape its Flags give it (`nvn_format::texture_layers`).
+pub(crate) fn texture_layout_layers(
+    props: &BTreeMap<String, Args>,
+    info: crate::nvn_format::FormatInfo,
+    [width, height, depth]: [u32; 3],
+    layers: u32,
+    levels: u32,
+) -> crate::nvn_format::Layers {
+    let flags = props.get("Flags").map_or(0, |value| value.x[0]);
+    crate::nvn_format::texture_layers(info, width, height, depth, layers, levels, flags)
+}
+
 fn texture_storage(props: &BTreeMap<String, Args>) -> Result<(u64, u64), String> {
     let get = |key: &str| props.get(key).map(|value| value.x[0] as u32);
     if props.contains_key("PackagedTextureLayout") {
@@ -4641,12 +4662,13 @@ fn texture_storage(props: &BTreeMap<String, Args>) -> Result<(u64, u64), String>
         8 => (4, 2),
         _ => return Err(format!("{samples} samples")),
     };
+    let (width, height) = (width * sample_x, height * sample_y);
     Ok(crate::nvn_format::block_linear_size(
         info,
-        width * sample_x,
-        height * sample_y,
+        width,
+        height,
         depth,
-        layers,
+        texture_layout_layers(props, info, [width, height, depth], layers, levels),
         levels,
     ))
 }
