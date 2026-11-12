@@ -127,6 +127,10 @@ pub struct Fixed {
     /// The depth target is a D24 format held as D32F: polygon offset
     /// units are D24 steps (2^-24) where the device can force that.
     pub depth_bias_d24: bool,
+    /// Alpha to coverage (MultisampleState): with one sample a fragment
+    /// is kept where its target 0 alpha covers it (leaf and grass cards'
+    /// cut-out).
+    pub alpha_to_coverage: bool,
 }
 
 /// One face's stencil test and update.
@@ -1040,7 +1044,7 @@ impl Renderer {
             objects.cmd_set_polygon_mode(commands, fixed.polygon_mode);
             objects.cmd_set_rasterization_samples(commands, vk::SampleCountFlags::TYPE_1);
             objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
-            objects.cmd_set_alpha_to_coverage_enable(commands, false);
+            objects.cmd_set_alpha_to_coverage_enable(commands, fixed.alpha_to_coverage);
             objects.cmd_set_depth_bias_enable(commands, fixed.depth_bias.is_some());
             if let Some([constant, clamp, slope]) = fixed.depth_bias {
                 let clamp = if self.gpu.depth_bias_clamp {
@@ -1279,6 +1283,7 @@ pub(crate) mod tests {
                 depth_minus_one_to_one: false,
                 depth_bias: None,
                 depth_bias_d24: false,
+                alpha_to_coverage: false,
             },
             blends: vec![Blend::default()],
             mesh: None,

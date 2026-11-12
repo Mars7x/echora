@@ -6627,6 +6627,13 @@ impl Nvn {
                 }),
             stencil: (arg(&depth_state, "StencilTestEnable", 0).unwrap_or(0) != 0)
                 .then(|| self.stencil_faces(&depth_state)),
+            // MultisampleState SetAlphaToCoverageEnable(state, enable).
+            alpha_to_coverage: arg(
+                &snapshot("BindMultisampleState"),
+                "AlphaToCoverageEnable",
+                0,
+            )
+            .is_some_and(|enable| enable != 0),
             // DEPTH24_STENCIL8 (NVN format 53) is held as D32F_S8 (`vk_format`).
             depth_bias_d24: self
                 .object(self.render.depth, "Texture")
