@@ -20,7 +20,15 @@
 //!   instead (derivatives and implicit levels across it), per pixel N
 //!   (0 top left, 1 top right, 2 bottom left, 3 bottom right) `quad N
 //!   fragcoord X Y Z W`, `quad N attribute LOCATION X Y Z W` and `quad N
-//!   helper`; `compare_op N` the depth comparisons' VkCompareOp where a
+//!   helper`; `input LOCATION W0 W1 W2 W3` (also `quad N input ...`) an
+//!   input vector exactly as the fragment stage's input variable holds it
+//!   (hex words, missing ones 0; what IPA reads, before its own 1/w), in
+//!   place of `attribute`; `front_facing 0|1` and `sample_mask W` (hex)
+//!   those built-ins; `trace_pixel X Y` the pixel a program translated with
+//!   ECHORA_VERTEX_TRACE records (else the FragCoord given): its record is
+//!   printed as the runtime's ECHORA_VERTEX_TRACE_REPORT prints it (`out
+//!   [...]`, `tex at OFFSET xTIMES W0 W1 W2 W3`), so the two compare field
+//!   by field; `compare_op N` the depth comparisons' VkCompareOp where a
 //!   sampler gives none; `sampler KEYS` the state of every sample whose
 //!   binding has none of its own, `sampler SET BINDING KEYS` a combined
 //!   image sampler's (or sampler variable's) and `sampler SET BINDING
@@ -99,6 +107,8 @@ fn main() {
         ..Inputs::default()
     };
     let dispatch = String::from_utf8_lossy(&read("dispatch.txt")).into_owned();
+    // The traced pixel (`trace_pixel`, else the FragCoord given).
+    let mut trace_pixel: Option<u32> = None;
     for line in dispatch.lines() {
         let floats: Vec<u64> = line
             .split_whitespace()
@@ -124,6 +134,11 @@ fn main() {
                 Some(&"attribute") if floats.len() == 5 => {
                     let words = floats[1..].iter().map(|v| u64::from(v.to_bits())).collect();
                     quad.locations.insert(floats[0] as u32, words);
+                }
+                Some(&"input") => {
+                    if let Some((location, words)) = input_words(&rest[1..]) {
+                        quad.locations.insert(location, words);
+                    }
                 }
                 Some(&"helper") => quad.helper = true,
                 _ => {}
@@ -171,6 +186,29 @@ fn main() {
             Some("attribute") if floats.len() == 5 => {
                 let location = f32::from_bits(floats[0] as u32) as u32;
                 inputs.locations.insert(location, floats[1..].to_vec());
+                continue;
+            }
+            Some("input") => {
+                if let Some((location, words)) = input_words(&fields[1..]) {
+                    inputs.locations.insert(location, words);
+                }
+                continue;
+            }
+            Some("front_facing") if fields.len() == 2 => {
+                let front = fields[1] != "0";
+                inputs.builtins.insert(17, vec![u64::from(front)]);
+                continue;
+            }
+            Some("sample_mask") if fields.len() == 2 => {
+                if let Ok(mask) = u32::from_str_radix(fields[1].trim_start_matches("0x"), 16) {
+                    inputs.builtins.insert(20, vec![u64::from(mask)]);
+                }
+                continue;
+            }
+            Some("trace_pixel") if fields.len() == 3 => {
+                if let (Ok(x), Ok(y)) = (fields[1].parse::<u32>(), fields[2].parse::<u32>()) {
+                    trace_pixel = Some(x | y << 16);
+                }
                 continue;
             }
             _ => {}
@@ -264,6 +302,40 @@ fn main() {
     inputs.images = images;
     inputs.image_arrays = image_arrays;
     let machine = Machine::new(&words);
+    // A program translated with ECHORA_VERTEX_TRACE (a fragment program's
+    // trace of one pixel): its record buffer, read back after the run.
+    let trace_buffer = (machine.has_spec_id(echora_shader_abi::VERTEX_TRACE_LOW_SPEC_ID)
+        && machine.has_spec_id(echora_shader_abi::VERTEX_TRACE_HIGH_SPEC_ID))
+    .then_some(0x7e00_0000_0000u64);
+    if let Some(buffer) = trace_buffer {
+        inputs.memory.insert(buffer, vec![0; 64 * 512]);
+        inputs
+            .specialization
+            .insert(echora_shader_abi::VERTEX_TRACE_LOW_SPEC_ID, buffer as u32);
+        inputs.specialization.insert(
+            echora_shader_abi::VERTEX_TRACE_HIGH_SPEC_ID,
+            (buffer >> 32) as u32,
+        );
+        let frag_coord = inputs
+            .quad
+            .first()
+            .map(|pixel| pixel.frag_coord)
+            .or_else(|| {
+                inputs.builtins.get(&15).map(|words| {
+                    std::array::from_fn(|n| {
+                        f32::from_bits(words.get(n).copied().unwrap_or(0) as u32)
+                    })
+                })
+            });
+        let pixel = trace_pixel.or_else(|| {
+            frag_coord.map(|[x, y, ..]| (x.max(0.0) as u32) | (y.max(0.0) as u32) << 16)
+        });
+        if let Some(pixel) = pixel {
+            inputs
+                .specialization
+                .insert(echora_shader_abi::FRAGMENT_TRACE_PIXEL_SPEC_ID, pixel);
+        }
+    }
     for argument in &arguments[1..] {
         if let Some(range) = argument.strip_prefix("watch=").and_then(hex_range) {
             inputs.watch.push(range);
@@ -353,6 +425,13 @@ fn main() {
     for group in groups {
         inputs.workgroup_id = group;
         let report = machine.simulate(&inputs);
+        if let Some(buffer) = trace_buffer
+            && let Some(bytes) = report.memory.get(&buffer)
+        {
+            for line in echora_shader::sim::trace_lines(bytes) {
+                println!("{line}");
+            }
+        }
         let quiet_group = quiet
             && report.problems.is_empty()
             && report.writes.is_empty()
@@ -677,4 +756,18 @@ fn sampler_state(keys: &[&str], mut state: Sampler) -> Result<Sampler, String> {
         }
     }
     Ok(state)
+}
+
+/// `LOCATION w0 [w1 [w2 [w3]]]` (the words hex, as the stage's input
+/// variable holds them; missing ones 0).
+fn input_words(fields: &[&str]) -> Option<(u32, Vec<u64>)> {
+    let (location, words) = fields.split_first()?;
+    let location = location.parse().ok()?;
+    let mut words: Vec<u64> = words
+        .iter()
+        .map(|word| u32::from_str_radix(word.trim_start_matches("0x"), 16).map(u64::from))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    words.resize(4, 0);
+    Some((location, words))
 }

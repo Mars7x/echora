@@ -804,6 +804,57 @@ impl Shared {
     }
 }
 
+/// The records of a trace buffer (ECHORA_VERTEX_TRACE, `Layout::
+/// vertex_trace`) as the runtime's ECHORA_VERTEX_TRACE_REPORT prints them
+/// after its program and stage names (" | out [...]" for a fragment
+/// program's r0..r3, " | tex at OFFSET xTIMES W0 W1 W2 W3" per texture
+/// instruction), so a run on the GPU and a simulation compare field by
+/// field.
+pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
+    let words: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&word| u32::from_le_bytes(word))
+        .collect();
+    let mut lines = Vec::new();
+    for (record, entry) in words.chunks_exact(128).enumerate() {
+        if entry.iter().all(|&word| word == 0) {
+            continue;
+        }
+        let position: Vec<f32> = entry[4..8]
+            .iter()
+            .map(|&bits| f32::from_bits(bits))
+            .collect();
+        let mut line = format!(
+            "record {record}: done {:#x} flags {:#x} ids {} {} position {position:?}",
+            entry[0], entry[1], entry[2], entry[3]
+        );
+        if entry[104..108].iter().any(|&word| word != 0) {
+            let out: Vec<f32> = entry[104..108]
+                .iter()
+                .map(|&bits| f32::from_bits(bits))
+                .collect();
+            line += &format!(" | out {out:?}");
+        }
+        for texture in entry[8..8 + 6 * 16].chunks_exact(6) {
+            if texture[0] != 0 {
+                line += &format!(
+                    " | tex at {:#x} x{} {:08x} {:08x} {:08x} {:08x}",
+                    texture[0] - 1,
+                    texture[1],
+                    texture[2],
+                    texture[3],
+                    texture[4],
+                    texture[5]
+                );
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 /// `value` with a denormal flushed to a zero of its sign, when `flush`.
 fn flushed(value: f32, flush: bool) -> f32 {
     if flush && value.is_subnormal() {
@@ -1794,6 +1845,12 @@ impl Machine {
     }
 
     /// Runs workgroup `inputs.workgroup_id` of a dispatch.
+    /// Whether the module declares a specialization constant with SpecId
+    /// `id`.
+    pub fn has_spec_id(&self, id: u32) -> bool {
+        self.spec_ids.values().any(|&spec_id| spec_id == id)
+    }
+
     /// An invocation's output variables with a Location (a fragment
     /// program's colours) by (Location, Index), from `Report::invocations`.
     pub fn located_outputs(&self, variables: &HashMap<u32, Value>) -> BTreeMap<(u32, u32), Value> {
@@ -8287,6 +8344,121 @@ mod tests {
         assert_eq!(written.get(5000), Some([1, 2, 3, 4]));
         assert_eq!(written.get(4999), Some(texels[4999]));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_traced_fragment_program_s_record_prints_as_the_runtime_s_report() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::{
+            FRAGMENT_TRACE_PIXEL_SPEC_ID, Stage, VERTEX_TRACE_HIGH_SPEC_ID,
+            VERTEX_TRACE_LOW_SPEC_ID,
+        };
+        // IPA R0, a[0x80]; IPA R1, a[0x84] (flat inputs given as words);
+        // TEX.LZ R4, R0, R1 (2D, handle c[0x0][0x40]) xyzw; R0-R3 = R4-R7:
+        // colour 0. Traced at pixel (10, 20).
+        let ipa = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+                (76, 2, 1),
+                (81, 3, 7),
+            ])
+        };
+        let tex = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 1),
+            (40, 14, 0x10),
+            (60, 1, 1),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        let copy = |d: u128, a: u128| word(&[(0, 12, 0x202), (16, 8, d), (32, 8, a), (72, 4, 0xf)]);
+        let program = [
+            ipa(0, 0x80),
+            ipa(1, 0x84),
+            tex,
+            copy(0, 4),
+            copy(1, 5),
+            copy(2, 6),
+            copy(3, 7),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let mut imap = [Interpolation::Unused; 128];
+        imap[..2].fill(Interpolation::Constant);
+        let layout = Layout {
+            stage: Stage::Fragment,
+            header: Some(Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0xf,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            }),
+            vertex_trace: true,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let machine = Machine::new(&translated.spirv);
+        assert!(machine.has_spec_id(VERTEX_TRACE_LOW_SPEC_ID));
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        let buffer = 0x7e00_0000_0000u64;
+        let texels: Vec<[u32; 4]> = (0..16u32).map(|n| [n, 2 * n, 3 * n, 0x3f80_0000]).collect();
+        let report = machine.simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            builtins: HashMap::from([(
+                15,
+                [10.5f32, 20.5, 0.5, 1.0]
+                    .map(|v| u64::from(v.to_bits()))
+                    .to_vec(),
+            )]),
+            // Location 0 as the stage reads it: (0.625, 0.375) as words.
+            locations: HashMap::from([(0, vec![0x3f20_0000, 0x3ec0_0000, 0, 0])]),
+            images: HashMap::from([(
+                (0, binding),
+                Image {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    layers: 1,
+                    texels: texels.into(),
+                },
+            )]),
+            memory: BTreeMap::from([(buffer, vec![0; 64 * 512])]),
+            specialization: HashMap::from([
+                (VERTEX_TRACE_LOW_SPEC_ID, buffer as u32),
+                (VERTEX_TRACE_HIGH_SPEC_ID, (buffer >> 32) as u32),
+                (FRAGMENT_TRACE_PIXEL_SPEC_ID, 10 | 20 << 16),
+            ]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let lines = trace_lines(&report.memory[&buffer]);
+        // Texel (2, 1), number 6: 6, 12, 18 and 1.0; the TEX at 0x20.
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with(" | out [8e-45, 1.7e-44, 2.5e-44, 1.0] | tex at 0x20 x1 00000006 0000000c 00000012 3f800000"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].starts_with("record 0: done 0x1 "), "{}", lines[0]);
     }
 
     #[test]
