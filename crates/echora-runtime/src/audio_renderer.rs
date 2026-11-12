@@ -212,6 +212,10 @@ pub struct Renderer {
     /// SetVoiceDropParameter's f32 bits (Eden-NS2's default 1.0). Voices
     /// are never dropped here, so it is only reported back.
     pub voice_drop_parameter: u32,
+    /// What the application's updates ask for, counted by kind (voice
+    /// formats and routing, mixes, effect and sink types): the survey the
+    /// mixer is built from.
+    pub survey: BTreeMap<String, u64>,
 }
 
 impl Renderer {
@@ -226,7 +230,26 @@ impl Renderer {
             effects: BTreeMap::new(),
             rendering_time_limit: 100,
             voice_drop_parameter: 1.0f32.to_bits(),
+            survey: BTreeMap::new(),
         }
+    }
+
+    /// The run report's entry for this renderer.
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sample_rate": self.parameters.sample_rate,
+            "sample_count": self.parameters.sample_count,
+            "voices": self.parameters.voices,
+            "mixes": self.parameters.mixes,
+            "sinks": self.parameters.sinks,
+            "effects": self.parameters.effects,
+            "revision": format!("{:#x}", self.parameters.revision),
+            "started": self.started,
+            "frames_rendered": self.frames,
+            "updates": self.updates,
+            "survey": self.survey,
+            "mixing_implemented": false,
+        })
     }
 
     fn frame_period(&self) -> Duration {
@@ -304,6 +327,7 @@ impl Renderer {
             word(0x24), // splitter
             word(0x28), // render info
         ];
+        let splitter_size = sizes[8];
         let total: usize = HEADER_SIZE + sizes.iter().sum::<usize>();
         if total > input.len() {
             return Err(format!(
@@ -317,7 +341,7 @@ impl Renderer {
             voices,
             resources,
             effects,
-            _mixes,
+            mixes,
             sinks,
             ..,
         ] = sizes;
@@ -396,6 +420,13 @@ impl Renderer {
         for index in 0..effect_count {
             let entry = &input[at + index * EFFECT_IN..];
             let (kind, new, enabled) = (entry[0], entry[1] != 0, entry[2] != 0);
+            if kind != 0 {
+                let mix = crate::bytes::le_u32(&entry[4..8]);
+                *self
+                    .survey
+                    .entry(format!("effect type {kind} mix {mix} enabled {enabled}"))
+                    .or_default() += 1;
+            }
             let usage = self.effects.entry(index).or_insert((kind, new, enabled));
             if usage.0 != kind || new {
                 *usage = (kind, true, enabled);
@@ -406,6 +437,68 @@ impl Renderer {
             output[out + index * effect_out] = if used { 3 } else { 4 };
         }
         out += effect_count * effect_out;
+        // Mixes (0x930 each, after a 0x20 dirty-count header in later
+        // revisions) and sinks, surveyed only.
+        let mixes_at = at + effects;
+        let header = mixes % 0x930;
+        for index in 0..mixes / 0x930 {
+            let entry = &input[mixes_at + header + index * 0x930..][..0x930];
+            if entry[0xc] == 0 {
+                continue;
+            }
+            let field = |at: usize| crate::bytes::le_u32(&entry[at..at + 4]);
+            *self
+                .survey
+                .entry(format!(
+                    "mix {} rate {} buffers {} effects {} volume {} to mix {} splitter {}",
+                    field(0x10) as i32,
+                    field(4),
+                    field(8),
+                    field(0x14),
+                    f32::from_bits(field(0)),
+                    field(0x924) as i32,
+                    field(0x928) as i32
+                ))
+                .or_default() += 1;
+        }
+        let sinks_at = mixes_at + mixes;
+        for index in 0..sink_count {
+            let entry = &input[sinks_at + index * SINK_IN..][..SINK_IN];
+            if entry[1] == 0 {
+                continue;
+            }
+            let detail = match entry[0] {
+                // Device: its name and input count.
+                1 => {
+                    let name: String = entry[0x20..0x120]
+                        .iter()
+                        .take_while(|&&byte| byte != 0)
+                        .map(|&byte| byte as char)
+                        .collect();
+                    format!(
+                        "device {name:?} inputs {} downmix {}",
+                        crate::bytes::le_u32(&entry[0x120..0x124]),
+                        entry[0x12b]
+                    )
+                }
+                // Circular buffer: size, inputs, sample count and format.
+                2 => format!(
+                    "circular buffer size {:#x} inputs {} samples {} format {}",
+                    crate::bytes::le_u32(&entry[0x28..0x2c]),
+                    crate::bytes::le_u32(&entry[0x2c..0x30]),
+                    crate::bytes::le_u32(&entry[0x30..0x34]),
+                    entry[0x38]
+                ),
+                other => format!("type {other}"),
+            };
+            *self.survey.entry(format!("sink {detail}")).or_default() += 1;
+        }
+        if splitter_size != 0 {
+            *self
+                .survey
+                .entry(format!("splitter section {splitter_size:#x} bytes"))
+                .or_default() += 1;
+        }
         // Sinks report no circular-buffer progress.
         out += sink_count * SINK_OUT;
         // Performance and error info stay zero (no history, no errors).
@@ -453,7 +546,21 @@ impl Renderer {
         voice.sample_rate = word(0xc);
         voice.pitch = f32::from_bits(word(0x1c));
         let (buffers_at, flush_at) = if v2 { (0x78, 0x171) } else { (0x60, 0x159) };
+        let (mix_at, biquad_stride) = if v2 { (0x70, 0x18) } else { (0x58, 0xc) };
+        let survey = format!(
+            "voice format {} channels {} rate {} to mix {} splitter {} biquads {}{} adpcm table {} quality {}",
+            entry[0xb],
+            word(0x18),
+            word(0xc),
+            word(mix_at) as i32,
+            word(mix_at + 4) as i32,
+            entry[0x24],
+            entry[0x24 + biquad_stride],
+            word(mix_at - 0x10) != 0 || word(mix_at - 0xc) != 0,
+            entry[flush_at + 5]
+        );
         voice.flush += u32::from(entry[flush_at]);
+        *self.survey.entry(survey).or_default() += 1;
         voice.play_state = match entry[0xa] {
             0 => PlayState::Started,
             1 if voice.play_state != PlayState::Stopped => PlayState::RequestStop,
