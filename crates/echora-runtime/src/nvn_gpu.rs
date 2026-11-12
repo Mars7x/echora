@@ -3785,10 +3785,11 @@ impl Nvn {
             {
                 let mut bound: Vec<_> = textures.iter().collect();
                 bound.sort_by_key(|(binding, _)| **binding);
-                let reads: Vec<String> = bound
-                    .iter()
-                    .map(|(binding, (source, _))| {
-                        let writer = match source {
+                let reads: Vec<String> =
+                    bound
+                        .iter()
+                        .map(|(binding, (source, _))| {
+                            let writer = match source {
                             TextureSource::Target(target)
                             | TextureSource::TargetView { key: target, .. } => self
                                 .target_writers
@@ -3798,12 +3799,12 @@ impl Nvn {
                                 }),
                             _ => "upload".to_string(),
                         };
-                        format!(
-                            "{binding}={} ({writer})",
-                            self.describe_sources(std::iter::once(source))
-                        )
-                    })
-                    .collect();
+                            format!(
+                                "{binding}={} ({writer})",
+                                self.describe_sources(std::iter::once(source))
+                            )
+                        })
+                        .collect();
                 eprintln!(
                     "dispatch sources present {} {:016x}: reads {} writes {}",
                     self.presented_frames,
