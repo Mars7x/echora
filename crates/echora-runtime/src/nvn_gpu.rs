@@ -6873,8 +6873,18 @@ impl Nvn {
         });
         if let Some(texture) = depth.filter(|&texture| self.depth_traced(texture)) {
             eprintln!(
-                "depth trace present {} draw {:016x}/{:016x} depth {texture:x} (bound {:x})",
-                self.presented_frames, keys.0, keys.1, self.render.depth
+                "depth trace present {} draw {:016x}/{:016x} depth {texture:x} (bound {:x}) viewport {:?} scissor {:?}",
+                self.presented_frames,
+                keys.0,
+                keys.1,
+                self.render.depth,
+                self.render.state.get("SetViewport").map(|bind| [
+                    bind.x[1] as i32,
+                    bind.x[2] as i32,
+                    bind.x[3] as i32,
+                    bind.x[4] as i32
+                ]),
+                self.render.scissor
             );
         }
         if let Some(texture) = depth {
