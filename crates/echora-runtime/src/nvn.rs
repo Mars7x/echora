@@ -4922,7 +4922,13 @@ impl Nvn {
     /// At each present: map ECHORA_CALL_WATCH's GPU range to guest memory
     /// once and follow its present window (`call_watch` compares).
     fn arm_call_watch(&self) {
-        let Ok(range) = debug_var("ECHORA_CALL_WATCH") else {
+        // ECHORA_CALL_WATCH_GUEST=<start>-<end>: the range in guest
+        // memory (a CPU-side object) instead of GPU addresses.
+        let guest_range = debug_var("ECHORA_CALL_WATCH_GUEST").ok();
+        let Some(range) = guest_range
+            .clone()
+            .or_else(|| debug_var("ECHORA_CALL_WATCH").ok())
+        else {
             return;
         };
         let present = |name: &str, default: u64| {
@@ -4948,10 +4954,15 @@ impl Nvn {
         }) else {
             return;
         };
-        let Ok(guest) = self.gpu_to_guest(start, end - start) else {
-            return;
+        let guest = if guest_range.is_some() {
+            start
+        } else {
+            let Ok(guest) = self.gpu_to_guest(start, end - start) else {
+                return;
+            };
+            eprintln!("call watch: GPU {start:#x}..{end:#x} is guest {guest:#x}");
+            guest
         };
-        eprintln!("call watch: GPU {start:#x}..{end:#x} is guest {guest:#x}");
         CALL_WATCH_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
         *watch = Some(CallWatch {
             range: guest..guest + (end - start),
