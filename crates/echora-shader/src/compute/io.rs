@@ -34,6 +34,7 @@ const DECORATION_NO_PERSPECTIVE: u32 = 13;
 const DECORATION_FLAT: u32 = 14;
 const DECORATION_CENTROID: u32 = 16;
 const DECORATION_LOCATION: u32 = 30;
+const DECORATION_INDEX: u32 = 32;
 const DECORATION_COMPONENT: u32 = 31;
 
 /// A program's inputs and outputs so far.
@@ -45,6 +46,8 @@ pub(super) struct Io {
     /// differently: one scalar per component, by (location, component).
     component_inputs: BTreeMap<(u32, u32), u32>,
     outputs: BTreeMap<u32, u32>,
+    /// The fragment output at Location 0, Index 1 (dual-source blending).
+    second_source: Option<u32>,
     /// Built-in outputs, by built-in.
     builtin_outputs: BTreeMap<u32, u32>,
     /// Fragment inputs read at the centroid.
@@ -93,6 +96,22 @@ impl Emitter {
         } else {
             self.io.inputs.insert(location, variable);
         }
+        variable
+    }
+
+    /// The fragment output at Location 0, Index 1: render target 0's
+    /// second blend source (declared once).
+    fn second_source(&mut self) -> u32 {
+        if let Some(variable) = self.io.second_source {
+            return variable;
+        }
+        let vec4 = self.vec4();
+        let pointer = self.module.pointer(storage::OUTPUT, vec4);
+        let variable = self.module.global_variable(pointer, storage::OUTPUT);
+        self.module.decorate(variable, DECORATION_LOCATION, &[0]);
+        self.module.decorate(variable, DECORATION_INDEX, &[1]);
+        self.interface.push(variable);
+        self.io.second_source = Some(variable);
         variable
     }
 
@@ -483,11 +502,18 @@ impl Emitter {
             return;
         }
         let mut register = 0u8;
+        let dual = self.layout.dual_source_blend;
         for target in 0..8u32 {
             if header.targets >> (target * 4) & 0xf == 0 {
                 continue;
             }
-            let variable = self.generic(target, true);
+            // With dual-source blending colour 1 is target 0's second
+            // source.
+            let variable = if dual && target == 1 {
+                self.second_source()
+            } else {
+                self.generic(target, true)
+            };
             let components: Vec<u32> = (0..4)
                 .map(|n| {
                     let bits = self.read_register(register + n);
@@ -496,8 +522,18 @@ impl Emitter {
                 .collect();
             let vector = self.vector(self.f32, &components);
             self.function.emit(op::STORE, &[variable, vector]);
-            self.frag_colors |= 1 << target;
+            if !(dual && target == 1) {
+                self.frag_colors |= 1 << target;
+            }
             register += 4;
+        }
+        // No colour 1 written: a second source of zeros.
+        if dual && header.targets >> 4 & 0xf == 0 {
+            let variable = self.second_source();
+            let vec4 = self.vec4();
+            let zero = self.float_constant(0.0);
+            let zeros = self.value(op::COMPOSITE_CONSTRUCT, vec4, &[zero, zero, zero, zero]);
+            self.function.emit(op::STORE, &[variable, zeros]);
         }
         if header.writes_sample_mask || header.writes_depth {
             if header.writes_sample_mask {

@@ -37,6 +37,7 @@ const DECORATION_SPEC_ID: u32 = 1;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
+const DECORATION_INDEX: u32 = 32;
 /// Derivatives (OpDPdx .. OpFwidthCoarse).
 const DPDX: u16 = 207;
 const DPDY: u16 = 208;
@@ -485,6 +486,9 @@ pub struct Machine {
     /// Input and output variables' Locations (a fragment program's
     /// attributes and colours), by variable id.
     pub locations: HashMap<u32, u32>,
+    /// Output variables' Index decorations (1: a dual-source blend's second
+    /// colour), by variable id.
+    pub indices: HashMap<u32, u32>,
     /// The entry point's execution model.
     model: u32,
     /// Their first Components (a scalar input of one component of a
@@ -764,6 +768,7 @@ impl Machine {
             cooperative: false,
             names: BTreeMap::new(),
             locations: HashMap::new(),
+            indices: HashMap::new(),
             components: HashMap::new(),
             model: 0,
             step_file: None,
@@ -816,6 +821,9 @@ impl Machine {
                         }
                         DECORATION_LOCATION => {
                             machine.locations.insert(target, value);
+                        }
+                        DECORATION_INDEX => {
+                            machine.indices.insert(target, value);
                         }
                         DECORATION_COMPONENT => {
                             machine.components.insert(target, value);
@@ -1637,6 +1645,20 @@ impl Machine {
     }
 
     /// Runs workgroup `inputs.workgroup_id` of a dispatch.
+    /// An invocation's output variables with a Location (a fragment
+    /// program's colours) by (Location, Index), from `Report::invocations`.
+    pub fn located_outputs(&self, variables: &HashMap<u32, Value>) -> BTreeMap<(u32, u32), Value> {
+        self.globals
+            .iter()
+            .filter(|&&(_, _, class)| class == storage::OUTPUT)
+            .filter_map(|&(variable, _, _)| {
+                let location = *self.locations.get(&variable)?;
+                let index = self.indices.get(&variable).copied().unwrap_or(0);
+                Some(((location, index), variables.get(&variable)?.clone()))
+            })
+            .collect()
+    }
+
     pub fn simulate(&self, inputs: &Inputs) -> Report {
         self.flush32.set(inputs.flush_denormals32);
         let [x, y, z] = self.local_size;
@@ -5201,6 +5223,7 @@ mod tests {
             loop_trace: true,
             vertex_trace: false,
             float64: false,
+            dual_source_blend: false,
             ..Layout::workgroup([32, 1, 1])
         };
         let translated = crate::compute::translate(&code, &layout).unwrap();
@@ -6882,6 +6905,76 @@ mod tests {
         });
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(f32::from_bits(report.invocations[0][&8][0] as u32), 2.0);
+    }
+
+    #[test]
+    fn dual_source_blending_makes_colour_one_target_zero_s_second_source() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // R0-R3 colour 0 (1, 2, 3, 4), R4-R7 colour 1 (5, 6, 7, 8).
+        let mut program: Vec<u128> = (0..8u32)
+            .map(|n| mov(u128::from(n), (n as f32 + 1.0).to_bits()))
+            .collect();
+        program.push(EXIT);
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let run = |targets: u32, dual_source_blend: bool| {
+            let header = Header {
+                stage: Stage::Fragment,
+                imap: [Interpolation::Unused; 128],
+                targets,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            };
+            let layout = Layout {
+                stage: Stage::Fragment,
+                header: Some(header),
+                dual_source_blend,
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let translated = crate::compute::translate(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let machine = Machine::new(&translated.spirv);
+            let report = machine.simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let outputs: BTreeMap<(u32, u32), Vec<f32>> = machine
+                .located_outputs(&report.invocations[0])
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        value.iter().map(|&w| f32::from_bits(w as u32)).collect(),
+                    )
+                })
+                .collect();
+            (outputs, translated.frag_colors)
+        };
+        let (colour, second) = (vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]);
+        // Two targets: Locations 0 and 1.
+        let (outputs, colours) = run(0xff, false);
+        assert_eq!(
+            outputs,
+            BTreeMap::from([((0, 0), colour.clone()), ((1, 0), second.clone())])
+        );
+        assert_eq!(colours, 0b11);
+        // Dual-source: colour 1 is Location 0's Index 1, no Location 1.
+        let (outputs, colours) = run(0xff, true);
+        assert_eq!(
+            outputs,
+            BTreeMap::from([((0, 0), colour.clone()), ((0, 1), second)])
+        );
+        assert_eq!(colours, 0b1);
+        // No colour 1 written: a second source of zeros.
+        let (outputs, _) = run(0xf, true);
+        assert_eq!(
+            outputs,
+            BTreeMap::from([((0, 0), colour), ((0, 1), vec![0.0; 4])])
+        );
     }
 
     #[test]

@@ -544,8 +544,13 @@ fn main() {
                             .iter()
                             .map(|&word| format!("{}", f32::from_bits(word as u32)))
                             .collect();
+                        // Index 1: a dual-source blend's second colour.
+                        let index = match machine.indices.get(variable) {
+                            Some(&index) if index != 0 => format!(" index {index}"),
+                            _ => String::new(),
+                        };
                         println!(
-                            "  pixel {n} location {location} (%{variable}): {}",
+                            "  pixel {n} location {location}{index} (%{variable}): {}",
                             floats.join(" ")
                         );
                     }

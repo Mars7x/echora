@@ -115,6 +115,26 @@ pub struct Parameters {
     pub mesh: Option<MeshParameters>,
 }
 
+/// Translation choices beyond `Parameters`, each off by default (a type of
+/// its own, so that adding one changes no `Parameters` literal). The
+/// runtime keys translations by them as by `Parameters`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// Fragment programs, for a pipeline whose render target 0 blends with
+    /// a second source (SRC1_COLOR, ONE_MINUS_SRC1_COLOR, SRC1_ALPHA,
+    /// ONE_MINUS_SRC1_ALPHA): the program's colour output 1 (the registers
+    /// after colour 0's, as the hardware takes the second source; Mesa's
+    /// NAK maps dual-source index 1 of location 0 to colour 1) becomes the
+    /// output at Location 0, Index 1, and no Location 1 output is made
+    /// (`Translated::frag_colors` leaves bit 1 clear). A program that
+    /// writes no colour 1 gives a second source of zeros.
+    pub dual_source_blend: bool,
+    /// The device runs 64-bit floats (shaderFloat64): non-`.FTZ` FADD,
+    /// FMUL and FFMA keep 32-bit denormals exactly, computed through f64
+    /// where denormals occur, on hosts that flush them.
+    pub float64: bool,
+}
+
 /// The task or mesh pipeline state a program is translated against, as the
 /// runtime derives it from the programs' control sections (`bound_mesh_program`
 /// in the runtime).

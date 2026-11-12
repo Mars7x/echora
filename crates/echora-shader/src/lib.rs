@@ -14,7 +14,7 @@ pub mod sim;
 pub mod spirv;
 
 pub use decode::{Instruction, Op, decode, decode_program};
-use echora_shader_abi::{Parameters, Stage, Translate, Translated, Unsupported};
+use echora_shader_abi::{Options, Parameters, Stage, Translate, Translated, Unsupported};
 
 /// Bytes of the header in front of a graphics program's code.
 pub const GRAPHICS_HEADER_SIZE: usize = header::SIZE;
@@ -26,6 +26,15 @@ pub const MAX_INSTRUCTIONS: usize = 65536;
 /// address) to SPIR-V: a pure function, callable from many threads at once.
 /// Compute, vertex, fragment, task and mesh programs are translated.
 pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, Unsupported> {
+    translate_with_options(program, parameters, &Options::default())
+}
+
+/// `translate` with `options` (dual-source blending, 64-bit floats).
+pub fn translate_with_options(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+) -> Result<Translated, Unsupported> {
     let mesh = match parameters.stage_slot {
         None => None,
         Some(stage @ (Stage::Task | Stage::Mesh)) => Some(mesh_layout(stage, parameters)?),
@@ -66,7 +75,8 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
             }),
             loop_trace: loop_trace(),
             vertex_trace: vertex_trace(),
-            float64: false,
+            float64: options.float64,
+            dual_source_blend: options.dual_source_blend,
         };
         // Offsets in errors are from the program's start.
         return compute::translate(&code, &layout).map_err(|mut error| {
@@ -93,7 +103,8 @@ pub fn translate(program: &[u8], parameters: &Parameters) -> Result<Translated, 
         mesh: None,
         loop_trace: loop_trace(),
         vertex_trace: false,
-        float64: false,
+        float64: options.float64,
+        dual_source_blend: false,
     };
     compute::translate(&code, &layout)
 }

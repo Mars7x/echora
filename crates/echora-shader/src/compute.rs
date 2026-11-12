@@ -337,6 +337,9 @@ pub struct Layout {
     /// FMUL and FFMA keep denormals exactly through f64 (see `denormal`),
     /// whatever the host does with 32-bit denormals.
     pub float64: bool,
+    /// Fragment programs: colour output 1 is render target 0's second blend
+    /// source (Location 0, Index 1; `Options::dual_source_blend`).
+    pub dual_source_blend: bool,
 }
 
 /// A task or mesh program's pipeline state.
@@ -395,6 +398,7 @@ impl Layout {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            dual_source_blend: false,
         }
     }
 }
@@ -3712,6 +3716,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            dual_source_blend: false,
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -3967,6 +3972,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            dual_source_blend: false,
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -4863,6 +4869,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            dual_source_blend: false,
         };
         valid_with(&words, &layout);
     }
