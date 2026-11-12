@@ -2768,6 +2768,7 @@ impl Nvn {
             if let Some(device) = device {
                 bag.props.insert("Device".into(), device);
             }
+            tag_state(core, this, kind, &bag.props)?;
             write_shared(&self.bags).insert(this, bag);
             return Ok(true);
         }
@@ -2824,6 +2825,9 @@ impl Nvn {
                     bag.props.insert(format!("{property}/{}", args.x[0]), args);
                 }
                 bag.props.insert(property.into(), args);
+                let props = bag.props.clone();
+                drop(bags);
+                tag_state(core, this, kind, &props)?;
                 return Ok(true);
             }
             if let Some(property) = rest.strip_prefix("Get") {
@@ -4675,7 +4679,51 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// passed by pointer (X1); vertex attribute and stream states as
 /// (count X1, array X2). Array elements are the bags of that kind at or
 /// above the array, in address order (the element size is NVN-private).
-fn snapshot_states(bags: &BTreeMap<u64, Bag>, command: &mut Command) {
+/// Fixed-function state structures a Bind reads from memory: their
+/// contents go with the structure's bytes, so a copy (the game keeps
+/// prebuilt states and copies them into its pass objects) binds the same
+/// state, as on the console.
+const TAGGED_STATES: [&str; 6] = [
+    "ColorState",
+    "BlendState",
+    "ChannelMaskState",
+    "PolygonState",
+    "DepthStencilState",
+    "MultisampleState",
+];
+
+/// The contents of tagged state structures by tag (the structure's first
+/// word: content-addressed, so equal states share one).
+type StateTags = HashMap<u32, (String, BTreeMap<String, Args>)>;
+static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
+
+/// After a setter changed a state structure at `address`: its contents'
+/// tag, written into the structure's first word (all are at least 4
+/// bytes), where a Bind of it or of a copy finds them.
+fn tag_state(
+    core: &mut Guest,
+    address: u64,
+    kind: &str,
+    props: &BTreeMap<String, Args>,
+) -> Result<(), Trap> {
+    if !TAGGED_STATES.contains(&kind) {
+        return Ok(());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    format!("{props:?}").hash(&mut hasher);
+    let tag = (hasher.finish() as u32) | 1;
+    STATE_TAGS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .entry(tag)
+        .or_insert_with(|| (kind.into(), props.clone()));
+    core.memory.write_u32(address, tag)
+}
+
+fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Command) {
     let Some(kind) = command
         .name
         .strip_prefix("nvnCommandBufferBind")
@@ -4688,6 +4736,36 @@ fn snapshot_states(bags: &BTreeMap<u64, Bag>, command: &mut Command) {
         _ => (1, command.x[1]),
     };
     if count > 32 || base == 0 {
+        return;
+    }
+    // A single tagged state: what the bound structure's bytes hold; an
+    // untagged one (never set through NVN) is the defaults, not another
+    // structure's state.
+    if TAGGED_STATES.contains(&kind) {
+        let tagged = core.memory.read_u32(base).ok().and_then(|tag| {
+            STATE_TAGS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()?
+                .get(&tag)
+                .filter(|(tagged_kind, _)| tagged_kind == kind)
+                .map(|(_, props)| props.clone())
+        });
+        let mut props = tagged
+            .or_else(|| {
+                bags.get(&base)
+                    .filter(|bag| bag.kind == kind)
+                    .map(|bag| bag.props.clone())
+            })
+            .unwrap_or_default();
+        props.insert(
+            "@Offset".into(),
+            Args {
+                x: [0; 4],
+                v: [0; 2],
+            },
+        );
+        command.states = std::sync::Arc::new(vec![props]);
         return;
     }
     command.states = std::sync::Arc::new(
@@ -4870,7 +4948,7 @@ fn record_command(
                 .push(core.memory.read_u64(x[2] + index * 8)?);
         }
     }
-    snapshot_states(bags, &mut command);
+    snapshot_states(bags, core, &mut command);
     if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
         let view = bag_in(bags, command.x[3], "TextureView").map_err(invalid)?;
         for (index, key) in ["Levels", "Layers"].iter().enumerate() {
