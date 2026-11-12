@@ -7322,8 +7322,15 @@ impl Nvn {
             self.render
                 .state
                 .iter()
-                .filter(|(key, _)| key.starts_with("BindUniformBuffer/"))
-                .map(|(key, bind)| format!("{key}:{:#x}+{:#x}", bind.x[3], bind.x[4]))
+                .filter(|(key, _)| key.starts_with("BindProgram@"))
+                .map(|(key, bind)| format!("{key}:program {:#x} bits {:#x}", bind.x[1], bind.x[2]))
+                .chain(
+                    self.render
+                        .state
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("BindUniformBuffer/"))
+                        .map(|(key, bind)| format!("{key}:{:#x}+{:#x}", bind.x[3], bind.x[4])),
+                )
                 .collect()
         } else {
             Vec::new()
