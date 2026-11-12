@@ -5246,10 +5246,12 @@ impl Nvn {
             // The (level, layer) a draw rendered into (level 0, layer 0
             // otherwise).
             let (level, layer) = places.get(index).copied().unwrap_or((0, 0));
+            // `sampled` in the list: the targets traced draws sample.
             if keys != "all"
-                && !keys
-                    .split(',')
-                    .any(|item| item.trim() == format!("{key:x}"))
+                && !keys.split(',').any(|item| {
+                    item.trim() == format!("{key:x}")
+                        || (item.trim() == "sampled" && what.starts_with("sampled by"))
+                })
             {
                 continue;
             }
