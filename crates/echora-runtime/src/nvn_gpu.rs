@@ -5236,6 +5236,14 @@ impl Nvn {
         if !(from..=to).contains(&self.presented_frames) {
             return Ok(());
         }
+        // Writes of the traced programs count as `sampled` too (their
+        // result beside their inputs).
+        let traced_write = what.starts_with("draw ")
+            && super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
+                wanted
+                    .split(',')
+                    .any(|item| what.ends_with(&format!("/{}", item.trim())))
+            });
         let present = self.presented_frames;
         let storages: Vec<u64> = written
             .iter()
@@ -5250,7 +5258,8 @@ impl Nvn {
             if keys != "all"
                 && !keys.split(',').any(|item| {
                     item.trim() == format!("{key:x}")
-                        || (item.trim() == "sampled" && what.starts_with("sampled by"))
+                        || (item.trim() == "sampled"
+                            && (traced_write || what.starts_with("sampled by")))
                 })
             {
                 continue;
