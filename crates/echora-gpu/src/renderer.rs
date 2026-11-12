@@ -1124,12 +1124,18 @@ impl Renderer {
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
-        let create = vk::ImageViewCreateInfo::default()
+        // A twin-format view samples only (an sRGB format has no storage
+        // use its image may have).
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
+        let mut create = vk::ImageViewCreateInfo::default()
             .image(info.image)
             .view_type(info.view_type)
             .format(format)
             .components(components)
             .subresource_range(info.range);
+        if format != info.format {
+            create = create.push_next(&mut usage);
+        }
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&create, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -3303,6 +3309,10 @@ impl Renderer {
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
+        // Used as an attachment only (an sRGB format has no storage use
+        // its image may have).
+        let mut usage =
+            vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -3311,7 +3321,8 @@ impl Renderer {
                 base_mip_level: level,
                 level_count: 1,
                 ..range(target.format)
-            });
+            })
+            .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -3351,10 +3362,16 @@ impl Renderer {
         // use, which a listed view format would need.
         // An sRGB format stores through its UNORM twin (image stores do
         // no sRGB encoding): STORAGE then applies to the twin's view only,
-        // which EXTENDED_USAGE allows.
+        // which EXTENDED_USAGE allows. A UNORM storage target keeps its
+        // sRGB twin the same way (rendered through an NVN RGBA8_SRGB view,
+        // as the game's window textures are): STORAGE stays with its own
+        // format, and twin views name their usage (`twin_view_usage`).
         let store_twin = self.storage_twin(format);
-        let twin = srgb_twin(format)
-            .filter(|_| !usage.contains(vk::ImageUsageFlags::STORAGE) || store_twin.is_some());
+        let unorm_with_twin =
+            srgb_twin(format).is_some() && store_twin.is_none() && !is_srgb(format);
+        let twin = srgb_twin(format).filter(|_| {
+            !usage.contains(vk::ImageUsageFlags::STORAGE) || store_twin.is_some() || unorm_with_twin
+        });
         // A storage target may also be written as unsigned words of its
         // texel size (a shader's R32UI view of an R11G11B10 or RGBA8
         // target): that alias is listed too.
@@ -3384,7 +3401,9 @@ impl Renderer {
         } else {
             flags
         };
-        let flags = if store_twin.is_some() && usage.contains(vk::ImageUsageFlags::STORAGE) {
+        let flags = if (store_twin.is_some() || unorm_with_twin)
+            && usage.contains(vk::ImageUsageFlags::STORAGE)
+        {
             flags | vk::ImageCreateFlags::EXTENDED_USAGE
         } else {
             flags
@@ -4824,17 +4843,26 @@ fn border_color(rgba: [u32; 4]) -> vk::BorderColor {
 
 /// The sRGB or UNORM counterpart of `format` (the pairs NVN texture views
 /// reinterpret between), if it has one.
+/// UNORM formats and their sRGB-encoded twins.
+const SRGB_PAIRS: [(vk::Format, vk::Format); 6] = [
+    (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+    (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+    (
+        vk::Format::BC1_RGBA_UNORM_BLOCK,
+        vk::Format::BC1_RGBA_SRGB_BLOCK,
+    ),
+    (vk::Format::BC2_UNORM_BLOCK, vk::Format::BC2_SRGB_BLOCK),
+    (vk::Format::BC3_UNORM_BLOCK, vk::Format::BC3_SRGB_BLOCK),
+    (vk::Format::BC7_UNORM_BLOCK, vk::Format::BC7_SRGB_BLOCK),
+];
+
+/// Whether `format` is one of the sRGB-encoded twins.
+fn is_srgb(format: vk::Format) -> bool {
+    SRGB_PAIRS.iter().any(|&(_, srgb)| srgb == format)
+}
+
 pub fn srgb_twin(format: vk::Format) -> Option<vk::Format> {
-    use vk::Format as F;
-    let pairs = [
-        (F::R8G8B8A8_UNORM, F::R8G8B8A8_SRGB),
-        (F::B8G8R8A8_UNORM, F::B8G8R8A8_SRGB),
-        (F::BC1_RGBA_UNORM_BLOCK, F::BC1_RGBA_SRGB_BLOCK),
-        (F::BC2_UNORM_BLOCK, F::BC2_SRGB_BLOCK),
-        (F::BC3_UNORM_BLOCK, F::BC3_SRGB_BLOCK),
-        (F::BC7_UNORM_BLOCK, F::BC7_SRGB_BLOCK),
-    ];
-    pairs.iter().find_map(|&(unorm, srgb)| {
+    SRGB_PAIRS.iter().find_map(|&(unorm, srgb)| {
         if format == unorm {
             Some(srgb)
         } else if format == srgb {

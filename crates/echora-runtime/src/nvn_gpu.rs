@@ -2866,7 +2866,7 @@ impl Nvn {
         // The structure was reused for other storage or in another format
         // since registration: the descriptor still names the texture it
         // held then.
-        let registered = (entry.x[2], entry.x[3]);
+        let registered = (entry.x[2], entry.x[3] & 0xffff_ffff);
         let current = self.texture_identity(entry.x[0]);
         let mut resolved = entry.x[0];
         if registered.0 != 0 && current != Some(registered) {
@@ -2876,16 +2876,21 @@ impl Nvn {
             }
         }
         // ECHORA_HANDLE_LOG=<storage hex>[,...] (debugging): each lookup of
-        // a descriptor registered over that storage, with the identity
+        // a descriptor registered over that storage (or whose texture is
+        // over it now), with the identity
         // (storage, format) registered and the object's now.
         if super::debug_var("ECHORA_HANDLE_LOG").is_ok_and(|wanted| {
             wanted.split(',').any(|item| {
-                u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(registered.0)
+                let item = u64::from_str_radix(item.trim().trim_start_matches("0x"), 16);
+                item == Ok(registered.0) || current.is_some_and(|(storage, _)| item == Ok(storage))
             })
         }) {
             eprintln!(
                 "handle present {} id {id} object {:x} registered {:x?} now {current:x?} at {} resolves {resolved:x}",
-                self.presented_frames, entry.x[0], registered, entry.x[4]
+                self.presented_frames,
+                entry.x[0],
+                registered,
+                entry.x[3] >> 32
             );
         }
         Ok(resolved)

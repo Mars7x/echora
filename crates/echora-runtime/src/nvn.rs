@@ -2142,9 +2142,10 @@ impl Nvn {
                 // its storage and format tell a later reuse of the
                 // structure apart.
                 let (storage, format) = self.texture_identity(x[2]).unwrap_or((0, 0));
+                // The format, and the present it was registered in (high
+                // half, for ECHORA_HANDLE_LOG).
                 entry.x[2] = storage;
-                entry.x[3] = format;
-                entry.x[4] = self.presented_frames;
+                entry.x[3] = format & 0xffff_ffff | self.presented_frames << 32;
                 let pool = self.objects.get_mut(&this).unwrap();
                 pool.state.insert(format!("Descriptor{id}"), entry);
                 return Ok(true);
