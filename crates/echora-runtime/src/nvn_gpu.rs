@@ -2984,6 +2984,19 @@ impl Nvn {
     /// Returns false when there is no window to present to.
     /// Submit the recorded work at each present without waiting for it (the
     /// GPU runs a frame behind; reads of results wait in `resolve_storage`).
+    /// The GPU has finished all work given to it: a fence the CPU waits
+    /// for has then really signaled. Frames otherwise run on the GPU while
+    /// the CPU prepares the next, and the application rewrites what it
+    /// believes finished frames read (its per-frame parameter blocks, read
+    /// in place from guest memory).
+    pub(super) fn gpu_finish(&mut self) -> Result<(), String> {
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        backend.stat("stat: GPU waits for a CPU sync wait", 1);
+        backend.renderer.flush()
+    }
+
     pub(super) fn gpu_submit(&mut self) -> Result<(), String> {
         match self.gpu.as_mut() {
             Some(backend) => backend.renderer.submit_frame(),

@@ -1276,6 +1276,11 @@ impl Nvn {
                 }
                 let sync = self.object(this, "Sync").map_err(invalid)?;
                 let signaled = sync.state.contains_key("Signaled");
+                // A fence signals when the work before it has completed:
+                // the GPU's share of it too, not only its submission.
+                if signaled {
+                    self.gpu_finish().map_err(stop)?;
+                }
                 core.cpu.regs[0] = if signaled {
                     0
                 } else if x[1] == 0 {
@@ -1564,6 +1569,7 @@ impl Nvn {
                 self.pump_queues(core)?;
                 if name == "nvnQueueFinish" {
                     self.drain_queues(core)?;
+                    self.gpu_finish().map_err(stop)?;
                 }
                 return Ok(true);
             }
