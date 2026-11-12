@@ -44,7 +44,9 @@
 //!   (or 3D slices) one after another, each texel four little-endian u32:
 //!   the components as the shader reads them (float bits for float, unorm
 //!   and snorm formats, integers for integer ones; missing ones 0, 0, 0,
-//!   1). Textures and images without these read as zeros;
+//!   1). Textures and images without these read as zeros. The `.bin`
+//!   files are read in 64 KiB blocks as the run touches them, so large
+//!   images cost only what is sampled;
 //! - `image-SET-BINDING-ELEMENT.txt` and `.bin`: likewise, element ELEMENT
 //!   of an image array (a texture pool view; its flags buffer is a
 //!   `uniform-` file).
@@ -69,7 +71,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use echora_shader::sim::{Address, Image, Inputs, Machine, Sampler};
+use echora_shader::sim::{Address, Image, Inputs, Machine, Sampler, Texels};
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -227,22 +229,12 @@ fn main() {
                 .filter_map(|field| field.parse().ok())
                 .collect();
             if let [width, height, depth, layers] = size[..] {
-                let texels = read(&name)
-                    .as_chunks::<16>()
-                    .0
-                    .iter()
-                    .map(|texel| {
-                        let word = |n: usize| {
-                            u32::from_le_bytes([
-                                texel[4 * n],
-                                texel[4 * n + 1],
-                                texel[4 * n + 2],
-                                texel[4 * n + 3],
-                            ])
-                        };
-                        [word(0), word(1), word(2), word(3)]
-                    })
-                    .collect();
+                // Read as the run touches them: dumps hold images of
+                // hundreds of megabytes.
+                let texels = Texels::from_file(&directory.join(&name)).unwrap_or_else(|error| {
+                    eprintln!("{name}: {error}");
+                    std::process::exit(2);
+                });
                 let image = Image {
                     width,
                     height,

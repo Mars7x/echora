@@ -363,7 +363,159 @@ pub struct Image {
     pub height: u32,
     pub depth: u32,
     pub layers: u32,
-    pub texels: Vec<[u32; 4]>,
+    pub texels: Texels,
+}
+
+/// An image's texels (x fastest, then y, then z or the layer), four words
+/// each: in memory, shared by the copies of the image and copied on its
+/// first write, or read from a dump file block by block as they are
+/// touched (`Texels::from_file`), so that a run reads only what it
+/// samples.
+#[derive(Clone)]
+pub struct Texels(TexelStore);
+
+#[derive(Clone)]
+enum TexelStore {
+    Memory(std::sync::Arc<Vec<[u32; 4]>>),
+    File(std::sync::Arc<FileTexels>),
+}
+
+struct FileTexels {
+    file: std::sync::Mutex<std::fs::File>,
+    count: usize,
+    blocks: std::sync::Mutex<HashMap<usize, std::sync::Arc<Vec<[u32; 4]>>>>,
+}
+
+/// Texels read from a file at a time.
+const TEXEL_BLOCK: usize = 4096;
+
+impl Texels {
+    /// The texels of a dump file (16 little-endian bytes each), read as
+    /// they are touched.
+    pub fn from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let count = (file.metadata()?.len() / 16) as usize;
+        Ok(Self(TexelStore::File(std::sync::Arc::new(FileTexels {
+            file: std::sync::Mutex::new(file),
+            count,
+            blocks: std::sync::Mutex::new(HashMap::new()),
+        }))))
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            TexelStore::Memory(texels) => texels.len(),
+            TexelStore::File(file) => file.count,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Texel `index`.
+    pub fn get(&self, index: usize) -> Option<[u32; 4]> {
+        match &self.0 {
+            TexelStore::Memory(texels) => texels.get(index).copied(),
+            TexelStore::File(file) => {
+                if index >= file.count {
+                    return None;
+                }
+                let block = file.block(index / TEXEL_BLOCK);
+                block.get(index % TEXEL_BLOCK).copied()
+            }
+        }
+    }
+
+    /// Texel `index` to write (a file's texels are read in first).
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut [u32; 4]> {
+        if let TexelStore::File(_) = self.0 {
+            self.0 = TexelStore::Memory(std::sync::Arc::new(self.to_vec()));
+        }
+        match &mut self.0 {
+            TexelStore::Memory(texels) => std::sync::Arc::make_mut(texels).get_mut(index),
+            TexelStore::File(_) => unreachable!("read into memory above"),
+        }
+    }
+
+    /// Every texel, in order.
+    pub fn to_vec(&self) -> Vec<[u32; 4]> {
+        (0..self.len())
+            .filter_map(|index| self.get(index))
+            .collect()
+    }
+}
+
+impl FileTexels {
+    /// Block `n` of the file's texels, read once.
+    fn block(&self, n: usize) -> std::sync::Arc<Vec<[u32; 4]>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut blocks = self.blocks.lock().expect("texel blocks");
+        if let Some(block) = blocks.get(&n) {
+            return block.clone();
+        }
+        let first = n * TEXEL_BLOCK;
+        let count = TEXEL_BLOCK.min(self.count - first);
+        let mut bytes = vec![0u8; count * 16];
+        let mut file = self.file.lock().expect("texel file");
+        let read = file
+            .seek(SeekFrom::Start(first as u64 * 16))
+            .and_then(|_| file.read_exact(&mut bytes));
+        if let Err(error) = read {
+            panic!("reading texels {first}..{}: {error}", first + count);
+        }
+        let block: Vec<[u32; 4]> = bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|texel| {
+                std::array::from_fn(|n| {
+                    u32::from_le_bytes([
+                        texel[4 * n],
+                        texel[4 * n + 1],
+                        texel[4 * n + 2],
+                        texel[4 * n + 3],
+                    ])
+                })
+            })
+            .collect();
+        let block = std::sync::Arc::new(block);
+        blocks.insert(n, block.clone());
+        block
+    }
+}
+
+impl Default for Texels {
+    fn default() -> Self {
+        Self::from(Vec::new())
+    }
+}
+
+impl From<Vec<[u32; 4]>> for Texels {
+    fn from(texels: Vec<[u32; 4]>) -> Self {
+        Self(TexelStore::Memory(std::sync::Arc::new(texels)))
+    }
+}
+
+impl FromIterator<[u32; 4]> for Texels {
+    fn from_iter<I: IntoIterator<Item = [u32; 4]>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl PartialEq for Texels {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && (0..self.len()).all(|n| self.get(n) == other.get(n))
+    }
+}
+
+impl std::fmt::Debug for Texels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            TexelStore::Memory(texels) => write!(f, "Texels({} in memory)", texels.len()),
+            TexelStore::File(file) => write!(f, "Texels({} from a file)", file.count),
+        }
+    }
 }
 
 impl Image {
@@ -383,10 +535,7 @@ impl Image {
             clamp(y, self.height),
             clamp(z, self.slices()),
         );
-        self.texels
-            .get(self.index(x, y, z))
-            .copied()
-            .unwrap_or([0, 0, 0, 0])
+        self.texels.get(self.index(x, y, z)).unwrap_or([0, 0, 0, 0])
     }
 
     fn texel_mut(&mut self, x: i64, y: i64, z: i64) -> Option<&mut [u32; 4]> {
@@ -5078,7 +5227,7 @@ mod tests {
         let report = Machine::new(&translated.spirv).simulate(&inputs);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         let result = &report.images[&(0, image.binding)];
-        assert_eq!(result.texels[2 * 4 + 3], [9, 109, 209, 309]);
+        assert_eq!(result.texels.get(2 * 4 + 3), Some([9, 109, 209, 309]));
     }
 
     #[test]
@@ -5574,7 +5723,7 @@ mod tests {
                                 height: 4,
                                 depth: 1,
                                 layers: 1,
-                                texels: texels.clone(),
+                                texels: texels.clone().into(),
                             },
                         )]),
                         ..Inputs::default()
@@ -5709,7 +5858,7 @@ mod tests {
                         height: 8,
                         depth: 1,
                         layers: 1,
-                        texels: vec![[0; 4]; 48],
+                        texels: vec![[0; 4]; 48].into(),
                     },
                 )]),
                 ..Inputs::default()
@@ -7874,7 +8023,7 @@ mod tests {
                         height: 4,
                         depth: 1,
                         layers: 1,
-                        texels: texels.clone(),
+                        texels: texels.clone().into(),
                     },
                 )]),
                 // Index 10 of a draw with base vertex 5494.
@@ -8045,6 +8194,102 @@ mod tests {
     }
 
     #[test]
+    fn texels_read_from_a_file_as_touched_equal_those_read_up_front() {
+        // 10,000 texels (past two 4096-texel blocks), as a dump writes them.
+        let texels: Vec<[u32; 4]> = (0..10_000u32)
+            .map(|n| {
+                [
+                    n,
+                    n.wrapping_mul(2_654_435_761),
+                    !n,
+                    (n as f32 * 0.5).to_bits(),
+                ]
+            })
+            .collect();
+        let bytes: Vec<u8> = texels
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "echora-texels-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let lazy = Texels::from_file(&path).unwrap();
+        let eager = Texels::from(texels.clone());
+        assert_eq!(lazy.len(), 10_000);
+        for n in [0, 1, 4095, 4096, 8191, 8192, 9999] {
+            assert_eq!(lazy.get(n), Some(texels[n]), "texel {n}");
+        }
+        assert_eq!(lazy.get(10_000), None);
+        assert_eq!(lazy, eager);
+        // A sample through each gives the same result: TEX.LL R4, R0 (x,
+        // y), R2 (level 0) of a 100 x 100 texture.
+        let tex = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 2),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+            (87, 3, 3),
+        ]);
+        let program = [
+            mov(0, 0.735f32.to_bits()),
+            mov(1, 0.415f32.to_bits()),
+            mov(2, 0),
+            tex,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        let run = |texels: Texels| {
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, binding),
+                    Image {
+                        width: 100,
+                        height: 100,
+                        depth: 1,
+                        layers: 1,
+                        texels,
+                    },
+                )]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            (4..8u8)
+                .map(|n| report.invocations[0][&registers[&n]][0])
+                .collect::<Vec<u64>>()
+        };
+        let expected: Vec<u64> = texels[41 * 100 + 73]
+            .iter()
+            .map(|&w| u64::from(w))
+            .collect();
+        assert_eq!(run(lazy.clone()), expected);
+        assert_eq!(run(eager), expected);
+        // A write reads the file's texels into memory first.
+        let mut written = lazy;
+        *written.get_mut(5000).unwrap() = [1, 2, 3, 4];
+        assert_eq!(written.get(5000), Some([1, 2, 3, 4]));
+        assert_eq!(written.get(4999), Some(texels[4999]));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn gathers_pick_their_component_and_offset() {
         // TLD4.c (2D, handle c[0x0][0x40]) R4, R0 (x, then y, or x and y
         // then the packed offsets in R2): component c of the four texels
@@ -8102,7 +8347,7 @@ mod tests {
                         height: 4,
                         depth: 1,
                         layers: 1,
-                        texels: texels.clone(),
+                        texels: texels.clone().into(),
                     },
                 )]),
                 ..Inputs::default()
@@ -8174,7 +8419,7 @@ mod tests {
                     height: 4,
                     depth: 1,
                     layers: 1,
-                    texels,
+                    texels: texels.into(),
                 },
             )]),
             ..Inputs::default()
@@ -8313,7 +8558,7 @@ mod tests {
                         height: 4,
                         depth: 1,
                         layers: 1,
-                        texels: texels.clone(),
+                        texels: texels.clone().into(),
                     },
                 )]),
                 samplers: HashMap::from([((0, binding), sampler)]),
@@ -8415,7 +8660,7 @@ mod tests {
                             height: 4,
                             depth: 1,
                             layers: 1,
-                            texels: texels.clone(),
+                            texels: texels.clone().into(),
                         },
                     )]),
                     compare_op: Some(compare),
@@ -8619,7 +8864,7 @@ mod tests {
                     height: 8,
                     depth: 1,
                     layers: 2,
-                    texels: vec![[0; 4]; 128],
+                    texels: vec![[0; 4]; 128].into(),
                 },
             )]),
             quad,
