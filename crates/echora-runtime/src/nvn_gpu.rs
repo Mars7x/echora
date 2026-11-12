@@ -3792,6 +3792,52 @@ impl Nvn {
                 )
             })
             .collect();
+        // ECHORA_DISPATCH_UNIFORM_DUMP=<program key hex>[,...] with
+        // ECHORA_DUMP_DIR (debugging): each dispatch of those programs
+        // writes its uniform buffers as uniforms-<key>-<present>-<n>.bin
+        // (n counting dispatches within the present), with
+        // ECHORA_DUMP_DISPATCH_FROM as the first present.
+        if let (Ok(wanted), Some(directory)) = (
+            super::debug_var("ECHORA_DISPATCH_UNIFORM_DUMP"),
+            super::debug_var_os("ECHORA_DUMP_DIR"),
+        ) && wanted
+            .split(',')
+            .any(|item| item.trim() == format!("{:016x}", key.0))
+            && super::debug_var("ECHORA_DUMP_DISPATCH_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|from| self.presented_frames >= from)
+        {
+            let directory = std::path::Path::new(&directory);
+            let _ = std::fs::create_dir_all(directory);
+            let mut index = 0;
+            while directory
+                .join(format!(
+                    "uniforms-{:016x}-{}-{index}-0.bin",
+                    key.0, self.presented_frames
+                ))
+                .exists()
+            {
+                index += 1;
+            }
+            for (binding, bytes) in &uniforms {
+                let _ = std::fs::write(
+                    directory.join(format!(
+                        "uniforms-{:016x}-{}-{index}-{binding}.bin",
+                        key.0, self.presented_frames
+                    )),
+                    bytes,
+                );
+            }
+            // An empty marker so the index above finds this dispatch.
+            let _ = std::fs::write(
+                directory.join(format!(
+                    "uniforms-{:016x}-{}-{index}-0.bin",
+                    key.0, self.presented_frames
+                )),
+                uniforms.get(&0).map_or(&[][..], |bytes| &bytes[..]),
+            );
+        }
         // DispatchComputeIndirect(cmd, NVNbufferAddress): the GPU reads the
         // three group counts at the address when the dispatch runs, from
         // the pool's GPU copy (an earlier pass's writes, a counter its
