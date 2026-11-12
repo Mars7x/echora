@@ -2187,7 +2187,11 @@ impl Nvn {
 
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         self.refresh_target_index();
-        // A mip level of another render target, by address.
+        // The render target this texture is (its format and size, at its
+        // address), or a mip level of one. Engines reuse transient memory
+        // for textures of other formats within a frame (an RGB9E5 image
+        // over the HDR scene's R11G11B10 memory once the scene is used):
+        // the target in the texture's own format is the one it reads.
         if let Some((key, level)) = self.resolve_target(texture) {
             if level > 0 {
                 return Ok(TextureSource::TargetView {
@@ -2198,7 +2202,10 @@ impl Nvn {
                     layer_count: 0,
                 });
             }
+            return Ok(TextureSource::Target(key));
         }
+        // Otherwise a target over the same memory in another format (a
+        // depth target sampled as R32F, say).
         if self
             .gpu
             .as_ref()
