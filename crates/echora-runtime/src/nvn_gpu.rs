@@ -6660,12 +6660,19 @@ impl Nvn {
         // Blending: ColorState enables per target, each target's latest
         // BlendState its factors and equations, ChannelMaskState write
         // masks.
+        // ECHORA_GPU_NO_BLEND=<fragment key hex>[,...] (debugging): those
+        // programs draw without blending.
+        let no_blend = super::debug_var("ECHORA_GPU_NO_BLEND").is_ok_and(|wanted| {
+            wanted
+                .split(',')
+                .any(|item| item.trim() == format!("{:016x}", keys.1))
+        });
         let blends: Vec<Blend> = (0..colors.len())
             .map(|target| {
                 let mut blend = Blend::default();
                 // SetBlendEnable(state, index, enable): each index's latest.
                 if let Some(enable) = color_state.get(&format!("BlendEnable/{target}")) {
-                    blend.enable = enable.x[1] != 0;
+                    blend.enable = enable.x[1] != 0 && !no_blend;
                 }
                 let blend_state = snapshot(&format!("BindBlendState/{target}"));
                 if let Some(func) = blend_state.get("BlendFunc") {
@@ -6779,6 +6786,11 @@ impl Nvn {
             );
             eprintln!("{line}");
             backend.note(line);
+            // The colour state as snapshotted for this draw (blend enables).
+            eprintln!(
+                "trace color state {:016x}/{:016x} {color_state:?} blends {blends:?}",
+                keys.0, keys.1
+            );
             let line = format!(
                 "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} uniforms {:?}",
                 keys.0,
