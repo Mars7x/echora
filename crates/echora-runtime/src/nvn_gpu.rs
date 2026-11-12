@@ -7099,6 +7099,7 @@ impl Nvn {
                     ))
                     .collect::<Vec<_>>()
             );
+            eprintln!("{line}");
             backend.note(line);
         }
         if traced_program
