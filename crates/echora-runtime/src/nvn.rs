@@ -391,10 +391,11 @@ pub struct Nvn {
     /// Host images of textures that have been rendered to.
     #[serde(skip)]
     images: BTreeMap<u64, Image>,
-    /// Storage of finalized textures, by structure address: a texture
-    /// initialized there later with other storage is another texture.
+    /// Storage and format of finalized textures, by structure address: a
+    /// texture initialized there later with other storage or in another
+    /// format is another texture.
     #[serde(skip)]
-    finalized_storage: HashMap<u64, u64>,
+    finalized_storage: HashMap<u64, (u64, u64)>,
     /// Texture views registered with texture pool descriptors, by (pool, id).
     #[serde(skip)]
     views: BTreeMap<(u64, u32), Bag>,
@@ -939,10 +940,12 @@ pub struct Object {
 }
 
 /// Key of the copy kept of a texture whose structure was finalized or
-/// reused, by its storage: pool descriptors registered before still
-/// describe it (guest addresses never set bit 63).
-pub(crate) fn retired_texture(storage: u64) -> u64 {
-    1 << 63 | storage
+/// reused, by its storage and format: pool descriptors registered before
+/// still describe it (guest addresses never set bit 63, nor reach bit 48;
+/// two textures over one memory in different formats, as RGB9E5 over an
+/// R11G11B10 scene, stay apart).
+pub(crate) fn retired_texture((storage, format): (u64, u64)) -> u64 {
+    1 << 63 | (format & 0x7fff) << 48 | storage & 0xffff_ffff_ffff
 }
 
 /// NVN object kinds, longest first so prefixes resolve uniquely.
@@ -2133,8 +2136,11 @@ impl Nvn {
                 entry.x[0] = x[2];
                 entry.x[1] = u64::from(rest == "RegisterImage");
                 // A hardware descriptor captures the texture as it is now:
-                // its storage tells a later reuse of the structure apart.
-                entry.x[2] = self.texture_storage(x[2]).unwrap_or(0);
+                // its storage and format tell a later reuse of the
+                // structure apart.
+                let (storage, format) = self.texture_identity(x[2]).unwrap_or((0, 0));
+                entry.x[2] = storage;
+                entry.x[3] = format;
                 let pool = self.objects.get_mut(&this).unwrap();
                 pool.state.insert(format!("Descriptor{id}"), entry);
                 return Ok(true);
@@ -2288,17 +2294,19 @@ impl Nvn {
                 let builder = self.bag(x[1], "TextureBuilder").map_err(invalid)?;
                 self.require_device(&builder).map_err(invalid)?;
                 let previous = self
-                    .texture_storage(this)
+                    .texture_identity(this)
                     .or_else(|| self.finalized_storage.remove(&this));
                 if let Some(object) = self.objects.get(&this).filter(|o| o.kind == "Texture") {
-                    if let Some(storage) = self.texture_storage(this) {
-                        self.objects.insert(retired_texture(storage), object.clone());
+                    if let Some(identity) = self.texture_identity(this) {
+                        self.objects.insert(retired_texture(identity), object.clone());
                     }
                 }
                 self.initialize(this, "Texture", builder).map_err(invalid)?;
-                // A texture structure reused for other storage: what the GPU
-                // kept under its address describes the old texture.
-                let storage = self.texture_storage(this);
+                // A texture structure reused for other storage or another
+                // format: what the GPU kept under its address describes the
+                // old texture.
+                let identity = self.texture_identity(this);
+                let storage = identity.map(|(storage, _)| storage);
                 // ECHORA_NVN_TEXTURE_LOG=<low>-<high> (hex) logs only textures
                 // whose storage starts in that range.
                 let logged = std::env::var("ECHORA_NVN_TEXTURE_LOG").ok().is_some_and(|range| {
@@ -2327,8 +2335,8 @@ impl Nvn {
                         self.presented_frames,
                     ));
                 }
-                if let Some(previous) = previous.filter(|previous| Some(*previous) != storage) {
-                    self.gpu_move_texture(this, previous, storage);
+                if let Some(previous) = previous.filter(|previous| Some(*previous) != identity) {
+                    self.gpu_move_texture(this, previous, identity);
                 }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
@@ -2337,10 +2345,10 @@ impl Nvn {
                 self.texture_epoch += 1;
                 let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
-                if let Some(storage) = self.texture_storage(this) {
-                    self.finalized_storage.insert(this, storage);
+                if let Some(identity) = self.texture_identity(this) {
+                    self.finalized_storage.insert(this, identity);
                     let object = self.objects[&this].clone();
-                    self.objects.insert(retired_texture(storage), object);
+                    self.objects.insert(retired_texture(identity), object);
                 }
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);

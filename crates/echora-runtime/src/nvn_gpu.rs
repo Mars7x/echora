@@ -703,12 +703,18 @@ impl Nvn {
 
     /// Forget the host target and cached upload kept for texture object
     /// `texture`, whose structure now describes another texture.
-    /// Texture structure `texture` now describes `storage` instead of
-    /// `previous`: what the GPU rendered stays with the memory, as on the
-    /// console. Its target moves to the retired key of `previous` (where a
-    /// descriptor registered before still finds it), and a target kept
-    /// for `storage` from an earlier texture there becomes its own.
-    pub(super) fn gpu_move_texture(&mut self, texture: u64, previous: u64, storage: Option<u64>) {
+    /// Texture structure `texture` now describes `identity` (storage and
+    /// format) instead of `previous`: what the GPU rendered stays with the
+    /// memory, as on the console. Its target moves to the retired key of
+    /// `previous` (where a descriptor registered before still finds it),
+    /// and a target kept for `identity` from an earlier texture there
+    /// becomes its own.
+    pub(super) fn gpu_move_texture(
+        &mut self,
+        texture: u64,
+        previous: (u64, u64),
+        identity: Option<(u64, u64)>,
+    ) {
         self.texture_epoch += 1;
         if let Some(backend) = self.gpu.as_mut() {
             backend.textures.remove(&texture);
@@ -717,8 +723,10 @@ impl Nvn {
             let retired = super::retired_texture(previous);
             let result = renderer
                 .move_target(texture, retired)
-                .and_then(|_| match storage {
-                    Some(storage) => renderer.move_target(super::retired_texture(storage), texture),
+                .and_then(|_| match identity {
+                    Some(identity) => {
+                        renderer.move_target(super::retired_texture(identity), texture)
+                    }
                     None => Ok(()),
                 });
             if let Err(error) = result {
@@ -2020,6 +2028,13 @@ impl Nvn {
     /// Guest address of a texture object's storage. A virtual pool has no
     /// storage of its own: its offset resolves through the pool's GPU
     /// range to the physical pool mapped there (MapVirtual).
+    /// A texture's storage and NVN format: what tells two textures over one
+    /// structure (or one memory) apart.
+    pub(super) fn texture_identity(&self, texture: u64) -> Option<(u64, u64)> {
+        let format = self.objects.get(&texture)?.builder.get("Format")?.x[0];
+        Some((self.texture_storage(texture)?, format))
+    }
+
     pub(super) fn texture_storage(&self, texture: u64) -> Option<u64> {
         let storage = self.objects.get(&texture)?.builder.get("Storage")?;
         let pool = self.objects.get(&storage.x[0])?;
@@ -2848,10 +2863,11 @@ impl Nvn {
             .state
             .get(&format!("Descriptor{id}"))
             .ok_or_else(|| format!("texture {id} is not registered"))?;
-        // The structure was reused for other storage since registration:
-        // the descriptor still names the texture it held then.
-        let registered = entry.x[2];
-        if registered != 0 && self.texture_storage(entry.x[0]) != Some(registered) {
+        // The structure was reused for other storage or in another format
+        // since registration: the descriptor still names the texture it
+        // held then.
+        let registered = (entry.x[2], entry.x[3]);
+        if registered.0 != 0 && self.texture_identity(entry.x[0]) != Some(registered) {
             let retired = super::retired_texture(registered);
             if self.objects.contains_key(&retired) {
                 return Ok(retired);
