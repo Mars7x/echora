@@ -7061,8 +7061,8 @@ impl Nvn {
         });
         if traced_program {
             let line = format!(
-                "trace textures {:016x}/{:016x} base {base_vertex} {traced_textures}",
-                keys.0, keys.1
+                "trace textures present {} {:016x}/{:016x} base {base_vertex} {traced_textures}",
+                self.presented_frames, keys.0, keys.1
             );
             eprintln!("{line}");
             backend.note(line);
