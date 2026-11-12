@@ -7323,7 +7323,12 @@ impl Nvn {
                 .state
                 .iter()
                 .filter(|(key, _)| key.starts_with("BindProgram@"))
-                .map(|(key, bind)| format!("{key}:program {:#x} bits {:#x}", bind.x[1], bind.x[2]))
+                .map(|(key, bind)| {
+                    format!(
+                        "{key}:program {:#x} bits {:#x} from buffer {:#x}",
+                        bind.x[1], bind.x[2], bind.x[0]
+                    )
+                })
                 .chain(
                     self.render
                         .state
@@ -7420,8 +7425,8 @@ impl Nvn {
         });
         if traced_program {
             let line = format!(
-                "trace textures present {} {:016x}/{:016x} base {base_vertex} {traced_textures}",
-                self.presented_frames, keys.0, keys.1
+                "trace textures present {} {:016x}/{:016x} base {base_vertex} buffer {:#x} {traced_textures}",
+                self.presented_frames, keys.0, keys.1, command.x[0]
             );
             eprintln!("{line}");
             backend.note(line);
