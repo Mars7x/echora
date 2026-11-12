@@ -6756,7 +6756,21 @@ impl Nvn {
             })
             .unzip();
         let mut extent = None;
-        for texture in colors.iter().filter(|texture| **texture != 0) {
+        for (index, texture) in colors
+            .iter()
+            .enumerate()
+            .filter(|(_, texture)| **texture != 0)
+        {
+            if self.depth_traced(*texture) {
+                eprintln!(
+                    "depth trace present {} draw {:016x}/{:016x} renders {texture:x} as view format {:?} level {:?}",
+                    self.presented_frames,
+                    keys.0,
+                    keys.1,
+                    self.render.color_formats.get(index),
+                    color_levels.get(index)
+                );
+            }
             extent.get_or_insert(self.ensure_render_target(*texture)?);
         }
         // A depth texture object over the storage of an existing depth
