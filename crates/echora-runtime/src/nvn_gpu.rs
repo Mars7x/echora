@@ -2191,7 +2191,63 @@ impl Nvn {
         None
     }
 
+    /// The alias target (and its size) a draw renders the blocks of
+    /// block-compressed texture `texture` into through a color view of
+    /// format `view`, when each of the view's texels is one block (an
+    /// RGBA16UI view of BC4: a pixel shader compressing, one pixel per 4x4
+    /// block). The texture's own image takes them before it is sampled
+    /// (`texture_source`), as on the console both name one memory.
+    fn block_alias_target(
+        &mut self,
+        texture: u64,
+        view: vk::Format,
+    ) -> Result<Option<(u64, (u32, u32))>, String> {
+        let Ok((width, height, format)) = self.target_shape(texture) else {
+            return Ok(None);
+        };
+        let Some(bytes) = echora_gpu::renderer::bc_block_bytes(format) else {
+            return Ok(None);
+        };
+        let texel = match echora_gpu::renderer::uint_alias(view) {
+            Some(vk::Format::R32G32_UINT) => 8,
+            Some(vk::Format::R32G32B32A32_UINT) => 16,
+            _ => 0,
+        };
+        if texel != bytes {
+            return Ok(None);
+        }
+        self.ensure_render_target(texture)?;
+        let alias = 1 << 62 | texture;
+        let shape = self.render_shape(texture);
+        let levels = self.texture_levels(texture);
+        let size = (width.div_ceil(4), height.div_ceil(4));
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .shaped_target(alias, size.0, size.1, shape, view, levels)?;
+        self.block_aliases.insert(texture, alias);
+        Ok(Some((alias, size)))
+    }
+
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
+        let source = self.texture_source_resolved(core, texture)?;
+        // Blocks drawn since it was last sampled come in first.
+        if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = &source
+            && let Some(alias) = self.block_aliases.remove(key)
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.renderer.copy_blocks(alias, *key)?;
+            backend.stat("stat: compressed blocks drawn copied in", 1);
+        }
+        Ok(source)
+    }
+
+    fn texture_source_resolved(
+        &mut self,
+        core: &Guest,
+        texture: u64,
+    ) -> Result<TextureSource, String> {
         self.refresh_target_index();
         // The render target this texture is (its format and size, at its
         // address), or a mip level of one. Engines reuse transient memory
@@ -6755,11 +6811,29 @@ impl Nvn {
                 _ => (*texture, level),
             })
             .unzip();
+        // A block-compressed texture viewed in an integer format one block
+        // wide per texel (RGBA16UI over BC4) renders into its blocks.
+        let mut color_formats = color_formats;
+        let mut colors = colors;
         let mut extent = None;
+        for (index, color) in colors.iter_mut().enumerate() {
+            let Some(view) = color_formats.get(index).copied().flatten() else {
+                continue;
+            };
+            if *color == 0 {
+                continue;
+            }
+            if let Some((alias, size)) = self.block_alias_target(*color, view)? {
+                *color = alias;
+                color_formats[index] = None;
+                extent.get_or_insert(size);
+            }
+        }
+        let aliases: Vec<u64> = self.block_aliases.values().copied().collect();
         for (index, texture) in colors
             .iter()
             .enumerate()
-            .filter(|(_, texture)| **texture != 0)
+            .filter(|(_, texture)| **texture != 0 && !aliases.contains(texture))
         {
             if self.depth_traced(*texture) {
                 eprintln!(

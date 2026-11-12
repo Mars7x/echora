@@ -2584,7 +2584,9 @@ impl Renderer {
             // 3D scene (measured on the trainer selection screen).
             self.targets_created += 1;
             let tiny = target.width * target.height <= 64;
-            let chain = target.levels > 1;
+            // (A block-compressed image cannot be cleared: its blocks
+            // come in whole from `copy_blocks`.)
+            let chain = target.levels > 1 && bc_block_bytes(target.format).is_none();
             self.register_views(&target);
             self.target_changes += 1;
             self.targets.insert(key, target);
@@ -3026,8 +3028,13 @@ impl Renderer {
         } else {
             vk::ImageUsageFlags::empty()
         };
+        // A block-compressed target is never an attachment or a storage
+        // image: draws write its blocks through an integer alias that is
+        // copied in (`copy_blocks`).
         let usage = if is_depth(format) {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        } else if bc_block_bytes(format).is_some() {
+            vk::ImageUsageFlags::empty()
         } else {
             vk::ImageUsageFlags::COLOR_ATTACHMENT | storage
         } | vk::ImageUsageFlags::SAMPLED
@@ -3648,6 +3655,74 @@ impl Renderer {
                 to.image,
                 vk::ImageLayout::GENERAL,
                 &[region],
+            );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// Copy every level and layer (or slice) of target `from`, whose
+    /// texels are the blocks of block-compressed target `to` (an RGBA16UI
+    /// image of 8-byte BC4 blocks, a quarter of its width and height),
+    /// into `to`: a size-compatible copy, its extent in `from`'s texels.
+    pub fn copy_blocks(&mut self, from: u64, to: u64) -> Result<(), String> {
+        self.transition(from, vk::ImageLayout::GENERAL)?;
+        self.transition(to, vk::ImageLayout::GENERAL)?;
+        self.order_target(from)?;
+        self.order_target(to)?;
+        let commands = self.commands()?;
+        let (source, destination) = (&self.targets[&from], &self.targets[&to]);
+        let levels = source.levels.min(destination.levels);
+        let layers = source.shape.layers().min(destination.shape.layers());
+        let regions: Vec<vk::ImageCopy> = (0..levels)
+            .map(|level| {
+                let subresource = |format| vk::ImageSubresourceLayers {
+                    aspect_mask: range(format).aspect_mask,
+                    mip_level: level,
+                    base_array_layer: 0,
+                    layer_count: layers,
+                };
+                // The destination level's blocks bound the copy (a level
+                // smaller than a block still holds one).
+                let blocks = |extent: u32| (extent >> level).max(1).div_ceil(4);
+                vk::ImageCopy {
+                    src_subresource: subresource(source.format),
+                    src_offset: vk::Offset3D::default(),
+                    dst_subresource: subresource(destination.format),
+                    dst_offset: vk::Offset3D::default(),
+                    extent: vk::Extent3D {
+                        width: blocks(destination.width).min((source.width >> level).max(1)),
+                        height: blocks(destination.height).min((source.height >> level).max(1)),
+                        depth: (source.shape.depth() >> level)
+                            .max(1)
+                            .min((destination.shape.depth() >> level).max(1)),
+                    },
+                }
+            })
+            .collect();
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        // SAFETY: recording outside rendering; both images are live and in
+        // GENERAL layout; an uncompressed texel the size of a compressed
+        // block copies to that block (Vulkan 1.0 size-compatible copies).
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_copy_image(
+                commands,
+                source.image,
+                vk::ImageLayout::GENERAL,
+                destination.image,
+                vk::ImageLayout::GENERAL,
+                &regions,
             );
             device.cmd_pipeline_barrier(
                 commands,
@@ -4843,6 +4918,30 @@ fn border_color(rgba: [u32; 4]) -> vk::BorderColor {
 
 /// The sRGB or UNORM counterpart of `format` (the pairs NVN texture views
 /// reinterpret between), if it has one.
+/// The bytes of one 4x4 block of a BC (block-compressed) format.
+pub fn bc_block_bytes(format: vk::Format) -> Option<u32> {
+    use vk::Format as F;
+    match format {
+        F::BC1_RGB_UNORM_BLOCK
+        | F::BC1_RGB_SRGB_BLOCK
+        | F::BC1_RGBA_UNORM_BLOCK
+        | F::BC1_RGBA_SRGB_BLOCK
+        | F::BC4_UNORM_BLOCK
+        | F::BC4_SNORM_BLOCK => Some(8),
+        F::BC2_UNORM_BLOCK
+        | F::BC2_SRGB_BLOCK
+        | F::BC3_UNORM_BLOCK
+        | F::BC3_SRGB_BLOCK
+        | F::BC5_UNORM_BLOCK
+        | F::BC5_SNORM_BLOCK
+        | F::BC6H_UFLOAT_BLOCK
+        | F::BC6H_SFLOAT_BLOCK
+        | F::BC7_UNORM_BLOCK
+        | F::BC7_SRGB_BLOCK => Some(16),
+        _ => None,
+    }
+}
+
 /// UNORM formats and their sRGB-encoded twins.
 const SRGB_PAIRS: [(vk::Format, vk::Format); 6] = [
     (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),

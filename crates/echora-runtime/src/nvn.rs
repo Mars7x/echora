@@ -411,6 +411,11 @@ pub struct Nvn {
     /// and present that last wrote each target, and its storage then.
     #[serde(skip)]
     target_writers: HashMap<u64, (u64, u64, u64)>,
+    /// Block-compressed targets drawn through an integer view (a pixel
+    /// shader compressing), by target: the alias target holding their
+    /// blocks since, copied in before they are next sampled.
+    #[serde(skip)]
+    block_aliases: HashMap<u64, u64>,
     /// Work skipped as "rendering disabled" before the last present: the
     /// capture log shows each captured frame's own.
     #[serde(skip)]
