@@ -7424,7 +7424,7 @@ impl Nvn {
                 keys.0, keys.1
             );
             let line = format!(
-                "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} uniforms {:?}",
+                "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} view formats {:?} levels {:x?} uniforms {:?}",
                 keys.0,
                 keys.1,
                 fixed.depth_test,
@@ -7436,6 +7436,8 @@ impl Nvn {
                 fixed.scissor,
                 blends,
                 colors,
+                self.render.color_formats,
+                self.render.color_levels,
                 uniforms
                     .iter()
                     .map(|(key, bytes)| (
