@@ -1425,6 +1425,24 @@ impl Renderer {
                 return self.texture_view(&identity, texture_type);
             }
         }
+        // A volume target read by a 2D or 2D-array binding: the device
+        // samples no 2D view of a 3D image, so its slices are copied into a
+        // 2D array beside it (refreshed at each such binding) and that is
+        // sampled: a 2D read of a volume reads slice 0, as the hardware's.
+        if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = source
+            && matches!(texture_type, 2 | 3)
+            && let Some(&Target {
+                width,
+                height,
+                format,
+                shape: ImageShape::D3 { depth },
+                ..
+            }) = self.targets.get(key)
+        {
+            let alias = key ^ 1 << 61;
+            self.volume_as_layers(*key, alias, width, height, depth, format)?;
+            return self.texture_view(&TextureSource::Target(alias), texture_type);
+        }
         let key = match source {
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                 self.transition(*key, vk::ImageLayout::GENERAL)?;
@@ -3501,6 +3519,83 @@ impl Renderer {
     fn order_target(&mut self, key: u64) -> Result<(), String> {
         let image = self.targets.get(&key).ok_or("no such target")?.image;
         self.order_after_rendering(&[image])
+    }
+
+    /// Copy level 0 of volume target `volume` (its `depth` slices) into
+    /// the array layers of target `alias`, created beside it.
+    fn volume_as_layers(
+        &mut self,
+        volume: u64,
+        alias: u64,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: vk::Format,
+    ) -> Result<(), String> {
+        use crate::draw::ImageShape;
+        self.shaped_target(
+            alias,
+            width,
+            height,
+            ImageShape::D2 { layers: depth },
+            format,
+            1,
+        )?;
+        self.transition(volume, vk::ImageLayout::GENERAL)?;
+        self.transition(alias, vk::ImageLayout::GENERAL)?;
+        self.order_target(volume)?;
+        self.order_target(alias)?;
+        let commands = self.commands()?;
+        let (from, to) = (&self.targets[&volume], &self.targets[&alias]);
+        let aspect = range(format).aspect_mask;
+        let region = vk::ImageCopy {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_offset: vk::Offset3D::default(),
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: depth,
+            },
+            dst_offset: vk::Offset3D::default(),
+            extent: vk::Extent3D {
+                width: from.width.min(to.width),
+                height: from.height.min(to.height),
+                depth,
+            },
+        };
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        // SAFETY: recording outside rendering; both images are live and in
+        // GENERAL layout; a volume's depth maps to the array's layers
+        // (Vulkan 1.1).
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_copy_image(
+                commands,
+                from.image,
+                vk::ImageLayout::GENERAL,
+                to.image,
+                vk::ImageLayout::GENERAL,
+                &[region],
+            );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
     }
 
     /// Copy `source` rect (x, y, width, height) of target `from` into
