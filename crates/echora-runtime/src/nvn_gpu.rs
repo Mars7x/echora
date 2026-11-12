@@ -7057,6 +7057,27 @@ impl Nvn {
         } else {
             Vec::new()
         };
+        // A traced program's sampled targets, as the draw meets them, also
+        // go through ECHORA_TARGET_TRACE (their contents when read, beside
+        // those when written).
+        if !traced_textures.is_empty() {
+            let mut sampled: Vec<u64> = textures
+                .values()
+                .filter_map(|(source, _)| match source {
+                    TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                        Some(*key)
+                    }
+                    _ => None,
+                })
+                .collect();
+            sampled.sort_unstable();
+            sampled.dedup();
+            self.trace_targets(
+                &sampled,
+                &[],
+                &format!("sampled by draw {:016x}/{:016x}", keys.0, keys.1),
+            )?;
+        }
         let backend = self.gpu.as_mut().unwrap();
         // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
         // programs' draws, with their fixed-function state.
