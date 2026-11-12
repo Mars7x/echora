@@ -1057,6 +1057,9 @@ pub struct Services {
     audio_outs: Vec<AudioOutState>,
     /// Renderer sessions and their system events.
     audio_renderers: Vec<(crate::audio_renderer::Renderer, Option<ReadableEventId>)>,
+    /// Each renderer's host stream, opened when its device sink first
+    /// produces samples (None inside: no host audio).
+    audio_renderer_hosts: BTreeMap<usize, Option<std::sync::mpsc::Sender<Vec<u8>>>>,
     /// IAudioDevice output volume auto-tune setting (commands 19/20).
     audio_volume_auto_tune: bool,
     /// IAudioDevice output volumes by device name (f32 bits).
@@ -1245,6 +1248,7 @@ impl Default for Services {
             audio_device_output_event: None,
             audio_outs: Vec::new(),
             audio_renderers: Vec::new(),
+            audio_renderer_hosts: BTreeMap::new(),
             audio_volume_auto_tune: false,
             audio_device_volumes: BTreeMap::new(),
             audio_device_list_requests: BTreeSet::new(),
@@ -1417,6 +1421,15 @@ fn service_name(arguments: &[u8]) -> Result<String, Trap> {
         ));
     }
     Ok(String::from_utf8(arguments[..length].to_vec()).expect("checked to be ASCII above"))
+}
+
+/// Guest memory as the audio renderer decodes wave buffers from it.
+struct GuestAudio<'a>(&'a Memory);
+
+impl crate::audio_mix::Source for GuestAudio<'_> {
+    fn read(&self, address: u64, out: &mut [u8]) -> bool {
+        self.0.read(address, out).is_ok()
+    }
 }
 
 struct Call<'a> {
@@ -5808,15 +5821,18 @@ impl Services {
 
     /// Release finished audio-out buffers and signal their events. Returns
     /// whether any event was signaled.
-    pub(crate) fn advance_audio(&mut self, now: std::time::Instant) -> bool {
+    pub(crate) fn advance_audio(&mut self, now: std::time::Instant, memory: &Memory) -> bool {
         let mut signaled = false;
-        for (renderer, event) in &mut self.audio_renderers {
-            if renderer.advance(now) {
+        let source = GuestAudio(memory);
+        for id in 0..self.audio_renderers.len() {
+            let (renderer, event) = &mut self.audio_renderers[id];
+            if renderer.advance(now, Some(&source)) {
                 if let Some(event) = event.and_then(|id| self.readable_events.get_mut(&id)) {
                     event.signaled = true;
                     signaled = true;
                 }
             }
+            self.play_renderer(id);
         }
         for out in &mut self.audio_outs {
             if out.advance(now) {
@@ -5827,6 +5843,28 @@ impl Services {
             }
         }
         signaled
+    }
+
+    /// Send what renderer `id` mixed for its device sink to the host.
+    fn play_renderer(&mut self, id: usize) {
+        let renderer = &mut self.audio_renderers[id].0;
+        let samples = renderer.take_output();
+        if samples.is_empty() || renderer.output_channels == 0 {
+            return;
+        }
+        let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
+        let host = self
+            .audio_renderer_hosts
+            .entry(id)
+            .or_insert_with(|| crate::audio::open(rate, channels));
+        if let Some(host) = host {
+            let mut pcm: Vec<u8> = samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect();
+            crate::audio::apply_volume(&mut pcm, crate::settings::master_volume());
+            let _ = host.send(pcm);
+        }
     }
 
     /// When the next audio-out buffer finishes, if any is playing.
@@ -5844,13 +5882,16 @@ impl Services {
     }
 
     /// IAudioRenderer (Eden-NS2 1a6d7d4 audio_renderer.cpp numbering). The
-    /// renderer state is `audio_renderer::Renderer`; nothing is mixed.
+    /// renderer state is `audio_renderer::Renderer`.
     fn audio_renderer(&mut self, id: usize, call: &mut Call<'_>) -> Result<Outcome, Trap> {
         const SERVICE: &str = "aud:u:audio_renderer";
         let now = std::time::Instant::now();
         let command = call.request.command_id;
+        self.audio_renderers[id]
+            .0
+            .advance(now, Some(&GuestAudio(&*call.memory)));
+        self.play_renderer(id);
         let renderer = &mut self.audio_renderers[id].0;
-        renderer.advance(now);
         let parameters = renderer.parameters;
         let word = |value: u32| value.to_le_bytes();
         match command {
