@@ -1689,14 +1689,19 @@ impl Nvn {
             .collect();
         let mut keys: Vec<String> = sources
             .map(|source| match source {
-                TextureSource::Target(key) => format!("t{key:x}"),
+                TextureSource::Target(key) => {
+                    format!("t{key:x}@{:x}", self.texture_storage(*key).unwrap_or(0))
+                }
                 TextureSource::TargetView {
                     key,
                     base_level,
                     level_count,
                     base_layer,
                     layer_count,
-                } => format!("t{key:x}[{base_level}+{level_count}/{base_layer}+{layer_count}]"),
+                } => format!(
+                    "t{key:x}@{:x}[{base_level}+{level_count}/{base_layer}+{layer_count}]",
+                    self.texture_storage(*key).unwrap_or(0)
+                ),
                 TextureSource::Upload {
                     key,
                     width,
@@ -3788,8 +3793,8 @@ impl Nvn {
                             | TextureSource::TargetView { key: target, .. } => self
                                 .target_writers
                                 .get(target)
-                                .map_or("never written".to_string(), |(program, present)| {
-                                    format!("written by {program:016x} at {present}")
+                                .map_or("never written".to_string(), |(program, present, storage)| {
+                                    format!("written by {program:016x} at {present} to {storage:x}")
                                 }),
                             _ => "upload".to_string(),
                         };
@@ -3808,8 +3813,9 @@ impl Nvn {
                 );
             }
             for target in &image_keys {
+                let storage = self.texture_storage(*target).unwrap_or(0);
                 self.target_writers
-                    .insert(*target, (key.0, self.presented_frames));
+                    .insert(*target, (key.0, self.presented_frames, storage));
             }
         }
         let images_written = image_keys.clone();
@@ -7269,12 +7275,6 @@ impl Nvn {
         for key in &colors_written {
             *self.frame_target_draws.entry(*key).or_default() += 1;
         }
-        if super::debug_var_os("ECHORA_DISPATCH_SOURCE_LOG").is_some() {
-            for key in &colors_written {
-                self.target_writers
-                    .insert(*key, (keys.1, self.presented_frames));
-            }
-        }
         let color_places: Vec<(u32, u32)> = draw
             .colors
             .iter()
@@ -7497,6 +7497,13 @@ impl Nvn {
             self.dump_mesh_stages(
                 core, command, keys.1, &stages, &uniforms, &textures, page_table,
             );
+        }
+        if super::debug_var_os("ECHORA_DISPATCH_SOURCE_LOG").is_some() {
+            for key in &colors_written {
+                let storage = self.texture_storage(*key).unwrap_or(0);
+                self.target_writers
+                    .insert(*key, (keys.1, self.presented_frames, storage));
+            }
         }
         self.trace_targets(&colors_written, &color_places, &draw_label)?;
         self.trace_memory(core, &draw_label)
