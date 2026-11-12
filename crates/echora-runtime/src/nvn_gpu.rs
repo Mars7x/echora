@@ -3650,6 +3650,25 @@ impl Nvn {
                     };
                     let base = gpu & !15;
                     let length = gpu - base + size;
+                    // ECHORA_STORAGE_WRITE_LOG=<gpu start>-<end>[,...]
+                    // (debugging): each dispatch binding a storage buffer
+                    // it writes over that range, with the present.
+                    if let Ok(ranges) = super::debug_var("ECHORA_STORAGE_WRITE_LOG")
+                        && descriptor.flags & 1 != 0
+                        && ranges.split(',').any(|range| {
+                            range.split_once('-').is_some_and(|(start, end)| {
+                                let parse = |text: &str| {
+                                    u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+                                };
+                                matches!((parse(start), parse(end)), (Some(start), Some(end)) if gpu < end && start < gpu + size)
+                            })
+                        })
+                    {
+                        eprintln!(
+                            "storage write present {} dispatch {:016x} binding {} gpu {gpu:#x}+{size:#x}",
+                            self.presented_frames, key.0, descriptor.binding
+                        );
+                    }
                     if descriptor.cbuf_index == 0 && !native {
                         c0[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
                         c0[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
@@ -4260,7 +4279,9 @@ impl Nvn {
             started.elapsed().as_micros() as u64,
         );
         self.trace_targets(&images_written, &[], &format!("dispatch {:016x}", key.0))?;
-        self.trace_memory(core, &format!("dispatch {:016x}", key.0))?;
+        if let Err(error) = self.trace_memory(core, &format!("dispatch {:016x}", key.0)) {
+            eprintln!("memory trace: {error}");
+        }
         let backend = self.gpu.as_mut().unwrap();
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             // Volumes a dispatch wrote, as their first slice reads back.
@@ -7968,7 +7989,12 @@ impl Nvn {
             }
         }
         self.trace_targets(&colors_written, &color_places, &draw_label)?;
-        self.trace_memory(core, &draw_label)
+        // A debugging trace that cannot read its range says so; the draw
+        // stands.
+        if let Err(error) = self.trace_memory(core, &draw_label) {
+            eprintln!("memory trace: {error}");
+        }
+        Ok(())
     }
 }
 
