@@ -363,9 +363,11 @@ impl Emitter {
         self.texture_values_split(texture, count, None)
     }
 
-    /// As `texture_values`; TEX.B (`coordinates` given) keeps all its
-    /// coordinates in Ra when unpacked (bit 60 clear) or with five values
-    /// or more.
+    /// As `texture_values`; with `coordinates` given (TEX.B, an unpacked
+    /// form or a least-level mode) Ra holds that many values when unpacked
+    /// (bit 60 clear) or with five values or more, Rb the rest; a packed
+    /// form (bit 60 set) of up to four values has them half in each (NAK's
+    /// SM70 scalar form: 1+1, 2+1, 2+2).
     fn texture_values_split(
         &mut self,
         texture: &Texture,
@@ -535,12 +537,15 @@ impl Emitter {
             + u32::from(texture.offsets)
             + 2 * u32::from(texture.per_tap)
             + u32::from(texture.depth_compare);
-        // The .LC forms as NAK lays them out: unpacked (bit 60 clear), the
-        // least level and coordinates in Ra and the rest in Rb.
+        // Unpacked (bit 60 clear), as NAK lays it out: the array index (or
+        // least level) and the coordinates in Ra, the rest (level, offsets,
+        // reference) in Rb. The game's one unpacked form, a 3D TEX.LL with
+        // offsets, reads its level and offsets from Rb and leaves Ra's
+        // fourth register unwritten.
         let values = self.texture_values_split(
             texture,
             count,
-            (handle_value || clamp).then_some(view.coordinates + extra),
+            (handle_value || clamp || !texture.packed).then_some(view.coordinates + extra),
         );
         let (values, least_level) = if clamp {
             let first = values[0];

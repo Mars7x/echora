@@ -7978,6 +7978,73 @@ mod tests {
     }
 
     #[test]
+    fn unpacked_samples_take_their_coordinates_from_ra_and_the_rest_from_rb() {
+        // TEX.LL with offsets, 3D, bit 60 clear (unpacked) R4, R16, R20:
+        // Ra the coordinates alone (R16-R18; R19 a decoy), Rb the level
+        // (R20) then the packed 4-bit offsets (R21: x + 1), as NAK lays out
+        // unpacked texture operands (and the game's one unpacked form reads
+        // them).
+        let tex = word(&[
+            (0, 12, 0xb60),
+            (16, 8, 4),
+            (24, 8, 16),
+            (32, 8, 20),
+            (40, 14, 0x10),
+            (61, 3, 2),
+            (64, 8, 255),
+            (72, 4, 1),
+            (76, 1, 1),
+            (81, 3, 7),
+            (87, 3, 3),
+        ]);
+        let program = [
+            mov(16, 0.25f32.to_bits()),
+            mov(17, 0.25f32.to_bits()),
+            mov(18, 0.25f32.to_bits()),
+            mov(19, 3.0f32.to_bits()),
+            mov(20, 1.0f32.to_bits()),
+            mov(21, 0x1),
+            tex,
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        // Level l of a 3D texture (4 >> l on a side): texel n holds
+        // 100 l + n.
+        let level = |l: u32| {
+            let side = 4 >> l;
+            Image {
+                width: side,
+                height: side,
+                depth: side,
+                layers: 1,
+                texels: (0..side * side * side)
+                    .map(|n| [((100 * l + n) as f32).to_bits(), 0, 0, 0])
+                    .collect(),
+            }
+        };
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([((0, binding), level(0))]),
+            mips: HashMap::from([((0, binding), vec![level(1), level(2)])]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        // Level 1 (2 x 2 x 2): (0.25, 0.25, 0.25) is texel (0, 0, 0), one
+        // to the right texel 1.
+        let got = f32::from_bits(report.invocations[0][&registers[&4]][0] as u32);
+        assert_eq!(got, 101.0);
+    }
+
+    #[test]
     fn gathers_pick_their_component_and_offset() {
         // TLD4.c (2D, handle c[0x0][0x40]) R4, R0 (x, then y, or x and y
         // then the packed offsets in R2): component c of the four texels
