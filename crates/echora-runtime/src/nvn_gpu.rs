@@ -5389,6 +5389,102 @@ impl Nvn {
             let (width, height) = ((width >> level).max(1), (height >> level).max(1));
             let depth = target.shape.depth();
             backend.renderer.flush()?;
+            // A depth target past 4096² (a 12288² shadow map is 2.4 GB as
+            // RGBA f32): only the requested rectangles, read as raw depth.
+            if echora_gpu::renderer::is_depth(format)
+                && u64::from(width) * u64::from(height) > 4096 * 4096
+            {
+                let depth_of = |bytes: &[u8]| -> f32 {
+                    match format {
+                        vk::Format::D16_UNORM => {
+                            f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0
+                        }
+                        vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32 => {
+                            (u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                                & 0xff_ffff) as f32
+                                / 16_777_215.0
+                        }
+                        _ => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    }
+                };
+                let size = if format == vk::Format::D16_UNORM {
+                    2
+                } else {
+                    4
+                };
+                let rects = super::debug_var("ECHORA_TARGET_TRACE_RECT").unwrap_or_default();
+                for rect in rects.split(';') {
+                    let values: Vec<u32> = rect
+                        .split(',')
+                        .filter_map(|value| value.trim().parse().ok())
+                        .collect();
+                    let [x, y, w, h] = values[..] else {
+                        continue;
+                    };
+                    if x + w > width || y + h > height || level != 0 || layer != 0 {
+                        continue;
+                    }
+                    let bytes =
+                        backend
+                            .renderer
+                            .read_target_region_bytes(key, size, Some([x, y, w, h]))?;
+                    for (row, line) in bytes.chunks_exact((w * size) as usize).enumerate() {
+                        let values: Vec<String> = line
+                            .chunks_exact(size as usize)
+                            .map(|texel| format!("{:.6}", depth_of(texel)))
+                            .collect();
+                        eprintln!(
+                            "target trace present {present} {what} {key:x} row {} from {x}: {}",
+                            y as usize + row,
+                            values.join(" ")
+                        );
+                    }
+                }
+                if let (Ok(regions), Some(directory)) = (
+                    super::debug_var("ECHORA_TARGET_TRACE_PGM"),
+                    super::debug_var_os("ECHORA_DUMP_DIR"),
+                ) {
+                    for region in regions.split(';') {
+                        let values: Vec<u32> = region
+                            .split(',')
+                            .filter_map(|value| value.trim().parse().ok())
+                            .collect();
+                        let [x, y, w, h, step] = values[..] else {
+                            continue;
+                        };
+                        let step = step.max(1);
+                        if x + w > width || y + h > height || level != 0 || layer != 0 {
+                            continue;
+                        }
+                        let (columns, rows) = (w / step, h / step);
+                        let mut image = format!("P5\n{columns} {rows}\n65535\n").into_bytes();
+                        // Row by row: a whole large map is never held at once.
+                        for row in 0..rows {
+                            let bytes = backend.renderer.read_target_region_bytes(
+                                key,
+                                size,
+                                Some([x, y + row * step, w, 1]),
+                            )?;
+                            for column in 0..columns {
+                                let at = (column * step * size) as usize;
+                                let value = depth_of(&bytes[at..at + size as usize]);
+                                let value = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                                image.extend_from_slice(&value.to_be_bytes());
+                            }
+                        }
+                        let directory = std::path::Path::new(&directory);
+                        let _ = std::fs::create_dir_all(directory);
+                        let _ = std::fs::write(
+                            directory.join(format!("trace-{key:x}-{present}-{x}-{y}.pgm")),
+                            image,
+                        );
+                    }
+                }
+                eprintln!(
+                    "target trace present {present} {what} wrote {key:x} level {level} layer {layer} {width}x{height} {format:?}: too large for a full readback (rectangles only)"
+                );
+                continue;
+            }
             let texels = match backend.renderer.read_target_slice(key, level, layer) {
                 Ok(texels) => texels,
                 Err(error) => {

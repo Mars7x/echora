@@ -4448,11 +4448,29 @@ impl Renderer {
     /// Level 0 of a color target as its own format's bytes, rows packed:
     /// `texel_bytes` is that format's texel size, which the caller knows.
     pub fn read_target_bytes(&mut self, key: u64, texel_bytes: u32) -> Result<Vec<u8>, String> {
+        self.read_target_region_bytes(key, texel_bytes, None)
+    }
+
+    /// `read_target_bytes` of the rectangle `rect` (x, y, width, height in
+    /// texels, clipped to the target) only, row after row: a few texels of
+    /// a large target without its whole readback.
+    pub fn read_target_region_bytes(
+        &mut self,
+        key: u64,
+        texel_bytes: u32,
+        rect: Option<[u32; 4]>,
+    ) -> Result<Vec<u8>, String> {
         let key = self.unscaled_copy(key)?;
-        let (image, width, height, format) = {
+        let (image, full_width, full_height, format) = {
             let target = self.targets.get(&key).ok_or("no such target")?;
             (target.image, target.width, target.height, target.format)
         };
+        let [x, y, width, height] = rect.unwrap_or([0, 0, full_width, full_height]);
+        let (x, y) = (x.min(full_width), y.min(full_height));
+        let (width, height) = (width.min(full_width - x), height.min(full_height - y));
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
         // Depth targets: their depth aspect (2 bytes per texel for D16, 4
         // for the others: a float for the D32 formats, the depth in the
         // low 24 bits for D24).
@@ -4477,6 +4495,11 @@ impl Renderer {
                 mip_level: 0,
                 base_array_layer: 0,
                 layer_count: 1,
+            },
+            image_offset: vk::Offset3D {
+                x: x as i32,
+                y: y as i32,
+                z: 0,
             },
             image_extent: vk::Extent3D {
                 width,
