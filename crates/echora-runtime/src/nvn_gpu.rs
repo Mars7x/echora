@@ -6058,7 +6058,8 @@ impl Nvn {
         // Instanced and quad draws (ECHORA_GPU_NO_INSTANCED skips them,
         // debugging). The counts the application passes are recorded: 1 to
         // 256 instances from base 0 in gameplay, confirming the argument
-        // order; implausible counts are refused.
+        // order, and 4,112 to 5,136 for the forest's ground cover (moss and
+        // grass blades); implausible counts are refused.
         let new_kind =
             instances != 1 || first_instance != 0 || quads || command.name.ends_with("Instanced");
         if new_kind {
@@ -6087,7 +6088,7 @@ impl Nvn {
                     command.name
                 ));
             }
-            if instances > 4096 || first_instance > 1 << 20 {
+            if instances > 1 << 20 || first_instance > 1 << 20 {
                 return Err(format!("{instances} instances from {first_instance}"));
             }
         }
