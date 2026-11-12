@@ -5891,7 +5891,14 @@ impl Nvn {
                             .unwrap()
                             .stat("stat: texture binding memo misses", 1);
                         let started = std::time::Instant::now();
-                        let texture = self.handle_texture(handle)?;
+                        let texture = self.handle_texture(handle).map_err(|error| {
+                            format!(
+                                "{error} ({:?} stage {:016x}, binding {})",
+                                stage.stage,
+                                keys_for_note.get(index).copied().unwrap_or(0),
+                                descriptor.binding
+                            )
+                        })?;
                         if let (Some(base), Some(size)) = (
                             self.texture_storage(texture),
                             self.texture_storage_size(texture),
