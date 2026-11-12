@@ -4827,7 +4827,9 @@ impl Nvn {
             if *stage_index != index {
                 continue;
             }
-            let (texels, width, height, depth) = match source {
+            // Every slice of a volume and every layer of an array (the
+            // simulator reads them all), slice or layer after slice.
+            let (texels, width, height, depth, layers) = match source {
                 TextureSource::Upload {
                     key,
                     width,
@@ -4836,26 +4838,22 @@ impl Nvn {
                     ..
                 } => {
                     renderer.texture_view_for(source)?;
-                    let depth = match shape {
-                        ImageShape::D3 { depth } => *depth,
-                        _ => 1,
-                    };
+                    let (depth, layers) = (shape.depth(), shape.layers());
                     let mut texels = Vec::new();
-                    for slice in 0..depth {
+                    for slice in 0..depth.max(layers) {
                         texels.extend(renderer.read_upload_slice(*key, 0, slice)?);
                     }
-                    (texels, *width, *height, depth)
+                    (texels, *width, *height, depth, layers)
                 }
                 TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                     let target = renderer.existing_target(*key).ok_or("no such target")?;
                     let (width, height) = (target.width, target.height);
-                    // Every slice of a volume (the simulator reads them all).
-                    let depth = target.shape.depth();
+                    let (depth, layers) = (target.shape.depth(), target.shape.layers());
                     let mut texels = Vec::new();
-                    for slice in 0..depth {
+                    for slice in 0..depth.max(layers) {
                         texels.extend(renderer.read_target_slice(*key, 0, slice)?);
                     }
-                    (texels, width, height, depth)
+                    (texels, width, height, depth, layers)
                 }
             };
             let bytes: Vec<u8> = texels
@@ -4865,7 +4863,7 @@ impl Nvn {
             write(format!("image-0-{binding}.bin"), &bytes)?;
             write(
                 format!("image-0-{binding}.txt"),
-                format!("{width} {height} {depth} 1\n").as_bytes(),
+                format!("{width} {height} {depth} {layers}\n").as_bytes(),
             )?;
         }
         Ok(())
@@ -4885,24 +4883,25 @@ impl Nvn {
         for (binding, source) in read {
             eprintln!("dispatch dump {key:016x}: reading binding {binding} from {source:?}");
             let mut one = || -> Result<(), String> {
-                // Every slice of a volume (the simulator reads them all).
-                let depth;
+                // Every slice of a volume and every layer of an array (the
+                // simulator reads them all).
+                let (depth, layers);
                 let texels = match source {
                     TextureSource::Upload { key, shape, .. } => {
                         renderer.texture_view_for(source)?;
-                        depth = shape.depth();
+                        (depth, layers) = (shape.depth(), shape.layers());
                         let mut texels = Vec::new();
-                        for slice in 0..depth {
+                        for slice in 0..depth.max(layers) {
                             texels.extend(renderer.read_upload_slice(*key, 0, slice)?);
                         }
                         texels
                     }
                     TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
-                        depth = renderer
-                            .existing_target(*key)
-                            .map_or(1, |target| target.shape.depth());
+                        (depth, layers) = renderer.existing_target(*key).map_or((1, 1), |target| {
+                            (target.shape.depth(), target.shape.layers())
+                        });
                         let mut texels = Vec::new();
-                        for slice in 0..depth {
+                        for slice in 0..depth.max(layers) {
                             texels.extend(renderer.read_target_slice(*key, 0, slice)?);
                         }
                         texels
@@ -4915,7 +4914,7 @@ impl Nvn {
                         .map(|target| (target.width, target.height))
                         .ok_or("no such target")?,
                 };
-                let count = (width * height * depth) as usize;
+                let count = (width * height * depth.max(layers)) as usize;
                 let bytes: Vec<u8> = texels
                     .iter()
                     .take(count)
@@ -4925,7 +4924,7 @@ impl Nvn {
                     .map_err(|error| error.to_string())?;
                 std::fs::write(
                     directory.join(format!("image-0-{binding}.txt")),
-                    format!("{width} {height} {depth} 1\n"),
+                    format!("{width} {height} {depth} {layers}\n"),
                 )
                 .map_err(|error| error.to_string())
             };
