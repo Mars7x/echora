@@ -2119,6 +2119,7 @@ impl Nvn {
                     target.width,
                     target.height,
                     depth,
+                    target.shape.layers(),
                     level,
                 );
                 let level_extent = (
@@ -2473,7 +2474,7 @@ impl Nvn {
                 for y in 0..height {
                     for x in 0..width {
                         let offset = crate::nvn_format::block_linear_offset(
-                            info, width, height, depth, x, y, z,
+                            info, width, height, depth, 1, x, y, z,
                         ) as usize;
                         if let Some(texel) = table.get_mut(offset..offset + 4) {
                             texel.copy_from_slice(&[
@@ -2515,9 +2516,11 @@ impl Nvn {
                 level_width.div_ceil(info.block_width),
                 level_height.div_ceil(info.block_height),
             );
-            let level_offset =
-                crate::nvn_format::block_linear_level_offset(info, width, height, depth, level);
-            let level_shape = crate::nvn_format::level_block_shape(info, height, depth, level);
+            let level_offset = crate::nvn_format::block_linear_level_offset(
+                info, width, height, depth, layers, level,
+            );
+            let level_shape =
+                crate::nvn_format::level_block_shape(info, height, depth, layers, level);
             let row_bytes = columns as usize * block;
             for layer in 0..layers {
                 let layer_base = u64::from(layer) * layer_stride + level_offset;

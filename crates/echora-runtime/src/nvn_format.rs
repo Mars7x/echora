@@ -166,9 +166,16 @@ pub struct BlockShape {
 /// the thresholds 16/32/64/128 GOB rows; 3D textures one GOB high and 16
 /// deep, halved while the depth fits in half (rules from a public
 /// recompilation of this build, checked there against the game's own
-/// texture data).
-pub fn base_block_shape(format: FormatInfo, height: u32, depth: u32) -> BlockShape {
+/// texture data); arrays and cubes of more than one layer one GOB high,
+/// each layer its own surface (the driver takes the layer count as the
+/// depth for the block height: the fog's 1360x1000 8-layer height map
+/// de-tiles to the console's image only this way, 0.95 correlation
+/// against 0.15-0.21 for the 2D rule's heights).
+pub fn base_block_shape(format: FormatInfo, height: u32, depth: u32, layers: u32) -> BlockShape {
     let rows = u64::from(height.max(1).div_ceil(format.block_height));
+    if depth <= 1 && layers > 1 {
+        return BlockShape { y: 0, z: 0 };
+    }
     if depth > 1 {
         let mut z = 4;
         while z > 0 && u64::from(depth) <= (1 << z) >> 1 {
@@ -190,8 +197,14 @@ pub fn base_block_shape(format: FormatInfo, height: u32, depth: u32) -> BlockSha
 /// The block shape of mip `level`: a level's block height halves while its
 /// rows fit in half the block; its depth halves once per level when its
 /// slices fit in half.
-pub fn level_block_shape(format: FormatInfo, height: u32, depth: u32, level: u32) -> BlockShape {
-    let base = base_block_shape(format, height, depth);
+pub fn level_block_shape(
+    format: FormatInfo,
+    height: u32,
+    depth: u32,
+    layers: u32,
+    level: u32,
+) -> BlockShape {
+    let base = base_block_shape(format, height, depth, layers);
     let mut z = base.z;
     for step in 1..=level {
         let d = u64::from((depth >> step).max(1));
@@ -216,25 +229,8 @@ pub fn block_linear_size(
     layers: u32,
     levels: u32,
 ) -> (u64, u64) {
-    let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
-    let base = base_block_shape(format, height, depth);
+    let (layer_size, base) = levels_size(format, width, height, depth, layers, levels);
     let (height_shift, depth_shift) = (base.y, base.z);
-    let mut layer_size = 0;
-    for level in 0..levels.max(1) {
-        let w = (width >> level).max(1);
-        let h = (height >> level).max(1);
-        let d = (depth >> level).max(1);
-        let rows = blocks(h, format.block_height);
-        let shape = level_block_shape(format, height, depth, level);
-        let (level_height_shift, level_depth_shift) = (shape.y, shape.z);
-        let row_bytes = align(
-            blocks(w, format.block_width) * u64::from(format.bytes_per_block),
-            GOB_WIDTH,
-        );
-        let block_rows = GOB_HEIGHT << level_height_shift;
-        let block_depth = 1u64 << level_depth_shift;
-        layer_size += row_bytes * align(rows, block_rows) * align(u64::from(d), block_depth);
-    }
     // Array layers start on a whole level-0 block.
     let block = GOB_SIZE << (height_shift + depth_shift);
     let layer_stride = if layers > 1 {
@@ -245,6 +241,37 @@ pub fn block_linear_size(
     (layer_stride * u64::from(layers.max(1)), GOB_SIZE)
 }
 
+/// One layer's bytes for mip levels 0..`levels`, each padded to its
+/// block, with the base block shape (`layers` decides it as above).
+fn levels_size(
+    format: FormatInfo,
+    width: u32,
+    height: u32,
+    depth: u32,
+    layers: u32,
+    levels: u32,
+) -> (u64, BlockShape) {
+    let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
+    let base = base_block_shape(format, height, depth, layers);
+    let mut layer_size = 0;
+    for level in 0..levels.max(1) {
+        let w = (width >> level).max(1);
+        let h = (height >> level).max(1);
+        let d = (depth >> level).max(1);
+        let rows = blocks(h, format.block_height);
+        let shape = level_block_shape(format, height, depth, layers, level);
+        let (level_height_shift, level_depth_shift) = (shape.y, shape.z);
+        let row_bytes = align(
+            blocks(w, format.block_width) * u64::from(format.bytes_per_block),
+            GOB_WIDTH,
+        );
+        let block_rows = GOB_HEIGHT << level_height_shift;
+        let block_depth = 1u64 << level_depth_shift;
+        layer_size += row_bytes * align(rows, block_rows) * align(u64::from(d), block_depth);
+    }
+    (layer_size, base)
+}
+
 /// Byte offset of mip level `level` within a block-linear surface (levels
 /// follow each other, each padded to its own block size).
 pub fn block_linear_level_offset(
@@ -252,12 +279,13 @@ pub fn block_linear_level_offset(
     width: u32,
     height: u32,
     depth: u32,
+    layers: u32,
     level: u32,
 ) -> u64 {
     if level == 0 {
         return 0;
     }
-    block_linear_size(format, width, height, depth, 1, level).0
+    levels_size(format, width, height, depth, layers, level).0
 }
 
 /// Byte offset of block (`x`, `y`, `z`) (in format blocks; `z` in slices)
@@ -274,11 +302,12 @@ pub fn block_linear_offset(
     width: u32,
     height: u32,
     depth: u32,
+    layers: u32,
     x: u32,
     y: u32,
     z: u32,
 ) -> u64 {
-    let shape = base_block_shape(format, height, depth);
+    let shape = base_block_shape(format, height, depth, layers);
     block_linear_offset_in(format, width, height, shape, x, y, z)
 }
 
@@ -379,7 +408,7 @@ mod tests {
                         (height >> level).max(1),
                         (depth >> level).max(1),
                     );
-                    let shape = level_block_shape(format, height, depth, level);
+                    let shape = level_block_shape(format, height, depth, 1, level);
                     let rows = h.div_ceil(format.block_height);
                     for z in 0..d {
                         for y in 0..rows {
@@ -405,10 +434,10 @@ mod tests {
         let bytes = format.bytes_per_block;
         for x in 0..96u32 {
             let run = block_linear_run(format, x);
-            let start = block_linear_offset(format, 96, 32, 1, x, 5, 0);
+            let start = block_linear_offset(format, 96, 32, 1, 1, x, 5, 0);
             for step in 0..run {
                 assert_eq!(
-                    block_linear_offset(format, 96, 32, 1, x + step, 5, 0),
+                    block_linear_offset(format, 96, 32, 1, 1, x + step, 5, 0),
                     start + u64::from(step * bytes)
                 );
             }
@@ -425,13 +454,13 @@ mod tests {
             block_height: 4,
             bytes_per_block: 16,
         };
-        assert_eq!(block_linear_level_offset(format, 1024, 2048, 1, 0), 0);
+        assert_eq!(block_linear_level_offset(format, 1024, 2048, 1, 1, 0), 0);
         assert_eq!(
-            block_linear_level_offset(format, 1024, 2048, 1, 1),
+            block_linear_level_offset(format, 1024, 2048, 1, 1, 1),
             256 * 16 * 512
         );
         let two = block_linear_size(format, 1024, 2048, 1, 1, 2).0;
-        assert_eq!(block_linear_level_offset(format, 1024, 2048, 1, 2), two);
+        assert_eq!(block_linear_level_offset(format, 1024, 2048, 1, 1, 2), two);
     }
 
     #[test]
@@ -456,24 +485,33 @@ mod tests {
         // Switch 2 swizzle: byte 16 of row 0 is 64 bytes in; row 1 starts
         // 16 bytes in, row 2 at 32 and row 4 at 128; byte 32 of row 0 opens
         // the second half-GOB.
-        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 4, 0, 0), 64);
-        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 0, 1, 0), 16);
-        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 8, 0, 0), 256);
-        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 0, 2, 0), 32);
-        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 0, 4, 0), 128);
+        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 1, 4, 0, 0), 64);
+        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 1, 0, 1, 0), 16);
+        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 1, 8, 0, 0), 256);
+        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 1, 0, 2, 0), 32);
+        assert_eq!(block_linear_offset(rgba8, 64, 8, 1, 1, 0, 4, 0), 128);
         assert_eq!(
-            block_linear_offset(rgba8, 64, 8, 1, 12, 7, 0),
+            block_linear_offset(rgba8, 64, 8, 1, 1, 12, 7, 0),
             256 + 128 + 64 + 32 + 16
         );
         // 64x16 RGBA8: 256-byte rows are four GOBs wide; the block holds two
         // GOBs vertically, so row 8 is the second GOB of the first block.
-        assert_eq!(block_linear_offset(rgba8, 64, 16, 1, 0, 8, 0), 512);
-        assert_eq!(block_linear_offset(rgba8, 64, 16, 1, 16, 0, 0), 1024);
+        assert_eq!(block_linear_offset(rgba8, 64, 16, 1, 1, 0, 8, 0), 512);
+        assert_eq!(block_linear_offset(rgba8, 64, 16, 1, 1, 16, 0, 0), 1024);
         // 16x8x4 RGBA8: one GOB per slice, four slices per block (depth
         // shift 2), so slice 2 is the third GOB of the only block.
-        assert_eq!(block_linear_offset(rgba8, 16, 8, 4, 0, 0, 2), 1024);
+        assert_eq!(block_linear_offset(rgba8, 16, 8, 4, 1, 0, 0, 2), 1024);
         assert_eq!(block_linear_size(rgba8, 16, 8, 4, 1, 1).0, 2048);
         // Two layers of a 4x4 texture: each layer starts on a GOB.
         assert_eq!(block_linear_size(rgba8, 4, 4, 1, 2, 1).0, 1024);
+        // Arrays: one-GOB-high blocks whatever the height (the 2D rule
+        // gives a 1000-row texture 16-GOB blocks).
+        let r16 = info(6).unwrap();
+        assert_eq!(base_block_shape(r16, 1000, 1, 1), BlockShape { y: 4, z: 0 });
+        assert_eq!(base_block_shape(r16, 1000, 1, 8), BlockShape { y: 0, z: 0 });
+        assert_eq!(
+            block_linear_offset(r16, 1360, 1000, 1, 8, 0, 8, 0),
+            2752 * 8
+        );
     }
 }

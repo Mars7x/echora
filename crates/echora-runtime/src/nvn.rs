@@ -4060,7 +4060,7 @@ impl Nvn {
             && bytes != 0
             && 16 % bytes == 0
         {
-            let shape = crate::nvn_format::level_block_shape(info, height, 1, 0);
+            let shape = crate::nvn_format::level_block_shape(info, height, 1, 1, 0);
             let size = crate::nvn_format::block_linear_size(info, width, height, 1, 1, 1).0;
             let mut tiled = vec![0u8; size as usize];
             core.memory
@@ -4134,6 +4134,7 @@ impl Nvn {
                                 width,
                                 height,
                                 depth,
+                                layers,
                                 x,
                                 ry / bh + row,
                                 z,
