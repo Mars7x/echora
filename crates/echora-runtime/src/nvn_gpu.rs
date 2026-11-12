@@ -5225,6 +5225,10 @@ impl Nvn {
             return Ok(());
         }
         let present = self.presented_frames;
+        let storages: Vec<u64> = written
+            .iter()
+            .map(|key| self.texture_storage(*key).unwrap_or(0))
+            .collect();
         let backend = self.gpu.as_mut().unwrap();
         for (index, &key) in written.iter().enumerate() {
             // The (level, layer) a draw rendered into (level 0, layer 0
@@ -5292,8 +5296,8 @@ impl Nvn {
                 })
                 .map_or(String::new(), |texel| format!(" pixel {texel:?}"));
             eprintln!(
-                "target trace present {present} {what} wrote {key:x} level {level} layer {layer} {width}x{height} {format:?}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}{slices}",
-                mean[0], mean[1], mean[2], mean[3]
+                "target trace present {present} {what} wrote {key:x} level {level} layer {layer} {width}x{height} {format:?} @{:x}: mean {:.4} {:.4} {:.4} {:.4}, {nonfinite} not finite{pixel}{slices}",
+                storages[index], mean[0], mean[1], mean[2], mean[3]
             );
         }
         Ok(())
