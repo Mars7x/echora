@@ -402,6 +402,10 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// Draws into each target since the last present (the capture log
+    /// shows the presented texture's).
+    #[serde(skip)]
+    frame_target_draws: HashMap<u64, u64>,
     /// Work skipped as "rendering disabled" before the last present: the
     /// capture log shows each captured frame's own.
     #[serde(skip)]
@@ -2462,14 +2466,15 @@ impl Nvn {
                         };
                         if let Some(image) = image {
                             eprintln!(
-                                "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?} disabled this frame {}",
+                                "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?} disabled this frame {} draws into it {}",
                                 self.presented_frames,
                                 image.width,
                                 image.height,
                                 image.texels.iter().map(|texel| texel[0] + texel[1] + texel[2]).sum::<f32>()
                                     / (3 * image.texels.len().max(1)) as f32,
                                 self.forced_waits,
-                                disabled - self.disabled_before_present
+                                disabled - self.disabled_before_present,
+                                self.frame_target_draws.get(&texture).copied().unwrap_or(0)
                             );
                             let directory = std::path::Path::new(&directory);
                             std::fs::create_dir_all(directory).map_err(|error| {
@@ -2483,6 +2488,7 @@ impl Nvn {
                         }
                     }
                 }
+                self.frame_target_draws.clear();
                 self.disabled_before_present = self
                     .skipped_work
                     .get("rendering disabled")

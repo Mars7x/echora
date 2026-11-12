@@ -7144,6 +7144,9 @@ impl Nvn {
             .copied()
             .filter(|key| *key != 0)
             .collect();
+        for key in &colors_written {
+            *self.frame_target_draws.entry(*key).or_default() += 1;
+        }
         let color_places: Vec<(u32, u32)> = draw
             .colors
             .iter()
