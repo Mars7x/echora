@@ -640,6 +640,12 @@ impl Nvn {
         layer: u32,
         color: [u32; 4],
     ) -> Result<(), String> {
+        // A texture object over one level of another target clears that
+        // target's level, as draws into it render there.
+        let (texture, level) = match self.resolve_target(texture) {
+            Some((key, base)) if key != texture => (key, base + level),
+            _ => (texture, level),
+        };
         self.ensure_render_target(texture)?;
         let scissor = self.render.scissor;
         let backend = self.gpu.as_mut().unwrap();
