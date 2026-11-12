@@ -2500,17 +2500,25 @@ impl Nvn {
         }
         // ECHORA_GPU_RAW_DUMP=<storage hex>[,...] with ECHORA_DUMP_DIR
         // (debugging): those textures' storage bytes as read for upload,
-        // with the builder properties that decide their layout.
+        // with the builder properties that decide their layout ("packaged":
+        // every texture with a packaged layout, once each).
         if let (Ok(wanted), Some(directory)) = (
             super::debug_var("ECHORA_GPU_RAW_DUMP"),
             super::debug_var_os("ECHORA_DUMP_DIR"),
-        ) && wanted
-            .split(',')
-            .any(|item| u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(base))
-        {
+        ) && wanted.split(',').any(|item| {
+            u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(base)
+                || (item.trim() == "packaged"
+                    && self
+                        .object(texture, "Texture")
+                        .is_ok_and(|object| object.builder.contains_key("PackagedTextureLayout"))
+                    && !std::path::Path::new(&directory)
+                        .join(format!("raw-{base:x}.txt"))
+                        .exists())
+        }) {
             let directory = std::path::Path::new(&directory);
             let _ = std::fs::create_dir_all(directory);
             let _ = std::fs::write(directory.join(format!("raw-{base:x}-{frame}.bin")), &raw);
+            let _ = std::fs::write(directory.join(format!("raw-{base:x}.txt")), b"");
             let _ = std::fs::write(
                 directory.join(format!("raw-{base:x}-{frame}.txt")),
                 format!(
