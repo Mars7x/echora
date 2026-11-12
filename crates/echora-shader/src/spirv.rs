@@ -196,6 +196,7 @@ pub mod capability {
     pub const FLOAT64: u32 = 10;
     pub const INT64: u32 = 11;
     pub const IMAGE_GATHER_EXTENDED: u32 = 25;
+    pub const MIN_LOD: u32 = 42;
     pub const SAMPLED_1D: u32 = 43;
     pub const IMAGE_1D: u32 = 44;
     pub const IMAGE_BUFFER: u32 = 47;

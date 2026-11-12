@@ -2241,6 +2241,31 @@ impl Machine {
         {
             lambda += f64::from(f32::from_bits(bias[0] as u32));
         }
+        // MinLod (0x80): after the operands of the lower mask bits (Bias,
+        // Lod, Grad (two), ConstOffset, Offset, ConstOffsets, Sample).
+        if let Some(&mask) = args.get(mask_at)
+            && mask & 0x80 != 0
+        {
+            let before: usize = [
+                (1u32, 1usize),
+                (2, 1),
+                (4, 2),
+                (8, 1),
+                (0x10, 1),
+                (0x20, 1),
+                (0x40, 1),
+            ]
+            .iter()
+            .filter(|&&(bit, _)| mask & bit != 0)
+            .map(|&(_, count)| count)
+            .sum();
+            if let Some(least) = args
+                .get(mask_at + 1 + before)
+                .and_then(|id| invocation.values.get(id))
+            {
+                lambda = lambda.max(f64::from(f32::from_bits(least[0] as u32)));
+            }
+        }
         Some(lambda)
     }
 
@@ -8094,6 +8119,84 @@ mod tests {
     }
 
     #[test]
+    fn gradient_samples_of_every_dimension_read_their_coordinates() {
+        // TXD R4, R0 (coordinates, then the layer), R8 (each coordinate's
+        // d/dx and d/dy), handle c[0x0][0x40]: 1D (dimension 0), 3D (2) and
+        // 2D array (5), on textures whose texel holds its index, sampled
+        // nearest at level 0.
+        let txd = |dimension: u128| {
+            word(&[
+                (0, 12, 0xb6c),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 8),
+                (40, 14, 0x10),
+                (61, 3, dimension),
+                (64, 8, 255),
+                (72, 4, 0x1),
+                (81, 3, 7),
+            ])
+        };
+        let small = 0.01f32.to_bits();
+        // (dimension, Ra values, image (width, height, depth, layers), the
+        // texel expected).
+        let cases: [(u128, Vec<u32>, [u32; 4], f32); 3] = [
+            (0, vec![0.625f32.to_bits()], [4, 1, 1, 1], 2.0),
+            (
+                2,
+                vec![0.75f32.to_bits(), 0.25f32.to_bits(), 0.75f32.to_bits()],
+                [2, 2, 2, 1],
+                5.0,
+            ),
+            (
+                5,
+                vec![0.75f32.to_bits(), 0.75f32.to_bits(), 1],
+                [2, 2, 1, 2],
+                7.0,
+            ),
+        ];
+        for (dimension, a, [width, height, depth, layers], expected) in cases {
+            let mut program: Vec<u128> = a
+                .iter()
+                .enumerate()
+                .map(|(n, &value)| mov(n as u128, value))
+                .collect();
+            program.extend((8..14).map(|n| mov(n, small)));
+            program.push(txd(dimension));
+            program.push(EXIT);
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let (translated, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let texture = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap();
+            let count = width * height * depth * layers;
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, texture.binding),
+                    Image {
+                        width,
+                        height,
+                        depth,
+                        layers,
+                        texels: (0..count)
+                            .map(|n| [(n as f32).to_bits(), 0, 0, 0])
+                            .collect(),
+                    },
+                )]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let got = f32::from_bits(report.invocations[0][&registers[&4]][0] as u32);
+            assert_eq!(got, expected, "dimension {dimension}");
+        }
+    }
+
+    #[test]
     fn linear_depth_compares_weight_the_four_results() {
         // TEX.LZ.DC R4, R0 (x, y), R2 (reference): level 0 (λ 0, the mag
         // filter). Texel (x, y) of a 4 x 4 depth texture: 0.1 (x + y). At
@@ -8369,6 +8472,100 @@ mod tests {
     }
 
     #[test]
+    fn level_queries_of_arrays_drop_the_layer() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // R0 = layer 1; IPA R1, a[0x80]; IPA R2, a[0x84]; TMML R4 (2D array,
+        // handle c[0x0][0x40]), R0 (layer, x, y), mask 0x3: the level as 8.8
+        // fixed point, clamped and not, from the coordinates alone.
+        let ipa = |d: u128, address: u128| {
+            word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+                (81, 3, 7),
+            ])
+        };
+        let tmml = word(&[
+            (0, 12, 0xb69),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 255),
+            (40, 14, 0x10),
+            (61, 3, 5),
+            (64, 8, 255),
+            (72, 4, 3),
+            (81, 3, 7),
+        ]);
+        let code: Vec<_> = [mov(0, 1), ipa(1, 0x80), ipa(2, 0x84), tmml, EXIT]
+            .iter()
+            .map(|&raw| decode(raw))
+            .collect();
+        let mut imap = [Interpolation::Unused; 128];
+        imap[..2].fill(Interpolation::ScreenLinear);
+        let layout = Layout {
+            stage: Stage::Fragment,
+            header: Some(Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            }),
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.cbuf_offset == 0x40)
+            .unwrap()
+            .binding;
+        // An 8 x 8 array of two layers, sampled 0.25 apart in x and 0.5 in
+        // y (four level-0 texels a pixel): level 2 (with the layer taken as
+        // a coordinate, y would be lost and the level 1).
+        let quad: Vec<QuadPixel> = (0..4u32)
+            .map(|n| {
+                let (u, v) = (0.125 + (n % 2) as f32 * 0.25, 0.125 + (n / 2) as f32 * 0.5);
+                QuadPixel {
+                    frag_coord: [10.5 + (n % 2) as f32, 20.5 + (n / 2) as f32, 0.5, 1.0],
+                    locations: HashMap::from([(
+                        0,
+                        vec![u64::from(u.to_bits()), u64::from(v.to_bits()), 0, 0],
+                    )]),
+                    helper: false,
+                }
+            })
+            .collect();
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            images: HashMap::from([(
+                (0, binding),
+                Image {
+                    width: 8,
+                    height: 8,
+                    depth: 1,
+                    layers: 2,
+                    texels: vec![[0; 4]; 128],
+                },
+            )]),
+            quad,
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        for n in 0..4 {
+            let read = |r: u8| report.invocations[n][&registers[&r]][0] as u32;
+            assert_eq!((read(4), read(5)), (512, 512), "pixel {n}");
+        }
+    }
+
+    #[test]
     fn a_quad_s_coordinates_pick_its_implicit_level() {
         use crate::header::{Header, Interpolation};
         use echora_shader_abi::Stage;
@@ -8599,6 +8796,143 @@ mod tests {
         // Fetches: the texel itself, at its level.
         assert_eq!(read(13), 1.0);
         assert_eq!(read(14), 10.0);
+    }
+
+    #[test]
+    fn least_level_samples_take_their_clamp_from_the_layer_register() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+        // TEX.LC (mode 4) and TEX.LB.LC (mode 5) R4, Ra, Rb (unpacked, as
+        // NAK lays them out): Ra the least level (8.8 fixed point, bits
+        // 16-31; an array's layer in bits 0-15), then the coordinates; Rb
+        // the bias. A vertex program samples at max(bias or 0, least).
+        let tex = |dimension: u128, lod: u128, b: u128| {
+            word(&[
+                (0, 12, 0xb60),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, b),
+                (40, 14, 0x10),
+                (61, 3, dimension),
+                (64, 8, 255),
+                (72, 4, 1),
+                (81, 3, 7),
+                (87, 3, lod),
+            ])
+        };
+        let level = |side: u32, value: f32, layers: u32| Image {
+            width: side,
+            height: side,
+            depth: 1,
+            layers,
+            texels: (0..side * side * layers)
+                .map(|n| {
+                    [
+                        (value + (n / (side * side)) as f32 * 100.0).to_bits(),
+                        0,
+                        0,
+                        0,
+                    ]
+                })
+                .collect(),
+        };
+        let fixed = |least: f32| ((least * 256.0) as u32) << 16;
+        // (dimension, mode, Ra values, bias, expected).
+        let cases: [(u128, u128, Vec<u32>, f32, f32); 4] = [
+            (
+                1,
+                4,
+                vec![fixed(1.0), 0.5f32.to_bits(), 0.5f32.to_bits()],
+                0.0,
+                10.0,
+            ),
+            (
+                1,
+                5,
+                vec![fixed(1.0), 0.5f32.to_bits(), 0.5f32.to_bits()],
+                0.25,
+                10.0,
+            ),
+            (
+                1,
+                5,
+                vec![fixed(1.0), 0.5f32.to_bits(), 0.5f32.to_bits()],
+                2.0,
+                20.0,
+            ),
+            // 2D array, layer 1 of each level (texel + 100).
+            (
+                5,
+                4,
+                vec![fixed(2.0) | 1, 0.5f32.to_bits(), 0.5f32.to_bits()],
+                0.0,
+                120.0,
+            ),
+        ];
+        for (dimension, mode, a, bias, expected) in cases {
+            let mut program: Vec<u128> = a
+                .iter()
+                .enumerate()
+                .map(|(n, &value)| mov(n as u128, value))
+                .collect();
+            program.push(mov(8, bias.to_bits()));
+            program.push(tex(dimension, mode, if mode == 5 { 8 } else { 255 }));
+            program.push(EXIT);
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let layout = Layout {
+                stage: Stage::Vertex,
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let binding = translated
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap()
+                .binding;
+            let layers = if dimension == 5 { 2 } else { 1 };
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([((0, binding), level(4, 0.0, layers))]),
+                mips: HashMap::from([(
+                    (0, binding),
+                    vec![level(2, 10.0, layers), level(1, 20.0, layers)],
+                )]),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let got = f32::from_bits(report.invocations[0][&registers[&4]][0] as u32);
+            assert_eq!(
+                got, expected,
+                "dimension {dimension} mode {mode} bias {bias}"
+            );
+        }
+        // A fragment program samples implicitly with a MinLod operand.
+        let program = [
+            mov(0, fixed(1.0)),
+            mov(1, 0.5f32.to_bits()),
+            mov(2, 0.5f32.to_bits()),
+            tex(1, 4, 255),
+            EXIT,
+        ];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let layout = Layout {
+            stage: Stage::Fragment,
+            header: Some(Header {
+                stage: Stage::Fragment,
+                imap: [Interpolation::Unused; 128],
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            }),
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let translated = crate::compute::translate(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
     }
 
     #[test]

@@ -23,6 +23,7 @@ const OPERAND_BIAS: u32 = 0x1;
 const OPERAND_LOD: u32 = 0x2;
 const OPERAND_GRAD: u32 = 0x4;
 const OPERAND_OFFSET: u32 = 0x10;
+const OPERAND_MIN_LOD: u32 = 0x80;
 
 /// A view type: SPIR-V's dimension and arrayed flag, the runtime's
 /// texture type, and how many coordinates (array index included) it takes.
@@ -499,10 +500,11 @@ impl Emitter {
         view: &View,
     ) -> Result<Vec<u32>, Unsupported> {
         let fetch = texture.op == TextureOp::Fetch;
-        // Level modes: TEX implicit, zero, bias or explicit; TLD zero or
-        // explicit; TLD4 none.
+        // Level modes: TEX implicit, zero, bias, explicit, implicit with a
+        // least level (.LC) or biased with one (.LB.LC); TLD zero or
+        // explicit; TLD4 none (NAK's SM70 numbering, 0-5).
         let valid = match texture.op {
-            TextureOp::Sample => texture.lod <= 3,
+            TextureOp::Sample => texture.lod <= 5,
             TextureOp::Fetch => matches!(texture.lod, 1 | 3),
             _ => true,
         };
@@ -518,16 +520,48 @@ impl Emitter {
         if fetch && (view.dim == 3 || texture.depth_compare) {
             return Err(unsupported(index, "cube or depth texel fetch"));
         }
-        let level_value = texture.lod >= 2;
+        let level_value = matches!(texture.lod, 2 | 3 | 5);
+        // .LC: the least level in the high half of the register an array's
+        // layer takes (its low half), one of its own before the coordinates
+        // otherwise, as 8.8 fixed point (NAK: f2u32(min_lod * 256), packed
+        // by PRMT 0x1054 with the layer).
+        let clamp = texture.op == TextureOp::Sample && matches!(texture.lod, 4 | 5);
+        let extra = u32::from(clamp && !view.arrayed);
         let handle_value = texture.handle_value;
         let count = view.coordinates
+            + extra
             + u32::from(handle_value)
             + u32::from(level_value)
             + u32::from(texture.offsets)
             + 2 * u32::from(texture.per_tap)
             + u32::from(texture.depth_compare);
-        let values =
-            self.texture_values_split(texture, count, handle_value.then_some(view.coordinates));
+        // The .LC forms as NAK lays them out: unpacked (bit 60 clear), the
+        // least level and coordinates in Ra and the rest in Rb.
+        let values = self.texture_values_split(
+            texture,
+            count,
+            (handle_value || clamp).then_some(view.coordinates + extra),
+        );
+        let (values, least_level) = if clamp {
+            let first = values[0];
+            let sixteen = self.constant(16);
+            let fixed = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[first, sixteen]);
+            let fixed = self.value(op::CONVERT_U_TO_F, self.f32, &[fixed]);
+            let step = self.float_constant(1.0 / 256.0);
+            let level = self.value(op::F_MUL, self.f32, &[fixed, step]);
+            let values = if view.arrayed {
+                let mask = self.constant(0xffff);
+                let layer = self.value(op::BITWISE_AND, self.u32, &[first, mask]);
+                std::iter::once(layer)
+                    .chain(values[1..].iter().copied())
+                    .collect()
+            } else {
+                values[1..].to_vec()
+            };
+            (values, Some(level))
+        } else {
+            (values, None)
+        };
         let mut next = view.coordinates as usize;
         // TEX.B: the handle follows the coordinates, a value that may
         // differ across the warp.
@@ -575,8 +609,8 @@ impl Emitter {
                 .collect()
         });
         // Only fragment programs have derivatives for an implicit level.
-        let implicit =
-            self.stage == echora_shader_abi::Stage::Fragment && matches!(texture.lod, 0 | 2);
+        let implicit = self.stage == echora_shader_abi::Stage::Fragment
+            && matches!(texture.lod, 0 | 2 | 4 | 5);
         let coordinate = if fetch {
             if let Some(offsets) = &offsets {
                 for (n, &offset) in offsets.iter().enumerate() {
@@ -656,20 +690,29 @@ impl Emitter {
             }
             // A fragment program samples at the implicit level, biased.
             TextureOp::Sample if implicit => {
-                if texture.lod == 2 {
+                if matches!(texture.lod, 2 | 5) {
                     mask |= OPERAND_BIAS;
                     let bias = level_operand.unwrap_or_else(|| self.float_constant(0.0));
                     let bias = self.value(op::BITCAST, self.f32, &[bias]);
                     operands.push(bias);
                 }
+                if let Some(least) = least_level {
+                    self.module.capability(capability::MIN_LOD);
+                    mask |= OPERAND_MIN_LOD;
+                    operands.push(least);
+                }
             }
-            // Elsewhere a bias over level zero is that level.
+            // Elsewhere a bias over level zero is that level (no less than
+            // a least level).
             TextureOp::Sample => {
                 mask |= OPERAND_LOD;
-                let lod = match level_operand {
+                let mut lod = match level_operand {
                     Some(value) => self.value(op::BITCAST, self.f32, &[value]),
                     None => self.float_constant(0.0),
                 };
+                if let Some(least) = least_level {
+                    lod = self.glsl(self.f32, glsl::N_MAX, &[lod, least]);
+                }
                 operands.push(lod);
             }
             _ => {}
@@ -743,6 +786,9 @@ impl Emitter {
                 let mut level = self.value(op::COMPOSITE_EXTRACT, self.f32, &[query, 0]);
                 if mask & OPERAND_BIAS != 0 {
                     level = self.value(op::F_ADD, self.f32, &[level, operands[0]]);
+                }
+                if let Some(least) = least_level {
+                    level = self.glsl(self.f32, glsl::N_MAX, &[level, least]);
                 }
                 level
             });
@@ -871,11 +917,9 @@ impl Emitter {
         texture: &Texture,
         view: &View,
     ) -> Result<Vec<u32>, Unsupported> {
-        if self.stage != echora_shader_abi::Stage::Fragment || view.arrayed {
-            return Err(unsupported(
-                index,
-                "TMML outside a fragment program or on an array",
-            ));
+        // Only fragment programs have the derivatives a level comes from.
+        if self.stage != echora_shader_abi::Stage::Fragment {
+            return Err(unsupported(index, "TMML outside a fragment program"));
         }
         self.module.capability(capability::IMAGE_QUERY);
         // The coordinates: all in Ra when Rb is RZ, else half in each.
@@ -887,8 +931,11 @@ impl Emitter {
             self.texture_values(texture, view.coordinates)
         };
         let (sampled, _) = self.sampled_image(index, texture, view, false, None)?;
+        // An array's layer comes first (NAK gives it 0: the level does not
+        // depend on it); the query takes the coordinates alone.
         let floats: Vec<u32> = values
             .iter()
+            .skip(usize::from(view.arrayed))
             .map(|&value| self.value(op::BITCAST, self.f32, &[value]))
             .collect();
         let coordinate = self.vector(self.f32, &floats);
@@ -915,8 +962,13 @@ impl Emitter {
         texture: &Texture,
         view: &View,
     ) -> Result<Vec<u32>, Unsupported> {
-        if view.dim != 1 {
-            return Err(unsupported(index, "TXD other than 2D"));
+        // Ra: the coordinates, then an array's layer (bits 0-15; with
+        // offsets they would share its register, bits 16-31); Rb: each
+        // coordinate's x and y derivative in turn (as NAK lays TXD out,
+        // nak_nir_lower_tex.c). Offsets move a sample by texels of the level
+        // the gradients pick, which Vulkan only takes as constants.
+        if texture.offsets {
+            return Err(unsupported(index, "TXD with offsets"));
         }
         let read = |e: &mut Self, base: u8, n: u8| {
             if base == 255 {
@@ -926,20 +978,25 @@ impl Emitter {
                 e.value(op::BITCAST, e.f32, &[bits])
             }
         };
-        let (x, y) = (read(self, texture.a.0, 0), read(self, texture.a.0, 1));
-        let mut coordinates = vec![x, y];
+        let spatial = (view.coordinates - u32::from(view.arrayed)) as u8;
+        let mut coordinates: Vec<u32> = (0..spatial).map(|n| read(self, texture.a.0, n)).collect();
         if view.arrayed {
             let layer = if texture.a.0 == 255 {
                 self.constant(0)
             } else {
-                self.read_register(texture.a.0.saturating_add(2))
+                self.read_register(texture.a.0.saturating_add(spatial))
             };
+            let mask = self.constant(0xffff);
+            let layer = self.value(op::BITWISE_AND, self.u32, &[layer, mask]);
             coordinates.push(self.value(op::CONVERT_U_TO_F, self.f32, &[layer]));
         }
         let coordinate = self.vector(self.f32, &coordinates);
-        let d: Vec<u32> = (0..4).map(|n| read(self, texture.b.0, n)).collect();
-        let dx = self.vector(self.f32, &[d[0], d[2]]);
-        let dy = self.vector(self.f32, &[d[1], d[3]]);
+        let d: Vec<u32> = (0..2 * spatial)
+            .map(|n| read(self, texture.b.0, n))
+            .collect();
+        let dx: Vec<u32> = d.iter().step_by(2).copied().collect();
+        let dy: Vec<u32> = d.iter().skip(1).step_by(2).copied().collect();
+        let (dx, dy) = (self.vector(self.f32, &dx), self.vector(self.f32, &dy));
         let (sampled, _) = self.sampled_image(index, texture, view, false, None)?;
         let vec4 = self.module.ty(Type::Vector {
             component: self.f32,
