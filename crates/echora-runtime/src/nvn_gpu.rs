@@ -639,6 +639,7 @@ impl Nvn {
         level: u32,
         layer: u32,
         color: [u32; 4],
+        rect: Option<[i32; 4]>,
     ) -> Result<(), String> {
         // A texture object over one level of another target clears that
         // target's level, as draws into it render there.
@@ -647,7 +648,6 @@ impl Nvn {
             _ => (texture, level),
         };
         self.ensure_render_target(texture)?;
-        let scissor = self.render.scissor;
         let backend = self.gpu.as_mut().unwrap();
         backend.renderer.defined(texture);
         let value = vk::ClearColorValue {
@@ -655,7 +655,7 @@ impl Nvn {
         };
         backend
             .renderer
-            .clear_color_level(texture, level, layer, scissor, value)
+            .clear_color_level(texture, level, layer, rect, value)
     }
 
     /// ClearDepthStencil on the GPU: the masked-off aspects keep their

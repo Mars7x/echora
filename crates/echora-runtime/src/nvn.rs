@@ -3347,9 +3347,10 @@ impl Nvn {
                 ]);
                 Ok(())
             }
-            // ClearTexture: as ClearColor on the texture's level and layer
-            // (the view's bases), whole level; a region smaller than the
-            // level and partial masks are noted, not modeled.
+            // ClearTexture(cmd, view, region, color, mask): the view's level,
+            // the region's rectangle (not the scissor, which limits draws)
+            // and, in an array or cube, its layers z..z+depth after the
+            // view's base layer; partial masks are noted, not modeled.
             "nvnCommandBufferClearTexture" => {
                 let texture = command.x[1];
                 self.object(texture, "Texture").map_err(stop)?;
@@ -3362,26 +3363,40 @@ impl Nvn {
                 if command.x[5] as u32 & 0xf != 0xf {
                     self.gpu_note("masked texture clears are not modeled");
                 }
-                if captured.len() == 12 {
-                    let (width, height) = self.texture_extent(texture).map_err(stop)?;
+                // CopyRegion { x, y, z, width, height, depth }.
+                let (rect, layers) = if captured.len() == 12 {
                     let region = &captured[4..10];
-                    let whole = region[0] == 0
-                        && region[1] == 0
-                        && region[3] as u32 >= width >> level
-                        && region[4] as u32 >= height >> level;
-                    if !whole {
-                        self.gpu_note(
-                            "partial texture clears are not modeled (whole level cleared)",
-                        );
-                    }
-                }
+                    let target = self
+                        .object(texture, "Texture")
+                        .ok()
+                        .and_then(|object| object.builder.get("Target"))
+                        .map_or(1, |value| value.x[0]);
+                    let layered = matches!(target, 4 | 6 | 8 | 9);
+                    let layers = if layered {
+                        let (z, depth) = (region[2] as u32, (region[5] as u32).max(1));
+                        layer + z..layer + z + depth
+                    } else {
+                        layer..layer + 1
+                    };
+                    let rect = [
+                        region[0] as i32,
+                        region[1] as i32,
+                        region[3] as i32,
+                        region[4] as i32,
+                    ];
+                    (Some(rect), layers)
+                } else {
+                    (None, layer..layer + 1)
+                };
                 if level != 0 && !mip_targets() {
                     return Ok(());
                 }
                 if self.gpu().is_some() {
-                    return self
-                        .gpu_clear_color(texture, level, layer, color)
-                        .map_err(stop);
+                    for layer in layers {
+                        self.gpu_clear_color(texture, level, layer, color, rect)
+                            .map_err(stop)?;
+                    }
+                    return Ok(());
                 }
                 self.gpu_note("texture clears without the GPU are not modeled");
                 Ok(())
@@ -3422,8 +3437,10 @@ impl Nvn {
                         self.gpu_note("masked color clears are not modeled on the GPU");
                     }
                     let color = std::array::from_fn(|channel| command.captured[channel] as u32);
+                    // The scissor rectangle limits the clear.
+                    let scissor = self.render.scissor;
                     return self
-                        .gpu_clear_color(texture, level as u32, layer, color)
+                        .gpu_clear_color(texture, level as u32, layer, color, scissor)
                         .map_err(stop);
                 }
                 let (width, height) = self.texture_extent(texture).map_err(stop)?;
