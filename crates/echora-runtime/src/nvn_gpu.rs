@@ -4166,7 +4166,23 @@ impl Nvn {
             for pool in backend.resident.values_mut() {
                 let piece = range.start.max(pool.base)..range.end.min(pool.base + pool.size);
                 if piece.start < piece.end {
-                    add_range(&mut pool.gpu_dirty, piece);
+                    // Ranges the CPU wrote since (flushed, not yet uploaded)
+                    // are newer in guest memory: the mirror's bytes there
+                    // are older and stay on the GPU.
+                    let mut pieces = vec![piece];
+                    for newer in &pool.guest_dirty {
+                        pieces = pieces
+                            .into_iter()
+                            .flat_map(|piece| {
+                                let mut left = vec![piece.clone()];
+                                remove_range(&mut left, newer.clone());
+                                left
+                            })
+                            .collect();
+                    }
+                    for piece in pieces {
+                        add_range(&mut pool.gpu_dirty, piece);
+                    }
                 }
             }
         }
@@ -5107,31 +5123,35 @@ impl Nvn {
         if !(from..=to).contains(&self.presented_frames) {
             return Ok(());
         }
-        let Some((start, end)) = range.split_once('-').and_then(|(start, end)| {
-            let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
-            Some((parse(start)?, parse(end)?))
-        }) else {
-            return Err(format!("ECHORA_MEMORY_TRACE={range}: not START-END"));
-        };
-        self.resolve_gpu_written(core, start..end)?;
-        let bytes = self.gpu_bytes(core, start, end - start)?;
-        if self.memory_trace_last.as_ref() != Some(&bytes) {
-            let words: Vec<String> = bytes
-                .chunks_exact(4)
-                .take(16)
-                .map(|word| {
-                    format!(
-                        "{:08x}",
-                        u32::from_le_bytes([word[0], word[1], word[2], word[3]])
-                    )
-                })
-                .collect();
-            eprintln!(
-                "memory trace present {} after {what}: {start:#x}.. now {}",
-                self.presented_frames,
-                words.join(" ")
-            );
-            self.memory_trace_last = Some(bytes);
+        // START-END[,START-END...]: each range on its own.
+        for item in range.split(',') {
+            let Some((start, end)) = item.split_once('-').and_then(|(start, end)| {
+                let parse =
+                    |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+                Some((parse(start)?, parse(end)?))
+            }) else {
+                return Err(format!("ECHORA_MEMORY_TRACE={range}: not START-END"));
+            };
+            self.resolve_gpu_written(core, start..end)?;
+            let bytes = self.gpu_bytes(core, start, end - start)?;
+            if self.memory_trace_last.get(&start) != Some(&bytes) {
+                let words: Vec<String> = bytes
+                    .chunks_exact(4)
+                    .take(16)
+                    .map(|word| {
+                        format!(
+                            "{:08x}",
+                            u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "memory trace present {} after {what}: {start:#x}.. now {}",
+                    self.presented_frames,
+                    words.join(" ")
+                );
+                self.memory_trace_last.insert(start, bytes);
+            }
         }
         Ok(())
     }
