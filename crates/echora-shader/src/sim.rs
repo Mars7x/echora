@@ -9405,8 +9405,8 @@ mod tests {
             ..Inputs::default()
         });
         assert!(report.problems.is_empty(), "{:?}", report.problems);
-        for n in 0..4 {
-            let read = |r: u8| report.invocations[n][&registers[&r]][0] as u32;
+        for (n, invocation) in report.invocations.iter().enumerate().take(4) {
+            let read = |r: u8| invocation[&registers[&r]][0] as u32;
             assert_eq!((read(4), read(5)), (512, 512), "pixel {n}");
         }
     }

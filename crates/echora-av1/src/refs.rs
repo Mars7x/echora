@@ -111,11 +111,11 @@ impl RefState {
     /// that was decoded as `picture`.
     pub fn update(&mut self, h: &FrameHeader, seq_color: (bool, bool, u8), picture: PictureId) {
         let (subsampling_x, subsampling_y, bit_depth) = seq_color;
-        for i in 0..NUM_REF_FRAMES {
+        for (i, slot) in self.slots.iter_mut().enumerate().take(NUM_REF_FRAMES) {
             if h.refresh_frame_flags & (1 << i) == 0 {
                 continue;
             }
-            self.slots[i] = RefSlot {
+            *slot = RefSlot {
                 valid: true,
                 picture: Some(picture),
                 frame_id: h.current_frame_id,
