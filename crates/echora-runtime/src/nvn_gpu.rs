@@ -60,6 +60,9 @@ pub struct Backend {
     programs: HashMap<(u64, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
     pub notes: BTreeMap<String, u64>,
+    /// "stat: " counters by their static name (`stat`; merged into the
+    /// notes for the report by `notes_with_stats`).
+    stats: super::FastMap<&'static str, u64>,
     /// Draws described in ECHORA_GPU_LOG so far (the first few are).
     traced: u32,
     /// Draws probed (ECHORA_GPU_PROBE).
@@ -201,6 +204,7 @@ impl Backend {
             vertex_trace_addresses: Vec::new(),
             programs: HashMap::new(),
             notes: BTreeMap::new(),
+            stats: Default::default(),
             traced: 0,
             probed: 0,
             watched_pixel: HashMap::new(),
@@ -231,13 +235,18 @@ impl Backend {
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
     /// the run report; nothing is logged.
     pub(super) fn stat(&mut self, name: &'static str, amount: u64) {
-        // Called several times per draw: no allocation once a name exists.
-        match self.notes.get_mut(name) {
-            Some(total) => *total += amount,
-            None => {
-                self.notes.insert(name.into(), amount);
-            }
+        // Called dozens of times per draw: a hashed lookup of the static
+        // name (the notes are a string-ordered map thousands long).
+        *self.stats.entry(name).or_default() += amount;
+    }
+
+    /// The notes with the stat counters added in.
+    pub(super) fn notes_with_stats(&self) -> BTreeMap<String, u64> {
+        let mut notes = self.notes.clone();
+        for (&name, &amount) in &self.stats {
+            *notes.entry(name.to_string()).or_default() += amount;
         }
+        notes
     }
 
     /// Count a note; its first occurrence is appended to ECHORA_GPU_LOG
@@ -551,6 +560,7 @@ impl Nvn {
     pub(crate) fn reset_gpu_stats(&mut self) {
         if let Some(backend) = self.gpu.as_mut() {
             backend.notes.retain(|name, _| !name.starts_with("stat: "));
+            backend.stats.clear();
         }
     }
 
@@ -7688,23 +7698,29 @@ impl Nvn {
             })
             .unwrap_or([0.0, 1.0]);
         // Fixed-function state from the record-time snapshots.
-        let snapshot = |key: &str| -> BTreeMap<String, super::Args> {
+        // (Shared, not copied: a draw read five of them.)
+        static NO_STATE: BTreeMap<String, super::Args> = BTreeMap::new();
+        let snapshot = |key: &str| -> Arc<Vec<BTreeMap<String, super::Args>>> {
             self.render
                 .state
                 .get(key)
-                .and_then(|bind| bind.states.first().cloned())
+                .map(|bind| bind.states.clone())
                 .unwrap_or_default()
         };
         let arg = |props: &BTreeMap<String, super::Args>, key: &str, index: usize| {
             props.get(key).map(|args| args.x[index])
         };
-        let polygon = snapshot("BindPolygonState");
+        let polygon_states = snapshot("BindPolygonState");
+        let polygon = polygon_states.first().unwrap_or(&NO_STATE);
         // The polygon state the draw binds (its address) and the props taken
         // for it, with their element's offset from that address (a nonzero
         // offset is another object's bag: the bound one has none).
-        let depth_state = snapshot("BindDepthStencilState");
-        let color_state = snapshot("BindColorState");
-        let mask_state = snapshot("BindChannelMaskState");
+        let depth_states = snapshot("BindDepthStencilState");
+        let depth_state = depth_states.first().unwrap_or(&NO_STATE);
+        let color_states = snapshot("BindColorState");
+        let color_state = color_states.first().unwrap_or(&NO_STATE);
+        let mask_states = snapshot("BindChannelMaskState");
+        let mask_state = mask_states.first().unwrap_or(&NO_STATE);
         // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
         // index equal to `index` starts a new primitive. Vulkan restarts
         // at the index type's all-ones value only, so matching indices are
@@ -7840,7 +7856,9 @@ impl Nvn {
                 .then(|| self.stencil_faces(&depth_state)),
             // MultisampleState SetAlphaToCoverageEnable(state, enable).
             alpha_to_coverage: arg(
-                &snapshot("BindMultisampleState"),
+                snapshot("BindMultisampleState")
+                    .first()
+                    .unwrap_or(&NO_STATE),
                 "AlphaToCoverageEnable",
                 0,
             )
@@ -7887,7 +7905,8 @@ impl Nvn {
                 if let Some(enable) = color_state.get(&format!("BlendEnable/{target}")) {
                     blend.enable = enable.x[1] != 0 && !no_blend;
                 }
-                let blend_state = snapshot(&format!("BindBlendState/{target}"));
+                let blend_states = snapshot(&format!("BindBlendState/{target}"));
+                let blend_state = blend_states.first().unwrap_or(&NO_STATE);
                 if let Some(func) = blend_state.get("BlendFunc") {
                     let factors = func.x.map(blend_factor);
                     if let [Some(src), Some(dst), Some(src_alpha), Some(dst_alpha)] = factors {

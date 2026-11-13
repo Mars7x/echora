@@ -5264,7 +5264,7 @@ impl Nvn {
             "skipped_work": self.skipped_work,
             "forced_waits": self.forced_waits,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
-            "gpu_notes": self.gpu.as_ref().map(|backend| &backend.notes),
+            "gpu_notes": self.gpu.as_ref().map(|backend| backend.notes_with_stats()),
             "gpu_flushes": self.gpu.as_ref().map(|backend| {
                 [
                     backend.renderer.flushes,
