@@ -1448,6 +1448,13 @@ fn replay_chunk() -> Option<u32> {
     (chunk > 0).then_some(chunk)
 }
 
+/// `name` without `prefix` when it starts with it (`strip_prefix`: no
+/// substring searcher is built, unlike `trim_start_matches`, which every
+/// replayed command paid for several times).
+pub(crate) fn without_prefix<'a>(name: &'a str, prefix: &str) -> &'a str {
+    name.strip_prefix(prefix).unwrap_or(name)
+}
+
 /// Split "nvn<Kind><Rest>" into (kind, rest).
 fn split_name(name: &str) -> Option<(&'static str, &str)> {
     let body = name.strip_prefix("nvn")?;
@@ -1740,7 +1747,7 @@ impl Nvn {
                 }
                 let device = self.objects.get_mut(&this).filter(|o| o.kind == "Device");
                 let device = device.ok_or_else(|| invalid("device is not initialized".into()))?;
-                let property = name.trim_start_matches("nvnDeviceSet");
+                let property = without_prefix(&name, "nvnDeviceSet");
                 device.state.insert(property.into(), args);
                 return Ok(true);
             }
@@ -2178,7 +2185,7 @@ impl Nvn {
             // memory (inferred). Host command buffers record calls either way.
             | "nvnCommandBufferSetRecordingMode" => {
                 self.object(this, "CommandBuffer").map_err(invalid)?;
-                let property = name.trim_start_matches("nvnCommandBufferSet");
+                let property = without_prefix(&name, "nvnCommandBufferSet");
                 let object = self.objects.get_mut(&this).unwrap();
                 object.state.insert(property.into(), args);
                 return Ok(true);
@@ -2258,7 +2265,7 @@ impl Nvn {
                     let mut names: BTreeMap<&str, usize> = BTreeMap::new();
                     for command in &commands {
                         *names
-                            .entry(command.name.trim_start_matches("nvnCommandBuffer"))
+                            .entry(without_prefix(&command.name, "nvnCommandBuffer"))
                             .or_default() += 1;
                     }
                     let work: Vec<String> = names
@@ -2589,7 +2596,7 @@ impl Nvn {
                 return Ok(true);
             }
             "nvnSamplerFinalize" | "nvnTexturePoolFinalize" | "nvnSamplerPoolFinalize" => {
-                let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
+                let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
@@ -2794,8 +2801,7 @@ impl Nvn {
                         x[2]
                     )));
                 }
-                let kind = name
-                    .trim_start_matches("nvn")
+                let kind = without_prefix(&name, "nvn")
                     .trim_end_matches("Initialize");
                 let mut builder = BTreeMap::new();
                 builder.insert("Storage".to_string(), args);
@@ -2865,7 +2871,7 @@ impl Nvn {
                 if name != "nvnCommandBufferFinalize" {
                     self.texture_epoch += 1;
                 }
-                let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
+                let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
                 if let Some(identity) = self.texture_identity(this) {
                     self.finalized_storage.insert(this, identity);
@@ -3005,7 +3011,7 @@ impl Nvn {
             | "nvnTexturePoolSetDebugLabel"
             | "nvnSamplerPoolSetDebugLabel" => {
                 let (kind, rest) = split_name(name).unwrap();
-                let property = rest.trim_start_matches("Set");
+                let property = without_prefix(&rest, "Set");
                 let object = self
                     .objects
                     .get_mut(&this)
@@ -3084,7 +3090,7 @@ impl Nvn {
             | "nvnSyncFinalize"
             | "nvnQueueFinalize"
             | "nvnMemoryPoolFinalize" => {
-                let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
+                let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 // Destructors finalize embedded objects that may never have
                 // been initialized (main+0x3b61ab4 finalizes two buffers of
                 // every instance); the driver tolerates that, so it is a
@@ -3717,7 +3723,7 @@ impl Nvn {
                     let commands = commands.clone();
                     let index = *next;
                     let command = &commands[index];
-                    let rest = command.name.trim_start_matches("nvnCommandBuffer");
+                    let rest = without_prefix(&command.name, "nvnCommandBuffer");
                     if rest == "WaitEvent" && !self.event_wait_holds(command, core)? {
                         if !force {
                             return Ok(progressed);
@@ -3845,7 +3851,7 @@ impl Nvn {
             };
             let window = present("ECHORA_READBACK_LOG_FROM", 0)
                 ..=present("ECHORA_READBACK_LOG_TO", u64::MAX);
-            let rest = command.name.trim_start_matches("nvnCommandBuffer");
+            let rest = without_prefix(&command.name, "nvnCommandBuffer");
             if window.contains(&self.presented_frames)
                 && ["Copy", "Report", "Counter", "Query"]
                     .iter()
@@ -3896,7 +3902,7 @@ impl Nvn {
                 "command present {} queue {:x?} {} x {:x?}",
                 self.presented_frames,
                 self.render_queue,
-                command.name.trim_start_matches("nvnCommandBuffer"),
+                without_prefix(&command.name, "nvnCommandBuffer"),
                 &command.x[1..8]
             );
         }
@@ -4526,7 +4532,7 @@ impl Nvn {
                 Ok(())
             }
             name => {
-                let rest = name.trim_start_matches("nvnCommandBuffer");
+                let rest = without_prefix(&name, "nvnCommandBuffer");
                 // Bind{Textures,Images,UniformBuffers,StorageBuffers}[Deferred]
                 // (cmd, stage, first, count, array): one binding per slot,
                 // as the singular command would make it.
@@ -6146,7 +6152,7 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
     };
     // Plural binds read their array at record time (Deferred ones when the
     // work runs).
-    let rest = command.name.trim_start_matches("nvnCommandBuffer");
+    let rest = without_prefix(&command.name, "nvnCommandBuffer");
     if let Some((_, words)) = plural_bind(rest).filter(|_| !rest.ends_with("Deferred")) {
         let count = (command.x[3] as usize).min(32);
         command.captured = read_u64s(command.x[4], count * words)?;

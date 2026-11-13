@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use crate::fast_map::FastMap;
+
 use ash::vk;
 
 use crate::draw::ImageShape;
@@ -193,20 +195,20 @@ pub struct Renderer {
     fence: vk::Fence,
     recording: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
-    targets: HashMap<u64, Target>,
+    targets: FastMap<u64, Target>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
-    uploads: HashMap<u64, (u64, Target)>,
+    uploads: FastMap<u64, (u64, Target)>,
     /// The texel bytes each upload was made from: a caller may drop its
     /// copy once the image holds them (`has_upload`), and `with_texels`
     /// reads them back from the image when needed again.
-    upload_lengths: HashMap<u64, u64>,
+    upload_lengths: FastMap<u64, u64>,
     /// Uploads forgotten while recorded work may still sample them:
     /// destroyed after the next flush.
     retired_uploads: Vec<Target>,
     /// Texel buffers made from guest buffer textures (shaders read them as
     /// samplerBuffer), by upload key: the generation copied, the buffer and
     /// its view.
-    texel_buffers: HashMap<u64, (u64, HostBuffer, vk::BufferView)>,
+    texel_buffers: FastMap<u64, (u64, HostBuffer, vk::BufferView)>,
     /// Texel buffers (and page tables) replaced while recorded work may
     /// still read them; a page table has no view (null).
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
@@ -215,13 +217,13 @@ pub struct Renderer {
     labels: Vec<String>,
     /// Draws and dispatches recorded since the last submission.
     work_items: u32,
-    samplers: HashMap<SamplerKey, vk::Sampler>,
+    samplers: FastMap<SamplerKey, vk::Sampler>,
     /// Views of another type than an image's own (a 2D-array view of a 2D
     /// image, ...), by image and view type.
-    extra_views: HashMap<(vk::Image, i32), vk::ImageView>,
+    extra_views: FastMap<(vk::Image, i32), vk::ImageView>,
     /// Host memory imported as storage buffers (VK_EXT_external_memory_host),
     /// by page-aligned host address and length.
-    imported: HashMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
+    imported: FastMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
     /// The GPU page table (`set_page_table`): its buffer and the entries
     /// written there.
     page_table: Option<(HostBuffer, Vec<u64>)>,
@@ -253,10 +255,10 @@ pub struct Renderer {
     retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Storage buffers kept on the GPU between dispatches (see
     /// `resident_buffer`), by the caller's key: buffer, memory, size.
-    resident: HashMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
+    resident: FastMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
     /// How each sampled view was made (image, type, format, range), so a
     /// swizzled copy of it can be made.
-    view_infos: HashMap<vk::ImageView, ViewInfo>,
+    view_infos: FastMap<vk::ImageView, ViewInfo>,
     /// Targets created since the caller last took them (to initialize).
     fresh_targets: Vec<u64>,
     /// Host-visible ring for per-draw data, reset after each flush.
@@ -520,17 +522,17 @@ impl Renderer {
             fence,
             recording: false,
             memory_types,
-            targets: HashMap::new(),
-            uploads: HashMap::new(),
-            upload_lengths: HashMap::new(),
+            targets: FastMap::default(),
+            uploads: FastMap::default(),
+            upload_lengths: FastMap::default(),
             retired_uploads: Vec::new(),
-            texel_buffers: HashMap::new(),
+            texel_buffers: FastMap::default(),
             retired_texel_buffers: Vec::new(),
             labels: Vec::new(),
             work_items: 0,
-            samplers: HashMap::new(),
-            extra_views: HashMap::new(),
-            imported: HashMap::new(),
+            samplers: FastMap::default(),
+            extra_views: FastMap::default(),
+            imported: FastMap::default(),
             addressed: Vec::new(),
             superseded: Vec::new(),
             dropped_shared_span: false,
@@ -542,8 +544,8 @@ impl Renderer {
             udmabuf: None,
             shared_refused: Default::default(),
             retired_shared: Vec::new(),
-            resident: HashMap::new(),
-            view_infos: HashMap::new(),
+            resident: FastMap::default(),
+            view_infos: FastMap::default(),
             fresh_targets: Vec::new(),
             ring: HostBuffer::empty(),
             ring_used: 0,

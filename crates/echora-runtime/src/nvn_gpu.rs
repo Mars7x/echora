@@ -7378,7 +7378,7 @@ impl Nvn {
             if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
                 backend.note(format!(
                     "instanced draw {} instances {bucket} base instance {}",
-                    command.name.trim_start_matches("nvnCommandBuffer"),
+                    super::without_prefix(&command.name, "nvnCommandBuffer"),
                     if first_instance > 4096 {
                         "over 4096".to_string()
                     } else {

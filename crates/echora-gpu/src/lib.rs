@@ -10,6 +10,7 @@
 pub use ash;
 pub mod compute;
 pub mod draw;
+mod fast_map;
 pub mod loop_guard;
 mod occlusion;
 pub mod pool;
