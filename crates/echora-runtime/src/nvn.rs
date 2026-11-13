@@ -346,6 +346,9 @@ pub struct Nvn {
     pub calls: BTreeMap<String, u64>,
     /// ECHORA_NVN_PROFILE: host microseconds spent in each entry point.
     pub call_microseconds: BTreeMap<String, u64>,
+    /// ECHORA_NVN_PROFILE: replayed commands' (count, host microseconds)
+    /// by name.
+    pub replay_microseconds: BTreeMap<String, (u64, u64)>,
     /// Property bags of builders and builder-like structures (anything set up
     /// with `nvn<Kind>SetDefaults`), keyed by guest address. Their layout is
     /// host-private: the application touches them only through NVN calls.
@@ -3461,6 +3464,28 @@ impl Nvn {
     /// Execute one recorded command on the host. Commands that are not
     /// modeled stop with their name.
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
+        // ECHORA_NVN_PROFILE: replayed commands' host time too, under
+        // "replay <name>".
+        if debug_var_os("ECHORA_NVN_PROFILE").is_none() {
+            return self.execute_untimed(command, core);
+        }
+        let started = std::time::Instant::now();
+        let result = self.execute_untimed(command, core);
+        let micros = started.elapsed().as_micros() as u64;
+        match self.replay_microseconds.get_mut(&command.name) {
+            Some(total) => {
+                total.0 += 1;
+                total.1 += micros;
+            }
+            None => {
+                self.replay_microseconds
+                    .insert(command.name.clone(), (1, micros));
+            }
+        }
+        result
+    }
+
+    fn execute_untimed(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
         // ECHORA_READBACK_LOG (debugging; ECHORA_READBACK_LOG_FROM/_TO
         // presents): each copy, report, counter or query command as it
         // runs, with its arguments and captured words (what the GPU hands

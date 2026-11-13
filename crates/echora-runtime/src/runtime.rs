@@ -3079,6 +3079,7 @@ impl Machine {
                     self.services.reset_profile();
                     self.nvn.calls.clear();
                     self.nvn.call_microseconds.clear();
+                    self.nvn.replay_microseconds.clear();
                     self.nvn.reset_gpu_stats();
                     crate::host_profile::restart();
                 }
