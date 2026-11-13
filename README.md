@@ -27,8 +27,8 @@ game.
 ## Status
 
 In short: Echora runs the game's code and draws its first 3D scene with its
-own shader translator, close to how the console draws it, but slowly and
-without sound.
+own shader translator, close to how the console draws it, with sound, but
+still well below full speed.
 
 What works today:
 
@@ -42,24 +42,23 @@ What works today:
   shader stages the game has used in test runs so far. The old shader
   recompiler is no longer needed.
 - The first 3D scene is drawn: the forest floor with its ground cover,
-  plants, mist with shafts of light, the canopy, and the Great Deku Tree,
-  lit and shadowed by the game's own passes.
-- The game's threads run on up to six CPU cores by default.
+  plants, fireflies, mist with shafts of light, the canopy, and the Great
+  Deku Tree, lit and shadowed by the game's own passes.
+- Sound. The game's audio renderer is mixed, with its voices, mixes and
+  effects, and played through your sound device (the launcher turns it on).
+- The game's threads run on up to six CPU cores by default, and the game's
+  GPU commands are turned into Vulkan work on a thread of their own.
 - The launcher installs the game, changes settings and starts it, with a
   mouse, keyboard or controller.
 
 What doesn't work yet:
 
-- The first 3D scene still has faults. Part of the tree's roots show a
-  magenta placeholder pattern where their texture should be, the tree is
-  darker than it should be, subtitles and the speaker's name are not drawn,
-  and now and then a frame comes out black. Nothing past that scene has been
-  reached.
-- Sound. The game's audio renderer is not mixed or played yet, so there is
-  no sound.
+- The first 3D scene still has faults. The Great Deku Tree is darker than
+  it should be, the water is too red, and subtitles and the speaker's name
+  are not drawn. Nothing past that scene has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, decoded on the GPU, averages about 30 pictures per second, and the
-  first 3D scene runs at about 2.
+  movie, decoded on the GPU, averages about 52 pictures per second, and the
+  first 3D scene runs at about 7.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
@@ -90,20 +89,29 @@ public references and models of the hardware. It comes with a simulator that
 runs a translated program on recorded inputs, which is how the translator's
 output is checked against a reference without running the game.
 
-That translator now handles every shader the game has used so far, and the
-work has moved on to the first 3D scene: making each of the game's graphics
-calls do what it does on the console. Most of the scene's faults turned out
-to be small differences of that kind, such as how textures with several
-layers are laid out in memory, which blend factors exist, or how a sampler
-compares depths.
+That translator now handles every shader the game has used so far. The
+first 3D scene came next: making each of the game's graphics calls do what
+it does on the console. Most of the scene's faults turned out to be small
+differences of that kind, such as how textures with several layers are laid
+out in memory, which blend factors exist, or how a sampler compares depths.
+
+The work has now moved on to speed. Much of the time went into waiting
+rather than working: the CPU and GPU took turns instead of running side by
+side, one lock serialised the game's threads, and the GPU stopped to drain
+its work far more often than the game asked it to. Removing those waits
+took the opening movie from about 28 to about 52 pictures per second and the
+first 3D scene from about 2 to about 7 frames per second, with the frames
+checked against earlier ones after each step.
 
 Much of this work is general rather than specific to Ocarina of Time. The
 translator handles the Switch 2's GPU instructions on their own terms, and
 it will move to its own repository so other Switch 2 recompilation projects
 can use it.
 
-The next steps are finishing the first 3D scene, sound, and then speed:
-the opening movie and that scene at the console's 60 frames per second.
+The next step is the rest of the way to the console's 60 frames per
+second for the opening movie and that scene, mostly by making each of the
+game's draws cheaper to turn into Vulkan work. After that come the scene's
+last faults and gameplay.
 
 ## Approach
 

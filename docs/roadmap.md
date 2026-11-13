@@ -12,25 +12,25 @@ when the code for it does.
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with Echora's own Rust shader translator, and the internal render scale is applied; the resolution planner is not connected yet. |
 | 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler, and again on 2026-11-12 with Echora's own shader translator alone. |
-| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game; it gets past the New Game movie and draws its first 3D scene close to the console's, with a few faults left ([limitations](limitations.md)). There is no sound yet. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game; it gets past the New Game movie and draws its first 3D scene close to the console's, with a few faults left ([limitations](limitations.md)). The game's audio is mixed and played. |
 | 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 12. Performance | Reproducible measurements show gains without regressions. | In progress. With six cores and the movies decoded on the GPU, the opening movie averages about 30 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 2 frames per second now that all of it is drawn. |
+| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie averages about 52 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 7 frames per second (`ECHORA_PRESENT_RATE`), from about 28 and 2 before the waits between the CPU and GPU were removed. |
 | 13. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 14. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
 ## Next steps
 
-1. Finish the first scene after the New Game movie: the placeholder pattern
-   on the tree's roots, the tree's brightness, subtitles, and the frames
-   that come out black. Then carry on to gameplay.
-2. Sound: mix and play the game's audio renderer (voices, mixes, effects
-   and the output device).
-3. Speed, until the opening movie and the first scene run at the console's
-   60 frames per second: fewer and cheaper GPU submissions, less work per
-   NVN command, then the cost of the translated code.
+1. Speed, until the opening movie and the first scene run at the console's
+   60 frames per second: less work per draw when the game's commands are
+   replayed into Vulkan (the first scene's limit now), fewer uniform copies,
+   then the cost of the translated code.
+2. Finish the first scene after the New Game movie: the tree's brightness,
+   the water's colour, and subtitles. Then carry on to gameplay.
+3. Sound: the remaining audio renderer effects (delay, biquad filter) and
+   depop.
 4. Turn on the faster code generation in game builds once it is checked in
    game: inline vector arithmetic, branches that skip unused flags and
    floating-point status kept in locals, then structured control flow once
@@ -46,5 +46,6 @@ when the code for it does.
 7. Translate and compile every shader before the game starts, so nothing
    stutters while it runs. `echora shaders` already lists all 34,275 unique
    shader stages the game ships.
-8. Run the opening movie's neural-network filter on the GPU's matrix units
-   (cooperative matrices), its largest remaining cost per picture.
+8. Check the opening movie's neural-network filter, which runs on the GPU's
+   matrix units (cooperative matrices), against an exact emulation of the
+   console's tensor cores.

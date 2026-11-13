@@ -7,13 +7,11 @@ to be missing or incomplete.
 ## Gameplay and graphics
 
 - The game gets past the New Game movie into its first 3D scene, which is
-  drawn with its ground cover, plants, mist, canopy and the Great Deku Tree.
-  Known faults there: part of the tree's roots show a magenta placeholder
-  pattern (a texture the game fills piece by piece is left incomplete), the
-  tree is darker than on the console, subtitles and the speaker's name are
-  not drawn, and some presented frames are black. No gameplay has been
-  reached yet. Every unimplemented operation still stops the run with a
-  report.
+  drawn with its ground cover, plants, fireflies, mist, canopy and the Great
+  Deku Tree. Known faults there: the tree is darker than on the console, the
+  water is too red, and subtitles and the speaker's name are not drawn (their
+  text textures stay empty). No gameplay has been reached yet. Every
+  unimplemented operation still stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
@@ -32,19 +30,26 @@ to be missing or incomplete.
 
 ## Sound
 
-- There is no sound. The game's audio renderer is tracked (voices advance
-  through their buffers in real time) but nothing is mixed or played yet.
+- The game's audio renderer is mixed and played: wave buffers (PCM16, float,
+  ADPCM) are decoded and resampled, voices and mixes are routed through
+  splitters, and reverb, I3DL2 reverb and aux sends run on their mixes. Output
+  is opt-in from the command line (`ECHORA_AUDIO=1`); the launcher turns it
+  on. Depop, the delay and biquad filter effects, and Opus voices' reset are
+  not implemented yet.
+- Below full speed the game produces less audio than the device plays, so
+  sound in the first 3D scene breaks up. This should go away with speed.
 
 ## Performance
 
-- Runs are far below full speed. The console runs the game at 60 frames per
-  second; here the opening movie averages about 30 pictures per second and
-  the first 3D scene runs at about 2 frames per second.
+- Runs are below full speed. The console runs the game at 60 frames per
+  second; here the opening movie averages about 52 pictures per second and
+  the first 3D scene runs at about 7 frames per second.
 - Guest threads run on up to six host threads by default, one per
   application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
-  On six cores the first 3D scene runs about 2.9 times as fast as on one, and
-  three cores get most of that. More cores help little for now, because the
-  thread that turns the game's GPU commands into Vulkan works alone.
+  The game's submitted GPU work is replayed into Vulkan on a thread of its
+  own (`ECHORA_REPLAY_INLINE=1` replays it on the submitting thread, as
+  before). In the first 3D scene that replay is now the limit: about 1,000
+  draws a frame at around 60 to 80 microseconds each.
 - The faster code-generation options (`inline-vector`, `structured`,
   `fused-flags`) are off by default until they are checked in game.
 
