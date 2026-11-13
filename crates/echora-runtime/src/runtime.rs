@@ -3060,12 +3060,15 @@ impl Machine {
             .is_some()
             .then(std::time::Instant::now);
         // Calls under the machine lock (present, lookups) see all work
-        // replayed, before and after them.
-        while self.nvn.replay_paused() {
+        // replayed, before and after them; a queued present leaves the
+        // frame's work to the replay thread.
+        let queued_present =
+            name == "nvnQueuePresentTexture" && crate::nvn::Nvn::present_queued_mode();
+        while self.nvn.replay_paused() && !queued_present {
             self.nvn.resume_replay(&mut guest)?;
         }
         let handled = self.nvn.call(&name, &mut guest)?;
-        while self.nvn.replay_paused() {
+        while self.nvn.replay_paused() && !queued_present {
             self.nvn.resume_replay(&mut guest)?;
         }
         if let Some(started) = profile {
@@ -5387,8 +5390,19 @@ impl Worker {
                     Some(crate::nvn::HostEntry::Proc(name))
                         if needs_replayed(&name, &self.core.cpu.regs)
                 ));
+        // A queued present waits only for the previous present's work.
+        let queued_present = machine_call
+            && crate::nvn::Nvn::present_queued_mode()
+            && matches!(
+                nvn.entry(pc),
+                Some(crate::nvn::HostEntry::Proc(name)) if name == "nvnQueuePresentTexture"
+            );
         let waited = (thread && settle && nvn.replay_paused()).then(std::time::Instant::now);
-        while crate::nvn::Nvn::replay_async() && nvn.replay_paused() && (settle || !thread) {
+        while crate::nvn::Nvn::replay_async()
+            && nvn.replay_paused()
+            && (settle || !thread)
+            && (!queued_present || nvn.present_pending())
+        {
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,

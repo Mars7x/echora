@@ -178,6 +178,9 @@ enum QueueItem {
     Fence { sync: u64, args: Args },
     /// A WaitSync: later work waits for the sync.
     WaitSync { sync: u64 },
+    /// A present (with a replay thread): the frame is shown once earlier
+    /// work has run.
+    Present { texture: u64 },
 }
 
 /// The ECHORA_* environment, read once: the draw path consulted debug
@@ -2941,11 +2944,22 @@ impl Nvn {
                 self.share_new_pools(core);
                 self.present_lap("stat: present us sharing pools", &mut since);
                 self.object(this, "Queue").map_err(invalid)?;
-                // The presented image needs the work queued before it.
-                self.pump_queues(core)?;
-                self.present_lap("stat: present us running queues", &mut since);
-                self.drain_queues(core)?;
-                self.present_lap("stat: present us draining queues", &mut since);
+                // The presented image needs the work queued before it (a
+                // queued present: the previous present's, so the replay is
+                // at most a frame behind).
+                if Self::present_queued_mode() {
+                    while self.present_pending() {
+                        self.pump_queues(core)?;
+                        if self.present_pending() {
+                            self.drain_queues(core)?;
+                        }
+                    }
+                } else {
+                    self.pump_queues(core)?;
+                    self.present_lap("stat: present us running queues", &mut since);
+                    self.drain_queues(core)?;
+                    self.present_lap("stat: present us draining queues", &mut since);
+                }
                 let window = self.object(x[1], "Window").map_err(invalid)?;
                 let index = x[2] as u32;
                 let texture = window
@@ -2953,159 +2967,18 @@ impl Nvn {
                     .get(&format!("Texture{index}"))
                     .ok_or_else(|| invalid(format!("window texture {index} does not exist")))?
                     .x[0];
-                if debug_var_os("ECHORA_GPU_FLOW").is_some() {
-                    let note = format!("flow present queue {this:x} texture {texture:x}");
-                    self.gpu_note(note);
+                // With a replay thread the present is queued behind the
+                // frame's work, as the console queues it, and the frame is
+                // shown when the replay reaches it; the caller goes on.
+                if Self::present_queued_mode() && !self.replaying && self.frame_capture.is_none() {
+                    self.pending
+                        .entry(this)
+                        .or_default()
+                        .push_back(QueueItem::Present { texture });
+                    self.pump_queues_handed_on(core)?;
+                    return Ok(true);
                 }
-                if !self.replaying && self.frame_capture.is_some() {
-                    self.replay_captured_frame(core, texture).map_err(stop)?;
-                }
-                self.presented_frames += 1;
-                self.arm_call_watch();
-                // ECHORA_PRESENT_RATE=N: every N presents, the count, the
-                // seconds since the first present and the rate over those N.
-                if let Some(every) = debug_var("ECHORA_PRESENT_RATE")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|every| *every > 0)
-                    && self.presented_frames.is_multiple_of(every)
-                {
-                    static START: std::sync::OnceLock<std::time::Instant> =
-                        std::sync::OnceLock::new();
-                    static LAST: std::sync::Mutex<Option<std::time::Instant>> =
-                        std::sync::Mutex::new(None);
-                    let now = std::time::Instant::now();
-                    let start = *START.get_or_init(|| now);
-                    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let window = last.map_or(0.0, |last| (now - last).as_secs_f64());
-                    *last = Some(now);
-                    eprintln!(
-                        "presents: {} at {:.1} s, {:.1}/s over the last {every}",
-                        self.presented_frames,
-                        (now - start).as_secs_f64(),
-                        if window > 0.0 { every as f64 / window } else { 0.0 }
-                    );
-                }
-                // A line every 500 presents: where a long run is.
-                if self.presented_frames.is_multiple_of(500) {
-                    eprintln!("present {}", self.presented_frames);
-                }
-                self.present_lap("stat: present us bookkeeping", &mut since);
-                if self.gpu().is_some() {
-                    self.gpu_present_window(texture).map_err(stop)?;
-                    self.present_lap("stat: present us window", &mut since);
-                    // A frame's work is submitted by its present, windowed or
-                    // not: headless runs otherwise gathered hundreds of
-                    // frames into one GPU job, which the kernel's 10 s job
-                    // limit ended with a whole-GPU reset.
-                    self.gpu_submit().map_err(stop)?;
-                    self.present_lap("stat: present us submitting", &mut since);
-                }
-                // ECHORA_CAPTURE_EVERY=N with ECHORA_CAPTURE_DIR (echora run
-                // sets it beside the report): the first and every N-th
-                // presented image as frame-<present>.png, unchanged frames
-                // included, so a run shows what was on screen. N=0 is off.
-                if let (Ok(every), Some(directory)) = (
-                    debug_var("ECHORA_CAPTURE_EVERY"),
-                    debug_var_os("ECHORA_CAPTURE_DIR"),
-                ) {
-                    let every = every.parse::<u64>().unwrap_or(0);
-                    let disabled = self
-                        .skipped_work
-                        .get("rendering disabled")
-                        .copied()
-                        .unwrap_or(0);
-                    // ECHORA_CAPTURE_FROM=N (debugging): only from present N
-                    // (dense captures of one scene).
-                    let from = debug_var("ECHORA_CAPTURE_FROM")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    if every != 0
-                        && (self.presented_frames == 1
-                            || (self.presented_frames >= from
-                                && self.presented_frames.is_multiple_of(every)))
-                    {
-                        let image = if self.gpu().is_some() {
-                            self.gpu_read_back(texture).map_err(stop)?
-                        } else {
-                            self.images.get(&texture).cloned()
-                        };
-                        if let Some(image) = image {
-                            eprintln!(
-                                "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?} disabled this frame {} draws into it {}",
-                                self.presented_frames,
-                                image.width,
-                                image.height,
-                                image.texels.iter().map(|texel| texel[0] + texel[1] + texel[2]).sum::<f32>()
-                                    / (3 * image.texels.len().max(1)) as f32,
-                                self.forced_waits,
-                                disabled - self.disabled_before_present,
-                                self.frame_target_draws.get(&texture).copied().unwrap_or(0)
-                            );
-                            let directory = std::path::Path::new(&directory);
-                            std::fs::create_dir_all(directory).map_err(|error| {
-                                invalid(format!("create {}: {error}", directory.display()))
-                            })?;
-                            let path =
-                                directory.join(format!("frame-{:05}.png", self.presented_frames));
-                            std::fs::write(&path, image.png()).map_err(|error| {
-                                invalid(format!("write {}: {error}", path.display()))
-                            })?;
-                        }
-                    }
-                }
-                self.frame_target_draws.clear();
-                self.disabled_before_present = self
-                    .skipped_work
-                    .get("rendering disabled")
-                    .copied()
-                    .unwrap_or(0);
-                if self.gpu().is_some() {
-                    self.gpu_dump_targets().map_err(stop)?;
-                }
-                if self.gpu().is_some() {
-                    self.log_cache_sizes();
-                }
-                if let Some(directory) = debug_var_os("ECHORA_FRAME_DIR") {
-                    // Reading back, encoding and hashing a frame costs more
-                    // than rendering it: only every ECHORA_FRAME_EVERY-th
-                    // present (default 60) and the first are written.
-                    let every = debug_var("ECHORA_FRAME_EVERY")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(60)
-                        .max(1);
-                    if self.presented_frames != 1 && !self.presented_frames.is_multiple_of(every) {
-                        return Ok(true);
-                    }
-                    if self.gpu().is_some() {
-                        if let Some(image) = self.gpu_read_back(texture).map_err(stop)? {
-                            self.images.insert(texture, image);
-                        }
-                    }
-                    let image = self.images.get(&texture).ok_or_else(|| {
-                        stop(format!("presented texture {texture:#x} was never rendered"))
-                    })?;
-                    let directory = std::path::Path::new(&directory);
-                    std::fs::create_dir_all(directory).map_err(|error| {
-                        invalid(format!("create {}: {error}", directory.display()))
-                    })?;
-                    let ppm = image.ppm();
-                    let hash = {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        ppm.hash(&mut hasher);
-                        hasher.finish()
-                    };
-                    if self.last_frame_hash == Some(hash) {
-                        return Ok(true);
-                    }
-                    self.last_frame_hash = Some(hash);
-                    let path = directory.join(format!("frame-{:05}.ppm", self.presented_frames));
-                    std::fs::write(&path, ppm)
-                        .map_err(|error| invalid(format!("write {}: {error}", path.display())))?;
-                }
+                self.present_frame(core, this, texture)?;
                 return Ok(true);
             }
             // State-only setters on initialized objects: recorded for the
@@ -3424,6 +3297,196 @@ impl Nvn {
         }
     }
 
+    /// Show the presented `texture` (queue `this`): the frame count, the
+    /// window, its submission, and the captures and dumps switches ask for.
+    fn present_frame(&mut self, core: &mut Guest, this: u64, texture: u64) -> Result<bool, Trap> {
+        let name = "nvnQueuePresentTexture";
+        let invalid = |message: String| Trap::InvalidState {
+            message: format!("{name}: {message}"),
+        };
+        let pc = core.cpu.pc;
+        let stop = move |message: String| Trap::UnsupportedService {
+            pc,
+            service: "nvn".into(),
+            command_id: None,
+            message: format!("{name}: {message}"),
+        };
+        let mut since = std::time::Instant::now();
+        if debug_var_os("ECHORA_GPU_FLOW").is_some() {
+            let note = format!("flow present queue {this:x} texture {texture:x}");
+            self.gpu_note(note);
+        }
+        if !self.replaying && self.frame_capture.is_some() {
+            self.replay_captured_frame(core, texture).map_err(stop)?;
+        }
+        self.presented_frames += 1;
+        self.arm_call_watch();
+        // ECHORA_PRESENT_RATE=N: every N presents, the count, the
+        // seconds since the first present and the rate over those N.
+        if let Some(every) = debug_var("ECHORA_PRESENT_RATE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|every| *every > 0)
+            && self.presented_frames.is_multiple_of(every)
+        {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let now = std::time::Instant::now();
+            let start = *START.get_or_init(|| now);
+            let mut last = LAST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let window = last.map_or(0.0, |last| (now - last).as_secs_f64());
+            *last = Some(now);
+            eprintln!(
+                "presents: {} at {:.1} s, {:.1}/s over the last {every}",
+                self.presented_frames,
+                (now - start).as_secs_f64(),
+                if window > 0.0 {
+                    every as f64 / window
+                } else {
+                    0.0
+                }
+            );
+        }
+        // A line every 500 presents: where a long run is.
+        if self.presented_frames.is_multiple_of(500) {
+            eprintln!("present {}", self.presented_frames);
+        }
+        self.present_lap("stat: present us bookkeeping", &mut since);
+        if self.gpu().is_some() {
+            self.gpu_present_window(texture).map_err(stop)?;
+            self.present_lap("stat: present us window", &mut since);
+            // A frame's work is submitted by its present, windowed or
+            // not: headless runs otherwise gathered hundreds of
+            // frames into one GPU job, which the kernel's 10 s job
+            // limit ended with a whole-GPU reset.
+            self.gpu_submit().map_err(stop)?;
+            self.present_lap("stat: present us submitting", &mut since);
+        }
+        // ECHORA_CAPTURE_EVERY=N with ECHORA_CAPTURE_DIR (echora run
+        // sets it beside the report): the first and every N-th
+        // presented image as frame-<present>.png, unchanged frames
+        // included, so a run shows what was on screen. N=0 is off.
+        if let (Ok(every), Some(directory)) = (
+            debug_var("ECHORA_CAPTURE_EVERY"),
+            debug_var_os("ECHORA_CAPTURE_DIR"),
+        ) {
+            let every = every.parse::<u64>().unwrap_or(0);
+            let disabled = self
+                .skipped_work
+                .get("rendering disabled")
+                .copied()
+                .unwrap_or(0);
+            // ECHORA_CAPTURE_FROM=N (debugging): only from present N
+            // (dense captures of one scene).
+            let from = debug_var("ECHORA_CAPTURE_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if every != 0
+                && (self.presented_frames == 1
+                    || (self.presented_frames >= from
+                        && self.presented_frames.is_multiple_of(every)))
+            {
+                let image = if self.gpu().is_some() {
+                    self.gpu_read_back(texture).map_err(stop)?
+                } else {
+                    self.images.get(&texture).cloned()
+                };
+                if let Some(image) = image {
+                    eprintln!(
+                        "capture present {} window texture {texture:#x} {}x{} mean {:.4} forced waits {:?} disabled this frame {} draws into it {}",
+                        self.presented_frames,
+                        image.width,
+                        image.height,
+                        image
+                            .texels
+                            .iter()
+                            .map(|texel| texel[0] + texel[1] + texel[2])
+                            .sum::<f32>()
+                            / (3 * image.texels.len().max(1)) as f32,
+                        self.forced_waits,
+                        disabled - self.disabled_before_present,
+                        self.frame_target_draws.get(&texture).copied().unwrap_or(0)
+                    );
+                    let directory = std::path::Path::new(&directory);
+                    std::fs::create_dir_all(directory).map_err(|error| {
+                        invalid(format!("create {}: {error}", directory.display()))
+                    })?;
+                    let path = directory.join(format!("frame-{:05}.png", self.presented_frames));
+                    std::fs::write(&path, image.png())
+                        .map_err(|error| invalid(format!("write {}: {error}", path.display())))?;
+                }
+            }
+        }
+        self.frame_target_draws.clear();
+        self.disabled_before_present = self
+            .skipped_work
+            .get("rendering disabled")
+            .copied()
+            .unwrap_or(0);
+        if self.gpu().is_some() {
+            self.gpu_dump_targets().map_err(stop)?;
+        }
+        if self.gpu().is_some() {
+            self.log_cache_sizes();
+        }
+        if let Some(directory) = debug_var_os("ECHORA_FRAME_DIR") {
+            // Reading back, encoding and hashing a frame costs more
+            // than rendering it: only every ECHORA_FRAME_EVERY-th
+            // present (default 60) and the first are written.
+            let every = debug_var("ECHORA_FRAME_EVERY")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60)
+                .max(1);
+            if self.presented_frames != 1 && !self.presented_frames.is_multiple_of(every) {
+                return Ok(true);
+            }
+            if self.gpu().is_some() {
+                if let Some(image) = self.gpu_read_back(texture).map_err(stop)? {
+                    self.images.insert(texture, image);
+                }
+            }
+            let image = self.images.get(&texture).ok_or_else(|| {
+                stop(format!("presented texture {texture:#x} was never rendered"))
+            })?;
+            let directory = std::path::Path::new(&directory);
+            std::fs::create_dir_all(directory)
+                .map_err(|error| invalid(format!("create {}: {error}", directory.display())))?;
+            let ppm = image.ppm();
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                ppm.hash(&mut hasher);
+                hasher.finish()
+            };
+            if self.last_frame_hash == Some(hash) {
+                return Ok(true);
+            }
+            self.last_frame_hash = Some(hash);
+            let path = directory.join(format!("frame-{:05}.ppm", self.presented_frames));
+            std::fs::write(&path, ppm)
+                .map_err(|error| invalid(format!("write {}: {error}", path.display())))?;
+        }
+        Ok(true)
+    }
+
+    /// ECHORA_REPLAY_THREAD: presents are queued behind the frame's work
+    /// (`QueueItem::Present`).
+    pub fn present_queued_mode() -> bool {
+        Self::replay_thread() && debug_var_os("ECHORA_PRESENT_NOW").is_none()
+    }
+
+    /// Whether a queued present has not been shown yet.
+    pub fn present_pending(&self) -> bool {
+        self.pending
+            .values()
+            .flatten()
+            .any(|item| matches!(item, QueueItem::Present { .. }))
+    }
+
     /// `pump_queues`, which with a replay thread runs one piece and leaves
     /// the rest to it (`resume_replay`).
     fn pump_queues_handed_on(&mut self, core: &mut Guest) -> Result<(), Trap> {
@@ -3654,6 +3717,12 @@ impl Nvn {
                     let (sync, args) = (*sync, *args);
                     self.pending.get_mut(&queue).unwrap().pop_front();
                     self.signal_sync(sync, args);
+                    progressed = true;
+                }
+                QueueItem::Present { texture } => {
+                    let texture = *texture;
+                    self.pending.get_mut(&queue).unwrap().pop_front();
+                    self.present_frame(core, queue, texture)?;
                     progressed = true;
                 }
                 QueueItem::WaitSync { sync } => {
