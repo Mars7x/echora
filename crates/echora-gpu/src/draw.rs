@@ -832,7 +832,9 @@ impl Renderer {
             _ => None,
         };
         let area = draw.fixed.scissor;
-        self.apply_condition()?;
+        // Reports a condition reads resolve outside the pass; the condition
+        // then begins inside it (a pass change ends one begun there).
+        self.prepare_condition()?;
         self.begin_rendering(
             &draw.colors,
             &draw.color_levels,
@@ -842,6 +844,7 @@ impl Renderer {
             draw.depth_layer,
             area,
         )?;
+        self.apply_condition()?;
         let commands = self.recording_commands()?;
         let objects = self.gpu.shader_objects()?.clone();
         let device = self.gpu.device.clone();

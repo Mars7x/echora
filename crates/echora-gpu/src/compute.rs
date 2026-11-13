@@ -242,8 +242,8 @@ impl Renderer {
         let objects = self.gpu.shader_objects()?.clone();
         // Gated on the guest's render condition, as the hardware gates
         // compute too.
-        self.apply_condition()?;
         let commands = self.commands()?;
+        self.apply_condition()?;
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
             .dst_access_mask(

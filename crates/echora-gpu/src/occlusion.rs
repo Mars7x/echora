@@ -253,6 +253,11 @@ impl Occlusion {
         self.active_inside = inside;
     }
 
+    /// Whether reports wait to be written (`resolve`).
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Whether a segment can begin inside a rendering pass: the slot has
     /// room and its next query was reset ahead.
     fn can_begin_inside(&self, fence: vk::Fence) -> bool {

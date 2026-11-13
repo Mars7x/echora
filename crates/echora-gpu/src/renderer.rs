@@ -321,6 +321,8 @@ pub struct Renderer {
     /// wanted, and active in the command buffer being recorded.
     condition: Option<(vk::Buffer, u64, bool)>,
     condition_active: bool,
+    /// The active condition began inside the open rendering pass.
+    condition_inside: bool,
     /// A failure that must end the run rather than skip one draw (an upload
     /// over MAX_UPLOAD_BYTES): the runtime takes it after each draw and
     /// dispatch and stops with it.
@@ -565,6 +567,7 @@ impl Renderer {
             occlusion: None,
             condition: None,
             condition_active: false,
+            condition_inside: false,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -609,7 +612,11 @@ impl Renderer {
                 .pass_ends
                 .entry(std::panic::Location::caller())
                 .or_default() += 1;
-            // A segment counting samples inside the pass ends in it.
+            // A condition or a segment counting samples begun inside the
+            // pass ends in it (the next draw begins the condition again).
+            if self.condition_active && self.condition_inside {
+                self.end_condition();
+            }
             let counting = self.occlusion_pass_ends(self.commands);
             self.open_pass = None;
             // SAFETY: recording, inside the pass begun by `begin_rendering`.
@@ -681,9 +688,9 @@ impl Renderer {
     /// Gate the draws and dispatches recorded from now on on the 32-bit
     /// word at `offset` in `buffer` (the guest memory's device copy): they
     /// run while it is nonzero, or zero when `inverted`; None: always.
-    /// The word is copied into the ring when gating starts (the GPU's
-    /// value then, in command order) and conditional rendering begins
-    /// outside a rendering pass, before the next draw or dispatch.
+    /// The GPU reads the word in place, as the console reads a render
+    /// condition from memory for the draws it gates; reports not yet
+    /// written are written first.
     pub fn set_condition(&mut self, condition: Option<(vk::Buffer, u64, bool)>) {
         if self.condition != condition {
             self.end_condition();
@@ -691,8 +698,30 @@ impl Renderer {
         }
     }
 
+    /// Whether beginning the wanted condition must first write reports
+    /// (outside a rendering pass).
+    fn condition_needs_resolve(&self) -> bool {
+        self.condition.is_some()
+            && !self.condition_active
+            && self
+                .occlusion
+                .as_ref()
+                .is_some_and(|occlusion| occlusion.has_pending())
+    }
+
+    /// Before a draw's rendering pass begins: the reports its condition
+    /// may read are written (ending an open pass when there are any).
+    pub(crate) fn prepare_condition(&mut self) -> Result<(), String> {
+        if self.condition_needs_resolve() {
+            let commands = self.commands()?;
+            self.occlusion_resolve(commands);
+        }
+        Ok(())
+    }
+
     /// Begin the wanted condition if it is not active (before recording a
-    /// draw or dispatch; ends an open rendering pass to do so).
+    /// draw or dispatch, inside the draw's rendering pass or outside any):
+    /// one begun inside a pass ends with it.
     pub(crate) fn apply_condition(&mut self) -> Result<(), String> {
         let Some((buffer, offset, inverted)) = self.condition else {
             return Ok(());
@@ -703,74 +732,43 @@ impl Renderer {
         let Some(conditional) = self.gpu.conditional_rendering.clone() else {
             return Ok(());
         };
-        let (ring, at) = self.ring_upload(&[0; 4], 4)?;
-        let commands = self.commands()?;
-        // Reports not yet written are, before the condition reads one.
-        self.occlusion_resolve(commands);
-        let copy = vk::BufferCopy {
-            src_offset: offset,
-            dst_offset: at,
-            size: 4,
+        let commands = if self.condition_needs_resolve() {
+            // Reports not yet written are, before the condition reads one.
+            let commands = self.commands()?;
+            self.occlusion_resolve(commands);
+            commands
+        } else {
+            self.recording_commands()?
         };
-        let before = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        let after = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
         let begin = vk::ConditionalRenderingBeginInfoEXT::default()
-            .buffer(ring)
-            .offset(at)
+            .buffer(buffer)
+            .offset(offset)
             .flags(if inverted {
                 vk::ConditionalRenderingFlagsEXT::INVERTED
             } else {
                 vk::ConditionalRenderingFlagsEXT::empty()
             });
-        // SAFETY: recording, outside rendering; the ranges exist.
-        unsafe {
-            let device = &self.gpu.device;
-            *self
-                .stats
-                .entry("stat: barriers in apply_condition")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[before],
-                &[],
-                &[],
-            );
-            device.cmd_copy_buffer(commands, buffer, ring, &[copy]);
-            *self
-                .stats
-                .entry("stat: barriers in apply_condition")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
-                vk::DependencyFlags::empty(),
-                &[after],
-                &[],
-                &[],
-            );
-            (conditional.fp().cmd_begin_conditional_rendering_ext)(commands, &begin);
-        }
+        // SAFETY: recording; the buffer is live, made for conditional
+        // rendering, and its writes were made visible to all reads.
+        unsafe { (conditional.fp().cmd_begin_conditional_rendering_ext)(commands, &begin) };
         self.condition_active = true;
+        self.condition_inside = self.open_pass.is_some();
+        *self.stats.entry("stat: conditions begun").or_default() += 1;
         Ok(())
     }
 
-    /// End the active condition (outside a rendering pass).
+    /// End the active condition (inside the rendering pass it began in, or
+    /// outside any for one begun outside).
     pub(crate) fn end_condition(&mut self) {
         if !self.condition_active {
             return;
         }
-        self.end_pass();
+        if !self.condition_inside {
+            self.end_pass();
+        }
         if let Some(conditional) = self.gpu.conditional_rendering.as_ref() {
-            // SAFETY: recording; conditional rendering was begun outside a
-            // pass in this command buffer, and the pass just ended.
+            // SAFETY: recording; conditional rendering is active, and this
+            // is where it began (its pass still open, or outside any).
             unsafe { (conditional.fp().cmd_end_conditional_rendering_ext)(self.commands) };
         }
         self.condition_active = false;
@@ -799,6 +797,12 @@ impl Renderer {
         }
         let device = self.gpu.device.clone();
         let addressable = self.gpu.buffer_device_address;
+        // Render conditions read reports here in place (`apply_condition`).
+        let conditional_usage = if self.gpu.conditional_rendering.is_some() {
+            vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(addressed_usage(
@@ -806,7 +810,8 @@ impl Renderer {
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | conditional_usage,
                 addressable,
             ))
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
