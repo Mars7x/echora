@@ -1113,7 +1113,7 @@ pub struct Services {
     decoder_image_pools: BTreeMap<u32, (u32, u32)>,
     /// The picture last decoded into each output slot (native image
     /// handle), handed out by GetFrame (213) and read through 961.
-    slot_pictures: BTreeMap<u32, Box<crate::av1::Picture>>,
+    slot_pictures: BTreeMap<u32, PendingPicture>,
     /// Each 911 request in order: its preference, u32 and native memory
     /// (address and size), as hex for the report.
     decoder_image_pool_requests: Vec<String>,
@@ -1136,23 +1136,14 @@ pub struct Services {
     /// submission id.
     video_submissions: u64,
     video_input: Vec<(u64, VideoFrame)>,
-    /// The host AV1 decoder of the current decoder session (created by
-    /// 201, dropped by 115), and its failures.
-    av1_decoder: Option<crate::av1::Decoder>,
-    /// The session's decoder on the GPU's video engine (the default;
-    /// ECHORA_VIDEO_DECODE=cpu or rav1d turns it off), used instead of
-    /// `av1_decoder` until it fails (then the session goes back to rav1d).
-    gpu_movie: Option<echora_gpu::video_av1::MovieDecoder>,
-    gpu_movie_failed: bool,
-    /// The video engine's device, opened on first use (None inside when
-    /// the host has no AV1 decode).
-    video_device: Option<Option<std::sync::Arc<echora_gpu::video::VideoDevice>>>,
-    /// Pictures decoded and when the first was (ECHORA_MOVIE_RATE).
-    av1_pictures: (u64, Option<std::time::Instant>, std::time::Instant),
-    /// ECHORA_MOVIE_SKIP_DECODE (debugging): the first picture decoded,
-    /// given back for every later submission without decoding.
-    skip_decode_picture: Option<Box<crate::av1::Picture>>,
-    av1_errors: Vec<String>,
+    /// The decoder thread's work queue (started by the first submission):
+    /// submissions are decoded there in order, off the machine lock, and a
+    /// picture is waited for when its pixels are first read (961).
+    video_jobs: Option<std::sync::mpsc::Sender<VideoJob>>,
+    /// When these services were made: "since boot" in ECHORA_MOVIE_RATE.
+    created: std::time::Instant,
+    /// The host decoders' failures (the first 16), filled by that thread.
+    av1_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// The last 600 video decoder requests: command and leading argument
     /// bytes (hex); GetFrame (213) and syncpoint waits add what they did.
     video_log: std::collections::VecDeque<String>,
@@ -1286,13 +1277,9 @@ impl Default for Services {
             empty_frame_requests: 0,
             video_submissions: 0,
             video_input: Vec::new(),
-            av1_decoder: None,
-            gpu_movie: None,
-            gpu_movie_failed: false,
-            video_device: None,
-            av1_pictures: (0, None, std::time::Instant::now()),
-            skip_decode_picture: None,
-            av1_errors: Vec::new(),
+            video_jobs: None,
+            created: std::time::Instant::now(),
+            av1_errors: Default::default(),
             video_log: Default::default(),
             library_applets: Vec::new(),
             applet_storages: Vec::new(),
@@ -1699,15 +1686,221 @@ fn poll_event_fds(event_fds: &BTreeMap<i32, u64>, entries: &mut [u8]) -> i32 {
 const VIDEO_INPUT_DEPTH: usize = 8;
 
 /// A video decoder submission, and the frame it becomes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct VideoFrame {
     /// The submission's presentation time (microseconds).
     timestamp: u64,
     /// The stream's last submission: its frame reports the end of the
     /// stream (the SDK's output property `last`).
     last: bool,
-    /// The picture the submission decoded to.
-    picture: Option<Box<crate::av1::Picture>>,
+    /// The picture the submission decodes to.
+    picture: PendingPicture,
+}
+
+/// A submission's picture: decoded on the decoder thread, and waited for
+/// when it is first looked at.
+enum PendingPicture {
+    Ready(Option<Box<crate::av1::Picture>>),
+    Decoding(std::sync::mpsc::Receiver<Option<Box<crate::av1::Picture>>>),
+}
+
+impl Default for PendingPicture {
+    fn default() -> Self {
+        Self::Ready(None)
+    }
+}
+
+impl PendingPicture {
+    /// The picture (None: the decoder gave none), waiting for the decoder
+    /// thread to finish it if it has not.
+    fn get(&mut self) -> Option<&crate::av1::Picture> {
+        if let Self::Decoding(receiver) = self {
+            *self = Self::Ready(receiver.recv().ok().flatten());
+        }
+        match self {
+            Self::Ready(picture) => picture.as_deref(),
+            Self::Decoding(_) => None,
+        }
+    }
+}
+
+/// Work for the decoder thread, done in the order sent.
+enum VideoJob {
+    /// One submission's bytes, and where its picture goes.
+    Decode(
+        Vec<u8>,
+        std::sync::mpsc::Sender<Option<Box<crate::av1::Picture>>>,
+    ),
+    /// A decoder session began or ended (201, 115): its host decoders go.
+    Reset,
+}
+
+/// The host decoders of the current decoder session, owned by the decoder
+/// thread.
+struct HostDecoder {
+    /// The rav1d decoder (created on first use, dropped with the session).
+    av1_decoder: Option<crate::av1::Decoder>,
+    /// The session's decoder on the GPU's video engine (the default;
+    /// ECHORA_VIDEO_DECODE=cpu or rav1d turns it off), used instead of
+    /// `av1_decoder` until it fails (then the session goes back to rav1d).
+    gpu_movie: Option<echora_gpu::video_av1::MovieDecoder>,
+    gpu_movie_failed: bool,
+    /// The video engine's device, opened on first use (None inside when
+    /// the host has no AV1 decode).
+    video_device: Option<Option<std::sync::Arc<echora_gpu::video::VideoDevice>>>,
+    /// Pictures decoded and when the first was (ECHORA_MOVIE_RATE).
+    av1_pictures: (u64, Option<std::time::Instant>, std::time::Instant),
+    /// ECHORA_MOVIE_SKIP_DECODE (debugging): the first picture decoded,
+    /// given back for every later submission without decoding.
+    skip_decode_picture: Option<Box<crate::av1::Picture>>,
+    av1_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl HostDecoder {
+    /// The decoder thread: each job in turn until the queue's sender goes.
+    fn run(mut self, jobs: std::sync::mpsc::Receiver<VideoJob>) {
+        for job in jobs {
+            match job {
+                VideoJob::Decode(bytes, picture) => {
+                    // A picture nobody waits for any more (its session
+                    // ended) is dropped.
+                    let _ = picture.send(self.decode_av1(&bytes));
+                }
+                VideoJob::Reset => {
+                    self.av1_decoder = None;
+                    self.gpu_movie = None;
+                    self.gpu_movie_failed = false;
+                }
+            }
+        }
+    }
+
+    fn note_error(&self, error: String) {
+        let mut errors = self
+            .av1_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if errors.len() < 16 {
+            errors.push(error);
+        }
+    }
+
+    /// Decode one submission with the session's host decoder (created on
+    /// first use): the last picture it completes, if any. Failures are
+    /// recorded (the first 16) and give no picture.
+    fn decode_av1(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
+        // ECHORA_MOVIE_SKIP_DECODE (debugging, to reach the scene after the
+        // opening movie sooner): after the first picture, each submission
+        // gives back that picture without decoding. The application's
+        // decoder calls, fences and timing are unchanged; only the pictures
+        // it shows stop changing.
+        let skip = crate::nvn::debug_var_os("ECHORA_MOVIE_SKIP_DECODE").is_some();
+        if skip && let Some(picture) = &self.skip_decode_picture {
+            return Some(picture.clone());
+        }
+        let picture = self.decode_av1_decoded(bytes);
+        if skip && self.skip_decode_picture.is_none() {
+            self.skip_decode_picture.clone_from(&picture);
+        }
+        picture
+    }
+
+    /// `decode_av1` without ECHORA_MOVIE_SKIP_DECODE.
+    fn decode_av1_decoded(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
+        let gpu = match self.decode_av1_gpu(bytes) {
+            Some(Ok(pictures)) => Some(Ok(pictures)),
+            Some(Err(error)) => {
+                // The session continues on rav1d (from its next key frame).
+                eprintln!("video: GPU decode failed ({error}); this movie continues on rav1d");
+                self.note_error(format!("GPU decode: {error}"));
+                self.gpu_movie = None;
+                self.gpu_movie_failed = true;
+                None
+            }
+            None => None,
+        };
+        let result = match gpu {
+            Some(result) => result,
+            None => match &mut self.av1_decoder {
+                Some(decoder) => decoder.decode(bytes),
+                None => crate::av1::Decoder::new().and_then(|mut decoder| {
+                    let result = decoder.decode(bytes);
+                    self.av1_decoder = Some(decoder);
+                    result
+                }),
+            },
+        };
+        if let Ok(pictures) = &result {
+            // ECHORA_MOVIE_RATE: decoded movie pictures per host second, a
+            // speed measure tied to content rather than to presents.
+            if !pictures.is_empty() && crate::nvn::debug_var_os("ECHORA_MOVIE_RATE").is_some() {
+                let (count, first, boot) = &mut self.av1_pictures;
+                let first = *first.get_or_insert_with(std::time::Instant::now);
+                *count += pictures.len() as u64;
+                if *count % 60 == 0 {
+                    let seconds = first.elapsed().as_secs_f64();
+                    eprintln!(
+                        "movie: {count} pictures in {seconds:.2} s ({:.1}/s), {:.2} s since boot",
+                        *count as f64 / seconds.max(1e-9),
+                        boot.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+        match result {
+            Ok(mut pictures) => pictures.pop().map(Box::new),
+            Err(error) => {
+                self.note_error(error);
+                None
+            }
+        }
+    }
+
+    /// Decode one submission on the GPU's video engine: the pictures it
+    /// shows, as rav1d gives them. None when GPU decoding is turned off
+    /// (ECHORA_VIDEO_DECODE=cpu or rav1d), unavailable, or failed earlier
+    /// this session.
+    fn decode_av1_gpu(&mut self, bytes: &[u8]) -> Option<Result<Vec<crate::av1::Picture>, String>> {
+        if self.gpu_movie_failed
+            || matches!(
+                crate::nvn::debug_var("ECHORA_VIDEO_DECODE").as_deref(),
+                Ok("cpu" | "rav1d")
+            )
+        {
+            return None;
+        }
+        if self.gpu_movie.is_none() {
+            let device = self
+                .video_device
+                .get_or_insert_with(|| match echora_gpu::video::VideoDevice::new() {
+                    Ok(device) => Some(device),
+                    Err(error) => {
+                        eprintln!("video: no GPU AV1 decode ({error}); using rav1d");
+                        None
+                    }
+                })
+                .clone()?;
+            self.gpu_movie = Some(echora_gpu::video_av1::MovieDecoder::new(device));
+        }
+        let movie = self.gpu_movie.as_mut()?;
+        Some((|| {
+            let mut pictures = Vec::new();
+            for shown in movie.decode(bytes)? {
+                let pitch = shown.width.next_multiple_of(2);
+                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch)];
+                movie.read_nv12(shown, pitch, &mut nv12)?;
+                let (full_range, matrix) = movie.color().unwrap_or((false, 1));
+                pictures.push(crate::av1::Picture {
+                    width: shown.width,
+                    height: shown.height,
+                    nv12,
+                    full_range,
+                    matrix,
+                });
+            }
+            Ok(pictures)
+        })())
+    }
 }
 
 /// The syncpoint token of a decoder output slot's fence: a range no
@@ -2517,9 +2710,7 @@ impl Services {
                     .collect();
                 call.reply(0, None, 0, &[])?;
                 self.video_decoders.push((size, parameters));
-                self.av1_decoder = None;
-                self.gpu_movie = None;
-                self.gpu_movie_failed = false;
+                self.reset_video_decoder();
                 self.decoder_fences.clear();
                 self.decoder_fences_released = false;
                 self.provisional_commands
@@ -2642,14 +2833,10 @@ impl Services {
                 data.extend_from_slice(&frame.timestamp.to_le_bytes());
                 data.extend_from_slice(&u32::from(frame.last).to_le_bytes());
                 call.reply(0, None, 0, &data)?;
-                match frame.picture {
-                    Some(picture) => {
-                        self.slot_pictures.insert(slot, picture);
-                    }
-                    None => {
-                        self.slot_pictures.remove(&slot);
-                    }
-                }
+                // The slot's picture, possibly still being decoded: 961
+                // waits for it (one that turns out to be none reads there
+                // as no picture did).
+                self.slot_pictures.insert(slot, frame.picture);
                 self.provisional_commands
                     .insert("appletOE:video_decoder:213");
                 Ok(Outcome::success())
@@ -2714,7 +2901,7 @@ impl Services {
                         let _ = file.write_all(&bytes);
                     }
                 }
-                let picture = self.decode_av1(&bytes);
+                let picture = self.decode_av1(bytes);
                 self.video_input.push((
                     id,
                     VideoFrame {
@@ -2739,9 +2926,7 @@ impl Services {
                 self.decoded_video_frames.clear();
                 self.video_input_event = None;
                 self.video_decoder_running = false;
-                self.av1_decoder = None;
-                self.gpu_movie = None;
-                self.gpu_movie_failed = false;
+                self.reset_video_decoder();
                 self.release_decoder_fences();
                 call.reply(0, None, 0, &[])?;
                 self.provisional_commands
@@ -4600,125 +4785,47 @@ impl Services {
         }
     }
 
-    /// Decode one submission with the session's host decoder (created on
-    /// first use): the last picture it completes, if any. Failures are
-    /// recorded (the first 16) and give no picture.
-    fn decode_av1(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
-        // ECHORA_MOVIE_SKIP_DECODE (debugging, to reach the scene after the
-        // opening movie sooner): after the first picture, each submission
-        // gives back that picture without decoding. The application's
-        // decoder calls, fences and timing are unchanged; only the pictures
-        // it shows stop changing.
-        let skip = crate::nvn::debug_var_os("ECHORA_MOVIE_SKIP_DECODE").is_some();
-        if skip && let Some(picture) = &self.skip_decode_picture {
-            return Some(picture.clone());
+    /// Queue one submission for the decoder thread (started here the
+    /// first time): its picture, to be waited for when it is needed.
+    /// ECHORA_VIDEO_DECODE_SYNC (debugging) waits for it at once, as when
+    /// submissions were decoded inside the call.
+    fn decode_av1(&mut self, bytes: Vec<u8>) -> PendingPicture {
+        let jobs = self.video_jobs.get_or_insert_with(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let decoder = HostDecoder {
+                av1_decoder: None,
+                gpu_movie: None,
+                gpu_movie_failed: false,
+                video_device: None,
+                av1_pictures: (0, None, self.created),
+                skip_decode_picture: None,
+                av1_errors: self.av1_errors.clone(),
+            };
+            let spawned = std::thread::Builder::new()
+                .name("video-decode".into())
+                .spawn(move || decoder.run(receiver));
+            if let Err(error) = spawned {
+                eprintln!("video: no decoder thread ({error})");
+            }
+            sender
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if jobs.send(VideoJob::Decode(bytes, sender)).is_err() {
+            return PendingPicture::Ready(None);
         }
-        let picture = self.decode_av1_decoded(bytes);
-        if skip && self.skip_decode_picture.is_none() {
-            self.skip_decode_picture.clone_from(&picture);
+        let mut picture = PendingPicture::Decoding(receiver);
+        if crate::nvn::debug_var_os("ECHORA_VIDEO_DECODE_SYNC").is_some() {
+            picture.get();
         }
         picture
     }
 
-    /// `decode_av1` without ECHORA_MOVIE_SKIP_DECODE.
-    fn decode_av1_decoded(&mut self, bytes: &[u8]) -> Option<Box<crate::av1::Picture>> {
-        let gpu = match self.decode_av1_gpu(bytes) {
-            Some(Ok(pictures)) => Some(Ok(pictures)),
-            Some(Err(error)) => {
-                // The session continues on rav1d (from its next key frame).
-                eprintln!("video: GPU decode failed ({error}); this movie continues on rav1d");
-                if self.av1_errors.len() < 16 {
-                    self.av1_errors.push(format!("GPU decode: {error}"));
-                }
-                self.gpu_movie = None;
-                self.gpu_movie_failed = true;
-                None
-            }
-            None => None,
-        };
-        let result = match gpu {
-            Some(result) => result,
-            None => match &mut self.av1_decoder {
-                Some(decoder) => decoder.decode(bytes),
-                None => crate::av1::Decoder::new().and_then(|mut decoder| {
-                    let result = decoder.decode(bytes);
-                    self.av1_decoder = Some(decoder);
-                    result
-                }),
-            },
-        };
-        if let Ok(pictures) = &result {
-            // ECHORA_MOVIE_RATE: decoded movie pictures per host second, a
-            // speed measure tied to content rather than to presents.
-            if !pictures.is_empty() && crate::nvn::debug_var_os("ECHORA_MOVIE_RATE").is_some() {
-                let (count, first, boot) = &mut self.av1_pictures;
-                let first = *first.get_or_insert_with(std::time::Instant::now);
-                *count += pictures.len() as u64;
-                if *count % 60 == 0 {
-                    let seconds = first.elapsed().as_secs_f64();
-                    eprintln!(
-                        "movie: {count} pictures in {seconds:.2} s ({:.1}/s), {:.2} s since boot",
-                        *count as f64 / seconds.max(1e-9),
-                        boot.elapsed().as_secs_f64()
-                    );
-                }
-            }
+    /// A decoder session began or ended: the decoder thread drops its host
+    /// decoders once the submissions queued before are done.
+    fn reset_video_decoder(&mut self) {
+        if let Some(jobs) = &self.video_jobs {
+            let _ = jobs.send(VideoJob::Reset);
         }
-        match result {
-            Ok(mut pictures) => pictures.pop().map(Box::new),
-            Err(error) => {
-                if self.av1_errors.len() < 16 {
-                    self.av1_errors.push(error);
-                }
-                None
-            }
-        }
-    }
-
-    /// Decode one submission on the GPU's video engine: the pictures it
-    /// shows, as rav1d gives them. None when GPU decoding is turned off
-    /// (ECHORA_VIDEO_DECODE=cpu or rav1d), unavailable, or failed earlier
-    /// this session.
-    fn decode_av1_gpu(&mut self, bytes: &[u8]) -> Option<Result<Vec<crate::av1::Picture>, String>> {
-        if self.gpu_movie_failed
-            || matches!(
-                crate::nvn::debug_var("ECHORA_VIDEO_DECODE").as_deref(),
-                Ok("cpu" | "rav1d")
-            )
-        {
-            return None;
-        }
-        if self.gpu_movie.is_none() {
-            let device = self
-                .video_device
-                .get_or_insert_with(|| match echora_gpu::video::VideoDevice::new() {
-                    Ok(device) => Some(device),
-                    Err(error) => {
-                        eprintln!("video: no GPU AV1 decode ({error}); using rav1d");
-                        None
-                    }
-                })
-                .clone()?;
-            self.gpu_movie = Some(echora_gpu::video_av1::MovieDecoder::new(device));
-        }
-        let movie = self.gpu_movie.as_mut()?;
-        Some((|| {
-            let mut pictures = Vec::new();
-            for shown in movie.decode(bytes)? {
-                let pitch = shown.width.next_multiple_of(2);
-                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch)];
-                movie.read_nv12(shown, pitch, &mut nv12)?;
-                let (full_range, matrix) = movie.color().unwrap_or((false, 1));
-                pictures.push(crate::av1::Picture {
-                    width: shown.width,
-                    height: shown.height,
-                    nv12,
-                    full_range,
-                    matrix,
-                });
-            }
-            Ok(pictures)
-        })())
     }
 
     /// The internal handle of a request that parked its thread, once.
@@ -7181,7 +7288,11 @@ impl Services {
                 let offset = share * u64::from(image - base);
                 let mut descriptor = [0u8; 0x80];
                 descriptor[0] = 0x14;
-                if let Some(picture) = self.slot_pictures.get(&image) {
+                if let Some(picture) = self
+                    .slot_pictures
+                    .get_mut(&image)
+                    .and_then(PendingPicture::get)
+                {
                     let (width, height) = (picture.width, picture.height);
                     // The picture is already NV12 at the guest's pitch: luma
                     // rows, then interleaved chroma rows.
@@ -9191,7 +9302,7 @@ impl Services {
             "video_submissions":self.video_submissions,
             "returned_frames":self.returned_frames,
             "decoded_frames":self.decoded_frames,
-            "av1_errors":self.av1_errors,
+            "av1_errors":*self.av1_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             "video_log":self.video_log,
             "decoder_image_pool_requests":self.decoder_image_pool_requests,
             "refused_video_submissions":self.refused_video_submissions,
@@ -9588,7 +9699,7 @@ mod tests {
             VideoFrame {
                 timestamp: u64::MAX,
                 last: true,
-                picture: None,
+                picture: PendingPicture::default(),
             },
         ));
         services.decoder_slots.extend([3, 4]);
