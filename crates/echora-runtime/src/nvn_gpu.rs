@@ -3453,6 +3453,14 @@ impl Nvn {
         Ok(Some(serial))
     }
 
+    /// Submit the batch with this serial if it is still being recorded.
+    pub(super) fn gpu_submit_through(&mut self, serial: u64) -> Result<(), String> {
+        match self.gpu.as_mut() {
+            Some(backend) => backend.renderer.submit_through(serial),
+            None => Ok(()),
+        }
+    }
+
     /// Note finished submissions without waiting.
     pub(super) fn gpu_poll_completed(&mut self) -> Result<(), String> {
         match self.gpu.as_mut() {

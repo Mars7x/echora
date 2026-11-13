@@ -5435,19 +5435,26 @@ impl Worker {
                 nvn.note_replay_wait(&name, waited.elapsed());
             }
         }
-        // A read of what programs stored through the page table: the GPU
-        // work it waits for finishes without the NVN state held, so the
-        // replay goes on meanwhile.
-        if thread
-            && matches!(
-                nvn.entry(pc),
-                Some(crate::nvn::HostEntry::Proc(name)) if name == "nvnMemoryPoolInvalidateMappedRange"
-            )
-        {
+        // A read of what programs stored through the page table, or a wait
+        // on a fence: the GPU work it waits for finishes without the NVN
+        // state held, so the replay goes on meanwhile.
+        let gpu_wait = match nvn.entry(pc) {
+            Some(crate::nvn::HostEntry::Proc(name)) if thread => match name.as_str() {
+                "nvnMemoryPoolInvalidateMappedRange" => Some(None),
+                "nvnSyncWait" => Some(Some(self.core.cpu.regs[0])),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(sync) = gpu_wait {
             // The replay may record more while the lock is free: a few
             // rounds, so what the call itself waits for has finished.
             for _ in 0..3 {
-                let serial = match nvn.read_wait_serial() {
+                let serial = match sync {
+                    Some(sync) => nvn.sync_wait_serial(sync),
+                    None => nvn.read_wait_serial(),
+                };
+                let serial = match serial {
                     Ok(Some(serial)) => serial,
                     Ok(None) => break,
                     Err(trap) => {

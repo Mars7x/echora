@@ -3497,6 +3497,28 @@ impl Nvn {
             .map_err(|message| Trap::InvalidState { message })
     }
 
+    /// With a replay thread, before nvnSyncWait on `sync`: the submission
+    /// holding its fence when it has signaled and the GPU may not have
+    /// finished it yet (submitted if still recording), which the caller
+    /// waits for without holding the NVN state.
+    pub fn sync_wait_serial(&mut self, sync: u64) -> Result<Option<u64>, Trap> {
+        let Some(serial) = self
+            .objects
+            .get(&sync)
+            .filter(|object| object.state.contains_key("Signaled"))
+            .and_then(|object| object.state.get("GpuSerial"))
+            .map(|serial| serial.x[0])
+        else {
+            return Ok(None);
+        };
+        if self.gpu_completed_serial() >= serial {
+            return Ok(None);
+        }
+        self.gpu_submit_through(serial)
+            .map_err(|message| Trap::InvalidState { message })?;
+        Ok(Some(serial))
+    }
+
     /// Whether submission `serial` has finished (noting finished ones).
     pub fn submission_done(&mut self, serial: u64) -> Result<bool, Trap> {
         self.gpu_poll_completed()
