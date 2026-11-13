@@ -2640,24 +2640,8 @@ impl Renderer {
             self.stat("stat: spans too large to share", 1);
             return Ok(None);
         }
-        // The 16 MiB chunk around it where the file holds it all, so the
-        // pools inside share one memory object (each is listed in every
-        // submission); else the span alone.
-        const CHUNK: u64 = 16 << 20;
-        let chunk_start = start & !(CHUNK - 1);
-        let chunk_span = (start + span - chunk_start).next_multiple_of(CHUNK);
-        let widened = if chunk_span <= MAX_SHARED_SPAN && (chunk_start, chunk_span) != (start, span)
-        {
-            self.share_span(file, chunk_start, chunk_span)?
-        } else {
-            None
-        };
-        let (start, span, (buffer, memory)) = match widened {
-            Some(imported) => (chunk_start, chunk_span, imported),
-            None => match self.share_span(file, start, span)? {
-                Some(imported) => (start, span, imported),
-                None => return Ok(None),
-            },
+        let Some((buffer, memory)) = self.share_span(file, start, span)? else {
+            return Ok(None);
         };
         let Some(address) = self.buffer_address(buffer) else {
             self.stat("stat: shared spans without a device address", 1);
@@ -2678,18 +2662,14 @@ impl Renderer {
     }
 
     /// Stop sharing file range `[offset, offset + length)`: its pages may be
-    /// released (a udmabuf would keep the old ones). The page table's spans
-    /// dropped with it (start and length), which may hold other pools' pages
-    /// too: those are mapped again.
-    pub fn release_file_range(&mut self, offset: u64, length: u64) -> Vec<(u64, u64)> {
+    /// released (a udmabuf would keep the old ones).
+    pub fn release_file_range(&mut self, offset: u64, length: u64) {
         let end = offset + length;
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
             .into_iter()
             .partition(|(start, span, ..)| *start < end && offset < start + span);
         self.addressed = kept;
-        let mut spans = Vec::with_capacity(gone.len());
-        for (start, span, buffer, memory, _) in gone {
-            spans.push((start, span));
+        for (_, _, buffer, memory, _) in gone {
             self.retired_shared.push((buffer, memory));
         }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
@@ -2702,7 +2682,6 @@ impl Renderer {
         }
         self.shared_refused
             .retain(|(start, span)| !(*start < end && offset < start + span));
-        spans
     }
 
     /// A udmabuf of `span` bytes of `file` at `start`, imported as a storage

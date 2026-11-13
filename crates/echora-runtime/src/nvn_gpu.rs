@@ -28,7 +28,7 @@ use super::{Command, Guest, Image, Nvn};
 pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
-    pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize, u64), bool)>,
+    pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize), bool)>,
 }
 
 pub struct Backend {
@@ -142,9 +142,6 @@ pub struct Backend {
     /// Bumped whenever a pool is shared (or shared again): the page table
     /// is rebuilt after it changes.
     share_generation: usize,
-    /// Per pool: bumped when a span its pages were mapped through was
-    /// dropped with another range (a released one), so it is mapped again.
-    remapped: HashMap<u64, u64>,
     /// Render targets by their texture's storage address, and the
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
@@ -229,7 +226,6 @@ impl Backend {
             shared_pools: HashMap::new(),
             shared_pieces: HashMap::new(),
             share_generation: 0,
-            remapped: HashMap::new(),
             target_index: HashMap::new(),
             target_chains: Vec::new(),
             target_index_stamp: None,
@@ -4823,53 +4819,9 @@ impl Nvn {
             // Its pages may be released and reused: shared spans of them
             // would keep the old ones.
             if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
-                self.release_file_range(offset, size);
+                backend.renderer.release_file_range(offset, size);
             }
         }
-    }
-
-    /// Stop sharing guest memory released since the last call
-    /// (`note_released_memory`).
-    pub(super) fn gpu_released_memory(&mut self) {
-        if self.gpu.is_none() {
-            return;
-        }
-        for (offset, length) in super::take_released_memory() {
-            self.release_file_range(offset, length);
-        }
-    }
-
-    /// Stop sharing file range `[offset, offset + length)`; pools whose
-    /// pages the page table mapped through a span dropped with it are
-    /// mapped again.
-    fn release_file_range(&mut self, offset: u64, length: u64) {
-        let backend = self.gpu.as_mut().unwrap();
-        let dropped = backend.renderer.release_file_range(offset, length);
-        if dropped.is_empty() {
-            return;
-        }
-        let overlaps = |at: u64, size: u64| {
-            dropped
-                .iter()
-                .any(|&(start, span)| start < at + size && at < start + span)
-        };
-        let mut touched: Vec<u64> = backend
-            .shared_pools
-            .iter()
-            .filter(|(_, (size, _, at))| overlaps(*at, *size))
-            .map(|(&base, _)| base)
-            .collect();
-        touched.extend(
-            backend
-                .shared_pieces
-                .iter()
-                .filter(|(_, pieces)| pieces.iter().any(|&(_, size, _, at)| overlaps(at, size)))
-                .map(|(&base, _)| base),
-        );
-        for base in touched {
-            *backend.remapped.entry(base).or_default() += 1;
-        }
-        backend.share_generation += 1;
     }
 
     /// Record the file offsets of memory pools not yet known, where the GPU
@@ -4926,7 +4878,6 @@ impl Nvn {
         if super::debug_var_os("ECHORA_PAGE_TABLE").is_none() {
             return Ok(Default::default());
         }
-        self.gpu_released_memory();
         // Host-visible pools reach the GPU through the file spans presents
         // record (`share_new_pools`, under the machine lock): a queue
         // submission's memory view cannot look them up. The table is rebuilt
@@ -5127,17 +5078,12 @@ impl Nvn {
     /// What decides how pool `base` maps into the page table besides its
     /// own properties: its recorded share (whole or in pieces) and, for a
     /// GPU-only pool, its resident buffer's address.
-    fn pool_share_signature(&self, base: u64, flags: u64) -> (u64, u64, usize, u64) {
+    fn pool_share_signature(&self, base: u64, flags: u64) -> (u64, u64, usize) {
         let Some(backend) = self.gpu.as_ref() else {
-            return (0, 0, 0, 0);
+            return (0, 0, 0);
         };
         if flags & 6 == 0 {
-            return (
-                backend.renderer.resident_address(base).unwrap_or(0),
-                0,
-                0,
-                0,
-            );
+            return (backend.renderer.resident_address(base).unwrap_or(0), 0, 0);
         }
         let shared = backend
             .shared_pools
@@ -5147,8 +5093,7 @@ impl Nvn {
             .shared_pieces
             .get(&base)
             .map_or(0, |pieces| pieces.len());
-        let remapped = backend.remapped.get(&base).copied().unwrap_or(0);
-        (shared.0, shared.1, pieces, remapped)
+        (shared.0, shared.1, pieces)
     }
 
     /// Write pool `base`'s page entries (pages from `first`) into `entries`.
@@ -6353,7 +6298,6 @@ impl Nvn {
         guest: u64,
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
-        self.gpu_released_memory();
         let backend = self.gpu.as_mut().unwrap();
         let within = |start: u64, size: u64| start <= guest && guest + length <= start + size;
         let found = backend

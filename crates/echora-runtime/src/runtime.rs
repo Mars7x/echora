@@ -531,7 +531,6 @@ impl Machine {
     fn release_main_thread_tls(&mut self) -> Result<(), Trap> {
         self.validate_main_thread_tls_release()?;
         if self.main_thread_tls_owned {
-            crate::nvn::note_released_memory(&self.memory, self.layout.tls_base, PAGE_SIZE);
             self.memory.unmap_exact(self.layout.tls_base, PAGE_SIZE)?;
             self.main_thread_tls_owned = false;
         }
@@ -3624,13 +3623,6 @@ impl Machine {
                         )?;
                     }
                 } else if size != self.heap_size {
-                    if size < self.heap_size {
-                        crate::nvn::note_released_memory(
-                            &self.memory,
-                            self.layout.heap_base + size,
-                            self.heap_size - size,
-                        );
-                    }
                     self.memory
                         .resize_heap(self.layout.heap_base, self.heap_size, size)?;
                 }
@@ -4439,7 +4431,6 @@ impl Machine {
                 if start != mapping.base || stop != next {
                     self.memory.set_permissions(start, stop - start, READ)?;
                 }
-                crate::nvn::note_released_memory(&self.memory, start, stop - start);
                 self.memory.unmap_exact(start, stop - start)?;
                 self.physical_size -= stop - start;
             }

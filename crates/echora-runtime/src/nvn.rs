@@ -199,41 +199,6 @@ fn debug_env() -> &'static HashMap<String, std::ffi::OsString> {
 /// lookup caches.
 type DebugOverrides = HashMap<String, Option<&'static std::ffi::OsStr>>;
 static DEBUG_OVERRIDES: std::sync::RwLock<Option<DebugOverrides>> = std::sync::RwLock::new(None);
-
-/// File ranges of guest memory released (unmapped, or a heap's shrunk
-/// tail) since the GPU last looked: spans shared with it keep the old
-/// pages, so the GPU stops sharing them (`Nvn::gpu_released_memory`).
-static RELEASED_FILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
-static RELEASED_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Before guest range `[address, address + length)` is released: note the
-/// file ranges its pages are backed by (`RELEASED_FILE_RANGES`).
-pub(crate) fn note_released_memory(memory: &Memory, address: u64, length: u64) {
-    const PAGE: u64 = 4096;
-    let mut ranges: Vec<(u64, u64)> = Vec::new();
-    let mut page = address & !(PAGE - 1);
-    while page < address + length {
-        if let Some((_, offset)) = memory.shared_span(page, PAGE) {
-            match ranges.last_mut() {
-                Some((start, size)) if *start + *size == offset => *size += PAGE,
-                _ => ranges.push((offset, PAGE)),
-            }
-        }
-        page += PAGE;
-    }
-    if !ranges.is_empty() {
-        RELEASED_FILE_RANGES.lock().unwrap().extend(ranges);
-        RELEASED_PENDING.store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// The file ranges released since the last call.
-pub(crate) fn take_released_memory() -> Vec<(u64, u64)> {
-    if !RELEASED_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
-        return Vec::new();
-    }
-    std::mem::take(&mut *RELEASED_FILE_RANGES.lock().unwrap())
-}
 static DEBUG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Replace the replay switches (`None` for none). The values are leaked:
