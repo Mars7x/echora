@@ -7,8 +7,10 @@
 //!
 //! * NaN propagation (FPProcessNaNs/FPProcessNaNs3 order), default NaN for
 //!   invalid operations, FPCR.DN and FPCR.FZ (single and double precision).
-//! * FPSR cumulative IOC, DZC, OFC and IDC. Inexact (IXC) and underflow (UFC)
-//!   accumulation is not modeled; FPCR trap-enable bits are stored only.
+//! * FPSR cumulative IOC, DZC, OFC and IDC, and inexact (IXC) for rounded
+//!   sums, differences, products and quotients and for overflows (other
+//!   operations do not raise it); underflow (UFC) accumulation is not
+//!   modeled; FPCR trap-enable bits are stored only.
 //! * FPCR.RMode other than round-to-nearest-even, FPCR.AH, FPCR.FZ16 and
 //!   FPCR.AHP stop explicitly instead of producing differently rounded
 //!   results. Half precision is supported only by the FCVT conversions.
@@ -3175,7 +3177,8 @@ mod tests {
             f64::from_bits(cpu.vectors[9] as u64),
             (-0.1f64).mul_add(10.0, -1.0)
         );
-        assert_eq!(cpu.fpsr, 0);
+        // The quotient 1/3 was rounded: inexact, and nothing else.
+        assert_eq!(cpu.fpsr, FPSR_IXC);
     }
 
     #[test]
