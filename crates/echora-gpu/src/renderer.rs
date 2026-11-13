@@ -839,15 +839,15 @@ impl Renderer {
                         .zip(entries.chunks(512))
                         .all(|(old, new)| {
                             old == new
-                                || old.iter().zip(new).all(|(old, new)| old == new || *old == 0)
+                                || old
+                                    .iter()
+                                    .zip(new)
+                                    .all(|(old, new)| old == new || *old == 0)
                         })
             });
         if added {
             let (buffer, written) = self.page_table.as_mut().unwrap();
-            for (index, (old, new)) in written
-                .chunks_mut(512)
-                .zip(entries.chunks(512))
-                .enumerate()
+            for (index, (old, new)) in written.chunks_mut(512).zip(entries.chunks(512)).enumerate()
             {
                 if old != new {
                     let raw: Vec<u8> = new.iter().flat_map(|entry| entry.to_le_bytes()).collect();
@@ -2364,7 +2364,9 @@ impl Renderer {
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
         // Kept sorted by start; a span holding this one starts at most
         // MAX_SHARED_SPAN before it.
-        let after = self.addressed.partition_point(|(known, ..)| *known <= start);
+        let after = self
+            .addressed
+            .partition_point(|(known, ..)| *known <= start);
         if let Some(&(known, _, _, _, address)) = self.addressed[..after]
             .iter()
             .rev()
@@ -2385,8 +2387,11 @@ impl Renderer {
             self.retired_shared.push((buffer, memory));
             return Ok(None);
         };
-        let at = self.addressed.partition_point(|(known, ..)| *known <= start);
-        self.addressed.insert(at, (start, span, buffer, memory, address));
+        let at = self
+            .addressed
+            .partition_point(|(known, ..)| *known <= start);
+        self.addressed
+            .insert(at, (start, span, buffer, memory, address));
         Ok(Some(address + (offset - start)))
     }
 

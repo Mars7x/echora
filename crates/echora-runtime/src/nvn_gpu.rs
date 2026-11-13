@@ -4737,6 +4737,9 @@ impl Nvn {
                 Some((storage.x[0], storage.x[1], gpu, flags))
             })
             .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
+            // GPU_NO_ACCESS (8): a physical pool the GPU reaches only
+            // through a virtual pool's mappings, never at its own address.
+            .filter(|&(_, _, _, flags)| flags & 8 == 0)
             .collect();
         let first = pools
             .iter()
@@ -5230,8 +5233,9 @@ impl Nvn {
         }
         // Pools an address in the constant buffers falls in.
         let pools: Vec<(u64, u64)> = self
-            .objects
-            .values()
+            .memory_pools
+            .iter()
+            .filter_map(|address| self.objects.get(address))
             .filter(|object| object.kind == "MemoryPool")
             .filter_map(|pool| {
                 let size = pool.builder.get("Storage")?.x[1];
@@ -6055,8 +6059,9 @@ impl Nvn {
             );
         }
         let pools: Vec<(u64, u64)> = self
-            .objects
-            .values()
+            .memory_pools
+            .iter()
+            .filter_map(|address| self.objects.get(address))
             .filter(|object| object.kind == "MemoryPool")
             .filter_map(|pool| {
                 pool.builder
@@ -6156,8 +6161,9 @@ impl Nvn {
             .find(|pool| pool.base <= guest && guest + length <= pool.base + pool.size)
             .map(|pool| (pool.base, pool.size, if pool.uncached { 2 } else { 0 }));
         let Some((base, size, flags)) = known.or_else(|| {
-            self.objects
-                .values()
+            self.memory_pools
+                .iter()
+                .filter_map(|address| self.objects.get(address))
                 .filter(|object| object.kind == "MemoryPool")
                 .filter_map(|pool| {
                     let storage = pool.builder.get("Storage")?;
