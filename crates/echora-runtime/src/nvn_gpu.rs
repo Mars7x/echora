@@ -24,6 +24,13 @@ use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage
 
 use super::{Command, Guest, Image, Nvn};
 
+/// A built page table (see `Nvn::page_table`).
+pub struct PageBuild {
+    first: u64,
+    entries: Vec<u64>,
+    pools: HashMap<(u64, u64, u64, u64), Option<(u64, u64, usize)>>,
+}
+
 pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
@@ -34,6 +41,10 @@ pub struct Backend {
     /// The GPU page table (ECHORA_PAGE_TABLE) and the pool set it was built
     /// for (count, and the sum of their GPU addresses and sizes).
     page_table: Option<((usize, u64), echora_shader_abi::PageTable)>,
+    /// The last page table built: its entries and, per pool (base, size,
+    /// GPU address, flags), the sharing it was mapped with (None: some
+    /// pages unmapped, so mapped again next time).
+    page_build: Option<PageBuild>,
     /// ECHORA_LOOP_TRACE (debugging): each traced compute program's
     /// counter buffer (`Renderer::debug_buffer` index and address) and the
     /// present it was last reported at.
@@ -184,6 +195,7 @@ impl Backend {
             translations: HashMap::new(),
             native_programs: Default::default(),
             page_table: None,
+            page_build: None,
             loop_traces: HashMap::new(),
             vertex_traces: HashMap::new(),
             vertex_trace_addresses: Vec::new(),
@@ -4738,10 +4750,6 @@ impl Nvn {
         // A table past 16 million pages (64 GiB) means the pools are not
         // what this model expects.
         let count = (end - first).min(16 << 20) as usize;
-        let mut entries = vec![0u64; count];
-        // A page under the largest span shared at once, so a chunk whose
-        // file offset is not page-aligned still fits once rounded to pages.
-        const CHUNK: u64 = (64 << 20) - PAGE_SIZE;
         let traced = super::debug_var("ECHORA_POOL_TRACE")
             .ok()
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
@@ -4758,152 +4766,56 @@ impl Nvn {
                     .map_or(0, |backend| backend.share_generation),
             );
         }
-        for (base, size, gpu, flags) in pools {
-            let host_visible = flags & 6 != 0;
-            // A pool shared in pieces: each piece, in chunks.
-            let pieces = self
-                .gpu
-                .as_ref()
-                .and_then(|backend| backend.shared_pieces.get(&base))
-                .filter(|_| host_visible)
-                .cloned();
-            if let Some(pieces) = pieces {
-                for (piece_offset, piece_length, file, at) in pieces {
-                    let mut done = 0;
-                    while done < piece_length {
-                        let length = (piece_length - done).min(CHUNK);
-                        let address = self.gpu.as_mut().unwrap().renderer.address_span(
-                            file,
-                            at + done,
-                            length,
-                        )?;
-                        if let Some(address) = address {
-                            let first_page = (gpu + piece_offset + done) >> PAGE_SHIFT;
-                            for page in 0..length.div_ceil(PAGE_SIZE) {
-                                if let Some(entry) =
-                                    entries.get_mut((first_page + page - first) as usize)
-                                {
-                                    *entry = address + page * PAGE_SIZE;
-                                }
-                            }
-                        }
-                        done += length;
-                    }
-                }
+        // Pools already in the table whose sharing has not changed keep
+        // their pages: a present typically shares one new pool, and building
+        // the whole table again (every pool's spans, ~256k entries) took
+        // about 12 ms. A pool gone or moved, or a table of another extent,
+        // builds it whole.
+        let signatures: Vec<_> = pools
+            .iter()
+            .map(|&(base, size, gpu, flags)| {
+                ((base, size, gpu, flags), self.pool_share_signature(base, flags))
+            })
+            .collect();
+        let previous = self
+            .gpu
+            .as_mut()
+            .unwrap()
+            .page_build
+            .take()
+            .filter(|built| built.first == first && built.entries.len() == count)
+            .filter(|built| {
+                let current: std::collections::HashSet<_> = signatures.iter().map(|(pool, _)| *pool).collect();
+                built.pools.keys().all(|pool| current.contains(pool))
+            });
+        let mut built_pools = HashMap::new();
+        let mut entries = match previous {
+            Some(built) => {
+                built_pools = built.pools;
+                built.entries
+            }
+            None => vec![0u64; count],
+        };
+        for (pool, signature) in signatures {
+            if built_pools.get(&pool) == Some(&Some(signature)) {
                 continue;
             }
-            let mut offset = 0;
-            while offset < size {
-                let length = (size - offset).min(CHUNK);
-                let mut recorded_span = false;
-                let address = if host_visible {
-                    let recorded = self
-                        .gpu
-                        .as_ref()
-                        .and_then(|backend| backend.shared_pools.get(&base))
-                        .filter(|(shared_size, ..)| *shared_size >= offset + length)
-                        .map(|&(_, file, at)| (file, at + offset));
-                    recorded_span = recorded.is_some();
-                    match recorded.or_else(|| core.memory.shared_span(base + offset, length)) {
-                        Some((file, at)) => self
-                            .gpu
-                            .as_mut()
-                            .unwrap()
-                            .renderer
-                            .address_span(file, at, length)?,
-                        None => None,
-                    }
-                } else {
-                    self.resident_pool_binding(core, base, size)?;
-                    self.gpu
-                        .as_ref()
-                        .unwrap()
-                        .renderer
-                        .resident_address(base)
-                        .map(|address| address + offset)
-                };
-                // A chunk no single span shares (a page unmapped, or the
-                // backing not contiguous): the runs of pages that are.
-                if address.is_none() && host_visible {
-                    let mut runs: Vec<(u64, u64, i32, u64)> = Vec::new();
-                    let mut page = 0;
-                    while page * PAGE_SIZE < length {
-                        let at = offset + page * PAGE_SIZE;
-                        if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE)
-                        {
-                            match runs.last_mut() {
-                                Some(run)
-                                    if run.2 == file
-                                        && run.0 + run.1 == at
-                                        && run.3 + run.1 == file_at =>
-                                {
-                                    run.1 += PAGE_SIZE;
-                                }
-                                _ => runs.push((at, PAGE_SIZE, file, file_at)),
-                            }
-                        }
-                        page += 1;
-                    }
-                    let backend = self.gpu.as_mut().unwrap();
-                    if runs.is_empty() {
-                        let known = backend.shared_pools.get(&base).map(|&(shared, ..)| shared);
-                        backend.note(format!(
-                            "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped ({}), guest {base:#x}, recorded size {known:x?}",
-                            if recorded_span { "its recorded span did not import" } else { "no shared span" }
-                        ));
-                    } else {
-                        backend.stat("stat: page table chunks mapped in runs", 1);
-                    }
-                    for (at, run_length, file, file_at) in runs {
-                        let mapped = self
-                            .gpu
-                            .as_mut()
-                            .unwrap()
-                            .renderer
-                            .address_span(file, file_at, run_length)?;
-                        if let Some(mapped) = mapped {
-                            let first_page = (gpu + at) >> PAGE_SHIFT;
-                            for page in 0..run_length / PAGE_SIZE {
-                                if let Some(entry) =
-                                    entries.get_mut((first_page + page - first) as usize)
-                                {
-                                    *entry = mapped + page * PAGE_SIZE;
-                                }
-                            }
-                        }
-                    }
-                    offset += length;
-                    continue;
-                }
-                if address.is_none() {
-                    let note = format!(
-                        "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped{}",
-                        if !host_visible {
-                            " (no resident copy)"
-                        } else if recorded_span {
-                            " (its recorded span did not import)"
-                        } else {
-                            " (no shared span)"
-                        }
-                    );
-                    let known = self
-                        .gpu
-                        .as_ref()
-                        .and_then(|backend| backend.shared_pools.get(&base))
-                        .map(|&(shared, ..)| shared);
-                    let note = format!("{note}, guest {base:#x}, recorded size {known:x?}");
-                    self.gpu.as_mut().unwrap().note(note);
-                }
-                if let Some(address) = address {
-                    let first_page = (gpu + offset) >> PAGE_SHIFT;
-                    for page in 0..length.div_ceil(PAGE_SIZE) {
-                        if let Some(entry) = entries.get_mut((first_page + page - first) as usize) {
-                            *entry = address + page * PAGE_SIZE;
-                        }
-                    }
-                }
-                offset += length;
+            let (base, size, gpu, flags) = pool;
+            let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
+                ..((gpu + size).div_ceil(PAGE_SIZE) - first).min(count as u64) as usize;
+            if let Some(range) = entries.get_mut(pages.clone()) {
+                range.fill(0);
             }
+            self.map_pool_pages(core, base, size, gpu, flags, first, &mut entries)?;
+            // A pool with unmapped pages is mapped again at the next build
+            // (a span may be shared by then).
+            let complete = entries
+                .get(pages)
+                .is_some_and(|range| range.iter().all(|&entry| entry != 0));
+            // Its signature after mapping (a GPU-only pool's resident
+            // buffer exists from its first mapping on).
+            let mapped = complete.then(|| self.pool_share_signature(base, flags));
+            built_pools.insert(pool, mapped);
         }
         let backend = self.gpu.as_mut().unwrap();
         // The renderer's counts from the spans just shared (refusals).
@@ -4911,6 +4823,11 @@ impl Nvn {
             backend.stat(name, amount);
         }
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
+        backend.page_build = Some(PageBuild {
+            first,
+            entries,
+            pools: built_pools,
+        });
         backend.stat(
             "stat: page table pinned MiB",
             backend.renderer.addressed_bytes() >> 20,
@@ -4922,6 +4839,188 @@ impl Nvn {
             started.elapsed().as_micros() as u64,
         );
         Ok(table)
+    }
+
+    /// What decides how pool `base` maps into the page table besides its
+    /// own properties: its recorded share (whole or in pieces) and, for a
+    /// GPU-only pool, its resident buffer's address.
+    fn pool_share_signature(&self, base: u64, flags: u64) -> (u64, u64, usize) {
+        let Some(backend) = self.gpu.as_ref() else {
+            return (0, 0, 0);
+        };
+        if flags & 6 == 0 {
+            return (backend.renderer.resident_address(base).unwrap_or(0), 0, 0);
+        }
+        let shared = backend
+            .shared_pools
+            .get(&base)
+            .map_or((0, 0), |&(size, file, at)| (size, (file as u64) << 48 ^ at));
+        let pieces = backend.shared_pieces.get(&base).map_or(0, |pieces| pieces.len());
+        (shared.0, shared.1, pieces)
+    }
+
+    /// Write pool `base`'s page entries (pages from `first`) into `entries`.
+    #[allow(clippy::too_many_arguments)]
+    fn map_pool_pages(
+        &mut self,
+        core: &mut Guest,
+        base: u64,
+        size: u64,
+        gpu: u64,
+        flags: u64,
+        first: u64,
+        entries: &mut [u64],
+    ) -> Result<(), String> {
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        // A page under the largest span shared at once, so a chunk whose
+        // file offset is not page-aligned still fits once rounded to pages.
+        const CHUNK: u64 = (64 << 20) - PAGE_SIZE;
+        let host_visible = flags & 6 != 0;
+        // A pool shared in pieces: each piece, in chunks.
+        let pieces = self
+            .gpu
+            .as_ref()
+            .and_then(|backend| backend.shared_pieces.get(&base))
+            .filter(|_| host_visible)
+            .cloned();
+        if let Some(pieces) = pieces {
+            for (piece_offset, piece_length, file, at) in pieces {
+                let mut done = 0;
+                while done < piece_length {
+                    let length = (piece_length - done).min(CHUNK);
+                    let address = self.gpu.as_mut().unwrap().renderer.address_span(
+                        file,
+                        at + done,
+                        length,
+                    )?;
+                    if let Some(address) = address {
+                        let first_page = (gpu + piece_offset + done) >> PAGE_SHIFT;
+                        for page in 0..length.div_ceil(PAGE_SIZE) {
+                            if let Some(entry) =
+                                entries.get_mut((first_page + page - first) as usize)
+                            {
+                                *entry = address + page * PAGE_SIZE;
+                            }
+                        }
+                    }
+                    done += length;
+                }
+            }
+            return Ok(());
+        }
+        let mut offset = 0;
+        while offset < size {
+            let length = (size - offset).min(CHUNK);
+            let mut recorded_span = false;
+            let address = if host_visible {
+                let recorded = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|backend| backend.shared_pools.get(&base))
+                    .filter(|(shared_size, ..)| *shared_size >= offset + length)
+                    .map(|&(_, file, at)| (file, at + offset));
+                recorded_span = recorded.is_some();
+                match recorded.or_else(|| core.memory.shared_span(base + offset, length)) {
+                    Some((file, at)) => self
+                        .gpu
+                        .as_mut()
+                        .unwrap()
+                        .renderer
+                        .address_span(file, at, length)?,
+                    None => None,
+                }
+            } else {
+                self.resident_pool_binding(core, base, size)?;
+                self.gpu
+                    .as_ref()
+                    .unwrap()
+                    .renderer
+                    .resident_address(base)
+                    .map(|address| address + offset)
+            };
+            // A chunk no single span shares (a page unmapped, or the
+            // backing not contiguous): the runs of pages that are.
+            if address.is_none() && host_visible {
+                let mut runs: Vec<(u64, u64, i32, u64)> = Vec::new();
+                let mut page = 0;
+                while page * PAGE_SIZE < length {
+                    let at = offset + page * PAGE_SIZE;
+                    if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE)
+                    {
+                        match runs.last_mut() {
+                            Some(run)
+                                if run.2 == file
+                                    && run.0 + run.1 == at
+                                    && run.3 + run.1 == file_at =>
+                            {
+                                run.1 += PAGE_SIZE;
+                            }
+                            _ => runs.push((at, PAGE_SIZE, file, file_at)),
+                        }
+                    }
+                    page += 1;
+                }
+                let backend = self.gpu.as_mut().unwrap();
+                if runs.is_empty() {
+                    let known = backend.shared_pools.get(&base).map(|&(shared, ..)| shared);
+                    backend.note(format!(
+                        "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped ({}), guest {base:#x}, recorded size {known:x?}",
+                        if recorded_span { "its recorded span did not import" } else { "no shared span" }
+                    ));
+                } else {
+                    backend.stat("stat: page table chunks mapped in runs", 1);
+                }
+                for (at, run_length, file, file_at) in runs {
+                    let mapped = self
+                        .gpu
+                        .as_mut()
+                        .unwrap()
+                        .renderer
+                        .address_span(file, file_at, run_length)?;
+                    if let Some(mapped) = mapped {
+                        let first_page = (gpu + at) >> PAGE_SHIFT;
+                        for page in 0..run_length / PAGE_SIZE {
+                            if let Some(entry) =
+                                entries.get_mut((first_page + page - first) as usize)
+                            {
+                                *entry = mapped + page * PAGE_SIZE;
+                            }
+                        }
+                    }
+                }
+                offset += length;
+                continue;
+            }
+            if address.is_none() {
+                let note = format!(
+                    "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped{}",
+                    if !host_visible {
+                        " (no resident copy)"
+                    } else if recorded_span {
+                        " (its recorded span did not import)"
+                    } else {
+                        " (no shared span)"
+                    }
+                );
+                let known = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|backend| backend.shared_pools.get(&base))
+                    .map(|&(shared, ..)| shared);
+                let note = format!("{note}, guest {base:#x}, recorded size {known:x?}");
+                self.gpu.as_mut().unwrap().note(note);
+            }
+            if let Some(address) = address {
+                let first_page = (gpu + offset) >> PAGE_SHIFT;
+                for page in 0..length.div_ceil(PAGE_SIZE) {
+                    if let Some(entry) = entries.get_mut((first_page + page - first) as usize) {
+                        *entry = address + page * PAGE_SIZE;
+                    }
+                }
+            }
+            offset += length;
+        }
+        Ok(())
     }
 
     /// Write one dispatch's inputs for the workgroup simulator (`cargo run
