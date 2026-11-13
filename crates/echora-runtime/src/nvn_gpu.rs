@@ -7483,9 +7483,9 @@ impl Nvn {
             )
         });
         let traced_textures = if super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
-            wanted
-                .split(',')
-                .any(|item| item == format!("{:016x}", keys.1))
+            wanted.split(',').any(|item| {
+                item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
+            })
         }) {
             let mut bound_textures: Vec<_> = textures.iter().collect();
             bound_textures.sort_by_key(|(key, _)| **key);
@@ -7605,9 +7605,9 @@ impl Nvn {
         // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
         // programs' draws, with their fixed-function state.
         let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
-            wanted
-                .split(',')
-                .any(|item| item == format!("{:016x}", keys.1))
+            wanted.split(',').any(|item| {
+                item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
+            })
         });
         if traced_program {
             let line = format!(
@@ -7622,12 +7622,13 @@ impl Nvn {
                 keys.0, keys.1
             );
             let line = format!(
-                "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} view formats {:?} levels {:x?} uniforms {:?}",
+                "trace program {:016x}/{:016x} bound {bound:?} depth test {} write {} {:?} bias {:?} stencil {:?} cull {:?} viewport {:?} scissor {:?} blends {:?} colors {:x?} view formats {:?} levels {:x?} uniforms {:?}",
                 keys.0,
                 keys.1,
                 fixed.depth_test,
                 fixed.depth_write,
                 fixed.depth_compare,
+                fixed.depth_bias,
                 fixed.stencil,
                 fixed.cull,
                 fixed.viewport,
