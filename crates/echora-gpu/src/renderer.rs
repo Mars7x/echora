@@ -205,8 +205,8 @@ pub struct Renderer {
     /// copy once the image holds them (`has_upload`), and `with_texels`
     /// reads them back from the image when needed again.
     upload_lengths: FastMap<u64, u64>,
-    /// Uploads forgotten while recorded work may still sample them:
-    /// destroyed after the next flush.
+    /// Uploads forgotten, and targets made again at another shape, while
+    /// recorded work may still use them: destroyed after the next flush.
     retired_uploads: Vec<Target>,
     /// Texel buffers made from guest buffer textures (shaders read them as
     /// samplerBuffer), by upload key: the generation copied, the buffer and
@@ -3174,7 +3174,8 @@ impl Renderer {
                     old.width, old.height, old.format, old.levels, old.shape
                 );
             }
-            self.flush()?;
+            // The old image goes once the work recorded so far has run
+            // (retired with this batch), not after a wait for it all.
             self.target_changes += 1;
             let old = self.targets.remove(&key).unwrap();
             // The same memory taller or shorter, as the application
@@ -3184,11 +3185,10 @@ impl Renderer {
             let flat = |shape: ImageShape| matches!(shape, ImageShape::D2 { layers: 1 });
             if (old.width, old.format) == (width, format) && flat(old.shape) && flat(shape) {
                 self.create_target_keeping(key, &old, height, levels)?;
-                self.flush()?;
-                self.destroy_target(old);
+                self.retired_uploads.push(old);
                 return Ok(&self.targets[&key]);
             }
-            self.destroy_target(old);
+            self.retired_uploads.push(old);
         }
         if !self.targets.contains_key(&key) {
             let scale = self.scale_for(key, width, height, shape);

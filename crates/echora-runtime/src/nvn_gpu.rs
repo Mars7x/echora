@@ -746,15 +746,25 @@ impl Nvn {
             Some((key, base)) if key != texture => (key, base + level),
             _ => (texture, level),
         };
+        let started = std::time::Instant::now();
         self.ensure_render_target(texture)?;
+        let ensured = std::time::Instant::now();
+        crate::timeline::span(u64::MAX - 2, "clear: ensure target", started, ensured);
         let backend = self.gpu.as_mut().unwrap();
         backend.renderer.defined(texture);
         let value = vk::ClearColorValue {
             float32: color.map(f32::from_bits),
         };
-        backend
+        let cleared = backend
             .renderer
-            .clear_color_level(texture, level, layer, rect, value)
+            .clear_color_level(texture, level, layer, rect, value);
+        crate::timeline::span(
+            u64::MAX - 2,
+            "clear: clear",
+            ensured,
+            std::time::Instant::now(),
+        );
+        cleared
     }
 
     /// ClearDepthStencil on the GPU: the masked-off aspects keep their
