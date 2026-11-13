@@ -380,7 +380,7 @@ struct Slot {
 /// Submission slots: the CPU records into one while the GPU runs the
 /// others' batches, so a submission waits only for the batch this many
 /// before it.
-pub(crate) const SLOTS: usize = 3;
+pub(crate) const SLOTS: usize = 6;
 
 /// Draws and dispatches one submission may hold (see `bound_submission`).
 const MAX_WORK_ITEMS: u32 = 1000;
