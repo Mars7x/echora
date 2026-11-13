@@ -4997,8 +4997,11 @@ fn replay_thread(shared: &Shared, mut core: Core) {
 
 /// With a replay thread: whether NVN call `name` (arguments `regs`) needs
 /// the work submitted before it to have run first: it waits for results,
-/// reads what the GPU wrote, or removes or re-identifies objects and memory
-/// that work reads. Other calls go on while the thread replays.
+/// reads texels the GPU wrote, or removes or re-identifies objects and
+/// memory that work reads. Other calls go on while the thread replays. An
+/// invalidate does not wait, as on the console: the GPU writes it makes
+/// visible are those of work replayed so far, which covers every fence the
+/// guest has seen signaled.
 fn needs_replayed(name: &str, regs: &[u64; 31]) -> bool {
     match name {
         "nvnSyncWait" => regs[1] != 0,
@@ -5007,7 +5010,6 @@ fn needs_replayed(name: &str, regs: &[u64; 31]) -> bool {
         _ => {
             name.ends_with("Finalize")
                 || name.ends_with("Initialize")
-                || name.contains("InvalidateMappedRange")
                 || name.contains("ReadTexels")
                 || name.contains("WriteTexels")
                 || name.contains("Register")
