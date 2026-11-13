@@ -923,7 +923,48 @@ pub struct Recorder {
     recordings: Recordings,
 }
 
+/// Whether workers make NVN call `name` without the NVN state
+/// (`Recorder::front`).
+pub fn front_call(name: &str) -> bool {
+    split_name(name).is_some_and(|(kind, _)| FRONT_KINDS.contains(&kind))
+}
+
+/// Kinds whose calls are only the generic property bags (no call on them
+/// has an arm of its own in `Nvn::call`): workers make them without the
+/// NVN state (`Recorder::front`).
+const FRONT_KINDS: &[&str] = &[
+    "BlendState",
+    "ChannelMaskState",
+    "ColorState",
+    "DepthStencilState",
+    "MultisampleState",
+    "PolygonState",
+    "BufferBuilder",
+];
+
 impl Recorder {
+    /// Make NVN call `name` when it is a property-bag call on a kind in
+    /// `FRONT_KINDS`, as `Nvn::call` would: Ok(true) once made.
+    pub fn front(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        let Some((kind, rest)) = split_name(name) else {
+            return Ok(false);
+        };
+        if !FRONT_KINDS.contains(&kind) {
+            return Ok(false);
+        }
+        call_watch(name, core);
+        let x = core.cpu.regs;
+        let this = x[0];
+        if this == 0 {
+            return Ok(false);
+        }
+        let args = Args {
+            x: [x[1], x[2], x[3], x[4]],
+            v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
+        };
+        bag_call(&self.bags, core, name, kind, rest, this, args, x)
+    }
+
     /// Record NVN call `name` when it is a call on a recording command
     /// buffer (X0) other than its management: Ok(true) once recorded,
     /// Ok(false) when it is not (the caller makes it with the NVN state).
@@ -2129,7 +2170,7 @@ impl Nvn {
                 self.object(this, kind).map_err(invalid)?;
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
-                self.object_generation += 1;
+                self.object_changed(this, kind);
                 return Ok(true);
             }
             // nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const
@@ -2391,7 +2432,11 @@ impl Nvn {
                 return Ok(true);
             }
             "nvnTextureFinalize" | "nvnWindowFinalize" | "nvnCommandBufferFinalize" => {
-                self.texture_epoch += 1;
+                // A command buffer holds no texture: the caches keyed by
+                // the texture epoch stay.
+                if name != "nvnCommandBufferFinalize" {
+                    self.texture_epoch += 1;
+                }
                 let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
                 if let Some(identity) = self.texture_identity(this) {
@@ -2756,7 +2801,7 @@ impl Nvn {
                 }
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
-                self.object_generation += 1;
+                self.object_changed(this, kind);
                 return Ok(true);
             }
             _ => {}
@@ -2887,105 +2932,8 @@ impl Nvn {
         // pointer, like builders.
         let bag_like =
             kind.ends_with("Builder") || kind == "TextureView" || kind.ends_with("State");
-        if bag_like && rest == "SetDefaults" {
-            // Builders keep their device across SetDefaults: the application
-            // sets the device first for some kinds (QueueBuilder).
-            let device = read_shared(&self.bags)
-                .get(&this)
-                .and_then(|bag| bag.props.get("Device").copied());
-            let mut bag = Bag {
-                kind: kind.into(),
-                props: BTreeMap::new(),
-            };
-            if let Some(device) = device {
-                bag.props.insert("Device".into(), device);
-            }
-            tag_state(core, this, kind, &bag.props)?;
-            write_shared(&self.bags).insert(this, bag);
+        if bag_like && bag_call(&self.bags, core, name, kind, rest, this, args, x)? {
             return Ok(true);
-        }
-        if bag_like {
-            if let Some(property) = rest.strip_prefix("Set") {
-                // Structures live in application memory (often the stack):
-                // a setter of another kind at the same address means the old
-                // structure's lifetime ended, so a new one starts there.
-                let mut bags = write_shared(&self.bags);
-                let bag = bags
-                    .entry(this)
-                    .and_modify(|bag| {
-                        if bag.kind != kind {
-                            *bag = Bag {
-                                kind: kind.into(),
-                                props: BTreeMap::new(),
-                            };
-                        }
-                    })
-                    .or_insert_with(|| Bag {
-                        kind: kind.into(),
-                        props: BTreeMap::new(),
-                    });
-                // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
-                // combined forms of SetWidth/SetHeight/SetDepth.
-                if let Some(dimensions) = property
-                    .strip_prefix("Size")
-                    .and_then(|rest| rest.strip_suffix('D'))
-                    .and_then(|count| count.parse::<usize>().ok())
-                    .filter(|count| (1..=3).contains(count))
-                {
-                    for (index, key) in ["Width", "Height", "Depth"].iter().enumerate() {
-                        let value = if index < dimensions { args.x[index] } else { 1 };
-                        bag.props.insert(
-                            (*key).into(),
-                            Args {
-                                x: [value, 0, 0, 0],
-                                v: [0; 2],
-                            },
-                        );
-                    }
-                    return Ok(true);
-                }
-                // Per-target setters (SetBlendEnable(state, index, enable),
-                // SetChannelMask(state, index, r, g, b, a)) also keep each
-                // index's latest call.
-                if matches!(property, "BlendEnable" | "ChannelMask") {
-                    let mut args = args;
-                    // The mask's alpha flag is the fifth argument (X5),
-                    // kept where integer setters leave V1 unused.
-                    if property == "ChannelMask" {
-                        args.v[1] = x[5];
-                    }
-                    bag.props.insert(format!("{property}/{}", args.x[0]), args);
-                }
-                let mut args = args;
-                // SetPackagedTextureLayout(builder, const
-                // NVNpackagedTextureLayout*): its eight bytes now, in X1
-                // (the structure may not outlive the call).
-                if kind == "TextureBuilder" && property == "PackagedTextureLayout" {
-                    args.x[1] = if args.x[0] != 0 {
-                        core.memory.read_u64(args.x[0])?
-                    } else {
-                        0
-                    };
-                }
-                bag.props.insert(property.into(), args);
-                let props = bag.props.clone();
-                drop(bags);
-                tag_state(core, this, kind, &props)?;
-                return Ok(true);
-            }
-            if let Some(property) = rest.strip_prefix("Get") {
-                let bags = read_shared(&self.bags);
-                let bag = bags
-                    .get(&this)
-                    .filter(|bag| bag.kind == kind)
-                    .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?;
-                let Some(value) = bag.props.get(property).copied() else {
-                    return Err(stop(format!("{property} was never set")));
-                };
-                core.cpu.regs[0] = value.x[0];
-                core.cpu.vectors[0] = u128::from(value.v[0]);
-                return Ok(true);
-            }
         }
         // Generic getters on initialized objects for properties their
         // builder set (nvn<Kind>Get<Prop> after nvn<Kind>BuilderSet<Prop>).
@@ -4727,6 +4675,18 @@ impl Nvn {
         Ok(())
     }
 
+    /// An object made or removed at `address`: `texture_storage` answers
+    /// change for pools (which every texture's storage goes through),
+    /// textures, and an address it has answered for.
+    fn object_changed(&mut self, address: u64, kind: &str) {
+        if kind == "MemoryPool"
+            || kind == "Texture"
+            || self.storage_memo.borrow().1.contains_key(&address)
+        {
+            self.object_generation += 1;
+        }
+    }
+
     fn initialize(
         &mut self,
         address: u64,
@@ -4736,7 +4696,7 @@ impl Nvn {
         if self.objects.contains_key(&address) {
             return Err(format!("{kind} {address:#x} is already initialized"));
         }
-        self.object_generation += 1;
+        self.object_changed(address, kind);
         if kind == "MemoryPool" {
             self.memory_pools.insert(address);
         }
@@ -4964,16 +4924,30 @@ fn tag_state(
         return Ok(());
     }
     use std::hash::{Hash, Hasher};
+    // The entries themselves are hashed (formatting them for every setter
+    // cost more than the setter), and the table is written only for a tag
+    // not seen yet.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     kind.hash(&mut hasher);
-    format!("{props:?}").hash(&mut hasher);
+    for (name, value) in props {
+        name.hash(&mut hasher);
+        value.x.hash(&mut hasher);
+        value.v.hash(&mut hasher);
+    }
     let tag = (hasher.finish() as u32) | 1;
-    STATE_TAGS
-        .write()
+    let known = STATE_TAGS
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_or_insert_with(HashMap::new)
-        .entry(tag)
-        .or_insert_with(|| (kind.into(), props.clone()));
+        .as_ref()
+        .is_some_and(|tags| tags.contains_key(&tag));
+    if !known {
+        STATE_TAGS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .entry(tag)
+            .or_insert_with(|| (kind.into(), props.clone()));
+    }
     core.memory.write_u32(address, tag)
 }
 
@@ -5112,6 +5086,137 @@ impl Nvn {
             last: None,
         });
     }
+}
+
+/// The generic property bags (SetDefaults / Set<Prop> / Get<Prop> on
+/// builders, fixed-function state structures and texture views): Ok(true)
+/// when `kind`/`rest` is one of those calls and it was made. They touch
+/// only the shared bags and the structure's tag, so workers make the hot
+/// ones without the NVN state (`Recorder::front`).
+#[allow(clippy::too_many_arguments)]
+fn bag_call(
+    bags: &Bags,
+    core: &mut Guest,
+    name: &str,
+    kind: &str,
+    rest: &str,
+    this: u64,
+    args: Args,
+    x: [u64; 31],
+) -> Result<bool, Trap> {
+    let invalid = |message: String| Trap::InvalidState {
+        message: format!("{name}: {message}"),
+    };
+    let pc = core.cpu.pc;
+    let stop = move |message: String| Trap::UnsupportedService {
+        pc,
+        service: "nvn".into(),
+        command_id: None,
+        message: format!("{name}: {message}"),
+    };
+    let bag_like = kind.ends_with("Builder") || kind == "TextureView" || kind.ends_with("State");
+    if bag_like && rest == "SetDefaults" {
+        // Builders keep their device across SetDefaults: the application
+        // sets the device first for some kinds (QueueBuilder).
+        let device = read_shared(bags)
+            .get(&this)
+            .and_then(|bag| bag.props.get("Device").copied());
+        let mut bag = Bag {
+            kind: kind.into(),
+            props: BTreeMap::new(),
+        };
+        if let Some(device) = device {
+            bag.props.insert("Device".into(), device);
+        }
+        tag_state(core, this, kind, &bag.props)?;
+        write_shared(bags).insert(this, bag);
+        return Ok(true);
+    }
+    if bag_like {
+        if let Some(property) = rest.strip_prefix("Set") {
+            // Structures live in application memory (often the stack):
+            // a setter of another kind at the same address means the old
+            // structure's lifetime ended, so a new one starts there.
+            let mut bags = write_shared(bags);
+            let bag = bags
+                .entry(this)
+                .and_modify(|bag| {
+                    if bag.kind != kind {
+                        *bag = Bag {
+                            kind: kind.into(),
+                            props: BTreeMap::new(),
+                        };
+                    }
+                })
+                .or_insert_with(|| Bag {
+                    kind: kind.into(),
+                    props: BTreeMap::new(),
+                });
+            // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
+            // combined forms of SetWidth/SetHeight/SetDepth.
+            if let Some(dimensions) = property
+                .strip_prefix("Size")
+                .and_then(|rest| rest.strip_suffix('D'))
+                .and_then(|count| count.parse::<usize>().ok())
+                .filter(|count| (1..=3).contains(count))
+            {
+                for (index, key) in ["Width", "Height", "Depth"].iter().enumerate() {
+                    let value = if index < dimensions { args.x[index] } else { 1 };
+                    bag.props.insert(
+                        (*key).into(),
+                        Args {
+                            x: [value, 0, 0, 0],
+                            v: [0; 2],
+                        },
+                    );
+                }
+                return Ok(true);
+            }
+            // Per-target setters (SetBlendEnable(state, index, enable),
+            // SetChannelMask(state, index, r, g, b, a)) also keep each
+            // index's latest call.
+            if matches!(property, "BlendEnable" | "ChannelMask") {
+                let mut args = args;
+                // The mask's alpha flag is the fifth argument (X5),
+                // kept where integer setters leave V1 unused.
+                if property == "ChannelMask" {
+                    args.v[1] = x[5];
+                }
+                bag.props.insert(format!("{property}/{}", args.x[0]), args);
+            }
+            let mut args = args;
+            // SetPackagedTextureLayout(builder, const
+            // NVNpackagedTextureLayout*): its eight bytes now, in X1
+            // (the structure may not outlive the call).
+            if kind == "TextureBuilder" && property == "PackagedTextureLayout" {
+                args.x[1] = if args.x[0] != 0 {
+                    core.memory.read_u64(args.x[0])?
+                } else {
+                    0
+                };
+            }
+            bag.props.insert(property.into(), args);
+            let props = bag.props.clone();
+            drop(bags);
+            tag_state(core, this, kind, &props)?;
+            return Ok(true);
+        }
+        if let Some(property) = rest.strip_prefix("Get") {
+            let bags = read_shared(bags);
+            let bag = bags
+                .get(&this)
+                .filter(|bag| bag.kind == kind)
+                .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?;
+            let Some(value) = bag.props.get(property).copied() else {
+                return Err(stop(format!("{property} was never set")));
+            };
+            core.cpu.regs[0] = value.x[0];
+            core.cpu.vectors[0] = u128::from(value.v[0]);
+            return Ok(true);
+        }
+    }
+    let _ = (&invalid, &stop);
+    Ok(false)
 }
 
 fn call_watch(name: &str, core: &Guest) {

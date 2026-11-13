@@ -626,7 +626,12 @@ impl Nvn {
     /// Drop cached textures whose storage overlaps guest `range`, or the
     /// texture object `texture` itself: the application wrote it.
     pub(super) fn gpu_invalidate(&mut self, range: std::ops::Range<u64>, texture: Option<u64>) {
-        self.binding_serial += 1;
+        // Resolved bindings (`binding_memo`) change only with a texture's
+        // bytes: one named, or one under the range. Descriptors are
+        // registered, not read from the range.
+        if texture.is_some() {
+            self.binding_serial += 1;
+        }
         if let Some(backend) = self.gpu.as_mut() {
             for pool in backend.resident.values_mut() {
                 let start = range.start.max(pool.base);
@@ -653,6 +658,10 @@ impl Nvn {
                 true
             });
             backend.stat("stat: textures invalidated", touched.len() as u64);
+            if !touched.is_empty() {
+                self.binding_serial += 1;
+            }
+            let backend = self.gpu.as_mut().unwrap();
             for (key, overlap) in touched {
                 backend.texture_checked.remove(&key);
                 backend.dirty.entry(key).or_default().push(overlap);

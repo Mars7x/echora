@@ -5160,7 +5160,11 @@ impl Worker {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match crate::nvn::thunk_in(&thunks, pc) {
-                Some(name) if name.starts_with("nvnCommandBuffer") => name.to_owned(),
+                Some(name)
+                    if name.starts_with("nvnCommandBuffer") || crate::nvn::front_call(name) =>
+                {
+                    name.to_owned()
+                }
                 _ => return false,
             }
         };
@@ -5172,7 +5176,11 @@ impl Worker {
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
                 counter,
             };
-            shared.recorder.record(&name, &mut guest)
+            if name.starts_with("nvnCommandBuffer") {
+                shared.recorder.record(&name, &mut guest)
+            } else {
+                shared.recorder.front(&name, &mut guest)
+            }
         };
         match recorded {
             Ok(true) => {
