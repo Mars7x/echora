@@ -2353,6 +2353,10 @@ impl Renderer {
             timer.end(&self.gpu.device, self.commands, self.fence);
         }
         *self.stats.entry("stat: submissions").or_default() += 1;
+        *self
+            .stats
+            .entry("stat: shared spans held at submissions")
+            .or_default() += (self.shared.len() + self.addressed.len()) as u64;
         let start = std::time::Instant::now();
         let device = &self.gpu.device;
         let buffers = [self.commands];
@@ -2541,22 +2545,60 @@ impl Renderer {
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
         const PAGE: u64 = 4096;
+        // Imports are made a chunk at a time and shared by every binding
+        // inside one, with the page table's spans too: each imported
+        // memory object is listed in every submission, so thousands of
+        // binding-sized ones made each vkQueueSubmit take milliseconds.
+        const CHUNK: u64 = 16 << 20;
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
         let key = (start, span);
-        if let Some(index) = self.shared.iter().position(|(known, _, _)| *known == key) {
+        let after = self
+            .addressed
+            .partition_point(|(known, ..)| *known <= start);
+        if let Some(&(known, _, buffer, _, _)) = self.addressed[..after]
+            .iter()
+            .rev()
+            .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
+            .find(|(known, held, ..)| start + span <= known + held)
+        {
+            return Ok(Some((buffer, offset - known)));
+        }
+        if let Some(index) = self
+            .shared
+            .iter()
+            .position(|((known, held), _, _)| *known <= start && start + span <= known + held)
+        {
             let entry = self.shared.remove(index);
-            let buffer = entry.1;
+            let ((known, _), buffer, _) = entry;
             self.shared.push(entry);
-            return Ok(Some((buffer, offset - start)));
+            return Ok(Some((buffer, offset - known)));
         }
         if span > MAX_SHARED_SPAN || self.shared_refused.contains(&key) {
             return Ok(None);
         }
-        let Some(imported) = self.share_span(file, start, span)? else {
-            self.shared_refused.insert(key);
-            return Ok(None);
+        // The chunk around the span, where the file holds it all; else the
+        // span alone.
+        let chunk_start = start & !(CHUNK - 1);
+        let chunk_span = (start + span - chunk_start).next_multiple_of(CHUNK);
+        let widened = if chunk_span <= MAX_SHARED_SPAN && (chunk_start, chunk_span) != key {
+            self.share_span(file, chunk_start, chunk_span)?
+                .map(|imported| ((chunk_start, chunk_span), imported))
+        } else {
+            None
         };
+        let (key, imported) = match widened {
+            Some(widened) => widened,
+            None => match self.share_span(file, start, span)? {
+                Some(imported) => (key, imported),
+                None => {
+                    self.shared_refused.insert(key);
+                    return Ok(None);
+                }
+            },
+        };
+        self.stat("stat: spans imported for bindings", 1);
+        let (start, span) = key;
         self.shared.push((key, imported.0, imported.1));
         self.shared_bytes += span;
         while self.shared_bytes > MAX_SHARED_BYTES && self.shared.len() > 1 {
