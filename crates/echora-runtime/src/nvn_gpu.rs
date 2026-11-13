@@ -4749,10 +4749,10 @@ impl Nvn {
             .unwrap_or(first);
         // A table past 16 million pages (64 GiB) means the pools are not
         // what this model expects.
-        // Rounded up to 65536 pages (256 MiB): pools are made at rising GPU
+        // Rounded up to 262144 pages (1 GiB): pools are made at rising GPU
         // addresses, about one a present, and a table that grows by a page
         // each time would be built whole each time.
-        let count = (end - first).next_multiple_of(1 << 16).min(16 << 20) as usize;
+        let count = (end - first).next_multiple_of(1 << 18).min(16 << 20) as usize;
         let traced = super::debug_var("ECHORA_POOL_TRACE")
             .ok()
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
@@ -4790,12 +4790,7 @@ impl Nvn {
             signatures.iter().map(|(pool, _)| *pool).collect();
         let whole = match &previous {
             None => Some("stat: page table built whole (first)"),
-            Some(built) if built.first != first || built.entries.len() != count => {
-                Some("stat: page table built whole (extent)")
-            }
-            Some(built) if !built.pools.keys().all(|pool| current.contains(pool)) => {
-                Some("stat: page table built whole (pool gone or moved)")
-            }
+            Some(built) if built.first != first => Some("stat: page table built whole (extent)"),
             Some(_) => None,
         };
         if let Some(reason) = whole {
@@ -4810,6 +4805,28 @@ impl Nvn {
             }
             None => vec![0u64; count],
         };
+        // The table grew or shrank at its end; pools gone (finalized, or
+        // made again elsewhere) lose their pages.
+        entries.resize(count, 0);
+        let gone: Vec<_> = built_pools
+            .keys()
+            .filter(|pool| !current.contains(pool))
+            .copied()
+            .collect();
+        for pool in gone {
+            built_pools.remove(&pool);
+            let (_, size, gpu, _) = pool;
+            let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
+                ..((gpu + size).div_ceil(PAGE_SIZE).saturating_sub(first)).min(count as u64) as usize;
+            if let Some(range) = entries.get_mut(pages) {
+                range.fill(0);
+            }
+            self.gpu.as_mut().unwrap().stat("stat: page table pools unmapped", 1);
+            // A pool kept over the same GPU pages is mapped again.
+            built_pools.retain(|&(_, kept_size, kept_gpu, _), _| {
+                kept_gpu + kept_size <= gpu || gpu + size <= kept_gpu
+            });
+        }
         self.gpu.as_mut().unwrap().stat(
             "stat: page table walk microseconds",
             started.elapsed().as_micros() as u64,
