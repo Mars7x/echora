@@ -1972,8 +1972,10 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
         } => format!(
             "{p}::int_to_fp(&mut m.cpu, {rd}, {rn}, {gp_bits}, {p}::FpSize::{size:?}, {signed})?;"
         ),
-        // Inline in round-to-nearest (the host's conversion is the Arm one,
-        // and no integer converts to a denormal); the helper otherwise.
+        // Inline in round-to-nearest with the inexact flag already raised
+        // (the host's conversion is the Arm one, no integer converts to a
+        // denormal, and the sticky flag a rounding conversion raises is
+        // set); the helper otherwise.
         SimdOp::SimdIntToFp {
             rd,
             rn,
@@ -1993,6 +1995,7 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
             .replace("RN", &rn.to_string());
             format!(
                 "if m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+                 && m.cpu.fpsr & {p}::FPSR_IXC != 0 \
                  {{ m.cpu.vectors[{rd}] = {convert}; }} else \
                  {{ {p}::simd_int_to_fp(&mut m.cpu, {rd}, {rn}, {p}::FpSize::{size:?}, {signed})?; }}"
             )
