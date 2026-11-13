@@ -1972,14 +1972,31 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
         } => format!(
             "{p}::int_to_fp(&mut m.cpu, {rd}, {rn}, {gp_bits}, {p}::FpSize::{size:?}, {signed})?;"
         ),
+        // Inline in round-to-nearest (the host's conversion is the Arm one,
+        // and no integer converts to a denormal); the helper otherwise.
         SimdOp::SimdIntToFp {
             rd,
             rn,
             size,
             signed,
-        } => format!(
-            "{p}::simd_int_to_fp(&mut m.cpu, {rd}, {rn}, {p}::FpSize::{size:?}, {signed})?;"
-        ),
+        } => {
+            let convert = match (size, signed) {
+                (FpSize::S, true) => {
+                    "u128::from((m.cpu.vectors[RN] as u32 as i32 as f32).to_bits())"
+                }
+                (FpSize::S, false) => "u128::from((m.cpu.vectors[RN] as u32 as f32).to_bits())",
+                (FpSize::D, true) => {
+                    "u128::from((m.cpu.vectors[RN] as u64 as i64 as f64).to_bits())"
+                }
+                (FpSize::D, false) => "u128::from((m.cpu.vectors[RN] as u64 as f64).to_bits())",
+            }
+            .replace("RN", &rn.to_string());
+            format!(
+                "if m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+                 {{ m.cpu.vectors[{rd}] = {convert}; }} else \
+                 {{ {p}::simd_int_to_fp(&mut m.cpu, {rd}, {rn}, {p}::FpSize::{size:?}, {signed})?; }}"
+            )
+        }
         SimdOp::FpToInt {
             rd,
             rn,
@@ -1991,7 +2008,7 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
             "{p}::fp_to_int(&mut m.cpu, {rd}, {rn}, {gp_bits}, {p}::FpSize::{size:?}, {signed}, {p}::Rounding::{rounding:?})?;"
         ),
         SimdOp::MoveImmediate { rd, value } => {
-            format!("{p}::move_immediate(&mut m.cpu, {rd}, {value:#x});")
+            format!("m.cpu.vectors[{rd}] = {value:#x}u128;")
         }
         SimdOp::ModifyImmediate {
             rd,
@@ -2010,7 +2027,21 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
             bytes,
             dst,
             src,
-        } => format!("{p}::insert_element(&mut m.cpu, {rd}, {rn}, {bytes}, {dst}, {src});"),
+        } => {
+            // Inline: one lane of Vn into one lane of Vd (`insert_element`).
+            let bits = u32::from(bytes) * 8;
+            let mask = if bytes >= 16 {
+                u128::MAX
+            } else {
+                (1u128 << bits) - 1
+            };
+            let (from, to) = (u32::from(src) * bits, u32::from(dst) * bits);
+            format!(
+                "{{ let lane = (m.cpu.vectors[{rn}] >> {from}) & {mask:#x}u128; \
+                 m.cpu.vectors[{rd}] = (m.cpu.vectors[{rd}] & !{:#x}u128) | (lane << {to}); }}",
+                mask << to
+            )
+        }
         SimdOp::InsertGeneral {
             rd,
             rn,
@@ -2034,7 +2065,26 @@ pub fn emit_call(op: &SimdOp) -> Option<String> {
             index,
             q,
             scalar,
-        } => format!("{p}::dup_element(&mut m.cpu, {rd}, {rn}, {bytes}, {index}, {q}, {scalar});"),
+        } => {
+            // Inline: one lane of Vn, alone or in every lane of Vd
+            // (`dup_element`); copies are placed by one multiplication (the
+            // lane is below 2^bits, so no carries cross lanes).
+            let bits = u32::from(bytes) * 8;
+            let mask = if bytes >= 16 {
+                u128::MAX
+            } else {
+                (1u128 << bits) - 1
+            };
+            let from = u32::from(index) * bits;
+            let lane = format!("((m.cpu.vectors[{rn}] >> {from}) & {mask:#x}u128)");
+            if scalar {
+                format!("m.cpu.vectors[{rd}] = {lane};")
+            } else {
+                let lanes = if q { 128 } else { 64 } / bits;
+                let copies = (0..lanes).fold(0u128, |all, lane| all | 1u128 << (lane * bits));
+                format!("m.cpu.vectors[{rd}] = {lane}.wrapping_mul({copies:#x}u128);")
+            }
+        }
         SimdOp::DupGeneral { rd, rn, bytes, q } => {
             format!("{p}::dup_general(&mut m.cpu, {rd}, {rn}, {bytes}, {q});")
         }
