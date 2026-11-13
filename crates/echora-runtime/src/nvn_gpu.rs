@@ -8022,6 +8022,46 @@ impl Nvn {
             }
         }
         self.trace_targets(&colors_written, &color_places, &draw_label)?;
+        // ECHORA_DEPTH_TRACE_TEXEL=<x>,<y> with ECHORA_DEPTH_TRACE (debugging):
+        // after each draw into the traced depth memory, that texel's depth
+        // when the draw changed it (which draw put a shadow caster there).
+        if let (Some(target), Ok(texel)) = (depth, super::debug_var("ECHORA_DEPTH_TRACE_TEXEL"))
+            && self.depth_traced(target)
+            && let Some((x, y)) = texel.split_once(',').and_then(|(x, y)| {
+                Some((x.trim().parse::<u32>().ok()?, y.trim().parse::<u32>().ok()?))
+            })
+        {
+            let format = self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .existing_target(target)
+                .map(|target| target.format);
+            let size = if format == Some(vk::Format::D16_UNORM) {
+                2
+            } else {
+                4
+            };
+            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            renderer.flush()?;
+            if let Ok(bytes) = renderer.read_target_region_bytes(target, size, Some([x, y, 1, 1]))
+                && bytes.len() >= size as usize
+            {
+                let value = if size == 2 {
+                    f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0
+                } else {
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                };
+                if self.depth_texel_last != Some(value.to_bits()) {
+                    self.depth_texel_last = Some(value.to_bits());
+                    eprintln!(
+                        "depth texel present {} after {draw_label} ({x},{y}) = {value:.6}",
+                        self.presented_frames
+                    );
+                }
+            }
+        }
         // A debugging trace that cannot read its range says so; the draw
         // stands.
         if let Err(error) = self.trace_memory(core, &draw_label) {

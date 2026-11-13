@@ -416,6 +416,9 @@ pub struct Nvn {
     /// blocks since, copied in before they are next sampled.
     #[serde(skip)]
     block_aliases: HashMap<u64, u64>,
+    /// ECHORA_DEPTH_TRACE_TEXEL: the traced texel's last depth bits.
+    #[serde(skip)]
+    depth_texel_last: Option<u32>,
     /// Work skipped as "rendering disabled" before the last present: the
     /// capture log shows each captured frame's own.
     #[serde(skip)]
