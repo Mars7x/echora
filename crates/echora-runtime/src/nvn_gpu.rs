@@ -1834,7 +1834,7 @@ impl Nvn {
                         self.presented_frames
                     );
                 }
-                if let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 12)? {
+                if let Some((buffer, offset)) = self.indirect_arguments(core, guest)? {
                     return Ok(MeshGroups::Indirect { buffer, offset });
                 }
                 let bytes = self.gpu_bytes(core, address, 12)?;
@@ -4389,7 +4389,7 @@ impl Nvn {
             let guest = self.gpu_to_guest(command.x[1], 12)?;
             self.resolve_copies(core, Some(guest..guest + 12))?;
             Some(
-                self.resident_pool_binding(core, guest, 12)?
+                self.indirect_arguments(core, guest)?
                     .ok_or("indirect dispatch arguments are in no memory pool")?,
             )
         } else {
@@ -6295,6 +6295,38 @@ impl Nvn {
             return Ok(None);
         };
         backend.renderer.import_file(file, offset, length)
+    }
+
+    /// Where the GPU reads the 12 bytes of indirect arguments at guest
+    /// `guest` from: the pool's GPU copy when a GPU write through a binding
+    /// made it newer there, otherwise guest memory itself, shared in place,
+    /// for a CPU-visible pool (what the CPU wrote, and what programs stored
+    /// through the page table, which reaches such pools in guest memory and
+    /// not their copy: a culling pass's counts were read from the stale
+    /// copy, and foliage and particles were not drawn); the copy otherwise.
+    fn indirect_arguments(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let range = guest..guest + 12;
+        let copy_newer = self.gpu.as_ref().unwrap().resident.values().any(|pool| {
+            pool.contains(guest)
+                && pool
+                    .gpu_dirty
+                    .iter()
+                    .any(|dirty| dirty.start < range.end && range.start < dirty.end)
+        });
+        if !copy_newer {
+            if let Some(shared) = self.shared_binding(guest, 12)? {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: indirect arguments read in place", 1);
+                return Ok(Some(shared));
+            }
+        }
+        self.resident_pool_binding(core, guest, 12)
     }
 
     /// The device buffer and offset for `length` storage bytes at guest
