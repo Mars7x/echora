@@ -405,6 +405,26 @@ impl Renderer {
 
     /// The counts noted since the last call.
     pub fn take_stats(&mut self) -> HashMap<&'static str, u64> {
+        // Named once per source line, so each name is kept for the run.
+        static NAMES: std::sync::Mutex<
+            Vec<(&'static std::panic::Location<'static>, &'static str)>,
+        > = std::sync::Mutex::new(Vec::new());
+        let mut names = NAMES.lock().unwrap();
+        for (location, amount) in std::mem::take(&mut self.pass_ends) {
+            let name = match names.iter().find(|(known, _)| *known == location) {
+                Some((_, name)) => name,
+                None => {
+                    let file = location.file().rsplit('/').next().unwrap_or("");
+                    let name: &'static str = Box::leak(
+                        format!("stat: rendering passes ended at {file}:{}", location.line())
+                            .into_boxed_str(),
+                    );
+                    names.push((location, name));
+                    name
+                }
+            };
+            *self.stats.entry(name).or_default() += amount;
+        }
         std::mem::take(&mut self.stats)
     }
 

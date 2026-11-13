@@ -181,6 +181,10 @@ pub struct Renderer {
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
     /// Counts for the runtime's statistics (`take_stats`).
     pub(crate) stats: HashMap<&'static str, u64>,
+    /// Rendering passes ended, by the source line that ended them (for
+    /// the statistics: a pass that ends between draws costs a store and
+    /// load of every attachment).
+    pub(crate) pass_ends: HashMap<&'static std::panic::Location<'static>, u64>,
     /// Debugging buffers shaders write through device addresses
     /// (`debug_buffer`).
     debug_buffers: Vec<HostBuffer>,
@@ -497,6 +501,7 @@ impl Renderer {
         let mut renderer = Self {
             texture_pool: None,
             stats: HashMap::new(),
+            pass_ends: HashMap::new(),
             debug_buffers: Vec::new(),
             timer,
             shader_cache: None,
@@ -589,6 +594,7 @@ impl Renderer {
     /// The command buffer, begun if nothing is recording.
     /// The command buffer, for recording outside a rendering pass (an open
     /// one ends first).
+    #[track_caller]
     pub(crate) fn commands(&mut self) -> Result<vk::CommandBuffer, String> {
         let commands = self.recording_commands()?;
         self.end_pass();
@@ -596,8 +602,13 @@ impl Renderer {
     }
 
     /// End the rendering pass a draw left open, if any.
+    #[track_caller]
     pub(crate) fn end_pass(&mut self) {
         if self.open_pass.take().is_some() {
+            *self
+                .pass_ends
+                .entry(std::panic::Location::caller())
+                .or_default() += 1;
             // SAFETY: recording, inside the pass begun by `begin_rendering`.
             unsafe { self.gpu.device.cmd_end_rendering(self.commands) };
         }
@@ -625,6 +636,10 @@ impl Renderer {
                     .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                 // SAFETY: recording, outside any rendering pass.
                 unsafe {
+                    *self
+                        .stats
+                        .entry("stat: barriers in recording_commands")
+                        .or_default() += 1;
                     self.gpu.device.cmd_pipeline_barrier(
                         self.commands,
                         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -708,6 +723,10 @@ impl Renderer {
         // SAFETY: recording, outside rendering; the ranges exist.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in apply_condition")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -718,6 +737,10 @@ impl Renderer {
                 &[],
             );
             device.cmd_copy_buffer(commands, buffer, ring, &[copy]);
+            *self
+                .stats
+                .entry("stat: barriers in apply_condition")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -952,6 +975,10 @@ impl Renderer {
         // SAFETY: recording outside rendering; the buffer is live.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in fill_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -962,6 +989,10 @@ impl Renderer {
                 &[],
             );
             device.cmd_fill_buffer(commands, buffer, at, length, value);
+            *self
+                .stats
+                .entry("stat: barriers in fill_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -997,6 +1028,10 @@ impl Renderer {
         // SAFETY: recording outside rendering; both buffers are live.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in copy_to_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -1016,6 +1051,10 @@ impl Renderer {
                     size: length,
                 }],
             );
+            *self
+                .stats
+                .entry("stat: barriers in copy_to_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1052,6 +1091,10 @@ impl Renderer {
         // SAFETY: recording outside rendering; both buffers are live.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in read_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -1071,6 +1114,10 @@ impl Renderer {
                     size: length,
                 }],
             );
+            *self
+                .stats
+                .entry("stat: barriers in read_resident")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1833,6 +1880,7 @@ impl Renderer {
         unsafe {
             let device = &self.gpu.device;
             // A reused image: after every earlier read of it.
+            *self.stats.entry("stat: barriers in upload").or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 if reusing {
@@ -1899,6 +1947,7 @@ impl Renderer {
         let commands = self.commands()?;
         // SAFETY: recording; the image is live.
         unsafe {
+            *self.stats.entry("stat: barriers in upload").or_default() += 1;
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1989,6 +2038,10 @@ impl Renderer {
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            *self
+                .stats
+                .entry("stat: barriers in with_texels")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -2170,6 +2223,10 @@ impl Renderer {
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
             // SAFETY: recording, outside rendering (the pass just ended).
             unsafe {
+                *self
+                    .stats
+                    .entry("stat: barriers in submit_current")
+                    .or_default() += 1;
                 self.gpu.device.cmd_pipeline_barrier(
                     self.commands,
                     vk::PipelineStageFlags::ALL_COMMANDS,
@@ -2229,6 +2286,7 @@ impl Renderer {
         if let Some(timer) = &self.timer {
             timer.end(&self.gpu.device, self.commands, self.fence);
         }
+        *self.stats.entry("stat: submissions").or_default() += 1;
         let device = &self.gpu.device;
         let buffers = [self.commands];
         let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
@@ -2949,6 +3007,10 @@ impl Renderer {
         // SAFETY: recording; both images are live and in GENERAL layout.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in create_target_keeping")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -2966,6 +3028,10 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 &[region],
             );
+            *self
+                .stats
+                .entry("stat: barriers in create_target_keeping")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -3013,6 +3079,10 @@ impl Renderer {
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            *self
+                .stats
+                .entry("stat: barriers in zero_target")
+                .or_default() += 1;
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -3320,6 +3390,10 @@ impl Renderer {
                 &blits,
                 filter,
             );
+            *self
+                .stats
+                .entry("stat: barriers in keep_unscaled")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -3483,6 +3557,10 @@ impl Renderer {
                     &[region],
                 );
             }
+            *self
+                .stats
+                .entry("stat: barriers in initialize_target")
+                .or_default() += 1;
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -3837,6 +3915,7 @@ impl Renderer {
     /// Record a full barrier moving `key`'s image to `layout`. An image
     /// already there records nothing and leaves an open rendering pass open
     /// (a draw sampling a target would otherwise end the pass each time).
+    #[track_caller]
     pub(crate) fn transition(&mut self, key: u64, layout: vk::ImageLayout) -> Result<(), String> {
         if self.targets.get(&key).ok_or("no such target")?.layout == layout {
             return Ok(());
@@ -3861,6 +3940,10 @@ impl Renderer {
         target.layout = layout;
         // SAFETY: recording; the image is live.
         unsafe {
+            *self
+                .stats
+                .entry("stat: barriers in transition")
+                .or_default() += 1;
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -3887,6 +3970,7 @@ impl Renderer {
     }
 
     /// A full memory barrier; everything written before is visible after.
+    #[track_caller]
     pub(crate) fn memory_barrier(&mut self) -> Result<(), String> {
         let commands = self.commands()?;
         let barrier = vk::MemoryBarrier::default()
@@ -3894,6 +3978,10 @@ impl Renderer {
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         // SAFETY: recording outside rendering.
         unsafe {
+            *self
+                .stats
+                .entry("stat: barriers in memory_barrier")
+                .or_default() += 1;
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -3979,6 +4067,10 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 &[region],
             );
+            *self
+                .stats
+                .entry("stat: barriers in volume_as_layers")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -4047,6 +4139,10 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 &regions,
             );
+            *self
+                .stats
+                .entry("stat: barriers in copy_blocks")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -4400,6 +4496,7 @@ impl Renderer {
             }
         }
         // SAFETY: recording; attachments are live and in GENERAL layout.
+        *self.stats.entry("stat: render passes begun").or_default() += 1;
         unsafe { self.gpu.device.cmd_begin_rendering(commands, &info) };
         self.open_pass = Some((views, depth_view, whole));
         Ok(())
@@ -4480,6 +4577,10 @@ impl Renderer {
         // swapchain image was acquired.
         unsafe {
             let device = &self.gpu.device;
+            *self
+                .stats
+                .entry("stat: barriers in blit_to_swapchain")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -4501,6 +4602,10 @@ impl Renderer {
                     },
                     &[range],
                 );
+                *self
+                    .stats
+                    .entry("stat: barriers in blit_to_swapchain")
+                    .or_default() += 1;
                 device.cmd_pipeline_barrier(
                     commands,
                     vk::PipelineStageFlags::TRANSFER,
@@ -4522,6 +4627,10 @@ impl Renderer {
                 &[blit],
                 filter,
             );
+            *self
+                .stats
+                .entry("stat: barriers in blit_to_swapchain")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -4746,6 +4855,10 @@ impl Renderer {
                 &[blit],
                 vk::Filter::NEAREST,
             );
+            *self
+                .stats
+                .entry("stat: barriers in read_level")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -4899,6 +5012,10 @@ impl Renderer {
                 &[blit],
                 vk::Filter::NEAREST,
             );
+            *self
+                .stats
+                .entry("stat: barriers in unscaled_copy")
+                .or_default() += 1;
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,

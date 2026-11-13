@@ -803,6 +803,7 @@ impl Renderer {
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                 // SAFETY: recording, outside rendering; both ranges exist.
                 unsafe {
+                    *self.stats.entry("stat: barriers in draw").or_default() += 1;
                     self.gpu.device.cmd_pipeline_barrier(
                         commands,
                         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -815,6 +816,7 @@ impl Renderer {
                     self.gpu
                         .device
                         .cmd_copy_buffer(commands, buffer, ring, &[copy]);
+                    *self.stats.entry("stat: barriers in draw").or_default() += 1;
                     self.gpu.device.cmd_pipeline_barrier(
                         commands,
                         vk::PipelineStageFlags::TRANSFER,

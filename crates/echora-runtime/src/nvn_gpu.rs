@@ -6959,8 +6959,17 @@ impl Nvn {
                         // the movie). A buffer the stage writes keeps the
                         // copy, whose writes come back like a dispatch's
                         // (`resolve_storage`).
+                        // ECHORA_DRAW_STORAGE_RESIDENT (measuring) reads it
+                        // from the pool's GPU-memory copy instead, to compare
+                        // the GPU's time reading system memory.
                         if descriptor.flags & 1 == 0 {
-                            if let Some((buffer, offset)) = self.shared_binding(guest, length)? {
+                            let in_place =
+                                if super::debug_var_os("ECHORA_DRAW_STORAGE_RESIDENT").is_some() {
+                                    self.resident_pool_binding(core, guest, length)?
+                                } else {
+                                    self.shared_binding(guest, length)?
+                                };
+                            if let Some((buffer, offset)) = in_place {
                                 storage_in_place
                                     .insert((index, descriptor.binding), (buffer, offset, length));
                                 self.gpu
