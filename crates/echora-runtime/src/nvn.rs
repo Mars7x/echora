@@ -959,6 +959,8 @@ pub struct Registry {
     buffers: HashMap<u64, RegisteredBuffer>,
     /// Each event's guest address (its u32), by event object.
     events: HashMap<u64, u64>,
+    /// Sync objects not signaled (a zero-timeout wait on one times out).
+    unsignaled: std::collections::HashSet<u64>,
 }
 
 type SharedRegistry = std::sync::Arc<std::sync::RwLock<Registry>>;
@@ -1009,7 +1011,8 @@ const REGISTRY_CALLS: &[&str] = &[
 /// Whether workers make NVN call `name` without the NVN state
 /// (`Recorder::front`).
 pub fn front_call(name: &str) -> bool {
-    REGISTRY_CALLS.contains(&name)
+    name == "nvnSyncWait"
+        || REGISTRY_CALLS.contains(&name)
         || split_name(name).is_some_and(|(kind, _)| FRONT_KINDS.contains(&kind))
 }
 
@@ -1030,6 +1033,19 @@ impl Recorder {
     /// Make NVN call `name` when it is a property-bag call on a kind in
     /// `FRONT_KINDS`, as `Nvn::call` would: Ok(true) once made.
     pub fn front(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        // A zero-timeout poll of a sync no fence has signaled yet times out
+        // (2) without the NVN state, so a thread polling one does not wait
+        // for a whole queue replay to learn that; anything else is made
+        // with the state.
+        if name == "nvnSyncWait" {
+            let x = core.cpu.regs;
+            if x[1] == 0 && read_shared(&self.registry).unsignaled.contains(&x[0]) {
+                call_watch(name, core);
+                core.cpu.regs[0] = 2;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if REGISTRY_CALLS.contains(&name) {
             call_watch(name, core);
             return registry_call(&self.registry, &self.bags, name, core);
@@ -1641,6 +1657,7 @@ impl Nvn {
                 self.object(x[1], "Device").map_err(invalid)?;
                 self.initialize(this, "Sync", BTreeMap::new())
                     .map_err(invalid)?;
+                write_shared(&self.registry).unsignaled.insert(this);
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1917,6 +1934,7 @@ impl Nvn {
                     // Signaled when the queue's earlier work has run.
                     let sync = self.objects.get_mut(&x[1]).unwrap();
                     sync.state.remove("Signaled");
+                    write_shared(&self.registry).unsignaled.insert(x[1]);
                     self.pending
                         .get_mut(&this)
                         .unwrap()
@@ -3086,6 +3104,9 @@ impl Nvn {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
                     self.gpu_forget_pool(base);
                     self.pool_epoch += 1;
+                }
+                if kind == "Sync" {
+                    write_shared(&self.registry).unsignaled.remove(&this);
                 }
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
@@ -4876,6 +4897,7 @@ impl Nvn {
     /// Signal a sync, noting the GPU submission that holds the work
     /// before it (what a CPU wait on it has to wait for).
     fn signal_sync(&mut self, sync: u64, args: Args) {
+        write_shared(&self.registry).unsignaled.remove(&sync);
         let serial = self.gpu_recorded_serial();
         if let Some(object) = self.objects.get_mut(&sync) {
             object.state.insert("Signaled".into(), args);
