@@ -391,6 +391,10 @@ pub struct Nvn {
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
     recording: Recordings,
+    /// Devices, memory pools, buffers and events as workers query them
+    /// without the NVN state's lock (see `Registry`). Buffers live only here.
+    #[serde(skip)]
+    registry: SharedRegistry,
     /// Finished command lists by NVNcommandHandle, with the order of their
     /// last recording or submission.
     #[serde(skip)]
@@ -934,12 +938,74 @@ fn lock_shared<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Recorder {
     bags: Bags,
     recordings: Recordings,
+    registry: SharedRegistry,
 }
+
+/// What the hottest object calls read (device checks, texture handles, a
+/// pool's flags and addresses, buffers, event addresses), kept apart from
+/// the NVN state so workers make those calls without its lock: none of them
+/// is read by command replay. Pools, devices and events are added and
+/// removed by their calls under the NVN state's lock; buffers are created,
+/// queried and finalized here only.
+#[derive(Debug, Default)]
+pub struct Registry {
+    devices: std::collections::HashSet<u64>,
+    pools: HashMap<u64, RegisteredPool>,
+    buffers: HashMap<u64, RegisteredBuffer>,
+    /// Each event's guest address (its u32), by event object.
+    events: HashMap<u64, u64>,
+}
+
+type SharedRegistry = std::sync::Arc<std::sync::RwLock<Registry>>;
+
+/// A memory pool as `Registry` keeps it.
+#[derive(Clone, Copy, Debug)]
+struct RegisteredPool {
+    /// Guest storage and size (the builder's SetStorage).
+    storage: u64,
+    size: u64,
+    /// Its GPU virtual address.
+    gpu: u64,
+    /// The builder's Flags, if it set them.
+    flags: Option<Args>,
+    /// Buffers made in the pool and not finalized.
+    buffers: u64,
+}
+
+/// A buffer: its builder's properties (Storage is pool, offset, size) and
+/// the state its setters recorded (a debug label).
+#[derive(Clone, Debug)]
+struct RegisteredBuffer {
+    builder: BTreeMap<String, Args>,
+    state: BTreeMap<String, Args>,
+}
+
+/// Calls `Registry` answers alone (`registry_call`).
+const REGISTRY_CALLS: &[&str] = &[
+    "nvnMemoryPoolGetFlags",
+    "nvnDeviceGetTextureHandle",
+    "nvnDeviceGetTexelFetchHandle",
+    "nvnDeviceGetImageHandle",
+    "nvnDeviceGetSeparateTextureHandle",
+    "nvnDeviceGetSeparateSamplerHandle",
+    "nvnDeviceGetInteger",
+    "nvnBufferInitialize",
+    "nvnBufferFinalize",
+    "nvnBufferGetAddress",
+    "nvnBufferMap",
+    "nvnBufferGetSize",
+    "nvnBufferGetMemoryPool",
+    "nvnBufferGetMemoryOffset",
+    "nvnBufferFlushMappedRange",
+    "nvnBufferSetDebugLabel",
+    "nvnEventGetValue",
+];
 
 /// Whether workers make NVN call `name` without the NVN state
 /// (`Recorder::front`).
 pub fn front_call(name: &str) -> bool {
-    split_name(name).is_some_and(|(kind, _)| FRONT_KINDS.contains(&kind))
+    REGISTRY_CALLS.contains(&name)
+        || split_name(name).is_some_and(|(kind, _)| FRONT_KINDS.contains(&kind))
 }
 
 /// Kinds whose calls are only the generic property bags (no call on them
@@ -959,6 +1025,10 @@ impl Recorder {
     /// Make NVN call `name` when it is a property-bag call on a kind in
     /// `FRONT_KINDS`, as `Nvn::call` would: Ok(true) once made.
     pub fn front(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        if REGISTRY_CALLS.contains(&name) {
+            call_watch(name, core);
+            return registry_call(&self.registry, &self.bags, name, core);
+        }
         let Some((kind, rest)) = split_name(name) else {
             return Ok(false);
         };
@@ -1013,6 +1083,207 @@ pub fn thunk_in(names: &[String], pc: u64) -> Option<&str> {
 }
 
 /// A bag's properties, when the bag at `address` is a `kind`.
+/// Make one of `REGISTRY_CALLS` from `registry` (and the bags, for a
+/// buffer's builder), as `Nvn::call` would have from its objects: Ok(true)
+/// once made, Ok(false) when the registry cannot answer (the caller makes
+/// the call with the NVN state, which reports the error it always did).
+fn registry_call(
+    registry: &SharedRegistry,
+    bags: &Bags,
+    name: &str,
+    core: &mut Guest,
+) -> Result<bool, Trap> {
+    let invalid = |message: String| Trap::InvalidState {
+        message: format!("{name}: {message}"),
+    };
+    let x = core.cpu.regs;
+    let this = x[0];
+    if this == 0 {
+        return Ok(false);
+    }
+    match name {
+        // nvnMemoryPoolGetFlags: the builder's Flags (the generic getter).
+        "nvnMemoryPoolGetFlags" => {
+            let Some(flags) = read_shared(registry)
+                .pools
+                .get(&this)
+                .and_then(|pool| pool.flags)
+            else {
+                return Ok(false);
+            };
+            core.cpu.regs[0] = flags.x[0];
+            core.cpu.vectors[0] = u128::from(flags.v[0]);
+            Ok(true)
+        }
+        // Texture and sampler handles: arithmetic on the indices (see the
+        // arms in `Nvn::call`), on an initialized device.
+        "nvnDeviceGetTextureHandle"
+        | "nvnDeviceGetTexelFetchHandle"
+        | "nvnDeviceGetImageHandle"
+        | "nvnDeviceGetSeparateTextureHandle"
+        | "nvnDeviceGetSeparateSamplerHandle" => {
+            if !read_shared(registry).devices.contains(&this) {
+                return Ok(false);
+            }
+            let (texture, sampler) = match name {
+                "nvnDeviceGetTextureHandle" => (x[1] as u32, x[2] as u32),
+                "nvnDeviceGetSeparateSamplerHandle" => (0, x[1] as u32),
+                _ => (x[1] as u32, 0),
+            };
+            if texture >= 1 << 20 || sampler >= 1 << 12 {
+                return Ok(false);
+            }
+            core.cpu.regs[0] = u64::from(texture) | (u64::from(sampler) << 20);
+            Ok(true)
+        }
+        "nvnDeviceGetInteger" => {
+            if !read_shared(registry).devices.contains(&this) || x[2] == 0 {
+                return Ok(false);
+            }
+            let Some(value) = device_integer(x[1] as u32) else {
+                return Ok(false);
+            };
+            core.memory.write_u32(x[2], value as u32)?;
+            Ok(true)
+        }
+        // nvnBufferInitialize(NVNbuffer*, const NVNbufferBuilder*): Storage
+        // is (pool, offset, size) within an initialized pool.
+        "nvnBufferInitialize" => {
+            let builder = bag_in(&read_shared(bags), x[1], "BufferBuilder").map_err(invalid)?;
+            let device = builder
+                .get("Device")
+                .ok_or_else(|| invalid("builder device was never set".into()))?
+                .x[0];
+            let storage = builder
+                .get("Storage")
+                .copied()
+                .ok_or_else(|| invalid("buffer storage was never set".into()))?;
+            let (pool, offset, size) = (storage.x[0], storage.x[1], storage.x[2]);
+            let mut registry = write_shared(registry);
+            if !registry.devices.contains(&device) {
+                return Err(invalid(format!("Device {device:#x} is not initialized")));
+            }
+            let pool_size = registry
+                .pools
+                .get(&pool)
+                .ok_or_else(|| invalid(format!("MemoryPool {pool:#x} is not initialized")))?
+                .size;
+            if offset.checked_add(size).is_none_or(|end| end > pool_size) {
+                return Err(invalid(format!(
+                    "buffer {offset:#x}+{size:#x} outside its pool"
+                )));
+            }
+            if registry.buffers.contains_key(&this) {
+                return Err(invalid(format!("Buffer {this:#x} is already initialized")));
+            }
+            registry.buffers.insert(
+                this,
+                RegisteredBuffer {
+                    builder,
+                    state: BTreeMap::new(),
+                },
+            );
+            if let Some(pool) = registry.pools.get_mut(&pool) {
+                pool.buffers += 1;
+            }
+            core.cpu.regs[0] = 1;
+            Ok(true)
+        }
+        // Destructors finalize embedded buffers that may never have been
+        // initialized; the driver tolerates that (see `Nvn::call`).
+        "nvnBufferFinalize" => {
+            let mut registry = write_shared(registry);
+            if let Some(buffer) = registry.buffers.remove(&this) {
+                let pool = buffer.builder["Storage"].x[0];
+                if let Some(pool) = registry.pools.get_mut(&pool) {
+                    pool.buffers = pool.buffers.saturating_sub(1);
+                }
+            }
+            Ok(true)
+        }
+        "nvnBufferGetAddress" | "nvnBufferMap" | "nvnBufferGetSize" => {
+            let registry = read_shared(registry);
+            let buffer = registry
+                .buffers
+                .get(&this)
+                .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?;
+            let storage = buffer.builder["Storage"];
+            core.cpu.regs[0] = match name {
+                "nvnBufferGetSize" => storage.x[2],
+                _ => {
+                    let pool = registry.pools.get(&storage.x[0]).ok_or_else(|| {
+                        invalid(format!("MemoryPool {:#x} is not initialized", storage.x[0]))
+                    })?;
+                    if name == "nvnBufferGetAddress" {
+                        pool.gpu + storage.x[1]
+                    } else {
+                        pool.storage + storage.x[1]
+                    }
+                }
+            };
+            Ok(true)
+        }
+        "nvnBufferGetMemoryPool" | "nvnBufferGetMemoryOffset" => {
+            let registry = read_shared(registry);
+            let storage = registry
+                .buffers
+                .get(&this)
+                .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?
+                .builder["Storage"];
+            core.cpu.regs[0] = if name.ends_with("Pool") {
+                storage.x[0]
+            } else {
+                storage.x[1]
+            };
+            Ok(true)
+        }
+        // CPU cache maintenance on a buffer: a range check (host storage is
+        // coherent). InvalidateMappedRange stays with the NVN state: the CPU
+        // may read what the GPU wrote there.
+        "nvnBufferFlushMappedRange" => {
+            let size = read_shared(registry)
+                .buffers
+                .get(&this)
+                .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?
+                .builder["Storage"]
+                .x[2];
+            if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
+                return Err(invalid(format!(
+                    "range {:#x}+{:#x} outside the buffer",
+                    x[1], x[2]
+                )));
+            }
+            Ok(true)
+        }
+        "nvnBufferSetDebugLabel" => {
+            let mut registry = write_shared(registry);
+            let buffer = registry
+                .buffers
+                .get_mut(&this)
+                .ok_or_else(|| invalid("Buffer is not initialized".into()))?;
+            buffer.state.insert(
+                "DebugLabel".into(),
+                Args {
+                    x: [x[1], x[2], x[3], x[4]],
+                    v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
+                },
+            );
+            Ok(true)
+        }
+        // nvnEventGetValue: the u32 at the event's storage, as the GPU or
+        // the CPU last wrote it (a CPU polling an event sees the GPU's
+        // signal as soon as replay reaches it, not after the whole replay).
+        "nvnEventGetValue" => {
+            let Some(address) = read_shared(registry).events.get(&this).copied() else {
+                return Ok(false);
+            };
+            core.cpu.regs[0] = u64::from(core.memory.read_u32(address)?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn bag_in(
     bags: &BTreeMap<u64, Bag>,
     address: u64,
@@ -1222,6 +1493,13 @@ impl Nvn {
         if this == 0 {
             return Err(invalid("null object".into()));
         }
+        // Calls the registry answers (buffers live only there).
+        if REGISTRY_CALLS.contains(&name)
+            && !(name == "nvnEventGetValue" && debug_var_os("ECHORA_GPU_FLOW").is_some())
+            && registry_call(&self.registry, &self.bags, name, core)?
+        {
+            return Ok(true);
+        }
         // A management call on a command buffer sees the command memory its
         // recording used so far (recording itself counts it apart).
         if name
@@ -1237,6 +1515,7 @@ impl Nvn {
             "nvnDeviceInitialize" => {
                 let builder = self.bag(x[1], "DeviceBuilder").map_err(invalid)?;
                 self.initialize(this, "Device", builder).map_err(invalid)?;
+                write_shared(&self.registry).devices.insert(this);
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1432,6 +1711,17 @@ impl Nvn {
                         v: [0; 2],
                     },
                 );
+                let flags = pool.builder.get("Flags").copied();
+                write_shared(&self.registry).pools.insert(
+                    this,
+                    RegisteredPool {
+                        storage: memory,
+                        size,
+                        gpu,
+                        flags,
+                        buffers: 0,
+                    },
+                );
                 self.pool_epoch += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
@@ -1572,40 +1862,7 @@ impl Nvn {
                 }
                 return Ok(true);
             }
-            // nvnBufferInitialize(NVNbuffer*, const NVNbufferBuilder*) ->
-            // NVNboolean. SetStorage is (pool, offset, size) within an
-            // initialized pool.
-            "nvnBufferInitialize" => {
-                let builder = self.bag(x[1], "BufferBuilder").map_err(invalid)?;
-                self.require_device(&builder).map_err(invalid)?;
-                let storage = builder
-                    .get("Storage")
-                    .copied()
-                    .ok_or_else(|| invalid("buffer storage was never set".into()))?;
-                let (pool, offset, size) = (storage.x[0], storage.x[1], storage.x[2]);
-                let pool_size =
-                    self.object(pool, "MemoryPool").map_err(invalid)?.builder["Storage"].x[1];
-                if offset.checked_add(size).is_none_or(|end| end > pool_size) {
-                    return Err(invalid(format!(
-                        "buffer {offset:#x}+{size:#x} outside its pool"
-                    )));
-                }
-                self.initialize(this, "Buffer", builder).map_err(invalid)?;
-                core.cpu.regs[0] = 1;
-                return Ok(true);
-            }
-            // nvnBufferGetAddress / nvnBufferMap / nvnBufferGetSize.
-            "nvnBufferGetAddress" | "nvnBufferMap" | "nvnBufferGetSize" => {
-                let buffer = self.object(this, "Buffer").map_err(invalid)?;
-                let storage = buffer.builder["Storage"];
-                let pool = &self.objects[&storage.x[0]];
-                core.cpu.regs[0] = match name {
-                    "nvnBufferGetAddress" => pool.state["GpuAddress"].x[0] + storage.x[1],
-                    "nvnBufferMap" => pool.builder["Storage"].x[0] + storage.x[1],
-                    _ => storage.x[2],
-                };
-                return Ok(true);
-            }
+            // Buffers: `registry_call` (they live in the registry only).
             // nvnTextureGetTextureAddress -> the GPU address of the
             // texture's storage: its pool's GPU address plus the offset its
             // builder's SetStorage gave, as for buffers.
@@ -1624,13 +1881,11 @@ impl Nvn {
                 core.cpu.regs[0] = base + storage.x[1];
                 return Ok(true);
             }
-            // nvn{Buffer,Texture}GetMemoryPool / GetMemoryOffset: the pool and
-            // offset given to the builder's SetStorage(pool, offset[, size]).
-            "nvnBufferGetMemoryPool"
-            | "nvnBufferGetMemoryOffset"
-            | "nvnTextureGetMemoryPool"
-            | "nvnTextureGetMemoryOffset" => {
-                let kind = if name.starts_with("nvnBuffer") { "Buffer" } else { "Texture" };
+            // nvnTextureGetMemoryPool / GetMemoryOffset: the pool and offset
+            // given to the builder's SetStorage(pool, offset) (buffers:
+            // `registry_call`).
+            "nvnTextureGetMemoryPool" | "nvnTextureGetMemoryOffset" => {
+                let kind = "Texture";
                 let object = self.object(this, kind).map_err(invalid)?;
                 let storage = object
                     .builder
@@ -2168,6 +2423,12 @@ impl Nvn {
             "nvnEventInitialize" => {
                 let builder = self.bag(x[1], "EventBuilder").map_err(invalid)?;
                 self.initialize(this, "Event", builder).map_err(invalid)?;
+                // Where its value lives, for lock-free reads; an event whose
+                // storage does not resolve is read with the NVN state (which
+                // reports why).
+                if let Ok(address) = self.event_address(this) {
+                    write_shared(&self.registry).events.insert(this, address);
+                }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -2308,8 +2569,13 @@ impl Nvn {
                 }
                 return Ok(true);
             }
-            "nvnBufferFlushMappedRange" | "nvnBufferInvalidateMappedRange" => {
-                let size = self.object(this, "Buffer").map_err(invalid)?.builder["Storage"].x[2];
+            "nvnBufferInvalidateMappedRange" => {
+                let size = read_shared(&self.registry)
+                    .buffers
+                    .get(&this)
+                    .ok_or_else(|| invalid("Buffer is not initialized".into()))?
+                    .builder["Storage"]
+                    .x[2];
                 if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
                     return Err(invalid(format!("range {:#x}+{:#x} outside the buffer", x[1], x[2])));
                 }
@@ -2701,7 +2967,6 @@ impl Nvn {
             // presented, so it is recorded only.
             | "nvnWindowSetNumActiveTextures"
             | "nvnTextureSetDebugLabel"
-            | "nvnBufferSetDebugLabel"
             | "nvnMemoryPoolSetDebugLabel"
             | "nvnQueueSetDebugLabel"
             | "nvnSyncSetDebugLabel"
@@ -2785,8 +3050,7 @@ impl Nvn {
                 program.state.insert("DebugLabel".into(), args);
                 return Ok(true);
             }
-            "nvnBufferFinalize"
-            | "nvnProgramFinalize"
+            "nvnProgramFinalize"
             | "nvnSyncFinalize"
             | "nvnQueueFinalize"
             | "nvnMemoryPoolFinalize" => {
@@ -2800,12 +3064,18 @@ impl Nvn {
                     return Ok(true);
                 }
                 self.object(this, kind).map_err(invalid)?;
-                if kind == "MemoryPool"
-                    && self.objects.values().any(|object| {
-                        object.kind == "Buffer" && object.builder["Storage"].x[0] == this
-                    })
-                {
-                    return Err(stop("memory pool finalized while buffers use it".into()));
+                if kind == "MemoryPool" {
+                    let mut registry = write_shared(&self.registry);
+                    if registry.pools.get(&this).is_some_and(|pool| pool.buffers > 0) {
+                        return Err(stop("memory pool finalized while buffers use it".into()));
+                    }
+                    let pool = registry.pools.remove(&this);
+                    // Events whose storage was in the pool resolve no more.
+                    if let Some(pool) = pool {
+                        registry
+                            .events
+                            .retain(|_, address| !(pool.storage..pool.storage + pool.size).contains(address));
+                    }
                 }
                 if kind == "MemoryPool" {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
@@ -4582,6 +4852,7 @@ impl Nvn {
         Recorder {
             bags: self.bags.clone(),
             recordings: self.recording.clone(),
+            registry: self.registry.clone(),
         }
     }
 
