@@ -3659,17 +3659,26 @@ impl Nvn {
             _ => {}
         }
         // Commands that read or write guest memory themselves see earlier
-        // dispatches' results in place (draws and dispatches resolve what
-        // they read; ReportCounter resolves only the report it writes on
-        // the CPU, as a resolve of everything here was a submission and a
-        // wait per counted object).
-        if matches!(
-            command.name.as_str(),
-            "nvnCommandBufferCopyBufferToTexture"
-                | "nvnCommandBufferCopyTextureToTexture"
-                | "nvnCommandBufferClearBuffer"
-        ) {
-            if let Err(message) = self.resolve_storage(core, None) {
+        // dispatches' results in place, for the range they touch (draws and
+        // dispatches resolve what they read; ReportCounter resolves only
+        // the report it writes on the CPU). Resolving everything here read
+        // back every uncached pool's GPU writes, a wait each time.
+        let touched = match command.name.as_str() {
+            "nvnCommandBufferClearBuffer" => Some(
+                self.gpu_to_guest(command.x[1], command.x[2])
+                    .ok()
+                    .map(|to| to..to + command.x[2]),
+            ),
+            "nvnCommandBufferCopyTextureToTexture" => Some(
+                self.texture_storage(command.x[1])
+                    .zip(self.texture_storage_size(command.x[1]))
+                    .map(|(base, size)| base..base + size),
+            ),
+            // Its source range is known once the region is (in the arm).
+            _ => None,
+        };
+        if let Some(range) = touched {
+            if let Err(message) = self.resolve_storage(core, range) {
                 return Err(Trap::UnsupportedService {
                     pc: core.cpu.pc,
                     service: "nvn".into(),
@@ -4046,6 +4055,9 @@ impl Nvn {
                         * u64::from(info.bytes_per_block)
                 };
                 let source = self.gpu_to_guest(command.x[1], size).map_err(stop)?;
+                // Earlier dispatches' results in the source come back first.
+                self.resolve_storage(core, Some(source..source + size))
+                    .map_err(|message| stop(format!("dispatch results: {message}")))?;
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() {
                     let mut sample = vec![0u8; size.min(1 << 20) as usize];
                     core.memory.read(source, &mut sample)?;
@@ -4150,13 +4162,21 @@ impl Nvn {
                     return Err(stop(format!("{size:#x}-byte clear")));
                 }
                 let to = self.gpu_to_guest(address, size).map_err(stop)?;
-                let bytes: Vec<u8> = std::iter::repeat_n(value.to_le_bytes(), size as usize / 4)
-                    .flatten()
-                    .collect();
-                core.memory.write(to, &bytes)?;
+                // Written a megabyte at a time from one repeated pattern.
+                let pattern: Vec<u8> =
+                    std::iter::repeat_n(value.to_le_bytes(), (size as usize / 4).min(1 << 18))
+                        .flatten()
+                        .collect();
+                let mut done = 0;
+                while done < size {
+                    let length = (size - done).min(pattern.len() as u64);
+                    core.memory.write(to + done, &pattern[..length as usize])?;
+                    done += length;
+                }
                 // In GPU order: a resident copy of the range (a counter a
-                // later dispatch adds to) takes the cleared words too.
-                self.gpu_invalidate(to..to + size, None);
+                // later dispatch adds to) takes the cleared words too,
+                // filled there rather than uploaded again.
+                self.gpu_clear_buffer(to..to + size, value).map_err(stop)?;
                 Ok(())
             }
             name => {

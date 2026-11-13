@@ -670,6 +670,43 @@ impl Nvn {
         }
     }
 
+    /// ClearBuffer over guest `range` (already written in guest memory):
+    /// cached textures over it are dropped as for a flush, and resident
+    /// copies are filled with `value` on the GPU instead of uploaded.
+    pub(super) fn gpu_clear_buffer(
+        &mut self,
+        range: std::ops::Range<u64>,
+        value: u32,
+    ) -> Result<(), String> {
+        self.gpu_invalidate(range.clone(), None);
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        let mut fills = Vec::new();
+        for pool in backend.resident.values_mut() {
+            let piece = range.start.max(pool.base)..range.end.min(pool.base + pool.size);
+            if piece.start < piece.end {
+                // Both copies hold the cleared words once the fill runs.
+                remove_range(&mut pool.guest_dirty, piece.clone());
+                remove_range(&mut pool.gpu_dirty, piece.clone());
+                fills.push((pool.base, piece));
+            }
+        }
+        for (base, piece) in fills {
+            backend.stat(
+                "stat: resident bytes cleared on the GPU",
+                piece.end - piece.start,
+            );
+            backend.renderer.fill_resident(
+                base,
+                piece.start - base,
+                piece.end - piece.start,
+                value,
+            )?;
+        }
+        Ok(())
+    }
+
     /// ClearColor on the GPU: `color` as the four captured 32-bit words.
     pub(super) fn gpu_clear_color(
         &mut self,
@@ -1888,7 +1925,7 @@ impl Nvn {
 
     /// Bytes of a texture object's block-linear storage (all levels and
     /// layers).
-    fn texture_storage_size(&self, texture: u64) -> Option<u64> {
+    pub(super) fn texture_storage_size(&self, texture: u64) -> Option<u64> {
         let object = self.objects.get(&texture)?;
         let get = |key: &str| object.builder.get(key).map(|value| value.x[0] as u32);
         let info = crate::nvn_format::info(get("Format")?)?;

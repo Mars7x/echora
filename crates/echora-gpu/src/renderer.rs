@@ -921,6 +921,54 @@ impl Renderer {
         Ok(())
     }
 
+    /// Record a fill of `length` bytes of resident buffer `key` at `at`
+    /// with the 32-bit `value` (in order with other work): ClearBuffer on
+    /// the GPU's copy. Both must be multiples of 4.
+    pub fn fill_resident(
+        &mut self,
+        key: u64,
+        at: u64,
+        length: u64,
+        value: u32,
+    ) -> Result<(), String> {
+        let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
+        let length = length.min(size.saturating_sub(at));
+        if length == 0 {
+            return Ok(());
+        }
+        let commands = self.commands()?;
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let after = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        // SAFETY: recording outside rendering; the buffer is live.
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            device.cmd_fill_buffer(commands, buffer, at, length, value);
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
     /// Record a copy of `length` ring bytes at `offset` of `source` into
     /// resident buffer `key` at `at`, ordered after earlier work.
     fn copy_to_resident(
