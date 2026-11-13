@@ -192,6 +192,10 @@ pub struct Renderer {
     targets: HashMap<u64, Target>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
     uploads: HashMap<u64, (u64, Target)>,
+    /// The texel bytes each upload was made from: a caller may drop its
+    /// copy once the image holds them (`has_upload`), and `with_texels`
+    /// reads them back from the image when needed again.
+    upload_lengths: HashMap<u64, u64>,
     /// Uploads forgotten while recorded work may still sample them:
     /// destroyed after the next flush.
     retired_uploads: Vec<Target>,
@@ -494,6 +498,7 @@ impl Renderer {
             memory_types,
             targets: HashMap::new(),
             uploads: HashMap::new(),
+            upload_lengths: HashMap::new(),
             retired_uploads: Vec::new(),
             texel_buffers: HashMap::new(),
             retired_texel_buffers: Vec::new(),
@@ -1209,6 +1214,30 @@ impl Renderer {
         texture_type: u32,
     ) -> Result<vk::ImageView, String> {
         use crate::draw::{ImageShape, TextureSource};
+        // Released texels come back from the image when this view needs
+        // another image made from them (the aliases below).
+        let filled;
+        let source = match source {
+            TextureSource::Upload {
+                texels,
+                format,
+                shape,
+                ..
+            } if texels.is_empty()
+                && !block_compressed(*format)
+                && match shape {
+                    ImageShape::D2 { layers } => {
+                        matches!(texture_type, 0 | 1) || (texture_type == 4 && *layers == 1)
+                    }
+                    ImageShape::D3 { .. } => matches!(texture_type, 2 | 3),
+                    _ => false,
+                } =>
+            {
+                filled = self.with_texels(source)?;
+                &filled
+            }
+            _ => source,
+        };
         // A 2D upload read by a 1D binding (the shader's texture
         // instruction is 1D): Vulkan has no 1D view of a 2D image, so its
         // first row is uploaded again as a 1D image under its own cache
@@ -1547,6 +1576,11 @@ impl Renderer {
                 return Ok(());
             }
         }
+        if texels.is_empty() && !levels.is_empty() {
+            return Err(format!(
+                "upload {key:#x}: texels released without a current image"
+            ));
+        }
         let level_count = levels
             .iter()
             .map(|region| region.level + 1)
@@ -1762,7 +1796,109 @@ impl Renderer {
             self.register_views(&target);
         }
         self.uploads.insert(*key, (*generation, target));
+        self.upload_lengths.insert(*key, texels.len() as u64);
         Ok(())
+    }
+
+    /// Whether upload `key` holds its texels at `generation` (its image
+    /// was made from them).
+    pub fn has_upload(&self, key: u64, generation: u64) -> bool {
+        self.uploads
+            .get(&key)
+            .is_some_and(|(uploaded, _)| *uploaded == generation)
+    }
+
+    /// `source` with its texels: when the caller released them (an
+    /// upload source with no texels, its image current), they are read
+    /// back from the upload's image, region by region at the offsets
+    /// they were uploaded from.
+    pub(crate) fn with_texels(
+        &mut self,
+        source: &crate::draw::TextureSource,
+    ) -> Result<crate::draw::TextureSource, String> {
+        let crate::draw::TextureSource::Upload {
+            key,
+            generation,
+            texels,
+            levels,
+            ..
+        } = source
+        else {
+            return Ok(source.clone());
+        };
+        if !texels.is_empty() {
+            return Ok(source.clone());
+        }
+        let length = *self
+            .upload_lengths
+            .get(key)
+            .filter(|_| self.has_upload(*key, *generation))
+            .ok_or_else(|| format!("upload {key:#x}: texels released and no current image"))?;
+        let (image, image_levels, image_layers, format) = {
+            let (_, target) = &self.uploads[key];
+            (
+                target.image,
+                target.levels,
+                target.shape.layers(),
+                target.format,
+            )
+        };
+        let buffer = self.host_buffer(length.max(16), vk::BufferUsageFlags::TRANSFER_DST)?;
+        let copies: Vec<vk::BufferImageCopy> = levels
+            .iter()
+            .filter(|region| region.level < image_levels && region.layer < image_layers)
+            .map(|region| vk::BufferImageCopy {
+                buffer_offset: region.offset,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: range(format).aspect_mask,
+                    mip_level: region.level,
+                    base_array_layer: region.layer,
+                    layer_count: 1,
+                },
+                image_extent: vk::Extent3D {
+                    width: region.width,
+                    height: region.height,
+                    depth: region.depth,
+                },
+                ..Default::default()
+            })
+            .collect();
+        let commands = self.commands()?;
+        // SAFETY: recording; the upload image is live, in GENERAL layout
+        // and made with TRANSFER_SRC; the buffer holds every region.
+        unsafe {
+            let device = &self.gpu.device;
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            device.cmd_copy_image_to_buffer(
+                commands,
+                image,
+                vk::ImageLayout::GENERAL,
+                buffer.buffer,
+                &copies,
+            );
+        }
+        self.flush()?;
+        // SAFETY: in bounds; the copy has completed.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.mapped.cast::<u8>(), length as usize) }
+                .to_vec();
+        buffer.destroy(self.device());
+        let mut filled = source.clone();
+        if let crate::draw::TextureSource::Upload { texels, .. } = &mut filled {
+            *texels = std::sync::Arc::new(bytes);
+        }
+        Ok(filled)
     }
 
     pub(crate) fn sampler(
@@ -2054,6 +2190,11 @@ impl Renderer {
             if cached == generation {
                 return Ok(*view);
             }
+        }
+        // Released texels come back from the upload's image.
+        if texels.is_empty() {
+            let filled = self.with_texels(source)?;
+            return self.texel_buffer_view(&filled);
         }
         let start = levels.first().map_or(0, |region| region.offset as usize);
         let end = levels
@@ -4223,6 +4364,7 @@ impl Renderer {
             if let Some((_, target)) = self.uploads.remove(&key) {
                 self.retired_uploads.push(target);
             }
+            self.upload_lengths.remove(&key);
         }
     }
 

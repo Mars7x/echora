@@ -2324,6 +2324,32 @@ impl Nvn {
         }
     }
 
+    /// A cached upload of 64 KiB or more whose image the renderer holds
+    /// keeps no host copy of its texels: the renderer reads them back from
+    /// the image when it needs them again (an alias image, a texel
+    /// buffer). The forest's 436 uploads kept 2.7 GB on the host.
+    fn release_upload_texels(&mut self, texture: u64) {
+        let backend = self.gpu.as_mut().unwrap();
+        let Some((
+            _,
+            TextureSource::Upload {
+                key,
+                generation,
+                texels,
+                ..
+            },
+            _,
+        )) = backend.textures.get_mut(&texture)
+        else {
+            return;
+        };
+        if texels.len() < 1 << 16 || !backend.renderer.has_upload(*key, *generation) {
+            return;
+        }
+        *texels = Arc::new(Vec::new());
+        backend.stat("stat: upload texels released", 1);
+    }
+
     /// The upload of a texture's guest memory, cached while it holds.
     fn guest_texture(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         // Flushed pieces of a cached upload: unchanged bytes keep it.
@@ -2371,8 +2397,10 @@ impl Nvn {
         let frame = self.presented_frames;
         let backend = self.gpu.as_ref().unwrap();
         if backend.texture_checked.get(&texture) == Some(&frame) {
-            if let Some((_, source, _)) = backend.textures.get(&texture) {
-                return Ok(source.clone());
+            if backend.textures.contains_key(&texture) {
+                self.release_upload_texels(texture);
+                let backend = self.gpu.as_ref().unwrap();
+                return Ok(backend.textures[&texture].1.clone());
             }
         }
         let object = self.object(texture, "Texture")?;
@@ -2561,10 +2589,11 @@ impl Nvn {
                 info.name
             );
         }
-        if let Some((sampled, source, _)) = self.gpu.as_ref().unwrap().textures.get(&texture) {
+        if let Some((sampled, _, _)) = self.gpu.as_ref().unwrap().textures.get(&texture) {
             if *sampled == sample && !stale && !shadow_changed {
-                let source = source.clone();
+                self.release_upload_texels(texture);
                 let backend = self.gpu.as_mut().unwrap();
+                let source = backend.textures[&texture].1.clone();
                 backend.texture_checked.insert(texture, frame);
                 if full_check_passed == Some(true) {
                     let quiet = backend.shadow_quiet.entry(texture).or_default();
