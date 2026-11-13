@@ -2942,9 +2942,20 @@ impl Renderer {
     /// Before recording a draw or dispatch: submit once a submission holds
     /// MAX_WORK_ITEMS of them. One submission is one GPU job, and the
     /// kernel resets the whole GPU when a job runs past its 10 s limit
-    /// (headless runs once gathered 270 frames of work into one).
+    /// (headless runs once gathered 270 frames of work into one). Smaller
+    /// submissions also let the GPU run a frame's work while the CPU still
+    /// records the rest of it, instead of all of it after the present
+    /// (ECHORA_SUBMIT_ITEMS, default 128).
     pub(crate) fn bound_submission(&mut self) -> Result<(), String> {
-        if self.work_items >= MAX_WORK_ITEMS {
+        static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| {
+            std::env::var("ECHORA_SUBMIT_ITEMS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(128)
+                .clamp(1, MAX_WORK_ITEMS)
+        });
+        if self.work_items >= limit {
             self.flush_async()?;
         }
         self.work_items += 1;
