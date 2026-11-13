@@ -548,6 +548,9 @@ struct Emitter {
     txq_fallbacks: Vec<(u8, u32)>,
     frag_colors: u32,
     push_fields: u32,
+    /// A global store or atomic went through the page table
+    /// (`PUSH_PAGE_TABLE_READ_ONLY` stays clear).
+    page_table_stores: bool,
     /// Uniform buffer of each constant bank used, by bank.
     banks: BTreeMap<u8, u32>,
     /// The block type every bank's buffer shares, once declared.
@@ -666,6 +669,7 @@ impl Emitter {
             txq_fallbacks: Vec::new(),
             frag_colors: 0,
             push_fields: 0,
+            page_table_stores: false,
             banks: BTreeMap::new(),
             bank_block: None,
             builtins: BTreeMap::new(),
@@ -740,7 +744,13 @@ impl Emitter {
             frag_colors: self.frag_colors,
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: self.spec_constants,
-            push_fields: self.push_fields,
+            push_fields: if self.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
+                && !self.page_table_stores
+            {
+                self.push_fields | echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY
+            } else {
+                self.push_fields
+            },
             texture_pool_bindings: self.pool_bindings,
         }
     }

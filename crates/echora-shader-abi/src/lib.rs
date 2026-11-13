@@ -306,6 +306,11 @@ pub const PUSH_TRANSLATOR: u32 = 1;
 pub const PUSH_RESOLUTION_SCALE: u32 = 2;
 pub const PUSH_PAGE_TABLE: u32 = 4;
 pub const PUSH_VERTEX_FETCH: u32 = 8;
+/// Metadata, not a push field: the program reads through the page table
+/// (`PUSH_PAGE_TABLE`) but never stores through it, so the CPU need not wait
+/// for it before reading guest memory. A translator that does not know
+/// leaves it clear (the conservative answer).
+pub const PUSH_PAGE_TABLE_READ_ONLY: u32 = 16;
 /// The fields of the ABI block (all but the translator's words).
 pub const PUSH_ABI_FIELDS: u32 = PUSH_RESOLUTION_SCALE | PUSH_PAGE_TABLE | PUSH_VERTEX_FETCH;
 

@@ -208,6 +208,9 @@ impl Emitter {
         address: Address,
         size: u8,
     ) -> Result<(), Unsupported> {
+        if space == Space::Global {
+            self.page_table_stores = true;
+        }
         let value = if data == 255 {
             self.constant(0)
         } else {
@@ -285,6 +288,7 @@ impl Emitter {
         kind: u8,
     ) -> Result<(), Unsupported> {
         if space == Space::Global {
+            self.page_table_stores = true;
             self.module.note_store();
         }
         let float = kind == 3;
@@ -734,6 +738,7 @@ impl Emitter {
         values: &[u32],
         strong: bool,
     ) -> Result<(), Unsupported> {
+        self.page_table_stores = true;
         self.module.note_store();
         let operands = access(strong);
         let va = self.global_address(address);

@@ -104,10 +104,13 @@ pub struct Backend {
     /// over imported guest memory) since the GPU last finished: a CPU read
     /// of one waits for the GPU first (see `resolve_storage`).
     in_place_writes: Vec<std::ops::Range<u64>>,
-    /// A compute program that reaches global memory through the page table
-    /// was dispatched: its stores land in guest memory or a resident pool's
-    /// copy with no range recorded (see `resolve_gpu_written`).
+    /// A program storing through the page table was recorded since the
+    /// last wait for it: its stores land in guest memory or a resident
+    /// pool's copy with no range recorded (see `resolve_gpu_written`).
     page_table_writes: bool,
+    /// Work storing through the page table has run at some point: the
+    /// resident pools' ranges a CPU read covers may hold its results.
+    page_table_wrote: bool,
     /// Storage buffers kept on the GPU between dispatches (when guest
     /// memory cannot be imported), by guest address: see `Resident`.
     resident: HashMap<u64, ResidentPool>,
@@ -198,6 +201,7 @@ impl Backend {
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             page_table_writes: false,
+            page_table_wrote: false,
             resident: HashMap::new(),
             samples_reports: std::collections::HashSet::new(),
             shared_pools: HashMap::new(),
@@ -4226,8 +4230,20 @@ impl Nvn {
         } else {
             Default::default()
         };
-        if page_table.address != 0 {
-            self.gpu.as_mut().unwrap().page_table_writes = true;
+        // Only a program that stores through the table makes later CPU
+        // reads wait (one that only reads it, the translator says, does not).
+        if page_table.address != 0
+            && self.gpu.as_ref().unwrap().programs[&key]
+                .stages
+                .iter()
+                .any(|stage| {
+                    stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
+                        && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
+                })
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.page_table_writes = true;
+            backend.page_table_wrote = true;
         }
         let pool = if stage.texture_pool_bindings != 0 {
             self.pool_entries(core, 5)?
@@ -4417,10 +4433,16 @@ impl Nvn {
         range: std::ops::Range<u64>,
     ) -> Result<(), String> {
         if let Some(backend) = self.gpu.as_mut()
-            && backend.page_table_writes
+            && backend.page_table_wrote
         {
-            backend.stat("stat: GPU waits for page-table writes", 1);
-            backend.renderer.flush()?;
+            // Work storing through the table recorded since the last wait
+            // finishes first; once it has, later reads need no wait until
+            // more such work is recorded.
+            if backend.page_table_writes {
+                backend.stat("stat: GPU waits for page-table writes", 1);
+                backend.renderer.flush()?;
+                backend.page_table_writes = false;
+            }
             for pool in backend.resident.values_mut() {
                 let piece = range.start.max(pool.base)..range.end.min(pool.base + pool.size);
                 if piece.start < piece.end {
@@ -6992,8 +7014,16 @@ impl Nvn {
         };
         // Stages store through the table (a vertex program writing texels
         // back for the CPU): later CPU reads of those ranges wait for them.
-        if page_table.address != 0 {
-            self.gpu.as_mut().unwrap().page_table_writes = true;
+        // Stages that only read through it (the translator says) do not.
+        if page_table.address != 0
+            && stages.iter().any(|stage| {
+                stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
+                    && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
+            })
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.page_table_writes = true;
+            backend.page_table_wrote = true;
         }
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams
