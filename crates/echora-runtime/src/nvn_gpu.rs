@@ -3494,9 +3494,16 @@ impl Nvn {
 
     /// Work recorded before submission `serial` ends at a fence or event
     /// the guest can see signaled.
+    /// The batch is submitted here: a CPU wait for this point (a sync wait,
+    /// a read of what the work before it stored) then waits for that work
+    /// alone, not for what the replay records after it into the same batch.
     pub(super) fn gpu_observable(&mut self, serial: u64) {
         if let Some(backend) = self.gpu.as_mut() {
             backend.observable_serial = backend.observable_serial.max(serial);
+            if let Err(error) = backend.renderer.submit_through(serial) {
+                backend.note(format!("submitting at a signal: {error}"));
+            }
+            backend.stat("stat: batches ended at a signal", 1);
         }
     }
 
