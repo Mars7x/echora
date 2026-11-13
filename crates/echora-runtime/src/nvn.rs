@@ -378,6 +378,10 @@ pub struct Nvn {
     /// is remapped: what `texture_storage` answers can change only then.
     #[serde(skip)]
     object_generation: u64,
+    /// The tiled level `copy_texels` builds a whole-level copy in, kept
+    /// between copies.
+    #[serde(skip)]
+    tiled_scratch: std::cell::RefCell<Vec<u8>>,
     /// The memory pools among `objects` (the page table walks them).
     #[serde(skip)]
     memory_pools: std::collections::BTreeSet<u64>,
@@ -4279,10 +4283,16 @@ impl Nvn {
         {
             let shape = crate::nvn_format::level_block_shape(info, height, 1, layout, 0);
             let size = crate::nvn_format::block_linear_size(info, width, height, 1, layout, 1).0;
-            let mut tiled = vec![0u8; size as usize];
-            core.memory
-                .read(base, &mut tiled)
-                .map_err(TexelError::Trap)?;
+            // The buffer is kept between copies (a picture each present).
+            // Without padding the rows cover every byte; otherwise the
+            // level is read first.
+            let mut tiled = std::mem::take(&mut *self.tiled_scratch.borrow_mut());
+            tiled.resize(size as usize, 0);
+            if row_size * u64::from(rows) != size {
+                core.memory
+                    .read(base, &mut tiled)
+                    .map_err(TexelError::Trap)?;
+            }
             let mut linear = vec![0u8; (row_size * u64::from(rows)) as usize];
             core.memory
                 .read(source, &mut linear)
@@ -4299,6 +4309,7 @@ impl Nvn {
                 }
             }
             core.memory.write(base, &tiled).map_err(TexelError::Trap)?;
+            *self.tiled_scratch.borrow_mut() = tiled;
             // A single-level texture's upload can take these rows as they
             // are while its storage stays as written here.
             let copied = (get("Levels").unwrap_or(1) <= 1).then(|| {
