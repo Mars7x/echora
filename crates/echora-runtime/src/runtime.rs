@@ -2817,6 +2817,7 @@ impl Machine {
             machine: std::sync::Mutex::new(&mut *self),
             wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
             nvn,
+            nvn_waiters: std::sync::atomic::AtomicUsize::new(0),
             recorder,
             thunks,
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -4808,6 +4809,9 @@ struct Shared<'a> {
     /// machine, whose `nvn` holds only the entry points meanwhile. Taken
     /// after the machine lock, never before it.
     nvn: std::sync::Mutex<crate::nvn::Nvn>,
+    /// Threads waiting for `nvn` (a replay in pieces hands it over to them
+    /// between pieces; the mutex alone gives it straight back).
+    nvn_waiters: std::sync::atomic::AtomicUsize,
     /// Records calls on recording command buffers without the NVN state's
     /// lock (see `Worker::recorded_nvn_call`).
     recorder: crate::nvn::Recorder,
@@ -4832,6 +4836,19 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
+    /// The NVN state, counted among its waiters until it is held.
+    fn lock_nvn(&self) -> std::sync::MutexGuard<'_, crate::nvn::Nvn> {
+        self.nvn_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let nvn = self
+            .nvn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.nvn_waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        nvn
+    }
+
     /// Wake the parked workers named by `workers` (bit per worker).
     fn wake_workers(&self, workers: u64) {
         for (index, wake) in self.wake.iter().enumerate() {
@@ -5005,10 +5022,7 @@ impl Worker {
                 // state in for the boundary.
                 self.swap_in(&mut machine);
                 let outcome = if host_call.is_some() {
-                    let mut nvn = shared
-                        .nvn
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut nvn = shared.lock_nvn();
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
                     let outcome = machine.boundary(result);
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
@@ -5220,16 +5234,29 @@ impl Worker {
             return false;
         }
         let asked = std::time::Instant::now();
-        let mut nvn = shared
-            .nvn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut nvn = shared.lock_nvn();
         let locked = std::time::Instant::now();
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         // A replay in pieces: the lock is let go between them, so other
         // threads' calls are not held up by the whole replay.
         while made && nvn.replay_paused() {
             drop(nvn);
+            // Waiting threads take it first: the mutex would hand it straight
+            // back to this one (up to a fraction of a millisecond).
+            let waiting = shared
+                .nvn_waiters
+                .load(std::sync::atomic::Ordering::Acquire);
+            if waiting > 0 {
+                let handed = std::time::Instant::now();
+                while shared
+                    .nvn_waiters
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    >= waiting
+                    && handed.elapsed() < std::time::Duration::from_micros(200)
+                {
+                    std::thread::yield_now();
+                }
+            }
             nvn = shared
                 .nvn
                 .lock()
