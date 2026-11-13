@@ -3695,13 +3695,15 @@ impl Renderer {
         }
     }
 
-    /// Record a full barrier moving `key`'s image to `layout`.
+    /// Record a full barrier moving `key`'s image to `layout`. An image
+    /// already there records nothing and leaves an open rendering pass open
+    /// (a draw sampling a target would otherwise end the pass each time).
     pub(crate) fn transition(&mut self, key: u64, layout: vk::ImageLayout) -> Result<(), String> {
-        let commands = self.commands()?;
-        let target = self.targets.get_mut(&key).ok_or("no such target")?;
-        if target.layout == layout {
+        if self.targets.get(&key).ok_or("no such target")?.layout == layout {
             return Ok(());
         }
+        let commands = self.commands()?;
+        let target = self.targets.get_mut(&key).ok_or("no such target")?;
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
