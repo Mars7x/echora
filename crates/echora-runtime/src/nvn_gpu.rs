@@ -1385,7 +1385,7 @@ impl Nvn {
                 let Some(bind) = self
                     .render
                     .state
-                    .get(&format!("BindUniformBuffer/5/{}", index - 3))
+                    .get(bind_key("BindUniformBuffer", Some(5), (index - 3) as u64))
                     .map(|bind| (bind.x[3], bind.x[4]))
                 else {
                     return Ok(None);
@@ -3809,10 +3809,10 @@ impl Nvn {
                 eprintln!("c1probe   root {table} {:?}", words(&bytes));
             }
             for slot in 0..4 {
-                if let Some(bind) = self
-                    .render
-                    .state
-                    .get(&format!("BindUniformBuffer/5/{slot}"))
+                if let Some(bind) =
+                    self.render
+                        .state
+                        .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
                 {
                     eprintln!("c1probe   ubo {slot} {:#x}+{:#x}", bind.x[3], bind.x[4]);
                 }
@@ -3941,10 +3941,10 @@ impl Nvn {
             if entry + 12 > storage_base as usize {
                 break;
             }
-            if let Some(bind) = self
-                .render
-                .state
-                .get(&format!("BindUniformBuffer/5/{slot}"))
+            if let Some(bind) =
+                self.render
+                    .state
+                    .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
             {
                 c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
                 c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
@@ -3960,10 +3960,10 @@ impl Nvn {
                 if entry + 12 > texture_base as usize || entry + 12 > c0.len() {
                     break;
                 }
-                if let Some(bind) = self
-                    .render
-                    .state
-                    .get(&format!("BindStorageBuffer/5/{slot}"))
+                if let Some(bind) =
+                    self.render
+                        .state
+                        .get(bind_key("BindStorageBuffer", Some(5), slot as u64))
                 {
                     c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
                     c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
@@ -4005,7 +4005,7 @@ impl Nvn {
                             let bind = self
                                 .render
                                 .state
-                                .get(&format!("BindStorageBuffer/5/{slot}"))
+                                .get(bind_key("BindStorageBuffer", Some(5), slot as u64))
                                 .ok_or_else(|| {
                                     format!("storage buffer 5/{slot} is not bound: {layout}")
                                 })?;
@@ -4147,7 +4147,7 @@ impl Nvn {
                     let handle = self
                         .render
                         .state
-                        .get(&format!("BindTexture/5/{slot}"))
+                        .get(bind_key("BindTexture", Some(5), slot as u64))
                         .ok_or_else(|| format!("texture 5/{slot} is not bound: {layout}"))?
                         .x[3];
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
@@ -4182,7 +4182,7 @@ impl Nvn {
                     let handle = self
                         .render
                         .state
-                        .get(&format!("BindImage/5/{slot}"))
+                        .get(bind_key("BindImage", Some(5), slot as u64))
                         .ok_or_else(|| format!("image 5/{slot} is not bound: {layout}"))?
                         .x[3];
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
@@ -4239,7 +4239,7 @@ impl Nvn {
                     let bind = self
                         .render
                         .state
-                        .get(&format!("BindUniformBuffer/5/{slot}"))
+                        .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
                         .ok_or_else(|| format!("uniform buffer 5/{slot} is not bound"))?;
                     let used = u64::from(stage.cbuf_used_sizes[descriptor.index as usize]);
                     let size = bind.x[4].min(used.max(16)).min(64 << 10);
@@ -4925,7 +4925,9 @@ impl Nvn {
         let offset = attribute.get("Format").map_or(0, |args| args.x[1]);
         let (Some(props), Some(bind)) = (
             streams.get(stream),
-            self.render.state.get(&format!("BindVertexBuffer/{stream}")),
+            self.render
+                .state
+                .get(bind_key("BindVertexBuffer", None, stream as u64)),
         ) else {
             return Ok(Default::default());
         };
@@ -6987,7 +6989,7 @@ impl Nvn {
                         let bind = self
                             .render
                             .state
-                            .get(&format!("BindUniformBuffer/{nvn}/{slot}"))
+                            .get(bind_key("BindUniformBuffer", Some(nvn as u64), slot as u64))
                             .ok_or_else(|| {
                                 // The slots that are bound, by stage, and
                                 // the program's stages (which bank it reads).
@@ -7054,7 +7056,7 @@ impl Nvn {
                         let bind = self
                             .render
                             .state
-                            .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
+                            .get(bind_key("BindStorageBuffer", Some(nvn as u64), slot as u64))
                             .ok_or_else(|| {
                                 let bound: Vec<&str> = self
                                     .render
@@ -7123,7 +7125,7 @@ impl Nvn {
                         let handle = self
                             .render
                             .state
-                            .get(&format!("BindTexture/{nvn}/{slot}"))
+                            .get(bind_key("BindTexture", Some(nvn as u64), slot as u64))
                             .ok_or_else(|| format!("texture {nvn}/{slot} is not bound"))?
                             .x[3];
                         // Valid within a present (textures are revalidated
@@ -7216,11 +7218,11 @@ impl Nvn {
             }
             let nvn = slots[index];
             for slot in 0..16u64 {
-                if let Some(bind) = self
-                    .render
-                    .state
-                    .get(&format!("BindStorageBuffer/{nvn}/{slot}"))
-                {
+                if let Some(bind) = self.render.state.get(bind_key(
+                    "BindStorageBuffer",
+                    Some(nvn as u64),
+                    slot as u64,
+                )) {
                     let offset = u64::from(c0_storage_table(nvn)) + 16 * slot;
                     storage_entries.push((index, offset as u32, bind.x[3], bind.x[4]));
                 }
@@ -7550,7 +7552,11 @@ impl Nvn {
             } else {
                 0
             };
-            let data = match self.render.state.get(&format!("BindVertexBuffer/{index}")) {
+            let data = match self
+                .render
+                .state
+                .get(bind_key("BindVertexBuffer", None, index as u64))
+            {
                 Some(bind) if bind.x[3] > skip => {
                     let divisor = value(props, "Divisor");
                     let reach = if stride == 0 {
@@ -7585,7 +7591,9 @@ impl Nvn {
         }) {
             for index in 0..16 {
                 let (Some(bind), Some(props)) = (
-                    self.render.state.get(&format!("BindVertexBuffer/{index}")),
+                    self.render
+                        .state
+                        .get(bind_key("BindVertexBuffer", None, index as u64)),
                     stream_states.get(index),
                 ) else {
                     continue;
@@ -9075,11 +9083,11 @@ impl PointerProbe<'_, '_> {
             0 | 2 => return None,
             1 => word.copy_from_slice(self.nvn.stage_constants(self.core, 5)?.get(at..at + 8)?),
             index => {
-                let bind = self
-                    .nvn
-                    .render
-                    .state
-                    .get(&format!("BindUniformBuffer/5/{}", index - 3))?;
+                let bind = self.nvn.render.state.get(bind_key(
+                    "BindUniformBuffer",
+                    Some(5),
+                    (index - 3) as u64,
+                ))?;
                 if u64::from(offset) + 8 > bind.x[4] {
                     return None;
                 }
@@ -9211,4 +9219,27 @@ fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, Strin
             .join("echora/dispatch-dumps"),
     };
     Ok(root.join(format!("{key:016x}-{present}")))
+}
+
+/// The render state's key for a binding of `kind` (stage `stage`, if any)
+/// at `slot`, as "{kind}/{stage}/{slot}" or "{kind}/{slot}": made once
+/// each (draws looked a dozen up, each formatted anew).
+fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'static str {
+    thread_local! {
+        static KEYS: std::cell::RefCell<
+            HashMap<(usize, Option<u64>, u64), &'static str, std::hash::BuildHasherDefault<super::FastHasher>>,
+        > = std::cell::RefCell::new(HashMap::default());
+    }
+    KEYS.with(|keys| {
+        *keys
+            .borrow_mut()
+            .entry((kind.as_ptr() as usize, stage, slot))
+            .or_insert_with(|| {
+                let key = match stage {
+                    Some(stage) => format!("{kind}/{stage}/{slot}"),
+                    None => format!("{kind}/{slot}"),
+                };
+                Box::leak(key.into_boxed_str())
+            })
+    })
 }
