@@ -393,6 +393,8 @@ pub struct Nvn {
     memory_pools: std::collections::BTreeSet<u64>,
     /// `texture_storage` answers by texture, at an object generation.
     #[serde(skip)]
+    /// `texture_storage_size` results, kept as `storage_memo` is.
+    size_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
     storage_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]

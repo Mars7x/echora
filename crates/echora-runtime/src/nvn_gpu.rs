@@ -1993,6 +1993,25 @@ impl Nvn {
     /// Bytes of a texture object's block-linear storage (all levels and
     /// layers).
     pub(super) fn texture_storage_size(&self, texture: u64) -> Option<u64> {
+        // Remembered as `texture_storage` is (the shape walk below is the
+        // same for every draw that binds the texture).
+        let generation = (self.object_generation, self.texture_epoch);
+        if let Ok(mut memo) = self.size_memo.try_borrow_mut() {
+            if memo.0 != generation {
+                *memo = (generation, Default::default());
+            }
+            if let Some(found) = memo.1.get(&texture) {
+                return *found;
+            }
+        }
+        let found = self.texture_storage_size_uncached(texture);
+        if let Ok(mut memo) = self.size_memo.try_borrow_mut() {
+            memo.1.insert(texture, found);
+        }
+        found
+    }
+
+    fn texture_storage_size_uncached(&self, texture: u64) -> Option<u64> {
         let object = self.objects.get(&texture)?;
         let get = |key: &str| object.builder.get(key).map(|value| value.x[0] as u32);
         let info = crate::nvn_format::info(get("Format")?)?;
@@ -2093,12 +2112,6 @@ impl Nvn {
                     .stat("stat: texture pool handles unresolved", 1);
                 continue;
             };
-            if let (Some(base), Some(size)) = (
-                self.texture_storage(texture),
-                self.texture_storage_size(texture),
-            ) {
-                self.resolve_storage(core, Some(base..base + size))?;
-            }
             // As the draw path does before it memoizes: GPU-written
             // bytes under the texture come back first.
             if let (Some(base), Some(size)) = (
