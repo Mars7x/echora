@@ -80,11 +80,15 @@ pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) 
     // ECHORA_HMMA=subgroup forces the shuffle path, and ECHORA_HMMA=exact
     // the tensor cores' published arithmetic, on any device.
     let cooperative = has(T::FLOAT16) && has(T::FLOAT32);
+    // Fragments staged as whole 32-bit registers by default: the movie's
+    // pictures came out identical to the half-staged path's (presents
+    // 2,000-2,100, every pixel) at about half the time of its heaviest
+    // program; ECHORA_HMMA=coop16 stages halves as before.
     let mode = match std::env::var("ECHORA_HMMA").as_deref() {
         Ok("exact") => 2,
         Ok("subgroup") => 0,
-        Ok("coop32") if cooperative => 3,
-        _ if cooperative => 1,
+        Ok("coop16") if cooperative => 1,
+        _ if cooperative => 3,
         _ => 0,
     };
     MATRIX_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
