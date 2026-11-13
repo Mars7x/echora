@@ -1140,6 +1140,9 @@ pub struct Services {
     /// submissions are decoded there in order, off the machine lock, and a
     /// picture is waited for when its pixels are first read (961).
     video_jobs: Option<std::sync::mpsc::Sender<VideoJob>>,
+    /// Picture buffers the application is done with (a slot's picture
+    /// replaced by its next one), on their way back to the decoder thread.
+    spare_pictures: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     /// When these services were made: "since boot" in ECHORA_MOVIE_RATE.
     created: std::time::Instant,
     /// The host decoders' failures (the first 16), filled by that thread.
@@ -1278,6 +1281,7 @@ impl Default for Services {
             video_submissions: 0,
             video_input: Vec::new(),
             video_jobs: None,
+            spare_pictures: None,
             created: std::time::Instant::now(),
             av1_errors: Default::default(),
             video_log: Default::default(),
@@ -1754,6 +1758,10 @@ struct HostDecoder {
     /// given back for every later submission without decoding.
     skip_decode_picture: Option<Box<crate::av1::Picture>>,
     av1_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Buffers of pictures the application is done with, used again for
+    /// the next pictures of the same size (a fresh 3 MB buffer per picture
+    /// is zeroed and faulted in for nothing: the read-back fills it whole).
+    spare: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl HostDecoder {
@@ -1887,7 +1895,12 @@ impl HostDecoder {
             let mut pictures = Vec::new();
             for shown in movie.decode(bytes)? {
                 let pitch = shown.width.next_multiple_of(2);
-                let mut nv12 = vec![0u8; echora_gpu::video::nv12_size(shown.height, pitch)];
+                let size = echora_gpu::video::nv12_size(shown.height, pitch);
+                let mut nv12 = self
+                    .spare
+                    .try_iter()
+                    .find(|spare| spare.len() == size)
+                    .unwrap_or_else(|| vec![0u8; size]);
                 movie.read_nv12(shown, pitch, &mut nv12)?;
                 let (full_range, matrix) = movie.color().unwrap_or((false, 1));
                 pictures.push(crate::av1::Picture {
@@ -2836,7 +2849,12 @@ impl Services {
                 // The slot's picture, possibly still being decoded: 961
                 // waits for it (one that turns out to be none reads there
                 // as no picture did).
-                self.slot_pictures.insert(slot, frame.picture);
+                let replaced = self.slot_pictures.insert(slot, frame.picture);
+                if let (Some(PendingPicture::Ready(Some(picture))), Some(spare)) =
+                    (replaced, &self.spare_pictures)
+                {
+                    let _ = spare.try_send(picture.nv12);
+                }
                 self.provisional_commands
                     .insert("appletOE:video_decoder:213");
                 Ok(Outcome::success())
@@ -4792,7 +4810,12 @@ impl Services {
     fn decode_av1(&mut self, bytes: Vec<u8>) -> PendingPicture {
         let jobs = self.video_jobs.get_or_insert_with(|| {
             let (sender, receiver) = std::sync::mpsc::channel();
+            // A few wait at most: buffers the decoder does not take (it
+            // is not reading pictures back) are freed, not kept.
+            let (spare_sender, spare) = std::sync::mpsc::sync_channel(8);
+            self.spare_pictures = Some(spare_sender);
             let decoder = HostDecoder {
+                spare,
                 av1_decoder: None,
                 gpu_movie: None,
                 gpu_movie_failed: false,
