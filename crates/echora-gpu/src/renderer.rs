@@ -2238,10 +2238,21 @@ impl Renderer {
         if !self.recording {
             return Ok(());
         }
+        let start = std::time::Instant::now();
         self.submit_current()?;
+        let submitted = std::time::Instant::now();
+        self.stat(
+            "stat: flush ns submitting",
+            (submitted - start).as_nanos() as u64,
+        );
         self.swap_slot();
         // Its previous submission (if any) must finish before reuse.
-        self.finish_current()
+        let finished = self.finish_current();
+        self.stat(
+            "stat: flush ns waiting for the other slot",
+            submitted.elapsed().as_nanos() as u64,
+        );
+        finished
     }
 
     /// Exchange the recorded slot with the spare one.
@@ -2342,6 +2353,7 @@ impl Renderer {
             timer.end(&self.gpu.device, self.commands, self.fence);
         }
         *self.stats.entry("stat: submissions").or_default() += 1;
+        let start = std::time::Instant::now();
         let device = &self.gpu.device;
         let buffers = [self.commands];
         let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
@@ -2354,6 +2366,10 @@ impl Renderer {
                 .queue_submit(self.gpu.queue, &submit, self.fence)
                 .map_err(vk_error("vkQueueSubmit"))?;
         }
+        *self
+            .stats
+            .entry("stat: flush ns in vkQueueSubmit")
+            .or_default() += start.elapsed().as_nanos() as u64;
         self.current_in_flight = true;
         Ok(())
     }
