@@ -28,7 +28,7 @@ use super::{Command, Guest, Image, Nvn};
 pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
-    pools: HashMap<(u64, u64, u64, u64), Option<(u64, u64, usize)>>,
+    pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize), bool)>,
 }
 
 pub struct Backend {
@@ -4810,9 +4810,14 @@ impl Nvn {
             }
             None => vec![0u64; count],
         };
+        let checked = core.memory.can_share();
         for (pool, signature) in signatures {
-            if built_pools.get(&pool) == Some(&Some(signature)) {
-                continue;
+            // Mapped with this sharing already; one with unmapped pages
+            // again only when it was mapped without the guest's page table
+            // to look spans up in, which this build has.
+            match built_pools.get(&pool) {
+                Some(&(built, retry)) if built == signature && !(retry && checked) => continue,
+                _ => {}
             }
             let (base, size, gpu, flags) = pool;
             let backend = self.gpu.as_mut().unwrap();
@@ -4827,15 +4832,15 @@ impl Nvn {
                 range.fill(0);
             }
             self.map_pool_pages(core, base, size, gpu, flags, first, &mut entries)?;
-            // A pool with unmapped pages is mapped again at the next build
-            // (a span may be shared by then).
+            // A pool with unmapped pages, mapped without the guest's page
+            // table, is mapped again by a build that has it.
             let complete = entries
                 .get(pages)
                 .is_some_and(|range| range.iter().all(|&entry| entry != 0));
             // Its signature after mapping (a GPU-only pool's resident
             // buffer exists from its first mapping on).
-            let mapped = complete.then(|| self.pool_share_signature(base, flags));
-            built_pools.insert(pool, mapped);
+            let mapped = self.pool_share_signature(base, flags);
+            built_pools.insert(pool, (mapped, !complete && !checked));
         }
         let backend = self.gpu.as_mut().unwrap();
         // The renderer's counts from the spans just shared (refusals).

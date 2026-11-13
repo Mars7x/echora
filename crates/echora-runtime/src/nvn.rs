@@ -45,6 +45,12 @@ impl GuestMemory<'_> {
         }
     }
 
+    /// Whether `shared_span` can answer (a queue submission's view
+    /// cannot look the page table up).
+    pub fn can_share(&self) -> bool {
+        matches!(self, Self::Checked(_))
+    }
+
     /// Guest memory's file and the file offset of `length` bytes at
     /// `address`, when they can be shared with the GPU in place (see
     /// `Memory::shared_span`); the page table is only reachable under the
