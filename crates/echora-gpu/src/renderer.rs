@@ -203,7 +203,8 @@ pub struct Renderer {
     /// samplerBuffer), by upload key: the generation copied, the buffer and
     /// its view.
     texel_buffers: HashMap<u64, (u64, HostBuffer, vk::BufferView)>,
-    /// Texel buffers replaced while recorded work may still read them.
+    /// Texel buffers (and page tables) replaced while recorded work may
+    /// still read them; a page table has no view (null).
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
     /// Debugging (ECHORA_LAST_SUBMIT / ECHORA_SLOW_SUBMITS files): what
     /// the current submission records, to find work that stalls the GPU.
@@ -811,9 +812,9 @@ impl Renderer {
 
     /// The GPU page table: `entries[i]` is the device address of guest page
     /// `first_page + i` (0: unmapped; see `echora_shader_abi::PageTable`).
-    /// Rewritten only when the entries change, after the work that may
-    /// still read it; the value is what programs get in their push
-    /// constants.
+    /// A new buffer only when the entries change (the old one lives until
+    /// the work that may read it has completed); the value is what programs
+    /// get in their push constants.
     pub fn set_page_table(
         &mut self,
         first_page: u32,
@@ -828,19 +829,16 @@ impl Renderer {
             .as_ref()
             .is_some_and(|(_, written)| written.as_slice() == entries);
         if !current {
-            self.flush()?;
-            let fits = self
-                .page_table
-                .as_ref()
-                .is_some_and(|(buffer, _)| buffer.size >= bytes);
-            if !fits {
-                if let Some((old, _)) = self.page_table.take() {
-                    old.destroy(&self.gpu.device);
-                }
-                let buffer =
-                    self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-                self.page_table = Some((buffer, Vec::new()));
+            // A new buffer: work recorded or running may still read the old
+            // one, which is freed with this slot's submission (rewriting it
+            // in place waited for all of that work, once per pool shared).
+            if let Some((old, _)) = self.page_table.take() {
+                self.retired_texel_buffers
+                    .push((old, vk::BufferView::null()));
             }
+            let buffer =
+                self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            self.page_table = Some((buffer, Vec::new()));
             let (buffer, written) = self.page_table.as_mut().unwrap();
             let raw: Vec<u8> = entries
                 .iter()

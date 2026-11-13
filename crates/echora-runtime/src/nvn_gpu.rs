@@ -4712,6 +4712,7 @@ impl Nvn {
         {
             return Ok(table);
         }
+        let started = std::time::Instant::now();
         let pools: Vec<(u64, u64, u64, u64)> = self
             .objects
             .values()
@@ -4915,6 +4916,11 @@ impl Nvn {
             backend.renderer.addressed_bytes() >> 20,
         );
         backend.page_table = Some((key, table));
+        backend.stat("stat: page table builds", 1);
+        backend.stat(
+            "stat: page table build microseconds",
+            started.elapsed().as_micros() as u64,
+        );
         Ok(table)
     }
 
