@@ -3943,7 +3943,12 @@ impl Nvn {
                     // (a runaway shader under study), so by default only
                     // uncached pools are read back, as before.
                     let resolved = match debug_var_os("ECHORA_INDIRECT_EXACT") {
-                        Some(_) => self.resolve_gpu_written(core, at..at + 12),
+                        Some(_) => {
+                            if let Some(backend) = self.gpu.as_mut() {
+                                backend.stat("stat: indirect dispatch counts read back", 1);
+                            }
+                            self.resolve_gpu_written(core, at..at + 12)
+                        }
                         None => self.resolve_storage(core, None),
                     };
                     if let Err(message) = resolved {
