@@ -5006,9 +5006,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
 /// memory that work reads. Other calls go on while the thread replays. An
 /// invalidate does not wait, as on the console: the GPU writes it makes
 /// visible are those of work replayed so far, which covers every fence the
-/// guest has seen signaled. Nor does registering a texture or sampler: the
-/// console's GPU reads descriptors from the pool's memory when it runs the
-/// work, so work queued earlier sees the new one there too.
+/// guest has seen signaled.
 fn needs_replayed(nvn: &crate::nvn::Nvn, name: &str, regs: &[u64; 31]) -> bool {
     match name {
         "nvnSyncWait" => regs[1] != 0,
@@ -5021,6 +5019,7 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &str, regs: &[u64; 31]) -> bool {
             name.ends_with("Finalize")
                 || name.contains("ReadTexels")
                 || name.contains("WriteTexels")
+                || name.contains("Register")
                 || name.contains("SetShaders")
                 || name.contains("MapVirtual")
         }
