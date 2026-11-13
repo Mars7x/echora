@@ -43,15 +43,15 @@ pub(crate) struct Occlusion {
     pool: vk::QueryPool,
     /// The fence of each submission slot: slot `i` owns queries from
     /// `i * QUERIES`; the next free one of each.
-    fences: [vk::Fence; 2],
-    next: [u32; 2],
+    fences: [vk::Fence; crate::renderer::SLOTS],
+    next: [u32; crate::renderer::SLOTS],
     /// The query counting now, in the command buffer being recorded, and
     /// whether it began inside the open rendering pass.
     active: Option<u32>,
     active_inside: bool,
     /// Each slot's queries below this are reset (and those from `next`
     /// on unused), so one can begin inside a rendering pass.
-    reset_upto: [u32; 2],
+    reset_upto: [u32; crate::renderer::SLOTS],
     /// Counting resumes in the next command buffer (a segment ended at a
     /// submission).
     resume: bool,
@@ -63,7 +63,7 @@ pub(crate) struct Occlusion {
     ended: u32,
     /// Each slot's plan entries and sums used so far (both reset with the
     /// slot's queries): a resolve's plan and sums are written past them.
-    plan_next: [u32; 2],
+    plan_next: [u32; crate::renderer::SLOTS],
     /// The count since the last reset as of the last resolve (u64); each
     /// query's result as copied out (u64 each, by query index); the
     /// resolve plans (four u32 per report: from, to, carry, unused); and
@@ -86,13 +86,18 @@ pub(crate) struct Occlusion {
 /// Plan entries each slot may use: every report and one accumulator entry
 /// per resolve.
 const PLANS: u32 = 2 * QUERIES;
+/// Submission slots (each owns QUERIES queries and PLANS plan entries).
+const SLOTS: u32 = crate::renderer::SLOTS as u32;
 
 impl Occlusion {
-    pub(crate) fn new(renderer: &Renderer, fences: [vk::Fence; 2]) -> Result<Self, String> {
+    pub(crate) fn new(
+        renderer: &Renderer,
+        fences: [vk::Fence; crate::renderer::SLOTS],
+    ) -> Result<Self, String> {
         let device = renderer.device();
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::OCCLUSION)
-            .query_count(2 * QUERIES);
+            .query_count(SLOTS * QUERIES);
         // SAFETY: a valid create info on a live device; destroyed in `destroy`.
         let pool = unsafe { device.create_query_pool(&info, None) }
             .map_err(vk_error("vkCreateQueryPool"))?;
@@ -101,9 +106,9 @@ impl Occlusion {
             | vk::BufferUsageFlags::TRANSFER_DST;
         let accumulator = renderer.host_buffer_with(16, usage, true)?;
         accumulator.write(0, &[0; 16]);
-        let results = renderer.host_buffer_with(u64::from(2 * QUERIES) * 8, usage, true)?;
-        let plans = renderer.host_buffer_with(u64::from(2 * PLANS) * 16, usage, true)?;
-        let sums = renderer.host_buffer_with(u64::from(2 * PLANS) * 8, usage, true)?;
+        let results = renderer.host_buffer_with(u64::from(SLOTS * QUERIES) * 8, usage, true)?;
+        let plans = renderer.host_buffer_with(u64::from(SLOTS * PLANS) * 16, usage, true)?;
+        let sums = renderer.host_buffer_with(u64::from(SLOTS * PLANS) * 8, usage, true)?;
         let address = |buffer: &HostBuffer| {
             renderer
                 .buffer_address(buffer.buffer)
@@ -140,16 +145,16 @@ impl Occlusion {
         Ok(Self {
             pool,
             fences,
-            next: [0; 2],
+            next: [0; crate::renderer::SLOTS],
             active: None,
             active_inside: false,
-            reset_upto: [0; 2],
+            reset_upto: [0; crate::renderer::SLOTS],
             resume: false,
             batch_from: 0,
             reset_from: None,
             pending: Vec::new(),
             ended: 0,
-            plan_next: [0; 2],
+            plan_next: [0; crate::renderer::SLOTS],
             accumulator_address: address(&accumulator)?,
             results_address: address(&results)?,
             plans_address: address(&plans)?,
@@ -170,7 +175,10 @@ impl Occlusion {
 
     /// The slot of the command buffer recorded under `fence`.
     fn slot(&self, fence: vk::Fence) -> usize {
-        usize::from(self.fences[1] == fence)
+        self.fences
+            .iter()
+            .position(|known| *known == fence)
+            .unwrap_or(0)
     }
 
     /// A slot's queries are free again once its fence has signalled

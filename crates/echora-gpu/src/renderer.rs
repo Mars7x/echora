@@ -286,9 +286,10 @@ pub struct Renderer {
     pub(crate) open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
     completed_reads: Vec<(u64, Vec<u8>)>,
     next_read_token: u64,
-    /// The other submission slot: while one slot's work runs on the GPU,
-    /// the CPU records into the other (see `flush_async`).
-    spare: Slot,
+    /// The other submission slots, the oldest submission first: while
+    /// their work runs on the GPU, the CPU records into the current one
+    /// (see `flush_async`).
+    spares: Vec<Slot>,
     /// The recorded slot's previous submission has not been waited for.
     current_in_flight: bool,
     /// Serial (`flushes` at submission) of the recorded slot's last
@@ -375,6 +376,11 @@ struct Slot {
     /// Serial of its last submission.
     serial: u64,
 }
+
+/// Submission slots: the CPU records into one while the GPU runs the
+/// others' batches, so a submission waits only for the batch this many
+/// before it.
+pub(crate) const SLOTS: usize = 3;
 
 /// Draws and dispatches one submission may hold (see `bound_submission`).
 const MAX_WORK_ITEMS: u32 = 1000;
@@ -470,31 +476,38 @@ impl Renderer {
             .map_err(vk_error("vkCreateFence"))?;
         let memory_types = gpu.memory_properties();
         let descriptor_pool = create_descriptor_pool(device)?;
-        let spare_allocate = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: valid create infos on a live device; destroyed in Drop.
-        let spare_commands = unsafe { device.allocate_command_buffers(&spare_allocate) }
-            .map_err(vk_error("vkAllocateCommandBuffers"))?[0];
-        // SAFETY: as above.
-        let spare_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(vk_error("vkCreateFence"))?;
-        let spare = Slot {
-            commands: spare_commands,
-            fence: spare_fence,
-            ring: HostBuffer::empty(),
-            ring_used: 0,
-            descriptor_pool: create_descriptor_pool(device)?,
-            sets_used: 0,
-            descriptors_used: [0; 4],
-            pending_reads: Vec::new(),
-            retired_uploads: Vec::new(),
-            retired_texel_buffers: Vec::new(),
-            retired_shared: Vec::new(),
-            in_flight: false,
-            serial: 0,
-        };
+        let mut spares = Vec::with_capacity(SLOTS - 1);
+        for _ in 1..SLOTS {
+            let spare_allocate = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: valid create infos on a live device; destroyed in Drop.
+            let spare_commands = unsafe { device.allocate_command_buffers(&spare_allocate) }
+                .map_err(vk_error("vkAllocateCommandBuffers"))?[0];
+            // SAFETY: as above.
+            let spare_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(vk_error("vkCreateFence"))?;
+            spares.push(Slot {
+                commands: spare_commands,
+                fence: spare_fence,
+                ring: HostBuffer::empty(),
+                ring_used: 0,
+                descriptor_pool: create_descriptor_pool(device)?,
+                sets_used: 0,
+                descriptors_used: [0; 4],
+                pending_reads: Vec::new(),
+                retired_uploads: Vec::new(),
+                retired_texel_buffers: Vec::new(),
+                retired_shared: Vec::new(),
+                in_flight: false,
+                serial: 0,
+            });
+        }
+        let mut fences = [fence; SLOTS];
+        for (slot, spare) in fences[1..].iter_mut().zip(&spares) {
+            *slot = spare.fence;
+        }
         // SAFETY: the physical device belongs to the live instance.
         let (period, valid_bits) = unsafe {
             let limits = gpu
@@ -509,8 +522,7 @@ impl Renderer {
                 .map_or(0, |family| family.timestamp_valid_bits);
             (limits.timestamp_period, bits)
         };
-        let timer =
-            crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
+        let timer = crate::timing::GpuTimer::from_env(device, period, valid_bits, fences);
         let mut renderer = Self {
             texture_pool: None,
             pool_cache: None,
@@ -572,7 +584,7 @@ impl Renderer {
             written: std::collections::HashSet::new(),
             last_attachments: Vec::new(),
             hazard_barriers: 0,
-            spare,
+            spares,
             current_in_flight: false,
             current_serial: 0,
             completed_serial: 0,
@@ -600,7 +612,10 @@ impl Renderer {
         // read through their device address.
         let addressable = renderer.gpu.buffer_device_address;
         renderer.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
-        renderer.spare.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
+        for index in 0..renderer.spares.len() {
+            let ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
+            renderer.spares[index].ring = ring;
+        }
         Ok(renderer)
     }
 
@@ -654,9 +669,9 @@ impl Renderer {
             if let Some(timer) = self.timer.as_mut() {
                 timer.begin(&self.gpu.device, self.commands, self.fence);
             }
-            if self.spare.in_flight {
-                // The other slot's batch may still run: this one starts
-                // after it, so batches finish in submission order and each
+            if self.spares.iter().any(|spare| spare.in_flight) {
+                // Other slots' batches may still run: this one starts after
+                // them, so batches finish in submission order and each
                 // slot's retired resources are free once its fence signals.
                 let barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -689,10 +704,14 @@ impl Renderer {
         self.gpu.conditional_rendering.is_some()
     }
 
-    /// The fences of the two submission slots (they keep their handles
-    /// when the slots swap), and the current one's.
-    pub(crate) fn slot_fences(&self) -> [vk::Fence; 2] {
-        [self.fence, self.spare.fence]
+    /// The fences of the submission slots (they keep their handles when
+    /// the slots swap).
+    pub(crate) fn slot_fences(&self) -> [vk::Fence; SLOTS] {
+        let mut fences = [self.fence; SLOTS];
+        for (slot, spare) in fences[1..].iter_mut().zip(&self.spares) {
+            *slot = spare.fence;
+        }
+        fences
     }
 
     pub(crate) fn current_fence(&self) -> vk::Fence {
@@ -1272,7 +1291,11 @@ impl Renderer {
     /// Whether deferred reads wait for a flush.
     /// Whether deferred reads wait in either slot.
     pub fn reads_pending(&self) -> bool {
-        !self.pending_reads.is_empty() || !self.spare.pending_reads.is_empty()
+        !self.pending_reads.is_empty()
+            || self
+                .spares
+                .iter()
+                .any(|spare| !spare.pending_reads.is_empty())
     }
 
     /// The completed deferred reads among `tokens`, by token; other
@@ -2187,10 +2210,12 @@ impl Renderer {
     /// completed: deferred reads are then available and retired resources
     /// are freed.
     pub fn flush(&mut self) -> Result<(), String> {
-        if self.spare.in_flight {
-            self.swap_slot();
-            self.finish_current()?;
-            self.swap_slot();
+        for index in 0..self.spares.len() {
+            if self.spares[index].in_flight {
+                self.swap_with(index);
+                self.finish_current()?;
+                self.swap_with(index);
+            }
         }
         if self.recording {
             self.submit_current()?;
@@ -2224,15 +2249,17 @@ impl Renderer {
         if serial > self.flushes {
             return self.flush();
         }
-        // Submitted: only the spare slot can still be running (the recorded
-        // one was waited for before it became current again).
+        // Submitted: spare slots up to it can still be running (the
+        // recorded one was waited for before it became current again).
         if self.current_in_flight {
             self.finish_current()?;
         }
-        if self.spare.in_flight {
-            self.swap_slot();
-            self.finish_current()?;
-            self.swap_slot();
+        for index in 0..self.spares.len() {
+            if self.spares[index].in_flight && self.spares[index].serial <= serial {
+                self.swap_with(index);
+                self.finish_current()?;
+                self.swap_with(index);
+            }
         }
         Ok(())
     }
@@ -2253,10 +2280,12 @@ impl Renderer {
             // SAFETY: the fence is live.
             unsafe { renderer.gpu.device.get_fence_status(fence) }.unwrap_or(false)
         };
-        if self.spare.in_flight && signaled(self, self.spare.fence) {
-            self.swap_slot();
-            self.finish_current()?;
-            self.swap_slot();
+        for index in 0..self.spares.len() {
+            if self.spares[index].in_flight && signaled(self, self.spares[index].fence) {
+                self.swap_with(index);
+                self.finish_current()?;
+                self.swap_with(index);
+            }
         }
         if self.current_in_flight && signaled(self, self.fence) {
             self.finish_current()?;
@@ -2296,9 +2325,16 @@ impl Renderer {
         finished
     }
 
-    /// Exchange the recorded slot with the spare one.
+    /// After a submission: the slot just submitted joins the spares as
+    /// the newest, and the oldest becomes the one recorded.
     fn swap_slot(&mut self) {
-        let spare = &mut self.spare;
+        self.swap_with(0);
+        self.spares.rotate_left(1);
+    }
+
+    /// Exchange the recorded slot with spare `index`.
+    fn swap_with(&mut self, index: usize) {
+        let spare = &mut self.spares[index];
         std::mem::swap(&mut self.commands, &mut spare.commands);
         std::mem::swap(&mut self.fence, &mut spare.fence);
         std::mem::swap(&mut self.ring, &mut spare.ring);
@@ -5462,9 +5498,12 @@ impl Drop for Renderer {
                     .into_iter()
                     .map(|(_, _, buffer, memory, _)| (buffer, memory)),
             );
-        let retired = std::mem::take(&mut self.retired_shared)
-            .into_iter()
-            .chain(std::mem::take(&mut self.spare.retired_shared));
+        let retired = std::mem::take(&mut self.retired_shared).into_iter().chain(
+            self.spares
+                .iter_mut()
+                .flat_map(|spare| std::mem::take(&mut spare.retired_shared))
+                .collect::<Vec<_>>(),
+        );
         for (buffer, memory) in shared.chain(retired) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
@@ -5489,8 +5528,10 @@ impl Drop for Renderer {
         }
         let ring = std::mem::replace(&mut self.ring, HostBuffer::empty());
         ring.destroy(&self.gpu.device);
-        let ring = std::mem::replace(&mut self.spare.ring, HostBuffer::empty());
-        ring.destroy(&self.gpu.device);
+        for index in 0..self.spares.len() {
+            let ring = std::mem::replace(&mut self.spares[index].ring, HostBuffer::empty());
+            ring.destroy(&self.gpu.device);
+        }
         self.destroy_texture_pool();
         for buffer in std::mem::take(&mut self.debug_buffers) {
             buffer.destroy(&self.gpu.device);
@@ -5503,11 +5544,13 @@ impl Drop for Renderer {
             self.gpu
                 .device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.gpu
-                .device
-                .destroy_descriptor_pool(self.spare.descriptor_pool, None);
+            for spare in &self.spares {
+                self.gpu
+                    .device
+                    .destroy_descriptor_pool(spare.descriptor_pool, None);
+                self.gpu.device.destroy_fence(spare.fence, None);
+            }
             self.gpu.device.destroy_fence(self.fence, None);
-            self.gpu.device.destroy_fence(self.spare.fence, None);
             self.gpu.device.destroy_command_pool(self.pool, None);
         }
     }

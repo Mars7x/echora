@@ -18,9 +18,9 @@ struct ItemTimes {
     pool: vk::QueryPool,
     /// Each slot's items in recording order: slot `i` owns queries from
     /// `i * 2 * ITEMS`, two per item.
-    names: [Vec<String>; 2],
+    names: [Vec<String>; crate::renderer::SLOTS],
     /// Whether an item is open (started, not ended) in each slot.
-    open: [bool; 2],
+    open: [bool; crate::renderer::SLOTS],
     totals: std::collections::HashMap<String, (f64, u64)>,
 }
 
@@ -29,7 +29,7 @@ pub(crate) struct GpuTimer {
     /// Nanoseconds per timestamp tick.
     period: f64,
     /// The fence of each submission slot: slot `i` owns queries 2i, 2i+1.
-    fences: [vk::Fence; 2],
+    fences: [vk::Fence; crate::renderer::SLOTS],
     /// End of the last batch counted, in ticks: batches finish in order,
     /// and one may start before the previous one ends, so busy time is
     /// the union of the intervals.
@@ -47,29 +47,29 @@ impl GpuTimer {
         device: &ash::Device,
         period: f32,
         valid_bits: u32,
-        fences: [vk::Fence; 2],
+        fences: [vk::Fence; crate::renderer::SLOTS],
     ) -> Option<Self> {
         if std::env::var_os("ECHORA_GPU_TIME").is_none_or(|value| value == "0") || valid_bits == 0 {
             return None;
         }
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(4);
+            .query_count(2 * crate::renderer::SLOTS as u32);
         // SAFETY: a valid create info on a live device; destroyed in Drop.
         let pool = unsafe { device.create_query_pool(&info, None) }.ok()?;
         let items = (std::env::var_os("ECHORA_GPU_TIME").is_some_and(|value| value == "items"))
             .then(|| {
                 let info = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(4 * ITEMS);
+                    .query_count(2 * crate::renderer::SLOTS as u32 * ITEMS);
                 // SAFETY: as above.
                 unsafe { device.create_query_pool(&info, None) }.ok()
             })
             .flatten()
             .map(|pool| ItemTimes {
                 pool,
-                names: [Vec::new(), Vec::new()],
-                open: [false; 2],
+                names: std::array::from_fn(|_| Vec::new()),
+                open: [false; crate::renderer::SLOTS],
                 totals: std::collections::HashMap::new(),
             });
         Some(Self {
