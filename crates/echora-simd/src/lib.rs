@@ -197,7 +197,8 @@ impl<'a> Fp<'a> {
         }
         let infinite = value & !self.format.sign_bit() == self.format.exponent_mask();
         if infinite && finite_inputs {
-            self.raise(FPSR_OFC);
+            // FPRound: an overflow is inexact too.
+            self.raise(FPSR_OFC | FPSR_IXC);
         }
         if self.mode.fz && self.format.is_denormal(value) {
             return value & self.format.sign_bit();
@@ -233,6 +234,44 @@ fn is_zero(format: Format, value: u64) -> bool {
 
 fn is_infinity(format: Format, value: u64) -> bool {
     value & !format.sign_bit() == format.exponent_mask()
+}
+
+/// Whether round-to-nearest `raw`, the host's result of `op` on `a` and
+/// `b`, differs from the exact result (FPSR.IXC), decided by an error-free
+/// transformation: the rounding error of a sum (two-sum) and the residual
+/// of a product, quotient or root (one fused multiply-add) are computed
+/// exactly, so a nonzero one means a rounded result. Only for normal
+/// operands or zeros and a normal result; anything else, and a residual too
+/// small to represent, answers `false` (inexactness there stays unmodeled).
+fn rounded(format: Format, size: FpSize, op: FpBinaryOp, a: u64, b: u64, raw: u64) -> bool {
+    let exponent = format.exponent_mask();
+    let normal = |value: u64| {
+        let field = value & exponent;
+        field != 0 && field != exponent
+    };
+    let usable = |value: u64| normal(value) || is_zero(format, value);
+    if !(usable(a) && usable(b) && normal(raw)) {
+        return false;
+    }
+    macro_rules! residual {
+        ($float:ty, $from:expr) => {{
+            let (x, y, r): ($float, $float, $float) = ($from(a), $from(b), $from(raw));
+            match op {
+                FpBinaryOp::Add | FpBinaryOp::Sub => {
+                    let y = if op == FpBinaryOp::Sub { -y } else { y };
+                    let virtual_y = r - x;
+                    (x - (r - virtual_y)) + (y - virtual_y) != 0.0
+                }
+                FpBinaryOp::Mul | FpBinaryOp::NegMul => x.mul_add(y, -r) != 0.0,
+                FpBinaryOp::Div => r.mul_add(y, -x) != 0.0,
+                _ => false,
+            }
+        }};
+    }
+    match size {
+        FpSize::S => residual!(f32, |value: u64| f32::from_bits(value as u32)),
+        FpSize::D => residual!(f64, f64::from_bits),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -361,13 +400,15 @@ pub fn fp_convert(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Re
 }
 
 /// Fast paths: with FPCR in its default mode (round to nearest, no flush,
-/// no default NaN) and no NaN or infinity in the result, the exact helpers
-/// return the host's native result unchanged and raise no flag. The fast
+/// no default NaN), FPSR.IXC already set (it is sticky, and the exact
+/// helpers raise it for a rounded result) and no NaN or infinity in the
+/// result, the exact helpers return the host's native result unchanged and
+/// raise no new flag. The fast
 /// paths below are inlined into translated code and fall back to the exact
 /// helpers otherwise.
 #[inline(always)]
 fn default_mode(cpu: &Cpu) -> bool {
-    cpu.fpcr == 0
+    cpu.fpcr == 0 && cpu.fpsr & FPSR_IXC != 0
 }
 
 /// Whether raw `value` of `size` is finite (not an infinity or NaN).
@@ -511,23 +552,38 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
                     fp.raise(FPSR_DZC);
                 }
                 let raw = native!(size, a, b, |x, y| x / y);
+                if rounded(format, size, op, a, b, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 fp.output(raw, finite && !is_zero(format, b))
             }
             FpBinaryOp::NegMul => {
                 let raw = native!(size, a, b, |x, y| x * y);
+                if rounded(format, size, op, a, b, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 // FPNeg of the product, a default NaN included.
                 fp.output(raw, finite) ^ format.sign_bit()
             }
             FpBinaryOp::Mul => {
                 let raw = native!(size, a, b, |x, y| x * y);
+                if rounded(format, size, op, a, b, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 fp.output(raw, finite)
             }
             FpBinaryOp::Add => {
                 let raw = native!(size, a, b, |x, y| x + y);
+                if rounded(format, size, op, a, b, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 fp.output(raw, finite)
             }
             FpBinaryOp::Sub => {
                 let raw = native!(size, a, b, |x, y| x - y);
+                if rounded(format, size, op, a, b, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 fp.output(raw, finite)
             }
         }
@@ -3558,9 +3614,10 @@ mod fast_path_tests {
         }
     }
 
-    fn cpu_with(fpcr: u32, values: &[u64]) -> Cpu {
+    fn cpu_with((fpcr, fpsr): (u32, u32), values: &[u64]) -> Cpu {
         let mut cpu = Cpu {
             fpcr,
+            fpsr,
             ..Cpu::default()
         };
         for (index, value) in values.iter().enumerate() {
@@ -3584,7 +3641,11 @@ mod fast_path_tests {
             FpTernaryOp::NegMulAdd,
             FpTernaryOp::NegMulSub,
         ];
-        for fpcr in [0, FPCR_FZ, FPCR_DN] {
+        // With and without the sticky FPSR.IXC the fast paths wait for.
+        let modes = [0, FPCR_FZ, FPCR_DN]
+            .into_iter()
+            .flat_map(|fpcr| [(fpcr, 0), (fpcr, FPSR_IXC)]);
+        for fpcr in modes {
             for size in [FpSize::S, FpSize::D] {
                 let values = samples(size);
                 for &a in &values {
@@ -3622,6 +3683,53 @@ mod fast_path_tests {
 #[cfg(test)]
 mod sticky_inexact_tests {
     use super::*;
+
+    /// The exact path raises FPSR.IXC for a rounded sum, difference,
+    /// product or quotient and leaves it clear for an exact one; an
+    /// overflow raises it with OFC.
+    #[test]
+    fn rounded_results_raise_inexact() {
+        let cases: [(FpBinaryOp, f64, f64, bool); 12] = [
+            (FpBinaryOp::Add, 1.0, 2.0, false),
+            (FpBinaryOp::Add, 1.0, 1.0e-30, true),
+            (FpBinaryOp::Add, 0.1, 0.2, true),
+            (FpBinaryOp::Sub, 3.5, 1.25, false),
+            (FpBinaryOp::Sub, 1.0, 1.0e-20, true),
+            (FpBinaryOp::Mul, 1.5, 4.0, false),
+            (FpBinaryOp::Mul, 0.1, 0.1, true),
+            (FpBinaryOp::NegMul, 0.1, 3.0, true),
+            (FpBinaryOp::NegMul, 0.5, 3.0, false),
+            (FpBinaryOp::Div, 1.0, 4.0, false),
+            (FpBinaryOp::Div, 1.0, 3.0, true),
+            (FpBinaryOp::Div, 0.0, 3.0, false),
+        ];
+        for fpcr in [0, FPCR_FZ] {
+            for (op, a, b, inexact) in cases {
+                for size in [FpSize::S, FpSize::D] {
+                    let bits = |value: f64| match size {
+                        FpSize::S => u64::from((value as f32).to_bits()),
+                        FpSize::D => value.to_bits(),
+                    };
+                    let mut cpu = Cpu {
+                        fpcr,
+                        ..Cpu::default()
+                    };
+                    let mut fp = Fp::new(&mut cpu, size).unwrap();
+                    binary_lane(&mut fp, op, bits(a), bits(b));
+                    assert_eq!(
+                        cpu.fpsr & FPSR_IXC != 0,
+                        inexact,
+                        "{op:?} {a} {b} {size:?} fpcr {fpcr:#x}"
+                    );
+                }
+            }
+        }
+        let mut cpu = Cpu::default();
+        let mut fp = Fp::new(&mut cpu, FpSize::S).unwrap();
+        let big = u64::from(3.0e38f32.to_bits());
+        binary_lane(&mut fp, FpBinaryOp::Add, big, big);
+        assert_eq!(cpu.fpsr, FPSR_OFC | FPSR_IXC);
+    }
 
     /// FNMUL negates a NaN result too (FPNeg with FPCR.AH clear).
     #[test]
