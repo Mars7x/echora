@@ -69,6 +69,31 @@ fn main() {
             mesh: (sizes != 0).then(|| mesh(false)),
             ..parameters
         };
+        // ECHORA_SHADER_TRANSLATOR=rust: the Rust translator's program, as
+        // the renderer uses it, instead of the plugin's.
+        if std::env::var("ECHORA_SHADER_TRANSLATOR").as_deref() == Ok("rust") {
+            match shader::translate_rust(&bytes, &parameters) {
+                Ok(program) => {
+                    translated += 1;
+                    *stages.entry(format!("{:?}", program.stage)).or_default() += 1;
+                    if let Some(directory) = &out_dir {
+                        let name = Path::new(path).file_name().unwrap_or_default();
+                        let mut target = Path::new(directory).join(name).into_os_string();
+                        target.push(".spv");
+                        let spirv: Vec<u8> = program
+                            .spirv
+                            .iter()
+                            .flat_map(|word| word.to_le_bytes())
+                            .collect();
+                        if let Err(error) = std::fs::write(&target, spirv) {
+                            eprintln!("{}: {error}", Path::new(&target).display());
+                        }
+                    }
+                }
+                Err(error) => *reasons.entry(error.reason).or_default() += 1,
+            }
+            continue;
+        }
         let mut result = shader::translate(&bytes, parameters, &mut NoEnvironment);
         if sizes == 0
             && matches!(&result, Err(error) if error.contains("outside task and mesh programs"))
