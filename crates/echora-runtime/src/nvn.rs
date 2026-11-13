@@ -2063,7 +2063,11 @@ impl Nvn {
             // blocked then is drained.
             "nvnQueueFlush" | "nvnQueueFinish" => {
                 self.object(this, "Queue").map_err(invalid)?;
-                self.pump_queues(core)?;
+                if name == "nvnQueueFinish" {
+                    self.pump_queues(core)?;
+                } else {
+                    self.pump_queues_handed_on(core)?;
+                }
                 if name == "nvnQueueFinish" {
                     self.drain_queues(core)?;
                     self.gpu_finish().map_err(stop)?;
@@ -2084,7 +2088,7 @@ impl Nvn {
                     .entry(this)
                     .or_default()
                     .push_back(QueueItem::WaitSync { sync: x[1] });
-                self.pump_queues(core)?;
+                self.pump_queues_handed_on(core)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -2444,7 +2448,7 @@ impl Nvn {
                             next: 0,
                         });
                 }
-                self.pump_queues(core)?;
+                self.pump_queues_handed_on(core)?;
                 return Ok(true);
             }
             // nvnTextureGetSwizzle(texture, int* r, int* g, int* b, int* a):
@@ -3420,6 +3424,18 @@ impl Nvn {
         }
     }
 
+    /// `pump_queues`, which with a replay thread runs one piece and leaves
+    /// the rest to it (`resume_replay`).
+    fn pump_queues_handed_on(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        if !Self::replay_thread() {
+            return self.pump_queues(core);
+        }
+        self.replay_budget = replay_chunk();
+        let pumped = self.pump_queues(core);
+        self.replay_budget = None;
+        pumped
+    }
+
     /// Whether a replay stopped after its piece (`replay_budget`) has work
     /// left that `resume_replay` continues.
     pub fn replay_paused(&self) -> bool {
@@ -3431,7 +3447,25 @@ impl Nvn {
     /// at a time first, as the console's GPU runs it while the CPU goes on.
     pub fn replay_async() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("ECHORA_ASYNC_REPLAY").is_some())
+        *ON.get_or_init(|| {
+            std::env::var_os("ECHORA_ASYNC_REPLAY").is_some() || Self::replay_thread()
+        })
+    }
+
+    /// ECHORA_REPLAY_THREAD (being measured): replays run on a thread of
+    /// their own (asynchronous, as ECHORA_ASYNC_REPLAY), and only calls
+    /// that need their results finish them first.
+    pub fn replay_thread() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ECHORA_REPLAY_THREAD").is_some())
+    }
+
+    /// The replay thread ran a piece for `time`.
+    pub fn note_replay_thread(&mut self, time: std::time::Duration) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat("stat: replay thread pieces", 1);
+            backend.stat("stat: replay thread us", time.as_micros() as u64);
+        }
     }
 
     /// Continue a replay that stopped after its piece, for another piece:

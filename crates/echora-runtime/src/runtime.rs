@@ -2801,6 +2801,9 @@ impl Machine {
         let placeholder = idle(self);
         let mut cores = vec![std::mem::replace(&mut self.core, placeholder)];
         cores.extend((1..workers).map(|_| idle(self)));
+        // ECHORA_REPLAY_THREAD: submitted work runs on a thread of its own
+        // (through its own view of guest memory) while guest threads go on.
+        let replay_core = crate::nvn::Nvn::replay_thread().then(|| idle(self));
         for core in &mut cores {
             core.parallel = true;
         }
@@ -2833,6 +2836,8 @@ impl Machine {
                     .collect();
                 (std::sync::RwLock::new(()), ids)
             }),
+            replay_wake: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            replay_failed: std::sync::Mutex::new(None),
         };
         let finished: Vec<(Core, Option<Trap>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = cores
@@ -2857,10 +2862,23 @@ impl Machine {
                         .expect("spawn guest worker")
                 })
                 .collect();
-            handles
+            if let Some(core) = replay_core {
+                let shared = &shared;
+                std::thread::Builder::new()
+                    .name("nvn-replay".into())
+                    .stack_size(64 << 20)
+                    .spawn_scoped(scope, move || replay_thread(shared, core))
+                    .expect("spawn replay thread");
+            }
+            let finished = handles
                 .into_iter()
                 .map(|handle| handle.join().expect("guest worker panicked"))
-                .collect()
+                .collect();
+            shared
+                .stop
+                .store(true, std::sync::atomic::Ordering::Release);
+            shared.wake_replay();
+            finished
         });
         self.nvn = shared
             .nvn
@@ -4838,9 +4856,23 @@ struct Shared<'a> {
     /// threads keep their cores but never execute at the same time, which
     /// separates scheduling faults from memory-ordering ones.
     serial: Option<std::sync::Mutex<()>>,
+    /// ECHORA_REPLAY_THREAD: wakes the replay thread when a replay stopped
+    /// after a piece with work left (`replay_thread`), and the error that
+    /// ended its replay, which the next NVN call reports.
+    replay_wake: (std::sync::Mutex<bool>, std::sync::Condvar),
+    replay_failed: std::sync::Mutex<Option<Trap>>,
 }
 
 impl Shared<'_> {
+    /// Wake the replay thread (it has work left).
+    fn wake_replay(&self) {
+        let (pending, wake) = &self.replay_wake;
+        *pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_one();
+    }
+
     /// After letting the NVN state go between replay pieces: waiting threads
     /// take it first (the mutex would hand it straight back to this one),
     /// for up to a fraction of a millisecond.
@@ -4909,6 +4941,77 @@ fn locked_nvn_call(name: &str) -> bool {
         name,
         "nvnQueuePresentTexture" | "nvnDeviceGetProcAddress" | "nvnBootstrapLoader"
     )
+}
+
+/// ECHORA_REPLAY_THREAD: run the pieces of submitted work that NVN calls
+/// left (`Nvn::replay_paused`), a piece at a time with the NVN state
+/// locked, handing it to waiting calls between pieces, while guest threads
+/// run (as the console's GPU works while its CPU goes on).
+fn replay_thread(shared: &Shared, mut core: Core) {
+    use std::sync::atomic::Ordering;
+    let _watch = crate::fault::watch(&core);
+    while !shared.stop.load(Ordering::Acquire) {
+        let mut nvn = shared.lock_nvn();
+        let failed = shared
+            .replay_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if nvn.replay_paused() && !failed {
+            let counter = core.physical_counter_ticks();
+            let mut guest = crate::nvn::Guest {
+                cpu: &mut core.cpu,
+                memory: crate::nvn::GuestMemory::View(&mut core.memory),
+                counter,
+            };
+            let started = std::time::Instant::now();
+            let result = nvn.resume_replay(&mut guest);
+            nvn.note_replay_thread(started.elapsed());
+            if let Err(trap) = result {
+                *shared
+                    .replay_failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trap);
+            }
+            drop(nvn);
+            shared.hand_nvn_over();
+            continue;
+        }
+        drop(nvn);
+        let (pending, wake) = &shared.replay_wake;
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*pending {
+            pending = wake
+                .wait_timeout(pending, std::time::Duration::from_millis(2))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        *pending = false;
+    }
+}
+
+/// With a replay thread: whether NVN call `name` (arguments `regs`) needs
+/// the work submitted before it to have run first: it waits for results,
+/// reads what the GPU wrote, or removes or re-identifies objects and memory
+/// that work reads. Other calls go on while the thread replays.
+fn needs_replayed(name: &str, regs: &[u64; 31]) -> bool {
+    match name {
+        "nvnSyncWait" => regs[1] != 0,
+        "nvnQueueFinish" => true,
+        "nvnCommandBufferInitialize" | "nvnCommandBufferFinalize" => false,
+        _ => {
+            name.ends_with("Finalize")
+                || name.ends_with("Initialize")
+                || name.contains("InvalidateMappedRange")
+                || name.contains("ReadTexels")
+                || name.contains("WriteTexels")
+                || name.contains("Register")
+                || name.contains("SetShaders")
+                || name.contains("MapVirtual")
+        }
+    }
 }
 
 /// The `boundary_kinds` slot of a block's result: SVC numbers 0..0x80,
@@ -5253,6 +5356,15 @@ impl Worker {
         {
             return false;
         }
+        if let Some(trap) = shared
+            .replay_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.held_failed = Some(Some(trap));
+            return false;
+        }
         let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
         let locked = std::time::Instant::now();
@@ -5265,7 +5377,17 @@ impl Worker {
             nvn.entry(pc),
             Some(crate::nvn::HostEntry::Proc(name)) if locked_nvn_call(&name)
         );
-        while crate::nvn::Nvn::replay_async() && nvn.replay_paused() {
+        // With a replay thread, only calls that need the work's results
+        // (or change what it reads) finish it first; others go on.
+        let thread = crate::nvn::Nvn::replay_thread();
+        let settle = machine_call
+            || (thread
+                && matches!(
+                    nvn.entry(pc),
+                    Some(crate::nvn::HostEntry::Proc(name))
+                        if needs_replayed(&name, &self.core.cpu.regs)
+                ));
+        while crate::nvn::Nvn::replay_async() && nvn.replay_paused() && (settle || !thread) {
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
@@ -5277,7 +5399,7 @@ impl Worker {
                 drop(nvn);
                 return false;
             }
-            if !machine_call {
+            if !settle {
                 break;
             }
             drop(nvn);
@@ -5285,6 +5407,9 @@ impl Worker {
             nvn = shared.lock_nvn();
         }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
+        if thread && nvn.replay_paused() {
+            shared.wake_replay();
+        }
         // A replay in pieces: the lock is let go between them, so other
         // threads' calls are not held up by the whole replay (with
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
