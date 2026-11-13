@@ -5193,6 +5193,7 @@ impl Worker {
                 }
                 let kind = boundary_kind(&result);
                 let yielded = kind == 0x0b && (-2..=0).contains(&(self.core.cpu.regs[0] as i64));
+                let sleep_ns = self.core.cpu.regs[0] as i64;
                 let host_call = match &result {
                     Err(Trap::MissingBlock { pc }) if machine.nvn.has_entry(*pc) => Some(*pc),
                     _ => None,
@@ -5226,7 +5227,12 @@ impl Worker {
                     let now = std::time::Instant::now();
                     crate::timeline::span(thread, "guest", ran, waited);
                     crate::timeline::span(thread, "machine-lock-wait", waited, held);
-                    crate::timeline::span(thread, &boundary_kind_name(kind), held, now);
+                    let name = if kind == 0x0b {
+                        format!("svc 0x0b ns {sleep_ns}")
+                    } else {
+                        boundary_kind_name(kind)
+                    };
+                    crate::timeline::span(thread, &name, held, now);
                 }
                 match outcome {
                     Ok(()) => {
