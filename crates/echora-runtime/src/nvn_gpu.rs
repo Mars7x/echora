@@ -1091,6 +1091,15 @@ impl Nvn {
         let (code, key) = self
             .stage_code(core, gpu)
             .ok_or_else(|| format!("stage at {gpu:#x} is in no memory pool"))?;
+        // ECHORA_SHADER_DIR: a stage whose code was not yet readable when
+        // its program was set is written when first translated.
+        if let Some(directory) = super::debug_var_os("ECHORA_SHADER_DIR") {
+            let path = std::path::Path::new(&directory).join(format!("stage-{key:016x}.code"));
+            if !path.exists() {
+                let _ = std::fs::create_dir_all(&directory);
+                let _ = std::fs::write(path, code.as_slice());
+            }
+        }
         let native_pointers = self.gpu.as_ref().unwrap().native_programs.contains(&key);
         let cache_key = (
             key,
