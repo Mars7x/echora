@@ -5460,6 +5460,13 @@ impl Worker {
                 made = false;
             }
         }
+        if thread {
+            let name = match nvn.entry(pc) {
+                Some(crate::nvn::HostEntry::Proc(name)) => name,
+                _ => "other".into(),
+            };
+            nvn.note_held(&name, locked.elapsed());
+        }
         drop(nvn);
         self.nvn_lock_micros[0] += (locked - asked).as_micros() as u64;
         self.nvn_lock_micros[1] += locked.elapsed().as_micros() as u64;

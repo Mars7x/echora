@@ -3555,6 +3555,25 @@ impl Nvn {
         }
     }
 
+    /// A guest thread held the NVN state `time` for call `name`.
+    pub fn note_held(&mut self, name: &str, time: std::time::Duration) {
+        thread_local! {
+            static NAMES: std::cell::RefCell<HashMap<String, &'static str>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        let key = NAMES.with(|names| {
+            *names
+                .borrow_mut()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    Box::leak(format!("stat: nvn held us by {name}").into_boxed_str())
+                })
+        });
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(key, time.as_micros() as u64);
+        }
+    }
+
     /// The replay thread waited `time` for the NVN state.
     pub fn note_replay_thread_wait(&mut self, time: std::time::Duration) {
         if let Some(backend) = self.gpu.as_mut() {
