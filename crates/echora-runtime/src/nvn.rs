@@ -2453,6 +2453,30 @@ impl Nvn {
                 }
                 self.presented_frames += 1;
                 self.arm_call_watch();
+                // ECHORA_PRESENT_RATE=N: every N presents, the count, the
+                // seconds since the first present and the rate over those N.
+                if let Some(every) = debug_var("ECHORA_PRESENT_RATE")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|every| *every > 0)
+                    && self.presented_frames.is_multiple_of(every)
+                {
+                    static START: std::sync::OnceLock<std::time::Instant> =
+                        std::sync::OnceLock::new();
+                    static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                        std::sync::Mutex::new(None);
+                    let now = std::time::Instant::now();
+                    let start = *START.get_or_init(|| now);
+                    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let window = last.map_or(0.0, |last| (now - last).as_secs_f64());
+                    *last = Some(now);
+                    eprintln!(
+                        "presents: {} at {:.1} s, {:.1}/s over the last {every}",
+                        self.presented_frames,
+                        (now - start).as_secs_f64(),
+                        if window > 0.0 { every as f64 / window } else { 0.0 }
+                    );
+                }
                 // A line every 500 presents: where a long run is.
                 if self.presented_frames.is_multiple_of(500) {
                     eprintln!("present {}", self.presented_frames);
