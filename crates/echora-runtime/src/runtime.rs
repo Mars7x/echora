@@ -5517,8 +5517,8 @@ impl Worker {
                     Some(sync) => nvn.sync_wait_serial(sync),
                     None => nvn.read_wait_serial(),
                 };
-                let serial = match serial {
-                    Ok(Some(serial)) => serial,
+                let (serial, marker) = match serial {
+                    Ok(Some(target)) => target,
                     Ok(None) => break,
                     Err(trap) => {
                         self.held_failed = Some(Some(trap));
@@ -5526,7 +5526,7 @@ impl Worker {
                     }
                 };
                 loop {
-                    match nvn.submission_done(serial) {
+                    match nvn.submission_done(serial, marker) {
                         Ok(true) => break,
                         Ok(false) => {
                             drop(nvn);

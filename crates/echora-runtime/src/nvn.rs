@@ -1798,8 +1798,12 @@ impl Nvn {
                 // the submission holding the fence is waited for; later
                 // work keeps running.
                 if signaled {
-                    let serial = sync.state.get("GpuSerial").map(|serial| serial.x[0]);
-                    self.gpu_wait_sync(serial).map_err(stop)?;
+                    let recorded = sync.state.get("GpuSerial").copied();
+                    // Its marker passed: the work before the fence is done.
+                    if !recorded.is_some_and(|recorded| self.gpu_marker_done(recorded.x[1])) {
+                        let serial = recorded.map(|serial| serial.x[0]);
+                        self.gpu_wait_sync(serial).map_err(stop)?;
+                    }
                 }
                 core.cpu.regs[0] = if signaled {
                     0
@@ -3493,7 +3497,7 @@ impl Nvn {
     /// With a replay thread, before an invalidate: the GPU submission its
     /// read waits for (`gpu_read_wait_serial`), which the caller waits for
     /// without holding the NVN state.
-    pub fn read_wait_serial(&mut self) -> Result<Option<u64>, Trap> {
+    pub fn read_wait_serial(&mut self) -> Result<Option<(u64, u64)>, Trap> {
         self.gpu_read_wait_serial()
             .map_err(|message| Trap::InvalidState { message })
     }
@@ -3502,26 +3506,30 @@ impl Nvn {
     /// holding its fence when it has signaled and the GPU may not have
     /// finished it yet (submitted if still recording), which the caller
     /// waits for without holding the NVN state.
-    pub fn sync_wait_serial(&mut self, sync: u64) -> Result<Option<u64>, Trap> {
-        let Some(serial) = self
+    pub fn sync_wait_serial(&mut self, sync: u64) -> Result<Option<(u64, u64)>, Trap> {
+        let Some(recorded) = self
             .objects
             .get(&sync)
             .filter(|object| object.state.contains_key("Signaled"))
             .and_then(|object| object.state.get("GpuSerial"))
-            .map(|serial| serial.x[0])
+            .copied()
         else {
             return Ok(None);
         };
-        if self.gpu_completed_serial() >= serial {
+        let (serial, marker) = (recorded.x[0], recorded.x[1]);
+        if self.gpu_completed_serial() >= serial || self.gpu_marker_done(marker) {
             return Ok(None);
         }
         self.gpu_submit_through(serial)
             .map_err(|message| Trap::InvalidState { message })?;
-        Ok(Some(serial))
+        Ok(Some((serial, marker)))
     }
 
     /// Whether submission `serial` has finished (noting finished ones).
-    pub fn submission_done(&mut self, serial: u64) -> Result<bool, Trap> {
+    pub fn submission_done(&mut self, serial: u64, marker: u64) -> Result<bool, Trap> {
+        if self.gpu_marker_done(marker) {
+            return Ok(true);
+        }
         self.gpu_poll_completed()
             .map_err(|message| Trap::InvalidState { message })?;
         Ok(self.gpu_completed_serial() >= serial)
@@ -5331,7 +5339,7 @@ impl Nvn {
     /// before it (what a CPU wait on it has to wait for).
     fn signal_sync(&mut self, sync: u64, args: Args) {
         let serial = self.gpu_recorded_serial();
-        self.gpu_observable(serial);
+        let marker = self.gpu_observable(serial).unwrap_or(0);
         {
             let mut registry = write_shared(&self.registry);
             registry.unsignaled.remove(&sync);
@@ -5344,6 +5352,7 @@ impl Nvn {
             object.state.insert("Signaled".into(), args);
             let mut recorded = Args::default();
             recorded.x[0] = serial;
+            recorded.x[1] = marker;
             object.state.insert("GpuSerial".into(), recorded);
         }
     }

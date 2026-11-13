@@ -290,6 +290,12 @@ pub struct Renderer {
     /// their work runs on the GPU, the CPU records into the current one
     /// (see `flush_async`).
     spares: Vec<Slot>,
+    /// The recorded slot's markers (`mark`); live markers by id (event,
+    /// batch serial); events free for reuse; the next marker id.
+    current_markers: Vec<u64>,
+    markers: FastMap<u64, (vk::Event, u64)>,
+    free_events: Vec<vk::Event>,
+    next_marker: u64,
     /// The recorded slot's previous submission has not been waited for.
     current_in_flight: bool,
     /// Serial (`flushes` at submission) of the recorded slot's last
@@ -375,6 +381,8 @@ struct Slot {
     in_flight: bool,
     /// Serial of its last submission.
     serial: u64,
+    /// Markers its commands set (`mark`), freed once it completes.
+    markers: Vec<u64>,
 }
 
 /// Submission slots: the CPU records into one while the GPU runs the
@@ -502,6 +510,7 @@ impl Renderer {
                 retired_shared: Vec::new(),
                 in_flight: false,
                 serial: 0,
+                markers: Vec::new(),
             });
         }
         let mut fences = [fence; SLOTS];
@@ -585,6 +594,10 @@ impl Renderer {
             last_attachments: Vec::new(),
             hazard_barriers: 0,
             spares,
+            current_markers: Vec::new(),
+            markers: FastMap::default(),
+            free_events: Vec::new(),
+            next_marker: 1,
             current_in_flight: false,
             current_serial: 0,
             completed_serial: 0,
@@ -2264,6 +2277,66 @@ impl Renderer {
         Ok(())
     }
 
+    /// A point in the commands recorded so far that the host can see the GPU
+    /// pass (`marker_done`) before the rest of the batch runs: everything
+    /// before it has completed and its writes are visible to the host. None
+    /// when nothing is being recorded (the last submission's serial says).
+    pub fn mark(&mut self) -> Result<Option<u64>, String> {
+        if !self.recording {
+            return Ok(None);
+        }
+        let commands = self.commands()?;
+        let event = match self.free_events.pop() {
+            Some(event) => event,
+            // SAFETY: a valid create info on a live device.
+            None => unsafe {
+                self.gpu
+                    .device
+                    .create_event(&vk::EventCreateInfo::default(), None)
+            }
+            .map_err(vk_error("vkCreateEvent"))?,
+        };
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        // SAFETY: recording outside rendering; the event is unsignaled.
+        unsafe {
+            self.gpu.device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            self.gpu
+                .device
+                .cmd_set_event(commands, event, vk::PipelineStageFlags::ALL_COMMANDS);
+        }
+        let id = self.next_marker;
+        self.next_marker += 1;
+        self.markers.insert(id, (event, self.flushes + 1));
+        self.current_markers.push(id);
+        self.stat("stat: markers set", 1);
+        Ok(Some(id))
+    }
+
+    /// Whether the GPU has passed marker `id` (or its batch completed).
+    pub fn marker_done(&self, id: u64) -> bool {
+        let Some(&(event, serial)) = self.markers.get(&id) else {
+            return true;
+        };
+        serial <= self.completed_serial
+            // SAFETY: the event is live.
+            || unsafe { self.gpu.device.get_event_status(event) }.unwrap_or(false)
+    }
+
+    /// The batch serial marker `id` belongs to.
+    pub fn marker_serial(&self, id: u64) -> Option<u64> {
+        self.markers.get(&id).map(|&(_, serial)| serial)
+    }
+
     /// Submit the batch with this serial if it is still being recorded
     /// (without waiting for it), so `poll_completed` can see it finish.
     pub fn submit_through(&mut self, serial: u64) -> Result<(), String> {
@@ -2351,6 +2424,7 @@ impl Renderer {
         std::mem::swap(&mut self.retired_shared, &mut spare.retired_shared);
         std::mem::swap(&mut self.current_in_flight, &mut spare.in_flight);
         std::mem::swap(&mut self.current_serial, &mut spare.serial);
+        std::mem::swap(&mut self.current_markers, &mut spare.markers);
     }
 
     /// End and submit the current slot's command buffer.
@@ -2502,6 +2576,15 @@ impl Renderer {
                 .map_err(vk_error("vkResetDescriptorPool"))?;
         }
         self.current_in_flight = false;
+        // Its markers are passed: their events are reset for reuse.
+        for id in std::mem::take(&mut self.current_markers) {
+            if let Some((event, _)) = self.markers.remove(&id) {
+                // SAFETY: the batch that set it has completed.
+                if unsafe { self.gpu.device.reset_event(event) }.is_ok() {
+                    self.free_events.push(event);
+                }
+            }
+        }
         self.completed_serial = self.completed_serial.max(self.current_serial);
         self.completed_shared
             .store(self.completed_serial, std::sync::atomic::Ordering::Release);
@@ -5551,6 +5634,12 @@ impl Drop for Renderer {
                 self.gpu.device.destroy_fence(spare.fence, None);
             }
             self.gpu.device.destroy_fence(self.fence, None);
+            for (_, (event, _)) in std::mem::take(&mut self.markers) {
+                self.gpu.device.destroy_event(event, None);
+            }
+            for event in std::mem::take(&mut self.free_events) {
+                self.gpu.device.destroy_event(event, None);
+            }
             self.gpu.device.destroy_command_pool(self.pool, None);
         }
     }

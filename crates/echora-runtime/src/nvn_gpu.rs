@@ -128,6 +128,9 @@ pub struct Backend {
     /// no later ones, which the console's GPU may not have made yet).
     page_table_write_serial: u64,
     observable_serial: u64,
+    /// The renderer's marker at the last such signal (`Renderer::mark`):
+    /// a wait for it ends when the GPU passes it, not when its batch ends.
+    observable_marker: Option<u64>,
     /// Work storing through the page table has run at some point: the
     /// resident pools' ranges a CPU read covers may hold its results.
     page_table_wrote: bool,
@@ -231,6 +234,7 @@ impl Backend {
             page_table_writes: false,
             page_table_write_serial: 0,
             observable_serial: 0,
+            observable_marker: None,
             page_table_wrote: false,
             resident: HashMap::new(),
             samples_reports: std::collections::HashSet::new(),
@@ -3444,7 +3448,7 @@ impl Nvn {
     /// page table, `resolve_gpu_written`), submitted if still recording;
     /// None when none or it has finished. The caller waits for it without
     /// the NVN state (`gpu_poll_completed`, `gpu_completed_serial`).
-    pub(super) fn gpu_read_wait_serial(&mut self) -> Result<Option<u64>, String> {
+    pub(super) fn gpu_read_wait_serial(&mut self) -> Result<Option<(u64, u64)>, String> {
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(None);
         };
@@ -3454,16 +3458,22 @@ impl Nvn {
         let serial = backend
             .page_table_write_serial
             .min(backend.observable_serial);
+        // Up to the last signal: its marker, when it is in that batch.
+        let marker = backend
+            .observable_marker
+            .filter(|&marker| backend.renderer.marker_serial(marker) == Some(serial))
+            .unwrap_or(0);
         if serial
             <= backend
                 .renderer
                 .completed_handle()
                 .load(std::sync::atomic::Ordering::Acquire)
+            || (marker != 0 && backend.renderer.marker_done(marker))
         {
             return Ok(None);
         }
         backend.renderer.submit_through(serial)?;
-        Ok(Some(serial))
+        Ok(Some((serial, marker)))
     }
 
     /// Submit the batch with this serial if it is still being recorded.
@@ -3494,17 +3504,31 @@ impl Nvn {
 
     /// Work recorded before submission `serial` ends at a fence or event
     /// the guest can see signaled.
-    /// The batch is submitted here: a CPU wait for this point (a sync wait,
-    /// a read of what the work before it stored) then waits for that work
-    /// alone, not for what the replay records after it into the same batch.
-    pub(super) fn gpu_observable(&mut self, serial: u64) {
-        if let Some(backend) = self.gpu.as_mut() {
-            backend.observable_serial = backend.observable_serial.max(serial);
-            if let Err(error) = backend.renderer.submit_through(serial) {
-                backend.note(format!("submitting at a signal: {error}"));
+    /// A marker is set here (`Renderer::mark`): a CPU wait for this point
+    /// (a sync wait, a read of what the work before it stored) then ends
+    /// when the GPU passes it, not when the rest of its batch, what the
+    /// replay records after it, has run too. The marker, if one was set.
+    pub(super) fn gpu_observable(&mut self, serial: u64) -> Option<u64> {
+        let backend = self.gpu.as_mut()?;
+        backend.observable_serial = backend.observable_serial.max(serial);
+        let marker = match backend.renderer.mark() {
+            Ok(marker) => marker,
+            Err(error) => {
+                backend.note(format!("marking a signal: {error}"));
+                None
             }
-            backend.stat("stat: batches ended at a signal", 1);
-        }
+        };
+        backend.observable_marker = marker;
+        marker
+    }
+
+    /// Whether the GPU passed marker `marker` (0: none).
+    pub(super) fn gpu_marker_done(&self, marker: u64) -> bool {
+        marker != 0
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|backend| backend.renderer.marker_done(marker))
     }
 
     pub(super) fn gpu_wait_sync(&mut self, serial: Option<u64>) -> Result<(), String> {
@@ -4820,15 +4844,25 @@ impl Nvn {
                     started,
                     started,
                 );
+                // A marker at the last signal the GPU has passed already
+                // covers what is waited for up to it.
+                let marked = backend.observable_marker.is_some_and(|marker| {
+                    backend.renderer.marker_serial(marker) == Some(backend.observable_serial)
+                        && backend.renderer.marker_done(marker)
+                });
                 if backend.page_table_write_serial <= backend.observable_serial {
                     backend.stat("stat: GPU waits for page-table writes", 1);
-                    backend.renderer.wait_for(backend.page_table_write_serial)?;
+                    if !(marked && backend.page_table_write_serial == backend.observable_serial) {
+                        backend.renderer.wait_for(backend.page_table_write_serial)?;
+                    }
                     backend.page_table_writes = false;
                 } else {
                     // Stores recorded after the last signal the guest saw
                     // are not waited for; the ones before it are.
                     backend.stat("stat: GPU waits for page-table writes up to a signal", 1);
-                    backend.renderer.wait_for(backend.observable_serial)?;
+                    if !marked {
+                        backend.renderer.wait_for(backend.observable_serial)?;
+                    }
                 }
                 backend.stat(
                     "stat: GPU waits for page-table writes us",
