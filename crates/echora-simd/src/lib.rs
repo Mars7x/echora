@@ -228,6 +228,38 @@ macro_rules! native {
     };
 }
 
+/// `mul_add` through the processor's fused multiply-add where it has one.
+/// The crate is built for the baseline x86-64, where `mul_add` is the
+/// software routine (correct, but tens of times slower); the result is the
+/// same correctly rounded one either way.
+trait Fused: Sized {
+    fn fused(self, y: Self, z: Self) -> Self;
+}
+
+macro_rules! fused {
+    ($float:ty) => {
+        impl Fused for $float {
+            #[inline]
+            fn fused(self, y: Self, z: Self) -> Self {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    #[target_feature(enable = "fma")]
+                    fn hardware(x: $float, y: $float, z: $float) -> $float {
+                        x.mul_add(y, z)
+                    }
+                    if std::arch::is_x86_feature_detected!("fma") {
+                        // SAFETY: the processor has the feature (just checked).
+                        return unsafe { hardware(self, y, z) };
+                    }
+                }
+                self.mul_add(y, z)
+            }
+        }
+    };
+}
+fused!(f32);
+fused!(f64);
+
 fn is_zero(format: Format, value: u64) -> bool {
     value & !format.sign_bit() == 0
 }
@@ -262,8 +294,8 @@ fn rounded(format: Format, size: FpSize, op: FpBinaryOp, a: u64, b: u64, raw: u6
                     let virtual_y = r - x;
                     (x - (r - virtual_y)) + (y - virtual_y) != 0.0
                 }
-                FpBinaryOp::Mul | FpBinaryOp::NegMul => x.mul_add(y, -r) != 0.0,
-                FpBinaryOp::Div => r.mul_add(y, -x) != 0.0,
+                FpBinaryOp::Mul | FpBinaryOp::NegMul => x.fused(y, -r) != 0.0,
+                FpBinaryOp::Div => r.fused(y, -x) != 0.0,
                 _ => false,
             }
         }};
@@ -615,11 +647,11 @@ pub fn fp_ternary(
         let raw = match size {
             FpSize::S => u64::from(
                 f32::from_bits(n as u32)
-                    .mul_add(f32::from_bits(m as u32), f32::from_bits(a as u32))
+                    .fused(f32::from_bits(m as u32), f32::from_bits(a as u32))
                     .to_bits(),
             ),
             FpSize::D => f64::from_bits(n)
-                .mul_add(f64::from_bits(m), f64::from_bits(a))
+                .fused(f64::from_bits(m), f64::from_bits(a))
                 .to_bits(),
         };
         if finite(size, raw) {
@@ -683,11 +715,11 @@ fn ternary_lane(fp: &mut Fp<'_>, op: FpTernaryOp, n: u64, m: u64, a: u64) -> u64
         let raw = match size {
             FpSize::S => u64::from(
                 f32::from_bits(n as u32)
-                    .mul_add(f32::from_bits(m as u32), f32::from_bits(a as u32))
+                    .fused(f32::from_bits(m as u32), f32::from_bits(a as u32))
                     .to_bits(),
             ),
             FpSize::D => f64::from_bits(n)
-                .mul_add(f64::from_bits(m), f64::from_bits(a))
+                .fused(f64::from_bits(m), f64::from_bits(a))
                 .to_bits(),
         };
         fp.output(raw, finite)
@@ -1213,13 +1245,13 @@ fn fast_vec_fp_lane(
                 FpSize::S => {
                     let x = f32::from_bits(a as u32);
                     let x = if negate { -x } else { x };
-                    let fused = x.mul_add(f32::from_bits(b as u32), f32::from_bits(d as u32));
+                    let fused = x.fused(f32::from_bits(b as u32), f32::from_bits(d as u32));
                     u64::from(fused.to_bits())
                 }
                 FpSize::D => {
                     let x = f64::from_bits(a);
                     let x = if negate { -x } else { x };
-                    x.mul_add(f64::from_bits(b), f64::from_bits(d)).to_bits()
+                    x.fused(f64::from_bits(b), f64::from_bits(d)).to_bits()
                 }
             }
         }
@@ -1308,11 +1340,11 @@ fn step_lane(fp: &mut Fp<'_>, rsqrt: bool, a: u64, b: u64) -> u64 {
     let raw = match size {
         FpSize::S => {
             let fused = (-f32::from_bits(a as u32))
-                .mul_add(f32::from_bits(b as u32), f32::from_bits(constant as u32));
+                .fused(f32::from_bits(b as u32), f32::from_bits(constant as u32));
             u64::from(if rsqrt { fused * 0.5 } else { fused }.to_bits())
         }
         FpSize::D => {
-            let fused = (-f64::from_bits(a)).mul_add(f64::from_bits(b), f64::from_bits(constant));
+            let fused = (-f64::from_bits(a)).fused(f64::from_bits(b), f64::from_bits(constant));
             if rsqrt { fused * 0.5 } else { fused }.to_bits()
         }
     };
