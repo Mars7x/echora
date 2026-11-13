@@ -266,7 +266,7 @@ impl Backend {
 const TRACED_VARIANT: u64 = 0x7472_6163_6564_0000;
 
 /// Stage keys (vertex, fragment) and the stages' translations.
-type BoundProgram = ((u64, u64), Vec<Arc<Translated>>);
+pub(super) type BoundProgram = ((u64, u64), Vec<Arc<Translated>>);
 /// Stage key, binding base, previous stage's stores, generic input types,
 /// compute workgroup size and shared memory, and the task/mesh state.
 type TranslationKey = (
@@ -629,6 +629,7 @@ impl Nvn {
         // Resolved bindings (`binding_memo`) change only with a texture's
         // bytes: one named, or one under the range. Descriptors are
         // registered, not read from the range.
+        self.flush_epoch += 1;
         if texture.is_some() {
             self.binding_serial += 1;
         }
@@ -1418,6 +1419,45 @@ impl Nvn {
     }
 
     fn bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
+        // The same programs as the last draw, within a present and with no
+        // flush of guest memory since (program code is revalidated once a
+        // present, as textures are): its stages again.
+        let bind = |bit: u32| {
+            self.render
+                .state
+                .get(if bit == 0 {
+                    "BindProgram@0"
+                } else {
+                    "BindProgram@1"
+                })
+                .map(|command| command.x)
+        };
+        let attributes = self
+            .render
+            .state
+            .get("BindVertexAttribState")
+            .map(|command| command.states.clone());
+        let stamp = bind(0)
+            .zip(bind(1))
+            .map(|(vertex, fragment)| (self.presented_frames, self.flush_epoch, vertex, fragment));
+        if let (Some(stamp), Some((memo, memo_attributes, bound))) = (stamp, &self.program_memo)
+            && *memo == stamp
+            && match (&attributes, memo_attributes) {
+                (Some(now), Some(then)) => Arc::ptr_eq(now, then),
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            return Ok(bound.clone());
+        }
+        let bound = self.resolve_bound_program(core)?;
+        if let Some(stamp) = stamp {
+            self.program_memo = Some((stamp, attributes, bound.clone()));
+        }
+        Ok(bound)
+    }
+
+    fn resolve_bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
         let mut addresses = Vec::new();
         for bit in [0u32, 1] {
             let bind = self
@@ -3286,6 +3326,17 @@ impl Nvn {
             return Ok(());
         };
         backend.stat("stat: GPU waits for a CPU sync wait", 1);
+        // Census: how far the waited-for work is from what is recorded.
+        let recorded = backend.renderer.recorded_serial();
+        let census = match serial {
+            None => "stat: sync waits for everything (no serial)",
+            Some(serial) if serial >= recorded && recorded > backend.renderer.flushes => {
+                "stat: sync waits on work still recording"
+            }
+            Some(serial) if serial + 1 >= recorded => "stat: sync waits on the last submission",
+            Some(_) => "stat: sync waits on earlier submissions",
+        };
+        backend.stat(census, 1);
         match serial {
             Some(serial) => backend.renderer.wait_for(serial),
             None => backend.renderer.flush(),

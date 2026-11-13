@@ -511,6 +511,19 @@ pub struct Nvn {
     /// draw. Registering a descriptor evicts the handles that name it.
     #[serde(skip)]
     binding_memo: ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>),
+    /// Bumped by every flush of guest memory (`gpu_invalidate`) and every
+    /// change of a program object or its shaders.
+    #[serde(skip)]
+    flush_epoch: u64,
+    /// The last bound programs a draw resolved: (present, flush epoch, the
+    /// two BindProgram arguments, the vertex attribute snapshot) and the
+    /// result (see `bound_program`).
+    #[serde(skip)]
+    program_memo: Option<(
+        (u64, u64, [u64; 8], [u64; 8]),
+        Option<std::sync::Arc<Vec<BTreeMap<String, Args>>>>,
+        gpu::BoundProgram,
+    )>,
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,
     /// Hash of the last frame written to ECHORA_FRAME_DIR; identical
@@ -4644,6 +4657,8 @@ impl Nvn {
         data: u64,
         stride: u64,
     ) -> Result<(), Trap> {
+        // Bound programs resolve again (`program_memo`).
+        self.flush_epoch += 1;
         let invalid = |message: String| Trap::InvalidState {
             message: format!("nvnProgram shaders: {message}"),
         };
@@ -4684,6 +4699,10 @@ impl Nvn {
     /// change for pools (which every texture's storage goes through),
     /// textures, and an address it has answered for.
     fn object_changed(&mut self, address: u64, kind: &str) {
+        // Bound programs resolve again (`program_memo`).
+        if kind == "Program" {
+            self.flush_epoch += 1;
+        }
         if kind == "MemoryPool"
             || kind == "Texture"
             || self.storage_memo.borrow().1.contains_key(&address)
