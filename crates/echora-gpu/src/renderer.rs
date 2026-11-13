@@ -894,17 +894,46 @@ impl Renderer {
     /// work that reads it, after work that used it). Uploads larger than
     /// the ring go in pieces.
     pub fn upload_resident(&mut self, key: u64, at: u64, bytes: &[u8]) -> Result<(), String> {
-        const PIECE: usize = 8 << 20;
-        if bytes.len() > PIECE {
-            for (index, piece) in bytes.chunks(PIECE).enumerate() {
-                self.upload_resident(key, at + (index * PIECE) as u64, piece)?;
-            }
-            return Ok(());
+        self.upload_resident_with(key, at, bytes.len() as u64, |done, piece| {
+            piece.copy_from_slice(&bytes[done as usize..done as usize + piece.len()]);
+        })
+    }
+
+    /// `upload_resident` of `length` bytes that `fill(offset, piece)`
+    /// writes straight into the staging ring, piece by piece (no copy of
+    /// the whole range on the side first).
+    pub fn upload_resident_with(
+        &mut self,
+        key: u64,
+        at: u64,
+        length: u64,
+        mut fill: impl FnMut(u64, &mut [u8]),
+    ) -> Result<(), String> {
+        const PIECE: u64 = 8 << 20;
+        let mut done = 0;
+        while done < length {
+            let piece = (length - done).min(PIECE);
+            let (source, offset) = self.ring_alloc(piece, 16)?;
+            fill(done, self.ring.slice_mut(offset as usize, piece as usize));
+            self.copy_to_resident(key, at + done, source, offset, piece)?;
+            done += piece;
         }
-        let (source, offset) = self.ring_upload(bytes, 16)?;
+        Ok(())
+    }
+
+    /// Record a copy of `length` ring bytes at `offset` of `source` into
+    /// resident buffer `key` at `at`, ordered after earlier work.
+    fn copy_to_resident(
+        &mut self,
+        key: u64,
+        at: u64,
+        source: vk::Buffer,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), String> {
         let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
         let commands = self.commands()?;
-        let length = (bytes.len() as u64).min(size.saturating_sub(at));
+        let length = length.min(size.saturating_sub(at));
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -4900,6 +4929,14 @@ impl HostBuffer {
             mapped: std::ptr::null_mut(),
             size: 0,
         }
+    }
+
+    /// `length` bytes of the mapping at `offset`, to write in place.
+    pub fn slice_mut(&mut self, offset: usize, length: usize) -> &mut [u8] {
+        assert!(offset + length <= self.size as usize);
+        // SAFETY: in bounds of the mapping, which lives as long as self;
+        // borrowed mutably, so no other slice of it exists meanwhile.
+        unsafe { std::slice::from_raw_parts_mut(self.mapped.add(offset), length) }
     }
 
     pub fn write(&self, offset: usize, bytes: &[u8]) {

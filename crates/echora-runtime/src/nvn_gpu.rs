@@ -6288,12 +6288,18 @@ impl Nvn {
         }
         let uploads = std::mem::take(&mut pool.guest_dirty);
         for range in uploads {
-            let bytes = read_storage(core, range.start, range.end - range.start);
+            let length = range.end - range.start;
             let backend = self.gpu.as_mut().unwrap();
-            backend.stat("stat: dispatch storage bytes", bytes.len() as u64);
-            backend
-                .renderer
-                .upload_resident(base, range.start - base, &bytes)?;
+            backend.stat("stat: dispatch storage bytes", length);
+            // Guest bytes go straight into the staging ring.
+            backend.renderer.upload_resident_with(
+                base,
+                range.start - base,
+                length,
+                |done, piece| {
+                    read_storage_into(core, range.start + done, piece);
+                },
+            )?;
         }
         Ok(Some((buffer, guest - base)))
     }
@@ -8590,8 +8596,14 @@ const STORAGE_CHUNK: u64 = 64 << 10;
 /// zeros).
 fn read_storage(core: &Guest, base: u64, length: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; length as usize];
-    if core.memory.read(base, &mut bytes).is_ok() {
-        return bytes;
+    read_storage_into(core, base, &mut bytes);
+    bytes
+}
+
+/// `read_storage` into `bytes`.
+fn read_storage_into(core: &Guest, base: u64, bytes: &mut [u8]) {
+    if core.memory.read(base, bytes).is_ok() {
+        return;
     }
     for (index, chunk) in bytes.chunks_mut(1 << 12).enumerate() {
         if core
@@ -8602,7 +8614,6 @@ fn read_storage(core: &Guest, base: u64, length: u64) -> Vec<u8> {
             chunk.fill(0);
         }
     }
-    bytes
 }
 
 /// A fast 64-bit hash of `bytes`.
