@@ -3254,7 +3254,7 @@ impl Renderer {
             std::env::var("ECHORA_SUBMIT_ITEMS")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(128)
+                .unwrap_or(MAX_WORK_ITEMS)
                 .clamp(1, MAX_WORK_ITEMS)
         });
         if self.work_items >= limit {

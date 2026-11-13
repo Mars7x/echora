@@ -3477,7 +3477,7 @@ impl Nvn {
         Ok(true)
     }
 
-    /// ECHORA_REPLAY_THREAD: presents are queued behind the frame's work
+    /// With a replay thread: presents are queued behind the frame's work
     /// (`QueueItem::Present`).
     pub fn present_queued_mode() -> bool {
         Self::replay_thread() && debug_var_os("ECHORA_PRESENT_NOW").is_none()
@@ -3539,12 +3539,13 @@ impl Nvn {
         })
     }
 
-    /// ECHORA_REPLAY_THREAD (being measured): replays run on a thread of
-    /// their own (asynchronous, as ECHORA_ASYNC_REPLAY), and only calls
-    /// that need their results finish them first.
+    /// Replays run on a thread of their own (asynchronous, as
+    /// ECHORA_ASYNC_REPLAY), and only calls that need their results finish
+    /// them first; ECHORA_REPLAY_INLINE (debugging) runs them on the
+    /// calling guest thread as before.
     pub fn replay_thread() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("ECHORA_REPLAY_THREAD").is_some())
+        *ON.get_or_init(|| std::env::var_os("ECHORA_REPLAY_INLINE").is_none())
     }
 
     /// A call (`name`) waited for a replay to finish before it ran.

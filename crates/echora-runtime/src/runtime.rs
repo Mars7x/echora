@@ -2801,7 +2801,7 @@ impl Machine {
         let placeholder = idle(self);
         let mut cores = vec![std::mem::replace(&mut self.core, placeholder)];
         cores.extend((1..workers).map(|_| idle(self)));
-        // ECHORA_REPLAY_THREAD: submitted work runs on a thread of its own
+        // Submitted work runs on a thread of its own (unless ECHORA_REPLAY_INLINE)
         // (through its own view of guest memory) while guest threads go on.
         let replay_core = crate::nvn::Nvn::replay_thread().then(|| idle(self));
         for core in &mut cores {
@@ -4859,7 +4859,7 @@ struct Shared<'a> {
     /// threads keep their cores but never execute at the same time, which
     /// separates scheduling faults from memory-ordering ones.
     serial: Option<std::sync::Mutex<()>>,
-    /// ECHORA_REPLAY_THREAD: wakes the replay thread when a replay stopped
+    /// With a replay thread: wakes it when a replay stopped
     /// after a piece with work left (`replay_thread`), and the error that
     /// ended its replay, which the next NVN call reports.
     replay_wake: (std::sync::Mutex<bool>, std::sync::Condvar),
@@ -4946,7 +4946,7 @@ fn locked_nvn_call(name: &str) -> bool {
     )
 }
 
-/// ECHORA_REPLAY_THREAD: run the pieces of submitted work that NVN calls
+/// The replay thread: run the pieces of submitted work that NVN calls
 /// left (`Nvn::replay_paused`), a piece at a time with the NVN state
 /// locked, handing it to waiting calls between pieces, while guest threads
 /// run (as the console's GPU works while its CPU goes on).
