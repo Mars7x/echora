@@ -23,7 +23,7 @@ time.
 ## Guest loads and stores
 
 A load or store is one host `mov` after a range test. The relaxed atomics
-(f87afd9) cost nothing: LLVM merges their aligned and unaligned paths into
+(69e76d6) cost nothing: LLVM merges their aligned and unaligned paths into
 the same `mov` and leaves one dead `test`. Plain accesses measured up to 8%
 faster on `ldst`, but are not correct (a plain load can be hoisted out of a
 polling loop; `tests/concurrency.rs`), and a branchless inline-asm `mov` was
@@ -230,7 +230,7 @@ time than flat, so the rebuild takes about as long as today's.
 3,757 flag writes in them are dead); in game code compares before a branch
 are the common case.
 
-The `window-memory` and block bookkeeping changes below need
+The `window-memory` and block bookkeeping changes above need
 `echora-guest` and runtime work first. They are not in this set.
 
 ## Order for the rebuild

@@ -32,9 +32,9 @@ when the code for it does.
 3. Sound: the remaining audio renderer effects (delay, biquad filter) and
    depop.
 4. Turn on the faster code generation in game builds once it is checked in
-   game: inline vector arithmetic, branches that skip unused flags and
-   floating-point status kept in locals, then structured control flow once
-   it measures faster. They go in with the next full rebuild.
+   game: inline vector arithmetic with whole-vector checks, branches that
+   skip unused flags, and floating-point status kept in locals; then
+   structured control flow once it measures faster. They go in with the next full rebuild.
 5. Shorten the first build from about an hour: leaner generated code (about
    a third smaller in tests so far), full optimisation only for the hot code a
    profile finds, and more parallel compiler jobs.

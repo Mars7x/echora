@@ -16,6 +16,9 @@ crates chosen for each host.
 | `echora-simd` | The vector and floating-point operations. Generated code reaches them through declarations in `echora-guest`, so changing one does not recompile the game's code. |
 | `echora-runtime` | Boots the game and runs it: threads and scheduling, kernel calls, IPC and system services, file systems, input, audio, movies, and the NVN graphics layer. |
 | `echora-gpu` | The Vulkan device, renderer and presentation, plus shader translation: the Rust translator (`echora-shader`) and an optional external plugin (docs/shader-plugin.md). |
+| `echora-shader` | Echora's shader translator: NVN2 (Ampere) programs to SPIR-V, with a CPU simulator for checking translations ([shader-translator](shader-translator.md)). |
+| `echora-shader-abi` | The types the translator and the runtime share: translation results, descriptors, the push-constant block and `ABI_VERSION`. |
+| `echora-av1` | AV1 header parsing and reference tracking for decoding the movies on the GPU ([av1-decode](av1-decode.md)). |
 | `echora-input` | Gamepads as a Switch controller: evdev on Linux, gilrs on Windows. |
 | `echora-audio` | Plays the game's audio on the default output device through CPAL. |
 | `echora-resolution` | Plans render and output sizes. Not yet connected to the renderer. |
@@ -35,10 +38,11 @@ input and audio are host crates of their own.
   where the disk allows, both instant and taking no extra space, and
   otherwise a copy after a free-space check. Either way the original can be
   moved or deleted afterwards. On first Play it runs `echora prepare`
-  (fetching the shader recompiler, translating and building) with its
+  (translating and building) with its
   progress shown. Every control works with mouse, keyboard and controller.
-- **Runtime.** Guest threads run on one host thread by default, or on up to
-  six workers that model the console's application cores (not yet stable).
+- **Runtime.** Guest threads run on one worker per host CPU by default, at
+  most six, which model the console's application cores (`ECHORA_WORKERS`,
+  or the launcher's CPU cores setting).
   The game's zlib and zstd routines run as host code with identical results.
   Movies are AV1, decoded on the GPU's video engine (Vulkan Video) or with
   rav1d where the GPU cannot. Every unimplemented operation stops
@@ -46,12 +50,17 @@ input and audio are host crates of their own.
 - **GPU.** Guest memory is imported into Vulkan where the driver allows
   (`VK_EXT_external_memory_host`); otherwise the game's memory pools are
   mirrored in device memory and copied only when the CPU touches them. Mesh
-  and task pipelines are drawn with `VK_EXT_mesh_shader`. The
-  `translate-dump` and `shader-check` tools translate dumped shader stages
-  offline.
-- **Generated code.** Three code-generation options can be turned on for a
-  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `structured`,
-  `fused-flags`). All are off by default until they are checked in game.
+  and task pipelines are drawn with `VK_EXT_mesh_shader`. On Linux, draws'
+  storage buffers share guest memory with the GPU through udmabuf where the
+  driver allows it. The game's submitted command buffers are replayed into
+  Vulkan on a thread of their own (`ECHORA_REPLAY_INLINE=1` replays them on
+  the submitting thread). `cargo run -p echora-shader --example survey --
+  DIR` translates dumped shader stages offline with the Rust translator and
+  ranks what it refuses; `shader-check --compare` also compiles them on the
+  host's driver. `translate-dump` and plain `shader-check` need a plugin.
+- **Generated code.** Five code-generation options can be turned on for a
+  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `fused-flags`,
+  `whole-vector-checks`, `fp-status-locals`, `structured`). All are off by default until they are checked in game.
 
 ## Front ends
 

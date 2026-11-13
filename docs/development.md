@@ -8,7 +8,7 @@ the game, see the [README](../README.md#building).
 The launcher's steps are commands of their own:
 
 ```sh
-target/release/echora prepare /path/to/game.nup   # fetch, translate and build (-j N, --force, --check)
+target/release/echora prepare /path/to/game.nup   # translate and build (-j N, --force, --check)
 target/release/echora inspect /path/to/game.nup   # packages, versions, build ID
 target/release/echora verify /path/to/game.nup    # hash-check every file
 target/release/echora import /path/to/game.nup    # validate and cache the program's ExeFS
@@ -17,6 +17,7 @@ target/release/echora analyze /path/to/game.nup --limit 20000000   # code discov
 target/release/echora boot /path/to/game.nup      # create the game process without running it
 target/release/echora lift /path/to/game.nup      # only translate (several GiB of Rust)
 target/release/echora extract /path/to/game.nup out --subtree romfs
+target/release/echora shaders /path/to/game.nup   # count every GPU program the game ships (--dump DIR writes them)
 ```
 
 See [content input](content.md) for the formats Echora reads.
@@ -82,6 +83,8 @@ read.
 | `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. |
 | `ECHORA_GPU=0` | Run without the GPU backend. |
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
+| `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
+| `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
 
 **Translation**
 
@@ -89,14 +92,18 @@ read.
 |---|---|
 | `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `structured`, `fused-flags` (a compare and its B.cond test the operands directly where NZCV is dead after them), `whole-vector-checks` (with `inline-vector`: inlined vector float operations check whole vectors before the exact per-lane test), `fp-status-locals` (FPCR and FPSR kept in window locals). All are off by default; [codegen speed](codegen-speed.md) recommends a set for the next full rebuild. |
 | `ECHORA_SHADER_CACHE=dir` | Keep the driver's compiled shader binaries in this folder between runs, so later runs skip compiling them. `echora run` sets it to `shader-cache` in the translation folder. |
-| `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for `translate-dump` and `shader-check` in `echora-gpu`. |
+| `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for the `survey` example in `echora-shader` and `shader-check` in `echora-gpu`. |
+| `ECHORA_SHADER_TRANSLATOR=plugin\|compare` | Use an installed shader plugin instead of Echora's own translator, or compare the two. `ECHORA_SHADER_PLUGIN=path` names the plugin; see [shader plugins](shader-plugin.md). |
+| `ECHORA_HMMA=exact\|subgroup\|coop16` | How the matrix multiplies translate. By default cooperative matrices with 32-bit fragment staging where the device has them, else the subgroup path. |
 
 **Measuring**
 
 | Variable | Effect |
 |---|---|
 | `ECHORA_VIDEO_DECODE=cpu` | Decode the movies with rav1d on the CPU (`rav1d` works too). By default they decode on the GPU's video engine (Vulkan Video), and a movie the GPU cannot decode continues on rav1d. See [av1-decode.md](av1-decode.md). |
-| `ECHORA_MOVIE_RATE=1` | Every 60 movie pictures, print how many have been decoded, the rate per second and the time since boot. This is the speed measure to compare runs with; presented frames per second are not comparable, because loading presents black frames at a load-dependent rate. |
+| `ECHORA_MOVIE_RATE=1` | Every 60 movie pictures, print how many have been decoded, the rate per second and the time since boot. This is the speed measure for the movie; presented frames per second are not comparable there, because loading presents black frames at a load-dependent rate. In the 3D scene, use `ECHORA_PRESENT_RATE`. |
+| `ECHORA_PRESENT_RATE=N` | Every N presents, print the count and the rate over those N. |
+| `ECHORA_TIMELINE=file` | Write each thread's guest runs, lock waits, NVN calls and replay pieces as spans over a few presents (debugging). |
 | `ECHORA_GPU_TIME=1` | Every few seconds, print how long the GPU was busy, against wall time and against the time the CPU waited for it. |
 | `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |
 | `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |

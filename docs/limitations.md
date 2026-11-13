@@ -34,24 +34,27 @@ to be missing or incomplete.
   ADPCM) are decoded and resampled, voices and mixes are routed through
   splitters, and reverb, I3DL2 reverb and aux sends run on their mixes. Output
   is opt-in from the command line (`ECHORA_AUDIO=1`); the launcher turns it
-  on. Depop, the delay and biquad filter effects, and Opus voices' reset are
-  not implemented yet.
-- Below full speed the game produces less audio than the device plays, so
-  sound in the first 3D scene breaks up. This should go away with speed.
+  on. Depop, the performance counters, and the delay, biquad filter,
+  limiter, capture and compressor effects are not implemented yet.
+- Audio output is not resampled, so the device must accept the game's
+  sample rate. Six channels are mixed down to two where the device cannot
+  play six.
+- In the first 3D scene, which runs below full speed, the game's sound comes
+  only in short pieces; this has not been looked into yet.
 
 ## Performance
 
 - Runs are below full speed. The console runs the game at 60 frames per
   second; here the opening movie averages about 52 pictures per second and
   the first 3D scene runs at about 7 frames per second.
-- Guest threads run on up to six host threads by default, one per
-  application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
+- Guest threads run on one host thread per CPU by default, at most six, one
+  per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its
   own (`ECHORA_REPLAY_INLINE=1` replays it on the submitting thread, as
-  before). In the first 3D scene that replay is now the limit: about 1,000
-  draws a frame at around 60 to 80 microseconds each.
-- The faster code-generation options (`inline-vector`, `structured`,
-  `fused-flags`) are off by default until they are checked in game.
+  before). In the first 3D scene that replay is now the limit: each draw
+  costs tens of microseconds to replay.
+- The faster code-generation options (`inline-vector`, `fused-flags`,
+  `whole-vector-checks`, `fp-status-locals`, `structured`) are off by default until they are checked in game.
 
 ## Platforms
 
@@ -65,9 +68,7 @@ to be missing or incomplete.
   or later), which needs 4 KiB host pages. On Windows, releasing part of a
   2 MiB memory chunk zeroes it but keeps its storage committed until the whole
   chunk is released.
-- Gamepads on Windows (gilrs) have not been tested on hardware. Audio output
-  does not resample, so the device must accept the game's rate and channel
-  count.
+- Gamepads on Windows (gilrs) have not been tested on hardware.
 
 ## Content input
 

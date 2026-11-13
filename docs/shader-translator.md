@@ -2,11 +2,11 @@
 
 The game's GPU programs are NVN2 programs: NVIDIA Ampere (SM 8.x, the
 Switch 2's T239) machine code with a control section. `echora-shader` is
-Echora's own translator, in Rust. Until it covers every program, an
-external translator plugin loaded at run time handles the rest
-([shader-plugin.md](shader-plugin.md)): a program the Rust translator
-handles uses its SPIR-V, anything else goes to the plugin, and a
-differential mode compares the two.
+Echora's own translator, in Rust. It translates every program the game has
+used so far, and is the default. An external translator plugin can still
+be loaded ([shader-plugin.md](shader-plugin.md)); it is used only when
+selected with `ECHORA_SHADER_TRANSLATOR=plugin`, and
+`ECHORA_SHADER_TRANSLATOR=compare` compares the two.
 
 ## Design stance
 
@@ -51,7 +51,9 @@ goals first-class, next to correctness:
   interface fills the same types.
 - `echora_shader::translate(program, &Parameters) -> Result<Translated,
   Unsupported>`: pure, no callbacks. `Parameters` carries what the program
-  does not (only the stage slot a task or mesh program is bound as);
+  does not: the stage slot a task or mesh program is bound as, the mesh
+  state, compute sizes the control section leaves out, and how HMMA
+  translates;
   `Unsupported` names the first unhandled instruction or feature and its
   offset. `Translated` lists the specialization constants and push
   constants it reads.
@@ -79,7 +81,7 @@ goals first-class, next to correctness:
   normalized, integer, float or scaled numbers), bit-exact for integers.
   Index buffers stay fixed-function.
 
-## Plan
+## Order of work (done)
 
 1. **Decoder**: 128-bit words into typed instructions; unsupported forms are
    `Op::Unknown` with the raw bits, never a panic.
@@ -249,7 +251,9 @@ programs (their function inlined; a mesh program's outputs shared by the
 workgroup) and reports the mesh output counts, indices and positions or
 the emitted task groups.
 
-**Matrix multiply.** HMMA runs on the subgroup: each lane gathers its A
+**Matrix multiply.** Where the device has cooperative matrices at 16x16x16
+(half and 32-bit accumulators), HMMA uses them by default; otherwise, or
+with ECHORA_HMMA=subgroup, it runs on the subgroup: each lane gathers its A
 row from its own quad and its B columns from the quads of lanes 8t and
 8t + 4. Half products are exact in 32-bit floats and are summed in k
 order with 32-bit round-to-nearest; a half result is rounded once at the
@@ -270,13 +274,15 @@ run as one multiply: the second's B and C fill columns 8-15 and its D is
 read from there, halving the multiplies and the scratch traffic.
 Scratch addresses are a per-lane base (computed once where it reaches)
 plus a constant. `MatrixPath::Cooperative32` (`MatrixMode::Cooperative32`,
-under test behind ECHORA_HMMA=coop32) stores each fragment register
+the default where the device has cooperative matrices; ECHORA_HMMA=coop16
+stages halves instead) stores each fragment register
 whole: a register's two halves are adjacent in A's rows and B's columns,
 so A goes row-major and B column-major into a word scratch, 8 words a
 line, and the half matrices are loaded through word pointers (the stride
 counts the pointer's elements, as Mesa's lowering reads the extension); a
 half C and D go as A does. A simulator test checks it gives the same D
-bits as `Cooperative`; it stays off by default until the GPU agrees.
+bits as `Cooperative`, and the movie's pictures came out identical on the
+GPU.
 With `MatrixPath::Exact` (`Parameters::matrix_mode` `MatrixMode::Exact`)
 the subgroup path sums like the A100's tensor cores as published (Fasi,
 Higham, Mikaitis and Pranesh, 2021; Khattak and Mikaitis, 2025): each
@@ -435,7 +441,7 @@ atomic (vertexPipelineStoresAndAtomics, fragmentStoresAndAtomics), and
 `Options::dual_source_blend` needs dualSrcBlend. `requirements::missing`
 turns the first feature a device lacks into a refusal naming it, so the
 runtime can refuse such a program before pipeline creation instead of
-failing validation; the survey example totals the requirements over a
+failing validation (it does not use this yet); the survey example totals the requirements over a
 dump.
 
 **Denormals.** The hardware keeps 32-bit denormals in float operations
@@ -458,8 +464,7 @@ applied to the bits, so no 32-bit float operation meets a denormal. FMUL
 with a scale, `.DNZ` and directed rounding stay as before. Each such
 instruction adds about 70 (FADD, FMUL) or 110 (FFMA) SPIR-V instructions,
 of which only the 32-bit operation and about 20 integer tests run without
-denormals. The flag is off until the runtime says the device has
-`shaderFloat64`. The simulator models a flushing host with
+denormals. The runtime does not turn the flag on yet. The simulator models a flushing host with
 `Inputs::flush_denormals32` and runs 64-bit floats.
 
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
@@ -483,14 +488,13 @@ plain structured code, so the output aims for that:
   A texture pool handle's index, sampler, float view and integer flag
   are reused in the same way across samples through that handle.
 
-An optional spirv-opt pass (its performance recipe) sits behind a switch
-and is measured against the unoptimised output before it becomes a
-default.
+An optional spirv-opt pass (its performance recipe) is planned, to be
+measured against the unoptimised output before it becomes a default.
 
 **Verification.** Unit tests per form (words built from known fields,
 decoded and compared); on the user's machine, nvdisasm (CUDA toolkit) as a
-decode oracle, and a differential translation of the ~6,200 dumped game
-stages against Lichii (spirv-val, a driver compile, and where the two
+decode oracle, and a differential translation of the dumped game
+stages against a plugin translator (`shader-check --compare`; spirv-val, a driver compile, and where the two
 differ, finding out which is right). No game data is in the repository.
 
 ## Decoded so far

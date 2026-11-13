@@ -1,9 +1,11 @@
 # Shader translator plugins
 
 Echora turns the game's GPU programs into SPIR-V with its own translator,
-`echora-shader` (see [shader-translator.md](shader-translator.md)). Until
-that translator handles every program, an external translator can be
-loaded at run time as a plugin, for the programs it does not handle yet.
+`echora-shader` (see [shader-translator.md](shader-translator.md)), which
+handles every program the game has used so far. An external translator
+can still be loaded at run time as an optional plugin, to compare with or
+to fall back on. It is used only when selected with
+`ECHORA_SHADER_TRANSLATOR=plugin` (or `compare`).
 No plugin is part of this repository; one is built and installed
 separately, under its own license.
 
@@ -11,7 +13,8 @@ separately, under its own license.
 
 The runtime loads `ECHORA_SHADER_PLUGIN` (a shared library path), else
 `echora/shader-plugin.so` in the cache directory (`$XDG_CACHE_HOME`, or
-`~/.cache`). Plugins load on Linux only. A plugin built for a different
+`~/.cache`). Plugins load on Linux only. `echora run` sets
+`EDEN_NX2_TENSOR=1`, which a plugin may read to expand matrix multiplies. A plugin built for a different
 `echora_shader_abi::ABI_VERSION`, or whose input and output structs differ
 in size from Echora's, is not used.
 
@@ -19,8 +22,8 @@ in size from Echora's, is not used.
 
 | Value | Programs translated by |
 |---|---|
-| `plugin` (the default with a plugin) | the plugin |
-| `rust` (the default without one) | the Rust translator where it can, the plugin otherwise |
+| `rust` (the default) | the Rust translator where it can, an installed plugin otherwise |
+| `plugin` | the plugin |
 | `compare` | the plugin; how the Rust translator differs is reported |
 
 `shader-check --compare stage-*.code` makes the same comparison offline

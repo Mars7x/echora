@@ -57,9 +57,10 @@ confirmed against Echora's own runs rather than assumed:
 
 Confirmed in Echora so far: ZBIC segments in `main` (see below), symbol
 tables reached only through `DT_GNU_HASH`, and AV1 for the intro movie
-(decoded with rav1d). The mesh and task pipelines are translated by the
-shader recompiler and drawn through `VK_EXT_mesh_shader`, not yet checked
-against the console's output.
+(decoded on the GPU's video engine, with rav1d as the fallback). The mesh
+and task pipelines are translated by Echora's own shader translator and
+drawn through `VK_EXT_mesh_shader`, not yet checked against the console's
+output.
 
 ## ZBIC format
 
@@ -170,6 +171,10 @@ belongs on disk: `/tmp` is a RAM-backed tmpfs on the development machine.
 
 ## Mesh and task shaders
 
+Historical: this is the C++ shader recompiler Echora used before its own
+translator. It is no longer part of the repository (it can still be loaded
+as a plugin).
+
 The game's NVN table includes the whole `DrawMeshTasks` family, and the OoT
 bring-up notes say the opening uses `DrawMeshTasksIndirect`. The shader
 recompiler was first pinned to PokeDinner, which has no task or mesh
@@ -181,6 +186,10 @@ The RX 9070 XT (RADV) exposes task and mesh stages with subgroup size
 control 32-64.
 
 ## Recompiler pin: Lichii
+
+Historical: this is the C++ shader recompiler Echora used before its own
+translator. It is no longer part of the repository (it can still be loaded
+as a plugin).
 
 The pin moved from PokeDinner (`c3ce9bc`) to Lichii (`809fb3a`), an
 Eglantine fork that carries the task and mesh work and lowers more of OoT's

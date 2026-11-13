@@ -40,7 +40,8 @@ What works today:
   scene.
 - Echora's own shader translator, written in Rust, translates all 6,215
   shader stages the game has used in test runs so far. The old shader
-  recompiler is no longer needed.
+  recompiler is no longer needed. It can still be loaded as an optional
+  plugin, used only when selected ([shader plugins](docs/shader-plugin.md)).
 - The first 3D scene is drawn: the forest floor with its ground cover,
   plants, fireflies, mist with shafts of light, the canopy, and the Great
   Deku Tree, lit and shadowed by the game's own passes.
@@ -79,7 +80,7 @@ wrote Echora's own translator in Rust, for four reasons:
 - Shaders reach the game's real memory through a page table, the way the
   console's GPU sees it, instead of guesses.
 - Every shader can be translated without running the game, so they can all
-  be prepared before it starts and nothing stutters while you play.
+  be prepared before it starts. That step is not built yet.
 - The PC's own hardware, such as the matrix units the game's upscaler needs,
   can be used directly instead of being emulated step by step.
 - The whole project shares one language and one design.
@@ -130,9 +131,10 @@ interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
 Echora is written in pure Rust. Like any PC program it uses the system's own
-libraries for graphics, sound, input and windows, and the CPU video decoder
-it falls back on when a GPU can't decode the movies keeps hand-written
-assembly for speed. Anything that goes beyond what the
+libraries for graphics, sound, input and windows, and the Zstandard library
+it reads the game's compressed files with. The CPU video decoder it falls
+back on when a GPU can't decode the movies keeps hand-written assembly for
+speed. Anything that goes beyond what the
 console does, such as frame rates above 60 or ultrawide, will be kept in a
 separate layer of enhancements that can be turned off.
 
@@ -158,8 +160,8 @@ together.
 - Linux
 - Your own dump of the game (update 1.1.1), as a NUP file or a folder
 - A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
-- Rust 1.88 or newer, `git`, a C compiler, NASM, `pkg-config` and these
-  system libraries:
+- Rust 1.88 or newer (CI builds with 1.99.1), `git`, a C compiler, NASM,
+  `pkg-config` and these system libraries:
 
 ```sh
 # Ubuntu
@@ -168,8 +170,8 @@ sudo apt install build-essential nasm pkg-config libasound2-dev libudev-dev libx
 sudo dnf install gcc nasm pkgconf-pkg-config alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
 ```
 
-The C compiler and NASM are for the system libraries' bindings and the
-AV1 video decoder; Echora's own code is all Rust.
+The C compiler is for libzstd and the system libraries' bindings, and NASM
+for the AV1 decoder's assembly; Echora's own code is all Rust.
 
 ### Getting started
 

@@ -47,6 +47,7 @@ submission bytes ──► Parser::parse_temporal_unit ──► Vec<Output>
 - `video.rs`: plain-data mirrors of the `StdVideoAV1*` and
   `StdVideoDecodeAV1*` structures. Bitfield flags are plain bools and
   pointers are owned values; enums carry their Std numeric values.
+- `metadata.rs`: metadata OBUs, handed on as `Output::Metadata`.
 - `ivf.rs`: an IVF reader, for the test streams.
 - `examples/av1_headers.rs`: prints every picture's header and what
   changes from one picture to the next
@@ -129,6 +130,8 @@ Notes on values:
   of `reference_name_slot_indices` to DPB slots, and reads shown pictures
   back as NV12 at the guest's pitch. It refuses film grain and superres,
   so the caller falls back to rav1d.
+- Submissions are decoded in order on a decoder thread; a picture is
+  waited for when its pixels are first read.
 - The game's movies decode this way by default; `ECHORA_VIDEO_DECODE=cpu`
   (or `rav1d`) decodes them with rav1d instead. If the device has no AV1
   decode, or a decode fails, that movie continues on rav1d, and the log

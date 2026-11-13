@@ -1,5 +1,12 @@
 # Multi-core review: echora-runtime workers and synchronisation
 
+Status, 2026-11-13: this is a record of the review that led to today's
+design. The two-worker stall (finding 1) and the guest memory faults were
+fixed, and the game now runs on up to six workers by default. NVN calls no
+longer take the machine lock, `submit_unlocked` is gone, and submitted GPU
+work is replayed on a thread of its own. Line numbers and function names
+below are as they were then.
+
 A read-only review of how `echora-runtime` runs guest threads on several
 workers (`ECHORA_WORKERS`), looking for causes of the stall with two
 workers and the guest memory faults with three. Line numbers are for
@@ -390,7 +397,7 @@ worker's time), split by the main session's measurements at W=6: NVN
 | 6 | 1.45x | 1.92x |
 
 Moving NVN to its own lock cuts global hold time to 0.40 of what it was,
-as measured in the game (78.3 s to 32.5 s, 0.42 of it, with dea1c7f).
+as measured in the game (78.3 s to 32.5 s, 0.42 of it, with 6668766).
 The model then shows the next limit: workers wait on the NVN lock itself
 (56% of their time at six). So the next gain is NVN work that does not
 serialise all workers: per-object locks, or recording that only takes a

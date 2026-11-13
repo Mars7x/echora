@@ -17,6 +17,9 @@
 | `echora-gpu` | Vulkan on the host's driver: a triangle draw, a compute dispatch into a storage buffer, whole and partial clears read back; the shader library's ABI layout and short-program rejection; loop guards on SPIR-V; rational resolution scales and aspect-preserving presentation. |
 | `echora-launcher` | Installing a file or dump and reinstalling in place; an install that outlives its renamed and deleted source; the free-space message; accepting only the supported build; (ignored, with `ECHORA_TEST_NUP`) installing the real game without copying; reading `echora prepare`'s progress lines and the progress bar's weighting; GNOME button layouts; resize edges; directional focus (in-line preference, returning where a move came from); the spring curve; series titles. |
 | `echora` | `prepare`: counting built region crates from cargo's messages, when a translation counts as prepared (its runner, and no other build's stamp), build jobs. |
+| `echora-shader` | Instruction decoding from known fields; translations run in the simulator against models written apart from the translator (texture, half-float and branch forms, matrix multiplies on each path). |
+| `echora-shader-abi` | The push-constant block's field offsets, the descriptor layout and vertex formats. |
+| `echora-av1` | Header elements on hand-written bitstreams, and every picture checked against rav1d ([AV1 decoding](av1-decode.md#tests)). |
 | `echora-input` | evdev capability words, button mapping by position (with the xpad north/west swap), triggers, hats and sticks within the circle. |
 | `echora-audio` | Volume scaling and clamping; a bounded queue that plays silence on underrun. |
 
@@ -28,9 +31,10 @@ segment to be hash-checked and every module to carry MOD0 dynamic metadata
 with a counted symbol table.
 
 Shader translation is checked offline against the stages a run dumps
-(`ECHORA_SHADER_DIR`): `translate-dump` in `echora-gpu` translates each one
-and groups the failures by reason, and `shader-check` also compiles each
-translation on the host's Vulkan driver.
+(`ECHORA_SHADER_DIR`): `cargo run -p echora-shader --example survey -- DIR`
+translates each one with the Rust translator and ranks what it refuses, and
+`shader-check --compare` in `echora-gpu` also compiles them on the host's
+Vulkan driver. `translate-dump` and plain `shader-check` need a plugin.
 
 The running game is checked from its run reports and from presented frames
 saved with `ECHORA_CAPTURE_EVERY` ([development](development.md)). These
@@ -64,6 +68,8 @@ breaking its reference on purpose and seeing it fail.
 | `sync_stress` | Twelve guest threads on all six cores with mixed priorities, through the real Machine and scheduler at one to six workers: each round a counter increment under a user mutex (ArbitrateLock/Unlock, with a yield inside the section every other round), a turn in a ring on one address (WaitForAddress / SignalToAddress) and a barrier on a condition variable (WaitProcessWideKeyAtomic / SignalProcessWideKey). Checks every count exactly, the ring's order, that condition waits return with the mutex owned, and that the run ends (no lost wake-up). Two more modes add SetThreadCoreMask each round: threads moving themselves (then told the new core, by the one worker that serves it; thread 0 moves with its DisableCount set and must stay on its worker until it re-enables), and threads moving the next thread, often while it waits. |
 | `wait_timeouts` | At one to six workers, for WaitForAddress, WaitProcessWideKeyAtomic and WaitSynchronization: a thread times out (TimedOut, index -1 for handles, without the mutex for a condition variable) and leaves the queue, so a later signal for one waiter finds and wakes only the next waiter (the address signal's waiter count, the cleared key word, the exiting thread's handle), and nothing writes the timed-out thread's registers again. A condition waiter signaled while another thread holds the mutex still times out at its deadline (TimedOut, without the mutex, which its holder still owns). Then signals racing timeouts over 120 rounds of varying deadlines and delays: on an address the signal woke the waiter exactly when its wait returned 0; on a condition variable a wait returns 0 owning the mutex (only once the signaler releases it) or TimedOut without it. CancelSynchronization as Atmosphere's KThread::WaitCancel: a thread in WaitSynchronization returns Cancelled (index -1); a running thread, or one in an address or condition-variable wait, is not woken, and its next WaitSynchronization returns Cancelled once; and over 120 rounds of cancels racing timeouts, each cancel ends exactly one wait (the raced one or the next). |
 | `structure_semantics` | Every window's structured tree from `echora_lift::structure` (blocks, loops, ifs, dispatch, irreducible regions and their switches) run on the reference, against plain execution of the window: straight from every entry, and sliced, with every block an entry and the tree left and re-entered after a third of the blocks. |
+| `golden` | The default emission's hash, so a change to it is seen. |
+| `fp_status` | FPCR and FPSR in window locals against the plain path. |
 | `fused_flags` | Flag setters fused with their B.cond (`EmitOptions::fused_flags`, lifted with it on whatever the features): SUBS, CMP, CMN, ADDS (shifted, immediate, extended; 32 and 64 bits) and ANDS/TST before every condition, with successors that overwrite NZCV (must fuse) or need it: a CSEL in a successor, the SVC ending the program, a CCMP before the branch or in a successor, an indirect branch to a block reading NZCV (must not fuse). About 20,000 runs from states at every condition's edges, straight and sliced, against the reference. |
 
 The generated programs come from `build.rs` in `echora-aot-tests`, with
@@ -119,8 +125,10 @@ The cost of the runtime's machine lock across workers is modelled by a
 third benchmark, without the runtime or the game:
 
 ```
-cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6] [--hold US] [--nvn-lock global|own|none] [--fast F]]
+cargo bench -p echora-aot-tests --bench lock [-- [--workers 1,2,4,6] [--hold US] [--nvn-lock global|own|recording|split|none] [--fast F]]
 ```
+
+The other options are listed in `benches/lock.rs`.
 
 W workers on host threads run the arith kernel in slices, and after each
 slice do `--hold` microseconds of host work, split as the game's is
@@ -133,7 +141,8 @@ lock.
 
 Codegen choices that are off by default have features on `echora-aot-tests`
 that lift with them on: `inline-vector` (common vector operations as native
-code) and `structured` (each window's entries from its structured tree).
+code), `fused-flags`, `whole-vector-checks`, `fp-status-locals` and
+`structured` (each window's entries from its structured tree).
 Run the semantic suites with the feature to check a choice
 (`cargo test -p echora-aot-tests --release --features structured`; this one
 builds more slowly than the flat default), and the benchmark with it to
