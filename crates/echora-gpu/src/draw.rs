@@ -555,8 +555,10 @@ impl Renderer {
     pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
+        let mut since = std::time::Instant::now();
         let scale = self.attachment_scale(&draw.colors, draw.depth)?;
         self.bound_submission()?;
+        self.lap("stat: renderer ns submission", &mut since);
         let program = draw.program;
         // The texture pool's entries (writing them may flush).
         let pool = if program.pool {
@@ -612,7 +614,9 @@ impl Renderer {
         if matches!(draw.mesh, Some(MeshGroups::Indirect { .. })) {
             bytes += 32;
         }
+        self.lap("stat: renderer ns pool and views", &mut since);
         self.reserve(bytes, descriptors)?;
+        self.lap("stat: renderer ns reserve", &mut since);
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
         let mut writes: Vec<(
@@ -720,6 +724,7 @@ impl Renderer {
                 }
             }
         }
+        self.lap("stat: renderer ns uniforms storage textures", &mut since);
         let set = self.descriptor_set(program.layout)?;
         let texel_infos: Vec<[vk::BufferView; 1]> = writes
             .iter()
@@ -756,7 +761,7 @@ impl Renderer {
                 .device
                 .update_descriptor_sets(&descriptor_writes, &[])
         };
-
+        self.lap("stat: renderer ns descriptor set", &mut since);
         // Vertex streams and indices.
         let mut vertex_buffers = Vec::new();
         for stream in &draw.streams {
@@ -994,6 +999,7 @@ impl Renderer {
                 .to_bytes(),
             )
         };
+        self.lap("stat: renderer ns geometry pass state", &mut since);
         self.time_item(true);
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
@@ -1150,10 +1156,21 @@ impl Renderer {
             // The pass stays open for the next draw into the same targets.
         }
         self.time_item(false);
+        self.lap("stat: renderer ns commands", &mut since);
         Ok(written
             .into_iter()
             .map(|(key, offset, length)| (key, self.defer_ring_read(offset, length)))
             .collect())
+    }
+}
+
+impl Renderer {
+    /// Count the time since `since` under `name` and restart it (the
+    /// draw's phases, in the statistics).
+    fn lap(&mut self, name: &'static str, since: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        self.stat(name, (now - *since).as_nanos() as u64);
+        *since = now;
     }
 }
 
