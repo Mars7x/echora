@@ -188,6 +188,24 @@ impl Renderer {
     /// recorded or submitted work may read it is written after a flush.
     pub(crate) fn bind_pool(&mut self, entries: &[PoolEntry]) -> Result<vk::DescriptorSet, String> {
         self.texture_pool()?;
+        // The same entries as the last call, with no target made again
+        // since (a view of one would change): the set already holds them.
+        if let Some((last, changes, targets)) = &self.pool_cache
+            && *changes == self.target_changes
+            && last.len() == entries.len()
+            && last.iter().zip(entries).all(|(last, entry)| {
+                (last.texture, last.sampler) == (entry.texture, entry.sampler)
+                    && last.sampler_state == entry.sampler_state
+                    && last.source.same_as(&entry.source)
+            })
+        {
+            let targets = targets.clone();
+            self.stat("stat: texture pool sets unchanged", 1);
+            self.order_after_rendering(&targets)?;
+            let pool = self.texture_pool.as_mut().unwrap();
+            pool.in_use = true;
+            return Ok(pool.set);
+        }
         // (binding, index, view or sampler) for every entry, resolved
         // before the set is touched (views can upload).
         let mut wanted: Vec<(u32, u32, u64)> = Vec::new();
@@ -349,12 +367,14 @@ impl Renderer {
             pool.written.insert((array, index), handle);
         }
         pool.in_use = true;
+        self.pool_cache = Some((entries.to_vec(), self.target_changes, targets));
         Ok(set)
     }
 
     /// Entries holding any of `views` (an image about to be destroyed,
     /// after its work completed) become null again.
     pub(crate) fn forget_pool_views(&mut self, views: &[vk::ImageView]) {
+        self.pool_cache = None;
         let Some(pool) = self.texture_pool.as_mut() else {
             return;
         };

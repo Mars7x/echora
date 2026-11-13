@@ -178,6 +178,72 @@ pub enum TextureSource {
     },
 }
 
+impl TextureSource {
+    /// Whether two sources name the same texels: an upload by its key and
+    /// generation (its texels are cached under them and never compared).
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Target(a), Self::Target(b)) => a == b,
+            (
+                Self::TargetView {
+                    key,
+                    base_level,
+                    level_count,
+                    base_layer,
+                    layer_count,
+                },
+                Self::TargetView {
+                    key: other_key,
+                    base_level: other_base_level,
+                    level_count: other_level_count,
+                    base_layer: other_base_layer,
+                    layer_count: other_layer_count,
+                },
+            ) => {
+                (key, base_level, level_count, base_layer, layer_count)
+                    == (
+                        other_key,
+                        other_base_level,
+                        other_level_count,
+                        other_base_layer,
+                        other_layer_count,
+                    )
+            }
+            (
+                Self::Upload {
+                    key,
+                    generation,
+                    width,
+                    height,
+                    shape,
+                    format,
+                    ..
+                },
+                Self::Upload {
+                    key: other_key,
+                    generation: other_generation,
+                    width: other_width,
+                    height: other_height,
+                    shape: other_shape,
+                    format: other_format,
+                    ..
+                },
+            ) => {
+                (key, generation, width, height, shape, format)
+                    == (
+                        other_key,
+                        other_generation,
+                        other_width,
+                        other_height,
+                        other_shape,
+                        other_format,
+                    )
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The dimensionality of an image and its layers (or depth).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageShape {
@@ -248,6 +314,38 @@ pub struct Sampler {
     /// A texture view's mip levels (base, count) of an upload; not part of
     /// the Vulkan sampler (one guest sampler serves textures of any size).
     pub view_levels: Option<(u32, u32)>,
+}
+
+impl PartialEq for Sampler {
+    fn eq(&self, other: &Self) -> bool {
+        let components =
+            |mapping: vk::ComponentMapping| [mapping.r, mapping.g, mapping.b, mapping.a];
+        (
+            self.min_filter,
+            self.mag_filter,
+            self.mipmap,
+            self.base_level_only,
+            self.address,
+            self.lod.map(f32::to_bits),
+            self.compare,
+            self.border,
+            components(self.components),
+            self.format,
+            self.view_levels,
+        ) == (
+            other.min_filter,
+            other.mag_filter,
+            other.mipmap,
+            other.base_level_only,
+            other.address,
+            other.lod.map(f32::to_bits),
+            other.compare,
+            other.border,
+            components(other.components),
+            other.format,
+            other.view_levels,
+        )
+    }
 }
 
 impl Default for Sampler {

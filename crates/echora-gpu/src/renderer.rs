@@ -181,6 +181,9 @@ pub struct Renderer {
     pub gpu: Gpu,
     /// The texture pool's set (`crate::pool`), once a program reads it.
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
+    /// The texture pool entries last bound, the target changes then, and
+    /// the targets they read (`bind_pool`).
+    pub(crate) pool_cache: Option<(Vec<crate::pool::PoolEntry>, u64, Vec<vk::Image>)>,
     /// Counts for the runtime's statistics (`take_stats`).
     pub(crate) stats: HashMap<&'static str, u64>,
     /// Rendering passes ended, by the source line that ended them (for
@@ -510,6 +513,7 @@ impl Renderer {
             crate::timing::GpuTimer::from_env(device, period, valid_bits, [fence, spare.fence]);
         let mut renderer = Self {
             texture_pool: None,
+            pool_cache: None,
             stats: HashMap::new(),
             pass_ends: HashMap::new(),
             debug_buffers: Vec::new(),
