@@ -2333,6 +2333,7 @@ impl Nvn {
                 if let Some(object) = self.objects.get(&this).filter(|o| o.kind == "Texture") {
                     if let Some(identity) = self.texture_identity(this) {
                         self.objects.insert(retired_texture(identity), object.clone());
+                        self.object_generation += 1;
                     }
                 }
                 self.initialize(this, "Texture", builder).map_err(invalid)?;
@@ -2383,11 +2384,13 @@ impl Nvn {
                     self.finalized_storage.insert(this, identity);
                     let object = self.objects[&this].clone();
                     self.objects.insert(retired_texture(identity), object);
+                    self.object_generation += 1;
                 }
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);
                 }
                 self.objects.remove(&this);
+                self.object_generation += 1;
                 self.images.remove(&this);
                 write_shared(&self.recording).remove(&this);
                 return Ok(true);
