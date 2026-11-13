@@ -773,7 +773,9 @@ impl Renderer {
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(addressed_usage(
+                // INDIRECT_BUFFER: dispatches read their group counts here.
                 vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
                 addressable,
@@ -2593,7 +2595,9 @@ impl Renderer {
         let info = vk::BufferCreateInfo::default()
             .size(span)
             .usage(addressed_usage(
+                // INDIRECT_BUFFER: dispatches read their group counts here.
                 vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
                 addressable,
