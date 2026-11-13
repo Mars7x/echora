@@ -4785,12 +4785,23 @@ impl Nvn {
             .as_mut()
             .unwrap()
             .page_build
-            .take()
-            .filter(|built| built.first == first && built.entries.len() == count)
-            .filter(|built| {
-                let current: std::collections::HashSet<_> = signatures.iter().map(|(pool, _)| *pool).collect();
-                built.pools.keys().all(|pool| current.contains(pool))
-            });
+            .take();
+        let current: std::collections::HashSet<_> =
+            signatures.iter().map(|(pool, _)| *pool).collect();
+        let whole = match &previous {
+            None => Some("stat: page table built whole (first)"),
+            Some(built) if built.first != first || built.entries.len() != count => {
+                Some("stat: page table built whole (extent)")
+            }
+            Some(built) if !built.pools.keys().all(|pool| current.contains(pool)) => {
+                Some("stat: page table built whole (pool gone or moved)")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = whole {
+            self.gpu.as_mut().unwrap().stat(reason, 1);
+        }
+        let previous = previous.filter(|_| whole.is_none());
         let mut built_pools = HashMap::new();
         let mut entries = match previous {
             Some(built) => {
@@ -4804,6 +4815,12 @@ impl Nvn {
                 continue;
             }
             let (base, size, gpu, flags) = pool;
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat("stat: page table pools mapped", 1);
+            if built_pools.contains_key(&pool) {
+                backend.stat("stat: page table pools mapped again", 1);
+                backend.stat("stat: page table bytes mapped again", size);
+            }
             let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
                 ..((gpu + size).div_ceil(PAGE_SIZE) - first).min(count as u64) as usize;
             if let Some(range) = entries.get_mut(pages.clone()) {
