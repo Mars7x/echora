@@ -345,6 +345,8 @@ pub struct Machine {
     /// NVN calls workers made without the machine lock (see
     /// `Worker::held_nvn_call`).
     lock_free_nvn_calls: u64,
+    /// Yields returned without the machine lock (`Worker::quiet_yield`).
+    lock_free_yields: u64,
     /// Of those, calls recorded on command buffers without even the NVN
     /// state's lock (see `Worker::recorded_nvn_call`).
     recorded_nvn_calls: u64,
@@ -452,6 +454,7 @@ impl Machine {
             boundary_kinds: vec![0; 0x84],
             boundary_held: vec![0; 0x84],
             lock_free_nvn_calls: 0,
+            lock_free_yields: 0,
             recorded_nvn_calls: 0,
             nvn_lock_stats: [0; 2],
             nvn_thread_wait: BTreeMap::new(),
@@ -2854,6 +2857,8 @@ impl Machine {
                         lock_free_calls: 0,
                         recorded_calls: 0,
                         nvn_lock_micros: [0; 2],
+                        quiet_yields_until: None,
+                        lock_free_yields: 0,
                     };
                     std::thread::Builder::new()
                         .name(format!("guest-worker-{index}"))
@@ -3099,6 +3104,7 @@ impl Machine {
                 {
                     self.lock_stats = [0; 3];
                     self.lock_free_nvn_calls = 0;
+                    self.lock_free_yields = 0;
                     self.recorded_nvn_calls = 0;
                     self.nvn_lock_stats = [0; 2];
                     self.nvn_thread_wait.clear();
@@ -4641,7 +4647,7 @@ impl Machine {
             "steps":self.core.steps,
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
-            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
+            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
                 (boundary_kind_name(kind), *count)
@@ -4933,6 +4939,13 @@ struct Worker {
     recorded_calls: u64,
     /// Their microseconds waiting for the NVN state's lock and holding it.
     nvn_lock_micros: [u64; 2],
+    /// Until when a yield (SleepThread 0, -1 or -2) returns at once without
+    /// the machine lock: the last one taken under it found nothing else to
+    /// run here and kept this thread (games yield in spin loops thousands of
+    /// times a frame, and each took the lock).
+    quiet_yields_until: Option<std::time::Instant>,
+    /// Yields returned that way since the lock was last taken.
+    lock_free_yields: u64,
 }
 
 /// NVN entry points that stay under the machine lock: present publishes
@@ -5057,10 +5070,31 @@ fn boundary_kind_name(kind: usize) -> String {
     }
 }
 
+/// How long yields return without the machine lock after one that kept its
+/// thread (see `Worker::quiet_yield`).
+const QUIET_YIELDS: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// Parked workers recheck waits and deadlines at least this often.
 const PARKED_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
 
 impl Worker {
+    /// SleepThread trapped: when it is a yield and the last yield under the
+    /// lock kept this thread a moment ago (no preemption asked since), it
+    /// returns now, past the SVC, as that yield would again.
+    fn quiet_yield(&mut self) -> bool {
+        let yields = (-2..=0).contains(&(self.core.cpu.regs[0] as i64));
+        let quiet = self
+            .quiet_yields_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if !yields || !quiet || self.core.preempt.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.core.settle_block_trap();
+        self.core.cpu.pc = self.core.cpu.pc.wrapping_add(4);
+        self.lock_free_yields += 1;
+        true
+    }
+
     fn run(
         mut self,
         shared: &Shared,
@@ -5105,6 +5139,7 @@ impl Worker {
                         Err(Trap::MissingBlock { pc })
                             if self.recorded_nvn_call(shared, pc)
                                 || self.held_nvn_call(shared, pc) => {}
+                        Err(Trap::SupervisorCall { number: 0x0b }) if self.quiet_yield() => {}
                         result => break result,
                     }
                 };
@@ -5122,6 +5157,7 @@ impl Worker {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let held = std::time::Instant::now();
                 machine.lock_free_nvn_calls += std::mem::take(&mut self.lock_free_calls);
+                machine.lock_free_yields += std::mem::take(&mut self.lock_free_yields);
                 machine.recorded_nvn_calls += std::mem::take(&mut self.recorded_calls);
                 let [nvn_waited, nvn_held] = std::mem::take(&mut self.nvn_lock_micros);
                 machine.nvn_lock_stats[0] += nvn_waited;
@@ -5156,6 +5192,7 @@ impl Worker {
                     time[1] += (held - waited).as_micros() as u64;
                 }
                 let kind = boundary_kind(&result);
+                let yielded = kind == 0x0b && (-2..=0).contains(&(self.core.cpu.regs[0] as i64));
                 let host_call = match &result {
                     Err(Trap::MissingBlock { pc }) if machine.nvn.has_entry(*pc) => Some(*pc),
                     _ => None,
@@ -5200,6 +5237,12 @@ impl Worker {
                             0
                         };
                         self.swap_out(&mut machine, true);
+                        // A yield that kept this thread: the next ones for a
+                        // moment return without the lock (a thread made
+                        // runnable here meanwhile waits that long at most).
+                        self.quiet_yields_until = (yielded
+                            && self.core.current_thread_id == thread)
+                            .then(|| std::time::Instant::now() + QUIET_YIELDS);
                         drop(machine);
                         shared.wake_workers(spare);
                         continue;
