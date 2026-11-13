@@ -3776,6 +3776,10 @@ impl Nvn {
                 let mut report = [0u8; 16];
                 if command.x[1] & 0xffff_ffff == 1 {
                     report[..8].copy_from_slice(&self.render.samples_passed.to_le_bytes());
+                } else if debug_var_os("ECHORA_TIMESTAMP_IN_COUNTER").is_some() {
+                    // Debugging: timestamp counters carry the time in their
+                    // value word too (which consumer reads which word).
+                    report[..8].copy_from_slice(&timestamp.to_le_bytes());
                 }
                 report[8..].copy_from_slice(&timestamp.to_le_bytes());
                 core.memory.write(to, &report)?;
