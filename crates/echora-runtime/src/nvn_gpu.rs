@@ -6278,20 +6278,30 @@ impl Nvn {
     }
 
     /// The buffer and offset that share `length` guest bytes at `guest` with
-    /// the GPU in place, when they lie in a shared memory pool and the span
-    /// imports; None otherwise (the caller copies).
+    /// the GPU in place, when they lie in a shared memory pool, or in one
+    /// piece of a pool shared in pieces, and the span imports; None
+    /// otherwise (the caller copies).
     fn shared_binding(
         &mut self,
         guest: u64,
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
         let backend = self.gpu.as_mut().unwrap();
-        let Some((file, offset)) = backend
+        let within = |start: u64, size: u64| start <= guest && guest + length <= start + size;
+        let found = backend
             .shared_pools
             .iter()
-            .find(|(base, (size, _, _))| **base <= guest && guest + length <= **base + *size)
+            .find(|(base, (size, _, _))| within(**base, *size))
             .map(|(base, &(_, file, offset))| (file, offset + (guest - base)))
-        else {
+            .or_else(|| {
+                backend.shared_pieces.iter().find_map(|(base, pieces)| {
+                    pieces
+                        .iter()
+                        .find(|&&(at, size, ..)| within(base + at, size))
+                        .map(|&(at, _, file, offset)| (file, offset + (guest - base - at)))
+                })
+            });
+        let Some((file, offset)) = found else {
             return Ok(None);
         };
         backend.renderer.import_file(file, offset, length)
