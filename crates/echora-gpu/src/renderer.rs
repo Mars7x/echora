@@ -275,6 +275,10 @@ pub struct Renderer {
     spare: Slot,
     /// The recorded slot's previous submission has not been waited for.
     current_in_flight: bool,
+    /// Serial (`flushes` at submission) of the recorded slot's last
+    /// submission, and the highest serial known to have completed.
+    current_serial: u64,
+    completed_serial: u64,
     /// Labels of the last submission (ECHORA_SLOW_SUBMITS reports them).
     submitted_labels: Vec<String>,
     /// Render targets created, and recreated because their shape changed.
@@ -347,6 +351,8 @@ struct Slot {
     retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
+    /// Serial of its last submission.
+    serial: u64,
 }
 
 /// Draws and dispatches one submission may hold (see `bound_submission`).
@@ -466,6 +472,7 @@ impl Renderer {
             retired_texel_buffers: Vec::new(),
             retired_shared: Vec::new(),
             in_flight: false,
+            serial: 0,
         };
         // SAFETY: the physical device belongs to the live instance.
         let (period, valid_bits) = unsafe {
@@ -542,6 +549,8 @@ impl Renderer {
             hazard_barriers: 0,
             spare,
             current_in_flight: false,
+            current_serial: 0,
+            completed_serial: 0,
             submitted_labels: Vec::new(),
             occlusion: None,
             condition: None,
@@ -1963,6 +1972,35 @@ impl Renderer {
         Ok(())
     }
 
+    /// Serial of the submission that holds everything recorded so far:
+    /// `wait_for` with it waits for that work and no later work.
+    pub fn recorded_serial(&self) -> u64 {
+        self.flushes + u64::from(self.recording)
+    }
+
+    /// Wait until the submission with this serial (and every earlier one)
+    /// has completed. Work recorded after it keeps running; when the serial
+    /// is still being recorded this is `flush`.
+    pub fn wait_for(&mut self, serial: u64) -> Result<(), String> {
+        if serial <= self.completed_serial {
+            return Ok(());
+        }
+        if serial > self.flushes {
+            return self.flush();
+        }
+        // Submitted: only the spare slot can still be running (the recorded
+        // one was waited for before it became current again).
+        if self.current_in_flight {
+            self.finish_current()?;
+        }
+        if self.spare.in_flight {
+            self.swap_slot();
+            self.finish_current()?;
+            self.swap_slot();
+        }
+        Ok(())
+    }
+
     /// End of a frame: submit what was recorded without waiting for it, so
     /// the GPU renders this frame while the CPU prepares the next. Reads of
     /// results still go through `flush`, which waits.
@@ -2002,6 +2040,7 @@ impl Renderer {
         );
         std::mem::swap(&mut self.retired_shared, &mut spare.retired_shared);
         std::mem::swap(&mut self.current_in_flight, &mut spare.in_flight);
+        std::mem::swap(&mut self.current_serial, &mut spare.serial);
     }
 
     /// End and submit the current slot's command buffer.
@@ -2030,6 +2069,7 @@ impl Renderer {
         }
         self.recording = false;
         self.flushes += 1;
+        self.current_serial = self.flushes;
         self.work_items = 0;
         let labels = std::mem::take(&mut self.labels);
         // The one before stays beside it (`.prev`): with two submissions in
@@ -2115,6 +2155,7 @@ impl Renderer {
                 .map_err(vk_error("vkResetDescriptorPool"))?;
         }
         self.current_in_flight = false;
+        self.completed_serial = self.completed_serial.max(self.current_serial);
         self.flush_wait_microseconds += wait_start.elapsed().as_micros() as u64;
         if let Some(timer) = self.timer.as_mut() {
             timer.finished(&self.gpu.device, self.fence, self.flush_wait_microseconds);

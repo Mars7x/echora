@@ -1296,9 +1296,12 @@ impl Nvn {
                 let sync = self.object(this, "Sync").map_err(invalid)?;
                 let signaled = sync.state.contains_key("Signaled");
                 // A fence signals when the work before it has completed:
-                // the GPU's share of it too, not only its submission.
+                // the GPU's share of it too, not only its submission. Only
+                // the submission holding the fence is waited for; later
+                // work keeps running.
                 if signaled {
-                    self.gpu_finish().map_err(stop)?;
+                    let serial = sync.state.get("GpuSerial").map(|serial| serial.x[0]);
+                    self.gpu_wait_sync(serial).map_err(stop)?;
                 }
                 core.cpu.regs[0] = if signaled {
                     0
@@ -1567,16 +1570,16 @@ impl Nvn {
                     self.gpu_note(note);
                 }
                 self.object(x[1], "Sync").map_err(invalid)?;
-                let sync = self.objects.get_mut(&x[1]).unwrap();
                 if self.pending.get(&this).is_some_and(|work| !work.is_empty()) {
                     // Signaled when the queue's earlier work has run.
+                    let sync = self.objects.get_mut(&x[1]).unwrap();
                     sync.state.remove("Signaled");
                     self.pending
                         .get_mut(&this)
                         .unwrap()
                         .push_back(QueueItem::Fence { sync: x[1], args });
                 } else {
-                    sync.state.insert("Signaled".into(), args);
+                    self.signal_sync(x[1], args);
                 }
                 return Ok(true);
             }
@@ -2417,11 +2420,7 @@ impl Nvn {
                 let next = window.state["NextTexture"].x[0];
                 window.state.get_mut("NextTexture").unwrap().x[0] = (next + 1) % count;
                 core.memory.write_u32(x[2], next as u32)?;
-                self.objects
-                    .get_mut(&x[1])
-                    .unwrap()
-                    .state
-                    .insert("Signaled".into(), args);
+                self.signal_sync(x[1], args);
                 core.cpu.regs[0] = 0;
                 return Ok(true);
             }
@@ -3134,9 +3133,7 @@ impl Nvn {
                 QueueItem::Fence { sync, args } => {
                     let (sync, args) = (*sync, *args);
                     self.pending.get_mut(&queue).unwrap().pop_front();
-                    if let Some(object) = self.objects.get_mut(&sync) {
-                        object.state.insert("Signaled".into(), args);
-                    }
+                    self.signal_sync(sync, args);
                     progressed = true;
                 }
                 QueueItem::WaitSync { sync } => {
@@ -3634,14 +3631,13 @@ impl Nvn {
             // now. WaitSync(cmd, const NVNsync*): later commands wait for it;
             // an unsignaled sync would block the queue forever, so it stops.
             "nvnCommandBufferFenceSync" => {
-                let sync = self
-                    .objects
-                    .get_mut(&command.x[1])
+                self.objects
+                    .get(&command.x[1])
                     .filter(|object| object.kind == "Sync")
                     .ok_or_else(|| stop("fenced sync is not initialized".into()))?;
                 let mut args = Args::default();
                 args.x[..3].copy_from_slice(&command.x[1..4]);
-                sync.state.insert("Signaled".into(), args);
+                self.signal_sync(command.x[1], args);
                 Ok(())
             }
             "nvnCommandBufferWaitSync" => {
@@ -4588,6 +4584,18 @@ impl Nvn {
             if used != 0 {
                 self.use_command_memory(buffer, "CommandMemory", used);
             }
+        }
+    }
+
+    /// Signal a sync, noting the GPU submission that holds the work
+    /// before it (what a CPU wait on it has to wait for).
+    fn signal_sync(&mut self, sync: u64, args: Args) {
+        let serial = self.gpu_recorded_serial();
+        if let Some(object) = self.objects.get_mut(&sync) {
+            object.state.insert("Signaled".into(), args);
+            let mut recorded = Args::default();
+            recorded.x[0] = serial;
+            object.state.insert("GpuSerial".into(), recorded);
         }
     }
 

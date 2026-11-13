@@ -132,6 +132,9 @@ pub struct Backend {
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
     target_index: HashMap<u64, Vec<u64>>,
+    /// The render targets with more than one level, in the same index (a
+    /// texture over one of their levels resolves to them).
+    target_chains: Vec<u64>,
     target_index_stamp: Option<(u64, u64)>,
 }
 
@@ -208,6 +211,7 @@ impl Backend {
             shared_pieces: HashMap::new(),
             share_generation: 0,
             target_index: HashMap::new(),
+            target_chains: Vec::new(),
             target_index_stamp: None,
         }))
     }
@@ -1893,8 +1897,28 @@ impl Nvn {
             .collect();
         handles.sort_unstable();
         handles.dedup();
+        // Resolved handles are kept for the present as the draw path's
+        // bindings are (`binding_memo`, same stamp).
+        let stamp = (
+            self.texture_epoch,
+            self.gpu.as_ref().unwrap().renderer.target_changes,
+            self.binding_serial,
+            self.presented_frames,
+        );
+        if self.binding_memo.0 != stamp {
+            self.binding_memo = (stamp, Default::default());
+        }
         let mut entries = Vec::new();
         for handle in handles {
+            if let Some((source, sampler_state)) = self.binding_memo.1.get(&handle) {
+                entries.push(echora_gpu::pool::PoolEntry {
+                    texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
+                    sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
+                    source: source.clone(),
+                    sampler_state: *sampler_state,
+                });
+                continue;
+            }
             let Ok(texture) = self.handle_texture(handle) else {
                 self.gpu
                     .as_mut()
@@ -1908,9 +1932,20 @@ impl Nvn {
             ) {
                 self.resolve_storage(core, Some(base..base + size))?;
             }
+            // As the draw path does before it memoizes: GPU-written
+            // bytes under the texture come back first.
+            if let (Some(base), Some(size)) = (
+                self.texture_storage(texture),
+                self.texture_storage_size(texture),
+            ) {
+                self.resolve_storage(core, Some(base..base + size))?;
+            }
             let source = self.texture_source(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, &source);
+            self.binding_memo
+                .1
+                .insert(handle, (source.clone(), sampler_state));
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                 sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -2117,13 +2152,22 @@ impl Nvn {
             return;
         };
         let mut index: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut chains = Vec::new();
         for key in backend.renderer.target_keys() {
             if let Some(base) = self.texture_storage(key) {
                 index.entry(base).or_default().push(key);
             }
+            if backend
+                .renderer
+                .existing_target(key)
+                .is_some_and(|target| target.levels > 1)
+            {
+                chains.push(key);
+            }
         }
         let backend = self.gpu.as_mut().unwrap();
         backend.target_index = index;
+        backend.target_chains = chains;
         backend.target_index_stamp = Some((backend.renderer.target_changes, self.texture_epoch));
     }
 
@@ -2162,7 +2206,22 @@ impl Nvn {
         }
         let base = self.texture_storage(texture)?;
         let extent = extent?;
-        for key in renderer.target_keys() {
+        // The targets at this storage and those with levels, from the
+        // index when it is current (every target otherwise).
+        let candidates: Vec<u64> = if self.target_index_current() {
+            let backend = self.gpu.as_ref()?;
+            backend
+                .target_index
+                .get(&base)
+                .into_iter()
+                .flatten()
+                .chain(backend.target_chains.iter())
+                .copied()
+                .collect()
+        } else {
+            renderer.target_keys()
+        };
+        for key in candidates {
             let Some(target) = renderer.existing_target(key) else {
                 continue;
             };
@@ -3169,6 +3228,27 @@ impl Nvn {
         };
         backend.stat("stat: GPU waits for a CPU sync wait", 1);
         backend.renderer.flush()
+    }
+
+    /// Serial of the GPU submission holding everything recorded so far
+    /// (0 without a GPU).
+    pub(super) fn gpu_recorded_serial(&self) -> u64 {
+        self.gpu
+            .as_ref()
+            .map_or(0, |backend| backend.renderer.recorded_serial())
+    }
+
+    /// A CPU wait on a signaled sync: waits for the submission that held
+    /// the work before its fence, or for everything when that is unknown.
+    pub(super) fn gpu_wait_sync(&mut self, serial: Option<u64>) -> Result<(), String> {
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        backend.stat("stat: GPU waits for a CPU sync wait", 1);
+        match serial {
+            Some(serial) => backend.renderer.wait_for(serial),
+            None => backend.renderer.flush(),
+        }
     }
 
     pub(super) fn gpu_submit(&mut self) -> Result<(), String> {
@@ -6405,10 +6485,14 @@ impl Nvn {
                     }
                     DescriptorKind::UniformBuffer => {
                         let used = stage.cbuf_used_sizes[descriptor.index as usize].max(16);
-                        self.gpu.as_mut().unwrap().note(format!(
-                            "driver constant buffer {} read as zeros ({used} bytes, {:?} stage {:016x})",
-                            descriptor.index, stage.stage, keys_for_note.get(index).copied().unwrap_or(0)
-                        ));
+                        // Every draw takes this path: the note is formatted
+                        // only when tracing the flow.
+                        if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                            self.gpu.as_mut().unwrap().note(format!(
+                                "driver constant buffer {} read as zeros ({used} bytes, {:?} stage {:016x})",
+                                descriptor.index, stage.stage, keys_for_note.get(index).copied().unwrap_or(0)
+                            ));
+                        }
                         uniforms.insert((index, descriptor.binding), vec![0; used as usize]);
                     }
                     // Storage buffer i of graphics stage s (NVN numbering):
@@ -6740,15 +6824,17 @@ impl Nvn {
                 257..=4096 => "257-4096",
                 _ => "over 4096",
             };
-            backend.note(format!(
-                "instanced draw {} instances {bucket} base instance {}",
-                command.name.trim_start_matches("nvnCommandBuffer"),
-                if first_instance > 4096 {
-                    "over 4096".to_string()
-                } else {
-                    first_instance.to_string()
-                }
-            ));
+            if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                backend.note(format!(
+                    "instanced draw {} instances {bucket} base instance {}",
+                    command.name.trim_start_matches("nvnCommandBuffer"),
+                    if first_instance > 4096 {
+                        "over 4096".to_string()
+                    } else {
+                        first_instance.to_string()
+                    }
+                ));
+            }
             if super::debug_var_os("ECHORA_GPU_NO_INSTANCED").is_some() {
                 return Err(format!(
                     "{} is not drawn (ECHORA_GPU_NO_INSTANCED)",
@@ -7243,13 +7329,6 @@ impl Nvn {
         // The polygon state the draw binds (its address) and the props taken
         // for it, with their element's offset from that address (a nonzero
         // offset is another object's bag: the bound one has none).
-        let polygon_trace = format!(
-            "polygon bound {:#x?} props {polygon:?}",
-            self.render
-                .state
-                .get("BindPolygonState")
-                .map(|bind| bind.x[1])
-        );
         let depth_state = snapshot("BindDepthStencilState");
         let color_state = snapshot("BindColorState");
         let mask_state = snapshot("BindChannelMaskState");
@@ -7410,7 +7489,9 @@ impl Nvn {
                 .and_then(|texture| texture.builder.get("Format"))
                 .is_some_and(|format| format.x[0] as u32 == 53),
         };
-        if let Some([units, clamp, factor]) = fixed.depth_bias {
+        if let Some([units, clamp, factor]) = fixed.depth_bias
+            && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
+        {
             self.gpu.as_mut().unwrap().note(format!(
                 "polygon offset units {units} factor {factor} clamp {clamp}"
             ));
@@ -7712,6 +7793,13 @@ impl Nvn {
                 })
                 .collect();
             uniform_summary.sort();
+            let polygon_trace = format!(
+                "polygon bound {:#x?} props {polygon:?}",
+                self.render
+                    .state
+                    .get("BindPolygonState")
+                    .map(|bind| bind.x[1])
+            );
             let line = format!(
                 "trace draw {:016x}/{:016x} {polygon_trace} {:?} count {count} indices {:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
