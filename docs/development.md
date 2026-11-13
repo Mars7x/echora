@@ -85,6 +85,7 @@ read.
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
 | `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
+| `ECHORA_PAGE_TABLE=0` | Give translated programs an empty GPU page table, so their global memory reads return zeros (debugging). The page table is on by default. |
 
 **Translation**
 

@@ -4,8 +4,9 @@ Echora turns the game's GPU programs into SPIR-V with its own translator,
 `echora-shader` (see [shader-translator.md](shader-translator.md)), which
 handles every program the game has used so far. An external translator
 can still be loaded at run time as an optional plugin, to compare with or
-to fall back on. It is used only when selected with
-`ECHORA_SHADER_TRANSLATOR=plugin` (or `compare`).
+to fall back on: by default an installed plugin gets only the programs the
+Rust translator refuses, and with `ECHORA_SHADER_TRANSLATOR=plugin` (or
+`compare`) it translates every program.
 No plugin is part of this repository; one is built and installed
 separately, under its own license.
 
@@ -14,7 +15,8 @@ separately, under its own license.
 The runtime loads `ECHORA_SHADER_PLUGIN` (a shared library path), else
 `echora/shader-plugin.so` in the cache directory (`$XDG_CACHE_HOME`, or
 `~/.cache`). Plugins load on Linux only. `echora run` sets
-`EDEN_NX2_TENSOR=1`, which a plugin may read to expand matrix multiplies. A plugin built for a different
+`EDEN_NX2_TENSOR=1`, which a plugin may read to expand matrix multiplies.
+A plugin built for a different
 `echora_shader_abi::ABI_VERSION`, or whose input and output structs differ
 in size from Echora's, is not used.
 

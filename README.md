@@ -41,7 +41,8 @@ What works today:
 - Echora's own shader translator, written in Rust, translates all 6,215
   shader stages the game has used in test runs so far. The old shader
   recompiler is no longer needed. It can still be loaded as an optional
-  plugin, used only when selected ([shader plugins](docs/shader-plugin.md)).
+  plugin, to compare with or for a program Echora's translator refuses
+  ([shader plugins](docs/shader-plugin.md)).
 - The first 3D scene is drawn: the forest floor with its ground cover,
   plants, fireflies, mist with shafts of light, the canopy, and the Great
   Deku Tree, lit and shadowed by the game's own passes.
