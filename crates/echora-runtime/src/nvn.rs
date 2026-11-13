@@ -523,6 +523,12 @@ pub struct Nvn {
     /// shaders.
     #[serde(skip)]
     flush_epoch: u64,
+    /// Commands a replay in pieces may still run before it stops
+    /// (`pump_queues`), and whether it stopped with work left.
+    #[serde(skip)]
+    replay_budget: Option<u32>,
+    #[serde(skip)]
+    replay_paused: bool,
     /// `program_memo` for mesh draws: by every BindProgram bit's arguments.
     #[serde(skip)]
     mesh_program_memo: (
@@ -1416,6 +1422,19 @@ const KINDS: &[&str] = &[
     "EventBuilder",
     "Event",
 ];
+
+/// Commands a replay runs before it lets other threads' NVN calls in
+/// (ECHORA_REPLAY_CHUNK, default 64; 0 runs it whole).
+fn replay_chunk() -> Option<u32> {
+    static CHUNK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let chunk = *CHUNK.get_or_init(|| {
+        std::env::var("ECHORA_REPLAY_CHUNK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64)
+    });
+    (chunk > 0).then_some(chunk)
+}
 
 /// Split "nvn<Kind><Rest>" into (kind, rest).
 fn split_name(name: &str) -> Option<(&'static str, &str)> {
@@ -2520,7 +2539,12 @@ impl Nvn {
                     _ => return Err(stop(format!("event signal mode {mode} is not modeled"))),
                 };
                 core.memory.write_u32(address, new)?;
-                self.pump_queues(core)?;
+                // The work it releases runs in pieces: the caller lets other
+                // threads' calls in between (`resume_replay`).
+                self.replay_budget = replay_chunk();
+                let pumped = self.pump_queues(core);
+                self.replay_budget = None;
+                pumped?;
                 return Ok(true);
             }
             // nvnEventInitialize(NVNevent*, const NVNeventBuilder*) ->
@@ -3360,17 +3384,39 @@ impl Nvn {
     /// at a wait that does not hold, and work another queue runs (a
     /// SignalEvent, a fence) may let it continue.
     fn pump_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        self.replay_paused = false;
         loop {
             let mut progressed = false;
             let queues: Vec<u64> = self.pending.keys().copied().collect();
             for queue in queues {
                 progressed |= self.run_queue(queue, core, false)?;
+                if self.replay_paused {
+                    return Ok(());
+                }
             }
             if !progressed {
                 self.pending.retain(|_, work| !work.is_empty());
                 return Ok(());
             }
         }
+    }
+
+    /// Whether a replay stopped after its piece (`replay_budget`) has work
+    /// left that `resume_replay` continues.
+    pub fn replay_paused(&self) -> bool {
+        self.replay_paused
+    }
+
+    /// Continue a replay that stopped after its piece, for another piece:
+    /// the caller drops the NVN state lock between pieces, so other
+    /// threads' calls (recording, texture setup) run meanwhile, as the CPU
+    /// does while the GPU works.
+    pub fn resume_replay(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        self.replay_budget = replay_chunk();
+        let pumped = self.pump_queues(core);
+        self.replay_budget = None;
+        self.publish_resolve_state();
+        pumped
     }
 
     /// Run all queued work, waits that do not hold included (counted in
@@ -3445,6 +3491,15 @@ impl Nvn {
     fn run_queue_work(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
         let mut progressed = false;
         loop {
+            // A replay in pieces (`replay_budget`) stops here when its piece
+            // is done; `resume_replay` goes on from this item.
+            if let Some(budget) = self.replay_budget.as_mut() {
+                if *budget == 0 {
+                    self.replay_paused = true;
+                    return Ok(progressed);
+                }
+                *budget -= 1;
+            }
             let Some(item) = self
                 .pending
                 .get_mut(&queue)

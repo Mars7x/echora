@@ -3041,6 +3041,9 @@ impl Machine {
             .is_some()
             .then(std::time::Instant::now);
         let handled = self.nvn.call(&name, &mut guest)?;
+        while self.nvn.replay_paused() {
+            self.nvn.resume_replay(&mut guest)?;
+        }
         if let Some(started) = profile {
             *self.nvn.call_microseconds.entry(name.clone()).or_default() +=
                 started.elapsed().as_micros() as u64;
@@ -5222,7 +5225,26 @@ impl Worker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let locked = std::time::Instant::now();
-        let made = self.held_nvn_call_locked(&mut nvn, pc);
+        let mut made = self.held_nvn_call_locked(&mut nvn, pc);
+        // A replay in pieces: the lock is let go between them, so other
+        // threads' calls are not held up by the whole replay.
+        while made && nvn.replay_paused() {
+            drop(nvn);
+            nvn = shared
+                .nvn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let counter = self.core.physical_counter_ticks();
+            let mut guest = crate::nvn::Guest {
+                cpu: &mut self.core.cpu,
+                memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
+                counter,
+            };
+            if let Err(trap) = nvn.resume_replay(&mut guest) {
+                self.held_failed = Some(Some(trap));
+                made = false;
+            }
+        }
         drop(nvn);
         self.nvn_lock_micros[0] += (locked - asked).as_micros() as u64;
         self.nvn_lock_micros[1] += locked.elapsed().as_micros() as u64;
