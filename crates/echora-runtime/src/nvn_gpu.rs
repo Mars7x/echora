@@ -2101,6 +2101,26 @@ impl Nvn {
     }
 
     pub(super) fn texture_storage(&self, texture: u64) -> Option<u64> {
+        // Remembered until an object is created or removed, a texture is
+        // initialized or finalized, or a virtual pool is remapped: the
+        // property walk below was a third of the draw path's time.
+        let generation = (self.object_generation, self.texture_epoch);
+        if let Ok(mut memo) = self.storage_memo.try_borrow_mut() {
+            if memo.0 != generation {
+                *memo = (generation, Default::default());
+            }
+            if let Some(found) = memo.1.get(&texture) {
+                return *found;
+            }
+        }
+        let found = self.texture_storage_uncached(texture);
+        if let Ok(mut memo) = self.storage_memo.try_borrow_mut() {
+            memo.1.insert(texture, found);
+        }
+        found
+    }
+
+    fn texture_storage_uncached(&self, texture: u64) -> Option<u64> {
         let storage = self.objects.get(&texture)?.builder.get("Storage")?;
         let pool = self.objects.get(&storage.x[0])?;
         let base = pool.builder.get("Storage")?.x[0];

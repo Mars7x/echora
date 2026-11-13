@@ -368,6 +368,13 @@ pub struct Nvn {
     /// a lookup misses (see `pool_for`).
     #[serde(skip)]
     pool_ranges: std::cell::RefCell<Vec<[u64; 6]>>,
+    /// Bumped whenever an object is created or removed, or a virtual pool
+    /// is remapped: what `texture_storage` answers can change only then.
+    #[serde(skip)]
+    object_generation: u64,
+    /// `texture_storage` answers by texture, at an object generation.
+    #[serde(skip)]
+    storage_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
     recording: Recordings,
@@ -1451,6 +1458,7 @@ impl Nvn {
                     }
                 }
                 self.pool_ranges.borrow_mut().clear();
+                self.object_generation += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -2107,6 +2115,7 @@ impl Nvn {
                 let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
                 self.objects.remove(&this);
+                self.object_generation += 1;
                 return Ok(true);
             }
             // nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const
@@ -2728,6 +2737,7 @@ impl Nvn {
                     self.pool_epoch += 1;
                 }
                 self.objects.remove(&this);
+                self.object_generation += 1;
                 return Ok(true);
             }
             _ => {}
@@ -4700,6 +4710,7 @@ impl Nvn {
         if self.objects.contains_key(&address) {
             return Err(format!("{kind} {address:#x} is already initialized"));
         }
+        self.object_generation += 1;
         self.objects.insert(
             address,
             Object {
