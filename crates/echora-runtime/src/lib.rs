@@ -43,6 +43,7 @@ pub mod services;
 pub mod settings;
 mod synchronization;
 mod threads;
+mod timeline;
 #[allow(clippy::unwrap_used)] // ported NVN code: unwraps follow presence checks
 pub mod window;
 

@@ -4957,6 +4957,12 @@ fn replay_thread(shared: &Shared, mut core: Core) {
     while !shared.stop.load(Ordering::Acquire) {
         let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
+        crate::timeline::span(
+            u64::MAX,
+            "replay-lock-wait",
+            asked,
+            std::time::Instant::now(),
+        );
         nvn.note_replay_thread_wait(asked.elapsed() + std::mem::take(&mut handed));
         let failed = shared
             .replay_failed
@@ -4973,6 +4979,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
             let started = std::time::Instant::now();
             let result = nvn.resume_replay(&mut guest);
             nvn.note_replay_thread(started.elapsed());
+            crate::timeline::span(u64::MAX, "replay", started, std::time::Instant::now());
             if let Err(trap) = result {
                 *shared
                     .replay_failed
@@ -5178,6 +5185,12 @@ impl Worker {
                 machine.thread_time.entry(thread).or_default()[2] +=
                     held.elapsed().as_micros() as u64;
                 machine.boundary_held[kind] += held.elapsed().as_micros() as u64;
+                if crate::timeline::on() {
+                    let now = std::time::Instant::now();
+                    crate::timeline::span(thread, "guest", ran, waited);
+                    crate::timeline::span(thread, "machine-lock-wait", waited, held);
+                    crate::timeline::span(thread, &boundary_kind_name(kind), held, now);
+                }
                 match outcome {
                     Ok(()) => {
                         machine.request_preemptions();
@@ -5509,6 +5522,11 @@ impl Worker {
                 _ => "other".into(),
             };
             nvn.note_held(&name, locked.elapsed());
+            if crate::timeline::on() {
+                let who = self.core.current_thread_id;
+                crate::timeline::span(who, "nvn-lock-wait", asked, locked);
+                crate::timeline::span(who, &name, locked, std::time::Instant::now());
+            }
         }
         drop(nvn);
         self.nvn_lock_micros[0] += (locked - asked).as_micros() as u64;

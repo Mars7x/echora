@@ -3330,6 +3330,7 @@ impl Nvn {
             self.replay_captured_frame(core, texture).map_err(stop)?;
         }
         self.presented_frames += 1;
+        crate::timeline::present(self.presented_frames);
         self.arm_call_watch();
         // ECHORA_PRESENT_RATE=N: every N presents, the count, the
         // seconds since the first present and the rate over those N.
