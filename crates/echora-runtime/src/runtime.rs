@@ -5387,6 +5387,7 @@ impl Worker {
                     Some(crate::nvn::HostEntry::Proc(name))
                         if needs_replayed(&name, &self.core.cpu.regs)
                 ));
+        let waited = (thread && settle && nvn.replay_paused()).then(std::time::Instant::now);
         while crate::nvn::Nvn::replay_async() && nvn.replay_paused() && (settle || !thread) {
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
@@ -5405,6 +5406,11 @@ impl Worker {
             drop(nvn);
             shared.hand_nvn_over();
             nvn = shared.lock_nvn();
+        }
+        if let Some(waited) = waited {
+            if let Some(crate::nvn::HostEntry::Proc(name)) = nvn.entry(pc) {
+                nvn.note_replay_wait(&name, waited.elapsed());
+            }
         }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         if thread && nvn.replay_paused() {

@@ -3460,6 +3460,29 @@ impl Nvn {
         *ON.get_or_init(|| std::env::var_os("ECHORA_REPLAY_THREAD").is_some())
     }
 
+    /// A call (`name`) waited for a replay to finish before it ran.
+    pub fn note_replay_wait(&mut self, name: &str, time: std::time::Duration) {
+        thread_local! {
+            static NAMES: std::cell::RefCell<HashMap<String, (&'static str, &'static str)>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        let (count, micros) = NAMES.with(|names| {
+            *names
+                .borrow_mut()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    (
+                        Box::leak(format!("stat: replay finished for {name}").into_boxed_str()),
+                        Box::leak(format!("stat: replay finished us for {name}").into_boxed_str()),
+                    )
+                })
+        });
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(count, 1);
+            backend.stat(micros, time.as_micros() as u64);
+        }
+    }
+
     /// The replay thread ran a piece for `time`.
     pub fn note_replay_thread(&mut self, time: std::time::Duration) {
         if let Some(backend) = self.gpu.as_mut() {
