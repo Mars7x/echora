@@ -1,10 +1,9 @@
 //! `echora prepare`: everything between a game and a runnable translation,
-//! so the launcher can set the game up with one command. It fetches the
-//! shader recompiler sources, lifts the game and builds the runner, and
-//! reports its progress on stdout in lines a front end can follow:
+//! so the launcher can set the game up with one command. It lifts the game
+//! and builds the runner, and reports its progress on stdout in lines a
+//! front end can follow:
 //!
 //! ```text
-//! echora-prepare: step fetch
 //! echora-prepare: step lift
 //! echora-prepare: step build
 //! echora-prepare: built 340 of 1111

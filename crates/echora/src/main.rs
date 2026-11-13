@@ -110,9 +110,8 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         region_bits: u32,
     },
-    /// Set the game up to run: fetch the shader recompiler, lift the game
-    /// and build its translation. Does nothing when this build of Echora
-    /// already prepared it.
+    /// Set the game up to run: lift the game and build its translation.
+    /// Does nothing when this build of Echora already prepared it.
     Prepare {
         input: PathBuf,
         /// Cache root (as for `import`).

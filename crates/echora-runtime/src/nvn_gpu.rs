@@ -38,7 +38,7 @@ pub struct Backend {
     /// Compute stage keys translated with raw storage pointers
     /// (`Parameters::native_pointers`).
     native_programs: std::collections::HashSet<u64>,
-    /// The GPU page table (ECHORA_PAGE_TABLE) and the pool set it was built
+    /// The GPU page table and the pool set it was built
     /// for (count, and the sum of their GPU addresses and sizes).
     page_table: Option<((usize, u64), echora_shader_abi::PageTable)>,
     /// The last page table built: its entries and, per pool (base, size,
@@ -4568,7 +4568,7 @@ impl Nvn {
                 .insert(key.0, (index, address, self.presented_frames));
         }
         // The GPU page table, for programs that read global memory through
-        // it (ECHORA_PAGE_TABLE).
+        // it.
         let page_table = if self.gpu.as_ref().unwrap().programs[&key]
             .stages
             .iter()
@@ -4963,7 +4963,8 @@ impl Nvn {
     }
 
     /// The GPU page table programs reach global memory through
-    /// (ECHORA_PAGE_TABLE; `echora_shader_abi::PageTable`), rebuilt when the
+    /// (`echora_shader_abi::PageTable`; ECHORA_PAGE_TABLE=0, debugging,
+    /// leaves it empty), rebuilt when the
     /// memory pools change. A host-visible pool's pages point into shared
     /// spans of guest memory (the CPU's bytes, coherent as on the console);
     /// a GPU-only pool's into its resident copy. A page the GPU cannot reach
@@ -4973,7 +4974,7 @@ impl Nvn {
         core: &mut Guest,
     ) -> Result<echora_shader_abi::PageTable, String> {
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
-        if super::debug_var_os("ECHORA_PAGE_TABLE").is_none() {
+        if super::debug_var_os("ECHORA_PAGE_TABLE").is_some_and(|value| value == "0") {
             return Ok(Default::default());
         }
         // Host-visible pools reach the GPU through the file spans presents

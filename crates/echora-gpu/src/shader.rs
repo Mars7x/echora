@@ -14,10 +14,11 @@ pub const MAX_DESCRIPTORS: usize = 64;
 /// Which translator turns a program into SPIR-V (ECHORA_SHADER_TRANSLATOR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Translator {
-    /// The external translator plugin (the default when one is installed).
+    /// The external translator plugin (ECHORA_SHADER_TRANSLATOR=plugin).
     Plugin,
     /// The Rust translator (`echora-shader`) for each program it handles,
-    /// the plugin for the rest (the default without a plugin).
+    /// the plugin for the rest: the default (it translates every stage the
+    /// game uses).
     Rust,
     /// Both: the plugin's program is used; what the Rust translator does
     /// differently is reported (`compare`).
@@ -31,7 +32,6 @@ impl Translator {
             Ok("rust") => Self::Rust,
             Ok("compare") => Self::Compare,
             Ok("plugin") => Self::Plugin,
-            _ if available() => Self::Plugin,
             _ => Self::Rust,
         }
     }
