@@ -857,6 +857,9 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     // Generated code is compiled at a moderate level; the guest crate, the
     // runtime it calls into and the runtime's AV1 decoder (several times
     // slower at level 1) get full optimization.
+    // The runtime's own crates (renderer, translator, decoders) at full
+    // optimization too; the region crates and echora-guest's dependencies
+    // are left as they are (changing those rebuilds every region).
     // `rpath` lets the runner find the bundles and the shared guest crate.
     // One codegen unit per crate: with a thousand region crates sharing the
     // cores, total CPU time decides the build, and splitting a region costs
@@ -868,7 +871,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
          [profile.release]\nopt-level = 1\ncodegen-units = 1\nrpath = true\n\n\
          [profile.release.package.echora-guest]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.echora-runtime]\nopt-level = 3\ncodegen-units = 16\n\n\
-         [profile.release.package.rav1d]\nopt-level = 3\ncodegen-units = 16\n",
+         [profile.release.package.rav1d]\nopt-level = 3\ncodegen-units = 16\n\n\
+         [profile.release.package.echora-gpu]\nopt-level = 3\n\n[profile.release.package.echora-shader]\nopt-level = 3\n\n[profile.release.package.echora-shader-abi]\nopt-level = 3\n\n[profile.release.package.echora-simd]\nopt-level = 3\n\n[profile.release.package.echora-av1]\nopt-level = 3\n\n[profile.release.package.echora-audio]\nopt-level = 3\n\n[profile.release.package.echora-loader]\nopt-level = 3\n\n[profile.release.package.echora-nup]\nopt-level = 3\n\n[profile.release.package.ash]\nopt-level = 3\n\n[profile.release.package.astc-decode]\nopt-level = 3\n\n[profile.release.package.miniz_oxide]\nopt-level = 3\n\n[profile.release.package.zstd]\nopt-level = 3\n\n[profile.release.package.unsafe-libopus]\nopt-level = 3\n\n[profile.release.package.sha2]\nopt-level = 3\n",
     )?;
     // Linking the bundles as shared libraries needs the standard library
     // linked dynamically too; on Unix the runner records where it lives.
