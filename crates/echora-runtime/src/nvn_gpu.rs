@@ -853,7 +853,13 @@ impl Nvn {
         let Some(path) = super::debug_var_os("ECHORA_CACHE_SIZES") else {
             return;
         };
-        if !self.presented_frames.is_multiple_of(600) {
+        // ECHORA_CACHE_SIZES_EVERY=N presents (600).
+        let every = super::debug_var("ECHORA_CACHE_SIZES_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(600)
+            .max(1);
+        if !self.presented_frames.is_multiple_of(every) {
             return;
         }
         let commands: usize = self

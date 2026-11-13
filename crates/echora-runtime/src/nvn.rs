@@ -2525,10 +2525,10 @@ impl Nvn {
                 if self.gpu().is_some() {
                     self.gpu_dump_targets().map_err(stop)?;
                 }
+                if self.gpu().is_some() {
+                    self.log_cache_sizes();
+                }
                 if let Some(directory) = debug_var_os("ECHORA_FRAME_DIR") {
-                    if self.gpu().is_some() {
-                        self.log_cache_sizes();
-                    }
                     // Reading back, encoding and hashing a frame costs more
                     // than rendering it: only every ECHORA_FRAME_EVERY-th
                     // present (default 60) and the first are written.
