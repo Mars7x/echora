@@ -629,7 +629,13 @@ impl Nvn {
         // Resolved bindings (`binding_memo`) change only with a texture's
         // bytes: one named, or one under the range. Descriptors are
         // registered, not read from the range.
-        self.flush_epoch += 1;
+        if self
+            .code_pools
+            .iter()
+            .any(|(&start, &size)| start < range.end && range.start < start + size)
+        {
+            self.flush_epoch += 1;
+        }
         if texture.is_some() {
             self.binding_serial += 1;
         }
@@ -1566,6 +1572,32 @@ impl Nvn {
     /// tessellation slot; a pass-through geometry program bound with it
     /// lists the per-primitive outputs.
     fn bound_mesh_program(
+        &mut self,
+        core: &Guest,
+    ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
+        // As `bound_program`: the same binds within a present and with no
+        // shader-code flush or program change since give the same stages.
+        let mut binds: Vec<(String, [u64; 8])> = self
+            .render
+            .state
+            .iter()
+            .filter(|(key, _)| key.starts_with("BindProgram@"))
+            .map(|(key, bind)| (key.clone(), bind.x))
+            .collect();
+        binds.sort_unstable();
+        let stamp = (self.presented_frames, self.flush_epoch);
+        if self.mesh_program_memo.0 != stamp {
+            self.mesh_program_memo = (stamp, HashMap::new());
+        }
+        if let Some(found) = self.mesh_program_memo.1.get(&binds) {
+            return Ok(found.clone());
+        }
+        let found = self.resolve_bound_mesh_program(core)?;
+        self.mesh_program_memo.1.insert(binds, found.clone());
+        Ok(found)
+    }
+
+    fn resolve_bound_mesh_program(
         &mut self,
         core: &Guest,
     ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
@@ -6300,9 +6332,10 @@ impl Nvn {
             .resident
             .get(&base)
             .is_some_and(|pool| {
+                let at = pool.gpu_dirty.partition_point(|dirty| dirty.end <= guest);
                 pool.gpu_dirty
-                    .iter()
-                    .any(|dirty| dirty.start <= guest && guest + length <= dirty.end)
+                    .get(at)
+                    .is_some_and(|dirty| dirty.start <= guest && guest + length <= dirty.end)
             });
         if uncached && !gpu_newer {
             self.resolve_resident(core, Some(guest..guest + length))?;
@@ -6344,15 +6377,9 @@ impl Nvn {
         } else {
             guest..guest + length
         };
-        let mut uploads = Vec::new();
-        for dirty in &pool.guest_dirty {
-            let piece = dirty.start.max(bound.start)..dirty.end.min(bound.end);
-            if piece.start < piece.end {
-                uploads.push(piece);
-            }
-        }
-        for piece in &uploads {
-            remove_range(&mut pool.guest_dirty, piece.clone());
+        let uploads = ranges_within(&pool.guest_dirty, bound.clone());
+        if !uploads.is_empty() {
+            remove_range(&mut pool.guest_dirty, bound);
         }
         for range in uploads {
             let length = range.end - range.start;
@@ -8624,35 +8651,45 @@ fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str
 }
 
 fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
+    // The list is sorted and disjoint: the ranges touching `range` are one
+    // run, found by binary search, and become one.
+    let low = ranges.partition_point(|existing| existing.end < range.start);
+    let high = ranges.partition_point(|existing| existing.start <= range.end);
     let mut merged = range;
-    ranges.retain(|existing| {
-        if existing.start <= merged.end && merged.start <= existing.end {
-            merged = merged.start.min(existing.start)..merged.end.max(existing.end);
-            false
-        } else {
-            true
-        }
-    });
-    let at = ranges.partition_point(|existing| existing.start < merged.start);
-    ranges.insert(at, merged);
+    if low < high {
+        merged = merged.start.min(ranges[low].start)..merged.end.max(ranges[high - 1].end);
+    }
+    ranges.splice(low..high, [merged]);
 }
 
-/// Remove `range` from a list of disjoint ranges.
+/// Remove `range` from a sorted list of disjoint ranges.
 fn remove_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
-    let mut kept = Vec::with_capacity(ranges.len() + 1);
-    for existing in ranges.drain(..) {
-        if existing.end <= range.start || range.end <= existing.start {
-            kept.push(existing);
-            continue;
-        }
-        if existing.start < range.start {
-            kept.push(existing.start..range.start);
-        }
-        if range.end < existing.end {
-            kept.push(range.end..existing.end);
-        }
+    let low = ranges.partition_point(|existing| existing.end <= range.start);
+    let high = ranges.partition_point(|existing| existing.start < range.end);
+    if low >= high {
+        return;
     }
-    *ranges = kept;
+    let mut kept = Vec::with_capacity(2);
+    if ranges[low].start < range.start {
+        kept.push(ranges[low].start..range.start);
+    }
+    if range.end < ranges[high - 1].end {
+        kept.push(range.end..ranges[high - 1].end);
+    }
+    ranges.splice(low..high, kept);
+}
+
+/// The parts of a sorted list of disjoint ranges inside `range`.
+fn ranges_within(
+    ranges: &[std::ops::Range<u64>],
+    range: std::ops::Range<u64>,
+) -> Vec<std::ops::Range<u64>> {
+    let low = ranges.partition_point(|existing| existing.end <= range.start);
+    ranges[low..]
+        .iter()
+        .take_while(|existing| existing.start < range.end)
+        .map(|existing| existing.start.max(range.start)..existing.end.min(range.end))
+        .collect()
 }
 
 /// Uploads from CPU-uncached pools up to this size keep a copy of their

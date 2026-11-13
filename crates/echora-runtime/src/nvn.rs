@@ -518,10 +518,20 @@ pub struct Nvn {
     /// draw. Registering a descriptor evicts the handles that name it.
     #[serde(skip)]
     binding_memo: ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>),
-    /// Bumped by every flush of guest memory (`gpu_invalidate`) and every
-    /// change of a program object or its shaders.
+    /// Bumped by every flush of guest memory over a SHADER_CODE pool
+    /// (`gpu_invalidate`) and every change of a program object or its
+    /// shaders.
     #[serde(skip)]
     flush_epoch: u64,
+    /// `program_memo` for mesh draws: by every BindProgram bit's arguments.
+    #[serde(skip)]
+    mesh_program_memo: (
+        (u64, u64),
+        HashMap<Vec<(String, [u64; 8])>, (gpu::BoundProgram, Vec<u32>, Vec<Args>)>,
+    ),
+    /// SHADER_CODE pools' guest storage (start, size).
+    #[serde(skip)]
+    code_pools: BTreeMap<u64, u64>,
     /// Bound programs draws resolved, by the two BindProgram arguments,
     /// with the vertex attribute snapshot they were resolved with; valid
     /// for a (present, flush epoch) (see `bound_program`).
@@ -1726,6 +1736,11 @@ impl Nvn {
                 self.next_gpu_address = (gpu + size)
                     .checked_next_multiple_of(GPU_ADDRESS_ALIGNMENT)
                     .ok_or_else(|| invalid("GPU address space exhausted".into()))?;
+                // SHADER_CODE (0x40): program code lives here; a flush over
+                // it resolves bound programs again (`program_memo`).
+                if builder.get("Flags").is_some_and(|flags| flags.x[0] & 0x40 != 0) {
+                    self.code_pools.insert(memory, size);
+                }
                 self.initialize(this, "MemoryPool", builder)
                     .map_err(invalid)?;
                 let pool = self.objects.get_mut(&this).unwrap();
@@ -3106,6 +3121,8 @@ impl Nvn {
                 if kind == "MemoryPool" {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
                     self.gpu_forget_pool(base);
+                    self.code_pools.remove(&base);
+                    self.flush_epoch += 1;
                     self.pool_epoch += 1;
                 }
                 if kind == "Sync" {
