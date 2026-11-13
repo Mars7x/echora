@@ -4767,14 +4767,26 @@ impl Nvn {
         if wanted.is_empty() {
             return Ok(());
         }
-        let mut tokens = Vec::new();
+        // One copy per pool, of all its pieces.
+        let mut by_pool: Vec<(u64, Vec<std::ops::Range<u64>>)> = Vec::new();
         for (base, piece) in &wanted {
-            let token = backend.renderer.read_resident(
-                *base,
-                piece.start - base,
-                piece.end - piece.start,
-            )?;
-            tokens.push((token, *base, piece.clone()));
+            match by_pool.iter_mut().find(|(known, _)| known == base) {
+                Some((_, pieces)) => pieces.push(piece.clone()),
+                None => by_pool.push((*base, vec![piece.clone()])),
+            }
+        }
+        let mut tokens = Vec::new();
+        for (base, pieces) in by_pool {
+            let ranges: Vec<(u64, u64)> = pieces
+                .iter()
+                .map(|piece| (piece.start - base, piece.end - piece.start))
+                .collect();
+            let read = backend.renderer.read_resident_ranges(base, &ranges)?;
+            tokens.extend(
+                read.into_iter()
+                    .zip(pieces)
+                    .map(|(token, piece)| (token, base, piece)),
+            );
         }
         backend.renderer.flush()?;
         // Only these: pending dispatch and draw results stay for
@@ -6349,6 +6361,19 @@ impl Nvn {
         guest: u64,
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        self.resident_pool_binding_for(core, guest, length, false)
+    }
+
+    /// `resident_pool_binding` for GPU work that writes all `length` bytes
+    /// before anything reads them (a counter report) when `overwritten`:
+    /// the guest's bytes there are neither stored back nor uploaded first.
+    fn resident_pool_binding_for(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+        length: u64,
+        overwritten: bool,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
         // A pool already mirrored first (no scan of every NVN object); a
         // pool finalized since is dropped with its buffer key reused only
         // by a pool at the same address and size.
@@ -6406,7 +6431,7 @@ impl Nvn {
                     .get(at)
                     .is_some_and(|dirty| dirty.start <= guest && guest + length <= dirty.end)
             });
-        if uncached && !gpu_newer {
+        if uncached && !gpu_newer && !overwritten {
             self.resolve_resident(core, Some(guest..guest + length))?;
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -6433,7 +6458,9 @@ impl Nvn {
                 gpu_dirty: Vec::new(),
             };
         }
-        if uncached && !gpu_newer {
+        if overwritten {
+            remove_range(&mut pool.guest_dirty, guest..guest + length);
+        } else if uncached && !gpu_newer {
             add_range(&mut pool.guest_dirty, guest..guest + length);
         }
         // Only what this binding can read goes up; the pool's other dirty
@@ -6482,7 +6509,8 @@ impl Nvn {
         timestamp: u64,
     ) -> Result<bool, String> {
         let guest = self.gpu_to_guest(address, 16)?;
-        let Some((buffer, offset)) = self.resident_pool_binding(core, guest, 16)? else {
+        // The report writes all 16 bytes (the count and the timestamp).
+        let Some((buffer, offset)) = self.resident_pool_binding_for(core, guest, 16, true)? else {
             return Ok(false);
         };
         let backend = self.gpu.as_mut().unwrap();

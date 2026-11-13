@@ -272,7 +272,7 @@ pub struct Renderer {
     /// render area): the next draw into the same attachments continues it
     /// instead of storing and loading them again. Any other recording
     /// (`commands`) ends it.
-    open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
+    pub(crate) open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
     completed_reads: Vec<(u64, Vec<u8>)>,
     next_read_token: u64,
     /// The other submission slot: while one slot's work runs on the GPU,
@@ -604,13 +604,19 @@ impl Renderer {
     /// End the rendering pass a draw left open, if any.
     #[track_caller]
     pub(crate) fn end_pass(&mut self) {
-        if self.open_pass.take().is_some() {
+        if self.open_pass.is_some() {
             *self
                 .pass_ends
                 .entry(std::panic::Location::caller())
                 .or_default() += 1;
+            // A segment counting samples inside the pass ends in it.
+            let counting = self.occlusion_pass_ends(self.commands);
+            self.open_pass = None;
             // SAFETY: recording, inside the pass begun by `begin_rendering`.
             unsafe { self.gpu.device.cmd_end_rendering(self.commands) };
+            if counting {
+                self.occlusion_pass_ended(self.commands);
+            }
         }
     }
 
@@ -1072,63 +1078,103 @@ impl Renderer {
     /// host: its token completes with the next flush (see
     /// `take_reads`).
     pub fn read_resident(&mut self, key: u64, at: u64, length: u64) -> Result<u64, String> {
+        Ok(self.read_resident_ranges(key, &[(at, length)])?[0])
+    }
+
+    /// `read_resident` of several `(at, length)` ranges of buffer `key`,
+    /// recorded as one copy between one pair of barriers (a frame's
+    /// copy-back reads hundreds of small pieces of a pool). One token per
+    /// range, in order.
+    pub fn read_resident_ranges(
+        &mut self,
+        key: u64,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<u64>, String> {
         let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
-        let length = length.min(size.saturating_sub(at));
-        let (target, offset) = self.ring_alloc(length, 16)?;
-        let commands = self.commands()?;
-        // Reports still pending are written first (they come before this
-        // read in command order; the batch is otherwise resolved only at
-        // submission, after the copy). A condition gating the resolve's
-        // dispatch ends first; the next draw begins it again.
-        self.end_condition();
-        self.occlusion_resolve(commands);
-        let before = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        let after = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ);
-        // SAFETY: recording outside rendering; both buffers are live.
-        unsafe {
-            let device = &self.gpu.device;
-            *self
-                .stats
-                .entry("stat: barriers in read_resident")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[before],
-                &[],
-                &[],
-            );
-            device.cmd_copy_buffer(
-                commands,
-                buffer,
-                target,
-                &[vk::BufferCopy {
+        let ranges: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|&(at, length)| (at, length.min(size.saturating_sub(at))))
+            .collect();
+        let mut tokens = Vec::with_capacity(ranges.len());
+        let mut first = 0;
+        while first < ranges.len() {
+            // As many ranges as one ring allocation holds (allocating them
+            // one by one could flush the ring between them).
+            let mut total = 0u64;
+            let mut last = first;
+            while last < ranges.len() {
+                let next = total.next_multiple_of(16) + ranges[last].1;
+                if next > RING_SIZE && last > first {
+                    break;
+                }
+                total = next;
+                last += 1;
+            }
+            let (target, base) = self.ring_alloc(total, 16)?;
+            let commands = self.commands()?;
+            // Reports still pending are written first (they come before
+            // this read in command order; the batch is otherwise resolved
+            // only at submission, after the copy). A condition gating the
+            // resolve's dispatch ends first; the next draw begins it again.
+            self.end_condition();
+            self.occlusion_resolve(commands);
+            let mut regions = Vec::with_capacity(last - first);
+            let mut offset = base;
+            for &(at, length) in &ranges[first..last] {
+                offset = offset.next_multiple_of(16);
+                regions.push(vk::BufferCopy {
                     src_offset: at,
                     dst_offset: offset,
                     size: length,
-                }],
-            );
-            *self
-                .stats
-                .entry("stat: barriers in read_resident")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[after],
-                &[],
-                &[],
-            );
+                });
+                offset += length;
+            }
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            let copied: Vec<vk::BufferCopy> = regions
+                .iter()
+                .copied()
+                .filter(|region| region.size != 0)
+                .collect();
+            // SAFETY: recording outside rendering; both buffers are live.
+            unsafe {
+                let device = &self.gpu.device;
+                *self
+                    .stats
+                    .entry("stat: barriers in read_resident")
+                    .or_default() += 2;
+                device.cmd_pipeline_barrier(
+                    commands,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+                if !copied.is_empty() {
+                    device.cmd_copy_buffer(commands, buffer, target, &copied);
+                }
+                device.cmd_pipeline_barrier(
+                    commands,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[after],
+                    &[],
+                    &[],
+                );
+            }
+            for region in regions {
+                tokens.push(self.defer_ring_read(region.dst_offset, region.size as usize));
+            }
+            first = last;
         }
-        Ok(self.defer_ring_read(offset, length as usize))
+        Ok(tokens)
     }
 
     /// Room for `size` bytes in the ring (flushing when it is full).
@@ -1210,6 +1256,7 @@ impl Renderer {
     /// The completed deferred reads among `tokens`, by token; other
     /// readers' results stay for them.
     pub fn take_reads(&mut self, tokens: &[u64]) -> HashMap<u64, Vec<u8>> {
+        let tokens: std::collections::HashSet<u64> = tokens.iter().copied().collect();
         let (mine, others) = std::mem::take(&mut self.completed_reads)
             .into_iter()
             .partition(|(token, _)| tokens.contains(token));
@@ -4497,7 +4544,12 @@ impl Renderer {
         }
         // SAFETY: recording; attachments are live and in GENERAL layout.
         *self.stats.entry("stat: render passes begun").or_default() += 1;
+        let counting = self.occlusion_pass_begins(commands);
+        // SAFETY: recording; attachments are live and in GENERAL layout.
         unsafe { self.gpu.device.cmd_begin_rendering(commands, &info) };
+        if counting {
+            self.occlusion_pass_begun(commands);
+        }
         self.open_pass = Some((views, depth_view, whole));
         Ok(())
     }

@@ -4,10 +4,12 @@
 //! NVN counts samples that pass the depth and stencil tests from
 //! ResetCounter(SAMPLES_PASSED) on, and ReportCounter(SAMPLES_PASSED,
 //! address) writes the count so far (NVNcounterData: the counter, then a
-//! timestamp). Here one occlusion query is active outside rendering passes
-//! from a reset until the next report or the end of the command buffer
-//! (queries cannot span command buffers): each report ends a segment and
-//! begins the next. Reading a query's result waits for the work before it,
+//! timestamp). Here one occlusion query is active from a reset until the
+//! next report or the end of the command buffer (queries cannot span
+//! command buffers): each report ends a segment and begins the next. A
+//! segment begun inside a rendering pass ends in it, and one begun outside
+//! ends before a pass begins, so a report inside a pass stays inside it
+//! (queries begun in a pass were reset before it). Reading a query's result waits for the work before it,
 //! so reports are not resolved one by one: a batch of them is resolved at
 //! once, before a condition is begun and before a submission (when the
 //! counts can next be read), by one copy of the batch's query results and
@@ -33,6 +35,8 @@ struct Pending {
     carry: bool,
     buffer: vk::Buffer,
     offset: u64,
+    /// Written beside the count when the batch resolves.
+    timestamp: u64,
 }
 
 pub(crate) struct Occlusion {
@@ -41,8 +45,13 @@ pub(crate) struct Occlusion {
     /// `i * QUERIES`; the next free one of each.
     fences: [vk::Fence; 2],
     next: [u32; 2],
-    /// The query counting now, in the command buffer being recorded.
+    /// The query counting now, in the command buffer being recorded, and
+    /// whether it began inside the open rendering pass.
     active: Option<u32>,
+    active_inside: bool,
+    /// Each slot's queries below this are reset (and those from `next`
+    /// on unused), so one can begin inside a rendering pass.
+    reset_upto: [u32; 2],
     /// Counting resumes in the next command buffer (a segment ended at a
     /// submission).
     resume: bool,
@@ -133,6 +142,8 @@ impl Occlusion {
             fences,
             next: [0; 2],
             active: None,
+            active_inside: false,
+            reset_upto: [0; 2],
             resume: false,
             batch_from: 0,
             reset_from: None,
@@ -202,6 +213,7 @@ impl Occlusion {
             );
         }
         self.next[slot] = 0;
+        self.reset_upto[slot] = 0;
         self.plan_next[slot] = 0;
         self.batch_from = slot as u32 * QUERIES;
         self.ended = self.batch_from;
@@ -215,26 +227,67 @@ impl Occlusion {
         self.next[slot] < QUERIES && self.plan_next[slot] + self.pending.len() as u32 + 2 < PLANS
     }
 
-    /// Start a segment: reset a query of this slot and begin it (outside
-    /// a rendering pass; the slot has room).
-    fn begin(&mut self, device: &ash::Device, commands: vk::CommandBuffer, fence: vk::Fence) {
+    /// Start a segment with the slot's next query (the slot has room):
+    /// reset first outside a rendering pass; `inside` one, it was reset
+    /// ahead (`can_begin_inside`).
+    fn begin(
+        &mut self,
+        device: &ash::Device,
+        commands: vk::CommandBuffer,
+        fence: vk::Fence,
+        inside: bool,
+    ) {
         let slot = self.slot(fence);
         let query = slot as u32 * QUERIES + self.next[slot];
         self.next[slot] += 1;
-        // SAFETY: recording, outside rendering; the query is this slot's
-        // and unused since the slot's queries were last freed.
+        // SAFETY: recording; the query is this slot's and unused since the
+        // slot's queries were last freed (reset here outside a pass, or
+        // ahead by `reset_ahead` for one inside).
         unsafe {
-            device.cmd_reset_query_pool(commands, self.pool, query, 1);
+            if !inside {
+                device.cmd_reset_query_pool(commands, self.pool, query, 1);
+            }
             device.cmd_begin_query(commands, self.pool, query, self.control);
         }
         self.active = Some(query);
+        self.active_inside = inside;
     }
 
-    /// End the active segment (outside a rendering pass); it joins the
-    /// batch.
+    /// Whether a segment can begin inside a rendering pass: the slot has
+    /// room and its next query was reset ahead.
+    fn can_begin_inside(&self, fence: vk::Fence) -> bool {
+        let slot = self.slot(fence);
+        self.has_room(fence) && self.next[slot] < self.reset_upto[slot]
+    }
+
+    /// Outside a rendering pass: reset the slot's next unused queries in
+    /// one command when few reset ones are left, for segments begun inside
+    /// passes.
+    fn reset_ahead(&mut self, device: &ash::Device, commands: vk::CommandBuffer, fence: vk::Fence) {
+        let slot = self.slot(fence);
+        let from = self.next[slot].max(self.reset_upto[slot]);
+        if from >= self.next[slot] + 256 || from >= QUERIES {
+            return;
+        }
+        let to = (self.next[slot] + 1024).min(QUERIES);
+        // SAFETY: recording, outside rendering; the queries are this
+        // slot's and unused since its queries were last freed.
+        unsafe {
+            device.cmd_reset_query_pool(
+                commands,
+                self.pool,
+                slot as u32 * QUERIES + from,
+                to - from,
+            )
+        };
+        self.reset_upto[slot] = to;
+    }
+
+    /// End the active segment (in the pass it began in, or outside one if
+    /// it began outside); it joins the batch.
     fn end(&mut self, device: &ash::Device, commands: vk::CommandBuffer) {
         if let Some(query) = self.active.take() {
-            // SAFETY: recording, outside rendering; the query is active.
+            // SAFETY: recording where the query began; it is active.
             unsafe { device.cmd_end_query(commands, self.pool, query) };
             self.ended = query + 1;
         }
@@ -356,6 +409,14 @@ impl Occlusion {
                 self.accumulator.buffer,
                 &[total],
             );
+            for report in &self.pending {
+                device.cmd_update_buffer(
+                    commands,
+                    report.buffer,
+                    report.offset + 8,
+                    &report.timestamp.to_le_bytes(),
+                );
+            }
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -400,10 +461,35 @@ impl Renderer {
     /// End the active segment and begin the next, resolving the batch
     /// first when the slot has no room for it.
     fn next_segment(&mut self, begin: bool) -> Result<(), String> {
+        // Inside a rendering pass when the active segment began in it and
+        // the next can (no resolve, its query reset ahead).
+        if self.open_pass.is_some() {
+            let fence = self.current_fence();
+            let device = self.gpu.device.clone();
+            let commands = self.recording_commands()?;
+            let occlusion = self.occlusion()?;
+            if (occlusion.active.is_none() || occlusion.active_inside)
+                && (!begin || occlusion.can_begin_inside(fence))
+            {
+                occlusion.end(&device, commands);
+                if begin {
+                    occlusion.resume = false;
+                    occlusion.begin(&device, commands, fence, true);
+                }
+                return Ok(());
+            }
+        }
         let commands = self.commands()?;
+        self.occlusion()?;
+        self.next_segment_outside(commands, begin);
+        Ok(())
+    }
+
+    /// `next_segment` outside a rendering pass (the occlusion state made).
+    fn next_segment_outside(&mut self, commands: vk::CommandBuffer, begin: bool) {
         let fence = self.current_fence();
         let device = self.gpu.device.clone();
-        let occlusion = self.occlusion()?;
+        let occlusion = self.occlusion.as_mut().expect("made by the caller");
         occlusion.end(&device, commands);
         if begin && !occlusion.has_room(fence) {
             self.end_condition();
@@ -431,9 +517,55 @@ impl Renderer {
         if begin {
             let occlusion = self.occlusion.as_mut().expect("made above");
             occlusion.resume = false;
-            occlusion.begin(&device, commands, fence);
+            occlusion.begin(&device, commands, fence, false);
         }
-        Ok(())
+    }
+
+    /// Before a rendering pass begins (outside it): queries are reset
+    /// ahead for segments inside it, and a segment counting ends, for the
+    /// next to begin inside (`occlusion_pass_begun`). True when one did.
+    pub(crate) fn occlusion_pass_begins(&mut self, commands: vk::CommandBuffer) -> bool {
+        let fence = self.current_fence();
+        let device = self.gpu.device.clone();
+        let Some(occlusion) = self.occlusion.as_mut() else {
+            return false;
+        };
+        occlusion.reset_ahead(&device, commands, fence);
+        if occlusion.active.is_some() && occlusion.can_begin_inside(fence) {
+            occlusion.end(&device, commands);
+            return true;
+        }
+        // Otherwise (no room) the segment spans the pass; a report in it
+        // ends the pass first.
+        false
+    }
+
+    /// After a rendering pass began: counting goes on inside it.
+    pub(crate) fn occlusion_pass_begun(&mut self, commands: vk::CommandBuffer) {
+        let fence = self.current_fence();
+        let device = self.gpu.device.clone();
+        if let Some(occlusion) = self.occlusion.as_mut() {
+            occlusion.begin(&device, commands, fence, true);
+        }
+    }
+
+    /// Before a rendering pass ends: a segment begun inside it ends there.
+    /// True when one did (`occlusion_pass_ended` begins the next).
+    pub(crate) fn occlusion_pass_ends(&mut self, commands: vk::CommandBuffer) -> bool {
+        let device = self.gpu.device.clone();
+        match self.occlusion.as_mut() {
+            Some(occlusion) if occlusion.active.is_some() && occlusion.active_inside => {
+                occlusion.end(&device, commands);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// After a rendering pass ended a segment: counting goes on outside,
+    /// resolving the batch first when the slot has no room.
+    pub(crate) fn occlusion_pass_ended(&mut self, commands: vk::CommandBuffer) {
+        self.next_segment_outside(commands, true);
     }
 
     /// ResetCounter(SAMPLES_PASSED): the count restarts from 0 here.
@@ -460,7 +592,6 @@ impl Renderer {
         let counting = self.occlusion()?.active.is_some();
         let resume = self.occlusion()?.resume;
         self.next_segment(false)?;
-        let commands = self.commands()?;
         let occlusion = self.occlusion.as_mut().expect("made by next_segment");
         occlusion.pending.push(Pending {
             from: occlusion.reset_from.unwrap_or(occlusion.batch_from),
@@ -468,24 +599,8 @@ impl Renderer {
             carry: occlusion.reset_from.is_none(),
             buffer,
             offset,
+            timestamp,
         });
-        let written = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-        // SAFETY: recording, outside rendering; the range is the buffer's.
-        unsafe {
-            let device = &self.gpu.device;
-            device.cmd_update_buffer(commands, buffer, offset + 8, &timestamp.to_le_bytes());
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[written],
-                &[],
-                &[],
-            );
-        }
         if counting || resume {
             self.next_segment(true)?;
         }
@@ -504,7 +619,7 @@ impl Renderer {
             occlusion.end(&device, commands);
             occlusion.resolve(&device, commands, fence);
             if counting && occlusion.has_room(fence) {
-                occlusion.begin(&device, commands, fence);
+                occlusion.begin(&device, commands, fence, false);
             } else if counting {
                 occlusion.resume = true;
             }
@@ -535,7 +650,7 @@ impl Renderer {
             occlusion.slot_reused(fence);
             if occlusion.resume {
                 occlusion.resume = false;
-                occlusion.begin(&device, commands, fence);
+                occlusion.begin(&device, commands, fence, false);
             }
         }
     }
