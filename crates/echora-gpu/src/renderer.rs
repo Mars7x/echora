@@ -2392,6 +2392,29 @@ impl Renderer {
             .stats
             .entry("stat: shared spans held at submissions")
             .or_default() += (self.shared.len() + self.addressed.len()) as u64;
+        // ECHORA_SPAN_LOG (debugging): every 200th submission, how the
+        // page table's spans lie in the file (sizes and the gaps between).
+        if self.flushes.is_multiple_of(200) && std::env::var_os("ECHORA_SPAN_LOG").is_some() {
+            let gaps: Vec<u64> = self
+                .addressed
+                .windows(2)
+                .map(|pair| pair[1].0.saturating_sub(pair[0].0 + pair[0].1))
+                .collect();
+            let small = gaps.iter().filter(|gap| **gap <= 64 << 10).count();
+            let sizes: u64 = self.addressed.iter().map(|(_, span, ..)| span).sum();
+            eprintln!(
+                "spans: {} page-table ({} MiB, {} gaps of 64 KiB or less, first gaps {:x?}), {} for bindings",
+                self.addressed.len(),
+                sizes >> 20,
+                small,
+                &gaps[..gaps.len().min(24)],
+                self.shared.len()
+            );
+        }
+        *self
+            .stats
+            .entry("stat: page-table spans held at submissions")
+            .or_default() += (self.addressed.len() + self.superseded.len()) as u64;
         let start = std::time::Instant::now();
         let device = &self.gpu.device;
         let buffers = [self.commands];
