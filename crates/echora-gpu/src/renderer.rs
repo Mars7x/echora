@@ -699,18 +699,21 @@ impl Renderer {
     }
 
     /// Whether beginning the wanted condition must first write reports
-    /// (outside a rendering pass).
+    /// (outside a rendering pass): one still waiting goes to the word it
+    /// reads (a condition on an earlier, written report needs none).
     fn condition_needs_resolve(&self) -> bool {
-        self.condition.is_some()
-            && !self.condition_active
+        let Some((buffer, offset, _)) = self.condition else {
+            return false;
+        };
+        !self.condition_active
             && self
                 .occlusion
                 .as_ref()
-                .is_some_and(|occlusion| occlusion.has_pending())
+                .is_some_and(|occlusion| occlusion.pending_at(buffer, offset))
     }
 
-    /// Before a draw's rendering pass begins: the reports its condition
-    /// may read are written (ending an open pass when there are any).
+    /// Before a draw's rendering pass begins: the report its condition
+    /// reads is written (ending an open pass) when it still waits.
     pub(crate) fn prepare_condition(&mut self) -> Result<(), String> {
         if self.condition_needs_resolve() {
             let commands = self.commands()?;

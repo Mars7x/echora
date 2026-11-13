@@ -253,9 +253,12 @@ impl Occlusion {
         self.active_inside = inside;
     }
 
-    /// Whether reports wait to be written (`resolve`).
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+    /// Whether a report waiting to be written (`resolve`) goes to the
+    /// word at `offset` in `buffer`.
+    pub(crate) fn pending_at(&self, buffer: vk::Buffer, offset: u64) -> bool {
+        self.pending.iter().any(|report| {
+            report.buffer == buffer && report.offset <= offset && offset < report.offset + 16
+        })
     }
 
     /// Whether a segment can begin inside a rendering pass: the slot has
