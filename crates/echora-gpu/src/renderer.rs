@@ -2698,17 +2698,20 @@ impl Renderer {
             self.stat("stat: spans too large to share", 1);
             return Ok(None);
         }
-        // Spans that touch this one in the file join it: one import of
-        // their union pins the same pages, and every imported memory object
-        // is listed in each submission (pools made one after another left
-        // thousands). The spans it replaces stay until the table is built
-        // whole again (`take_superseded`).
+        // Spans that touch this one in the file, or lie within a few pages
+        // of it (pools are carved one after another with a page or so of
+        // the allocator's between), join it: one import of their union pins
+        // about the same pages, and every imported memory object is listed
+        // in each submission (pools made one after another left thousands).
+        // The spans it replaces stay until the table is built whole again
+        // (`take_superseded`).
+        const GAP: u64 = 64 << 10;
         let (mut low, mut high) = (start, start + span);
         loop {
             let grown = self
                 .addressed
                 .iter()
-                .filter(|(known, held, ..)| *known <= high && low <= known + held)
+                .filter(|(known, held, ..)| *known <= high + GAP && low <= known + held + GAP)
                 .fold((low, high), |(low, high), (known, held, ..)| {
                     (low.min(*known), high.max(known + held))
                 });
