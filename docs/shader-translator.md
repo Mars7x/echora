@@ -4,9 +4,9 @@ The game's GPU programs are NVN2 programs: NVIDIA Ampere (SM 8.x, the
 Switch 2's T239) machine code with a control section. `echora-shader` is
 Echora's own translator, in Rust. It translates every program the game has
 used so far, and is the default. An external translator plugin can still
-be loaded ([shader-plugin.md](shader-plugin.md)); it is used only when
-selected with `ECHORA_SHADER_TRANSLATOR=plugin`, and
-`ECHORA_SHADER_TRANSLATOR=compare` compares the two.
+be loaded ([shader-plugin.md](shader-plugin.md)): by default it gets only
+a program this translator refuses, `ECHORA_SHADER_TRANSLATOR=plugin` sends
+it every program, and `ECHORA_SHADER_TRANSLATOR=compare` compares the two.
 
 ## Design stance
 
