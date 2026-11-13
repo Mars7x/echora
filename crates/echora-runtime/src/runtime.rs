@@ -4953,8 +4953,11 @@ fn locked_nvn_call(name: &str) -> bool {
 fn replay_thread(shared: &Shared, mut core: Core) {
     use std::sync::atomic::Ordering;
     let _watch = crate::fault::watch(&core);
+    let mut handed = std::time::Duration::ZERO;
     while !shared.stop.load(Ordering::Acquire) {
+        let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
+        nvn.note_replay_thread_wait(asked.elapsed() + std::mem::take(&mut handed));
         let failed = shared
             .replay_failed
             .lock()
@@ -4977,7 +4980,9 @@ fn replay_thread(shared: &Shared, mut core: Core) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trap);
             }
             drop(nvn);
+            let handing = std::time::Instant::now();
             shared.hand_nvn_over();
+            handed += handing.elapsed();
             continue;
         }
         drop(nvn);

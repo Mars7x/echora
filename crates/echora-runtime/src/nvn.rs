@@ -2948,12 +2948,16 @@ impl Nvn {
                 // queued present: the previous present's, so the replay is
                 // at most a frame behind).
                 if Self::present_queued_mode() {
+                    if self.present_pending() {
+                        self.present_lap("stat: present us before waiting", &mut since);
+                    }
                     while self.present_pending() {
                         self.pump_queues(core)?;
                         if self.present_pending() {
                             self.drain_queues(core)?;
                         }
                     }
+                    self.present_lap("stat: present us waiting for the previous present", &mut since);
                 } else {
                     self.pump_queues(core)?;
                     self.present_lap("stat: present us running queues", &mut since);
@@ -3548,6 +3552,16 @@ impl Nvn {
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat(count, 1);
             backend.stat(micros, time.as_micros() as u64);
+        }
+    }
+
+    /// The replay thread waited `time` for the NVN state.
+    pub fn note_replay_thread_wait(&mut self, time: std::time::Duration) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(
+                "stat: replay thread us waiting for the lock",
+                time.as_micros() as u64,
+            );
         }
     }
 
