@@ -707,12 +707,16 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         .context("locate the echora-simd crate")?;
     let simd = simd.to_string_lossy().into_owned();
 
-    // ECHORA_LIFT_OPTIONS: code generation options, comma-separated
-    // (structured, inline-vector, fused-flags, whole-vector-checks,
-    // fp-status-locals); all off by default.
+    // Code generation options: inline-vector, fused-flags,
+    // whole-vector-checks and fp-status-locals by default (the set
+    // docs/codegen-speed.md measured: vector code about 5x, scalar FP about
+    // 2x); ECHORA_LIFT_OPTIONS, comma-separated, replaces them (with
+    // structured among the choices, and `flat` for none).
     let mut options = EmitOptions::default();
-    for option in std::env::var("ECHORA_LIFT_OPTIONS")
-        .unwrap_or_default()
+    let chosen = std::env::var("ECHORA_LIFT_OPTIONS").unwrap_or_else(|_| {
+        "inline-vector,fused-flags,whole-vector-checks,fp-status-locals".into()
+    });
+    for option in chosen
         .split(',')
         .map(str::trim)
         .filter(|option| !option.is_empty())
@@ -723,6 +727,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "fused-flags" => options.fused_flags = true,
             "whole-vector-checks" => options.whole_vector_checks = true,
             "fp-status-locals" => options.fp_status_locals = true,
+            "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
     }
