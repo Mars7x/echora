@@ -4749,7 +4749,10 @@ impl Nvn {
             .unwrap_or(first);
         // A table past 16 million pages (64 GiB) means the pools are not
         // what this model expects.
-        let count = (end - first).min(16 << 20) as usize;
+        // Rounded up to 65536 pages (256 MiB): pools are made at rising GPU
+        // addresses, about one a present, and a table that grows by a page
+        // each time would be built whole each time.
+        let count = (end - first).next_multiple_of(1 << 16).min(16 << 20) as usize;
         let traced = super::debug_var("ECHORA_POOL_TRACE")
             .ok()
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
