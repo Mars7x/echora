@@ -1035,7 +1035,15 @@ const REGISTRY_CALLS: &[&str] = &[
 pub fn front_call(name: &str) -> bool {
     name == "nvnSyncWait"
         || REGISTRY_CALLS.contains(&name)
-        || split_name(name).is_some_and(|(kind, _)| FRONT_KINDS.contains(&kind))
+        || split_name(name).is_some_and(|(kind, rest)| front_bag(kind, rest))
+}
+
+/// A property-bag call workers make without the NVN state: any on a kind
+/// in `FRONT_KINDS`, and the setters of texture builders and views (their
+/// getters include storage queries `Nvn::call` answers itself).
+fn front_bag(kind: &str, rest: &str) -> bool {
+    FRONT_KINDS.contains(&kind)
+        || (matches!(kind, "TextureBuilder" | "TextureView") && rest.starts_with("Set"))
 }
 
 /// Kinds whose calls are only the generic property bags (no call on them
@@ -1092,7 +1100,7 @@ impl Recorder {
         let Some((kind, rest)) = split_name(name) else {
             return Ok(false);
         };
-        if !FRONT_KINDS.contains(&kind) {
+        if !front_bag(kind, rest) {
             return Ok(false);
         }
         call_watch(name, core);
