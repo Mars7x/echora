@@ -4741,6 +4741,8 @@ impl Nvn {
                     return Ok(());
                 }
                 if rest == "SignalEvent" {
+                    let serial = self.gpu_recorded_serial();
+                    self.gpu_observable(serial);
                     let address = self.event_address(command.x[1]).map_err(stop)?;
                     let value = command.x[5] as u32;
                     let new = match command.x[2] as u32 {
@@ -5274,6 +5276,7 @@ impl Nvn {
     /// before it (what a CPU wait on it has to wait for).
     fn signal_sync(&mut self, sync: u64, args: Args) {
         let serial = self.gpu_recorded_serial();
+        self.gpu_observable(serial);
         {
             let mut registry = write_shared(&self.registry);
             registry.unsignaled.remove(&sync);

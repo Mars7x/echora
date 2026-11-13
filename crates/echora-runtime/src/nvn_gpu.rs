@@ -122,6 +122,12 @@ pub struct Backend {
     /// last wait for it: its stores land in guest memory or a resident
     /// pool's copy with no range recorded (see `resolve_gpu_written`).
     page_table_writes: bool,
+    /// The submission serial of the last such program recorded, and of the
+    /// work before the last fence or event the guest could see signaled:
+    /// a CPU read waits for stores up to that point only (it is entitled to
+    /// no later ones, which the console's GPU may not have made yet).
+    page_table_write_serial: u64,
+    observable_serial: u64,
     /// Work storing through the page table has run at some point: the
     /// resident pools' ranges a CPU read covers may hold its results.
     page_table_wrote: bool,
@@ -220,6 +226,8 @@ impl Backend {
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             page_table_writes: false,
+            page_table_write_serial: 0,
+            observable_serial: 0,
             page_table_wrote: false,
             resident: HashMap::new(),
             samples_reports: std::collections::HashSet::new(),
@@ -3419,6 +3427,14 @@ impl Nvn {
 
     /// A CPU wait on a signaled sync: waits for the submission that held
     /// the work before its fence, or for everything when that is unknown.
+    /// Work recorded before submission `serial` ends at a fence or event
+    /// the guest can see signaled.
+    pub(super) fn gpu_observable(&mut self, serial: u64) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.observable_serial = backend.observable_serial.max(serial);
+        }
+    }
+
     pub(super) fn gpu_wait_sync(&mut self, serial: Option<u64>) -> Result<(), String> {
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
@@ -4514,6 +4530,7 @@ impl Nvn {
             let backend = self.gpu.as_mut().unwrap();
             backend.page_table_writes = true;
             backend.page_table_wrote = true;
+            backend.page_table_write_serial = backend.renderer.recorded_serial();
         }
         let pool = if stage.texture_pool_bindings != 0 {
             self.pool_entries(core, 5)?
@@ -4709,9 +4726,21 @@ impl Nvn {
             // finishes first; once it has, later reads need no wait until
             // more such work is recorded.
             if backend.page_table_writes {
-                backend.stat("stat: GPU waits for page-table writes", 1);
-                backend.renderer.flush()?;
-                backend.page_table_writes = false;
+                let started = std::time::Instant::now();
+                if backend.page_table_write_serial <= backend.observable_serial {
+                    backend.stat("stat: GPU waits for page-table writes", 1);
+                    backend.renderer.wait_for(backend.page_table_write_serial)?;
+                    backend.page_table_writes = false;
+                } else {
+                    // Stores recorded after the last signal the guest saw
+                    // are not waited for; the ones before it are.
+                    backend.stat("stat: GPU waits for page-table writes up to a signal", 1);
+                    backend.renderer.wait_for(backend.observable_serial)?;
+                }
+                backend.stat(
+                    "stat: GPU waits for page-table writes us",
+                    started.elapsed().as_micros() as u64,
+                );
             }
             for pool in backend.resident.values_mut() {
                 let piece = range.start.max(pool.base)..range.end.min(pool.base + pool.size);
@@ -4788,7 +4817,12 @@ impl Nvn {
                     .map(|(token, piece)| (token, base, piece)),
             );
         }
+        let started = std::time::Instant::now();
         backend.renderer.flush()?;
+        backend.stat(
+            "stat: resident copy-back wait us",
+            started.elapsed().as_micros() as u64,
+        );
         // Only these: pending dispatch and draw results stay for
         // `resolve_copies`.
         let ids: Vec<u64> = tokens.iter().map(|(token, ..)| *token).collect();
@@ -7572,6 +7606,7 @@ impl Nvn {
             let backend = self.gpu.as_mut().unwrap();
             backend.page_table_writes = true;
             backend.page_table_wrote = true;
+            backend.page_table_write_serial = backend.renderer.recorded_serial();
         }
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams
