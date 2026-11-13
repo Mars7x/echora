@@ -2968,11 +2968,15 @@ impl Nvn {
             "nvnQueuePresentTexture" => {
                 // Presents run under the machine lock, with the page table:
                 // pools made since the last one learn their file offsets.
+                let mut since = std::time::Instant::now();
                 self.share_new_pools(core);
+                self.present_lap("stat: present us sharing pools", &mut since);
                 self.object(this, "Queue").map_err(invalid)?;
                 // The presented image needs the work queued before it.
                 self.pump_queues(core)?;
+                self.present_lap("stat: present us running queues", &mut since);
                 self.drain_queues(core)?;
+                self.present_lap("stat: present us draining queues", &mut since);
                 let window = self.object(x[1], "Window").map_err(invalid)?;
                 let index = x[2] as u32;
                 let texture = window
@@ -3017,13 +3021,16 @@ impl Nvn {
                 if self.presented_frames.is_multiple_of(500) {
                     eprintln!("present {}", self.presented_frames);
                 }
+                self.present_lap("stat: present us bookkeeping", &mut since);
                 if self.gpu().is_some() {
                     self.gpu_present_window(texture).map_err(stop)?;
+                    self.present_lap("stat: present us window", &mut since);
                     // A frame's work is submitted by its present, windowed or
                     // not: headless runs otherwise gathered hundreds of
                     // frames into one GPU job, which the kernel's 10 s job
                     // limit ended with a whole-GPU reset.
                     self.gpu_submit().map_err(stop)?;
+                    self.present_lap("stat: present us submitting", &mut since);
                 }
                 // ECHORA_CAPTURE_EVERY=N with ECHORA_CAPTURE_DIR (echora run
                 // sets it beside the report): the first and every N-th
@@ -5607,6 +5614,16 @@ static CALL_WATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 impl Nvn {
     /// At each present: map ECHORA_CALL_WATCH's GPU range to guest memory
     /// once and follow its present window (`call_watch` compares).
+    /// Count the time since `since` under `name` in the GPU statistics
+    /// and restart it (a present's phases).
+    fn present_lap(&mut self, name: &'static str, since: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(name, (now - *since).as_micros() as u64);
+        }
+        *since = now;
+    }
+
     fn arm_call_watch(&self) {
         // ECHORA_CALL_WATCH_GUEST=<start>-<end>: the range in guest
         // memory (a CPU-side object) instead of GPU addresses.
