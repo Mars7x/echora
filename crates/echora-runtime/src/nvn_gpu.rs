@@ -4823,6 +4823,14 @@ impl Nvn {
                 Some(&(built, retry)) if built == signature && !(retry && checked) => continue,
                 _ => {}
             }
+            // ECHORA_PAGE_TABLE_LOG (debugging): each pool mapped and why.
+            if super::debug_var_os("ECHORA_PAGE_TABLE_LOG").is_some() {
+                eprintln!(
+                    "page table map {pool:x?} present {} checked {checked}: was {:x?}, now {signature:x?}",
+                    self.presented_frames,
+                    built_pools.get(&pool)
+                );
+            }
             let (base, size, gpu, flags) = pool;
             let backend = self.gpu.as_mut().unwrap();
             backend.stat("stat: page table pools mapped", 1);
