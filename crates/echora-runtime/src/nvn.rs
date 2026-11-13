@@ -355,10 +355,11 @@ pub struct Nvn {
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
     /// GPU ranges as (pool object, pool GPU address, range GPU address,
-    /// size, guest address): a pool's storage, or one mapping of a virtual
-    /// pool. Rebuilt when a lookup misses (see `pool_for`).
+    /// size, guest address, furthest end so far): a pool's storage, or one
+    /// mapping of a virtual pool, sorted by range GPU address. Rebuilt when
+    /// a lookup misses (see `pool_for`).
     #[serde(skip)]
-    pool_ranges: std::cell::RefCell<Vec<[u64; 5]>>,
+    pool_ranges: std::cell::RefCell<Vec<[u64; 6]>>,
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
     recording: Recordings,
@@ -4484,13 +4485,18 @@ impl Nvn {
     }
 
     /// The guest address of GPU address `address` and the bytes left in its
-    /// memory pool. Pool ranges are cached; a range whose pool object is
-    /// gone, or a miss, rebuilds the cache from the live pools.
+    /// memory pool. Pool ranges are cached, sorted by their GPU start with
+    /// the furthest end of the ranges up to each one beside it, so a lookup
+    /// is a binary search and a short walk back; a range whose pool object
+    /// is gone, or a miss, rebuilds the cache from the live pools.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let find = |ranges: &[[u64; 5]]| {
-            ranges
+        let find = |ranges: &[[u64; 6]]| {
+            let after = ranges.partition_point(|range| range[2] <= address);
+            ranges[..after]
                 .iter()
-                .find_map(|&[key, pool_gpu, gpu, size, memory]| {
+                .rev()
+                .take_while(|range| address < range[5])
+                .find_map(|&[key, pool_gpu, gpu, size, memory, _]| {
                     let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
                     let live = self.objects.get(&key).is_some_and(|pool| {
                         pool.kind == "MemoryPool"
@@ -4502,7 +4508,7 @@ impl Nvn {
         if let Some(found) = find(&self.pool_ranges.borrow()) {
             return Some(found);
         }
-        let mut ranges: Vec<[u64; 5]> = Vec::new();
+        let mut ranges: Vec<[u64; 6]> = Vec::new();
         for (key, pool) in &self.objects {
             if pool.kind != "MemoryPool" {
                 continue;
@@ -4512,7 +4518,7 @@ impl Nvn {
             };
             let storage = &pool.builder["Storage"];
             if storage.x[0] != 0 {
-                ranges.push([*key, gpu, gpu, storage.x[1], storage.x[0]]);
+                ranges.push([*key, gpu, gpu, storage.x[1], storage.x[0], 0]);
                 continue;
             }
             // A virtual pool: each mapping reaches into a physical pool.
@@ -4532,8 +4538,14 @@ impl Nvn {
                 else {
                     continue;
                 };
-                ranges.push([*key, gpu, gpu + offset, size, storage + physical_offset]);
+                ranges.push([*key, gpu, gpu + offset, size, storage + physical_offset, 0]);
             }
+        }
+        ranges.sort_by_key(|range| range[2]);
+        let mut end = 0;
+        for range in &mut ranges {
+            end = end.max(range[2].saturating_add(range[3]));
+            range[5] = end;
         }
         let found = find(&ranges);
         *self.pool_ranges.borrow_mut() = ranges;
