@@ -6251,10 +6251,18 @@ impl Nvn {
 
         // ECHORA_GPU_SKIP_DRAW=<stage key>[,...] (debugging): draws whose
         // program has one of those stages are not recorded.
+        // ECHORA_GPU_SKIP_DRAW_DEPTH=<storage hex> (debugging): the skip
+        // applies only to draws whose depth target is that memory (a
+        // shadow map's casters, not the same programs' other passes).
+        let skip_depth = super::debug_var("ECHORA_GPU_SKIP_DRAW_DEPTH")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
         if super::debug_var("ECHORA_GPU_SKIP_DRAW").is_ok_and(|skipped| {
             skipped.split(',').any(|skip| {
                 skip == format!("{:016x}", keys.0) || skip == format!("{:016x}", keys.1)
             })
+        }) && skip_depth.is_none_or(|storage| {
+            self.render.depth != 0 && self.texture_storage(self.render.depth) == Some(storage)
         }) {
             return Ok(());
         }
