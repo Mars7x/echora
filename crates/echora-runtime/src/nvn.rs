@@ -989,6 +989,10 @@ pub struct Registry {
     /// (pending dispatch reads, in-place writes, uncached pools' GPU
     /// writes): a CPU wait then needs the NVN state.
     resolve_pending: bool,
+    /// A replay stopped after a piece with work left (`Nvn::replay_paused`):
+    /// polls of syncs and events go to the NVN state, whose calls run the
+    /// next piece first, so the polled work gets done.
+    replay_pending: bool,
 }
 
 type SharedRegistry = std::sync::Arc<std::sync::RwLock<Registry>>;
@@ -1069,6 +1073,11 @@ impl Recorder {
     /// Make NVN call `name` when it is a property-bag call on a kind in
     /// `FRONT_KINDS`, as `Nvn::call` would: Ok(true) once made.
     pub fn front(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        if matches!(name, "nvnSyncWait" | "nvnEventGetValue")
+            && read_shared(&self.registry).replay_pending
+        {
+            return Ok(false);
+        }
         // A zero-timeout poll of a sync no fence has signaled yet times out
         // (2) without the NVN state, so a thread polling one does not wait
         // for a whole queue replay to learn that; anything else is made
@@ -1552,13 +1561,16 @@ impl Nvn {
     fn publish_resolve_state(&self) {
         let (pending, completed) = self.gpu_resolve_state();
         let current = read_shared(&self.registry);
-        if current.resolve_pending == pending && current.completed.is_some() == completed.is_some()
+        if current.resolve_pending == pending
+            && current.replay_pending == self.replay_paused
+            && current.completed.is_some() == completed.is_some()
         {
             return;
         }
         drop(current);
         let mut registry = write_shared(&self.registry);
         registry.resolve_pending = pending;
+        registry.replay_pending = self.replay_paused;
         if registry.completed.is_none() {
             registry.completed = completed;
         }
@@ -3405,6 +3417,14 @@ impl Nvn {
     /// left that `resume_replay` continues.
     pub fn replay_paused(&self) -> bool {
         self.replay_paused
+    }
+
+    /// ECHORA_ASYNC_REPLAY: nvnEventSignal returns once its replay's first
+    /// piece is done; later NVN calls (any thread's) run the rest a piece
+    /// at a time first, as the console's GPU runs it while the CPU goes on.
+    pub fn replay_async() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ECHORA_ASYNC_REPLAY").is_some())
     }
 
     /// Continue a replay that stopped after its piece, for another piece:

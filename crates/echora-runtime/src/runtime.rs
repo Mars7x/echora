@@ -3041,6 +3041,11 @@ impl Machine {
         let profile = crate::nvn::debug_var_os("ECHORA_NVN_PROFILE")
             .is_some()
             .then(std::time::Instant::now);
+        // Calls under the machine lock (present, lookups) see all work
+        // replayed, before and after them.
+        while self.nvn.replay_paused() {
+            self.nvn.resume_replay(&mut guest)?;
+        }
         let handled = self.nvn.call(&name, &mut guest)?;
         while self.nvn.replay_paused() {
             self.nvn.resume_replay(&mut guest)?;
@@ -5236,10 +5241,26 @@ impl Worker {
         let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
         let locked = std::time::Instant::now();
+        // An asynchronous replay's next piece runs before this call, so
+        // whoever calls next moves it on (and what the call sees has run).
+        if crate::nvn::Nvn::replay_async() && nvn.replay_paused() {
+            let counter = self.core.physical_counter_ticks();
+            let mut guest = crate::nvn::Guest {
+                cpu: &mut self.core.cpu,
+                memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
+                counter,
+            };
+            if let Err(trap) = nvn.resume_replay(&mut guest) {
+                self.held_failed = Some(Some(trap));
+                drop(nvn);
+                return false;
+            }
+        }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         // A replay in pieces: the lock is let go between them, so other
-        // threads' calls are not held up by the whole replay.
-        while made && nvn.replay_paused() {
+        // threads' calls are not held up by the whole replay (with
+        // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
+        while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
             drop(nvn);
             // Waiting threads take it first: the mutex would hand it straight
             // back to this one (up to a fraction of a millisecond).
