@@ -4810,6 +4810,10 @@ impl Nvn {
             }
             None => vec![0u64; count],
         };
+        self.gpu.as_mut().unwrap().stat(
+            "stat: page table walk microseconds",
+            started.elapsed().as_micros() as u64,
+        );
         let checked = core.memory.can_share();
         for (pool, signature) in signatures {
             // Mapped with this sharing already; one with unmapped pages
@@ -4847,6 +4851,10 @@ impl Nvn {
         for (name, amount) in backend.renderer.take_stats() {
             backend.stat(name, amount);
         }
+        backend.stat(
+            "stat: page table map microseconds",
+            started.elapsed().as_micros() as u64,
+        );
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
         backend.page_build = Some(PageBuild {
             first,

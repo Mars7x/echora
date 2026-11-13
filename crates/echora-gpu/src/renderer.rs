@@ -828,7 +828,35 @@ impl Renderer {
             .page_table
             .as_ref()
             .is_some_and(|(_, written)| written.as_slice() == entries);
-        if !current {
+        // Entries that only fill unmapped pages (a pool made since) are
+        // written in place: no program recorded before could reach those
+        // pages, so work still reading the table sees the same answers.
+        let added = !current
+            && self.page_table.as_ref().is_some_and(|(_, written)| {
+                written.len() == entries.len()
+                    && written
+                        .chunks(512)
+                        .zip(entries.chunks(512))
+                        .all(|(old, new)| {
+                            old == new
+                                || old.iter().zip(new).all(|(old, new)| old == new || *old == 0)
+                        })
+            });
+        if added {
+            let (buffer, written) = self.page_table.as_mut().unwrap();
+            for (index, (old, new)) in written
+                .chunks_mut(512)
+                .zip(entries.chunks(512))
+                .enumerate()
+            {
+                if old != new {
+                    let raw: Vec<u8> = new.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+                    buffer.write(index * 512 * 8, &raw);
+                    old.copy_from_slice(new);
+                }
+            }
+            self.stat("stat: page tables extended in place", 1);
+        } else if !current {
             // A new buffer: work recorded or running may still read the old
             // one, which is freed with this slot's submission (rewriting it
             // in place waited for all of that work, once per pool shared).
