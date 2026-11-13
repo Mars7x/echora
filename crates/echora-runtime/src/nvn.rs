@@ -4443,11 +4443,12 @@ impl Nvn {
                 // counts are three u32 at the address when the GPU reaches
                 // the command. The results that may have written them
                 // (a counter in a resident pool's GPU copy) are stored for
-                // that range, and it runs as DispatchCompute with them.
-                // ECHORA_GPU_INDIRECT (being validated): the GPU reads them
-                // itself (see `gpu_dispatch`).
+                // that range, and it runs as DispatchCompute with them,
+                // when there is no GPU or under ECHORA_CPU_INDIRECT
+                // (debugging); otherwise the GPU reads them itself in
+                // command order (see `gpu_dispatch`).
                 if rest == "DispatchComputeIndirect"
-                    && (self.gpu().is_none() || debug_var_os("ECHORA_GPU_INDIRECT").is_none())
+                    && (self.gpu().is_none() || debug_var_os("ECHORA_CPU_INDIRECT").is_some())
                 {
                     let at = self.gpu_to_guest(command.x[1], 12).map_err(stop)?;
                     // ECHORA_INDIRECT_EXACT (being investigated): the counts
