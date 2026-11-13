@@ -1437,11 +1437,13 @@ impl Nvn {
             .state
             .get("BindVertexAttribState")
             .map(|command| command.states.clone());
-        let stamp = bind(0)
-            .zip(bind(1))
-            .map(|(vertex, fragment)| (self.presented_frames, self.flush_epoch, vertex, fragment));
-        if let (Some(stamp), Some((memo, memo_attributes, bound))) = (stamp, &self.program_memo)
-            && *memo == stamp
+        let stamp = (self.presented_frames, self.flush_epoch);
+        if self.program_memo.0 != stamp {
+            self.program_memo = (stamp, HashMap::new());
+        }
+        let key = bind(0).zip(bind(1));
+        if let Some(key) = key
+            && let Some((memo_attributes, bound)) = self.program_memo.1.get(&key)
             && match (&attributes, memo_attributes) {
                 (Some(now), Some(then)) => Arc::ptr_eq(now, then),
                 (None, None) => true,
@@ -1451,8 +1453,8 @@ impl Nvn {
             return Ok(bound.clone());
         }
         let bound = self.resolve_bound_program(core)?;
-        if let Some(stamp) = stamp {
-            self.program_memo = Some((stamp, attributes, bound.clone()));
+        if let Some(key) = key {
+            self.program_memo.1.insert(key, (attributes, bound.clone()));
         }
         Ok(bound)
     }

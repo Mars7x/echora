@@ -519,15 +519,20 @@ pub struct Nvn {
     /// change of a program object or its shaders.
     #[serde(skip)]
     flush_epoch: u64,
-    /// The last bound programs a draw resolved: (present, flush epoch, the
-    /// two BindProgram arguments, the vertex attribute snapshot) and the
-    /// result (see `bound_program`).
+    /// Bound programs draws resolved, by the two BindProgram arguments,
+    /// with the vertex attribute snapshot they were resolved with; valid
+    /// for a (present, flush epoch) (see `bound_program`).
     #[serde(skip)]
-    program_memo: Option<(
-        (u64, u64, [u64; 8], [u64; 8]),
-        Option<std::sync::Arc<Vec<BTreeMap<String, Args>>>>,
-        gpu::BoundProgram,
-    )>,
+    program_memo: (
+        (u64, u64),
+        HashMap<
+            ([u64; 8], [u64; 8]),
+            (
+                Option<std::sync::Arc<Vec<BTreeMap<String, Args>>>>,
+                gpu::BoundProgram,
+            ),
+        >,
+    ),
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,
     /// Hash of the last frame written to ECHORA_FRAME_DIR; identical
