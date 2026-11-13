@@ -4841,6 +4841,21 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
+    /// After letting the NVN state go between replay pieces: waiting threads
+    /// take it first (the mutex would hand it straight back to this one),
+    /// for up to a fraction of a millisecond.
+    fn hand_nvn_over(&self) {
+        let waiting = self.nvn_waiters.load(std::sync::atomic::Ordering::Acquire);
+        if waiting > 0 {
+            let handed = std::time::Instant::now();
+            while self.nvn_waiters.load(std::sync::atomic::Ordering::Acquire) >= waiting
+                && handed.elapsed() < std::time::Duration::from_micros(200)
+            {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     /// The NVN state, counted among its waiters until it is held.
     fn lock_nvn(&self) -> std::sync::MutexGuard<'_, crate::nvn::Nvn> {
         self.nvn_waiters
@@ -5243,7 +5258,14 @@ impl Worker {
         let locked = std::time::Instant::now();
         // An asynchronous replay's next piece runs before this call, so
         // whoever calls next moves it on (and what the call sees has run).
-        if crate::nvn::Nvn::replay_async() && nvn.replay_paused() {
+        // A call made under the machine lock (present) finishes it here
+        // first, a piece at a time with only this lock held, so the machine
+        // lock is not held over the replay.
+        let machine_call = matches!(
+            nvn.entry(pc),
+            Some(crate::nvn::HostEntry::Proc(name)) if locked_nvn_call(&name)
+        );
+        while crate::nvn::Nvn::replay_async() && nvn.replay_paused() {
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
@@ -5255,6 +5277,12 @@ impl Worker {
                 drop(nvn);
                 return false;
             }
+            if !machine_call {
+                break;
+            }
+            drop(nvn);
+            shared.hand_nvn_over();
+            nvn = shared.lock_nvn();
         }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         // A replay in pieces: the lock is let go between them, so other
@@ -5262,22 +5290,7 @@ impl Worker {
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
         while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
             drop(nvn);
-            // Waiting threads take it first: the mutex would hand it straight
-            // back to this one (up to a fraction of a millisecond).
-            let waiting = shared
-                .nvn_waiters
-                .load(std::sync::atomic::Ordering::Acquire);
-            if waiting > 0 {
-                let handed = std::time::Instant::now();
-                while shared
-                    .nvn_waiters
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    >= waiting
-                    && handed.elapsed() < std::time::Duration::from_micros(200)
-                {
-                    std::thread::yield_now();
-                }
-            }
+            shared.hand_nvn_over();
             nvn = shared
                 .nvn
                 .lock()
