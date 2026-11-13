@@ -217,26 +217,31 @@ fn set_debug_overrides(overrides: Option<HashMap<String, Option<String>>>) {
 /// `std::env::var_os` for a ECHORA_* switch, from the snapshot (or a frame
 /// replay's switches).
 pub(crate) fn debug_var_os(name: &str) -> Option<&'static std::ffi::OsStr> {
-    // The draw path asks per texture binding; names are literals, so the
-    // answer is cached by the name's address (an integer lookup instead
-    // of hashing the string into the environment snapshot).
+    // The draw path asks dozens of times per draw; names are literals, so
+    // the answer is cached by the name's address in a small open-addressed
+    // table (a few instructions instead of hashing the string into the
+    // environment snapshot, or walking every name asked so far).
+    type Slot = (usize, usize, Option<&'static std::ffi::OsStr>);
+    const SLOTS: usize = 1024;
     thread_local! {
-        static CACHE: std::cell::RefCell<(u64, Vec<(usize, usize, Option<&'static std::ffi::OsStr>)>)> =
-            const { std::cell::RefCell::new((0, Vec::new())) };
+        static CACHE: std::cell::RefCell<(u64, usize, Vec<Slot>)> =
+            const { std::cell::RefCell::new((0, 0, Vec::new())) };
     }
     let key = (name.as_ptr() as usize, name.len());
     let generation = DEBUG_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.0 != generation {
-            *cache = (generation, Vec::new());
+        if cache.0 != generation || cache.2.is_empty() {
+            *cache = (generation, 0, vec![(0, 0, None); SLOTS]);
         }
-        if let Some(&(_, _, value)) = cache
-            .1
-            .iter()
-            .find(|(address, length, _)| (*address, *length) == key)
-        {
-            return value;
+        // Literals are at least a byte apart; their lengths spread the rest.
+        let mut slot = (key.0 ^ key.0 >> 10 ^ key.1 << 5) % SLOTS;
+        // At most half full (below), so an empty slot ends every probe.
+        while cache.2[slot].0 != 0 {
+            if (cache.2[slot].0, cache.2[slot].1) == key {
+                return cache.2[slot].2;
+            }
+            slot = (slot + 1) % SLOTS;
         }
         let overridden = DEBUG_OVERRIDES
             .read()
@@ -247,7 +252,10 @@ pub(crate) fn debug_var_os(name: &str) -> Option<&'static std::ffi::OsStr> {
             Some(value) => value,
             None => debug_env().get(name).map(|value| value.as_os_str()),
         };
-        cache.1.push((key.0, key.1, value));
+        if cache.1 < SLOTS / 2 {
+            cache.1 += 1;
+            cache.2[slot] = (key.0, key.1, value);
+        }
         value
     })
 }
