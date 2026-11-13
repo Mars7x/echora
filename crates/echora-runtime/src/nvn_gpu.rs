@@ -5038,9 +5038,17 @@ impl Nvn {
         let previous = self.gpu.as_mut().unwrap().page_build.take();
         let current: std::collections::HashSet<_> =
             signatures.iter().map(|(pool, _)| *pool).collect();
+        // Spans joined into larger ones, or dropped with other pools' pages
+        // in them, leave entries only a whole build replaces.
+        let (superseded, superseded_bytes, dropped) =
+            self.gpu.as_ref().unwrap().renderer.superseded_spans();
         let whole = match &previous {
             None => Some("stat: page table built whole (first)"),
             Some(built) if built.first != first => Some("stat: page table built whole (extent)"),
+            Some(_) if dropped => Some("stat: page table built whole (span dropped)"),
+            Some(_) if superseded >= 64 || superseded_bytes >= 256 << 20 => {
+                Some("stat: page table built whole (spans joined)")
+            }
             Some(_) => None,
         };
         if let Some(reason) = whole {
@@ -5135,6 +5143,9 @@ impl Nvn {
             started.elapsed().as_micros() as u64,
         );
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
+        if whole.is_some() {
+            backend.renderer.take_superseded(superseded);
+        }
         backend.page_build = Some(PageBuild {
             first,
             entries,

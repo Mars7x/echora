@@ -235,6 +235,12 @@ pub struct Renderer {
     /// until their file range is released, never evicted while the table
     /// may use them. Start, span, buffer, memory and device address.
     addressed: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
+    /// Page-table spans another joined (`address_span`): the table may
+    /// still point into them until it is built whole.
+    superseded: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
+    /// A released range dropped a span that held more than it: other pools
+    /// mapped through it are mapped again by a whole build.
+    dropped_shared_span: bool,
     /// Bytes `shared` pins in host memory (udmabuf pins its pages).
     pub shared_bytes: u64,
     /// /dev/udmabuf, opened on first use; None after it failed to open.
@@ -526,6 +532,8 @@ impl Renderer {
             extra_views: HashMap::new(),
             imported: HashMap::new(),
             addressed: Vec::new(),
+            superseded: Vec::new(),
+            dropped_shared_span: false,
             page_table: None,
             import_refused: Default::default(),
             shared: Vec::new(),
@@ -2667,20 +2675,76 @@ impl Renderer {
             self.stat("stat: spans too large to share", 1);
             return Ok(None);
         }
-        let Some((buffer, memory)) = self.share_span(file, start, span)? else {
-            return Ok(None);
+        // Spans that touch this one in the file join it: one import of
+        // their union pins the same pages, and every imported memory object
+        // is listed in each submission (pools made one after another left
+        // thousands). The spans it replaces stay until the table is built
+        // whole again (`take_superseded`).
+        let (mut low, mut high) = (start, start + span);
+        loop {
+            let grown = self
+                .addressed
+                .iter()
+                .filter(|(known, held, ..)| *known <= high && low <= known + held)
+                .fold((low, high), |(low, high), (known, held, ..)| {
+                    (low.min(*known), high.max(known + held))
+                });
+            if grown == (low, high) || grown.1 - grown.0 > MAX_SHARED_SPAN {
+                break;
+            }
+            (low, high) = grown;
+        }
+        let joined = if (low, high) != (start, start + span) {
+            self.share_span(file, low, high - low)?
+                .map(|imported| (low, high - low, imported))
+        } else {
+            None
+        };
+        let (start, span, (buffer, memory)) = match joined {
+            Some(joined) => joined,
+            None => match self.share_span(file, start, span)? {
+                Some(imported) => (start, span, imported),
+                None => return Ok(None),
+            },
         };
         let Some(address) = self.buffer_address(buffer) else {
             self.stat("stat: shared spans without a device address", 1);
             self.retired_shared.push((buffer, memory));
             return Ok(None);
         };
+        let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
+            .into_iter()
+            .partition(|(known, held, ..)| start <= *known && known + held <= start + span);
+        self.addressed = kept;
+        if !replaced.is_empty() {
+            self.stat("stat: page-table spans joined", replaced.len() as u64);
+        }
+        self.superseded.extend(replaced);
         let at = self
             .addressed
             .partition_point(|(known, ..)| *known <= start);
         self.addressed
             .insert(at, (start, span, buffer, memory, address));
         Ok(Some(address + (offset - start)))
+    }
+
+    /// How many joined spans wait for the table to be built whole, the
+    /// bytes they pin, and whether a released range dropped a span holding
+    /// other pools too.
+    pub fn superseded_spans(&self) -> (usize, u64, bool) {
+        let bytes = self.superseded.iter().map(|(_, span, ..)| span).sum();
+        (self.superseded.len(), bytes, self.dropped_shared_span)
+    }
+
+    /// The table was built whole: the first `count` joined-away spans
+    /// (replaced before the build began, so it points into none of them)
+    /// go once work recorded so far has finished.
+    pub fn take_superseded(&mut self, count: usize) {
+        let count = count.min(self.superseded.len());
+        for (_, _, buffer, memory, _) in self.superseded.drain(..count) {
+            self.retired_shared.push((buffer, memory));
+        }
+        self.dropped_shared_span = false;
     }
 
     /// Bytes of guest memory the page table's spans pin.
@@ -2696,7 +2760,20 @@ impl Renderer {
             .into_iter()
             .partition(|(start, span, ..)| *start < end && offset < start + span);
         self.addressed = kept;
+        for (start, span, buffer, memory, _) in gone {
+            if start < offset || end < start + span {
+                self.dropped_shared_span = true;
+            }
+            self.retired_shared.push((buffer, memory));
+        }
+        // Joined-away spans of the range keep old pages too: the table is
+        // built whole before more work is recorded.
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.superseded)
+            .into_iter()
+            .partition(|(start, span, ..)| *start < end && offset < start + span);
+        self.superseded = kept;
         for (_, _, buffer, memory, _) in gone {
+            self.dropped_shared_span = true;
             self.retired_shared.push((buffer, memory));
         }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
