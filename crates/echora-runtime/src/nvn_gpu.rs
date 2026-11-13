@@ -6258,7 +6258,16 @@ impl Nvn {
             .resident
             .values()
             .find(|pool| pool.base <= guest && guest + length <= pool.base + pool.size)
-            .map(|pool| (pool.base, pool.size, if pool.uncached { 2 } else { 0 }));
+            .map(|pool| {
+                let flags = if pool.uncached {
+                    2
+                } else if pool.host_visible {
+                    4
+                } else {
+                    0
+                };
+                (pool.base, pool.size, flags)
+            });
         let Some((base, size, flags)) = known.or_else(|| {
             self.memory_pools
                 .iter()
@@ -6308,6 +6317,7 @@ impl Nvn {
                 base,
                 size,
                 uncached: flags & 2 != 0,
+                host_visible: flags & 6 != 0,
                 guest_dirty: Vec::new(),
                 gpu_dirty: Vec::new(),
             });
@@ -6316,6 +6326,7 @@ impl Nvn {
                 base,
                 size,
                 uncached: flags & 2 != 0,
+                host_visible: flags & 6 != 0,
                 guest_dirty: vec![base..base + size],
                 gpu_dirty: Vec::new(),
             };
@@ -6323,7 +6334,26 @@ impl Nvn {
         if uncached && !gpu_newer {
             add_range(&mut pool.guest_dirty, guest..guest + length);
         }
-        let uploads = std::mem::take(&mut pool.guest_dirty);
+        // Only what this binding can read goes up; the pool's other dirty
+        // ranges wait for a binding over them (a 16-byte report used to
+        // bring up everything flushed anywhere in its pool).
+        // A GPU-only pool (the page table reaches it through this copy, not
+        // through guest memory) takes all of them, as before.
+        let bound = if flags & 6 == 0 {
+            base..base + size
+        } else {
+            guest..guest + length
+        };
+        let mut uploads = Vec::new();
+        for dirty in &pool.guest_dirty {
+            let piece = dirty.start.max(bound.start)..dirty.end.min(bound.end);
+            if piece.start < piece.end {
+                uploads.push(piece);
+            }
+        }
+        for piece in &uploads {
+            remove_range(&mut pool.guest_dirty, piece.clone());
+        }
         for range in uploads {
             let length = range.end - range.start;
             let backend = self.gpu.as_mut().unwrap();
@@ -8556,6 +8586,9 @@ struct ResidentPool {
     /// The CPU reads the pool without invalidating (CPU_UNCACHED): GPU
     /// writes come back at every CPU wait.
     uncached: bool,
+    /// The CPU can reach it (CPU_UNCACHED or CPU_CACHED): the page table
+    /// maps its guest memory, not this copy.
+    host_visible: bool,
     guest_dirty: Vec<std::ops::Range<u64>>,
     gpu_dirty: Vec<std::ops::Range<u64>>,
 }
