@@ -4726,8 +4726,9 @@ impl Nvn {
         }
         let started = std::time::Instant::now();
         let pools: Vec<(u64, u64, u64, u64)> = self
-            .objects
-            .values()
+            .memory_pools
+            .iter()
+            .filter_map(|address| self.objects.get(address))
             .filter(|object| object.kind == "MemoryPool")
             .filter_map(|pool| {
                 let storage = pool.builder.get("Storage")?;
@@ -4777,15 +4778,13 @@ impl Nvn {
         let signatures: Vec<_> = pools
             .iter()
             .map(|&(base, size, gpu, flags)| {
-                ((base, size, gpu, flags), self.pool_share_signature(base, flags))
+                (
+                    (base, size, gpu, flags),
+                    self.pool_share_signature(base, flags),
+                )
             })
             .collect();
-        let previous = self
-            .gpu
-            .as_mut()
-            .unwrap()
-            .page_build
-            .take();
+        let previous = self.gpu.as_mut().unwrap().page_build.take();
         let current: std::collections::HashSet<_> =
             signatures.iter().map(|(pool, _)| *pool).collect();
         let whole = match &previous {
@@ -4817,11 +4816,15 @@ impl Nvn {
             built_pools.remove(&pool);
             let (_, size, gpu, _) = pool;
             let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
-                ..((gpu + size).div_ceil(PAGE_SIZE).saturating_sub(first)).min(count as u64) as usize;
+                ..((gpu + size).div_ceil(PAGE_SIZE).saturating_sub(first)).min(count as u64)
+                    as usize;
             if let Some(range) = entries.get_mut(pages) {
                 range.fill(0);
             }
-            self.gpu.as_mut().unwrap().stat("stat: page table pools unmapped", 1);
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: page table pools unmapped", 1);
             // A pool kept over the same GPU pages is mapped again.
             built_pools.retain(|&(_, kept_size, kept_gpu, _), _| {
                 kept_gpu + kept_size <= gpu || gpu + size <= kept_gpu
@@ -4913,7 +4916,10 @@ impl Nvn {
             .shared_pools
             .get(&base)
             .map_or((0, 0), |&(size, file, at)| (size, (file as u64) << 48 ^ at));
-        let pieces = backend.shared_pieces.get(&base).map_or(0, |pieces| pieces.len());
+        let pieces = backend
+            .shared_pieces
+            .get(&base)
+            .map_or(0, |pieces| pieces.len());
         (shared.0, shared.1, pieces)
     }
 
@@ -5003,8 +5009,7 @@ impl Nvn {
                 let mut page = 0;
                 while page * PAGE_SIZE < length {
                     let at = offset + page * PAGE_SIZE;
-                    if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE)
-                    {
+                    if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE) {
                         match runs.last_mut() {
                             Some(run)
                                 if run.2 == file

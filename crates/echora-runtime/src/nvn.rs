@@ -378,6 +378,9 @@ pub struct Nvn {
     /// is remapped: what `texture_storage` answers can change only then.
     #[serde(skip)]
     object_generation: u64,
+    /// The memory pools among `objects` (the page table walks them).
+    #[serde(skip)]
+    memory_pools: std::collections::BTreeSet<u64>,
     /// `texture_storage` answers by texture, at an object generation.
     #[serde(skip)]
     storage_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
@@ -2121,6 +2124,7 @@ impl Nvn {
                 let kind = name.trim_start_matches("nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
                 self.objects.remove(&this);
+                self.memory_pools.remove(&this);
                 self.object_generation += 1;
                 return Ok(true);
             }
@@ -2396,6 +2400,7 @@ impl Nvn {
                     self.gpu_forget_texture(this);
                 }
                 self.objects.remove(&this);
+                self.memory_pools.remove(&this);
                 self.object_generation += 1;
                 self.images.remove(&this);
                 write_shared(&self.recording).remove(&this);
@@ -2746,6 +2751,7 @@ impl Nvn {
                     self.pool_epoch += 1;
                 }
                 self.objects.remove(&this);
+                self.memory_pools.remove(&this);
                 self.object_generation += 1;
                 return Ok(true);
             }
@@ -4720,6 +4726,9 @@ impl Nvn {
             return Err(format!("{kind} {address:#x} is already initialized"));
         }
         self.object_generation += 1;
+        if kind == "MemoryPool" {
+            self.memory_pools.insert(address);
+        }
         self.objects.insert(
             address,
             Object {

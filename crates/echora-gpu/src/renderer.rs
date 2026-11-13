@@ -2362,10 +2362,14 @@ impl Renderer {
         const PAGE: u64 = 4096;
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
-        if let Some(&(known, _, _, _, address)) = self
-            .addressed
+        // Kept sorted by start; a span holding this one starts at most
+        // MAX_SHARED_SPAN before it.
+        let after = self.addressed.partition_point(|(known, ..)| *known <= start);
+        if let Some(&(known, _, _, _, address)) = self.addressed[..after]
             .iter()
-            .find(|(known, held, ..)| *known <= start && start + span <= known + held)
+            .rev()
+            .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
+            .find(|(known, held, ..)| start + span <= known + held)
         {
             return Ok(Some(address + (offset - known)));
         }
@@ -2381,7 +2385,8 @@ impl Renderer {
             self.retired_shared.push((buffer, memory));
             return Ok(None);
         };
-        self.addressed.push((start, span, buffer, memory, address));
+        let at = self.addressed.partition_point(|(known, ..)| *known <= start);
+        self.addressed.insert(at, (start, span, buffer, memory, address));
         Ok(Some(address + (offset - start)))
     }
 
