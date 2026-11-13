@@ -184,8 +184,11 @@ impl Backend {
         let gpu = echora_gpu::vulkan::Gpu::new()?;
         let mut renderer = Renderer::new(gpu)?;
         // ECHORA_SHADER_CACHE=DIR (set by `echora run`): compiled shaders
-        // are kept there for the next run.
-        if let Some(directory) = super::debug_var_os("ECHORA_SHADER_CACHE") {
+        // are kept there for the next run (not with ECHORA_SHADER_STATS,
+        // which needs the driver to compile each).
+        if let Some(directory) = super::debug_var_os("ECHORA_SHADER_CACHE")
+            .filter(|_| super::debug_var_os("ECHORA_SHADER_STATS").is_none())
+        {
             renderer.set_shader_cache(directory.into());
         }
         if echora_gpu::renderer::Scale::env_override().is_none()
@@ -4533,6 +4536,11 @@ impl Nvn {
             (key.0, 1 << 63 | bits)
         };
         if !backend.programs.contains_key(&key) {
+            // ECHORA_SHADER_STATS (debugging): which program compiles next,
+            // for the driver's statistics (RADV_DEBUG=shaderstats) that follow.
+            if super::debug_var_os("ECHORA_SHADER_STATS").is_some() {
+                eprintln!("shader stats: dispatch {:016x}", key.0);
+            }
             let program = backend
                 .renderer
                 .create_program_specialized(vec![stage.clone()], &[specialization])?;
@@ -6885,6 +6893,9 @@ impl Nvn {
                 .map(|values| values.iter().map(|&(id, _)| (id, 0)).collect())
                 .collect();
             let base_filter = super::debug_var_os("ECHORA_VERTEX_TRACE_BASE").is_some();
+            if super::debug_var_os("ECHORA_SHADER_STATS").is_some() {
+                eprintln!("shader stats: draw {:016x}/{:016x}", keys.0, keys.1);
+            }
             let program = backend.renderer.create_program_specialized(
                 stages.clone(),
                 if base_filter {
