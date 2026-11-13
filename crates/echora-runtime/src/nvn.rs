@@ -974,6 +974,15 @@ pub struct Registry {
     events: HashMap<u64, u64>,
     /// Sync objects not signaled (a zero-timeout wait on one times out).
     unsignaled: std::collections::HashSet<u64>,
+    /// Signaled syncs and the GPU submission serial that held the work
+    /// before their fence.
+    signaled: HashMap<u64, u64>,
+    /// The renderer's completed submission serial (see `Renderer::wait_for`).
+    completed: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// GPU results are waiting to be stored in guest memory at a CPU wait
+    /// (pending dispatch reads, in-place writes, uncached pools' GPU
+    /// writes): a CPU wait then needs the NVN state.
+    resolve_pending: bool,
 }
 
 type SharedRegistry = std::sync::Arc<std::sync::RwLock<Registry>>;
@@ -1052,9 +1061,26 @@ impl Recorder {
         // with the state.
         if name == "nvnSyncWait" {
             let x = core.cpu.regs;
-            if x[1] == 0 && read_shared(&self.registry).unsignaled.contains(&x[0]) {
+            let registry = read_shared(&self.registry);
+            if x[1] == 0 && registry.unsignaled.contains(&x[0]) {
+                drop(registry);
                 call_watch(name, core);
                 core.cpu.regs[0] = 2;
+                return Ok(true);
+            }
+            // Signaled, its work done on the GPU and no results waiting to
+            // be stored: what the locked wait would find (0), without
+            // waiting for a queue replay to release the state.
+            let finished = registry.signaled.get(&x[0]).is_some_and(|&serial| {
+                !registry.resolve_pending
+                    && registry.completed.as_ref().is_some_and(|completed| {
+                        completed.load(std::sync::atomic::Ordering::Acquire) >= serial
+                    })
+            });
+            drop(registry);
+            if finished {
+                call_watch(name, core);
+                core.cpu.regs[0] = 0;
                 return Ok(true);
             }
             return Ok(false);
@@ -1489,6 +1515,29 @@ impl Nvn {
     /// convention (X0..X7, V0..V7); a result goes to X0 (or V0). Returns
     /// Ok(false) when `name` is not implemented, so the caller stops with it.
     pub fn call(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        let result = self.call_inner(name, core);
+        self.publish_resolve_state();
+        result
+    }
+
+    /// Tell lock-free sync waits (`Recorder::front`) whether GPU results
+    /// wait to be stored, and where the completed serial is.
+    fn publish_resolve_state(&self) {
+        let (pending, completed) = self.gpu_resolve_state();
+        let current = read_shared(&self.registry);
+        if current.resolve_pending == pending && current.completed.is_some() == completed.is_some()
+        {
+            return;
+        }
+        drop(current);
+        let mut registry = write_shared(&self.registry);
+        registry.resolve_pending = pending;
+        if registry.completed.is_none() {
+            registry.completed = completed;
+        }
+    }
+
+    fn call_inner(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
         call_watch(name, core);
         // Where the CPU may look at what the GPU wrote (after waiting for
         // it, or invalidating its view of a mapped range), deferred
@@ -1670,7 +1719,11 @@ impl Nvn {
                 self.object(x[1], "Device").map_err(invalid)?;
                 self.initialize(this, "Sync", BTreeMap::new())
                     .map_err(invalid)?;
-                write_shared(&self.registry).unsignaled.insert(this);
+                {
+                    let mut registry = write_shared(&self.registry);
+                    registry.unsignaled.insert(this);
+                    registry.signaled.remove(&this);
+                }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -1952,7 +2005,11 @@ impl Nvn {
                     // Signaled when the queue's earlier work has run.
                     let sync = self.objects.get_mut(&x[1]).unwrap();
                     sync.state.remove("Signaled");
-                    write_shared(&self.registry).unsignaled.insert(x[1]);
+                    {
+                        let mut registry = write_shared(&self.registry);
+                        registry.unsignaled.insert(x[1]);
+                        registry.signaled.remove(&x[1]);
+                    }
                     self.pending
                         .get_mut(&this)
                         .unwrap()
@@ -3126,7 +3183,9 @@ impl Nvn {
                     self.pool_epoch += 1;
                 }
                 if kind == "Sync" {
-                    write_shared(&self.registry).unsignaled.remove(&this);
+                    let mut registry = write_shared(&self.registry);
+                    registry.unsignaled.remove(&this);
+                    registry.signaled.remove(&this);
                 }
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
@@ -4959,8 +5018,15 @@ impl Nvn {
     /// Signal a sync, noting the GPU submission that holds the work
     /// before it (what a CPU wait on it has to wait for).
     fn signal_sync(&mut self, sync: u64, args: Args) {
-        write_shared(&self.registry).unsignaled.remove(&sync);
         let serial = self.gpu_recorded_serial();
+        {
+            let mut registry = write_shared(&self.registry);
+            registry.unsignaled.remove(&sync);
+            registry.signaled.insert(sync, serial);
+            // Results of the work before the fence may still be stored by
+            // this call; the state is published again when it returns.
+            registry.resolve_pending = true;
+        }
         if let Some(object) = self.objects.get_mut(&sync) {
             object.state.insert("Signaled".into(), args);
             let mut recorded = Args::default();

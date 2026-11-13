@@ -280,6 +280,9 @@ pub struct Renderer {
     /// submission, and the highest serial known to have completed.
     current_serial: u64,
     completed_serial: u64,
+    /// `completed_serial`, readable by other threads (a CPU wait answered
+    /// without the NVN state lock).
+    completed_shared: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Labels of the last submission (ECHORA_SLOW_SUBMITS reports them).
     submitted_labels: Vec<String>,
     /// Render targets created, and recreated because their shape changed.
@@ -552,6 +555,7 @@ impl Renderer {
             current_in_flight: false,
             current_serial: 0,
             completed_serial: 0,
+            completed_shared: Default::default(),
             submitted_labels: Vec::new(),
             occlusion: None,
             condition: None,
@@ -2075,6 +2079,11 @@ impl Renderer {
         Ok(())
     }
 
+    /// The highest completed submission serial, shared (see `wait_for`).
+    pub fn completed_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.completed_shared.clone()
+    }
+
     /// Serial of the submission that holds everything recorded so far:
     /// `wait_for` with it waits for that work and no later work.
     pub fn recorded_serial(&self) -> u64 {
@@ -2259,6 +2268,8 @@ impl Renderer {
         }
         self.current_in_flight = false;
         self.completed_serial = self.completed_serial.max(self.current_serial);
+        self.completed_shared
+            .store(self.completed_serial, std::sync::atomic::Ordering::Release);
         self.flush_wait_microseconds += wait_start.elapsed().as_micros() as u64;
         if let Some(timer) = self.timer.as_mut() {
             timer.finished(&self.gpu.device, self.fence, self.flush_wait_microseconds);
