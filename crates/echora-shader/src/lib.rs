@@ -434,7 +434,10 @@ mod tests {
         assert_eq!(translated.loaded_generics, 1 << 1);
         assert_eq!(
             translated.push_fields,
-            echora_shader_abi::PUSH_VERTEX_FETCH | echora_shader_abi::PUSH_PAGE_TABLE
+            // It reads through the page table and stores nothing there.
+            echora_shader_abi::PUSH_VERTEX_FETCH
+                | echora_shader_abi::PUSH_PAGE_TABLE
+                | echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY
         );
     }
 
