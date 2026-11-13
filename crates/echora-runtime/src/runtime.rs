@@ -5002,14 +5002,16 @@ fn replay_thread(shared: &Shared, mut core: Core) {
 /// invalidate does not wait, as on the console: the GPU writes it makes
 /// visible are those of work replayed so far, which covers every fence the
 /// guest has seen signaled.
-fn needs_replayed(name: &str, regs: &[u64; 31]) -> bool {
+fn needs_replayed(nvn: &crate::nvn::Nvn, name: &str, regs: &[u64; 31]) -> bool {
     match name {
         "nvnSyncWait" => regs[1] != 0,
         "nvnQueueFinish" => true,
         "nvnCommandBufferInitialize" | "nvnCommandBufferFinalize" => false,
+        // A structure made again without being finalized (finalizing waits
+        // already, so work queued since cannot name the old object).
+        _ if name.ends_with("Initialize") => nvn.holds_object(regs[0]),
         _ => {
             name.ends_with("Finalize")
-                || name.ends_with("Initialize")
                 || name.contains("ReadTexels")
                 || name.contains("WriteTexels")
                 || name.contains("Register")
@@ -5390,7 +5392,7 @@ impl Worker {
                 && matches!(
                     nvn.entry(pc),
                     Some(crate::nvn::HostEntry::Proc(name))
-                        if needs_replayed(&name, &self.core.cpu.regs)
+                        if needs_replayed(&nvn, &name, &self.core.cpu.regs)
                 ));
         // A queued present waits only for the previous present's work.
         let queued_present = machine_call

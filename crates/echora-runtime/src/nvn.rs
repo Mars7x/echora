@@ -3479,6 +3479,11 @@ impl Nvn {
         Self::replay_thread() && debug_var_os("ECHORA_PRESENT_NOW").is_none()
     }
 
+    /// Whether an NVN object lives at `address`.
+    pub fn holds_object(&self, address: u64) -> bool {
+        self.objects.contains_key(&address)
+    }
+
     /// Whether a queued present has not been shown yet.
     pub fn present_pending(&self) -> bool {
         self.pending
