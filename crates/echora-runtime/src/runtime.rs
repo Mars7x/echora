@@ -5508,6 +5508,7 @@ impl Worker {
             },
             _ => None,
         };
+        let pre_wait = std::time::Instant::now();
         if let Some(sync) = gpu_wait {
             // The replay may record more while the lock is free: a few
             // rounds, so what the call itself waits for has finished.
@@ -5539,6 +5540,14 @@ impl Worker {
                     }
                 }
             }
+        }
+        if gpu_wait.is_some() {
+            crate::timeline::span(
+                self.core.current_thread_id,
+                "gpu-wait-before-call",
+                pre_wait,
+                std::time::Instant::now(),
+            );
         }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         if thread && nvn.replay_paused() {

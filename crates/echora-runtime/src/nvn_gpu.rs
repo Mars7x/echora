@@ -4789,6 +4789,22 @@ impl Nvn {
             // more such work is recorded.
             if backend.page_table_writes {
                 let started = std::time::Instant::now();
+                let waited_serial = backend
+                    .page_table_write_serial
+                    .min(backend.observable_serial);
+                crate::timeline::span(
+                    u64::MAX - 3,
+                    &format!(
+                        "page-table-wait serial {waited_serial} recorded {} completed {}",
+                        backend.renderer.recorded_serial(),
+                        backend
+                            .renderer
+                            .completed_handle()
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    ),
+                    started,
+                    started,
+                );
                 if backend.page_table_write_serial <= backend.observable_serial {
                     backend.stat("stat: GPU waits for page-table writes", 1);
                     backend.renderer.wait_for(backend.page_table_write_serial)?;
@@ -4802,6 +4818,12 @@ impl Nvn {
                 backend.stat(
                     "stat: GPU waits for page-table writes us",
                     started.elapsed().as_micros() as u64,
+                );
+                crate::timeline::span(
+                    u64::MAX - 3,
+                    "page-table-wait",
+                    started,
+                    std::time::Instant::now(),
                 );
             }
             for pool in backend.resident.values_mut() {
@@ -4884,6 +4906,12 @@ impl Nvn {
         backend.stat(
             "stat: resident copy-back wait us",
             started.elapsed().as_micros() as u64,
+        );
+        crate::timeline::span(
+            u64::MAX - 3,
+            "resident-copy-back-flush",
+            started,
+            std::time::Instant::now(),
         );
         // Only these: pending dispatch and draw results stay for
         // `resolve_copies`.
