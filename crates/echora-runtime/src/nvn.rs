@@ -3841,6 +3841,16 @@ impl Nvn {
     fn execute(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
         // ECHORA_NVN_PROFILE: replayed commands' host time too, under
         // "replay <name>".
+        if crate::timeline::on() {
+            // Commands of a millisecond or more on the timeline, by name.
+            let started = std::time::Instant::now();
+            let result = self.execute_untimed(command, core);
+            let ended = std::time::Instant::now();
+            if ended - started >= std::time::Duration::from_millis(1) {
+                crate::timeline::span(u64::MAX - 1, &command.name, started, ended);
+            }
+            return result;
+        }
         if debug_var_os("ECHORA_NVN_PROFILE").is_none() {
             return self.execute_untimed(command, core);
         }
