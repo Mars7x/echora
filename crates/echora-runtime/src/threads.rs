@@ -500,6 +500,7 @@ impl ThreadCollection {
         if let Err(error) = memory.write(tls_address, &local_region) {
             // The new exact mapping cannot have gained aliases in this exclusive
             // operation. Roll it back before exposing the initialization error.
+            crate::nvn::note_released_memory(memory, tls_address, PAGE_SIZE);
             memory.unmap_exact(tls_address, PAGE_SIZE)?;
             return Err(error);
         }
@@ -535,6 +536,7 @@ impl ThreadCollection {
 
     fn unmap_owned_tls(memory: &mut Memory, address: u64) -> Result<(), Trap> {
         Self::validate_owned_tls(memory, address)?;
+        crate::nvn::note_released_memory(memory, address, PAGE_SIZE);
         memory.unmap_exact(address, PAGE_SIZE)
     }
 
