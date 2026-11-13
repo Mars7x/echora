@@ -2223,6 +2223,33 @@ impl Renderer {
         Ok(())
     }
 
+    /// Submit the batch with this serial if it is still being recorded
+    /// (without waiting for it), so `poll_completed` can see it finish.
+    pub fn submit_through(&mut self, serial: u64) -> Result<(), String> {
+        if serial > self.flushes && self.recording {
+            self.flush_async()?;
+        }
+        Ok(())
+    }
+
+    /// Note the submissions that have finished, without waiting: their
+    /// slots are freed and `completed_handle` moves on.
+    pub fn poll_completed(&mut self) -> Result<(), String> {
+        let signaled = |renderer: &Self, fence: vk::Fence| {
+            // SAFETY: the fence is live.
+            unsafe { renderer.gpu.device.get_fence_status(fence) }.unwrap_or(false)
+        };
+        if self.spare.in_flight && signaled(self, self.spare.fence) {
+            self.swap_slot();
+            self.finish_current()?;
+            self.swap_slot();
+        }
+        if self.current_in_flight && signaled(self, self.fence) {
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
     /// End of a frame: submit what was recorded without waiting for it, so
     /// the GPU renders this frame while the CPU prepares the next. Reads of
     /// results still go through `flush`, which waits.

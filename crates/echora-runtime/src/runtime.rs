@@ -5435,6 +5435,42 @@ impl Worker {
                 nvn.note_replay_wait(&name, waited.elapsed());
             }
         }
+        // A read of what programs stored through the page table: the GPU
+        // work it waits for finishes without the NVN state held, so the
+        // replay goes on meanwhile.
+        if thread
+            && matches!(
+                nvn.entry(pc),
+                Some(crate::nvn::HostEntry::Proc(name)) if name == "nvnMemoryPoolInvalidateMappedRange"
+            )
+        {
+            // The replay may record more while the lock is free: a few
+            // rounds, so what the call itself waits for has finished.
+            for _ in 0..3 {
+                let serial = match nvn.read_wait_serial() {
+                    Ok(Some(serial)) => serial,
+                    Ok(None) => break,
+                    Err(trap) => {
+                        self.held_failed = Some(Some(trap));
+                        return false;
+                    }
+                };
+                loop {
+                    match nvn.submission_done(serial) {
+                        Ok(true) => break,
+                        Ok(false) => {
+                            drop(nvn);
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            nvn = shared.lock_nvn();
+                        }
+                        Err(trap) => {
+                            self.held_failed = Some(Some(trap));
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
         let mut made = self.held_nvn_call_locked(&mut nvn, pc);
         if thread && nvn.replay_paused() {
             shared.wake_replay();

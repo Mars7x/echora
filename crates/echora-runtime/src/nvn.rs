@@ -3483,6 +3483,21 @@ impl Nvn {
         Self::replay_thread() && debug_var_os("ECHORA_PRESENT_NOW").is_none()
     }
 
+    /// With a replay thread, before an invalidate: the GPU submission its
+    /// read waits for (`gpu_read_wait_serial`), which the caller waits for
+    /// without holding the NVN state.
+    pub fn read_wait_serial(&mut self) -> Result<Option<u64>, Trap> {
+        self.gpu_read_wait_serial()
+            .map_err(|message| Trap::InvalidState { message })
+    }
+
+    /// Whether submission `serial` has finished (noting finished ones).
+    pub fn submission_done(&mut self, serial: u64) -> Result<bool, Trap> {
+        self.gpu_poll_completed()
+            .map_err(|message| Trap::InvalidState { message })?;
+        Ok(self.gpu_completed_serial() >= serial)
+    }
+
     /// Whether an NVN object lives at `address`.
     pub fn holds_object(&self, address: u64) -> bool {
         self.objects.contains_key(&address)

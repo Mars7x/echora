@@ -3427,6 +3427,50 @@ impl Nvn {
 
     /// A CPU wait on a signaled sync: waits for the submission that held
     /// the work before its fence, or for everything when that is unknown.
+    /// The submission a CPU read would wait for first (stores through the
+    /// page table, `resolve_gpu_written`), submitted if still recording;
+    /// None when none or it has finished. The caller waits for it without
+    /// the NVN state (`gpu_poll_completed`, `gpu_completed_serial`).
+    pub(super) fn gpu_read_wait_serial(&mut self) -> Result<Option<u64>, String> {
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(None);
+        };
+        if !backend.page_table_wrote || !backend.page_table_writes {
+            return Ok(None);
+        }
+        let serial = backend
+            .page_table_write_serial
+            .min(backend.observable_serial);
+        if serial
+            <= backend
+                .renderer
+                .completed_handle()
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        backend.renderer.submit_through(serial)?;
+        Ok(Some(serial))
+    }
+
+    /// Note finished submissions without waiting.
+    pub(super) fn gpu_poll_completed(&mut self) -> Result<(), String> {
+        match self.gpu.as_mut() {
+            Some(backend) => backend.renderer.poll_completed(),
+            None => Ok(()),
+        }
+    }
+
+    /// The serial of the last finished submission.
+    pub(super) fn gpu_completed_serial(&self) -> u64 {
+        self.gpu.as_ref().map_or(u64::MAX, |backend| {
+            backend
+                .renderer
+                .completed_handle()
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
     /// Work recorded before submission `serial` ends at a fence or event
     /// the guest can see signaled.
     pub(super) fn gpu_observable(&mut self, serial: u64) {
