@@ -59,61 +59,14 @@ What doesn't work yet:
   it should be, the water is too red, and subtitles and the speaker's name
   are not drawn. Nothing past that scene has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, decoded on the GPU, averages about 54 pictures per second, and the
-  first 3D scene runs at about 11.
+  movie, decoded on the GPU, averages about 56 pictures per second, and the
+  first 3D scene runs at about 12.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
 These figures come from update 1.1.1 (`0400486024DEC000` v131072) on an AMD
 RX 9070 XT. The [roadmap](docs/roadmap.md) and
 [known limitations](docs/limitations.md) go into more detail.
-
-## What I'm working on
-
-The game's GPU programs are written for the Switch 2's NVIDIA GPU and have to
-be translated into shaders your PC's GPU can run. Echora first used a C++
-shader recompiler from the Switch emulator world. It got the title screen and
-the opening movie on screen, but after the movie it turned out to be the
-source of the hardest bugs: it guessed where shaders keep their data, and the
-wrong guesses fed the game's own programs bad data and hung the GPU. So I
-wrote Echora's own translator in Rust, for four reasons:
-
-- Shaders reach the game's real memory through a page table, the way the
-  console's GPU sees it, instead of guesses.
-- Every shader can be translated without running the game, so they can all
-  be prepared before it starts. That step is not built yet.
-- The PC's own hardware, such as the matrix units the game's upscaler needs,
-  can be used directly instead of being emulated step by step.
-- The whole project shares one language and one design.
-
-It is a new design, with the details of each instruction checked against
-public references and models of the hardware. It comes with a simulator that
-runs a translated program on recorded inputs, which is how the translator's
-output is checked against a reference without running the game.
-
-That translator now handles every shader the game has used so far. The
-first 3D scene came next: making each of the game's graphics calls do what
-it does on the console. Most of the scene's faults turned out to be small
-differences of that kind, such as how textures with several layers are laid
-out in memory, which blend factors exist, or how a sampler compares depths.
-
-The work has now moved on to speed. Much of the time went into waiting
-rather than working: the CPU and GPU took turns instead of running side by
-side, one lock serialised the game's threads, and the GPU stopped to drain
-its work far more often than the game asked it to. Removing those waits
-took the opening movie from about 28 to about 56 pictures per second and the
-first 3D scene from about 2 to about 12 frames per second, with the frames
-checked against earlier ones after each step.
-
-Much of this work is general rather than specific to Ocarina of Time. The
-translator handles the Switch 2's GPU instructions on their own terms, and
-it will move to its own repository so other Switch 2 recompilation projects
-can use it.
-
-The next step is the rest of the way to the console's 60 frames per
-second for the opening movie and that scene, mostly by making each of the
-game's draws cheaper to turn into Vulkan work. After that come the scene's
-last faults and gameplay.
 
 ## Approach
 
@@ -131,13 +84,15 @@ pretending it worked. The translated code is tested against a reference
 interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
+Anything that goes beyond what the console does, such as frame rates above
+60 or ultrawide, will be kept in a separate layer of enhancements that can be
+turned off.
+
 Echora is written in pure Rust. Like any PC program it uses the system's own
 libraries for graphics, sound, input and windows, and the Zstandard library
 it reads the game's compressed files with. The CPU video decoder it falls
 back on when a GPU can't decode the movies keeps hand-written assembly for
-speed. Anything that goes beyond what the
-console does, such as frame rates above 60 or ultrawide, will be kept in a
-separate layer of enhancements that can be turned off.
+speed.
 
 This is slower than taking shortcuts. A port can get a game running sooner
 by replacing the game's own copies of Nintendo's libraries with PC code, or
@@ -164,6 +119,52 @@ over to other Switch 2 games.
 
 See the [architecture notes](docs/architecture.md) for how the crates fit
 together.
+
+## What I'm working on
+
+The game's GPU programs are written for the Switch 2's NVIDIA GPU and have to
+be translated into shaders your PC's GPU can run. Echora first used a C++
+shader recompiler from the Switch emulator world. It got the title screen and
+the opening movie on screen, but after the movie it turned out to be the
+source of the hardest bugs: it guessed where shaders keep their data, and the
+wrong guesses fed the game's own programs bad data and hung the GPU. So I
+wrote Echora's own translator in Rust, for four reasons:
+
+- Shaders reach the game's real memory through a page table, the way the
+  console's GPU sees it, instead of guesses.
+- Every shader can be translated without running the game, so they can all
+  be prepared before it starts. That step is not built yet.
+- The PC's own hardware, such as the matrix units the game's upscaler needs,
+  can be used directly instead of being emulated step by step.
+- The whole project shares one language and one design.
+
+It is a new design, with the details of each instruction checked against
+public references and models of the hardware. It comes with a simulator that
+runs a translated program on recorded inputs, which is how the translator's
+output is checked against a reference without running the game.
+
+The translator is general rather than specific to Ocarina of Time: it
+handles the Switch 2's GPU instructions on their own terms, and it will move
+to its own repository so other Switch 2 recompilation projects can use it.
+
+That translator now handles every shader the game has used so far. The
+first 3D scene came next: making each of the game's graphics calls do what
+it does on the console. Most of the scene's faults turned out to be small
+differences of that kind, such as how textures with several layers are laid
+out in memory, which blend factors exist, or how a sampler compares depths.
+
+The work has now moved on to speed. Much of the time went into waiting
+rather than working: the CPU and GPU took turns instead of running side by
+side, one lock serialised the game's threads, and the GPU stopped to drain
+its work far more often than the game asked it to. Removing those waits
+took the opening movie from about 28 to about 56 pictures per second and the
+first 3D scene from about 2 to about 12 frames per second, with the frames
+checked against earlier ones after each step.
+
+The next step is the rest of the way to the console's 60 frames per
+second for the opening movie and that scene, mostly by making each of the
+game's draws cheaper to turn into Vulkan work. After that come the scene's
+last faults and gameplay.
 
 ## Building
 
