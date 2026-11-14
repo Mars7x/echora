@@ -5971,11 +5971,20 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     mixed = (mixed ^ mixed >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
     mixed ^= mixed >> 31;
     let tag = (mixed as u32) | 1;
+    // Tags are only ever added, so one this thread has seen in the table
+    // stays there: the recording threads skip the shared lock for it.
+    thread_local! {
+        static SEEN: std::cell::RefCell<FastSet<u32>> = std::cell::RefCell::default();
+    }
+    if SEEN.with(|seen| seen.borrow().contains(&tag)) {
+        return Some(tag);
+    }
     let known = STATE_TAGS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .is_some_and(|tags| tags.contains_key(&tag));
+    SEEN.with(|seen| seen.borrow_mut().insert(tag));
     if !known {
         STATE_TAGS
             .write()
@@ -6826,6 +6835,34 @@ mod tests {
     use super::*;
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+    /// A state tag a thread has already seen is answered without the shared
+    /// table, and still names the snapshot another thread finds there.
+    #[test]
+    fn seen_state_tags_stay_in_the_shared_table() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "DepthFunc".to_string(),
+            Args {
+                x: [0x6a17, 0, 0, 0],
+                v: [0; 2],
+            },
+        );
+        let first = state_tag("DepthStencilState", &props).unwrap();
+        assert_eq!(state_tag("DepthStencilState", &props), Some(first));
+        let elsewhere = std::thread::spawn({
+            let props = props.clone();
+            move || state_tag("DepthStencilState", &props)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(elsewhere, Some(first));
+        let tags = STATE_TAGS.read().unwrap();
+        let (kind, snapshot) = tags.as_ref().unwrap().get(&first).unwrap();
+        assert_eq!(kind, "DepthStencilState");
+        assert_eq!(snapshot[0]["DepthFunc"].x[0], 0x6a17);
+        assert_eq!(state_tag("Unknown", &props), None);
+    }
 
     fn call(nvn: &mut Nvn, core: &mut Guest, name: &str, args: &[u64]) -> u64 {
         core.cpu.regs[..args.len()].copy_from_slice(args);
