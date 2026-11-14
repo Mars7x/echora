@@ -40,6 +40,7 @@ fn options() -> EmitOptions {
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
         untagged_blocks: std::env::var_os("CARGO_FEATURE_UNTAGGED_BLOCKS").is_some(),
+        stub_windows: false,
     }
 }
 
@@ -96,6 +97,7 @@ fn split_programs(out: &mut String) {
     irreducible_candidates(out);
     concurrency_code(out);
     stress_code(out);
+    plt_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1797,6 +1799,120 @@ fn stress_code(out: &mut String) {
     );
     let (root, regions) = split(&translation, options());
     writeln!(out, "pub mod stress_code {{").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// A synthetic PLT for `tests/plt.rs`: a caller window (BL to three stubs,
+/// and a BL to a function that tail-branches to the third), a window of
+/// stubs `ADRP X16; LDR X17, [X16, #off]; ADD X16, X16, #off; BR X17`
+/// loading GOT slots in the data page, and the functions they reach. The
+/// translation predicts the slots hold FA (in the caller's window, so in
+/// its region: a direct window call), FB and FC (another region); FD and FE
+/// are what a test rewrites the slots to. Split emission with the default
+/// options, which inline the stubs.
+fn plt_code(out: &mut String) {
+    use echora_lift::codegen::plt_report;
+
+    const BASE: u64 = 0x120_0000;
+    const GOT: u64 = 0x80_0000;
+    const SVC_7: u32 = 0xd400_00e1;
+    const RET: u32 = 0xd65f_03c0;
+    let (stub_a, stub_b, stub_c) = (BASE + 0x400, BASE + 0x410, BASE + 0x420);
+    let tailer = BASE + 0x100;
+    let (fa, fe) = (BASE + 0x200, BASE + 0x300);
+    let (fb, fc, fd) = (BASE + 0x800, BASE + 0x900, BASE + 0xa00);
+    let branch = |link: bool, from: u64, to: u64| {
+        (if link { 0x9400_0000 } else { 0x1400_0000 })
+            | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0xc00 / 4];
+    let mut place = |address: u64, program: &[u32]| {
+        let at = ((address - BASE) / 4) as usize;
+        words[at..at + program.len()].copy_from_slice(program);
+    };
+    place(
+        BASE,
+        &[
+            0xd280_00a0, // movz x0, #5
+            0xd280_0001, // movz x1, #0
+            branch(true, BASE + 8, stub_a),
+            branch(true, BASE + 12, stub_b),
+            branch(true, BASE + 16, tailer),
+            branch(true, BASE + 20, stub_c),
+            SVC_7,
+        ],
+    );
+    place(tailer, &[branch(false, tailer, stub_c)]);
+    place(fa, &[0x9100_0400, RET]); // add x0, x0, #1
+    place(fe, &[0xd280_0122, RET]); // movz x2, #9
+    place(fb, &[0x8b00_0000, RET]); // add x0, x0, x0
+    place(fc, &[0x8b00_0021, RET]); // add x1, x1, x0
+    place(fd, &[0xd100_0800, RET]); // sub x0, x0, #2
+    for (index, stub) in [stub_a, stub_b, stub_c].into_iter().enumerate() {
+        let offset = 8 * index as u32;
+        let page = ((GOT >> 12) as i64 - (stub >> 12) as i64) as u32;
+        place(
+            stub,
+            &[
+                0x9000_0010 | (page & 3) << 29 | (page >> 2 & 0x7_ffff) << 5,
+                0xf940_0211 | (offset / 8) << 10,
+                0x9100_0210 | offset << 10,
+                0xd61f_0220,
+            ],
+        );
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "plt".into(),
+        base: BASE,
+        bytes,
+    };
+    let entries = [BASE, fa, fb, fc, fd, fe];
+    let mut translation = discover(&[region], &entries, words.len()).expect("plt");
+    translation.got_words = [(GOT, fa), (GOT + 8, fb), (GOT + 16, fc)].into();
+    let report = plt_report(&translation, region_bits());
+    let (root, regions) = split(&translation, options());
+    let direct = regions
+        .iter()
+        .map(|(_, source)| source.matches("m.call_window(").count())
+        .sum::<usize>();
+    // The direct call runs only when X17 holds the predicted word.
+    let guarded = regions
+        .iter()
+        .any(|(_, source)| source.contains(&format!("if r.x17 == {fa:#x} {{\n")));
+    writeln!(out, "pub mod plt_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const GOT: u64 = {GOT:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(
+        out,
+        "pub const STUBS: [u64; 3] = [{stub_a:#x}, {stub_b:#x}, {stub_c:#x}];\n\
+         pub const FA: u64 = {fa:#x};\n\
+         pub const FB: u64 = {fb:#x};\n\
+         pub const FC: u64 = {fc:#x};\n\
+         pub const FD: u64 = {fd:#x};\n\
+         pub const FE: u64 = {fe:#x};"
+    )
+    .expect("write");
+    writeln!(
+        out,
+        "/// (stubs, predicted, inlined, BL sites, direct BL sites, B sites).\n\
+         pub const REPORT: (usize, usize, usize, usize, usize, usize) = ({}, {}, {}, {}, {}, {});\n\
+         /// Direct window calls in the emitted regions.\n\
+         pub const DIRECT_CALLS: usize = {direct};\n\
+         /// Whether the direct call is guarded by the predicted word.\n\
+         pub const GUARDED: bool = {guarded};",
+        report.stubs,
+        report.predicted,
+        report.inlined,
+        report.call_sites,
+        report.direct_call_sites,
+        report.tail_sites
+    )
+    .expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }

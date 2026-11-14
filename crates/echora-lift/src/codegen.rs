@@ -54,6 +54,12 @@ pub struct Translation {
     pub jump_tables: BTreeMap<u64, usize>,
     /// Every recovered jump-table case target (reached by an indirect branch).
     pub indirect_targets: BTreeSet<u64>,
+    /// Predicted 64-bit words of data the guest's dynamic linker writes
+    /// (GOT slots), by address: what the loader's relocations say it will
+    /// store there. Empty unless the caller fills it after discovery. A
+    /// prediction only chooses a guarded fast path (see `plt_stubs`); the
+    /// word in guest memory decides where execution goes.
+    pub got_words: BTreeMap<u64, u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -288,6 +294,7 @@ pub fn discover_with_tables(
         truncated,
         jump_tables,
         indirect_targets,
+        got_words: BTreeMap::new(),
     })
 }
 
@@ -1139,6 +1146,238 @@ fn emit_call(output: &mut String, next: u64) {
     .unwrap();
 }
 
+/// A call whose callee left its target in X17 (an inlined PLT stub, see
+/// `emit_plt_stub`): when that is the predicted target and its window is in
+/// this region, the callee's window function runs directly
+/// (`Core::call_window`); otherwise, as any call, through the window table.
+fn emit_call_predicted(output: &mut String, next: u64, direct: Option<(u64, u64)>) {
+    let Some((predicted, window)) = direct else {
+        emit_call(output, next);
+        return;
+    };
+    writeln!(
+        output,
+        "                if {} == {predicted:#x} {{",
+        reg(17, 64, false)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "                if let Err(trap) = m.call_window({next:#x}, run_window_{window:x}) {{ return Err(trap); }}"
+    )
+    .unwrap();
+    output.push_str("                } else {\n");
+    emit_call(output, next);
+    output.push_str("                }\n");
+}
+
+/// A PLT stub as the static linker writes them:
+/// `ADRP X16, page; LDR X17, [X16, #off]; ADD X16, X16, #off; BR X17`,
+/// one block of exactly these four instructions.
+#[derive(Clone, Debug)]
+pub struct PltStub {
+    pub address: u64,
+    /// The GOT slot the stub loads its target from.
+    pub slot: u64,
+    /// The word the loader is expected to leave in the slot
+    /// (`Translation::got_words`), if known.
+    pub predicted: Option<u64>,
+    /// ADRP, LDR and ADD: run inline where a branch reaches the stub.
+    body: [TranslatedInstruction; 3],
+}
+
+/// Every PLT stub of `translation`, by address.
+pub fn plt_stubs(translation: &Translation) -> BTreeMap<u64, PltStub> {
+    let mut stubs = BTreeMap::new();
+    for block in &translation.blocks {
+        let [adrp, ldr, add, br] = block.instructions.as_slice() else {
+            continue;
+        };
+        let offset = (ldr.word >> 10 & 0xfff) * 8;
+        if adrp.word & 0x9f00_001f != 0x9000_0010
+            || ldr.word & 0xffc0_03ff != 0xf940_0211
+            || add.word & 0xffc0_03ff != 0x9100_0210
+            || add.word >> 10 & 0xfff != offset
+            || br.word != 0xd61f_0220
+        {
+            continue;
+        }
+        let Instruction::Adr { address: page, .. } = adrp.instruction else {
+            continue;
+        };
+        let slot = page.wrapping_add(u64::from(offset));
+        stubs.insert(
+            block.start,
+            PltStub {
+                address: block.start,
+                slot,
+                predicted: translation.got_words.get(&slot).copied(),
+                body: [adrp.clone(), ldr.clone(), add.clone()],
+            },
+        );
+    }
+    stubs
+}
+
+/// Blocks every emission keeps a dispatch arm for: translation entries and
+/// the targets of BL. A host boundary may resume at them, and a direct
+/// window call may start there.
+fn entered_blocks(translation: &Translation) -> BTreeSet<u64> {
+    let mut entered: BTreeSet<u64> = translation.entries.iter().copied().collect();
+    for record in translation.instructions.values() {
+        if let Instruction::Branch { target, link: true } = record.instruction {
+            entered.insert(target);
+        }
+    }
+    let starts: BTreeSet<u64> = translation.blocks.iter().map(|block| block.start).collect();
+    entered.retain(|pc| starts.contains(pc));
+    entered
+}
+
+/// How split emission treats the PLT stubs of a translation.
+struct Plt {
+    stubs: BTreeMap<u64, PltStub>,
+    entered: BTreeSet<u64>,
+    region_bits: u32,
+}
+
+impl Plt {
+    fn of(translation: &Translation, region_bits: u32) -> Self {
+        let entered = entered_blocks(translation);
+        let mut stubs = plt_stubs(translation);
+        // A stub runs inline only where it keeps its own arm (where a
+        // host boundary at its start resumes) and is not traced.
+        stubs.retain(|pc, _| entered.contains(pc) && !traced_pcs().contains(pc));
+        Self {
+            stubs,
+            entered,
+            region_bits,
+        }
+    }
+
+    /// The stub a branch at `from` to `target` runs inline, and for a call
+    /// the window to call directly when the stub's word is the predicted
+    /// one: a translated entry in the caller's region (window functions of
+    /// other regions are only reachable through the window table).
+    fn site(&self, from: u64, target: u64, link: bool) -> Option<(&PltStub, Option<(u64, u64)>)> {
+        let stub = self.stubs.get(&target)?;
+        // A branch within the stub's window would be expanded or followed
+        // by the window's own structure; only crossing ones are rewritten.
+        if from >> SPLIT_WINDOW_BITS == target >> SPLIT_WINDOW_BITS {
+            return None;
+        }
+        let direct = stub.predicted.filter(|predicted| {
+            link && self.entered.contains(predicted)
+                && predicted >> self.region_bits == from >> self.region_bits
+        });
+        Some((stub, direct.map(|p| (p, p >> SPLIT_WINDOW_BITS))))
+    }
+}
+
+/// What split emission does with a translation's PLT stubs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PltReport {
+    /// Blocks matching the stub pattern.
+    pub stubs: usize,
+    /// Stubs whose GOT slot has a predicted word.
+    pub predicted: usize,
+    /// Stubs that run inline at their callers (those with a dispatch arm
+    /// of their own, see `entered_blocks`).
+    pub inlined: usize,
+    /// BL instructions to an inlined stub from another window.
+    pub call_sites: usize,
+    /// Of those, the calls that run the predicted target's window directly
+    /// when guest memory holds the predicted word.
+    pub direct_call_sites: usize,
+    /// B instructions to an inlined stub from another window.
+    pub tail_sites: usize,
+}
+
+/// [`PltReport`] of split emission with `region_bits`-bit regions.
+pub fn plt_report(translation: &Translation, region_bits: u32) -> PltReport {
+    let all = plt_stubs(translation);
+    let plt = Plt::of(translation, region_bits);
+    let mut report = PltReport {
+        stubs: all.len(),
+        predicted: all.values().filter(|stub| stub.predicted.is_some()).count(),
+        inlined: plt.stubs.len(),
+        ..PltReport::default()
+    };
+    for record in translation.instructions.values() {
+        let Instruction::Branch { target, link } = record.instruction else {
+            continue;
+        };
+        if let Some((_, direct)) = plt.site(record.pc, target, link) {
+            if link {
+                report.call_sites += 1;
+                report.direct_call_sites += usize::from(direct.is_some());
+            } else {
+                report.tail_sites += 1;
+            }
+        }
+    }
+    report
+}
+
+thread_local! {
+    /// The PLT stubs of the split emission running on this thread, unless
+    /// `EmitOptions::stub_windows` keeps every stub in its own window.
+    static PLT: std::cell::RefCell<Option<Plt>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets [`PLT`] for as long as it lives.
+struct PltStubs(Option<Plt>);
+
+impl PltStubs {
+    fn set(plt: Option<Plt>) -> Self {
+        Self(PLT.replace(plt))
+    }
+}
+
+impl Drop for PltStubs {
+    fn drop(&mut self) {
+        PLT.set(self.0.take());
+    }
+}
+
+/// A branch at `from` to the PLT stub at `target` (the branch has set the
+/// link register; for a call, `m.cpu.pc` is the stub): the stub runs here
+/// instead of in its window, as the same block (charged and with a host
+/// boundary before it, which resumes at the stub through the dispatcher),
+/// leaving its target in X17. Returns None, writing nothing, when `target`
+/// is not a stub this emission inlines; otherwise the predicted target and
+/// its window when a call can run that window directly.
+fn emit_plt_stub(
+    output: &mut String,
+    from: u64,
+    target: u64,
+    link: bool,
+) -> Option<Option<(u64, u64)>> {
+    PLT.with_borrow(|plt| {
+        let (stub, direct) = plt.as_ref()?.site(from, target, link)?;
+        if !link {
+            writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
+        }
+        writeln!(
+            output,
+            "                if let Err(trap) = m.tick_block_at({target:#x}, 4) {{ return Err(trap); }}"
+        )
+        .unwrap();
+        for record in &stub.body {
+            emit_instruction_body(output, record, false, true);
+        }
+        if link {
+            writeln!(
+                output,
+                "                m.cpu.pc = {};",
+                reg(17, 64, false)
+            )
+            .unwrap();
+        }
+        Some(direct)
+    })
+}
+
 /// An LDR of a SIMD&FP register: with `EmitOptions::inline_vector`, the
 /// same direct guest-memory loads as an integer LDR (a fault ends the run
 /// as one does), zero-extended into the register; otherwise the helper.
@@ -1269,7 +1508,10 @@ const WRITES_REGISTERS: &[&str] = &[
 
 /// Calls into other windows as emitted (`emit_call`), with the `Core`
 /// method each makes.
-const CALL_PREFIXES: &[(&str, &str)] = &[("if let Err(trap) = m.call(", "m.call(")];
+const CALL_PREFIXES: &[(&str, &str)] = &[
+    ("if let Err(trap) = m.call(", "m.call("),
+    ("if let Err(trap) = m.call_window(", "m.call_window("),
+];
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[&str] = &[
@@ -1665,8 +1907,18 @@ fn emit_instruction_body(
             }
             if *link {
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
-                emit_call(output, next);
+                match emit_plt_stub(output, pc, *target, true) {
+                    Some(direct) => emit_call_predicted(output, next, direct),
+                    None => emit_call(output, next),
+                }
                 output.push_str(after_call);
+            } else if emit_plt_stub(output, pc, *target, false).is_some() {
+                writeln!(
+                    output,
+                    "                {successor} = {};",
+                    reg(17, 64, false)
+                )
+                .unwrap();
             } else {
                 writeln!(output, "                {successor} = {target:#x};").unwrap();
             }
@@ -3412,6 +3664,13 @@ pub struct EmitOptions {
     /// Blocks that cannot return an error after their charge skip storing
     /// the block tag (only a trap inside a block reads it).
     pub untagged_blocks: bool,
+    /// Run every PLT stub (`plt_stubs`) in its own window, as before stubs
+    /// were inlined: a BL or B to a stub from another window otherwise runs
+    /// the stub's ADRP, LDR and ADD in place (the same block accounting and
+    /// boundary), and a BL then calls the loaded target, through its window
+    /// function directly where it is the predicted word
+    /// (`Translation::got_words`) in the caller's region.
+    pub stub_windows: bool,
 }
 
 thread_local! {
@@ -3707,6 +3966,7 @@ pub fn emit_rust_split_to_with<E>(
     let _window_memory = WindowMemory::set(options.window_memory);
     let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
     let _untagged_blocks = UntaggedBlocks::set(options.untagged_blocks);
+    let _plt = PltStubs::set((!options.stub_windows).then(|| Plt::of(translation, region_bits)));
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options

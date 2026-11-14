@@ -169,6 +169,42 @@ every round), `vector` 217/220/219 to 220/222/220. Small but consistent,
 so it stays opt-in for the rebuild. `tests/fp_status.rs` compares it with
 the plain path around MSR, MRS and float helpers.
 
+## PLT stubs inlined at their callers (default)
+
+The game's hottest translated window was its PLT: stubs of
+`ADRP X16, page; LDR X17, [X16, #off]; ADD X16, X16, #off; BR X17`
+(`codegen::plt_stubs`). Each call through one ran the stub's window (entry,
+locals, a dispatch match, one block, the exit) and then the window table
+again for the target. Split emission now runs the stub in place at every
+BL or B from another window: the caller charges the stub's block with the
+same `tick_block_at` (a host boundary or the budget there leaves the PC at
+the stub, and the host resumes it through the stub's own window), runs the
+ADRP, LDR and ADD, and branches to the loaded X17. The load is the guest's
+GOT word, so a rewritten or not-yet-bound slot (a lazy JUMP_SLOT holds its
+PLT0 value) goes where the word says.
+
+`echora lift` fills `Translation::got_words` with the words rtld is
+expected to leave in each relocated slot (`process::predicted_got_words`:
+relative relocations, and JUMP_SLOT, GLOB_DAT and ABS64 bound to the
+symbol's first definition in load order after rtld; that search order is
+inferred, not measured). When a call's predicted target is a translated
+entry in the caller's region, the call is
+`if x17 == PREDICTED { call_window(next, run_window_T) } else { call(next) }`:
+the window function directly, skipping the table lookup and the indirect
+call. Window functions of other regions are not nameable from a region
+crate, so their calls keep the table. The guard only saves work:
+`call_window` with a window that does not hold the PC returns at once and
+continues through the table.
+
+Stubs only reached by B, stubs a trace names, and branches within the
+stub's own window keep the window path; `stub-windows` in
+`ECHORA_LIFT_OPTIONS` (`EmitOptions::stub_windows`) keeps it everywhere,
+for comparison. `echora lift` prints the stubs found, predicted and
+inlined, and the BL (direct) and B sites rewritten. The recent-PC ring no
+longer records an inlined stub's entry (diagnostics only).
+`tests/plt.rs` runs a synthetic PLT with the predicted words, rewritten
+words, and the budget and a host boundary falling on an inlined stub.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

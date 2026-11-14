@@ -547,6 +547,62 @@ pub fn defined_symbol(module: &NsoModule, name: &str) -> Result<Option<u64>> {
     Ok(None)
 }
 
+/// One entry of a module's dynamic symbol table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicSymbol {
+    pub name: Vec<u8>,
+    /// `st_info`: binding in the high nibble, type in the low.
+    pub info: u8,
+    /// Whether the symbol has a section (is defined in this module).
+    pub defined: bool,
+    /// Module offset of a defined symbol.
+    pub value: u64,
+}
+
+/// Every entry of the module's dynamic symbol table by index (index zero,
+/// the reserved null symbol, included), from the bounded table already
+/// validated by [`analyze`]; empty without a counted table.
+pub fn dynamic_symbols(module: &NsoModule) -> Result<Vec<DynamicSymbol>> {
+    let Some(table) = module
+        .mod0
+        .as_ref()
+        .and_then(|info| info.dynamic.as_ref())
+        .and_then(|dynamic| dynamic.symbol_table.as_ref())
+    else {
+        return Ok(Vec::new());
+    };
+    let (Some(count), Some(strings), Some(string_size)) = (
+        table.count,
+        table.string_table_offset,
+        table.string_table_size,
+    ) else {
+        return Ok(Vec::new());
+    };
+    let symbols = view(
+        module,
+        table.memory_offset,
+        count * 24,
+        "dynamic symbol table",
+    )?;
+    let strings = view(module, strings, string_size, "dynamic string table")?;
+    let mut entries = Vec::with_capacity(count as usize);
+    for symbol in symbols.as_chunks::<24>().0 {
+        let offset = u32_at(symbol, 0, "symbol name offset")? as usize;
+        let tail = strings.get(offset..).unwrap_or_default();
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(tail.len());
+        entries.push(DynamicSymbol {
+            name: tail[..end].to_vec(),
+            info: symbol[4],
+            defined: u16::from_le_bytes([symbol[6], symbol[7]]) != 0,
+            value: u64_at(symbol, 8, "symbol value")?,
+        });
+    }
+    Ok(entries)
+}
+
 fn sysv_symbol_count(module: &NsoModule, address: u64) -> Result<u64> {
     let header = view(module, address, 8, "SysV hash header")?;
     let buckets = u32_at(header, 0, "SysV bucket count")? as u64;

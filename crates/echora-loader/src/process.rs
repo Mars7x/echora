@@ -13,6 +13,8 @@ pub const FIRST_MODULE_BASE: u64 = 0x71_0000_0000;
 pub const PACIBSP: u32 = 0xd503_237f;
 const NOP: u32 = 0xd503_201f;
 
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
 const R_AARCH64_RELATIVE: u32 = 1027;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const RELA_ENTRY_SIZE: usize = 24;
@@ -200,6 +202,98 @@ pub fn lazy_binding_targets(placed: &PlacedModule) -> Vec<u64> {
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+/// The words the guest's dynamic linker is expected to leave in relocated
+/// slots once every import is bound: absolute slot address -> absolute
+/// value, for every module after rtld. `R_AARCH64_RELATIVE` (RELA and RELR)
+/// slots hold the module base plus the addend (or the stored word);
+/// `JUMP_SLOT`, `GLOB_DAT` and `ABS64` slots the address of the symbol's
+/// first definition in load order, plus the addend. That lookup order is
+/// inferred from how dynamic linkers search their global scope, not
+/// measured against rtld; callers use these words only as predictions that
+/// guest memory confirms (a lazy `JUMP_SLOT` holds its PLT0 value until
+/// the first call binds it). Unresolved symbols and other relocation
+/// types are left out.
+pub fn predicted_got_words(placed: &[PlacedModule]) -> std::collections::BTreeMap<u64, u64> {
+    use std::collections::{BTreeMap, HashMap};
+    let modules: Vec<&PlacedModule> = placed.iter().filter(|p| p.module.name != "rtld").collect();
+    let symbols: Vec<Vec<crate::mod0::DynamicSymbol>> = modules
+        .iter()
+        .map(|p| crate::mod0::dynamic_symbols(&p.module).unwrap_or_default())
+        .collect();
+    // First definition of each name in load order.
+    let mut definitions: HashMap<&[u8], u64> = HashMap::new();
+    for (p, table) in modules.iter().zip(&symbols) {
+        for symbol in table.iter().skip(1) {
+            if symbol.defined && !symbol.name.is_empty() {
+                definitions
+                    .entry(symbol.name.as_slice())
+                    .or_insert(p.base.wrapping_add(symbol.value));
+            }
+        }
+    }
+    let mut words = BTreeMap::new();
+    for (p, table) in modules.iter().zip(&symbols) {
+        let module = &p.module;
+        let Some(dynamic) = module.mod0.as_ref().and_then(|m| m.dynamic.as_ref()) else {
+            continue;
+        };
+        for relocations in &dynamic.relocation_tables {
+            let Some(bytes) =
+                original_view(module, relocations.memory_offset, relocations.byte_size)
+            else {
+                continue;
+            };
+            match relocations.kind.as_str() {
+                "RELA" | "JMPREL/RELA" => {
+                    for entry in bytes.as_chunks::<RELA_ENTRY_SIZE>().0 {
+                        let (Some(offset), Some(info), Some(addend)) =
+                            (word(entry, 0), word(entry, 8), word(entry, 16))
+                        else {
+                            continue;
+                        };
+                        let value = match info as u32 {
+                            R_AARCH64_RELATIVE => Some(p.base.wrapping_add(addend)),
+                            R_AARCH64_JUMP_SLOT | R_AARCH64_GLOB_DAT | R_AARCH64_ABS64 => table
+                                .get((info >> 32) as usize)
+                                .and_then(|symbol| definitions.get(symbol.name.as_slice()))
+                                .map(|address| address.wrapping_add(addend)),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            words.insert(p.base.wrapping_add(offset), value);
+                        }
+                    }
+                }
+                "RELR" if relocations.entry_size == 8 => {
+                    let mut push = |slot: u64| {
+                        if let Some(value) = original_view(module, slot, 8).and_then(|b| word(b, 0))
+                        {
+                            words.insert(p.base.wrapping_add(slot), p.base.wrapping_add(value));
+                        }
+                    };
+                    let mut cursor = 0u64;
+                    for chunk in bytes.as_chunks::<8>().0 {
+                        let entry = word(chunk, 0).unwrap_or(0);
+                        if entry & 1 == 0 {
+                            push(entry);
+                            cursor = entry.wrapping_add(8);
+                        } else {
+                            for bit in 1..64 {
+                                if entry >> bit & 1 != 0 {
+                                    push(cursor.wrapping_add((bit - 1) * 8));
+                                }
+                            }
+                            cursor = cursor.wrapping_add(63 * 8);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    words
 }
 
 /// Static constructors: `DT_INIT_ARRAY` slots whose relative relocation
@@ -431,5 +525,61 @@ mod tests {
         assert_eq!(prologue_targets(&placed), [b + 0x40]);
         assert_eq!(lazy_binding_targets(&placed), [b + 0x60]);
         assert_eq!(code_address_targets(&placed), [b + 0x20, b + 0x30]);
+    }
+
+    /// `module()` named `name`, with a dynamic symbol table in rodata whose
+    /// symbol 1 (the JUMP_SLOT's) is `f`: defined at text 0x80 or not.
+    fn module_with_f(name: &str, defined: bool) -> NsoModule {
+        let mut module = module();
+        module.name = name.into();
+        let mut rodata = vec![0u8; 0x48];
+        // Symbol 1: name offset 1, GLOBAL FUNC, section 1 when defined.
+        rodata[24..28].copy_from_slice(&1u32.to_le_bytes());
+        rodata[28] = 0x12;
+        if defined {
+            rodata[30] = 1;
+            rodata[32..40].copy_from_slice(&0x80u64.to_le_bytes());
+        }
+        rodata[0x41] = b'f';
+        module.rodata = segment(0x100, rodata);
+        let dynamic = module.mod0.as_mut().unwrap().dynamic.as_mut().unwrap();
+        dynamic.symbol_table = Some(crate::mod0::SymbolTableInfo {
+            memory_offset: 0x100,
+            entry_size: 24,
+            count: Some(2),
+            has_sysv_hash: true,
+            has_gnu_hash: false,
+            string_table_offset: Some(0x140),
+            string_table_size: Some(8),
+            undefined_count: Some(u64::from(!defined)),
+            defined_count: Some(u64::from(defined)),
+        });
+        module
+    }
+
+    #[test]
+    fn got_words_are_relocated_and_symbols_bound_to_their_first_definition() {
+        // rtld's definition is not searched; main imports f, which the
+        // first module after it defines and the last defines again.
+        let placed = place_modules(vec![
+            module_with_f("rtld", true),
+            module_with_f("main", false),
+            module_with_f("sdk", true),
+            module_with_f("later", true),
+        ]);
+        let (main, sdk) = (placed[1].base, placed[2].base);
+        let words = predicted_got_words(&placed);
+        // RELR: the stored word plus the base, whatever it points at.
+        assert_eq!(words[&(main + 0x1000)], main + 0x40);
+        assert_eq!(words[&(main + 0x1018)], main + 0x81);
+        assert_eq!(words[&(main + 0x1020)], main + 0x2000);
+        // RELA RELATIVE: base plus addend.
+        assert_eq!(words[&(main + 0x1030)], main + 0xc0);
+        // JUMP_SLOT: f's first definition after rtld, not its lazy value.
+        assert_eq!(words[&(main + 0x1028)], sdk + 0x80);
+        assert_eq!(words[&(placed[3].base + 0x1028)], sdk + 0x80);
+        // rtld's own slots are not predicted.
+        assert!(!words.contains_key(&(placed[0].base + 0x1028)));
+        assert_eq!(words.len(), 3 * 6);
     }
 }

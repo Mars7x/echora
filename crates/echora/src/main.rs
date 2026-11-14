@@ -562,8 +562,11 @@ fn discover_game(
         .chain(call_sites)
         .collect();
     let start = Instant::now();
-    let translation =
+    let mut translation =
         discover_with_tables(&regions, &rodata, &roots, &deferred, &host_entries, limit)?;
+    // What rtld will leave in the GOT: PLT stubs inlined at their callers
+    // call the predicted target's window directly when guest memory agrees.
+    translation.got_words = process::predicted_got_words(&placed);
     // ECHORA_DISPATCH_AUDIT=FILE: how discovery resolved every indirect
     // branch of the game (echora_lift::dispatch), written to FILE.
     if let Some(path) = std::env::var_os("ECHORA_DISPATCH_AUDIT") {
@@ -693,6 +696,16 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             ""
         }
     );
+    let plt = echora_lift::codegen::plt_report(&d.translation, region_bits);
+    println!(
+        "PLT stubs: {} found, {} with a predicted GOT word, {} run inline; {} BL sites ({} with a direct window call), {} B sites",
+        plt.stubs,
+        plt.predicted,
+        plt.inlined,
+        plt.call_sites,
+        plt.direct_call_sites,
+        plt.tail_sites
+    );
     let out = d.cache.join("translations").join(&d.exefs_key);
     let guest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../echora-guest")
@@ -731,6 +744,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "window-memory" => options.window_memory = true,
             "dense-dispatch" => options.dense_dispatch = true,
             "untagged-blocks" => options.untagged_blocks = true,
+            "stub-windows" => options.stub_windows = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
