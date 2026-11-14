@@ -3497,19 +3497,7 @@ impl Renderer {
                 .unwrap_or(SUBMIT_ITEMS)
                 .clamp(1, MAX_WORK_ITEMS)
         });
-        // The GPU has run out of work: what is recorded goes now, so it
-        // never waits for a whole batch (checked every 16 items from 32).
-        let idle = self.work_items >= 32
-            && self.work_items.is_multiple_of(16)
-            && self.spares.iter().all(|spare| {
-                !spare.in_flight
-                    // SAFETY: the fence is live.
-                    || unsafe { self.gpu.device.get_fence_status(spare.fence) }.unwrap_or(false)
-            });
-        if self.work_items >= limit || idle {
-            if idle && self.work_items < limit {
-                self.stat("stat: submissions while the GPU was idle", 1);
-            }
+        if self.work_items >= limit {
             self.flush_async()?;
         }
         self.work_items += 1;
