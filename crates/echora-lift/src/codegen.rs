@@ -2307,6 +2307,21 @@ fn emit_instruction_body(
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 match emit_plt_stub(output, pc, *target, true) {
                     Some(direct) => emit_call_predicted(output, next, direct),
+                    None if function_call(pc, *target).is_some() => {
+                        flush_pending(output);
+                        let callee = match function_call(pc, *target) {
+                            Some(Some(index)) => {
+                                writeln!(output, "                let callee = function_at({index});").unwrap();
+                                "callee".to_owned()
+                            }
+                            _ => format!("run_function_{target:x}"),
+                        };
+                        writeln!(
+                            output,
+                            "                if let Err(trap) = m.call_window({next:#x}, {callee}) {{ return Err(trap); }}"
+                        )
+                        .unwrap();
+                    }
                     None => match direct_call_window(pc, *target) {
                         Some(window) => writeln!(
                             output,
@@ -3582,6 +3597,213 @@ fn emit_float_run(
     output.push_str("                }\n                }\n");
 }
 
+/// Blocks a lifted function may hold at most (`EmitOptions::functions`);
+/// larger ones run through their windows only.
+pub const FUNCTION_BLOCK_LIMIT: usize = 256;
+
+/// Lifted functions (`EmitOptions::functions`): every BL target that starts
+/// a block, with the blocks reachable from it in its region through
+/// branches, both sides of conditional ones, fallthroughs and the return
+/// point after a call, not entering another function's entry. A return, an
+/// indirect branch, an SVC or another trapping end, a branch to another
+/// function or out of the region leaves the function (its host function
+/// returns with the PC there, and the caller's `Core::call_window`
+/// continues through the window table). By entry: its blocks, in order.
+pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, Vec<u64>> {
+    use Instruction::*;
+    let by_start: BTreeMap<u64, &BasicBlock> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block))
+        .collect();
+    let entries: BTreeSet<u64> = translation
+        .instructions
+        .values()
+        .filter_map(|record| match record.instruction {
+            Branch { target, link: true } if by_start.contains_key(&target) => Some(target),
+            _ => None,
+        })
+        .collect();
+    let mut functions = BTreeMap::new();
+    'entries: for &entry in &entries {
+        let mut seen = BTreeSet::from([entry]);
+        let mut pending = vec![entry];
+        while let Some(start) = pending.pop() {
+            let block = by_start[&start];
+            let last = block
+                .instructions
+                .last()
+                .expect("blocks have an instruction");
+            let next = last.pc.wrapping_add(4);
+            let successors = match &last.instruction {
+                Branch {
+                    target,
+                    link: false,
+                } => vec![*target],
+                Branch { link: true, .. } | BranchReg { link: true, .. } => vec![next],
+                BranchCond { target, .. }
+                | CompareBranch { target, .. }
+                | TestBranch { target, .. } => vec![*target, next],
+                instruction if instruction.ends_block() => Vec::new(),
+                _ => vec![next],
+            };
+            for successor in successors {
+                if by_start.contains_key(&successor)
+                    && successor >> region_bits == entry >> region_bits
+                    && (successor == entry || !entries.contains(&successor))
+                    && seen.insert(successor)
+                {
+                    if seen.len() > FUNCTION_BLOCK_LIMIT {
+                        continue 'entries;
+                    }
+                    pending.push(successor);
+                }
+            }
+        }
+        functions.insert(entry, seen.into_iter().collect());
+    }
+    functions
+}
+
+/// With `EmitOptions::functions`: the lifted functions by entry, each
+/// with its index in the function table, and the region bits; with
+/// `EmitOptions::function_table`, calls go through the table.
+struct FunctionSet {
+    entries: BTreeMap<u64, usize>,
+    region_bits: u32,
+    table: bool,
+}
+
+thread_local! {
+    /// The lifted functions of the emission running on this thread.
+    static FUNCTIONS: std::cell::RefCell<Option<FunctionSet>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// How a BL at `from` to `target` reaches `target`'s lifted function: None
+/// when it does not (no function, or one of another region without the
+/// table); Some(None) directly; Some(Some(index)) through the function
+/// table (`EmitOptions::function_table`), from any region.
+fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
+    FUNCTIONS.with_borrow(|functions| {
+        let set = functions.as_ref()?;
+        let &index = set.entries.get(&target)?;
+        if set.table {
+            Some(Some(index))
+        } else {
+            (target >> set.region_bits == from >> set.region_bits).then_some(None)
+        }
+    })
+}
+
+/// Restores [`FUNCTIONS`] when it goes.
+struct Functions(Option<FunctionSet>);
+
+impl Drop for Functions {
+    fn drop(&mut self) {
+        FUNCTIONS.set(self.0.take());
+    }
+}
+
+/// With `EmitOptions::function_table`: every region's copy of the function
+/// table, which the root's `install` fills (no table yet: a call runs
+/// nothing and continues through the window table).
+const FUNCTION_TABLE_HELPER: &str = "#[allow(dead_code)]\nstatic FUNCTIONS: std::sync::OnceLock<&'static [echora_guest::WindowFn]> = std::sync::OnceLock::new();\n\
+/// The lifted functions by index, from the root's `install`.\npub fn install_functions(table: &'static [echora_guest::WindowFn]) { let _ = FUNCTIONS.set(table); }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn function_at(index: usize) -> echora_guest::WindowFn { match FUNCTIONS.get() { Some(table) => table[index], None => not_installed } }\n\
+#[allow(dead_code)]\nfn not_installed(_m: &mut Machine) -> Result<(), Trap> { Ok(()) }\n";
+
+/// BL sites by what function emission can do with them
+/// (`EmitOptions::functions`, `function_table`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CallReport {
+    pub sites: usize,
+    /// Whose target lies in the caller's region.
+    pub same_region: usize,
+    /// Whose target is a lifted function's entry (`functions`): reached
+    /// with the function table from any region.
+    pub function_entries: usize,
+    /// Of those, in the caller's region (reached directly).
+    pub same_region_functions: usize,
+    /// Lifted functions.
+    pub functions: usize,
+}
+
+/// [`CallReport`] of a translation with `region_bits`-bit regions.
+pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
+    let lifted = functions(translation, region_bits);
+    let mut report = CallReport {
+        functions: lifted.len(),
+        ..CallReport::default()
+    };
+    for record in translation.instructions.values() {
+        if let Instruction::Branch { target, link: true } = record.instruction {
+            let same = target >> region_bits == record.pc >> region_bits;
+            report.sites += 1;
+            report.same_region += usize::from(same);
+            if lifted.contains_key(&target) {
+                report.function_entries += 1;
+                report.same_region_functions += usize::from(same);
+            }
+        }
+    }
+    report
+}
+
+/// A lifted function's host function (`functions`): as a window's, over
+/// the function's blocks instead of a window's, starting at its entry
+/// (the PC a call sets), and returning when the next PC is none of its
+/// blocks; the caller's `Core::call_window` then continues from there.
+fn emit_function(
+    output: &mut String,
+    entry: u64,
+    blocks: &[BasicBlock],
+    inlined: &BTreeSet<u64>,
+    spin_heads: &BTreeSet<u64>,
+) {
+    let mut cases = String::new();
+    emit_split_cases(&mut cases, blocks, inlined, spin_heads);
+    cases.push_str("            _ => return Ok(()),\n");
+    let locals = RegisterLocals::of(&cases);
+    let deferred = DEFERRED_CHARGES.get();
+    writeln!(
+        output,
+        "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{"
+    )
+    .unwrap();
+    output.push_str(&locals.load());
+    let pending = if deferred { ", pending: &mut u64" } else { "" };
+    writeln!(
+        output,
+        "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R{pending}) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {entry:#x};"
+    )
+    .unwrap();
+    let body = locals.rewrite(&cases);
+    if WINDOW_MEMORY.get() {
+        output.push_str("    let wmem = m.memory.window_memory();\n");
+        output.push_str("    loop {\n        match next_pc {\n");
+        output.push_str(
+            &body
+                .replace("m.memory.load_u", "wmem.load_u")
+                .replace("m.memory.store_u", "wmem.store_u"),
+        );
+    } else {
+        output.push_str("    loop {\n        match next_pc {\n");
+        output.push_str(&body);
+    }
+    if deferred {
+        output.push_str(
+            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
+        );
+    } else {
+        output.push_str(
+            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
+        );
+    }
+    output.push_str(&locals.store());
+    output.push_str("    result\n}\n");
+}
+
 /// The blocks structured emission lets execution resume at, so the only
 /// blocks that keep a boundary before them: where the host resumes after
 /// a call, an SVC or another instruction that continues through the
@@ -4250,6 +4472,16 @@ pub struct EmitOptions {
     /// inlined call path at each site costs the caller's window more than
     /// the table lookup it saves. Off by default.
     pub direct_calls: bool,
+    /// Each lifted function (`functions`) is also one host function over
+    /// all its blocks of its region, and a BL to a function of the caller's
+    /// region calls it directly (`Core::call_window`); the windows stay
+    /// for everything else and for resuming after traps and boundaries.
+    pub functions: bool,
+    /// With `functions`: a BL to a lifted function of any region calls it
+    /// through a table of function pointers every region holds a copy of
+    /// (filled by the root's `install`), instead of only those of the
+    /// caller's region directly.
+    pub function_table: bool,
     /// Runs of at least `FLOAT_RUN_MINIMUM` scalar single-precision
     /// operations (`float_runs_in`) run as plain host arithmetic, checked
     /// once at the end, with the per-operation emission as the fallback
@@ -4732,6 +4964,43 @@ pub fn emit_rust_split_to_with<E>(
     );
     let finish_region = |_region: u64, source: String| unindent(&source);
     let mut current: Option<(u64, String)> = None;
+    // Lifted functions, emitted after their region's windows.
+    let lifted = if options.functions {
+        functions(translation, region_bits)
+    } else {
+        BTreeMap::new()
+    };
+    let _functions = Functions(FUNCTIONS.replace(options.functions.then(|| {
+        FunctionSet {
+            entries: lifted
+                .keys()
+                .enumerate()
+                .map(|(index, &entry)| (entry, index))
+                .collect(),
+            region_bits,
+            table: options.function_table,
+        }
+    })));
+    let header = if options.functions && options.function_table {
+        header + FUNCTION_TABLE_HELPER
+    } else {
+        header
+    };
+    let mut regions_seen: Vec<u64> = Vec::new();
+    let by_start: BTreeMap<u64, &BasicBlock> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block))
+        .collect();
+    let region_functions = |region: u64, output: &mut String| {
+        let first = region << region_bits;
+        let last = first + ((1u64 << region_bits) - 1);
+        for (&entry, starts) in lifted.range(first..=last) {
+            let blocks: Vec<BasicBlock> =
+                starts.iter().map(|start| by_start[start].clone()).collect();
+            emit_function(output, entry, &blocks, &inlined, &spin_heads);
+        }
+    };
     for (window, blocks) in &windows {
         let region = window >> shift;
         writeln!(
@@ -4739,8 +5008,12 @@ pub fn emit_rust_split_to_with<E>(
             "        {window:#x} => gen_r_{region:x}::run_window_{window:x}(m),"
         )
         .unwrap();
+        if regions_seen.last() != Some(&region) {
+            regions_seen.push(region);
+        }
         if current.as_ref().map(|(index, _)| *index) != Some(region) {
-            if let Some((index, source)) = current.take() {
+            if let Some((index, mut source)) = current.take() {
+                region_functions(index, &mut source);
                 sink(index, finish_region(index, source))?;
             }
             current = Some((region, header.clone()));
@@ -4867,7 +5140,8 @@ pub fn emit_rust_split_to_with<E>(
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }
-    if let Some((index, source)) = current.take() {
+    if let Some((index, mut source)) = current.take() {
+        region_functions(index, &mut source);
         sink(index, finish_region(index, source))?;
     }
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
@@ -4882,6 +5156,34 @@ pub fn emit_rust_split_to_with<E>(
         .unwrap();
     }
     root.push_str("];\n");
+    if options.functions && options.function_table {
+        // The lifted functions by index, which every region gets a copy of.
+        root.push_str("\nstatic FUNCTION_TABLE: &[WindowFn] = &[\n");
+        for &entry in lifted.keys() {
+            writeln!(
+                root,
+                "    gen_r_{:x}::run_function_{entry:x},",
+                entry >> region_bits
+            )
+            .unwrap();
+        }
+        root.push_str("];\n");
+        let mut installs = String::new();
+        for region in &regions_seen {
+            writeln!(
+                installs,
+                "    gen_r_{region:x}::install_functions(FUNCTION_TABLE);"
+            )
+            .unwrap();
+        }
+        root = root.replacen(
+            &format!("    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n"),
+            &format!(
+                "    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n{installs}"
+            ),
+            1,
+        );
+    }
     Ok(root)
 }
 

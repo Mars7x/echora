@@ -42,6 +42,8 @@ fn options() -> EmitOptions {
         untagged_blocks: std::env::var_os("CARGO_FEATURE_UNTAGGED_BLOCKS").is_some(),
         split_ticks: std::env::var_os("CARGO_FEATURE_SPLIT_TICKS").is_some(),
         direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
+        functions: std::env::var_os("CARGO_FEATURE_FUNCTIONS").is_some(),
+        function_table: std::env::var_os("CARGO_FEATURE_FUNCTION_TABLE").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
         float_run_loads: std::env::var_os("CARGO_FEATURE_FLOAT_RUN_LOADS").is_some(),
         deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
@@ -592,7 +594,10 @@ fn kernel_code(out: &mut String) {
         report.unresolved_targets
     );
     assert_eq!(report.jump_tables, 1, "the switch kernel's jump table");
-    let (root, regions) = split(&translation, kernel_options());
+    // One 64 KiB region, as the game's regions hold code: calls between
+    // the kernels' functions stay in their region.
+    LIFTED.set(LIFTED.get() + translation.instructions.len());
+    let (root, regions) = emit_rust_split_with(&translation, 16, kernel_options());
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
@@ -1239,15 +1244,41 @@ fn call_code(out: &mut String) {
         bytes: image,
     };
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
-    let (root, regions) = split(&translation, options());
-    writeln!(out, "pub mod call_code {{").expect("write");
-    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
-    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
-    writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
-    for (region, source) in regions {
-        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    // As split windows, and with lifted functions in one 64 KiB region (as
+    // the game's regions hold code), whose calls between them are direct.
+    for (name, functions, function_table) in [
+        ("call_code", false, false),
+        ("call_function_code", true, false),
+        ("call_function_table_code", true, true),
+    ] {
+        let (root, regions) = if functions {
+            LIFTED.set(LIFTED.get() + translation.instructions.len());
+            emit_rust_split_with(
+                &translation,
+                16,
+                EmitOptions {
+                    functions: true,
+                    function_table,
+                    ..options()
+                },
+            )
+        } else {
+            split(&translation, options())
+        };
+        let direct = regions
+            .iter()
+            .map(|(_, source)| source.matches("run_function_").count())
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
+        writeln!(out, "/// Lifted functions and direct calls named in the emission.\npub const FUNCTION_NAMES: usize = {direct};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
     }
-    writeln!(out, "{root}\n}}").expect("write");
 }
 
 /// Loop programs for `tests/loops.rs`: counted loops (X25) with a mid-loop

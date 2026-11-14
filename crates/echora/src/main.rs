@@ -706,6 +706,15 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         plt.direct_call_sites,
         plt.tail_sites
     );
+    let calls = echora_lift::codegen::call_report(&d.translation, region_bits);
+    println!(
+        "BL sites: {}; same-region BL targets: {}; BL targets that are function entries: {} ({} in the caller's region); lifted functions: {}",
+        calls.sites,
+        calls.same_region,
+        calls.function_entries,
+        calls.same_region_functions,
+        calls.functions
+    );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
@@ -753,6 +762,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "untagged-blocks" => options.untagged_blocks = true,
             "split-ticks" => options.split_ticks = true,
             "direct-calls" => options.direct_calls = true,
+            "functions" => options.functions = true,
+            "function-table" => options.function_table = true,
             "deferred-charges" => options.deferred_charges = true,
             "stub-windows" => options.stub_windows = true,
             "float-runs" => options.float_runs = true,

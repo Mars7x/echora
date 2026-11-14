@@ -282,6 +282,90 @@ game set plus deferred-charges, two rounds of seven runs): memset
 checks registers and steps against per-block charging, with a host
 boundary at every step of the run.
 
+## Lifted functions (design, opt-in prototype)
+
+Today a guest call (BL) stores the caller window's written locals, runs
+`Core::call` (the window table, an indirect call into the callee's 1 KiB
+window, whose `match next_pc` finds the entry block and whose entry loads
+its own locals from the `Core`), and reloads the caller's locals after.
+A guest function longer than its window leaves through the dispatcher.
+
+**Finding functions** (`codegen::functions`). Every BL target that starts
+a block is a function entry. Its body is the blocks reachable from it in
+its region through branches, both sides of conditional ones,
+fallthroughs and the return point after a call, without entering another
+function's entry (a B there is a tail call: it leaves). A return, BR (jump
+tables included: the target leaves), BLR's continuation, an SVC or
+another trapping end, and a branch out of the region leave the function.
+A block can belong to several functions (shared tails, multiple entries
+into one guest routine each get their own copy). Bodies are capped at
+`FUNCTION_BLOCK_LIMIT` (256) blocks; larger ones keep the window path. The
+lift prints the BL sites, how many target the caller's region, how many
+target a function entry, and how many of those are in the caller's region.
+
+**Emission** (`EmitOptions::functions`). Each function is a host function
+`run_function_<entry>(m) -> Result<(), Trap>`, the `WindowFn` shape: the
+window machinery over the function's blocks instead of a window's, with
+its register locals for the whole function, starting at its entry block
+(a constant, so no first dispatch), and returning when the next PC is none
+of its blocks. The windows stay: everything not reached through a call,
+and every resumption, runs there.
+
+**Calls.** A BL to a function calls `Core::call_window(return, f)`: its
+depth limit (`MAX_CALL_DEPTH`) bounds host stack use for deep or recursive
+guest chains, past which the call continues through the window table, and
+a callee that leaves before returning (a tail call, an indirect branch, a
+host function) continues through the window table until the PC is the
+return address, exactly as `Core::call` does. Within a region the call is
+direct (`run_function_<entry>`). Region crates cannot name each other's
+functions, so with `EmitOptions::function_table` every region holds a
+copy of a table of all functions' pointers, which the root's `install`
+fills (`install_functions`); a BL in any region then calls the target's
+entry by its constant index (`function_at(i)`: one OnceLock load, an
+indexed load and an indirect call, against `Core::call`'s table lookup,
+loop and return-address checks, and the callee's window dispatch). Main's
+relift12 counts 292,105 BL sites of which 15,530 call an entered block of
+the caller's 64 KiB region, so the table is the path most calls would
+take; it is part of the design, not a later step.
+
+**The calling convention is not assumed.** At a call the `Core` stays the
+truth: the caller stores the locals possibly written since they last
+equalled it (`RegisterLocals` dirty tracking) and reloads the ones it uses
+after, whatever the callee touched; the callee loads what it uses on entry
+and stores what it wrote on return. A guest that breaks the AArch64
+convention (a callee writing a callee-saved register, a caller reading a
+clobbered one) runs as it does today. Narrowing the reload to what the
+callee may write needs a transitive, conservative effect summary over the
+callee and everything it reaches (indirect calls: everything); a later
+step, measured on its own.
+
+**Exits and resumption.** A trap, an SVC, a host boundary (slice end,
+preemption, attention) or the budget leaves the function with the PC
+where execution continues, after the function's final store, and every
+caller up the host stack returns the trap the same way, storing its own
+locals; the host resumes at the PC through the dispatcher and the
+windows, as after a trap in nested `Core::call` frames today. Block
+charges, host boundaries (`resume_blocks`), deferred charges (the
+function body has its own pending count, added at its end) and step
+counts are those of the windows' blocks, which the function emits with
+the same code.
+
+**Recursion and stack.** Each call is one host frame (the function's
+locals); `call_window`'s depth limit caps the chain at `MAX_CALL_DEPTH`,
+beyond which calls run through the window table in the same frame loop as
+today.
+
+**Prototype measurements** (kernels lifted with 64 KiB regions, as the
+game's regions hold code, game option set, two rounds of seven runs,
+best): calls kernel, against window emission: direct-calls -3.6%/-5.4%,
+functions +6.1%/+7.0%; calls through the function table against direct
+function calls -6.4%/-3.0% (698/716 to 653/695 Minstr/s, against window
+emission's 612/612 in the earlier rounds: still ahead, across builds). Main's earlier direct-calls figure (-21%) was from kernels lifted
+with 1 KiB regions, where the calls kernel's caller and leaves are in
+different regions and its emission does not change: layout noise.
+`tests/calls.rs` runs its callers against the reference interpreter with
+functions in one region, directly and through the table.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

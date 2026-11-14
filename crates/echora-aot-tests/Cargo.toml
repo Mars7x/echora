@@ -12,6 +12,12 @@ publish.workspace = true
 # With float-runs and inline-vector: S loads inside float runs
 # (EmitOptions::float_run_loads).
 float-run-loads = []
+# Lifted functions as host functions, called directly within a region
+# (EmitOptions::functions).
+functions = []
+# With functions: calls to lifted functions go through the per-region
+# function table (EmitOptions::function_table).
+function-table = []
 # Scalar single-precision runs as plain host arithmetic checked once
 # (EmitOptions::float_runs).
 float-runs = []

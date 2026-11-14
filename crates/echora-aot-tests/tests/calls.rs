@@ -13,7 +13,10 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{Machine, READ, STATE_NORMAL, Trap, WRITE, call_code};
+use echora_aot_tests::{
+    Core, Machine, READ, STATE_NORMAL, Trap, WRITE, call_code, call_function_code,
+    call_function_table_code,
+};
 use echora_lift::aarch64::{Instruction, decode};
 
 const STATES_PER_CALLER: usize = 16;
@@ -128,7 +131,12 @@ fn reference(entry: u64, run: &mut Run) -> Option<()> {
     None
 }
 
-fn run_lifted(m: &mut Machine, entry: u64, run: &Run) -> Result<Run, Trap> {
+fn run_lifted(
+    m: &mut Machine,
+    dispatch: fn(&mut Core) -> Result<(), Trap>,
+    entry: u64,
+    run: &Run,
+) -> Result<Run, Trap> {
     let state = &run.state;
     m.core.cpu.regs = state.x;
     m.core.cpu.sp = state.sp;
@@ -138,7 +146,7 @@ fn run_lifted(m: &mut Machine, entry: u64, run: &Run) -> Result<Run, Trap> {
     m.memory.write(STACK, &run.stack).expect("stack is mapped");
     m.core.spin_polls = 0;
     let trap = loop {
-        match call_code::dispatch(&mut m.core) {
+        match dispatch(&mut m.core) {
             Ok(()) => continue,
             Err(Trap::HostBoundary) => {
                 m.core.spin_polls = 0;
@@ -169,6 +177,25 @@ fn run_lifted(m: &mut Machine, entry: u64, run: &Run) -> Result<Run, Trap> {
 
 #[test]
 fn lifted_calls_match_the_reference() {
+    check(call_code::dispatch);
+}
+
+/// The same callers with lifted functions in one region: calls between
+/// them run the callee's host function directly.
+#[test]
+fn lifted_functions_match_the_reference() {
+    const { assert!(call_function_code::FUNCTION_NAMES > 0) };
+    check(call_function_code::dispatch);
+}
+
+/// The same with calls through the function table.
+#[test]
+fn lifted_functions_through_the_table_match_the_reference() {
+    call_function_table_code::install();
+    check(call_function_table_code::dispatch);
+}
+
+fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
     let words = call_code::WORDS;
     let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
     let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -199,7 +226,7 @@ fn lifted_calls_match_the_reference() {
             let mut expected = before.clone();
             let reference = reference(entry, &mut expected);
             runs += 1;
-            let problem = match (reference, run_lifted(&mut m, entry, &before)) {
+            let problem = match (reference, run_lifted(&mut m, dispatch, entry, &before)) {
                 (Some(()), Ok(actual)) if actual == expected => continue,
                 (Some(()), Ok(actual)) => {
                     let mut text = difference(&expected.state, &actual.state);
