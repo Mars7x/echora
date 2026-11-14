@@ -776,6 +776,12 @@ impl Nvn {
                     break;
                 }
             }
+            // The queued work runs now, as the replay thread would run it.
+            if failed.is_none()
+                && let Err(trap) = self.drain_queues(core)
+            {
+                failed = Some(format!("queued work failed: {trap:?}"));
+            }
             let replayed = started.elapsed();
             let image = if self.gpu().is_some() {
                 self.gpu_submit()?;
