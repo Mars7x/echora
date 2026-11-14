@@ -34,10 +34,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("scalar", 0x2000),
     ("ldst", 0x2400),
     ("floats", 0x2800),
+    ("floatld", 0x2c00),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x2c00;
+pub const KERNEL_SIZE: u64 = 0x3000;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -285,6 +286,42 @@ fn assemble() -> Assembler {
         ; fsub s6, s5, s3
         ; fmadd s7, s6, s0, s4
         ; fmul s3, s7, s7
+        ; fadd s3, s3, s1
+        ; fsqrt s3, s3
+        ; fdiv s4, s3, s1
+        ; fmul s5, s4, s2
+        ; fadd s6, s5, s0
+        ; str s6, [x7], 4
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Scalar single-precision arithmetic reading its operands as it
+        // goes: four loads among twelve operations, a store. x0 =
+        // repetitions, x1 = source, x2 = destination, x3 = elements.
+        ; ->floatld:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr s0, [x6], 4
+        ; ldr s1, [x6], 4
+        ; fmul s3, s0, s1
+        ; ldr s2, [x6], 4
+        ; fmadd s3, s2, s2, s3
+        ; fadd s4, s0, s2
+        ; fmul s5, s4, s1
+        ; ldr s1, [x6], 4
+        ; fsub s6, s5, s3
+        ; fmadd s7, s6, s0, s4
+        ; fmul s3, s7, s1
         ; fadd s3, s3, s1
         ; fsqrt s3, s3
         ; fdiv s4, s3, s1

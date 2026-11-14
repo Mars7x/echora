@@ -43,6 +43,7 @@ fn options() -> EmitOptions {
         split_ticks: std::env::var_os("CARGO_FEATURE_SPLIT_TICKS").is_some(),
         direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
+        float_run_loads: std::env::var_os("CARGO_FEATURE_FLOAT_RUN_LOADS").is_some(),
         deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
         stub_windows: false,
     }
@@ -104,6 +105,7 @@ fn split_programs(out: &mut String) {
     plt_code(out);
     spill_code(out);
     float_run_code(out);
+    float_run_load_code(out);
     deferred_charge_code(out);
 }
 
@@ -2092,7 +2094,7 @@ fn float_run_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &entries, words.len()).expect("float runs");
-    let (runs, operations) = float_run_report(&translation);
+    let (runs, operations) = float_run_report(&translation, false);
     for (name, float_runs) in [("float_run_code", true), ("float_run_reference", false)] {
         let options = EmitOptions {
             float_runs,
@@ -2180,6 +2182,113 @@ fn deferred_charge_code(out: &mut String) {
         writeln!(
             out,
             "/// Deferred block charges in the emission.\npub const DEFERRED: usize = {deferred};"
+        )
+        .expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Float runs with loads for `tests/float_runs.rs`: as `float_run_code`,
+/// with LDR, LDUR and LDP of S registers among the operations (post- and
+/// pre-indexed and offset forms on X9, register offsets with X10, and LDR
+/// from SP), lifted with inline vector operations and float runs holding
+/// loads (`float_run_load_code`) and without float runs
+/// (`float_run_load_reference`).
+fn float_run_load_code(out: &mut String) {
+    use echora_lift::codegen::float_run_report;
+
+    const BASE: u64 = 0x210_0000;
+    const PROGRAMS: usize = 48;
+    const WINDOW: usize = 0x400 / 4;
+    let mut state: u64 = 0x1f83_d9ab_fb41_bd6b;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let mut words = vec![0u32; PROGRAMS * WINDOW];
+    let mut entries = Vec::new();
+    for program in 0..PROGRAMS {
+        let mut code = vec![0xd503_201f]; // nop
+        let arithmetic = 8 + next() as usize % 9;
+        let mut made = 0;
+        while made < arithmetic {
+            let (d, n, m, a) = (next() % 8, next() % 8, next() % 8, next() % 8);
+            if next() % 3 == 0 {
+                let imm9 = |value: i32| (value as u32 & 0x1ff) << 12;
+                code.push(match next() % 7 {
+                    0 => 0xbc40_0400 | imm9([4, 8, -4][next() as usize % 3]) | 9 << 5 | d, // ldr s, [x9], #imm
+                    1 => 0xbc40_0c00 | imm9([4, -8][next() as usize % 2]) | 9 << 5 | d, // ldr s, [x9, #imm]!
+                    2 => 0xbd40_0000 | (next() % 16) << 10 | 9 << 5 | d, // ldr s, [x9, #imm*4]
+                    3 => 0xbc40_0000 | imm9(-(next() as i32 % 16) * 4) | 9 << 5 | d, // ldur s, [x9, #-imm]
+                    4 => 0xbc60_7800 | 10 << 16 | 9 << 5 | d, // ldr s, [x9, x10, lsl #2]
+                    5 => {
+                        // ldp s, s, [x9, #imm]{!} or [x9], #imm
+                        let form = [0x2d40_0000, 0x2dc0_0000, 0x2cc0_0000][next() as usize % 3];
+                        let imm7 = ([2, -2, 4][next() as usize % 3] as u32 & 0x7f) << 15;
+                        let second = (d + 1) % 8;
+                        form | imm7 | second << 10 | 9 << 5 | d
+                    }
+                    _ => 0xbd40_0000 | 2 << 10 | 31 << 5 | d, // ldr s, [sp, #8]
+                });
+                continue;
+            }
+            let word = match next() % 13 {
+                0 => 0x1e20_2800 | m << 16 | n << 5 | d,
+                1 => 0x1e20_3800 | m << 16 | n << 5 | d,
+                2 | 3 => 0x1e20_0800 | m << 16 | n << 5 | d,
+                4 => 0x1e20_8800 | m << 16 | n << 5 | d,
+                5 => 0x1e20_1800 | m << 16 | n << 5 | d,
+                6 | 7 => 0x1f00_0000 | m << 16 | a << 10 | n << 5 | d,
+                8 => 0x1f00_8000 | m << 16 | a << 10 | n << 5 | d,
+                9 => 0x1f20_0000 | m << 16 | a << 10 | n << 5 | d,
+                10 => 0x1f20_8000 | m << 16 | a << 10 | n << 5 | d,
+                11 => 0x1e21_c000 | n << 5 | d,
+                _ => {
+                    let op = [0x1e20_4000, 0x1e20_c000, 0x1e21_4000][next() as usize % 3];
+                    code.push(op | n << 5 | d);
+                    continue;
+                }
+            };
+            code.push(word);
+            made += 1;
+        }
+        code.push(0xd400_00e1); // svc #7
+        let at = program * WINDOW;
+        words[at..at + code.len()].copy_from_slice(&code);
+        entries.push(BASE + (at * 4) as u64);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "float runs with loads".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &entries, words.len()).expect("float runs with loads");
+    let (runs, operations) = float_run_report(&translation, true);
+    for (name, float_runs) in [
+        ("float_run_load_code", true),
+        ("float_run_load_reference", false),
+    ] {
+        let options = EmitOptions {
+            inline_vector: true,
+            float_runs,
+            float_run_loads: true,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Float runs found (with loads), and the arithmetic operations they hold.\n\
+             pub const RUNS: (usize, usize) = ({runs}, {operations});"
         )
         .expect("write");
         for (region, source) in regions {

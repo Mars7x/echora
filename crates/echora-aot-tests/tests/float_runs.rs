@@ -9,7 +9,10 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{Machine, Trap, float_run_code, float_run_reference};
+use echora_aot_tests::{
+    Machine, Trap, float_run_code, float_run_load_code, float_run_load_reference,
+    float_run_reference,
+};
 
 const STATES_PER_PROGRAM: usize = 400;
 const FZ: u32 = 1 << 24;
@@ -174,5 +177,134 @@ fn float_runs_match_the_exact_emission_bit_for_bit() {
         }
     }
     println!("{runs} runs");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Data the load programs read: X9 starts in its middle, SP 8 bytes below
+/// its end (16-byte aligned or not).
+const DATA: u64 = 0x80_0000;
+const DATA_SIZE: u64 = 0x1000;
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct LoadState {
+    v: [u128; 32],
+    x9: u64,
+    x10: u64,
+    sp: u64,
+    fpsr: u32,
+}
+
+fn load_machine() -> Machine {
+    let words = float_run_load_code::WORDS;
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    Machine::with_layout(
+        float_run_load_code::BASE,
+        &image,
+        (image.len() as u64).next_multiple_of(0x1000),
+        DATA,
+        DATA_SIZE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loads(
+    m: &mut Machine,
+    dispatch: fn(&mut echora_aot_tests::Core) -> Result<(), Trap>,
+    entry: u64,
+    v: &[u128; 32],
+    data: &[u8],
+    (x9, x10, sp): (u64, u64, u64),
+    fpcr: u32,
+    fpsr: u32,
+) -> Result<LoadState, String> {
+    m.memory.write(DATA, data).unwrap();
+    m.core.cpu.vectors = *v;
+    m.core.cpu.regs[9] = x9;
+    m.core.cpu.regs[10] = x10;
+    m.core.cpu.sp = sp;
+    m.core.cpu.fpcr = fpcr;
+    m.core.cpu.fpsr = fpsr;
+    m.core.cpu.pc = entry;
+    loop {
+        match dispatch(&mut m.core) {
+            Ok(()) => continue,
+            Err(Trap::SupervisorCall { number: 7 }) => break,
+            Err(trap) => return Err(format!("{trap:?} at {:#x}", m.core.cpu.pc)),
+        }
+    }
+    Ok(LoadState {
+        v: m.core.cpu.vectors,
+        x9: m.core.cpu.regs[9],
+        x10: m.core.cpu.regs[10],
+        sp: m.core.cpu.sp,
+        fpsr: m.core.cpu.fpsr,
+    })
+}
+
+#[test]
+fn every_load_program_is_one_float_run() {
+    let programs = float_run_load_code::ENTRIES.len();
+    assert_eq!(float_run_load_code::RUNS.0, programs);
+}
+
+#[test]
+fn float_runs_with_loads_match_the_exact_emission_bit_for_bit() {
+    let (mut fast, mut exact) = (load_machine(), load_machine());
+    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let mut failures = Vec::new();
+    for &entry in float_run_load_code::ENTRIES {
+        for _ in 0..STATES_PER_PROGRAM / 2 {
+            let mut v = [0u128; 32];
+            for register in &mut v {
+                *register = u128::from(random.float()) | u128::from(random.next()) << 64;
+            }
+            let data: Vec<u8> = (0..DATA_SIZE / 4)
+                .flat_map(|_| random.float().to_le_bytes())
+                .collect();
+            // X9 in the middle, X10 a small index, SP aligned or not.
+            let registers = (
+                DATA + 0x800,
+                u64::from(random.next() % 32),
+                DATA + DATA_SIZE - 0x10
+                    + if random.next().is_multiple_of(4) {
+                        4
+                    } else {
+                        0
+                    },
+            );
+            let fpcr = [0, 0, FZ, FZ, DN, FZ | DN, RMODE_PLUS][random.next() as usize % 7];
+            let fpsr = if random.next().is_multiple_of(4) {
+                0
+            } else {
+                IXC
+            } | random.next() & 0x8f;
+            let expected = run_loads(
+                &mut exact,
+                float_run_load_reference::dispatch,
+                entry,
+                &v,
+                &data,
+                registers,
+                fpcr,
+                fpsr,
+            );
+            let actual = run_loads(
+                &mut fast,
+                float_run_load_code::dispatch,
+                entry,
+                &v,
+                &data,
+                registers,
+                fpcr,
+                fpsr,
+            );
+            if actual != expected && failures.len() < 10 {
+                failures.push(format!(
+                    "program at {entry:#x}, fpcr {fpcr:#x} fpsr {fpsr:#x} sp {:#x}: {actual:x?} vs {expected:x?}",
+                    registers.2
+                ));
+            }
+        }
+    }
     assert!(failures.is_empty(), "{failures:#?}");
 }

@@ -3384,7 +3384,7 @@ fn emit_block_body(
     let fuse = FUSE.replace(fusion(block));
     let mut body = String::new();
     let runs = if FLOAT_RUNS.get() {
-        float_runs_in(block)
+        float_runs_in(block, FLOAT_RUN_LOADS.get() && INLINE_VECTOR.get())
     } else {
         Vec::new()
     };
@@ -3488,8 +3488,10 @@ pub const FLOAT_RUN_MINIMUM: usize = 8;
 /// `FLOAT_RUN_MINIMUM` arithmetic ones. Nothing in a run stores, branches,
 /// calls or touches anything but S registers, FPCR and FPSR, so it can run
 /// again from its start.
-fn float_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
+    // Some(true): arithmetic; Some(false): a move, or with `loads` an S load.
     let kind = |record: &TranslatedInstruction| match &record.instruction {
+        Instruction::Simd(op) if loads && crate::simd::float_run_load(op) => Some(false),
         Instruction::Simd(op) => crate::simd::float_run_op(op),
         _ => None,
     };
@@ -3518,10 +3520,10 @@ fn float_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
 
 /// Float runs over a translation (`EmitOptions::float_runs`): how many,
 /// and the arithmetic operations they hold.
-pub fn float_run_report(translation: &Translation) -> (usize, usize) {
+pub fn float_run_report(translation: &Translation, loads: bool) -> (usize, usize) {
     let mut report = (0, 0);
     for block in &translation.blocks {
-        for (start, end) in float_runs_in(block) {
+        for (start, end) in float_runs_in(block, loads) {
             report.0 += 1;
             report.1 += block.instructions[start..end]
                 .iter()
@@ -3554,11 +3556,18 @@ fn emit_float_run(
             _ => unreachable!("float runs hold SIMD operations"),
         })
         .collect();
-    let (fast, finals) = crate::simd::float_run_fast(&ops);
+    let (fast, finals, gpr_finals) = crate::simd::float_run_fast(&ops);
     let (_, _, _, kit) = crate::simd::float_kit(crate::simd::FpSize::S);
     let commits: String = finals
         .iter()
         .map(|(register, value)| format!("m.cpu.vectors[{register}] = u128::from({value}); "))
+        .chain(gpr_finals.iter().map(|(register, value)| {
+            if *register == 31 {
+                format!("m.cpu.sp = {value}; ")
+            } else {
+                format!("m.cpu.regs[{register}] = {value}; ")
+            }
+        }))
         .collect();
     writeln!(
         output,
@@ -4246,6 +4255,10 @@ pub struct EmitOptions {
     /// once at the end, with the per-operation emission as the fallback
     /// (`emit_float_run`).
     pub float_runs: bool,
+    /// With `float_runs` and `inline_vector`: runs may also hold LDR,
+    /// LDUR and LDP of S registers (base updates committed with the run;
+    /// a load that faults ends the process at the same load as before).
+    pub float_run_loads: bool,
     /// With `split_ticks`: a block that cannot trap, call or read the
     /// counter, and is neither inlined into one that does nor a block
     /// execution can resume at or a backward branch's target
@@ -4259,6 +4272,17 @@ pub struct EmitOptions {
 thread_local! {
     /// `EmitOptions::float_runs` of the emission running on this thread.
     static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::float_run_loads` of the emission running on this thread.
+    static FLOAT_RUN_LOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`FLOAT_RUN_LOADS`] when it goes.
+struct FloatRunLoads(bool);
+
+impl Drop for FloatRunLoads {
+    fn drop(&mut self) {
+        FLOAT_RUN_LOADS.set(self.0);
+    }
 }
 
 /// Sets [`FLOAT_RUNS`] for as long as it lives.
@@ -4641,6 +4665,7 @@ pub fn emit_rust_split_to_with<E>(
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
     let _float_runs = FloatRuns::set(options.float_runs);
+    let _float_run_loads = FloatRunLoads(FLOAT_RUN_LOADS.replace(options.float_run_loads));
     let _deferred_charges = DeferredCharges::set(options.deferred_charges && options.split_ticks);
     if DEFERRED_CHARGES.get() {
         RESUME.set(Some(resume_blocks(translation)));

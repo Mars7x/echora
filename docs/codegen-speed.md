@@ -248,6 +248,22 @@ of seven runs): the new `floats` kernel (twelve operations per element)
 no run) and the rest within noise. `tests/float_runs.rs` compares it with
 the exact emission over edge values, FZ, DN and a directed rounding mode.
 
+### Loads in float runs (opt-in)
+
+`EmitOptions::float_run_loads` (`float-run-loads`, with float runs and
+inline vector operations): runs may also hold LDR, LDUR and LDP of S
+registers (immediate and register offsets, pre- and post-indexed). The
+fast copy loads in program order through the same inline loads and checks
+each loaded value as an operand from before the run; a base update is a
+local committed with the run. A guest load the guest may not make ends
+the process, so the fast copy dies at the same load the exact copy would
+(only the registers it leaves differ: the run's start). An SP base not
+16-byte aligned skips the load and declines, so the exact copy traps as
+before. Kernels (game set plus float-runs, with and without loads, two
+rounds of seven runs): `floatld` (four loads among twelve operations)
++41%/+41%, `floats` -3%/-4% (its loads now in the run, checked), the rest
+within noise.
+
 ## Deferred block charges (opt-in)
 
 `EmitOptions::deferred_charges` (`deferred-charges`, with split ticks): a

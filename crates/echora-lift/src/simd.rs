@@ -3159,16 +3159,57 @@ pub fn float_run_op(op: &SimdOp) -> Option<bool> {
     }
 }
 
+/// Registers and the locals holding their final values in a float run.
+pub type RegisterValues = Vec<(u8, String)>;
+
+/// Whether `op` is a load a float run can hold with
+/// `EmitOptions::float_run_loads`: LDR, LDUR or LDP of S registers.
+pub fn float_run_load(op: &SimdOp) -> bool {
+    matches!(
+        *op,
+        SimdOp::LoadStore {
+            load: true,
+            bytes: 4,
+            ..
+        } | SimdOp::LoadStorePair {
+            load: true,
+            bytes: 4,
+            ..
+        }
+    )
+}
+
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every
 /// operation as plain host single-precision arithmetic on locals, with
 /// `good` cleared where an operand read from the run's start or a result
 /// is anything but normal or zero, or a zero result might not be exact
 /// (what the inline paths require of one operation: then the host's IEEE
 /// result is the Arm one and raises nothing beyond the sticky IXC the run
-/// requires). Returns the code and the registers it writes with their
-/// final values' locals.
-pub fn float_run_fast(ops: &[SimdOp]) -> (String, Vec<(u8, String)>) {
+/// requires). Loads (`float_run_load`) read guest memory in program order,
+/// as the inline loads do, and their values are checked as operands from
+/// before the run; an SP base that is not 16-byte aligned skips the load
+/// and clears `good`, so the exact copy takes its alignment trap. Returns
+/// the code, the vector registers it writes with their final values'
+/// locals, and the general registers (31: SP) its base updates write.
+pub fn float_run_fast(ops: &[SimdOp]) -> (String, RegisterValues, RegisterValues) {
     let mut code = String::new();
+    // General registers (31: SP) as the run's loads see them.
+    let mut gprs: std::collections::BTreeMap<u8, String> = Default::default();
+    let mut gpr_written: Vec<u8> = Vec::new();
+    let read_gpr =
+        |code: &mut String, gprs: &mut std::collections::BTreeMap<u8, String>, register: u8| {
+            gprs.entry(register)
+                .or_insert_with(|| {
+                    let place = if register == 31 {
+                        "m.cpu.sp".to_owned()
+                    } else {
+                        format!("m.cpu.regs[{register}]")
+                    };
+                    code.push_str(&format!("let g{register} = {place}; "));
+                    format!("g{register}")
+                })
+                .clone()
+        };
     let mut values: std::collections::BTreeMap<u8, String> = Default::default();
     let mut written: Vec<u8> = Vec::new();
     let read = |code: &mut String,
@@ -3185,6 +3226,90 @@ pub fn float_run_fast(ops: &[SimdOp]) -> (String, Vec<(u8, String)>) {
     };
     for (index, op) in ops.iter().enumerate() {
         let t = format!("t{index}");
+        // A load: its address, as the exact copy forms it, and its
+        // destinations' values (checked as operands from before the run).
+        let (loaded, rn, base_update): (Vec<u8>, u8, Option<String>) = match *op {
+            SimdOp::LoadStore {
+                rt, rn, address, ..
+            } => {
+                let base = read_gpr(&mut code, &mut gprs, rn);
+                let (at, update) = match address {
+                    Address::Immediate { offset, writeback } => {
+                        let adjusted = format!("{base}.wrapping_add({:#x}u64)", offset as u64);
+                        let at = if writeback == Writeback::Post {
+                            base.clone()
+                        } else {
+                            adjusted.clone()
+                        };
+                        (at, (writeback != Writeback::None).then_some(adjusted))
+                    }
+                    Address::Register { rm, option, shift } => {
+                        let index = if rm == 31 {
+                            "0u64".to_owned()
+                        } else {
+                            read_gpr(&mut code, &mut gprs, rm)
+                        };
+                        (
+                            format!("{base}.wrapping_add(cpu::extend({index}, {option}, {shift}))"),
+                            None,
+                        )
+                    }
+                };
+                code.push_str(&format!("let a{index} = {at}; "));
+                (vec![rt], rn, update.map(|update| format!("({update})")))
+            }
+            SimdOp::LoadStorePair {
+                rt,
+                rt2,
+                rn,
+                offset,
+                writeback,
+                ..
+            } => {
+                let base = read_gpr(&mut code, &mut gprs, rn);
+                let adjusted = format!("{base}.wrapping_add({:#x}u64)", offset as u64);
+                let at = if writeback == Writeback::Post {
+                    base.clone()
+                } else {
+                    adjusted.clone()
+                };
+                code.push_str(&format!("let a{index} = {at}; "));
+                (
+                    vec![rt, rt2],
+                    rn,
+                    (writeback != Writeback::None).then(|| format!("({adjusted})")),
+                )
+            }
+            _ => (Vec::new(), 0, None),
+        };
+        if !loaded.is_empty() {
+            // SP must be 16-byte aligned (else the exact copy traps first).
+            let guard = if rn == 31 {
+                format!("{} & 15 == 0", gprs[&31])
+            } else {
+                "true".to_owned()
+            };
+            for (part, &rt) in loaded.iter().enumerate() {
+                let value = format!("l{index}_{part}");
+                code.push_str(&format!(
+                    "let {value} = if {guard} {{ m.memory.load_u32(a{index}.wrapping_add({})) }} else {{ good = false; 0 }}; good &= usable({value}); ",
+                    4 * part
+                ));
+                values.insert(rt, value);
+                if !written.contains(&rt) {
+                    written.push(rt);
+                }
+            }
+            if let Some(update) = base_update {
+                let local = format!("u{index}");
+                code.push_str(&format!("let {local} = {update}; "));
+                gprs.insert(rn, local);
+                if !gpr_written.contains(&rn) {
+                    gpr_written.push(rn);
+                }
+            }
+            continue;
+        }
         let rd = match *op {
             SimdOp::FpBinary {
                 op: binary,
@@ -3270,7 +3395,11 @@ pub fn float_run_fast(ops: &[SimdOp]) -> (String, Vec<(u8, String)>) {
         .iter()
         .map(|&register| (register, values[&register].clone()))
         .collect();
-    (code, finals)
+    let gpr_finals = gpr_written
+        .iter()
+        .map(|&register| (register, gprs[&register].clone()))
+        .collect();
+    (code, finals, gpr_finals)
 }
 
 #[cfg(test)]

@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
+# With float-runs and inline-vector: S loads inside float runs
+# (EmitOptions::float_run_loads).
+float-run-loads = []
 # Scalar single-precision runs as plain host arithmetic checked once
 # (EmitOptions::float_runs).
 float-runs = []

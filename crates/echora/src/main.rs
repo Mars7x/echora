@@ -706,9 +706,10 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         plt.direct_call_sites,
         plt.tail_sites
     );
-    let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation);
+    let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
+    let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
-        "float runs (at least {} scalar single-precision operations): {runs}, holding {operations} operations",
+        "float runs (at least {} scalar single-precision operations): {runs}, holding {operations} operations; with S loads in them: {load_runs}, holding {load_operations}",
         echora_lift::codegen::FLOAT_RUN_MINIMUM
     );
     let out = d.cache.join("translations").join(&d.exefs_key);
@@ -754,6 +755,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "deferred-charges" => options.deferred_charges = true,
             "stub-windows" => options.stub_windows = true,
             "float-runs" => options.float_runs = true,
+            "float-run-loads" => options.float_run_loads = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
