@@ -174,7 +174,7 @@ pub enum TextureSource {
         shape: ImageShape,
         format: vk::Format,
         texels: Arc<Vec<u8>>,
-        levels: Vec<UploadRegion>,
+        levels: std::sync::Arc<[UploadRegion]>,
     },
 }
 

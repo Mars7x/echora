@@ -1535,9 +1535,13 @@ impl Renderer {
                     *alias = key ^ 1 << 63;
                     *height = 1;
                     *shape = ImageShape::D1 { layers: *layers };
-                    for region in levels {
-                        region.height = 1;
-                    }
+                    *levels = levels
+                        .iter()
+                        .map(|region| crate::draw::UploadRegion {
+                            height: 1,
+                            ..*region
+                        })
+                        .collect();
                 }
                 return self.texture_view(&one_dimensional, texture_type);
             }
@@ -1725,7 +1729,8 @@ impl Renderer {
                         height: size,
                         depth: size,
                         offset: 0,
-                    }],
+                    }]
+                    .into(),
                 };
                 return self.texture_view(&identity, texture_type);
             }

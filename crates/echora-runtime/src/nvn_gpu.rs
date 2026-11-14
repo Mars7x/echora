@@ -3172,7 +3172,7 @@ impl Nvn {
             shape,
             format: vk_format,
             texels: Arc::new(texels),
-            levels,
+            levels: levels.into(),
         };
         self.gpu
             .as_mut()
@@ -7089,6 +7089,7 @@ impl Nvn {
         let mut uniform_bytes = 0u64;
         // Time per kind of binding (the statistics' "draw us binding ...").
         let mut binding_times = [std::time::Duration::ZERO; 5];
+        let mut memo_hits = 0u64;
         let mut binding_lap: Option<(usize, std::time::Instant)> = None;
         for (index, stage) in stages.iter().enumerate() {
             let nvn = slots[index];
@@ -7276,10 +7277,7 @@ impl Nvn {
                         if let Some((source, sampler)) = self.binding_memo.1.get(&handle) {
                             textures
                                 .insert((index, descriptor.binding), (source.clone(), *sampler));
-                            self.gpu
-                                .as_mut()
-                                .unwrap()
-                                .stat("stat: texture binding memo hits", 1);
+                            memo_hits += 1;
                             continue;
                         }
                         self.gpu
@@ -7416,6 +7414,7 @@ impl Nvn {
         }
         {
             let backend = self.gpu.as_mut().unwrap();
+            backend.stat("stat: texture binding memo hits", memo_hits);
             for (name, time) in [
                 "stat: draw ns binding uniform buffers",
                 "stat: draw ns binding driver constants",
