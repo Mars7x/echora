@@ -529,6 +529,11 @@ pub struct Nvn {
     /// draw. Registering a descriptor evicts the handles that name it.
     #[serde(skip)]
     binding_memo: ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>),
+    /// The other queues' memos, kept with their render state
+    /// (`switch_render_queue`): their handles resolve through their own
+    /// texture and sampler pools.
+    #[serde(skip)]
+    queue_memos: HashMap<u64, ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>)>,
     /// Bumped by every flush of guest memory over a SHADER_CODE pool
     /// (`gpu_invalidate`) and every change of a program object or its
     /// shaders.
@@ -2639,14 +2644,18 @@ impl Nvn {
                 // Handles naming this descriptor resolve anew (texture ids
                 // are bits 0..20 of a handle, sampler ids bits 20..32).
                 let sampler = rest.starts_with("RegisterSampler");
-                self.binding_memo.1.retain(|handle, _| {
+                let keep = |handle: &u64, _: &mut ResolvedBinding| {
                     let named = if sampler {
                         handle >> 20 & 0xfff
                     } else {
                         handle & 0xf_ffff
                     };
                     named != u64::from(id)
-                });
+                };
+                self.binding_memo.1.retain(keep);
+                for (_, memo) in self.queue_memos.values_mut() {
+                    memo.retain(keep);
+                }
                 let mut entry = Args::default();
                 match rest {
                     "RegisterSamplerBuilder" => {
@@ -3740,12 +3749,15 @@ impl Nvn {
         if self.render_queue != Some(queue) {
             let incoming = self.queue_render.remove(&queue).unwrap_or_default();
             let outgoing = std::mem::replace(&mut self.render, incoming);
+            // Resolved texture bindings go with the queue's state; the
+            // stamp still drops what changed meanwhile.
+            let incoming_memo = self.queue_memos.remove(&queue).unwrap_or_default();
+            let outgoing_memo = std::mem::replace(&mut self.binding_memo, incoming_memo);
             if let Some(previous) = self.render_queue {
                 self.queue_render.insert(previous, outgoing);
+                self.queue_memos.insert(previous, outgoing_memo);
             }
             self.render_queue = Some(queue);
-            // Resolved texture bindings came from the other queue's state.
-            self.bump_binding_serial("stat: binding serial by a queue switch");
         }
     }
 
