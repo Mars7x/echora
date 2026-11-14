@@ -4579,7 +4579,7 @@ pub mod stats {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.sort_by_key(|count| std::cmp::Reverse(count.1));
         counts
     }
 
@@ -4694,7 +4694,7 @@ pub mod stats {
             && let Some(path) = std::env::var_os("ECHORA_SIMD_STATS")
         {
             let mut rows: Vec<_> = counts.iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(a.1));
+            rows.sort_by_key(|row| std::cmp::Reverse(*row.1));
             let text: String = rows
                 .iter()
                 .map(|(key, count)| format!("{count} {key}\n"))
