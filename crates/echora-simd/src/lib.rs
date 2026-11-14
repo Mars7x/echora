@@ -469,7 +469,17 @@ pub fn fp_binary(
             FpBinaryOp::Div => Some(native!(size, a, b, |x, y| x / y)),
             _ => None,
         };
-        if let Some(raw) = raw.filter(|raw| finite(size, *raw)) {
+        // A tiny product or quotient of nonzero operands (a subnormal or a
+        // zero) is an inexact underflow, which raises UFC: the exact path
+        // takes it. A tiny sum or difference is exact and raises nothing.
+        let format = Format::of(size);
+        let zero = |value: u64| value & !format.sign_bit() == 0;
+        let underflow = |raw: u64| {
+            matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div)
+                && raw & format.exponent_mask() == 0
+                && !(zero(a) || op == FpBinaryOp::Mul && zero(b))
+        };
+        if let Some(raw) = raw.filter(|raw| finite(size, *raw) && !underflow(*raw)) {
             write_fp(cpu, rd, size, raw);
             return Ok(());
         }
@@ -654,7 +664,12 @@ pub fn fp_ternary(
                 .fused(f64::from_bits(m), f64::from_bits(a))
                 .to_bits(),
         };
-        if finite(size, raw) {
+        // A tiny fused result may be an inexact underflow (UFC): the exact
+        // path decides, unless it is the exact zero of zero operands.
+        let format = Format::of(size);
+        let zero = |value: u64| value & !format.sign_bit() == 0;
+        let tiny = raw & format.exponent_mask() == 0 && !((zero(n) || zero(m)) && zero(a));
+        if finite(size, raw) && !tiny {
             write_fp(cpu, rd, size, raw);
             return Ok(());
         }
@@ -3941,6 +3956,42 @@ mod sticky_inexact_tests {
                         (u128::from(exact as u32), exact_flags),
                         "{op:?} {a} {b}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_mode_arithmetic_matches_the_exact_path() {
+        // FPCR 0 (no flushing) with IXC set takes `fp_binary`'s native
+        // path: a tiny product or quotient must still raise UFC.
+        let values: [f32; 12] = [
+            1.0, -2.5, 3.0e38, 1.2e-38, 1.5e-38, 0.1, -0.333, 1.0e-20, 1.0e-30, 1.0e-45, 0.0, -0.0,
+        ];
+        for op in [
+            FpBinaryOp::Add,
+            FpBinaryOp::Sub,
+            FpBinaryOp::Mul,
+            FpBinaryOp::Div,
+        ] {
+            for a in values {
+                for b in values {
+                    let mut cpu = Cpu {
+                        fpsr: FPSR_IXC,
+                        ..Cpu::default()
+                    };
+                    cpu.vectors[1] = u128::from(a.to_bits());
+                    cpu.vectors[2] = u128::from(b.to_bits());
+                    fp_binary(&mut cpu, op, FpSize::S, 0, 1, 2).unwrap();
+                    let fast = (cpu.vectors[0], cpu.fpsr);
+                    let mut cpu = Cpu {
+                        fpsr: FPSR_IXC,
+                        ..Cpu::default()
+                    };
+                    cpu.vectors[1] = u128::from(a.to_bits());
+                    cpu.vectors[2] = u128::from(b.to_bits());
+                    fp_binary_exact(&mut cpu, op, FpSize::S, 0, 1, 2).unwrap();
+                    assert_eq!(fast, (cpu.vectors[0], cpu.fpsr), "{op:?} {a} {b}");
                 }
             }
         }
