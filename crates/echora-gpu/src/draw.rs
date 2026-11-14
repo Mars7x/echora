@@ -417,7 +417,7 @@ pub struct Draw<'a> {
     /// per generic input location, uploaded with the draw.
     pub vertex_fetch: Vec<echora_shader_abi::VertexAttribute>,
     /// The texture pool entries a program reading the pool may name.
-    pub pool: Vec<crate::pool::PoolEntry>,
+    pub pool: std::sync::Arc<[crate::pool::PoolEntry]>,
 }
 
 /// The workgroups of a mesh draw.
@@ -1396,7 +1396,7 @@ pub(crate) mod tests {
                 color.iter().flat_map(|value| value.to_le_bytes()).collect(),
             )]),
             textures: crate::FastMap::default(),
-            pool: Vec::new(),
+            pool: Default::default(),
             storage: crate::FastMap::default(),
             storage_in_place: crate::FastMap::default(),
             fixed: Fixed {

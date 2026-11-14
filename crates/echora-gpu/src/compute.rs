@@ -38,7 +38,7 @@ pub struct Dispatch<'a> {
     /// The GPU page table, for a program that reads it.
     pub page_table: echora_shader_abi::PageTable,
     /// The texture pool entries a program reading the pool may name.
-    pub pool: Vec<crate::pool::PoolEntry>,
+    pub pool: std::sync::Arc<[crate::pool::PoolEntry]>,
 }
 
 impl Renderer {
@@ -420,7 +420,7 @@ mod tests {
             image_formats: HashMap::new(),
             indirect: None,
             page_table: Default::default(),
-            pool: Vec::new(),
+            pool: Default::default(),
         };
         let results = renderer.dispatch(&dispatch).unwrap();
         assert_eq!(

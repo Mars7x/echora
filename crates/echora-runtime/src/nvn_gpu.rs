@@ -2090,11 +2090,26 @@ impl Nvn {
         &mut self,
         core: &mut Guest,
         nvn: u32,
-    ) -> Result<Vec<echora_gpu::pool::PoolEntry>, String> {
+    ) -> Result<std::sync::Arc<[echora_gpu::pool::PoolEntry]>, String> {
         // The renderer's counts from earlier pool writes.
         let backend = self.gpu.as_mut().unwrap();
         for (name, amount) in backend.renderer.take_stats() {
             backend.stat(name, amount);
+        }
+        let key = (
+            (
+                self.texture_epoch,
+                self.gpu.as_ref().unwrap().renderer.target_changes,
+                self.binding_serial,
+                self.presented_frames,
+            ),
+            self.gpu_writes_now(),
+            self.pool_inputs,
+        );
+        if let Some((cached, list)) = self.pool_entry_cache.get(&nvn)
+            && *cached == key
+        {
+            return Ok(list.clone());
         }
         let stage = u64::from(nvn);
         let mut handles: Vec<u64> = self
@@ -2165,7 +2180,20 @@ impl Nvn {
                 sampler_state,
             });
         }
-        Ok(entries)
+        let list: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = entries.into();
+        // Resolving may have moved the memo stamp: kept under the key now.
+        let key = (
+            (
+                self.texture_epoch,
+                self.gpu.as_ref().unwrap().renderer.target_changes,
+                self.binding_serial,
+                self.presented_frames,
+            ),
+            self.gpu_writes_now(),
+            self.pool_inputs,
+        );
+        self.pool_entry_cache.insert(nvn, (key, list.clone()));
+        Ok(list)
     }
 
     /// The sampler a texture binding samples with: the handle's sampler,
@@ -4712,7 +4740,7 @@ impl Nvn {
         let pool = if stage.texture_pool_bindings != 0 {
             self.pool_entries(core, 5)?
         } else {
-            Vec::new()
+            Default::default()
         };
         // ECHORA_DUMP_DISPATCH=<program key>[,...] (debugging): the first
         // dispatch of each listed program, for the workgroup simulator
@@ -7544,12 +7572,19 @@ impl Nvn {
         }
         let pool_started = std::time::Instant::now();
         // Texture pool entries, for stages that read the pool.
-        let mut pool = Vec::new();
+        // One stage's list is shared as it is (unchanged lists are then
+        // known without comparing); several are joined.
+        let mut lists = Vec::new();
         for (index, stage) in stages.iter().enumerate() {
             if stage.texture_pool_bindings != 0 {
-                pool.extend(self.pool_entries(core, slots[index])?);
+                lists.push(self.pool_entries(core, slots[index])?);
             }
         }
+        let pool: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = match lists.len() {
+            0 => Default::default(),
+            1 => lists.pop().unwrap(),
+            _ => lists.iter().flat_map(|list| list.iter().cloned()).collect(),
+        };
         {
             let backend = self.gpu.as_mut().unwrap();
             backend.stat(

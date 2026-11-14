@@ -254,7 +254,11 @@ pub struct Renderer {
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
     /// The texture pool entries last bound, the target changes then, and
     /// the targets they read (`bind_pool`).
-    pub(crate) pool_cache: Option<(Vec<crate::pool::PoolEntry>, u64, Vec<vk::Image>)>,
+    pub(crate) pool_cache: Option<(
+        std::sync::Arc<[crate::pool::PoolEntry]>,
+        u64,
+        Vec<vk::Image>,
+    )>,
     /// Each uploaded pool entry's resolved descriptors, by (texture,
     /// sampler) index: reused while the entry is the same (`bind_pool`).
     pub(crate) pool_entry_memo: FastMap<(u32, u32), crate::pool::ResolvedEntry>,

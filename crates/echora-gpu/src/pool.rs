@@ -21,7 +21,7 @@ use crate::vulkan::{SAMPLER_POOL_CAPACITY, TEXTURE_POOL_CAPACITY};
 /// One texture pool entry a draw or dispatch may read: the texture at
 /// `texture` (handle bits 0..20) and the sampler at `sampler` (bits
 /// 20..32), as the handle that names both resolves.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PoolEntry {
     pub texture: u32,
     pub sampler: u32,
@@ -196,18 +196,24 @@ impl Renderer {
     /// Write `entries` into the pool set and return it, for a program
     /// that reads the pool (bound as set 1). An entry that changes while
     /// recorded or submitted work may read it is written after a flush.
-    pub(crate) fn bind_pool(&mut self, entries: &[PoolEntry]) -> Result<vk::DescriptorSet, String> {
+    pub(crate) fn bind_pool(
+        &mut self,
+        entries: &std::sync::Arc<[PoolEntry]>,
+    ) -> Result<vk::DescriptorSet, String> {
         self.texture_pool()?;
         // The same entries as the last call, with no target made again
         // since (a view of one would change): the set already holds them.
         if let Some((last, changes, targets)) = &self.pool_cache
             && *changes == self.target_changes
-            && last.len() == entries.len()
-            && last.iter().zip(entries).all(|(last, entry)| {
-                (last.texture, last.sampler) == (entry.texture, entry.sampler)
-                    && last.sampler_state == entry.sampler_state
-                    && last.source.same_as(&entry.source)
-            })
+            // The same shared list (the runtime keeps one while nothing it
+            // was made from changed), or equal entries.
+            && (std::sync::Arc::ptr_eq(last, entries)
+                || last.len() == entries.len()
+                    && last.iter().zip(entries.iter()).all(|(last, entry)| {
+                        (last.texture, last.sampler) == (entry.texture, entry.sampler)
+                            && last.sampler_state == entry.sampler_state
+                            && last.source.same_as(&entry.source)
+                    }))
         {
             let targets = targets.clone();
             self.stat("stat: texture pool sets unchanged", 1);
@@ -221,7 +227,7 @@ impl Renderer {
         let mut wanted: Vec<(u32, u32, u64)> = Vec::new();
         let mut kinds: Vec<(u32, bool)> = Vec::new();
         let mut targets = Vec::new();
-        for entry in entries {
+        for entry in entries.iter() {
             if entry.texture >= TEXTURE_POOL_CAPACITY || entry.sampler >= SAMPLER_POOL_CAPACITY {
                 self.stat("stat: texture pool entries past capacity", 1);
                 continue;
@@ -402,7 +408,7 @@ impl Renderer {
             pool.written.insert((array, index), handle);
         }
         pool.in_use = true;
-        self.pool_cache = Some((entries.to_vec(), self.target_changes, targets));
+        self.pool_cache = Some((entries.clone(), self.target_changes, targets));
         Ok(set)
     }
 

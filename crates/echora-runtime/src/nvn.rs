@@ -538,6 +538,22 @@ pub struct Nvn {
     /// texture and sampler pools.
     #[serde(skip)]
     queue_memos: HashMap<u64, ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>)>,
+    /// Bumped whenever a stage's texture pool entries may change other
+    /// than through the memo stamp: a texture bind, a descriptor
+    /// registration, a render queue switch (`pool_entry_cache`).
+    #[serde(skip)]
+    pool_inputs: u64,
+    /// Each NVN stage's texture pool entries, kept while their memo stamp,
+    /// GPU write generation and `pool_inputs` hold: draws share one list,
+    /// which the renderer knows unchanged without comparing.
+    #[serde(skip)]
+    pool_entry_cache: FastMap<
+        u32,
+        (
+            ((u64, u64, u64, u64), u64, u64),
+            std::sync::Arc<[echora_gpu::pool::PoolEntry]>,
+        ),
+    >,
     /// Bumped by every flush of guest memory over a SHADER_CODE pool
     /// (`gpu_invalidate`) and every change of a program object or its
     /// shaders.
@@ -2791,6 +2807,7 @@ impl Nvn {
                 for (_, memo) in self.queue_memos.values_mut() {
                     memo.retain(keep);
                 }
+                self.pool_inputs += 1;
                 let mut entry = Args::default();
                 match rest {
                     "RegisterSamplerBuilder" => {
@@ -3884,6 +3901,7 @@ impl Nvn {
     /// Make `queue`'s GPU state the current one.
     fn switch_render_queue(&mut self, queue: u64) {
         if self.render_queue != Some(queue) {
+            self.pool_inputs += 1;
             let incoming = self.queue_render.remove(&queue).unwrap_or_default();
             let outgoing = std::mem::replace(&mut self.render, incoming);
             // Resolved texture bindings go with the queue's state; the
@@ -4774,6 +4792,7 @@ impl Nvn {
                             self.render
                                 .bound_textures
                                 .insert((command.x[1], slot), value[0]);
+                            self.pool_inputs += 1;
                         }
                         self.render
                             .state
@@ -4830,6 +4849,7 @@ impl Nvn {
                         self.render
                             .bound_textures
                             .insert((command.x[1], command.x[2]), command.x[3]);
+                        self.pool_inputs += 1;
                     }
                     self.render.state.insert(key, command.clone());
                     return Ok(());
