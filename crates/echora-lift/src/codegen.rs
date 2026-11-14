@@ -3372,7 +3372,26 @@ fn emit_block_body(
     let count = block.instructions.len();
     let fuse = FUSE.replace(fusion(block));
     let mut body = String::new();
+    let runs = if FLOAT_RUNS.get() {
+        float_runs_in(block)
+    } else {
+        Vec::new()
+    };
+    let mut skip_to = 0;
     for (index, instruction) in block.instructions.iter().enumerate() {
+        if index < skip_to {
+            continue;
+        }
+        if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
+            emit_float_run(
+                &mut body,
+                &block.instructions[index..end],
+                check_entry,
+                resumable,
+            );
+            skip_to = end;
+            continue;
+        }
         let block_size = (index == 0).then_some(count);
         emit_instruction(
             &mut body,
@@ -3422,6 +3441,100 @@ fn emit_block_body(
     } else {
         output.push_str(&body);
     }
+}
+
+/// Scalar single-precision operations a float run needs at least.
+pub const FLOAT_RUN_MINIMUM: usize = 8;
+
+/// The float runs of `block` (start and end indices): maximal sequences of
+/// `crate::simd::float_run_op` operations, neither the block's first
+/// instruction (its charge) nor its last (its successor), holding at least
+/// `FLOAT_RUN_MINIMUM` arithmetic ones. Nothing in a run stores, branches,
+/// calls or touches anything but S registers, FPCR and FPSR, so it can run
+/// again from its start.
+fn float_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let kind = |record: &TranslatedInstruction| match &record.instruction {
+        Instruction::Simd(op) => crate::simd::float_run_op(op),
+        _ => None,
+    };
+    let count = block.instructions.len();
+    let mut runs = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if kind(&block.instructions[index]).is_none() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut arithmetic = 0;
+        while index + 1 < count
+            && let Some(counts) = kind(&block.instructions[index])
+        {
+            arithmetic += usize::from(counts);
+            index += 1;
+        }
+        if arithmetic >= FLOAT_RUN_MINIMUM {
+            runs.push((start, index));
+        }
+    }
+    runs
+}
+
+/// Float runs over a translation (`EmitOptions::float_runs`): how many,
+/// and the arithmetic operations they hold.
+pub fn float_run_report(translation: &Translation) -> (usize, usize) {
+    let mut report = (0, 0);
+    for block in &translation.blocks {
+        for (start, end) in float_runs_in(block) {
+            report.0 += 1;
+            report.1 += block.instructions[start..end]
+                .iter()
+                .filter(|record| {
+                    matches!(&record.instruction, Instruction::Simd(op) if crate::simd::float_run_op(op) == Some(true))
+                })
+                .count();
+        }
+    }
+    report
+}
+
+/// A float run (`float_runs_in`), emitted twice: a fast copy on host
+/// single-precision locals (`crate::simd::float_run_fast`), committed to
+/// the vector registers only when FPCR is in the inline paths' mode, FPSR
+/// already holds the sticky IXC, and every operand from before the run and
+/// every result is normal or zero (a zero result exact), so the values are
+/// the Arm ones and nothing else would be raised; else the exact copy, as
+/// each operation is emitted alone, from the run's start.
+fn emit_float_run(
+    output: &mut String,
+    run: &[TranslatedInstruction],
+    check_entry: bool,
+    resumable: bool,
+) {
+    let ops: Vec<SimdOp> = run
+        .iter()
+        .map(|record| match &record.instruction {
+            Instruction::Simd(op) => *op,
+            _ => unreachable!("float runs hold SIMD operations"),
+        })
+        .collect();
+    let (fast, finals) = crate::simd::float_run_fast(&ops);
+    let (_, _, _, kit) = crate::simd::float_kit(crate::simd::FpSize::S);
+    let commits: String = finals
+        .iter()
+        .map(|(register, value)| format!("m.cpu.vectors[{register}] = u128::from({value}); "))
+        .collect();
+    writeln!(
+        output,
+        "                {{ {kit} let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
+        crate::simd::FP_MODE
+    )
+    .unwrap();
+    output.push_str("                if !committed {\n");
+    for record in run {
+        emit_instruction(output, record, false, None, check_entry, resumable);
+    }
+    output.push_str("                }\n                }\n");
 }
 
 /// The blocks structured emission lets execution resume at, so the only
@@ -4092,6 +4205,31 @@ pub struct EmitOptions {
     /// inlined call path at each site costs the caller's window more than
     /// the table lookup it saves. Off by default.
     pub direct_calls: bool,
+    /// Runs of at least `FLOAT_RUN_MINIMUM` scalar single-precision
+    /// operations (`float_runs_in`) run as plain host arithmetic, checked
+    /// once at the end, with the per-operation emission as the fallback
+    /// (`emit_float_run`).
+    pub float_runs: bool,
+}
+
+thread_local! {
+    /// `EmitOptions::float_runs` of the emission running on this thread.
+    static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`FLOAT_RUNS`] for as long as it lives.
+struct FloatRuns(bool);
+
+impl FloatRuns {
+    fn set(on: bool) -> Self {
+        Self(FLOAT_RUNS.replace(on))
+    }
+}
+
+impl Drop for FloatRuns {
+    fn drop(&mut self) {
+        FLOAT_RUNS.set(self.0);
+    }
 }
 
 thread_local! {
@@ -4430,6 +4568,7 @@ pub fn emit_rust_split_to_with<E>(
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
+    let _float_runs = FloatRuns::set(options.float_runs);
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _window_memory = WindowMemory::set(options.window_memory);
     let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);

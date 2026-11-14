@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
+# Scalar single-precision runs as plain host arithmetic checked once
+# (EmitOptions::float_runs).
+float-runs = []
 # Lift every program with common vector operations as native code
 # (codegen's EmitOptions::inline_vector):
 # `cargo test -p echora-aot-tests --features inline-vector`.

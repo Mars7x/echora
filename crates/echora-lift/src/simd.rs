@@ -2367,7 +2367,7 @@ fn unary_path(op: FpUnaryOp) -> String {
 /// Bit tests on one float format for inlined code: the host float and
 /// integer types, the lane width, and closures `normal`, `zero` and
 /// `usable` (normal or zero) on raw lanes.
-fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
+pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
     let (float, int, width, exponent, sign) = match size {
         FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
         FpSize::D => (
@@ -2390,7 +2390,7 @@ fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
 /// The FPCR the float helpers accept (round to nearest, no AH or FZ16):
 /// under it, an inlined float operation traps exactly when its helper
 /// would, that is never.
-const FP_MODE: &str = "m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH | echora_guest::simd::FPCR_FZ16) == 0";
+pub(crate) const FP_MODE: &str = "m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH | echora_guest::simd::FPCR_FZ16) == 0";
 
 /// FMAX/FMIN/FMAXNM/FMINNM of two normal-or-zero lanes `x` and `y`: the
 /// larger or smaller, +0 above -0. With neither a NaN nor a denormal, the
@@ -3103,6 +3103,153 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether `op` can be part of a float run (`crate::codegen`): a scalar
+/// single-precision FADD, FSUB, FMUL, FNMUL, FDIV, FMADD, FMSUB, FNMADD,
+/// FNMSUB or FSQRT (Some(true): arithmetic), or FMOV, FABS or FNEG between
+/// S registers (Some(false)).
+pub fn float_run_op(op: &SimdOp) -> Option<bool> {
+    match *op {
+        SimdOp::FpBinary {
+            op:
+                FpBinaryOp::Add
+                | FpBinaryOp::Sub
+                | FpBinaryOp::Mul
+                | FpBinaryOp::NegMul
+                | FpBinaryOp::Div,
+            size: FpSize::S,
+            ..
+        }
+        | SimdOp::FpTernary {
+            size: FpSize::S, ..
+        }
+        | SimdOp::FpUnary {
+            op: FpUnaryOp::Sqrt,
+            size: FpSize::S,
+            ..
+        } => Some(true),
+        SimdOp::FpUnary {
+            op: FpUnaryOp::Mov | FpUnaryOp::Abs | FpUnaryOp::Neg,
+            size: FpSize::S,
+            ..
+        } => Some(false),
+        _ => None,
+    }
+}
+
+/// The fast copy of a float run (`crate::codegen::emit_float_run`): every
+/// operation as plain host single-precision arithmetic on locals, with
+/// `good` cleared where an operand read from the run's start or a result
+/// is anything but normal or zero, or a zero result might not be exact
+/// (what the inline paths require of one operation: then the host's IEEE
+/// result is the Arm one and raises nothing beyond the sticky IXC the run
+/// requires). Returns the code and the registers it writes with their
+/// final values' locals.
+pub fn float_run_fast(ops: &[SimdOp]) -> (String, Vec<(u8, String)>) {
+    let mut code = String::new();
+    let mut values: std::collections::BTreeMap<u8, String> = Default::default();
+    let mut written: Vec<u8> = Vec::new();
+    let read = |code: &mut String,
+                values: &mut std::collections::BTreeMap<u8, String>,
+                register: u8| {
+        values
+            .entry(register)
+            .or_insert_with(|| {
+                code.push_str(&format!("let i{register} = m.cpu.vectors[{register}] as u32; good &= usable(i{register}); "
+                ));
+                format!("i{register}")
+            })
+            .clone()
+    };
+    for (index, op) in ops.iter().enumerate() {
+        let t = format!("t{index}");
+        let rd = match *op {
+            SimdOp::FpBinary {
+                op: binary,
+                rd,
+                rn,
+                rm,
+                ..
+            } => {
+                let (x, y) = (
+                    read(&mut code, &mut values, rn),
+                    read(&mut code, &mut values, rm),
+                );
+                let (expression, exact) = match binary {
+                    FpBinaryOp::Add => ("+", "true".to_owned()),
+                    FpBinaryOp::Sub => ("-", "true".to_owned()),
+                    FpBinaryOp::Div => ("/", format!("zero({x})")),
+                    _ => ("*", format!("(zero({x}) | zero({y}))")),
+                };
+                let negate = if binary == FpBinaryOp::NegMul {
+                    " ^ sign"
+                } else {
+                    ""
+                };
+                code.push_str(&format!("let {t} = (f32::from_bits({x}) {expression} f32::from_bits({y})).to_bits(){negate}; \
+                     good &= normal({t}) | (zero({t}) & {exact}); "
+                ));
+                rd
+            }
+            SimdOp::FpTernary {
+                op: ternary,
+                rd,
+                rn,
+                rm,
+                ra,
+                ..
+            } => {
+                let x = read(&mut code, &mut values, rn);
+                let y = read(&mut code, &mut values, rm);
+                let z = read(&mut code, &mut values, ra);
+                let (negate_addend, negate_product) = match ternary {
+                    FpTernaryOp::MulAdd => (false, false),
+                    FpTernaryOp::MulSub => (false, true),
+                    FpTernaryOp::NegMulAdd => (true, true),
+                    FpTernaryOp::NegMulSub => (true, false),
+                };
+                let n = if negate_product {
+                    format!("({x} ^ sign)")
+                } else {
+                    x.clone()
+                };
+                let a = if negate_addend {
+                    format!("({z} ^ sign)")
+                } else {
+                    z.clone()
+                };
+                code.push_str(&format!("let {t} = f32::from_bits({n}).mul_add(f32::from_bits({y}), f32::from_bits({a})).to_bits(); \
+                     good &= normal({t}) | (zero({t}) & (zero({x}) | zero({y})) & zero({z})); "
+                ));
+                rd
+            }
+            SimdOp::FpUnary {
+                op: unary, rd, rn, ..
+            } => {
+                let x = read(&mut code, &mut values, rn);
+                match unary {
+                    FpUnaryOp::Sqrt => code.push_str(&format!(
+                        "let {t} = f32::from_bits({x}).sqrt().to_bits(); good &= usable({t}); "
+                    )),
+                    FpUnaryOp::Abs => code.push_str(&format!("let {t} = {x} & !sign; ")),
+                    FpUnaryOp::Neg => code.push_str(&format!("let {t} = {x} ^ sign; ")),
+                    _ => code.push_str(&format!("let {t} = {x}; ")),
+                }
+                rd
+            }
+            _ => unreachable!("not a float run operation"),
+        };
+        values.insert(rd, t);
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    let finals = written
+        .iter()
+        .map(|&register| (register, values[&register].clone()))
+        .collect();
+    (code, finals)
 }
 
 #[cfg(test)]

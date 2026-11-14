@@ -706,6 +706,11 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         plt.direct_call_sites,
         plt.tail_sites
     );
+    let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation);
+    println!(
+        "float runs (at least {} scalar single-precision operations): {runs}, holding {operations} operations",
+        echora_lift::codegen::FLOAT_RUN_MINIMUM
+    );
     let out = d.cache.join("translations").join(&d.exefs_key);
     let guest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../echora-guest")
@@ -747,6 +752,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "split-ticks" => options.split_ticks = true,
             "direct-calls" => options.direct_calls = true,
             "stub-windows" => options.stub_windows = true,
+            "float-runs" => options.float_runs = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }

@@ -226,6 +226,28 @@ before a call fell from 28.3 to 9.7 on average. `tests/spills.rs`: a
 callee reading registers its callers wrote before the call, after it in a
 loop's previous pass, through a conditional successor, and never.
 
+## Float runs (opt-in)
+
+`EmitOptions::float_runs` (`float-runs`): a run of at least eight scalar
+single-precision FADD, FSUB, FMUL, FNMUL, FDIV, FMADD, FMSUB, FNMADD,
+FNMSUB or FSQRT (with FMOV, FABS, FNEG between them; nothing that stores,
+branches, calls or touches other state, and neither its block's first nor
+last instruction) is emitted twice. The fast copy computes on host f32
+locals and clears one `good` flag where an operand from before the run or
+any result is anything but normal or zero, or a zero product, quotient or
+fused result might be an underflow. It commits to the vector registers
+when FPCR is in the inline paths' mode, FPSR already holds the sticky IXC
+and `good` holds: the values are then the IEEE ones, which Arm gives too,
+and nothing beyond IXC would be raised. Otherwise the exact copy (each
+operation as emitted alone) runs from the run's start. No MXCSR state is
+read: the per-result class checks are a few integer operations, the run
+needs one FPCR and FPSR test, and operands from inside the run are not
+checked again. Kernels (game set vs game set plus float-runs, two rounds
+of seven runs): the new `floats` kernel (twelve operations per element)
+861/860 Minstr/s against 407/396 (2.1x); `scalar` (two operations per loop,
+no run) and the rest within noise. `tests/float_runs.rs` compares it with
+the exact emission over edge values, FZ, DN and a directed rounding mode.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`
