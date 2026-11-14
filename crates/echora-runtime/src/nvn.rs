@@ -757,7 +757,7 @@ impl Nvn {
             self.render = capture.render.clone();
             self.queue_render = capture.queue_render.clone();
             self.render_queue = capture.render_queue;
-            self.binding_serial += 1;
+            self.bump_binding_serial("stat: binding serial by a restored capture");
             let mut failed = None;
             for (queue, command) in &capture.commands {
                 if let Some(queue) = *queue {
@@ -3745,7 +3745,7 @@ impl Nvn {
             }
             self.render_queue = Some(queue);
             // Resolved texture bindings came from the other queue's state.
-            self.binding_serial += 1;
+            self.bump_binding_serial("stat: binding serial by a queue switch");
         }
     }
 
@@ -4672,7 +4672,7 @@ impl Nvn {
                         }
                         // Another pool: every handle may name other entries.
                         "SetTexturePool" | "SetSamplerPool" => {
-                            self.binding_serial += 1;
+                            self.bump_binding_serial("stat: binding serial by a pool set");
                             rest.into()
                         }
                         _ => rest.into(),

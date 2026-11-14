@@ -648,6 +648,14 @@ impl Nvn {
         Ok((width, height, vk_format))
     }
 
+    /// Resolve texture bindings anew (`binding_memo`), counted by `why`.
+    pub(super) fn bump_binding_serial(&mut self, why: &'static str) {
+        self.binding_serial += 1;
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(why, 1);
+        }
+    }
+
     /// Drop cached textures whose storage overlaps guest `range`, or the
     /// texture object `texture` itself: the application wrote it.
     pub(super) fn gpu_invalidate(&mut self, range: std::ops::Range<u64>, texture: Option<u64>) {
@@ -662,7 +670,7 @@ impl Nvn {
             self.flush_epoch += 1;
         }
         if texture.is_some() {
-            self.binding_serial += 1;
+            self.bump_binding_serial("stat: binding serial by an invalidated texture");
         }
         if let Some(backend) = self.gpu.as_mut() {
             for pool in backend.resident.values_mut() {
@@ -691,7 +699,7 @@ impl Nvn {
             });
             backend.stat("stat: textures invalidated", touched.len() as u64);
             if !touched.is_empty() {
-                self.binding_serial += 1;
+                self.bump_binding_serial("stat: binding serial by touched textures");
             }
             let backend = self.gpu.as_mut().unwrap();
             for (key, overlap) in touched {
