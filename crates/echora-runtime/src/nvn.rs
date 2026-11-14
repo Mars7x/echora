@@ -589,7 +589,7 @@ pub struct Nvn {
 /// NVN reads through pointer arguments at record time.
 #[derive(Clone, Debug)]
 pub struct Command {
-    pub name: String,
+    pub name: &'static str,
     pub x: [u64; 8],
     pub v: [u64; 8],
     pub captured: Vec<u64>,
@@ -1181,7 +1181,7 @@ impl Recorder {
     /// Record NVN call `name` when it is a call on a recording command
     /// buffer (X0) other than its management: Ok(true) once recorded,
     /// Ok(false) when it is not (the caller makes it with the NVN state).
-    pub fn record(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+    pub fn record(&self, name: &'static str, core: &mut Guest) -> Result<bool, Trap> {
         let Some(rest) = name.strip_prefix("nvnCommandBuffer") else {
             return Ok(false);
         };
@@ -1202,14 +1202,43 @@ impl Recorder {
 
 /// The entry point whose thunk is at `pc`, in a table of thunk names
 /// (`Nvn::thunk_names`).
-pub fn thunk_in(names: &[String], pc: u64) -> Option<&str> {
+pub fn thunk_in<'a>(names: &'a [impl AsRef<str>], pc: u64) -> Option<&'a str> {
+    names.get(thunk_index(pc)?).map(AsRef::as_ref)
+}
+
+/// The index of the thunk at `pc` in thunk order, if `pc` is one.
+pub fn thunk_index(pc: u64) -> Option<usize> {
     let offset = pc.checked_sub(THUNK_BASE)?;
     if offset >= THUNK_SIZE || !offset.is_multiple_of(THUNK_STRIDE) {
         return None;
     }
-    names
-        .get((offset / THUNK_STRIDE) as usize)
-        .map(String::as_str)
+    Some((offset / THUNK_STRIDE) as usize)
+}
+
+/// `name` as a string that lives for the run: entry point names are a
+/// fixed set, kept once, so recorded commands carry them without
+/// allocating.
+pub fn intern(name: &str) -> &'static str {
+    static NAMES: std::sync::RwLock<Option<std::collections::HashSet<&'static str>>> =
+        std::sync::RwLock::new(None);
+    if let Some(known) = NAMES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|names| names.get(name).copied())
+    {
+        return known;
+    }
+    let mut names = NAMES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let names = names.get_or_insert_with(Default::default);
+    if let Some(known) = names.get(name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
 }
 
 /// A bag's properties, when the bag at `address` is a `kind`.
@@ -1565,8 +1594,8 @@ impl Nvn {
     }
 
     /// The entry point name of each thunk, in thunk order (see `thunk_in`).
-    pub fn thunk_names(&self) -> Vec<String> {
-        self.thunks.clone()
+    pub fn thunk_names(&self) -> Vec<&'static str> {
+        self.thunks.iter().map(|name| intern(name)).collect()
     }
 
     /// How many entry point thunks exist (lookups add them).
@@ -3208,7 +3237,7 @@ impl Nvn {
                     let mut recording = lock_shared(&recording);
                     let bags = read_shared(&self.bags);
                     record_command(
-                        name,
+                        intern(name),
                         rest,
                         core,
                         &bags,
@@ -3927,14 +3956,14 @@ impl Nvn {
         let started = std::time::Instant::now();
         let result = self.execute_untimed(command, core);
         let micros = started.elapsed().as_micros() as u64;
-        match self.replay_microseconds.get_mut(&command.name) {
+        match self.replay_microseconds.get_mut(command.name) {
             Some(total) => {
                 total.0 += 1;
                 total.1 += micros;
             }
             None => {
                 self.replay_microseconds
-                    .insert(command.name.clone(), (1, micros));
+                    .insert(command.name.to_string(), (1, micros));
             }
         }
         result
@@ -4051,7 +4080,7 @@ impl Nvn {
     }
 
     fn execute_command(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
-        match command.name.as_str() {
+        match command.name {
             "nvnCommandBufferSetRenderEnable" => {
                 self.render.render_enable = (command.x[1] & 0xff == 0).then_some((2, 0));
                 if self.gpu().is_some() {
@@ -4118,7 +4147,7 @@ impl Nvn {
         // dispatches resolve what they read; ReportCounter resolves only
         // the report it writes on the CPU). Resolving everything here read
         // back every uncached pool's GPU writes, a wait each time.
-        let touched = match command.name.as_str() {
+        let touched = match command.name {
             "nvnCommandBufferClearBuffer" => Some(
                 self.gpu_to_guest(command.x[1], command.x[2])
                     .ok()
@@ -4149,7 +4178,7 @@ impl Nvn {
             command_id: None,
             message: format!("executing {}: {message}", command.name),
         };
-        match command.name.as_str() {
+        match command.name {
             // Push{Graphics,Compute}Constants: words into root table `table`
             // at `offset` (bytes, word aligned, within the 256-byte table).
             "nvnCommandBufferPushGraphicsConstants" | "nvnCommandBufferPushComputeConstants" => {
@@ -4237,7 +4266,7 @@ impl Nvn {
                 let rect: [u64; 4] = std::array::from_fn(|index| command.captured[index]);
                 if command.name.ends_with("Viewports") {
                     let mut viewport = command.clone();
-                    viewport.name = "nvnCommandBufferSetViewport".into();
+                    viewport.name = "nvnCommandBufferSetViewport";
                     for (index, value) in rect.iter().enumerate() {
                         viewport.x[1 + index] = f32::from_bits(*value as u32) as i32 as u64;
                     }
@@ -4255,7 +4284,7 @@ impl Nvn {
                     return Ok(());
                 }
                 let mut range = command.clone();
-                range.name = "nvnCommandBufferSetDepthRange".into();
+                range.name = "nvnCommandBufferSetDepthRange";
                 range.v[0] = command.captured[0];
                 range.v[1] = command.captured[1];
                 self.render.state.insert("SetDepthRange".into(), range);
@@ -4654,7 +4683,7 @@ impl Nvn {
                     for (index, value) in values.chunks(words).take(count).enumerate() {
                         let slot = command.x[2] + index as u64;
                         let mut bind = command.clone();
-                        bind.name = format!("nvnCommandBuffer{single}");
+                        bind.name = intern(&format!("nvnCommandBuffer{single}"));
                         bind.captured = Vec::new();
                         bind.x = [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0];
                         if words == 2 {
@@ -4775,7 +4804,7 @@ impl Nvn {
                         return Err(stop(format!("dispatch results: {message}")));
                     }
                     let mut direct = command.clone();
-                    direct.name = "nvnCommandBufferDispatchCompute".into();
+                    direct.name = "nvnCommandBufferDispatchCompute";
                     for (index, slot) in direct.x[1..4].iter_mut().enumerate() {
                         *slot = u64::from(core.memory.read_u32(at + index as u64 * 4)?);
                     }
@@ -6120,7 +6149,7 @@ fn call_watch(name: &str, core: &Guest) {
 }
 
 fn record_command(
-    name: &str,
+    name: &'static str,
     rest: &str,
     core: &mut Guest,
     bags: &BTreeMap<u64, Bag>,
@@ -6133,7 +6162,7 @@ fn record_command(
     };
     let x = core.cpu.regs;
     let mut command = Command {
-        name: name.into(),
+        name,
         x: std::array::from_fn(|index| x[index]),
         v: std::array::from_fn(|index| core.cpu.vectors[index] as u64),
         captured: Vec::new(),
@@ -6272,7 +6301,7 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
         command.captured = read_u64s(command.x[4], count * words)?;
         return Ok(());
     }
-    match command.name.as_str() {
+    match command.name {
         "nvnCommandBufferSetRenderTargets" => {
             let count = command.x[1] as usize;
             if count > 8 {

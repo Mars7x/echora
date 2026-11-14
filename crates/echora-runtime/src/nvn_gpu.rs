@@ -1853,7 +1853,7 @@ impl Nvn {
     /// reads three u32 group counts at that GPU address (from the device
     /// buffer of a resident pool when the GPU may have written them).
     fn mesh_groups(&mut self, core: &mut Guest, command: &Command) -> Result<MeshGroups, String> {
-        match command.name.as_str() {
+        match command.name {
             "nvnCommandBufferDrawMeshTasks" => {
                 let (first, count) = (command.x[1] as u32, command.x[2] as u32);
                 if first != 0 {
@@ -5766,7 +5766,7 @@ impl Nvn {
         textures: &echora_gpu::FastMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
         page_table: echora_shader_abi::PageTable,
     ) {
-        let groups = match command.name.as_str() {
+        let groups = match command.name {
             "nvnCommandBufferDrawMeshTasksIndirect" => {
                 let address = command.x[1];
                 let count = self
@@ -7494,7 +7494,7 @@ impl Nvn {
         // it) and the draw's base instance (0x644; DrawElementsInstanced's
         // and DrawArraysInstanced's, 0 for other direct draws). Programs
         // read the base instance there to find per-instance data.
-        let base_instance = match command.name.as_str() {
+        let base_instance = match command.name {
             "nvnCommandBufferDrawArraysInstanced" => command.x[4] as u32,
             "nvnCommandBufferDrawElementsInstanced" => command.x[6] as u32,
             _ => 0,
@@ -7619,7 +7619,7 @@ impl Nvn {
             topology(mode).ok_or_else(|| format!("primitive mode {mode}"))?
         };
         // Instance count and base instance (1 and 0 for plain draws).
-        let (instances, first_instance) = match command.name.as_str() {
+        let (instances, first_instance) = match command.name {
             // DrawArraysInstanced(cmd, mode, first, count, baseInstance,
             // instanceCount) (inferred NVN1 order).
             "nvnCommandBufferDrawArraysInstanced" => (command.x[5] as u32, command.x[4] as u32),
@@ -7667,7 +7667,7 @@ impl Nvn {
                 return Err(format!("{instances} instances from {first_instance}"));
             }
         }
-        let (mut indices, mut count, mut first, mut base_vertex) = match command.name.as_str() {
+        let (mut indices, mut count, mut first, mut base_vertex) = match command.name {
             // DrawArrays(cmd, mode, first, count).
             "nvnCommandBufferDrawArrays" | "nvnCommandBufferDrawArraysInstanced" => {
                 (Indices::None, command.x[3] as u32, command.x[2] as u32, 0)

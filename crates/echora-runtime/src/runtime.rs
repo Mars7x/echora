@@ -4851,7 +4851,7 @@ struct Shared<'a> {
     /// The NVN thunks' entry point names, for recognizing those calls
     /// without the NVN state's lock; refreshed with the machine's table when
     /// lookups add thunks.
-    thunks: std::sync::RwLock<Vec<String>>,
+    thunks: std::sync::RwLock<Vec<&'static str>>,
     /// ECHORA_EXCLUSIVE_THREADS=ID,... (diagnostic): those guest threads run
     /// only while no other worker runs guest code.
     exclusive: Option<(std::sync::RwLock<()>, Vec<u64>)>,
@@ -5402,11 +5402,11 @@ impl Worker {
                 .thunks
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match crate::nvn::thunk_in(&thunks, pc) {
+            match crate::nvn::thunk_index(pc).and_then(|index| thunks.get(index).copied()) {
                 Some(name)
                     if name.starts_with("nvnCommandBuffer") || crate::nvn::front_call(name) =>
                 {
-                    name.to_owned()
+                    name
                 }
                 _ => return false,
             }
