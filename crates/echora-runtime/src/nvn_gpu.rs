@@ -5152,6 +5152,10 @@ impl Nvn {
         backend.stat("stat: resident ranges copied back", wanted.len() as u64);
         // Which call site asked (`#[track_caller]` up the resolve chain).
         backend.stat(caller_stat(std::panic::Location::caller()), 1);
+        // Without a range every dirty range of the pools read was copied
+        // back: their lists empty at once (range by range shifted the
+        // whole list each time, hundreds per frame in the forest).
+        let whole = range.is_none();
         for (token, base, piece) in tokens {
             let bytes = completed
                 .remove(&token)
@@ -5160,7 +5164,11 @@ impl Nvn {
                 .write(piece.start, &bytes)
                 .map_err(|trap| format!("resident write-back: {trap:?}"))?;
             if let Some(pool) = self.gpu.as_mut().unwrap().resident.get_mut(&base) {
-                remove_range(&mut pool.gpu_dirty, piece);
+                if whole {
+                    pool.gpu_dirty.clear();
+                } else {
+                    remove_range(&mut pool.gpu_dirty, piece);
+                }
             }
         }
         Ok(())
