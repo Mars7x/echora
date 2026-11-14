@@ -201,9 +201,83 @@ impl<'a> Fp<'a> {
             self.raise(FPSR_OFC | FPSR_IXC);
         }
         if self.mode.fz && self.format.is_denormal(value) {
+            // FPRound with FPCR.FZ: a result below the normal range is a
+            // zero of its sign, and Underflow is raised.
+            self.raise(FPSR_UFC);
             return value & self.format.sign_bit();
         }
         value
+    }
+
+    /// FPRound's underflow, where the unrounded result is nonzero and below
+    /// the normal range (`tiny`): with FPCR.FZ a zero of its sign and UFC;
+    /// otherwise the host's rounded `raw`, with UFC and IXC when it is
+    /// `inexact`. None when the result is not tiny (`output` as usual).
+    fn underflow(&mut self, raw: u64, tiny: bool, inexact: bool) -> Option<u64> {
+        if !tiny {
+            return None;
+        }
+        if self.mode.fz {
+            self.raise(FPSR_UFC);
+            return Some(raw & self.format.sign_bit());
+        }
+        if inexact {
+            self.raise(FPSR_UFC | FPSR_IXC);
+        }
+        Some(raw)
+    }
+
+    /// Whether the product (or with `divide` the quotient) of finite nonzero
+    /// `a` and `b`, rounded by the host to `raw`, is tiny before rounding,
+    /// and whether `raw` is inexact. Single precision is decided exactly in
+    /// double (a product of singles is exact there); double precision from
+    /// `raw` below the normal range, its exactness from a residual.
+    fn tiny_product(&self, divide: bool, a: u64, b: u64, raw: u64) -> (bool, bool) {
+        let format = self.format;
+        if is_zero(format, a)
+            || is_zero(format, b)
+            || !self.is_finite(a)
+            || !self.is_finite(b)
+            || !self.is_finite(raw)
+        {
+            return (false, false);
+        }
+        match self.size {
+            FpSize::S => {
+                let x = f64::from(f32::from_bits(a as u32));
+                let y = f64::from(f32::from_bits(b as u32));
+                let r = f64::from(f32::from_bits(raw as u32));
+                let smallest = f64::from(f32::MIN_POSITIVE);
+                if divide {
+                    (
+                        (x / y).abs() < smallest,
+                        // r * y is exact in double.
+                        r * y != x,
+                    )
+                } else {
+                    let product = x * y;
+                    (product.abs() < smallest, product != r)
+                }
+            }
+            FpSize::D => {
+                if raw & format.exponent_mask() != 0 {
+                    return (false, false);
+                }
+                let (x, y, r) = (f64::from_bits(a), f64::from_bits(b), f64::from_bits(raw));
+                // Scaled by 2^600 (exact, and in range: the result is
+                // tiny), the residual of the rounding is not lost below the
+                // subnormals.
+                let scale = f64::from_bits((1023u64 + 600) << 52);
+                let inexact = r == 0.0
+                    || if divide {
+                        r.fused(y, -x) != 0.0
+                    } else {
+                        let (small, large) = if x.abs() < y.abs() { (x, y) } else { (y, x) };
+                        (small * scale).fused(large, -(r * scale)) != 0.0
+                    };
+                (true, inexact)
+            }
+        }
     }
 
     fn is_finite(&self, value: u64) -> bool {
@@ -594,6 +668,10 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
                     fp.raise(FPSR_DZC);
                 }
                 let raw = native!(size, a, b, |x, y| x / y);
+                let (tiny, inexact) = fp.tiny_product(true, a, b, raw);
+                if let Some(result) = fp.underflow(raw, tiny, inexact) {
+                    return result;
+                }
                 if rounded(format, size, op, a, b, raw) {
                     fp.raise(FPSR_IXC);
                 }
@@ -601,6 +679,10 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             }
             FpBinaryOp::NegMul => {
                 let raw = native!(size, a, b, |x, y| x * y);
+                let (tiny, inexact) = fp.tiny_product(false, a, b, raw);
+                if let Some(result) = fp.underflow(raw, tiny, inexact) {
+                    return result ^ format.sign_bit();
+                }
                 if rounded(format, size, op, a, b, raw) {
                     fp.raise(FPSR_IXC);
                 }
@@ -609,6 +691,10 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             }
             FpBinaryOp::Mul => {
                 let raw = native!(size, a, b, |x, y| x * y);
+                let (tiny, inexact) = fp.tiny_product(false, a, b, raw);
+                if let Some(result) = fp.underflow(raw, tiny, inexact) {
+                    return result;
+                }
                 if rounded(format, size, op, a, b, raw) {
                     fp.raise(FPSR_IXC);
                 }
@@ -737,6 +823,24 @@ fn ternary_lane(fp: &mut Fp<'_>, op: FpTernaryOp, n: u64, m: u64, a: u64) -> u64
                 .fused(f64::from_bits(m), f64::from_bits(a))
                 .to_bits(),
         };
+        // In single precision the product is exact in double and the sum's
+        // rounding error is found exactly (TwoSum), which decides
+        // tininess before rounding and inexactness.
+        if size == FpSize::S && finite {
+            let product = f64::from(f32::from_bits(n as u32)) * f64::from(f32::from_bits(m as u32));
+            let addend = f64::from(f32::from_bits(a as u32));
+            let sum = product + addend;
+            let back = sum - addend;
+            let error = (product - back) + (addend - (sum - back));
+            let tiny = (sum != 0.0 || error != 0.0) && sum.abs() < f64::from(f32::MIN_POSITIVE);
+            let inexact = error != 0.0 || sum != f64::from(f32::from_bits(raw as u32));
+            if let Some(result) = fp.underflow(raw, tiny, inexact) {
+                return result;
+            }
+            if inexact && fp.is_finite(raw) {
+                fp.raise(FPSR_IXC);
+            }
+        }
         fp.output(raw, finite)
     }
 }
@@ -3904,6 +4008,78 @@ mod sticky_inexact_tests {
         let big = u64::from(3.0e38f32.to_bits());
         binary_lane(&mut fp, FpBinaryOp::Add, big, big);
         assert_eq!(cpu.fpsr, FPSR_OFC | FPSR_IXC);
+    }
+
+    /// FPRound's underflow: a tiny inexact result raises UFC and IXC (a
+    /// product of 2^-103 squared rounds to +0); with FPCR.FZ a tiny result
+    /// is a zero of its sign and raises UFC, exact or not (a subnormal
+    /// difference, a quotient, a fused result); an exact subnormal without
+    /// FZ raises nothing.
+    #[test]
+    fn tiny_results_raise_underflow() {
+        let run = |op: FpBinaryOp, a: f32, b: f32, fpcr: u32| {
+            let mut cpu = Cpu {
+                fpcr,
+                ..Cpu::default()
+            };
+            cpu.vectors[1] = u128::from(a.to_bits());
+            cpu.vectors[2] = u128::from(b.to_bits());
+            fp_binary(&mut cpu, op, FpSize::S, 0, 1, 2).unwrap();
+            (cpu.vectors[0] as u32, cpu.fpsr)
+        };
+        let tiny = f32::from_bits(0x0c00_0000);
+        assert_eq!(
+            run(FpBinaryOp::Mul, tiny, tiny, 0),
+            (0, FPSR_UFC | FPSR_IXC)
+        );
+        assert_eq!(
+            run(FpBinaryOp::Mul, -tiny, tiny, FPCR_FZ),
+            (0x8000_0000, FPSR_UFC)
+        );
+        // 2^-140: subnormal and exact.
+        let exact = run(
+            FpBinaryOp::Mul,
+            f32::from_bits(0x0080_0000),
+            2.0f32.powi(-14),
+            0,
+        );
+        assert_eq!(exact, (0x0000_0200, 0));
+        assert_eq!(
+            run(
+                FpBinaryOp::Mul,
+                f32::from_bits(0x0080_0000),
+                2.0f32.powi(-14),
+                FPCR_FZ
+            ),
+            (0, FPSR_UFC)
+        );
+        // A rounded subnormal quotient.
+        assert_eq!(
+            run(FpBinaryOp::Div, f32::from_bits(0x0080_0000), 3.0, 0).1,
+            FPSR_UFC | FPSR_IXC
+        );
+        // An exact subnormal difference: nothing without FZ, UFC with it.
+        let (a, b) = (f32::from_bits(0x0080_0001), f32::from_bits(0x0080_0000));
+        assert_eq!(run(FpBinaryOp::Sub, a, b, 0), (1, 0));
+        assert_eq!(run(FpBinaryOp::Sub, a, b, FPCR_FZ), (0, FPSR_UFC));
+        // A fused result that cancels to a tiny inexact value.
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(tiny.to_bits());
+        cpu.vectors[2] = u128::from(tiny.to_bits());
+        cpu.vectors[3] = 0;
+        fp_ternary(&mut cpu, FpTernaryOp::MulAdd, FpSize::S, 0, 1, 2, 3).unwrap();
+        assert_eq!((cpu.vectors[0] as u32, cpu.fpsr), (0, FPSR_UFC | FPSR_IXC));
+        // Double: a product below the subnormals, and one rounded in them.
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(1.0e-200f64.to_bits());
+        cpu.vectors[2] = u128::from(1.0e-200f64.to_bits());
+        fp_binary(&mut cpu, FpBinaryOp::Mul, FpSize::D, 0, 1, 2).unwrap();
+        assert_eq!((cpu.vectors[0] as u64, cpu.fpsr), (0, FPSR_UFC | FPSR_IXC));
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(f64::MIN_POSITIVE.to_bits());
+        cpu.vectors[2] = u128::from(0.3f64.to_bits());
+        fp_binary(&mut cpu, FpBinaryOp::Mul, FpSize::D, 0, 1, 2).unwrap();
+        assert_eq!(cpu.fpsr, FPSR_UFC | FPSR_IXC);
     }
 
     /// FNMUL negates a NaN result too (FPNeg with FPCR.AH clear).
