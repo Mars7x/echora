@@ -2073,13 +2073,12 @@ impl Nvn {
         for (name, amount) in backend.renderer.take_stats() {
             backend.stat(name, amount);
         }
-        let prefix = format!("BindTexture/{nvn}/");
+        let stage = u64::from(nvn);
         let mut handles: Vec<u64> = self
             .render
-            .state
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(_, bind)| bind.x[3])
+            .bound_textures
+            .range((stage, 0)..=(stage, u64::MAX))
+            .map(|(_, &handle)| handle)
             .collect();
         handles.sort_unstable();
         handles.dedup();

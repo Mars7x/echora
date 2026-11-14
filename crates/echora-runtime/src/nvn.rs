@@ -623,6 +623,10 @@ pub struct RenderState {
     /// programs, state objects, pools, resources). Kept for the host
     /// renderer; nothing consumes it until draws are implemented.
     pub state: FastMap<String, Command>,
+    /// The texture handle bound at each (NVN stage, slot), as `state`
+    /// holds it under `BindTexture/{stage}/{slot}`: draws that read the
+    /// texture pool list a stage's handles without scanning `state`.
+    pub bound_textures: BTreeMap<(u64, u64), u64>,
 }
 
 /// Recorded commands that only change render state (SetRenderTargets,
@@ -4611,6 +4615,11 @@ impl Nvn {
                         if words == 2 {
                             bind.x[4] = value[1];
                         }
+                        if single == "BindTexture" {
+                            self.render
+                                .bound_textures
+                                .insert((command.x[1], slot), value[0]);
+                        }
                         self.render
                             .state
                             .insert(format!("{single}/{}/{slot}", command.x[1]), bind);
@@ -4662,6 +4671,11 @@ impl Nvn {
                         }
                         _ => rest.into(),
                     };
+                    if rest == "BindTexture" {
+                        self.render
+                            .bound_textures
+                            .insert((command.x[1], command.x[2]), command.x[3]);
+                    }
                     self.render.state.insert(key, command.clone());
                     return Ok(());
                 }
