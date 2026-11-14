@@ -26,6 +26,12 @@ pub(super) struct Memory {
     push_constants: Option<u32>,
     shared: Option<u32>,
     local: Option<u32>,
+    /// The page-table cache key of the global address just formed (its
+    /// uniform base register), which `mapped` takes.
+    page_key: Option<u8>,
+    /// Per function and uniform base register: the variables holding the
+    /// last page looked up through that base and its device base.
+    page_cache: std::collections::BTreeMap<(u32, u8), (u32, u32)>,
 }
 
 /// SPIR-V's memory-access operands for an aligned access, and a volatile
@@ -615,7 +621,32 @@ impl Emitter {
             let offset = self.constant64(i64::from(address.offset) as u64);
             sum = self.value(op::I_ADD, u64, &[sum, offset]);
         }
+        // Accesses relative to one uniform base mostly stay in a page: the
+        // lookup of the last such page is kept for them (see `mapped`).
+        self.memory.page_key = address.uniform.map(|(uniform, _)| uniform.0);
         sum
+    }
+
+    /// The variables caching the last page looked up through uniform base
+    /// `key` in the current function and its device base (no page yet:
+    /// u64::MAX, which no page number reaches).
+    fn page_cache(&mut self, key: u8) -> (u32, u32) {
+        let function = self.function.block().0;
+        if let Some(&variables) = self.memory.page_cache.get(&(function, key)) {
+            return variables;
+        }
+        let u64 = self.u64();
+        let pointer = self.module.pointer(storage::FUNCTION, u64);
+        let none = self.constant64(u64::MAX);
+        let zero = self.constant64(0);
+        let page = self
+            .function
+            .variable(&mut self.module, pointer, Some(none));
+        let base = self
+            .function
+            .variable(&mut self.module, pointer, Some(zero));
+        self.memory.page_cache.insert((function, key), (page, base));
+        (page, base)
     }
 
     /// Looks up global address `va` and, where it is mapped and `extra`
@@ -629,6 +660,7 @@ impl Emitter {
         self.memory.physical = true;
         self.module
             .capability(capability::PHYSICAL_STORAGE_BUFFER_ADDRESSES);
+        let key = self.memory.page_key.take();
         let u64 = self.u64();
         let (table, first, count) = self.page_table();
         let shift = self.constant(PAGE_SHIFT);
@@ -640,6 +672,9 @@ impl Emitter {
         let zero = self.constant64(0);
         let bound = self.value(op::I_NOT_EQUAL, self.bool, &[table, zero]);
         let mut inside = self.value(op::LOGICAL_AND, self.bool, &[below, bound]);
+        if let Some(key) = key {
+            return self.mapped_cached(key, va, page, relative, table, inside, extra, access);
+        }
         if let Some(extra) = extra {
             inside = self.value(op::LOGICAL_AND, self.bool, &[inside, extra]);
         }
@@ -657,6 +692,64 @@ impl Emitter {
                 let device = e.value(op::I_ADD, u64, &[base, within]);
                 access(e, device)
             })
+        })
+    }
+
+    /// `mapped` for an address relative to uniform base `key`: the page's
+    /// lookup is reused when the last page looked up through that base is
+    /// the same (it was inside the table and mapped, and the table does
+    /// not change during the program), else made and kept.
+    #[allow(clippy::too_many_arguments)]
+    fn mapped_cached(
+        &mut self,
+        key: u8,
+        va: u32,
+        page: u32,
+        relative: u32,
+        table: u32,
+        inside: u32,
+        extra: Option<u32>,
+        access: impl FnOnce(&mut Self, u32) -> Result<(), Unsupported>,
+    ) -> Result<(), Unsupported> {
+        let u64 = self.u64();
+        let (page_variable, base_variable) = self.page_cache(key);
+        let cached = self.value(op::LOAD, u64, &[page_variable]);
+        let hit = self.value(op::I_EQUAL, self.bool, &[page, cached]);
+        let cached_base = self.value(op::LOAD, u64, &[base_variable]);
+        let zero = self.constant64(0);
+        // The page's device base: the cached one, else the table's entry
+        // where the page is inside the table (0: not mapped).
+        let pointer = self.module.pointer(storage::FUNCTION, u64);
+        let found = self.function.variable(&mut self.module, pointer, None);
+        let first = self.value(op::SELECT, u64, &[hit, cached_base, zero]);
+        self.function.emit(op::STORE, &[found, first]);
+        let miss = self.value(op::LOGICAL_NOT, self.bool, &[hit]);
+        let lookup = self.value(op::LOGICAL_AND, self.bool, &[miss, inside]);
+        self.when(lookup, |e| {
+            let eight = e.constant64(8);
+            let step = e.value(op::I_MUL, u64, &[relative, eight]);
+            let entry = e.value(op::I_ADD, u64, &[table, step]);
+            let pointer = e.module.pointer(storage::PHYSICAL_STORAGE_BUFFER, u64);
+            let entry = e.value(op::CONVERT_U_TO_PTR, pointer, &[entry]);
+            let base = e.value(op::LOAD, u64, &[entry, ALIGNED, 8]);
+            e.function.emit(op::STORE, &[found, base]);
+            let mapped = e.value(op::I_NOT_EQUAL, e.bool, &[base, zero]);
+            e.when(mapped, |e| {
+                e.function.emit(op::STORE, &[page_variable, page]);
+                e.function.emit(op::STORE, &[base_variable, base]);
+                Ok(())
+            })
+        })?;
+        let base = self.value(op::LOAD, u64, &[found]);
+        let mut mapped = self.value(op::I_NOT_EQUAL, self.bool, &[base, zero]);
+        if let Some(extra) = extra {
+            mapped = self.value(op::LOGICAL_AND, self.bool, &[mapped, extra]);
+        }
+        self.when(mapped, |e| {
+            let mask = e.constant64(PAGE_SIZE - 1);
+            let within = e.value(op::BITWISE_AND, u64, &[va, mask]);
+            let device = e.value(op::I_ADD, u64, &[base, within]);
+            access(e, device)
         })
     }
 
