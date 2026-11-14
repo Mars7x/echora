@@ -10,7 +10,10 @@
 //! the CPU); the driver constant buffers 0..2 read as
 //! zeros.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+/// Maps here are keyed by addresses and names looked up on every call: the
+/// fast hasher, not SipHash.
+type HashMap<K, V> = super::FastMap<K, V>;
 use std::sync::Arc;
 
 use echora_gpu::ash::vk;
@@ -213,28 +216,28 @@ impl Backend {
         Ok(Some(Self {
             max_extent: renderer.max_image_extent(),
             renderer,
-            translations: HashMap::new(),
+            translations: HashMap::default(),
             native_programs: Default::default(),
             page_table: None,
             page_build: None,
-            loop_traces: HashMap::new(),
-            vertex_traces: HashMap::new(),
+            loop_traces: HashMap::default(),
+            vertex_traces: HashMap::default(),
             vertex_trace_addresses: Vec::new(),
-            programs: HashMap::new(),
+            programs: HashMap::default(),
             notes: BTreeMap::new(),
             stats: Default::default(),
             traced: 0,
             probed: 0,
-            watched_pixel: HashMap::new(),
+            watched_pixel: HashMap::default(),
             presenter: None,
-            textures: HashMap::new(),
-            texture_checked: HashMap::new(),
-            dirty: HashMap::new(),
-            storage_hashes: HashMap::new(),
-            dense_samples: HashMap::new(),
-            copied_levels: HashMap::new(),
-            shadows: HashMap::new(),
-            shadow_quiet: HashMap::new(),
+            textures: HashMap::default(),
+            texture_checked: HashMap::default(),
+            dirty: HashMap::default(),
+            storage_hashes: HashMap::default(),
+            dense_samples: HashMap::default(),
+            copied_levels: HashMap::default(),
+            shadows: HashMap::default(),
+            shadow_quiet: HashMap::default(),
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             gpu_writes: 0,
@@ -243,13 +246,13 @@ impl Backend {
             observable_serial: 0,
             observable_marker: None,
             page_table_wrote: false,
-            resident: HashMap::new(),
+            resident: HashMap::default(),
             samples_reports: std::collections::HashSet::new(),
-            shared_pools: HashMap::new(),
-            shared_pieces: HashMap::new(),
+            shared_pools: HashMap::default(),
+            shared_pieces: HashMap::default(),
             share_generation: 0,
-            target_index: HashMap::new(),
-            target_levels: HashMap::new(),
+            target_index: HashMap::default(),
+            target_levels: HashMap::default(),
             target_index_stamp: None,
         }))
     }
@@ -1540,7 +1543,7 @@ impl Nvn {
             .map(|command| command.states.clone());
         let stamp = (self.presented_frames, self.flush_epoch);
         if self.program_memo.0 != stamp {
-            self.program_memo = (stamp, HashMap::new());
+            self.program_memo = (stamp, HashMap::default());
         }
         let key = bind(0).zip(bind(1));
         if let Some(key) = key
@@ -1645,7 +1648,7 @@ impl Nvn {
         binds.sort_unstable();
         let stamp = (self.presented_frames, self.flush_epoch);
         if self.mesh_program_memo.0 != stamp {
-            self.mesh_program_memo = (stamp, HashMap::new());
+            self.mesh_program_memo = (stamp, HashMap::default());
         }
         if let Some(found) = self.mesh_program_memo.1.get(&binds) {
             return Ok(found.clone());
@@ -2440,8 +2443,8 @@ impl Nvn {
         let Some(backend) = self.gpu.as_ref() else {
             return;
         };
-        let mut index: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>> = HashMap::new();
+        let mut index: HashMap<u64, Vec<u64>> = HashMap::default();
+        let mut levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>> = HashMap::default();
         for key in backend.renderer.target_keys() {
             let base = self.texture_storage(key);
             if let Some(base) = base {
@@ -3771,7 +3774,7 @@ impl Nvn {
             );
         }
         if self.target_shapes.0 != self.texture_epoch {
-            self.target_shapes = (self.texture_epoch, HashMap::new());
+            self.target_shapes = (self.texture_epoch, HashMap::default());
         }
         let (width, height, format, levels, shape) = match self.target_shapes.1.get(&texture) {
             Some(known) => *known,
@@ -4153,17 +4156,17 @@ impl Nvn {
                 }
             }
         }
-        let mut storage = HashMap::new();
-        let mut storage_in_place = HashMap::new();
+        let mut storage = std::collections::HashMap::new();
+        let mut storage_in_place = std::collections::HashMap::new();
         // Each storage binding's GPU range (ECHORA_DUMP_DISPATCH).
         let mut storage_ranges = Vec::new();
         let mut written_back = Vec::new();
-        let mut uniforms = HashMap::new();
-        let mut textures = HashMap::new();
-        let mut images = HashMap::new();
+        let mut uniforms = std::collections::HashMap::new();
+        let mut textures = std::collections::HashMap::new();
+        let mut images = std::collections::HashMap::new();
         // The view formats images are written through (see
         // `Dispatch::image_formats`).
-        let mut image_formats = HashMap::new();
+        let mut image_formats = std::collections::HashMap::new();
         for descriptor in &stage.descriptors {
             let entry = descriptor.cbuf_offset as usize;
             match descriptor.kind() {
@@ -5344,7 +5347,7 @@ impl Nvn {
             self.gpu.as_mut().unwrap().stat(reason, 1);
         }
         let previous = previous.filter(|_| whole.is_none());
-        let mut built_pools = HashMap::new();
+        let mut built_pools = HashMap::default();
         let mut entries = match previous {
             Some(built) => {
                 built_pools = built.pools;
@@ -5645,13 +5648,13 @@ impl Nvn {
     /// behind it of every pool the dispatch can name (one its constant
     /// buffers hold an address in).
     #[allow(clippy::too_many_arguments)]
-    fn dump_dispatch(
+    fn dump_dispatch<S: std::hash::BuildHasher>(
         &self,
         core: &Guest,
         key: u64,
         stage: &Translated,
         groups: [u32; 3],
-        uniforms: &HashMap<u32, Vec<u8>>,
+        uniforms: &std::collections::HashMap<u32, Vec<u8>, S>,
         storage: &[(u32, u64, u64)],
         page_table: echora_shader_abi::PageTable,
     ) -> Result<(), String> {
@@ -7265,7 +7268,7 @@ impl Nvn {
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
         // address, by (stage index, binding).
-        let mut storage_written = HashMap::new();
+        let mut storage_written = HashMap::default();
         // Driver constant entries of bound storage buffers: (stage index,
         // c0 offset, GPU address, size).
         let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
@@ -7905,7 +7908,7 @@ impl Nvn {
         // reads is not read, and a stride-0 one (the same element for every
         // vertex) only that far, not its whole buffer (full-screen passes
         // bound megabytes for three vertices).
-        let mut needed: HashMap<u32, u64> = HashMap::new();
+        let mut needed: HashMap<u32, u64> = HashMap::default();
         for attribute in &attributes {
             let size = attribute_format_size(attribute.format);
             let end = u64::from(attribute.offset) + size;
@@ -9222,7 +9225,7 @@ impl ResidentPool {
 fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str {
     thread_local! {
         static NAMES: std::cell::RefCell<HashMap<(&'static str, u32), &'static str>> =
-            std::cell::RefCell::new(HashMap::new());
+            std::cell::RefCell::new(HashMap::default());
     }
     NAMES.with(|names| {
         *names
@@ -9620,7 +9623,7 @@ fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, Strin
 fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'static str {
     thread_local! {
         static KEYS: std::cell::RefCell<
-            HashMap<(usize, Option<u64>, u64), &'static str, std::hash::BuildHasherDefault<super::FastHasher>>,
+            HashMap<(usize, Option<u64>, u64), &'static str>,
         > = std::cell::RefCell::new(HashMap::default());
     }
     KEYS.with(|keys| {

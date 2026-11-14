@@ -115,7 +115,10 @@ impl GuestMemory<'_> {
     }
 }
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+/// Maps here are keyed by addresses and names looked up on every call: the
+/// fast hasher, not SipHash.
+type HashMap<K, V> = FastMap<K, V>;
 
 /// Exports replaced by host functions, resolved by symbol name in whichever
 /// loaded module defines them. Shared by the lifter (which leaves these
@@ -321,7 +324,7 @@ impl FastHasher {
 }
 
 /// A HashMap with [`FastHasher`].
-pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
 pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FastHasher>>;
 
 /// A texture handle resolved for a draw: what it samples and how.
