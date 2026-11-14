@@ -766,6 +766,7 @@ impl Nvn {
             self.render_queue = capture.render_queue;
             self.bump_binding_serial("stat: binding serial by a restored capture");
             let mut failed = None;
+            let started = std::time::Instant::now();
             for (queue, command) in &capture.commands {
                 if let Some(queue) = *queue {
                     self.switch_render_queue(queue);
@@ -775,9 +776,25 @@ impl Nvn {
                     break;
                 }
             }
+            let replayed = started.elapsed();
             let image = if self.gpu().is_some() {
                 self.gpu_submit()?;
-                self.gpu_read_back(texture)?
+                let finished = started.elapsed();
+                // The replay's times, for comparing builds on one frame:
+                // its commands, and those with the GPU's work finished.
+                let _ = std::fs::write(
+                    directory.join(format!("replay-{name}.txt")),
+                    format!(
+                        "commands_us {} finished_us {}\n",
+                        replayed.as_micros(),
+                        finished.as_micros()
+                    ),
+                );
+                if debug_var_os("ECHORA_REPLAY_NO_IMAGE").is_some() {
+                    None
+                } else {
+                    self.gpu_read_back(texture)?
+                }
             } else {
                 None
             };
