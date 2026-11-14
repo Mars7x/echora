@@ -979,6 +979,8 @@ type Bags = std::sync::Arc<std::sync::RwLock<BTreeMap<u64, Bag>>>;
 #[derive(Debug, Default)]
 pub struct Recording {
     commands: Vec<Command>,
+    /// Set by EndRecording: a recorder's cached handle to it is stale.
+    ended: bool,
     command_memory: u64,
 }
 
@@ -1189,13 +1191,34 @@ impl Recorder {
             return Ok(false);
         }
         let this = core.cpu.regs[0];
-        let recording = read_shared(&self.recordings).get(&this).cloned();
-        let Some(recording) = recording else {
-            return Ok(false);
+        // The command buffer this thread recorded into last, kept so most
+        // commands skip the shared map's lock; a recording that ended
+        // (EndRecording marks it) is looked up again.
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::Mutex<Recording>>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let cached = LAST.with(|last| {
+            last.borrow()
+                .as_ref()
+                .filter(|(buffer, _)| *buffer == this)
+                .map(|(_, recording)| recording.clone())
+        });
+        let recording = match cached {
+            Some(recording) if !lock_shared(&recording).ended => recording,
+            _ => {
+                let Some(recording) = read_shared(&self.recordings).get(&this).cloned() else {
+                    return Ok(false);
+                };
+                LAST.with(|last| *last.borrow_mut() = Some((this, recording.clone())));
+                recording
+            }
         };
         let mut recording = lock_shared(&recording);
-        let bags = read_shared(&self.bags);
-        record_command(name, rest, core, &bags, &mut recording, None)?;
+        if recording.ended {
+            return Ok(false);
+        }
+        record_command(name, rest, core, &self.bags, &mut recording, None)?;
         Ok(true)
     }
 }
@@ -2300,7 +2323,11 @@ impl Nvn {
                 let recording = write_shared(&self.recording)
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
-                let commands = std::mem::take(&mut lock_shared(&recording).commands);
+                let commands = {
+                    let mut recording = lock_shared(&recording);
+                    recording.ended = true;
+                    std::mem::take(&mut recording.commands)
+                };
                 if !commands.is_empty() {
                     self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
                 }
@@ -2980,7 +3007,10 @@ impl Nvn {
                 self.memory_pools.remove(&this);
                 self.object_generation += 1;
                 self.images.remove(&this);
-                write_shared(&self.recording).remove(&this);
+                if let Some(recording) = write_shared(&self.recording).remove(&this) {
+                    // A recorder's cached handle to it is stale now.
+                    lock_shared(&recording).ended = true;
+                }
                 return Ok(true);
             }
             // nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*) ->
@@ -3237,12 +3267,11 @@ impl Nvn {
                 let flow = debug_var_os("ECHORA_GPU_FLOW").is_some();
                 {
                     let mut recording = lock_shared(&recording);
-                    let bags = read_shared(&self.bags);
                     record_command(
                         intern(name),
                         rest,
                         core,
-                        &bags,
+                        &self.bags,
                         &mut recording,
                         flow.then_some(&mut notes),
                     )?;
@@ -5847,7 +5876,7 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     Some(tag)
 }
 
-fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Command) {
+fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
     let Some(kind) = command
         .name
         .strip_prefix("nvnCommandBufferBind")
@@ -5879,7 +5908,7 @@ fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Comman
             command.states = snapshot;
             return;
         }
-        let mut props = bags
+        let mut props = read_shared(bags)
             .get(&base)
             .filter(|bag| bag.kind == kind)
             .map(|bag| bag.props.clone())
@@ -5895,7 +5924,8 @@ fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Comman
         return;
     }
     command.states = std::sync::Arc::new(
-        bags.range(base..)
+        read_shared(bags)
+            .range(base..)
             .filter(|(_, bag)| bag.kind == kind)
             .take(count)
             .map(|(address, bag)| {
@@ -6183,7 +6213,7 @@ fn record_command(
     name: &'static str,
     rest: &str,
     core: &mut Guest,
-    bags: &BTreeMap<u64, Bag>,
+    bags: &Bags,
     recording: &mut Recording,
     mut notes: Option<&mut Vec<String>>,
 ) -> Result<(), Trap> {
@@ -6235,7 +6265,7 @@ fn record_command(
     }
     snapshot_states(bags, core, &mut command);
     if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
-        let view = bag_in(bags, command.x[3], "TextureView").map_err(invalid)?;
+        let view = bag_in(&read_shared(bags), command.x[3], "TextureView").map_err(invalid)?;
         for (index, key) in ["Levels", "Layers"].iter().enumerate() {
             command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
         }
@@ -6244,7 +6274,7 @@ fn record_command(
         let bases = if command.x[2] == 0 {
             [0, 0]
         } else {
-            let view = bag_in(bags, command.x[2], "TextureView").map_err(invalid)?;
+            let view = bag_in(&read_shared(bags), command.x[2], "TextureView").map_err(invalid)?;
             ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
         };
         command.captured.extend(bases);
@@ -6256,7 +6286,7 @@ fn record_command(
             let bases = if view == 0 {
                 [0, 0]
             } else {
-                let view = bag_in(bags, view, "TextureView").map_err(invalid)?;
+                let view = bag_in(&read_shared(bags), view, "TextureView").map_err(invalid)?;
                 ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
             };
             command.captured.extend(bases);
@@ -6274,7 +6304,7 @@ fn record_command(
         let mut formats = vec![0; count];
         for (index, view) in views.iter_mut().enumerate() {
             if *view != 0 {
-                let bag = bag_in(bags, *view, "TextureView").map_err(invalid)?;
+                let bag = bag_in(&read_shared(bags), *view, "TextureView").map_err(invalid)?;
                 if let (Some(format), Some(slot)) = (bag.get("Format"), formats.get_mut(index)) {
                     *slot = format.x[0];
                 }
