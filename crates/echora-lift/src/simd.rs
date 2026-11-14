@@ -2726,6 +2726,50 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
                 "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let _ = (n, v); m.cpu.vectors[{rd}] = {value}; }}"
             ))
         }
+        // FCMEQ, FCMGE, FCMGT, FCMLE, FCMLT against zero of normal-or-zero
+        // lanes: exact and raising nothing (a NaN or, under FZ, a denormal
+        // goes to the helper), as the register compares.
+        SimdOp::VecFpUnary {
+            op:
+                unary @ (VecFpUnaryOp::CmEqZero
+                | VecFpUnaryOp::CmGeZero
+                | VecFpUnaryOp::CmGtZero
+                | VecFpUnaryOp::CmLeZero
+                | VecFpUnaryOp::CmLtZero),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            ..
+        } if scalar || q || size == FpSize::S => {
+            let (float, int, width, kit) = float_kit(size);
+            let lanes = if scalar {
+                1
+            } else if q {
+                128 / width
+            } else {
+                64 / width
+            };
+            let test = match unary {
+                VecFpUnaryOp::CmEqZero => "==",
+                VecFpUnaryOp::CmGeZero => ">=",
+                VecFpUnaryOp::CmGtZero => ">",
+                VecFpUnaryOp::CmLeZero => "<=",
+                _ => "<",
+            };
+            let call = emit_call(op)?;
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; {kit} \
+                 let mut fast = {FP_MODE}; let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; \
+                 fast &= usable(x); \
+                 let hit = {float}::from_bits(x) {test} 0.0; \
+                 out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }} \
+                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            ))
+        }
         // Vector FABS / FNEG: the sign bits, natively unless FPCR.AH (its
         // NaN handling leaves a NaN's sign) asks for the helper.
         SimdOp::VecFpUnary {
