@@ -171,3 +171,16 @@ mod unix {
         }
     }
 }
+
+/// Timed waits on this thread end close to their deadline: Linux lets a
+/// thread's sleeps run up to 50 us late by default, so a guest's 20 us
+/// SleepThread (games poll with them) took about 45, where the console
+/// sleeps for close to what was asked.
+pub(crate) fn precise_timers() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_SET_TIMERSLACK takes the slack in nanoseconds and affects
+    // only the calling thread.
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong, 0, 0, 0);
+    }
+}

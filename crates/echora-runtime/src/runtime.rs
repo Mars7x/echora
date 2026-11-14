@@ -4966,6 +4966,7 @@ fn locked_nvn_call(name: &str) -> bool {
 fn replay_thread(shared: &Shared, mut core: Core) {
     use std::sync::atomic::Ordering;
     let _watch = crate::fault::watch(&core);
+    crate::fault::precise_timers();
     let mut handed = std::time::Duration::ZERO;
     while !shared.stop.load(Ordering::Acquire) {
         let asked = std::time::Instant::now();
@@ -5102,6 +5103,7 @@ impl Worker {
     ) -> (Core, Option<Trap>) {
         use std::sync::atomic::Ordering;
         let _watch = crate::fault::watch(&self.core);
+        crate::fault::precise_timers();
         loop {
             if self.active {
                 let ran = std::time::Instant::now();
