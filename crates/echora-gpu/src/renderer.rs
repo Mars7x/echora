@@ -390,6 +390,13 @@ struct Slot {
 /// before it.
 pub(crate) const SLOTS: usize = 6;
 
+/// Draws and dispatches a submission holds by default (ECHORA_SUBMIT_ITEMS):
+/// small enough that the GPU starts a frame's work while the replay is still
+/// recording it (a whole forest frame in one submission left the GPU idle
+/// until the replay was done: 8.2 presents/s, 10.5 with 200), large enough
+/// that submissions (about a millisecond each) stay few.
+const SUBMIT_ITEMS: u32 = 200;
+
 /// Draws and dispatches one submission may hold (see `bound_submission`).
 const MAX_WORK_ITEMS: u32 = 1000;
 
@@ -3487,7 +3494,7 @@ impl Renderer {
             std::env::var("ECHORA_SUBMIT_ITEMS")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(MAX_WORK_ITEMS)
+                .unwrap_or(SUBMIT_ITEMS)
                 .clamp(1, MAX_WORK_ITEMS)
         });
         if self.work_items >= limit {
