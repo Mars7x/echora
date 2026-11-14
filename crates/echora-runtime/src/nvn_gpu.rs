@@ -7271,6 +7271,27 @@ impl Nvn {
                             self.presented_frames,
                         );
                         if self.binding_memo.0 != stamp {
+                            let old = self.binding_memo.0;
+                            let backend = self.gpu.as_mut().unwrap();
+                            for (changed, name) in [
+                                (
+                                    old.0 != stamp.0,
+                                    "stat: binding memo resets by texture epoch",
+                                ),
+                                (
+                                    old.1 != stamp.1,
+                                    "stat: binding memo resets by target changes",
+                                ),
+                                (
+                                    old.2 != stamp.2,
+                                    "stat: binding memo resets by binding serial",
+                                ),
+                                (old.3 != stamp.3, "stat: binding memo resets by present"),
+                            ] {
+                                if changed {
+                                    backend.stat(name, 1);
+                                }
+                            }
                             self.binding_memo = (stamp, Default::default());
                         }
                         if let Some((source, sampler)) = self.binding_memo.1.get(&handle) {
