@@ -538,11 +538,14 @@ pub struct Nvn {
     /// texture and sampler pools.
     #[serde(skip)]
     queue_memos: HashMap<u64, ((u64, u64, u64, u64), FastMap<u64, ResolvedBinding>)>,
-    /// Bumped whenever a stage's texture pool entries may change other
-    /// than through the memo stamp: a texture bind, a descriptor
-    /// registration, a render queue switch (`pool_entry_cache`).
+    /// Bumped whenever texture pool entries may change other than through
+    /// the memo stamp and the stage's binds: a descriptor registration, a
+    /// render queue switch (`pool_entry_cache`).
     #[serde(skip)]
     pool_inputs: u64,
+    /// Texture binds that changed a stage's bound handle, by NVN stage.
+    #[serde(skip)]
+    stage_binds: FastMap<u64, u64>,
     /// Each NVN stage's texture pool entries, kept while their memo stamp,
     /// GPU write generation and `pool_inputs` hold: draws share one list,
     /// which the renderer knows unchanged without comparing.
@@ -550,7 +553,7 @@ pub struct Nvn {
     pool_entry_cache: FastMap<
         u32,
         (
-            ((u64, u64, u64, u64), u64, u64),
+            ((u64, u64, u64, u64), u64, u64, u64),
             std::sync::Arc<[echora_gpu::pool::PoolEntry]>,
         ),
     >,
@@ -4788,11 +4791,14 @@ impl Nvn {
                         if words == 2 {
                             bind.x[4] = value[1];
                         }
-                        if single == "BindTexture" {
-                            self.render
+                        if single == "BindTexture"
+                            && self
+                                .render
                                 .bound_textures
-                                .insert((command.x[1], slot), value[0]);
-                            self.pool_inputs += 1;
+                                .insert((command.x[1], slot), value[0])
+                                != Some(value[0])
+                        {
+                            *self.stage_binds.entry(command.x[1]).or_default() += 1;
                         }
                         self.render
                             .state
@@ -4845,11 +4851,14 @@ impl Nvn {
                         }
                         _ => rest.into(),
                     };
-                    if rest == "BindTexture" {
-                        self.render
+                    if rest == "BindTexture"
+                        && self
+                            .render
                             .bound_textures
-                            .insert((command.x[1], command.x[2]), command.x[3]);
-                        self.pool_inputs += 1;
+                            .insert((command.x[1], command.x[2]), command.x[3])
+                            != Some(command.x[3])
+                    {
+                        *self.stage_binds.entry(command.x[1]).or_default() += 1;
                     }
                     self.render.state.insert(key, command.clone());
                     return Ok(());

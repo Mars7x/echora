@@ -2105,6 +2105,7 @@ impl Nvn {
             ),
             self.gpu_writes_now(),
             self.pool_inputs,
+            self.stage_binds.get(&u64::from(nvn)).copied().unwrap_or(0),
         );
         if let Some((cached, list)) = self.pool_entry_cache.get(&nvn)
             && *cached == key
@@ -2191,6 +2192,7 @@ impl Nvn {
             ),
             self.gpu_writes_now(),
             self.pool_inputs,
+            self.stage_binds.get(&u64::from(nvn)).copied().unwrap_or(0),
         );
         self.pool_entry_cache.insert(nvn, (key, list.clone()));
         Ok(list)
