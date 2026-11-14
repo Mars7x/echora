@@ -1654,12 +1654,46 @@ impl RegisterLocals {
         text
     }
 
+    /// `store`, of only the locals in `dirty` (FPCR and FPSR as `store`).
+    fn store_dirty(&self, dirty: Dirty) -> String {
+        let mut text = String::new();
+        for index in &self.written {
+            if dirty & 1 << index != 0 {
+                write!(text, "    m.cpu.regs[{index}] = r.x{index};").unwrap();
+            }
+        }
+        if self.sp_written && dirty & DIRTY_SP != 0 {
+            text.push_str("    m.cpu.sp = r.sp;");
+        }
+        if self.flags && dirty & DIRTY_NZCV != 0 {
+            text.push_str("    m.cpu.nzcv = r.fl.nzcv;");
+        }
+        text.push_str(&self.store_fp_status());
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text
+    }
+
+    /// The window's match arms with guest state in locals: each line's
+    /// `Core` registers, SP and NZCV become the locals, and every call,
+    /// helper or flag helper that runs on the `Core` gets the locals
+    /// stored before and reloaded after. Only locals possibly written
+    /// since they last equalled the `Core` are stored (`Dirty`): a local
+    /// that was not still holds the `Core`'s value. That is tracked
+    /// forward through each arm, from the union over every arm's end (the
+    /// arms follow one another through the window's loop) and the window's
+    /// entry (all equal); a store or reload at an arm's top level leaves
+    /// every local equal on all paths past it, one in a nested branch
+    /// changes nothing (a conservative superset). Arms with their own
+    /// loops or jumps (structured emission) store every written local, as
+    /// a linear walk does not see their back edges.
     fn rewrite(&self, cases: &str) -> String {
-        let store = self.store().replace('\n', " ");
-        let reload = self.reload();
-        let mut text = String::with_capacity(cases.len());
         let fp_status = self.fpcr.0 || self.fpsr.0;
         let (store_fp, reload_fp) = (self.store_fp_status(), self.reload_fp_status());
+        let mut pieces = Vec::new();
+        let mut depth = 0usize;
+        let mut tracked = true;
         for line in cases.lines() {
             let mut line = line.replace("m.cpu.regs[", "x[");
             if fp_status {
@@ -1672,51 +1706,404 @@ impl RegisterLocals {
                 line = line.replace(&format!("x[{index}]"), &format!("r.x{index}"));
             }
             let mut line = replace_sp(&line);
-            if self.flags {
+            let before = depth;
+            let code = without_strings(&line);
+            depth = (depth + code.matches('{').count())
+                .checked_sub(code.matches('}').count())
+                .expect("balanced braces");
+            if code.contains("loop {") || code.contains("continue") || code.contains("break") {
+                tracked = false;
+            }
+            let indent = line[..line.len() - line.trim_start().len()].to_owned();
+            let kind = if self.flags {
                 line = line.replace("m.cpu.nzcv", "r.fl.nzcv");
                 for operation in FLAG_OPERATIONS {
                     line =
                         line.replace(&format!("m.cpu.{operation}"), &format!("r.fl.{operation}"));
                 }
-                if USES_FLAGS.iter().any(|helper| line.contains(helper)) {
-                    let indent = &line[..line.len() - line.trim_start().len()];
-                    writeln!(
-                        text,
-                        "{indent}m.cpu.nzcv = r.fl.nzcv;\n{line}\n{indent}r.fl.nzcv = m.cpu.nzcv;"
-                    )
-                    .unwrap();
-                    continue;
+                USES_FLAGS
+                    .iter()
+                    .any(|helper| line.contains(helper))
+                    .then_some(Kind::Flags)
+            } else {
+                None
+            };
+            let kind = kind.unwrap_or_else(|| {
+                if let Some((rest, call)) = CALL_PREFIXES.iter().find_map(|(prefix, call)| {
+                    Some((line.trim_start().strip_prefix(prefix)?, call))
+                }) {
+                    let arguments = rest[..rest.find(')').expect("call target")].to_owned();
+                    return Kind::Call(call, arguments);
                 }
+                let reads = READS_REGISTERS.iter().any(|helper| line.contains(helper));
+                let writes = WRITES_REGISTERS.iter().any(|helper| line.contains(helper));
+                match (reads, writes) {
+                    (_, true) => Kind::Helper { reload: true },
+                    (true, false) => Kind::Helper { reload: false },
+                    _ => Kind::Plain,
+                }
+            });
+            let writes = local_writes(&line);
+            pieces.push(Piece {
+                indent,
+                line,
+                kind,
+                before,
+                after: depth,
+                writes,
+            });
+        }
+        // Each arm's state on entry: the union of the states its
+        // predecessors set `next_pc` to it with (a successor that is not a
+        // constant may be any arm), to a fixed point; entering the window
+        // leaves every local equal to the `Core`.
+        let labels: Vec<Option<u64>> = pieces
+            .iter()
+            .filter(|piece| piece.before == 0 && piece.after > 0)
+            .map(|piece| arm_label(&piece.line))
+            .collect();
+        let precise = tracked && labels.iter().all(Option::is_some);
+        let arms: BTreeMap<u64, usize> = labels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, label)| Some(((*label)?, index)))
+            .collect();
+        let mut heads = Heads {
+            arms: vec![if tracked { 0 } else { Dirty::MAX }; labels.len()],
+            any: if tracked { 0 } else { Dirty::MAX },
+        };
+        loop {
+            let next = self.walk(&pieces, &heads, precise.then_some(&arms), None);
+            let grown = next.any & !heads.any != 0
+                || next.arms.iter().zip(&heads.arms).any(|(n, h)| n & !h != 0);
+            if !grown {
+                break;
             }
-            let indent = &line[..line.len() - line.trim_start().len()];
-            if let Some((rest, call)) = CALL_PREFIXES
-                .iter()
-                .find_map(|(prefix, call)| Some((line.trim_start().strip_prefix(prefix)?, call)))
-            {
-                // The callee runs on the Core: store before, reload after
-                // (also on its error path, so the final store keeps what
-                // the callee left).
-                let arguments = &rest[..rest.find(')').expect("call target")];
-                writeln!(
-                    text,
-                    "{indent}{store}let called = {call}{arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
-                )
-                .unwrap();
-                continue;
-            }
-            let reads = READS_REGISTERS.iter().any(|helper| line.contains(helper));
-            let writes = WRITES_REGISTERS.iter().any(|helper| line.contains(helper));
-            if reads || writes {
-                writeln!(text, "{indent}{store}").unwrap();
-            }
-            text.push_str(&line);
-            text.push('\n');
-            if writes {
-                writeln!(text, "{indent}{reload}").unwrap();
+            heads.any |= next.any;
+            for (head, n) in heads.arms.iter_mut().zip(&next.arms) {
+                *head |= n;
             }
         }
-        text
+        if !tracked {
+            heads.any = Dirty::MAX;
+        }
+        let mut text = String::with_capacity(cases.len());
+        self.walk(&pieces, &heads, precise.then_some(&arms), Some(&mut text));
+        without_overwritten_pc(&text)
     }
+
+    /// One pass over the arms, each from its entry state in `heads`: the
+    /// states the arms hand on (to each arm, and to any arm), and with
+    /// `out` the arms written with their stores. Without `arms` (the arm
+    /// of each PC), every arm's successors may be any arm.
+    fn walk(
+        &self,
+        pieces: &[Piece],
+        heads: &Heads,
+        arms: Option<&BTreeMap<u64, usize>>,
+        mut out: Option<&mut String>,
+    ) -> Heads {
+        let reload = self.reload();
+        let tracked = heads.any != Dirty::MAX;
+        let mut next = Heads {
+            arms: vec![0; heads.arms.len()],
+            any: 0,
+        };
+        let mut state: Dirty = 0;
+        let mut arm = 0usize;
+        let mut started = false;
+        let mut assigns = false;
+        // Whether the arm's last top-level line returns: its end is not
+        // reached.
+        let mut returns = false;
+        for piece in pieces {
+            if piece.before == 0 {
+                if piece.after > 0 {
+                    if started {
+                        arm += 1;
+                    }
+                    started = true;
+                    assigns = false;
+                    returns = false;
+                    state = heads.arms[arm] | heads.any;
+                } else {
+                    state = 0;
+                }
+            }
+            // Past a store (and reload) at an arm's top level every local
+            // equals the `Core` on all paths.
+            let top = tracked && piece.before == 1;
+            let indent = &piece.indent;
+            let line = &piece.line;
+            match &piece.kind {
+                Kind::Plain => {
+                    if let Some(out) = out.as_deref_mut() {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    state |= piece.writes;
+                }
+                Kind::Flags => {
+                    if let Some(out) = out.as_deref_mut() {
+                        writeln!(
+                            out,
+                            "{indent}m.cpu.nzcv = r.fl.nzcv;\n{line}\n{indent}r.fl.nzcv = m.cpu.nzcv;"
+                        )
+                        .unwrap();
+                    }
+                    state |= piece.writes;
+                    if top {
+                        state &= !DIRTY_NZCV;
+                    }
+                }
+                Kind::Call(call, arguments) => {
+                    // The callee runs on the Core: store before, reload
+                    // after (also on its error path, so the final store
+                    // keeps what the callee left).
+                    if let Some(out) = out.as_deref_mut() {
+                        let store = self.store_dirty(state);
+                        writeln!(
+                            out,
+                            "{indent}{store}let called = {call}{arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                        )
+                        .unwrap();
+                    }
+                    if top {
+                        state = 0;
+                    }
+                }
+                Kind::Helper { reload: reloads } => {
+                    if let Some(out) = out.as_deref_mut() {
+                        writeln!(out, "{indent}{}", self.store_dirty(state)).unwrap();
+                        out.push_str(line);
+                        out.push('\n');
+                        if *reloads {
+                            writeln!(out, "{indent}{reload}").unwrap();
+                        }
+                    }
+                    if top {
+                        state = 0;
+                    }
+                    if !(top && *reloads) {
+                        state |= piece.writes;
+                    }
+                }
+            }
+            if !tracked {
+                state = Dirty::MAX;
+            }
+            if piece.before > 0 {
+                if let Some(rest) = line.trim().strip_prefix("next_pc = ") {
+                    assigns = true;
+                    match (arms, successors(rest)) {
+                        (Some(arms), Some(targets)) => {
+                            for target in targets {
+                                // A PC outside the window leaves it.
+                                if let Some(&to) = arms.get(&target) {
+                                    next.arms[to] |= state;
+                                }
+                            }
+                        }
+                        _ => next.any |= state,
+                    }
+                }
+                if piece.before == 1 && piece.after == 1 {
+                    returns = line.trim().starts_with("return ");
+                }
+                // An arm whose end is reached without setting `next_pc`
+                // runs itself again.
+                if piece.after == 0 && !assigns && !returns {
+                    next.any |= state;
+                }
+            }
+        }
+        next
+    }
+}
+
+/// Entry states of a window's arms (`RegisterLocals::walk`): per arm, and
+/// for every arm.
+struct Heads {
+    arms: Vec<Dirty>,
+    any: Dirty,
+}
+
+/// The PC of an arm's first line (`0x1000 => {`).
+fn arm_label(line: &str) -> Option<u64> {
+    let label = line.trim().strip_suffix(" => {")?.strip_prefix("0x")?;
+    u64::from_str_radix(label, 16).ok()
+}
+
+/// The constant PCs a `next_pc = ...;` assignment (after the `=`) can set:
+/// a constant, or either side of a two-way conditional; None for anything
+/// else.
+fn successors(rest: &str) -> Option<Vec<u64>> {
+    let hex = |text: &str| u64::from_str_radix(text.trim().strip_prefix("0x")?, 16).ok();
+    let rest = rest.strip_suffix(';')?;
+    if let Some(value) = hex(rest) {
+        return Some(vec![value]);
+    }
+    let body = rest.strip_prefix("if ")?.strip_suffix(" }")?;
+    let (head, other) = body.rsplit_once(" } else { ")?;
+    let (_, taken) = head.rsplit_once(" { ")?;
+    Some(vec![hex(taken)?, hex(other)?])
+}
+
+/// Guest state a window's locals may hold that the `Core` does not:
+/// general register n at bit n, SP and NZCV above.
+type Dirty = u64;
+const DIRTY_SP: Dirty = 1 << 32;
+const DIRTY_NZCV: Dirty = 1 << 33;
+
+/// What a line of a window's arms does with the `Core`.
+enum Kind {
+    Plain,
+    /// A helper reading or writing NZCV in the `Core`.
+    Flags,
+    /// A call into other windows: the `Core` method and its arguments.
+    Call(&'static str, String),
+    /// A helper reading general registers in the `Core`, and writing them
+    /// with `reload`.
+    Helper {
+        reload: bool,
+    },
+}
+
+/// A line of a window's arms (`RegisterLocals::rewrite`), with its brace
+/// depth before and after and the locals it assigns.
+struct Piece {
+    indent: String,
+    line: String,
+    kind: Kind,
+    before: usize,
+    after: usize,
+    writes: Dirty,
+}
+
+/// The locals a rewritten line assigns: `r.xN = `, `r.sp = `, and NZCV
+/// through `r.fl` (any flag operation but `condition`, which reads it).
+fn local_writes(line: &str) -> Dirty {
+    let mut dirty = 0;
+    for (at, _) in line.match_indices("r.x") {
+        let rest = &line[at + 3..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 || at > 0 && line[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let index: u32 = rest[..digits].parse().expect("register digits");
+        if RegisterLocals::assigned(&rest[digits..])
+            || rest[digits..].trim_start().starts_with("+=")
+        {
+            dirty |= 1 << index;
+        }
+    }
+    if line
+        .match_indices("r.sp")
+        .any(|(at, _)| RegisterLocals::assigned(&line[at + 4..]))
+    {
+        dirty |= DIRTY_SP;
+    }
+    if line.contains("r.fl.nzcv = ")
+        || line
+            .match_indices("r.fl.")
+            .any(|(at, _)| sets_flags(&line[at + 5..]))
+    {
+        dirty |= DIRTY_NZCV;
+    }
+    if line.contains("&mut r") {
+        dirty = Dirty::MAX;
+    }
+    dirty
+}
+
+/// Whether the `Flags` method call at the start of `call` (after `r.fl.`)
+/// may write NZCV: any but `condition`, and ADD/SUB and add-with-carry
+/// whose last argument (whether to set the flags) is not `false`.
+fn sets_flags(call: &str) -> bool {
+    if call.starts_with("condition(") || call.starts_with("nzcv") {
+        return false;
+    }
+    if !(call.starts_with("add_sub(") || call.starts_with("add_with_carry(")) {
+        return true;
+    }
+    let open = call.find('(').expect("a call");
+    let mut depth = 0usize;
+    for (at, c) in call[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let arguments = &call[open + 1..open + at];
+                    let last = arguments.rsplit(',').next().unwrap_or("").trim();
+                    return last != "false";
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `line` without the contents of its string literals.
+fn without_strings(line: &str) -> String {
+    let mut code = String::with_capacity(line.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            quoted = true;
+        } else if c != '\'' {
+            code.push(c);
+        }
+    }
+    code
+}
+
+/// `text` without each `m.cpu.pc = X;` line that another `m.cpu.pc = `
+/// line follows with only constants moved into locals between: nothing
+/// can read the first.
+fn without_overwritten_pc(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let constant_move = |line: &str| {
+        let Some(rest) = line.strip_prefix("r.x") else {
+            return false;
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let Some(value) = rest[digits..].strip_prefix(" = 0x") else {
+            return false;
+        };
+        let value = value.strip_suffix(';').unwrap_or(value);
+        let value = value.strip_suffix("u64").unwrap_or(value);
+        digits > 0 && !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let pc_store = |line: &str| line.starts_with("m.cpu.pc = ") && line.ends_with(';');
+    let mut text = String::with_capacity(text.len());
+    for (index, line) in lines.iter().enumerate() {
+        if pc_store(line.trim()) {
+            let next = lines[index + 1..]
+                .iter()
+                .map(|line| line.trim())
+                .find(|line| !constant_move(line));
+            if next.is_some_and(pc_store) {
+                continue;
+            }
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
 }
 
 /// Each call in `line` that hands the `Cpu` to a helper (`&mut m.cpu`,

@@ -205,6 +205,27 @@ longer records an inlined stub's entry (diagnostics only).
 `tests/plt.rs` runs a synthetic PLT with the predicted words, rewritten
 words, and the budget and a host boundary falling on an inlined stub.
 
+## Stores before calls: only what changed (default)
+
+A split window keeps guest registers, SP and NZCV in locals and used to
+store every local the window writes before each call or register helper
+(the callee and the dispatcher read the `Core`). `RegisterLocals::rewrite`
+now stores only the locals possibly written since they last equalled the
+`Core`: a forward walk through each match arm, each arm entered with the
+union of the states its predecessors hand it (a constant `next_pc`, or
+either side of a two-way one; any other successor may be any arm; entering
+the window leaves all equal), to a fixed point. A store or reload at an
+arm's top level leaves every local equal on all paths past it; one in a
+nested branch changes nothing. NZCV counts as written by flag operations
+but not by an ADD/SUB or add-with-carry whose `set flags` argument is
+`false`. Arms with their own loops or jumps (structured emission) store
+everything, as before. The window's final store is unchanged. A PC store
+that another follows with only constants moved into locals between is
+dropped. Over the aot-tests programs (650 windows, 1,123 calls) the stores
+before a call fell from 28.3 to 9.7 on average. `tests/spills.rs`: a
+callee reading registers its callers wrote before the call, after it in a
+loop's previous pass, through a conditional successor, and never.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

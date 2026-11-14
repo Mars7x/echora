@@ -99,6 +99,7 @@ fn split_programs(out: &mut String) {
     concurrency_code(out);
     stress_code(out);
     plt_code(out);
+    spill_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1912,6 +1913,113 @@ fn plt_code(out: &mut String) {
         report.call_sites,
         report.direct_call_sites,
         report.tail_sites
+    )
+    .expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Two callers for `tests/spills.rs`, each in its own window, of one callee
+/// in a third (ADD X3, X1, X2; ADD X3, X3, X4; ADD X3, X3, X7;
+/// ADD X6, X6, X3; RET): a loop (ADD X1 before the BL; ADD X2 and ADD X4
+/// after it; SUBS X5 and B.NE back) whose later passes need what the
+/// previous one wrote stored before the call, and a straight caller (ADD
+/// X1; BL; ADD X2; SVC) whose call needs only X1 stored. X7 no caller
+/// touches.
+fn spill_code(out: &mut String) {
+    const BASE: u64 = 0x130_0000;
+    const SVC_7: u32 = 0xd400_00e1;
+    let (looping, straight, callee) = (BASE, BASE + 0x400, BASE + 0x800);
+    let branching = BASE + 0xc00;
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0x1000 / 4];
+    let mut place = |address: u64, program: &[u32]| {
+        let at = ((address - BASE) / 4) as usize;
+        words[at..at + program.len()].copy_from_slice(program);
+    };
+    // ADD X1; CBZ X8 to a BL (inlined into the CBZ's arm); else a BL in an
+    // arm of its own (an entry), whose call still needs X1 stored.
+    place(
+        branching,
+        &[
+            0x9100_0421,
+            0xb400_0088, // cbz x8, +0x10
+            bl(branching + 8, callee),
+            SVC_7,
+            0,
+            bl(branching + 0x14, callee),
+            SVC_7,
+        ],
+    );
+    place(
+        looping,
+        &[
+            0x9100_0421, // add x1, x1, #1
+            bl(looping + 4, callee),
+            0x9100_1442,                                      // add x2, x2, #5
+            0x9100_1c84,                                      // add x4, x4, #7
+            0xf100_04a5,                                      // subs x5, x5, #1
+            0x5400_0001 | (((-5i32) as u32) & 0x7_ffff) << 5, // b.ne the add
+            SVC_7,
+        ],
+    );
+    place(
+        straight,
+        &[0x9100_0421, bl(straight + 4, callee), 0x9100_1442, SVC_7],
+    );
+    place(
+        callee,
+        &[
+            0x8b02_0023,
+            0x8b04_0063,
+            0x8b07_0063,
+            0x8b03_00c6,
+            0xd65f_03c0,
+        ],
+    );
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "spills".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(
+        &[region],
+        &[looping, straight, callee, branching, branching + 8],
+        words.len(),
+    )
+    .expect("spills");
+    let (root, regions) = split(&translation, options());
+    // The straight caller's call: the line storing before it.
+    let window = format!("fn run_window_{:x}(", straight >> 10);
+    let call_line = regions
+        .iter()
+        .find_map(|(_, source)| {
+            let body = &source[source.find(&window)?..];
+            body.lines()
+                .find(|line| line.contains("let called = m.call"))
+                .map(str::to_owned)
+        })
+        .expect("the straight caller's call");
+    let stores_x1 = call_line.contains("m.cpu.regs[1] = r.x1;");
+    let stores_x2 = call_line.contains("m.cpu.regs[2] = r.x2;");
+    let selective = !options().structured;
+    writeln!(out, "pub mod spill_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(
+        out,
+        "pub const LOOPING: u64 = {looping:#x};\npub const STRAIGHT: u64 = {straight:#x};\n\
+         pub const BRANCHING: u64 = {branching:#x};\n\
+         /// Whether the straight caller stores X1 and X2 before its call.\n\
+         pub const STRAIGHT_STORES: (bool, bool) = ({stores_x1}, {stores_x2});\n\
+         /// Whether stores are chosen per call (not with structured\n\
+         /// emission, whose arms store every written local).\n\
+         pub const SELECTIVE: bool = {selective};"
     )
     .expect("write");
     for (region, source) in regions {
