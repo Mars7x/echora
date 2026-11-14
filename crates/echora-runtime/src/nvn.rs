@@ -2335,6 +2335,7 @@ impl Nvn {
                     self.command_list_commands -= old.len();
                     self.command_list_use.remove(&used);
                     self.list_memory.remove(&handle);
+                    release_list(old);
                 }
                 // Only in a sequenced present: lists are recorded by the
                 // dozen per frame.
@@ -2459,6 +2460,7 @@ impl Nvn {
                             );
                         }
                         self.command_list_commands -= list.len();
+                        release_list(list);
                     }
                 }
                 core.cpu.regs[0] = handle;
@@ -2925,7 +2927,7 @@ impl Nvn {
                 let storage = identity.map(|(storage, _)| storage);
                 // ECHORA_NVN_TEXTURE_LOG=<low>-<high> (hex) logs only textures
                 // whose storage starts in that range.
-                let logged = std::env::var("ECHORA_NVN_TEXTURE_LOG").ok().is_some_and(|range| {
+                let logged = debug_var("ECHORA_NVN_TEXTURE_LOG").ok().is_some_and(|range| {
                     let bounds = range.split_once('-').and_then(|(low, high)| {
                         let parse = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
                         Some((parse(low)?, parse(high)?))
@@ -6295,6 +6297,29 @@ fn record_command(
     recording.commands.push(command);
     recording.command_memory += COMMAND_MEMORY_PER_COMMAND;
     Ok(())
+}
+
+/// Drop a command list on a thread of its own: freeing hundreds of
+/// commands and their snapshots held the NVN lock in EndRecording.
+fn release_list(list: std::sync::Arc<Vec<Command>>) {
+    static RELEASE: std::sync::OnceLock<
+        std::sync::Mutex<std::sync::mpsc::Sender<std::sync::Arc<Vec<Command>>>>,
+    > = std::sync::OnceLock::new();
+    let sender = RELEASE.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<std::sync::Arc<Vec<Command>>>();
+        let spawned = std::thread::Builder::new()
+            .name("nvn-release".into())
+            .spawn(move || receiver.into_iter().for_each(drop));
+        if spawned.is_err() {
+            eprintln!("nvn: no list release thread; lists are freed in place");
+        }
+        std::sync::Mutex::new(sender)
+    });
+    // Without the thread the send fails and the list drops here.
+    let _ = sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send(list);
 }
 
 /// The singular command a plural bind stands for, and the words of each
