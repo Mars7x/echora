@@ -1139,11 +1139,21 @@ fn emit_instruction(
 /// the callee's PC, so this is not a `?` (those get the caller's PC stored
 /// on their error path).
 fn emit_call(output: &mut String, next: u64) {
+    flush_pending(output);
     writeln!(
         output,
         "                if let Err(trap) = m.call({next:#x}) {{ return Err(trap); }}"
     )
     .unwrap();
+}
+
+/// With `EmitOptions::deferred_charges`: the deferred blocks' instructions
+/// added to the steps, where the `Core` must count them (a callee's checks,
+/// a charge's check).
+fn flush_pending(output: &mut String) {
+    if DEFERRED_CHARGES.get() {
+        output.push_str("                m.steps += *pending; *pending = 0;\n");
+    }
 }
 
 /// A call whose callee left its target in X17 (an inlined PLT stub, see
@@ -1155,6 +1165,7 @@ fn emit_call_predicted(output: &mut String, next: u64, direct: Option<(u64, u64)
         emit_call(output, next);
         return;
     };
+    flush_pending(output);
     writeln!(
         output,
         "                if {} == {predicted:#x} {{",
@@ -3413,6 +3424,31 @@ fn emit_block_body(
         // never has a trap settled inside it: it need not be tagged.
         let tagged = !(UNTAGGED_BLOCKS.get() && !rest.contains('?') && !rest.contains("Err("));
         let resumable = kind == "block_at";
+        if DEFERRED_CHARGES.get() {
+            // A block with no host boundary that cannot trap, call, read
+            // the counter or poll: its instructions join the window's
+            // pending count, which the next charge, call or the window's
+            // end adds to the steps.
+            let observes = [
+                "?",
+                "Err(",
+                "m.call",
+                "physical_counter",
+                "spin_hint",
+                "trace_hit",
+            ];
+            let checked = RESUME.with_borrow(|resume| {
+                resume
+                    .as_ref()
+                    .is_none_or(|resume| resume.contains(&block.start))
+            });
+            if (!resumable || !checked) && !observes.iter().any(|text| rest.contains(text)) {
+                output.push_str(&format!("{indent}*pending += {count};\n"));
+                output.push_str(rest);
+                return;
+            }
+            flush_pending(output);
+        }
         output.push_str(&format!(
             "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
         ));
@@ -4210,6 +4246,14 @@ pub struct EmitOptions {
     /// once at the end, with the per-operation emission as the fallback
     /// (`emit_float_run`).
     pub float_runs: bool,
+    /// With `split_ticks`: a block that cannot trap, call or read the
+    /// counter, and is neither inlined into one that does nor a block
+    /// execution can resume at or a backward branch's target
+    /// (`resume_blocks`), adds its instructions to a count in the window
+    /// instead of charging them; the next charge, call or the window's end
+    /// adds that count to the steps. Every loop still passes a checked
+    /// charge.
+    pub deferred_charges: bool,
 }
 
 thread_local! {
@@ -4229,6 +4273,34 @@ impl FloatRuns {
 impl Drop for FloatRuns {
     fn drop(&mut self) {
         FLOAT_RUNS.set(self.0);
+    }
+}
+
+thread_local! {
+    /// With `EmitOptions::deferred_charges`: the blocks that keep their
+    /// charge's host boundary (`resume_blocks`: where execution can resume,
+    /// and every backward branch's target, so every loop still checks).
+    static RESUME: std::cell::RefCell<Option<BTreeSet<u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// `EmitOptions::deferred_charges` of the emission running on this thread.
+    static DEFERRED_CHARGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`DEFERRED_CHARGES`] for as long as it lives.
+struct DeferredCharges(bool);
+
+impl DeferredCharges {
+    fn set(on: bool) -> Self {
+        Self(DEFERRED_CHARGES.replace(on))
+    }
+}
+
+impl Drop for DeferredCharges {
+    fn drop(&mut self) {
+        DEFERRED_CHARGES.set(self.0);
+        RESUME.set(None);
     }
 }
 
@@ -4569,6 +4641,10 @@ pub fn emit_rust_split_to_with<E>(
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
     let _float_runs = FloatRuns::set(options.float_runs);
+    let _deferred_charges = DeferredCharges::set(options.deferred_charges && options.split_ticks);
+    if DEFERRED_CHARGES.get() {
+        RESUME.set(Some(resume_blocks(translation)));
+    }
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _window_memory = WindowMemory::set(options.window_memory);
     let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
@@ -4722,7 +4798,11 @@ pub fn emit_rust_split_to_with<E>(
         // memory gets it after each block, where the boundary check and
         // anything leaving the window see it.
         output.push_str(
-            "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n",
+            if DEFERRED_CHARGES.get() {
+                "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, pending: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
+            } else {
+                "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
+            },
         );
         let body = locals.rewrite(&cases);
         let header = if dense {
@@ -4747,9 +4827,18 @@ pub fn emit_rust_split_to_with<E>(
             output.push_str(&header);
             output.push_str(&body);
         }
-        output.push_str(
-            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
-        );
+        if DEFERRED_CHARGES.get() {
+            // The deferred blocks' instructions count before anything
+            // after the window (the host's trap settling and checks) sees
+            // the steps.
+            output.push_str(
+                "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
+            );
+        } else {
+            output.push_str(
+                "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
+            );
+        }
         output.push_str(&locals.store());
         output.push_str("    result\n}\n");
     }

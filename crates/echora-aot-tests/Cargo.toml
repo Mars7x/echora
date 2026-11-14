@@ -12,6 +12,9 @@ publish.workspace = true
 # Scalar single-precision runs as plain host arithmetic checked once
 # (EmitOptions::float_runs).
 float-runs = []
+# With split-ticks: blocks that cannot trap add to a pending count instead
+# of charging (EmitOptions::deferred_charges).
+deferred-charges = []
 # Lift every program with common vector operations as native code
 # (codegen's EmitOptions::inline_vector):
 # `cargo test -p echora-aot-tests --features inline-vector`.

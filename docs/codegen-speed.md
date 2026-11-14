@@ -248,6 +248,24 @@ of seven runs): the new `floats` kernel (twelve operations per element)
 no run) and the rest within noise. `tests/float_runs.rs` compares it with
 the exact emission over edge values, FZ, DN and a directed rounding mode.
 
+## Deferred block charges (opt-in)
+
+`EmitOptions::deferred_charges` (`deferred-charges`, with split ticks): a
+block that cannot trap, call, read the counter or poll, and is not a block
+execution can resume at or a backward branch's target (`resume_blocks`),
+adds its instruction count to a window local instead of charging the
+`Core` (a relaxed load of `stop`, a compare, a store). Every other charge
+and every call first adds that count to `steps`, and the window adds what
+is left when its body returns, before the host settles a trap or checks
+anything; every loop still passes a checked charge. No echora-guest change:
+`Core::steps` is public. A host boundary may come one arm later than
+before (the arm's `finish_block` sees the steps without the pending
+count), as a slice boundary moving by a few blocks. Kernels (game set vs
+game set plus deferred-charges, two rounds of seven runs): memset
++34%/+30%, calls +4%/+7%, the rest within noise. `tests/deferred_charges.rs`
+checks registers and steps against per-block charging, with a host
+boundary at every step of the run.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

@@ -43,6 +43,7 @@ fn options() -> EmitOptions {
         split_ticks: std::env::var_os("CARGO_FEATURE_SPLIT_TICKS").is_some(),
         direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
+        deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
         stub_windows: false,
     }
 }
@@ -103,6 +104,7 @@ fn split_programs(out: &mut String) {
     plt_code(out);
     spill_code(out);
     float_run_code(out);
+    deferred_charge_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -2105,6 +2107,79 @@ fn float_run_code(out: &mut String) {
             out,
             "/// Float runs found, and the arithmetic operations they hold.\n\
              pub const RUNS: (usize, usize) = ({runs}, {operations});"
+        )
+        .expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// A loop for `tests/deferred_charges.rs`, lifted with deferred charges
+/// (`deferred_charge_code`) and without (`deferred_charge_reference`), both
+/// with split ticks: X3 counts to X0 through a diamond on X1 (one side
+/// inlined into the CBZ's arm, the other its own arm) and a join, which
+/// two predecessors reach forward, so neither it nor the second side
+/// checks; then a block that does not check either leaves for another
+/// window, which calls a leaf in a third and ends in an SVC.
+fn deferred_charge_code(out: &mut String) {
+    const BASE: u64 = 0x150_0000;
+    let leaf = BASE + 0x400;
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let far = BASE + 0x800;
+    let branch = |from: u64, to: u64| {
+        0x1400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0xc00 / 4];
+    let program = [
+        0xd280_0003, // 0x00 movz x3, #0
+        0xb400_0061, // 0x04 L: cbz x1, A (+0xc)
+        0x9100_0c42, // 0x08 add x2, x2, #3
+        0x1400_0002, // 0x0c b J
+        0xca01_0042, // 0x10 A: eor x2, x2, x1
+        0x9100_0463, // 0x14 J: add x3, x3, #1
+        0xd200_0021, // 0x18 eor x1, x1, #1
+        0xeb00_007f, // 0x1c cmp x3, x0
+        0x54ff_ff2b, // 0x20 b.lt L
+        0x9100_04c6, // 0x24 add x6, x6, #1 (deferred, then out of the window)
+        branch(BASE + 0x28, far),
+    ];
+    words[..program.len()].copy_from_slice(&program);
+    // The leaf: add x5, x5, #1; ret.
+    words[0x100..0x102].copy_from_slice(&[0x9100_04a5, 0xd65f_03c0]);
+    // Far: bl leaf; add x4, x2, x3; svc #7.
+    words[0x200..0x203].copy_from_slice(&[bl(far, leaf), 0x8b03_0044, 0xd400_00e1]);
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "deferred charges".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation =
+        discover(&[region], &[BASE, leaf, far], words.len()).expect("deferred charges");
+    for (name, deferred_charges) in [
+        ("deferred_charge_code", true),
+        ("deferred_charge_reference", false),
+    ] {
+        let options = EmitOptions {
+            split_ticks: true,
+            deferred_charges,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        let deferred: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches("*pending += ").count())
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Deferred block charges in the emission.\npub const DEFERRED: usize = {deferred};"
         )
         .expect("write");
         for (region, source) in regions {

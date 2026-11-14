@@ -751,6 +751,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "untagged-blocks" => options.untagged_blocks = true,
             "split-ticks" => options.split_ticks = true,
             "direct-calls" => options.direct_calls = true,
+            "deferred-charges" => options.deferred_charges = true,
             "stub-windows" => options.stub_windows = true,
             "float-runs" => options.float_runs = true,
             "flat" => {}
