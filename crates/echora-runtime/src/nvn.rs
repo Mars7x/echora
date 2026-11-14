@@ -5781,8 +5781,9 @@ const TAGGED_STATES: [&str; 6] = [
 ];
 
 /// The contents of tagged state structures by tag (the structure's first
-/// word: content-addressed, so equal states share one).
-type StateTags = HashMap<u32, (String, BTreeMap<String, Args>)>;
+/// word: content-addressed, so equal states share one): the kind, and
+/// what a Bind of it snapshots (`snapshot_states`), made once per tag.
+type StateTags = HashMap<u32, (String, std::sync::Arc<Vec<BTreeMap<String, Args>>>)>;
 static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
 
 /// After a setter changed a state structure at `address`: its contents'
@@ -5794,8 +5795,17 @@ fn tag_state(
     kind: &str,
     props: &BTreeMap<String, Args>,
 ) -> Result<(), Trap> {
+    match state_tag(kind, props) {
+        Some(tag) => core.memory.write_u32(address, tag),
+        None => Ok(()),
+    }
+}
+
+/// The tag of a tagged state kind's contents (`tag_state`), its snapshot
+/// recorded the first time the tag is seen; None for other kinds.
+fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     if !TAGGED_STATES.contains(&kind) {
-        return Ok(());
+        return None;
     }
     use std::hash::{Hash, Hasher};
     // The entries themselves are hashed (formatting them for every setter
@@ -5820,9 +5830,19 @@ fn tag_state(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert_with(HashMap::new)
             .entry(tag)
-            .or_insert_with(|| (kind.into(), props.clone()));
+            .or_insert_with(|| {
+                let mut snapshot = props.clone();
+                snapshot.insert(
+                    "@Offset".into(),
+                    Args {
+                        x: [0; 4],
+                        v: [0; 2],
+                    },
+                );
+                (kind.into(), std::sync::Arc::new(vec![snapshot]))
+            });
     }
-    core.memory.write_u32(address, tag)
+    Some(tag)
 }
 
 fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Command) {
@@ -5851,14 +5871,16 @@ fn snapshot_states(bags: &BTreeMap<u64, Bag>, core: &Guest, command: &mut Comman
                 .as_ref()?
                 .get(&tag)
                 .filter(|(tagged_kind, _)| tagged_kind == kind)
-                .map(|(_, props)| props.clone())
+                .map(|(_, snapshot)| snapshot.clone())
         });
-        let mut props = tagged
-            .or_else(|| {
-                bags.get(&base)
-                    .filter(|bag| bag.kind == kind)
-                    .map(|bag| bag.props.clone())
-            })
+        if let Some(snapshot) = tagged {
+            command.states = snapshot;
+            return;
+        }
+        let mut props = bags
+            .get(&base)
+            .filter(|bag| bag.kind == kind)
+            .map(|bag| bag.props.clone())
             .unwrap_or_default();
         props.insert(
             "@Offset".into(),
@@ -6079,10 +6101,17 @@ fn bag_call(
                     0
                 };
             }
-            bag.props.insert(property.into(), args);
-            let props = bag.props.clone();
+            match bag.props.get_mut(property) {
+                Some(value) => *value = args,
+                None => {
+                    bag.props.insert(property.into(), args);
+                }
+            }
+            let tag = state_tag(kind, &bag.props);
             drop(bags);
-            tag_state(core, this, kind, &props)?;
+            if let Some(tag) = tag {
+                core.memory.write_u32(this, tag)?;
+            }
             return Ok(true);
         }
         if let Some(property) = rest.strip_prefix("Get") {
