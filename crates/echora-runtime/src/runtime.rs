@@ -2859,6 +2859,7 @@ impl Machine {
                         nvn_lock_micros: [0; 2],
                         quiet_yields_until: None,
                         lock_free_yields: 0,
+                        quiet_run: 0,
                     };
                     std::thread::Builder::new()
                         .name(format!("guest-worker-{index}"))
@@ -4946,6 +4947,8 @@ struct Worker {
     quiet_yields_until: Option<std::time::Instant>,
     /// Yields returned that way since the lock was last taken.
     lock_free_yields: u64,
+    /// Of those, in a row since the last yield or sleep under the lock.
+    quiet_run: u32,
 }
 
 /// NVN entry points that stay under the machine lock: present publishes
@@ -5075,6 +5078,13 @@ fn boundary_kind_name(kind: usize) -> String {
 /// thread (see `Worker::quiet_yield`).
 const QUIET_YIELDS: std::time::Duration = std::time::Duration::from_micros(50);
 
+/// The longest SleepThread a quiet worker sleeps in place (nanoseconds).
+const QUIET_SLEEP_NS: i64 = 100_000;
+
+/// Yields and sleeps returned without the lock in a row before one takes it
+/// again (the scheduler then sees whether another thread waits here).
+const QUIET_RUN: u32 = 64;
+
 /// Parked workers recheck waits and deadlines at least this often.
 const PARKED_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -5083,13 +5093,27 @@ impl Worker {
     /// lock kept this thread a moment ago (no preemption asked since), it
     /// returns now, past the SVC, as that yield would again.
     fn quiet_yield(&mut self) -> bool {
-        let yields = (-2..=0).contains(&(self.core.cpu.regs[0] as i64));
+        let ns = self.core.cpu.regs[0] as i64;
+        // Yields, and sleeps short enough that nothing else could have run
+        // here meanwhile anyway (games poll with 20 us sleeps): such a
+        // sleep is slept here, as parking the thread and waking it through
+        // the scheduler took twice as long as asked.
+        let short = (-2..=QUIET_SLEEP_NS).contains(&ns);
         let quiet = self
             .quiet_yields_until
             .is_some_and(|until| std::time::Instant::now() < until);
-        if !yields || !quiet || self.core.preempt.load(std::sync::atomic::Ordering::Relaxed) {
+        if !short
+            || !quiet
+            || self.quiet_run >= QUIET_RUN
+            || self.core.preempt.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
+        if ns > 0 {
+            std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+            self.quiet_yields_until = Some(std::time::Instant::now() + QUIET_YIELDS);
+        }
+        self.quiet_run += 1;
         self.core.settle_block_trap();
         self.core.cpu.pc = self.core.cpu.pc.wrapping_add(4);
         self.lock_free_yields += 1;
@@ -5194,7 +5218,8 @@ impl Worker {
                     time[1] += (held - waited).as_micros() as u64;
                 }
                 let kind = boundary_kind(&result);
-                let yielded = kind == 0x0b && (-2..=0).contains(&(self.core.cpu.regs[0] as i64));
+                let yielded =
+                    kind == 0x0b && (-2..=QUIET_SLEEP_NS).contains(&(self.core.cpu.regs[0] as i64));
                 let sleep_ns = self.core.cpu.regs[0] as i64;
                 let host_call = match &result {
                     Err(Trap::MissingBlock { pc }) if machine.nvn.has_entry(*pc) => Some(*pc),
@@ -5251,6 +5276,7 @@ impl Worker {
                         self.quiet_yields_until = (yielded
                             && self.core.current_thread_id == thread)
                             .then(|| std::time::Instant::now() + QUIET_YIELDS);
+                        self.quiet_run = 0;
                         drop(machine);
                         shared.wake_workers(spare);
                         continue;
