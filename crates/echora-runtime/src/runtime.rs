@@ -2942,7 +2942,7 @@ impl Machine {
         use crate::nvn::HostEntry;
         let name = match &entry {
             HostEntry::BootstrapLoader => "nvnBootstrapLoader".to_string(),
-            HostEntry::Proc(name) => name.clone(),
+            HostEntry::Proc(name) => (*name).to_string(),
             HostEntry::ZlibUncompress => "hle:zlib_uncompress".to_string(),
             HostEntry::ZstdDecompress => "hle:zstd_decompress".to_string(),
             HostEntry::InflateFinishCall => "hle:inflate_finish".to_string(),
@@ -3044,7 +3044,7 @@ impl Machine {
             // nvnBootstrapLoader(const char* name) -> PFNC.
             HostEntry::BootstrapLoader => Some(self.core.cpu.regs[0]),
             // nvnDeviceGetProcAddress(const NVNdevice*, const char* name) -> PFNC.
-            HostEntry::Proc(ref proc) if proc == "nvnDeviceGetProcAddress" => {
+            HostEntry::Proc(proc) if proc == "nvnDeviceGetProcAddress" => {
                 Some(self.core.cpu.regs[1])
             }
             HostEntry::Proc(_)
@@ -5543,7 +5543,7 @@ impl Worker {
         // on a fence: the GPU work it waits for finishes without the NVN
         // state held, so the replay goes on meanwhile.
         let gpu_wait = match nvn.entry(pc) {
-            Some(crate::nvn::HostEntry::Proc(name)) if thread => match name.as_str() {
+            Some(crate::nvn::HostEntry::Proc(name)) if thread => match name {
                 "nvnMemoryPoolInvalidateMappedRange" => Some(None),
                 "nvnSyncWait" => Some(Some(self.core.cpu.regs[0])),
                 _ => None,
@@ -5655,9 +5655,15 @@ impl Worker {
         };
         match outcome {
             Ok(true) => {
-                *nvn.calls.entry(name.clone()).or_default() += 1;
+                // Counted without a new key's allocation once it exists.
+                match nvn.calls.get_mut(name) {
+                    Some(count) => *count += 1,
+                    None => {
+                        nvn.calls.insert(name.to_string(), 1);
+                    }
+                }
                 if crate::nvn::debug_var_os("ECHORA_NVN_PROFILE").is_some() {
-                    *nvn.call_microseconds.entry(name).or_default() +=
+                    *nvn.call_microseconds.entry(name.to_string()).or_default() +=
                         started.elapsed().as_micros() as u64;
                 }
                 self.core.cpu.pc = self.core.cpu.regs[30];

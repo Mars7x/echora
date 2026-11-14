@@ -136,8 +136,9 @@ pub const MAX_NAME: usize = 256;
 pub enum HostEntry {
     /// The replaced sdk export `nvnBootstrapLoader(const char* name)`.
     BootstrapLoader,
-    /// A thunk handed to the application for one NVN entry point.
-    Proc(String),
+    /// A thunk handed to the application for one NVN entry point (its
+    /// interned name: looking one up allocates nothing).
+    Proc(&'static str),
     /// A guest function replaced by an equivalent host implementation
     /// (`crate::hle`), installed only for its exact code bytes.
     ZlibUncompress,
@@ -1648,7 +1649,7 @@ impl Nvn {
         }
         self.thunks
             .get((offset / THUNK_STRIDE) as usize)
-            .map(|name| HostEntry::Proc(name.clone()))
+            .map(|name| HostEntry::Proc(intern(name)))
     }
 
     /// Whether `pc` is a host entry (no allocation, unlike `entry`).
@@ -7075,7 +7076,7 @@ mod tests {
         assert_eq!(nvn.thunk("nvnDeviceGetProcAddress").unwrap(), first);
         assert_eq!(
             nvn.entry(second),
-            Some(HostEntry::Proc("nvnQueueInitialize".into()))
+            Some(HostEntry::Proc("nvnQueueInitialize"))
         );
         assert_eq!(nvn.entry(second + 4), None);
         assert_eq!(nvn.entry(THUNK_BASE + 0x100), None);
