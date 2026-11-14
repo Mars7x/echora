@@ -6572,6 +6572,7 @@ impl Nvn {
             return;
         };
         if backend.renderer.gpu.dma_buf_import.is_none() {
+            self.new_pools.clear();
             return;
         }
         // ECHORA_POOL_TRACE=<guest base> (debugging): that pool's sharing,
@@ -6599,8 +6600,11 @@ impl Nvn {
             );
         }
         let scanned = std::time::Instant::now();
-        let pools: Vec<(u64, u64)> = self
-            .memory_pools
+        // Only pools made since the last present: the others were shared
+        // (or found not shareable) then, and a pool made again over the
+        // same memory is made anew.
+        let new_pools = std::mem::take(&mut self.new_pools);
+        let pools: Vec<(u64, u64)> = new_pools
             .iter()
             .filter_map(|address| self.objects.get(address))
             .filter(|object| object.kind == "MemoryPool")
@@ -6627,7 +6631,7 @@ impl Nvn {
             "stat: present us scanning pools",
             scanned.elapsed().as_micros() as u64,
         );
-        backend.stat("stat: pools scanned", self.memory_pools.len() as u64);
+        backend.stat("stat: pools scanned", new_pools.len() as u64);
         for (base, size) in pools {
             if let Some((file, offset)) = core.memory.shared_span(base, size) {
                 let backend = self.gpu.as_mut().unwrap();
