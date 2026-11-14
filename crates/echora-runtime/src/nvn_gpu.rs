@@ -118,6 +118,10 @@ pub struct Backend {
     /// over imported guest memory) since the GPU last finished: a CPU read
     /// of one waits for the GPU first (see `resolve_storage`).
     in_place_writes: Vec<std::ops::Range<u64>>,
+    /// Bumped whenever GPU writes not yet in guest memory are recorded
+    /// (in place, pending storage, resident ranges): a memoized binding
+    /// checked at this generation needs no new check.
+    gpu_writes: u64,
     /// A program storing through the page table was recorded since the
     /// last wait for it: its stores land in guest memory or a resident
     /// pool's copy with no range recorded (see `resolve_gpu_written`).
@@ -231,6 +235,7 @@ impl Backend {
             shadow_quiet: HashMap::new(),
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
+            gpu_writes: 0,
             page_table_writes: false,
             page_table_write_serial: 0,
             observable_serial: 0,
@@ -2103,18 +2108,12 @@ impl Nvn {
         }
         let mut entries = Vec::new();
         for handle in handles {
-            if let Some((source, sampler_state, _)) =
-                self.binding_memo.1.get(&handle).filter(|(.., storage)| {
-                    !storage
-                        .as_ref()
-                        .is_some_and(|storage| self.gpu_writes_pending(storage))
-                })
-            {
+            if let Some((source, sampler_state)) = self.memoized_binding(handle) {
                 entries.push(echora_gpu::pool::PoolEntry {
                     texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                     sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
-                    source: source.clone(),
-                    sampler_state: *sampler_state,
+                    source,
+                    sampler_state,
                 });
                 continue;
             }
@@ -2140,9 +2139,15 @@ impl Nvn {
             let source = self.texture_source(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, &source);
-            self.binding_memo
-                .1
-                .insert(handle, (source.clone(), sampler_state, storage));
+            self.binding_memo.1.insert(
+                handle,
+                (
+                    source.clone(),
+                    sampler_state,
+                    storage,
+                    self.gpu_writes_now(),
+                ),
+            );
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                 sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -4188,6 +4193,7 @@ impl Nvn {
                         if descriptor.flags & 1 != 0 && !written.contains(&(guest..guest + length))
                         {
                             written.push(guest..guest + length);
+                            self.gpu.as_mut().unwrap().gpu_writes += 1;
                         }
                         continue;
                     }
@@ -4211,6 +4217,7 @@ impl Nvn {
                                     .find(|pool| pool.contains(guest))
                                 {
                                     add_range(&mut pool.gpu_dirty, guest..guest + length);
+                                    backend.gpu_writes += 1;
                                 }
                             }
                         }
@@ -4789,6 +4796,7 @@ impl Nvn {
                 continue;
             };
             let guest = self.gpu_to_guest(base, *length)?;
+            self.gpu.as_mut().unwrap().gpu_writes += 1;
             self.gpu.as_mut().unwrap().pending_storage.push((
                 *token,
                 guest..guest + length,
@@ -4819,6 +4827,33 @@ impl Nvn {
     /// (`None`), or, when any overlaps `range`, all of them (results come
     /// back in dispatch order, so an earlier one never lands on a later).
     #[track_caller]
+    /// The current GPU write generation (`gpu_writes`).
+    fn gpu_writes_now(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |backend| backend.gpu_writes)
+    }
+
+    /// A memoized binding of `handle`, unless GPU writes recorded since it
+    /// was last checked lie under its texture (it resolves anew then).
+    fn memoized_binding(
+        &mut self,
+        handle: u64,
+    ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
+        let now = self.gpu_writes_now();
+        let (source, sampler, storage, checked) = self.binding_memo.1.get(&handle)?;
+        if *checked != now {
+            if storage
+                .as_ref()
+                .is_some_and(|storage| self.gpu_writes_pending(storage))
+            {
+                return None;
+            }
+            let binding = (source.clone(), *sampler);
+            self.binding_memo.1.get_mut(&handle).unwrap().3 = now;
+            return Some(binding);
+        }
+        Some((source.clone(), *sampler))
+    }
+
     /// Whether GPU writes not yet in guest memory overlap `range` (what
     /// `resolve_storage` would bring back there).
     fn gpu_writes_pending(&self, range: &std::ops::Range<u64>) -> bool {
@@ -4949,6 +4984,7 @@ impl Nvn {
                     for piece in pieces {
                         add_range(&mut pool.gpu_dirty, piece);
                     }
+                    backend.gpu_writes += 1;
                 }
             }
         }
@@ -6762,6 +6798,7 @@ impl Nvn {
             .find(|pool| pool.base <= guest && guest + 16 <= pool.base + pool.size)
         {
             add_range(&mut pool.gpu_dirty, guest..guest + 16);
+            backend.gpu_writes += 1;
         }
         backend.samples_reports.insert(address);
         Ok(true)
@@ -7333,15 +7370,8 @@ impl Nvn {
                             }
                             self.binding_memo = (stamp, Default::default());
                         }
-                        if let Some((source, sampler, _)) =
-                            self.binding_memo.1.get(&handle).filter(|(.., storage)| {
-                                !storage
-                                    .as_ref()
-                                    .is_some_and(|storage| self.gpu_writes_pending(storage))
-                            })
-                        {
-                            textures
-                                .insert((index, descriptor.binding), (source.clone(), *sampler));
+                        if let Some(binding) = self.memoized_binding(handle) {
+                            textures.insert((index, descriptor.binding), binding);
                             memo_hits += 1;
                             continue;
                         }
@@ -7378,9 +7408,10 @@ impl Nvn {
                             }
                         }
                         let sampler = self.binding_sampler(handle, &source);
-                        self.binding_memo
-                            .1
-                            .insert(handle, (source.clone(), sampler, storage));
+                        self.binding_memo.1.insert(
+                            handle,
+                            (source.clone(), sampler, storage, self.gpu_writes_now()),
+                        );
                         textures.insert((index, descriptor.binding), (source, sampler));
                     }
                     other => {
@@ -8779,6 +8810,7 @@ impl Nvn {
                 continue;
             };
             storage_results += 1;
+            backend.gpu_writes += 1;
             backend.pending_storage.push((
                 token,
                 guest..guest + bytes.len() as u64,

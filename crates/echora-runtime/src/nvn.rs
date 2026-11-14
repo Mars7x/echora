@@ -324,11 +324,13 @@ pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>
 
 /// A texture handle resolved for a draw: what it samples and how.
 /// A texture handle's resolved binding: its source, its sampler and the
-/// guest range of the texture's storage (checked for GPU writes on reuse).
+/// guest range of the texture's storage (checked for GPU writes on reuse)
+/// and the GPU write generation it was last checked at.
 type ResolvedBinding = (
     echora_gpu::draw::TextureSource,
     echora_gpu::draw::Sampler,
     Option<std::ops::Range<u64>>,
+    u64,
 );
 
 /// A render target's width, height, format, mip levels and shape.
