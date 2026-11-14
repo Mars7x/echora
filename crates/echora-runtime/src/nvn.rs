@@ -321,6 +321,7 @@ impl FastHasher {
 
 /// A HashMap with [`FastHasher`].
 pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FastHasher>>;
 
 /// A texture handle resolved for a draw: what it samples and how.
 /// A texture handle's resolved binding: its source, its sampler and the
@@ -1069,16 +1070,16 @@ pub struct Recorder {
 /// queried and finalized here only.
 #[derive(Debug, Default)]
 pub struct Registry {
-    devices: std::collections::HashSet<u64>,
-    pools: HashMap<u64, RegisteredPool>,
-    buffers: HashMap<u64, RegisteredBuffer>,
+    devices: FastSet<u64>,
+    pools: FastMap<u64, RegisteredPool>,
+    buffers: FastMap<u64, RegisteredBuffer>,
     /// Each event's guest address (its u32), by event object.
-    events: HashMap<u64, u64>,
+    events: FastMap<u64, u64>,
     /// Sync objects not signaled (a zero-timeout wait on one times out).
-    unsignaled: std::collections::HashSet<u64>,
+    unsignaled: FastSet<u64>,
     /// Signaled syncs and the GPU submission serial that held the work
     /// before their fence.
-    signaled: HashMap<u64, u64>,
+    signaled: FastMap<u64, u64>,
     /// The renderer's completed submission serial (see `Renderer::wait_for`).
     completed: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// GPU results are waiting to be stored in guest memory at a CPU wait
