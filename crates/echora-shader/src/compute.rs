@@ -226,6 +226,10 @@ pub struct Needs {
     /// Each TXQ queried through a 2D array view: its component mask and
     /// its guest instruction (byte offset).
     pub txq_fallbacks: Vec<(u8, u32)>,
+    /// `.DNZ` multiplies: FMULs written as Mesa's `fmulz` shape, FFMAs as
+    /// its `ffmaz` shape, and those with a rounding mode or an FMUL scale,
+    /// which keep a select on the result.
+    pub dnz: [u32; 3],
 }
 
 /// `translate`, with what the program needs (`Needs`).
@@ -239,6 +243,7 @@ pub fn translate_with_needs(
         store: emitter.module.store_site(),
         txq_views: emitter.txq_views,
         txq_fallbacks: emitter.txq_fallbacks.clone(),
+        dnz: emitter.dnz_counts,
     };
     Ok((emitter.finish(), needs))
 }
@@ -546,6 +551,8 @@ struct Emitter {
     txq_views: (u32, u32),
     /// The fallback TXQs' masks and guest instructions (byte offsets).
     txq_fallbacks: Vec<(u8, u32)>,
+    /// `Needs::dnz`.
+    dnz_counts: [u32; 3],
     frag_colors: u32,
     push_fields: u32,
     /// A global store or atomic went through the page table
@@ -672,6 +679,7 @@ impl Emitter {
             texture_views: BTreeMap::new(),
             txq_views: (0, 0),
             txq_fallbacks: Vec::new(),
+            dnz_counts: [0; 3],
             frag_colors: 0,
             push_fields: 0,
             page_table_stores: false,
@@ -1288,6 +1296,44 @@ impl Emitter {
         self.value(op::LOGICAL_OR, self.bool, &[a, b])
     }
 
+    /// `product`, which is `a * b`, for a `.DNZ` multiply (NAK's `fmulz`):
+    /// +0 when a factor is zero, whatever the other (Inf, NaN). Written
+    /// `NMin(|a|, |b|) == 0 ? +0 : a * b`, the shape Mesa's
+    /// nir_opt_algebraic turns into its `fmulz` (one `v_mul_legacy_f32` on
+    /// RADV) instead of two FAbs, two compares, an OR and a select.
+    /// Exact for every operand; with `.FTZ` a subnormal factor counts as
+    /// zero where the host flushes 32-bit denormals (RADV and NVK in a
+    /// module that declares no denormal mode), as for every other `.FTZ`
+    /// operation, which is emitted plainly.
+    fn dnz_product(&mut self, a: u32, b: u32, product: u32) -> u32 {
+        let (a, b) = (
+            self.glsl(self.f32, glsl::F_ABS, &[a]),
+            self.glsl(self.f32, glsl::F_ABS, &[b]),
+        );
+        let smaller = self.glsl(self.f32, glsl::N_MIN, &[a, b]);
+        let zero = self.float_constant(0.0);
+        let is_zero = self.value(op::F_ORD_EQUAL, self.bool, &[smaller, zero]);
+        self.value(op::SELECT, self.f32, &[is_zero, zero, product])
+    }
+
+    /// `a * b + c` for a `.DNZ` FFMA: `+0 + c` when a factor is zero. Written
+    /// `fma(b == 0 ? 0 : a, a == 0 ? 0 : b, c + 0)`, the shape Mesa's
+    /// nir_opt_algebraic turns into its `ffmaz` (`v_fma_legacy_f32` on RADV,
+    /// GFX10.3 and later). A zero factor makes the product ±0, and `c + 0`
+    /// is `c` but for -0, which becomes +0, so the sum is `+0 + c` exactly;
+    /// otherwise the operands and the fused sum are unchanged (an exact
+    /// product that is not zero decides the sign of a zero sum). Subnormal
+    /// factors with `.FTZ` as in `dnz_product`.
+    fn dnz_fma(&mut self, a: u32, b: u32, c: u32) -> u32 {
+        let zero = self.float_constant(0.0);
+        let a_zero = self.value(op::F_ORD_EQUAL, self.bool, &[a, zero]);
+        let b_zero = self.value(op::F_ORD_EQUAL, self.bool, &[b, zero]);
+        let factor_a = self.value(op::SELECT, self.f32, &[b_zero, zero, a]);
+        let factor_b = self.value(op::SELECT, self.f32, &[a_zero, zero, b]);
+        let addend = self.value(op::F_ADD, self.f32, &[c, zero]);
+        self.glsl(self.f32, glsl::FMA, &[factor_a, factor_b, addend])
+    }
+
     /// A float operation the driver must not fuse with another
     /// (NoContraction): the hardware rounds each one.
     fn exact(&mut self, opcode: u16, operands: &[u32]) -> u32 {
@@ -1614,6 +1660,12 @@ impl Emitter {
                     self.float(index, b)?,
                     self.float(index, c)?,
                 );
+                if dnz && modes.rounding == 0 {
+                    self.dnz_counts[1] += 1;
+                    let value = self.dnz_fma(a, b, c);
+                    self.float_result(d.0, value, None, modes)?;
+                    return Ok(());
+                }
                 let mut value = self.glsl(self.f32, glsl::FMA, &[a, b, c]);
                 // a*b - value, then + c: the excess's sign.
                 let mut residual = (modes.rounding != 0).then(|| {
@@ -1622,6 +1674,7 @@ impl Emitter {
                     self.exact(op::F_ADD, &[part, c])
                 });
                 if dnz {
+                    self.dnz_counts[2] += 1;
                     // A zero factor: +0 + c, exactly.
                     let zero = self.zero_factor(a, b, modes.flush_to_zero);
                     let plus_zero = self.float_constant(0.0);
@@ -1665,7 +1718,11 @@ impl Emitter {
                     let negated = self.value(op::F_NEGATE, self.f32, &[value]);
                     self.glsl(self.f32, glsl::FMA, &[a, b, negated])
                 });
-                if dnz {
+                if dnz && modes.rounding == 0 && scale == 4 {
+                    self.dnz_counts[0] += 1;
+                    value = self.dnz_product(a, b, value);
+                } else if dnz {
+                    self.dnz_counts[2] += 1;
                     // A zero factor: +0, whatever the other (Inf, NaN).
                     let zero = self.zero_factor(a, b, modes.flush_to_zero);
                     let plus_zero = self.float_constant(0.0);

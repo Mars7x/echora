@@ -10,7 +10,10 @@
 //! runtime does and translated against the state their own control
 //! section gives. Then the device features the translated programs need
 //! beyond core Vulkan (`echora_shader::requirements`), each with how many
-//! programs need it and one that does (key and instruction offset).
+//! programs need it and one that does (key and instruction offset), and
+//! the `.DNZ` multiplies by how they are written. `SURVEY_KEYS=KEY,...`
+//! also prints, for each of those programs, its SPIR-V words and `.DNZ`
+//! multiplies.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +30,9 @@ fn main() {
     let mut fallback_masks: BTreeMap<u8, u32> = BTreeMap::new();
     let mut fallback_third: Vec<String> = Vec::new();
     let (mut total, mut translated, mut unread) = (0u32, 0u32, 0u32);
+    let mut dnz = [0u32; 3];
+    let keys = std::env::var("SURVEY_KEYS").unwrap_or_default();
+    let keys: Vec<&str> = keys.split(',').filter(|key| !key.is_empty()).collect();
     let (mut mesh_count, mut task_count) = (0u32, 0u32);
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
         .expect("read the directory")
@@ -141,6 +147,16 @@ fn main() {
         match echora_shader::translate_with_needs(&code, &parameters, &options) {
             Ok((program, program_needs)) => {
                 translated += 1;
+                for (total, count) in dnz.iter_mut().zip(program_needs.dnz) {
+                    *total += count;
+                }
+                if keys.iter().any(|wanted| key.starts_with(wanted)) {
+                    let [fmul, ffma, kept] = program_needs.dnz;
+                    println!(
+                        "{key}: {} SPIR-V words; .DNZ: {fmul} FMUL as fmulz, {ffma} FFMA as ffmaz, {kept} with a select",
+                        program.spirv.len()
+                    );
+                }
                 txq_inferred += program_needs.txq_views.0;
                 txq_fallback += program_needs.txq_views.1;
                 for &(mask, offset) in &program_needs.txq_fallbacks {
@@ -204,6 +220,10 @@ fn main() {
     for example in &fallback_third {
         println!("        fallback reading component 2: {example}");
     }
+    println!(
+        ".DNZ multiplies: {} FMUL as fmulz, {} FFMA as ffmaz, {} with a select (rounding or scale)",
+        dnz[0], dnz[1], dnz[2]
+    );
     println!("device features needed beyond core Vulkan 1.3:");
     for (feature, (count, reason, example)) in needed {
         println!("{count:6}  {feature}: {reason}  (e.g. {example})");

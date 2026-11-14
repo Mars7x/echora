@@ -27,11 +27,12 @@ pub(super) struct Memory {
     shared: Option<u32>,
     local: Option<u32>,
     /// The page-table cache key of the global address just formed (its
-    /// uniform base register), which `mapped` takes.
-    page_key: Option<u8>,
-    /// Per function and uniform base register: the variables holding the
-    /// last page looked up through that base and its device base.
-    page_cache: std::collections::BTreeMap<(u32, u8), (u32, u32)>,
+    /// base: a uniform register, else 0x100 plus the general register),
+    /// which `mapped` takes.
+    page_key: Option<u16>,
+    /// Per function and base: the variables holding the last page looked
+    /// up through that base and its device base.
+    page_cache: std::collections::BTreeMap<(u32, u16), (u32, u32)>,
 }
 
 /// SPIR-V's memory-access operands for an aligned access, and a volatile
@@ -621,16 +622,22 @@ impl Emitter {
             let offset = self.constant64(i64::from(address.offset) as u64);
             sum = self.value(op::I_ADD, u64, &[sum, offset]);
         }
-        // Accesses relative to one uniform base mostly stay in a page: the
-        // lookup of the last such page is kept for them (see `mapped`).
-        self.memory.page_key = address.uniform.map(|(uniform, _)| uniform.0);
+        // Accesses relative to one base (a uniform register, else the
+        // general register) mostly stay in a page: the lookup of the last
+        // such page is kept for them (see `mapped`). The cache compares
+        // pages, so any key is exact; the key only chooses which accesses
+        // share one.
+        self.memory.page_key = Some(match address.uniform {
+            Some((uniform, _)) => u16::from(uniform.0),
+            None => 0x100 | u16::from(address.reg.0),
+        });
         sum
     }
 
-    /// The variables caching the last page looked up through uniform base
-    /// `key` in the current function and its device base (no page yet:
-    /// u64::MAX, which no page number reaches).
-    fn page_cache(&mut self, key: u8) -> (u32, u32) {
+    /// The variables caching the last page looked up through base `key` in
+    /// the current function and its device base (no page yet: u64::MAX,
+    /// which no page number reaches).
+    fn page_cache(&mut self, key: u16) -> (u32, u32) {
         let function = self.function.block().0;
         if let Some(&variables) = self.memory.page_cache.get(&(function, key)) {
             return variables;
@@ -695,14 +702,14 @@ impl Emitter {
         })
     }
 
-    /// `mapped` for an address relative to uniform base `key`: the page's
+    /// `mapped` for an address relative to base `key`: the page's
     /// lookup is reused when the last page looked up through that base is
     /// the same (it was inside the table and mapped, and the table does
     /// not change during the program), else made and kept.
     #[allow(clippy::too_many_arguments)]
     fn mapped_cached(
         &mut self,
-        key: u8,
+        key: u16,
         va: u32,
         page: u32,
         relative: u32,

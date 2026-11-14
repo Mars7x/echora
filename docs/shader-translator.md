@@ -467,6 +467,38 @@ of which only the 32-bit operation and about 20 integer tests run without
 denormals. The runtime does not turn the flag on yet. The simulator models a flushing host with
 `Inputs::flush_denormals32` and runs 64-bit floats.
 
+**`.DNZ` multiplies.** FMUL and FFMA with `.DNZ` (NAK's `fmulz`/`ffmaz`)
+give +0 (FFMA: `+0 + c`) when a factor is zero, whatever the other (Inf,
+NaN). Without a rounding mode or an FMUL scale they are written in the
+shapes Mesa's `nir_opt_algebraic` turns into its `fmulz` and `ffmaz` (RADV:
+`has_fmulz` always, `has_ffmaz_no_denorms` from GFX10.3; AMD's
+`v_mul_legacy_f32`/`v_fma_legacy_f32`): FMUL as
+`NMin(|a|, |b|) == 0 ? +0 : a * b`, FFMA as
+`Fma(b == 0 ? 0 : a, a == 0 ? 0 : b, c + 0)` (`c + 0` is `c` but for -0, so
+a zero factor gives `+0 + c` exactly; the other operands and the fused sum
+are unchanged). Both are exact in Vulkan's semantics, whatever the driver
+does with them. With `.FTZ` a subnormal factor counts as zero where the
+host flushes 32-bit denormals, as for every other `.FTZ` operation (above);
+the earlier `|x| < smallest normal` test, which no pattern matches, is gone.
+Those with a rounding mode or a scale keep a select on the result.
+`Needs::dnz` counts them (the survey example totals them; `SURVEY_KEYS`
+prints them per program). That the patterns fire is read from Mesa's source
+(the FMUL shape needs no fast-math flag; the FFMA one needs `nsz`, which
+SPIR-V without `SignedZeroInfNanPreserve` gives), not measured on a device.
+GLSL.std.450 `Fma` itself is NIR's `ffma_weak`: fused where the GPU has no
+MAD32 (GFX10.3 and later, RDNA2 such as the Steam Deck), split into a
+multiply and an add on older AMD GPUs or with RADV's `split_fma`
+workaround; `OpFmaKHR` (VK_KHR_shader_fma, which RADV exposes) would be
+fused everywhere.
+
+**Page lookups.** A global access looks its page up in the page table
+(bounds, a 64-bit entry load, the mapped test). The last page looked up
+through each base (a uniform register, else the general register the
+address starts from) and its device base are kept in function variables:
+an access whose page is that page reuses them, compared at run time, so
+the reuse is exact for any address and the key only decides which accesses
+share a cache.
+
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
 plain structured code, so the output aims for that:
 

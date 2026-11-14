@@ -6875,6 +6875,174 @@ mod tests {
     }
 
     #[test]
+    fn dnz_multiplies_match_the_hardware_rule_on_every_special_operand() {
+        // FMUL.DNZ R3, R0, R1 and FFMA.DNZ R4, R0, R1, R2, with and without
+        // .FTZ (a flushing host for .FTZ, an IEEE one without): a zero factor
+        // gives +0 (+0 + c), whatever the other; .FTZ flushes subnormal
+        // operands and results to zeros of their sign.
+        let program = |ftz: u128| {
+            vec![
+                word(&[
+                    (0, 12, 0x220),
+                    (16, 8, 3),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (76, 1, 1),
+                    (80, 1, ftz),
+                    (84, 3, 4),
+                ]),
+                word(&[
+                    (0, 12, 0x223),
+                    (16, 8, 4),
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (64, 8, 2),
+                    (76, 1, 1),
+                    (80, 1, ftz),
+                ]),
+            ]
+        };
+        let specials: Vec<f32> = [
+            0.0,
+            -0.0,
+            1.0,
+            -2.5,
+            f32::MIN_POSITIVE,
+            -f32::from_bits(1),
+            f32::from_bits(0x0040_0000),
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1e-30,
+        ]
+        .into();
+        for ftz in [false, true] {
+            let words: Vec<u128> = program(u128::from(ftz));
+            let mut cases = Vec::new();
+            for &a in &specials {
+                for &b in &specials {
+                    for &c in &[0.0f32, -0.0, 1.5, -f32::from_bits(3), f32::INFINITY] {
+                        cases.push((a, b, c));
+                    }
+                }
+            }
+            let flush = |x: f32| {
+                if ftz && x.is_subnormal() {
+                    0.0f32.copysign(x)
+                } else {
+                    x
+                }
+            };
+            let mut mismatches = Vec::new();
+            for &(a, b, c) in &cases {
+                let mut code: Vec<u128> = [a, b, c]
+                    .iter()
+                    .enumerate()
+                    .map(|(n, x)| mov(n as u128, x.to_bits()))
+                    .collect();
+                code.extend_from_slice(&words);
+                code.push(EXIT);
+                let decoded: Vec<_> = code.iter().map(|&raw| decode(raw)).collect();
+                let (translated, registers, _) =
+                    translate_with_registers(&decoded, &Layout::workgroup([1, 1, 1])).unwrap();
+                let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                    workgroup_count: [1, 1, 1],
+                    flush_denormals32: ftz,
+                    ..Inputs::default()
+                });
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                let got = |n: u8| report.invocations[0][&registers[&n]][0] as u32;
+                let (fa, fb, fc) = (flush(a), flush(b), flush(c));
+                let zero = fa == 0.0 || fb == 0.0;
+                let product = flush(if zero { 0.0 } else { fa * fb });
+                let sum = flush(if zero { 0.0 + fc } else { fa.mul_add(fb, fc) });
+                for (register, expected, name) in [(3, product, "FMUL"), (4, sum, "FFMA")] {
+                    let value = got(register);
+                    let same = if expected.is_nan() {
+                        f32::from_bits(value).is_nan()
+                    } else {
+                        value == expected.to_bits()
+                    };
+                    if !same {
+                        mismatches.push(format!(
+                            "{name}.DNZ ftz {ftz}: {a:e} {b:e} {c:e} gave {value:#x}, expected {:#x}",
+                            expected.to_bits()
+                        ));
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
+        }
+    }
+
+    #[test]
+    fn dnz_multiplies_take_the_shapes_mesa_turns_into_fmulz_and_ffmaz() {
+        // FMUL.DNZ.FTZ R3, R0, R1; FFMA.DNZ.FTZ R4, R0, R1, R2.
+        let words = [
+            word(&[
+                (0, 12, 0x220),
+                (16, 8, 3),
+                (24, 8, 0),
+                (32, 8, 1),
+                (76, 1, 1),
+                (80, 1, 1),
+                (84, 3, 4),
+            ]),
+            word(&[
+                (0, 12, 0x223),
+                (16, 8, 4),
+                (24, 8, 0),
+                (32, 8, 1),
+                (64, 8, 2),
+                (76, 1, 1),
+                (80, 1, 1),
+            ]),
+            EXIT,
+        ];
+        let code: Vec<_> = words.iter().map(|&raw| decode(raw)).collect();
+        let (translated, needs) =
+            crate::compute::translate_with_needs(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(needs.dnz, [1, 1, 0]);
+        // Each instruction: (opcode, operands), and GLSL.std.450 extended
+        // instructions by number.
+        let words = &translated.spirv;
+        let mut at = 5;
+        let (mut opcodes, mut extended) = (Vec::new(), Vec::new());
+        let mut definitions: HashMap<u32, (u16, Vec<u32>)> = HashMap::new();
+        while at < words.len() {
+            let count = (words[at] >> 16) as usize;
+            let opcode = words[at] as u16;
+            let operands = words[at + 1..at + count].to_vec();
+            if opcode == op::EXT_INST {
+                extended.push(operands[3]);
+            }
+            if matches!(
+                opcode,
+                op::EXT_INST | op::SELECT | op::F_ORD_EQUAL | op::F_ADD
+            ) {
+                definitions.insert(operands[1], (opcode, operands.clone()));
+            }
+            opcodes.push(opcode);
+            at += count;
+        }
+        let glsl_count = |number: u32| extended.iter().filter(|&&n| n == number).count();
+        // fmulz: select(NMin(FAbs a, FAbs b) == 0, 0, a * b); no subnormal
+        // test is left.
+        assert_eq!(glsl_count(glsl::N_MIN), 1);
+        assert_eq!(glsl_count(glsl::F_ABS), 2);
+        assert!(!opcodes.contains(&op::F_ORD_LESS_THAN));
+        assert!(!opcodes.contains(&op::LOGICAL_OR));
+        // ffmaz: Fma(select, select, c + 0).
+        let fma = definitions
+            .values()
+            .find(|(opcode, operands)| *opcode == op::EXT_INST && operands[3] == glsl::FMA)
+            .expect("an Fma");
+        let kinds: Vec<u16> = fma.1[4..].iter().map(|id| definitions[id].0).collect();
+        assert_eq!(kinds, [op::SELECT, op::SELECT, op::F_ADD]);
+    }
+
+    #[test]
     fn multiplies_with_dnz_make_zero_factors_give_plus_zero() {
         let (inf, nan) = (f32::INFINITY.to_bits(), f32::NAN.to_bits());
         let float = |x: f32| x.to_bits();
@@ -10194,6 +10362,71 @@ mod tests {
             .flat_map(|e| e.to_le_bytes())
             .collect();
         // Device word at byte b of page p: 0x1000 p + b.
+        let page = |p: u64| -> Vec<u8> {
+            (0..0x400u32)
+                .flat_map(|w| (0x1000 * p as u32 + 4 * w).to_le_bytes())
+                .collect()
+        };
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory: BTreeMap::from([(table, entries), (device[0], page(0)), (device[1], page(1))]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let expected = [0x0u32, 0x8, 0x1004, 0x10, 0, 0x14];
+        for (n, &value) in expected.iter().enumerate() {
+            let got = report.invocations[0][&registers[&(12 + n as u8)]][0] as u32;
+            assert_eq!(got, value, "load {n} at offset {:#x}", offsets[n]);
+        }
+        assert_eq!(report.unmapped_pages, BTreeMap::from([(0x12, 1)]));
+    }
+
+    #[test]
+    fn loads_relative_to_a_register_base_reuse_the_last_page_s_lookup_exactly() {
+        use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
+        // MOV R4, base (0x10 pages up); MOV R5, 0; then LDG.E.64-address
+        // R(12 + n), [R4.64 + offset]: pages 0x10, 0x10, 0x11, 0x10 again,
+        // 0x12 (unmapped: zero), 0x10. Each word is the device word at its
+        // page's base plus the offset within it, whether the lookup was
+        // reused or made.
+        let base = 0x10u32 << PAGE_SHIFT;
+        let offsets = [0x0u32, 0x8, 0x1004, 0x10, 0x2000, 0x14];
+        let mut program = vec![mov(4, base), mov(5, 0)];
+        for (n, &offset) in offsets.iter().enumerate() {
+            program.push(word(&[
+                (0, 12, 0x381),
+                (16, 8, 12 + n as u128),
+                (24, 8, 4),
+                (40, 24, u128::from(offset)),
+                (72, 1, 1),
+                (73, 3, 4),
+            ]));
+        }
+        program.push(EXIT);
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        // The cache's "no page yet" (u64::MAX) is in the module: the loads
+        // went through it.
+        assert!(
+            translated
+                .spirv
+                .windows(2)
+                .any(|pair| pair == [u32::MAX, u32::MAX])
+        );
+        let table = 0x2000_0000u64;
+        let device = [0x3000_0000u64, 0x3000_1000];
+        let mut push = vec![0u8; 128];
+        let at = PUSH_PAGE_TABLE_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&3u32.to_le_bytes());
+        let entries: Vec<u8> = [device[0], device[1], 0]
+            .iter()
+            .flat_map(|e| e.to_le_bytes())
+            .collect();
         let page = |p: u64| -> Vec<u8> {
             (0..0x400u32)
                 .flat_map(|w| (0x1000 * p as u32 + 4 * w).to_le_bytes())
