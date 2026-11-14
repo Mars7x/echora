@@ -2095,7 +2095,13 @@ impl Nvn {
         }
         let mut entries = Vec::new();
         for handle in handles {
-            if let Some((source, sampler_state)) = self.binding_memo.1.get(&handle) {
+            if let Some((source, sampler_state, _)) =
+                self.binding_memo.1.get(&handle).filter(|(.., storage)| {
+                    !storage
+                        .as_ref()
+                        .is_some_and(|storage| self.gpu_writes_pending(storage))
+                })
+            {
                 entries.push(echora_gpu::pool::PoolEntry {
                     texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                     sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -2113,18 +2119,22 @@ impl Nvn {
             };
             // As the draw path does before it memoizes: GPU-written
             // bytes under the texture come back first.
-            if let (Some(base), Some(size)) = (
+            let storage = match (
                 self.texture_storage(texture),
                 self.texture_storage_size(texture),
             ) {
-                self.resolve_storage(core, Some(base..base + size))?;
+                (Some(base), Some(size)) => Some(base..base + size),
+                _ => None,
+            };
+            if let Some(storage) = &storage {
+                self.resolve_storage(core, Some(storage.clone()))?;
             }
             let source = self.texture_source(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, &source);
             self.binding_memo
                 .1
-                .insert(handle, (source.clone(), sampler_state));
+                .insert(handle, (source.clone(), sampler_state, storage));
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                 sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -4801,6 +4811,27 @@ impl Nvn {
     /// (`None`), or, when any overlaps `range`, all of them (results come
     /// back in dispatch order, so an earlier one never lands on a later).
     #[track_caller]
+    /// Whether GPU writes not yet in guest memory overlap `range` (what
+    /// `resolve_storage` would bring back there).
+    fn gpu_writes_pending(&self, range: &std::ops::Range<u64>) -> bool {
+        let Some(backend) = self.gpu.as_ref() else {
+            return false;
+        };
+        let overlaps =
+            |written: &std::ops::Range<u64>| written.start < range.end && range.start < written.end;
+        backend.in_place_writes.iter().any(overlaps)
+            || backend
+                .pending_storage
+                .iter()
+                .any(|(_, guest, ..)| overlaps(guest))
+            || backend.resident.values().any(|pool| {
+                let at = pool
+                    .gpu_dirty
+                    .partition_point(|dirty| dirty.end <= range.start);
+                pool.gpu_dirty.get(at).is_some_and(overlaps)
+            })
+    }
+
     pub(super) fn resolve_storage(
         &mut self,
         core: &mut Guest,
@@ -7294,7 +7325,13 @@ impl Nvn {
                             }
                             self.binding_memo = (stamp, Default::default());
                         }
-                        if let Some((source, sampler)) = self.binding_memo.1.get(&handle) {
+                        if let Some((source, sampler, _)) =
+                            self.binding_memo.1.get(&handle).filter(|(.., storage)| {
+                                !storage
+                                    .as_ref()
+                                    .is_some_and(|storage| self.gpu_writes_pending(storage))
+                            })
+                        {
                             textures
                                 .insert((index, descriptor.binding), (source.clone(), *sampler));
                             memo_hits += 1;
@@ -7313,11 +7350,15 @@ impl Nvn {
                                 descriptor.binding
                             )
                         })?;
-                        if let (Some(base), Some(size)) = (
+                        let storage = match (
                             self.texture_storage(texture),
                             self.texture_storage_size(texture),
                         ) {
-                            self.resolve_storage(core, Some(base..base + size))?;
+                            (Some(base), Some(size)) => Some(base..base + size),
+                            _ => None,
+                        };
+                        if let Some(storage) = &storage {
+                            self.resolve_storage(core, Some(storage.clone()))?;
                         }
                         let source = self.texture_source(core, texture)?;
                         texture_time += started.elapsed();
@@ -7331,7 +7372,7 @@ impl Nvn {
                         let sampler = self.binding_sampler(handle, &source);
                         self.binding_memo
                             .1
-                            .insert(handle, (source.clone(), sampler));
+                            .insert(handle, (source.clone(), sampler, storage));
                         textures.insert((index, descriptor.binding), (source, sampler));
                     }
                     other => {
