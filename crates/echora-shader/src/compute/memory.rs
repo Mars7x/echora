@@ -14,7 +14,7 @@ use echora_shader_abi::{
 };
 
 use super::{Emitter, unsupported};
-use crate::decode::{Address, Pred, Reg, Space};
+use crate::decode::{Address, Instruction, Op, Pred, Reg, Space};
 use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 use echora_shader_abi::Unsupported;
 
@@ -33,6 +33,67 @@ pub(super) struct Memory {
     /// Per function and base: the variables holding the last page looked
     /// up through that base and its device base.
     page_cache: std::collections::BTreeMap<(u32, u16), (u32, u32)>,
+    /// The global accesses (instruction indices) that go through the page
+    /// cache (`cached_accesses`); the others look their page up directly.
+    pub(super) cached: std::collections::BTreeSet<usize>,
+}
+
+/// The page-cache key of a global address: its uniform base register,
+/// else 0x100 plus its general register.
+fn page_key(address: Address) -> u16 {
+    match address.uniform {
+        Some((uniform, _)) => u16::from(uniform.0),
+        None => 0x100 | u16::from(address.reg.0),
+    }
+}
+
+/// The global accesses worth the page cache: those whose base serves at
+/// least two global accesses in their block, a block that branches back to
+/// its own start counting each access twice (its next pass hits). Where a
+/// base serves one access, the cache's load, compare, select and store
+/// cost more than the lookup they might save.
+pub(super) fn cached_accesses(
+    code: &[Instruction],
+    blocks: &[super::Block],
+) -> std::collections::BTreeSet<usize> {
+    let mut cached = std::collections::BTreeSet::new();
+    for block in blocks {
+        let looping =
+            matches!(block.end, super::End::Branch { target, .. } if target == block.start);
+        let mut uses: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+        for (index, instruction) in code
+            .iter()
+            .enumerate()
+            .take(block.body_end)
+            .skip(block.start)
+        {
+            let address = match instruction.op {
+                Op::Load {
+                    space: Space::Global,
+                    address,
+                    ..
+                }
+                | Op::Store {
+                    space: Space::Global,
+                    address,
+                    ..
+                }
+                | Op::Atomic {
+                    space: Space::Global,
+                    address,
+                    ..
+                } => address,
+                _ => continue,
+            };
+            uses.entry(page_key(address)).or_default().push(index);
+        }
+        for indices in uses.into_values() {
+            if indices.len() >= 2 || looping {
+                cached.extend(indices);
+            }
+        }
+    }
+    cached
 }
 
 /// SPIR-V's memory-access operands for an aligned access, and a volatile
@@ -627,10 +688,10 @@ impl Emitter {
         // such page is kept for them (see `mapped`). The cache compares
         // pages, so any key is exact; the key only chooses which accesses
         // share one.
-        self.memory.page_key = Some(match address.uniform {
-            Some((uniform, _)) => u16::from(uniform.0),
-            None => 0x100 | u16::from(address.reg.0),
-        });
+        let index = self.module.site.map(|site| site as usize / 16);
+        self.memory.page_key = index
+            .is_some_and(|index| self.memory.cached.contains(&index))
+            .then(|| page_key(address));
         sum
     }
 

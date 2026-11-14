@@ -205,7 +205,8 @@ pub struct Inputs {
     pub trace: Option<(usize, u32)>,
     /// 32-bit float operations flush denormal operands and results to a
     /// zero of their sign, as RADV and NVK do in a module that declares no
-    /// denormal mode (else they are kept, IEEE's results).
+    /// denormal mode (else they are kept, IEEE's results). A module that
+    /// declares DenormFlushToZero for 32 bits is flushed either way.
     pub flush_denormals32: bool,
 }
 
@@ -612,6 +613,9 @@ pub struct Machine {
     /// 32-bit float operations flush denormal operands and results
     /// (`Inputs::flush_denormals32`, for the run in progress).
     flush32: std::cell::Cell<bool>,
+    /// The module declares DenormFlushToZero for 32 bits: 32-bit
+    /// denormals are flushed whatever `Inputs::flush_denormals32` says.
+    declared_flush32: bool,
     types: HashMap<u32, Ty>,
     /// The result type of each constant.
     result_types: HashMap<u32, u32>,
@@ -978,6 +982,7 @@ impl Machine {
             model: 0,
             step_file: None,
             flush32: std::cell::Cell::new(false),
+            declared_flush32: false,
         };
         let mut entry = 0;
         let mut functions: Vec<(u32, Vec<Instruction>)> = Vec::new();
@@ -1005,6 +1010,12 @@ impl Machine {
                 op::ENTRY_POINT => {
                     machine.model = operands[0];
                     entry = operands[1];
+                }
+                op::EXECUTION_MODE
+                    if operands[1] == execution::DENORM_FLUSH_TO_ZERO
+                        && operands.get(2) == Some(&32) =>
+                {
+                    machine.declared_flush32 = true;
                 }
                 op::EXECUTION_MODE if operands[1] == EXECUTION_LOCAL_SIZE => {
                     machine.local_size = [operands[2], operands[3], operands[4]];
@@ -1910,7 +1921,8 @@ impl Machine {
     }
 
     pub fn simulate(&self, inputs: &Inputs) -> Report {
-        self.flush32.set(inputs.flush_denormals32);
+        self.flush32
+            .set(inputs.flush_denormals32 || self.declared_flush32);
         let [x, y, z] = self.local_size;
         let quad = inputs.quad.len() == 4;
         let count = if quad { 4 } else { (x * y * z) as usize };
@@ -6877,9 +6889,11 @@ mod tests {
     #[test]
     fn dnz_multiplies_match_the_hardware_rule_on_every_special_operand() {
         // FMUL.DNZ R3, R0, R1 and FFMA.DNZ R4, R0, R1, R2, with and without
-        // .FTZ (a flushing host for .FTZ, an IEEE one without): a zero factor
-        // gives +0 (+0 + c), whatever the other; .FTZ flushes subnormal
-        // operands and results to zeros of their sign.
+        // .FTZ: a zero factor gives +0 (+0 + c), whatever the other; .FTZ
+        // flushes subnormal operands and results to zeros of their sign.
+        // Without .FTZ on an IEEE host; with it on an IEEE host where the
+        // module declares the flush (`Options::denorm_flush_32`), else on a
+        // flushing host.
         let program = |ftz: u128| {
             vec![
                 word(&[
@@ -6917,7 +6931,8 @@ mod tests {
             1e-30,
         ]
         .into();
-        for ftz in [false, true] {
+        for (ftz, declared) in [(false, false), (false, true), (true, true), (true, false)] {
+            let host_flush = ftz && !declared;
             let words: Vec<u128> = program(u128::from(ftz));
             let mut cases = Vec::new();
             for &a in &specials {
@@ -6944,11 +6959,15 @@ mod tests {
                 code.extend_from_slice(&words);
                 code.push(EXIT);
                 let decoded: Vec<_> = code.iter().map(|&raw| decode(raw)).collect();
+                let layout = Layout {
+                    denorm_flush_32: declared,
+                    ..Layout::workgroup([1, 1, 1])
+                };
                 let (translated, registers, _) =
-                    translate_with_registers(&decoded, &Layout::workgroup([1, 1, 1])).unwrap();
+                    translate_with_registers(&decoded, &layout).unwrap();
                 let report = Machine::new(&translated.spirv).simulate(&Inputs {
                     workgroup_count: [1, 1, 1],
-                    flush_denormals32: ftz,
+                    flush_denormals32: host_flush,
                     ..Inputs::default()
                 });
                 assert!(report.problems.is_empty(), "{:?}", report.problems);
@@ -6966,7 +6985,7 @@ mod tests {
                     };
                     if !same {
                         mismatches.push(format!(
-                            "{name}.DNZ ftz {ftz}: {a:e} {b:e} {c:e} gave {value:#x}, expected {:#x}",
+                            "{name}.DNZ ftz {ftz} declared {declared}: {a:e} {b:e} {c:e} gave {value:#x}, expected {:#x}",
                             expected.to_bits()
                         ));
                     }
@@ -6978,8 +6997,9 @@ mod tests {
 
     #[test]
     fn dnz_multiplies_take_the_shapes_mesa_turns_into_fmulz_and_ffmaz() {
-        // FMUL.DNZ.FTZ R3, R0, R1; FFMA.DNZ.FTZ R4, R0, R1, R2.
-        let words = [
+        // FMUL.DNZ.FTZ R3, R0, R1; FFMA.DNZ.FTZ R4, R0, R1, R2; with
+        // `extra`, an FADD without .FTZ (R5 = R0 + R1) before them.
+        let dnz = [
             word(&[
                 (0, 12, 0x220),
                 (16, 8, 3),
@@ -6998,48 +7018,85 @@ mod tests {
                 (76, 1, 1),
                 (80, 1, 1),
             ]),
-            EXIT,
         ];
-        let code: Vec<_> = words.iter().map(|&raw| decode(raw)).collect();
-        let (translated, needs) =
-            crate::compute::translate_with_needs(&code, &Layout::workgroup([1, 1, 1])).unwrap();
-        assert_eq!(needs.dnz, [1, 1, 0]);
-        // Each instruction: (opcode, operands), and GLSL.std.450 extended
-        // instructions by number.
-        let words = &translated.spirv;
-        let mut at = 5;
-        let (mut opcodes, mut extended) = (Vec::new(), Vec::new());
-        let mut definitions: HashMap<u32, (u16, Vec<u32>)> = HashMap::new();
-        while at < words.len() {
-            let count = (words[at] >> 16) as usize;
-            let opcode = words[at] as u16;
-            let operands = words[at + 1..at + count].to_vec();
-            if opcode == op::EXT_INST {
-                extended.push(operands[3]);
+        let fadd = word(&[(0, 12, 0x221), (16, 8, 5), (24, 8, 0), (32, 8, 1)]);
+        // (needs.dnz, GLSL extended instructions by number, opcodes, the
+        // module's DenormFlushToZero 32 execution modes, the Fma's operand
+        // kinds).
+        let translate = |flush: bool, float64: bool, extra: bool| {
+            let mut words = Vec::new();
+            if extra {
+                words.push(fadd);
             }
-            if matches!(
-                opcode,
-                op::EXT_INST | op::SELECT | op::F_ORD_EQUAL | op::F_ADD
-            ) {
-                definitions.insert(operands[1], (opcode, operands.clone()));
+            words.extend(dnz);
+            words.push(EXIT);
+            let code: Vec<_> = words.iter().map(|&raw| decode(raw)).collect();
+            let layout = Layout {
+                denorm_flush_32: flush,
+                float64,
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (translated, needs) = crate::compute::translate_with_needs(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let words = &translated.spirv;
+            let mut at = 5;
+            let (mut opcodes, mut extended, mut modes) = (Vec::new(), Vec::new(), 0);
+            let mut definitions: HashMap<u32, (u16, Vec<u32>)> = HashMap::new();
+            while at < words.len() {
+                let count = (words[at] >> 16) as usize;
+                let opcode = words[at] as u16;
+                let operands = words[at + 1..at + count].to_vec();
+                if opcode == op::EXT_INST {
+                    extended.push(operands[3]);
+                }
+                if opcode == op::EXECUTION_MODE
+                    && operands[1] == crate::spirv::execution::DENORM_FLUSH_TO_ZERO
+                    && operands[2] == 32
+                {
+                    modes += 1;
+                }
+                if matches!(
+                    opcode,
+                    op::EXT_INST | op::SELECT | op::F_ORD_EQUAL | op::F_ADD
+                ) {
+                    definitions.insert(operands[1], (opcode, operands.clone()));
+                }
+                opcodes.push(opcode);
+                at += count;
             }
-            opcodes.push(opcode);
-            at += count;
-        }
-        let glsl_count = |number: u32| extended.iter().filter(|&&n| n == number).count();
-        // fmulz: select(NMin(FAbs a, FAbs b) == 0, 0, a * b); no subnormal
-        // test is left.
-        assert_eq!(glsl_count(glsl::N_MIN), 1);
-        assert_eq!(glsl_count(glsl::F_ABS), 2);
+            let fma = definitions
+                .values()
+                .find(|(opcode, operands)| *opcode == op::EXT_INST && operands[3] == glsl::FMA)
+                .expect("an Fma");
+            let kinds: Vec<u16> = fma.1[4..]
+                .iter()
+                .map(|id| definitions.get(id).map_or(0, |d| d.0))
+                .collect();
+            (needs.dnz, extended, opcodes, modes, kinds)
+        };
+        // With the declared flush: fmulz as select(NMin(FAbs a, FAbs b) ==
+        // 0, 0, a * b) and ffmaz as Fma(select, select, c + 0), no
+        // subnormal test, and the module flushes 32-bit denormals.
+        let (dnz_counts, extended, opcodes, modes, kinds) = translate(true, false, false);
+        assert_eq!(dnz_counts, [1, 1, 0]);
+        assert_eq!(extended.iter().filter(|&&n| n == glsl::N_MIN).count(), 1);
+        assert_eq!(extended.iter().filter(|&&n| n == glsl::F_ABS).count(), 2);
         assert!(!opcodes.contains(&op::F_ORD_LESS_THAN));
         assert!(!opcodes.contains(&op::LOGICAL_OR));
-        // ffmaz: Fma(select, select, c + 0).
-        let fma = definitions
-            .values()
-            .find(|(opcode, operands)| *opcode == op::EXT_INST && operands[3] == glsl::FMA)
-            .expect("an Fma");
-        let kinds: Vec<u16> = fma.1[4..].iter().map(|id| definitions[id].0).collect();
+        assert_eq!(modes, 1);
         assert_eq!(kinds, [op::SELECT, op::SELECT, op::F_ADD]);
+        // Without it: the explicit subnormal tests, nothing declared.
+        let (dnz_counts, _, opcodes, modes, _) = translate(false, false, false);
+        assert_eq!(dnz_counts, [0, 0, 2]);
+        assert!(opcodes.contains(&op::F_ORD_LESS_THAN));
+        assert_eq!(modes, 0);
+        // A non-.FTZ FADD that keeps denormals through f64: no flush is
+        // declared, so the explicit tests stay; without float64 it does
+        // not keep them and the flush is declared.
+        let (dnz_counts, _, _, modes, _) = translate(true, true, true);
+        assert_eq!((dnz_counts, modes), ([0, 0, 2], 0));
+        let (dnz_counts, _, _, modes, _) = translate(true, false, true);
+        assert_eq!((dnz_counts, modes), ([1, 1, 0], 1));
     }
 
     #[test]
@@ -10445,6 +10502,44 @@ mod tests {
             assert_eq!(got, value, "load {n} at offset {:#x}", offsets[n]);
         }
         assert_eq!(report.unmapped_pages, BTreeMap::from([(0x12, 1)]));
+    }
+
+    #[test]
+    fn the_page_cache_is_kept_only_for_bases_used_again_in_their_block() {
+        // LDG.E R12, [R4.64]: once in a straight block (no cache), and in a
+        // block that loops to itself (cached: its next pass hits).
+        let load = word(&[
+            (0, 12, 0x381),
+            (16, 8, 12),
+            (24, 8, 4),
+            (72, 1, 1),
+            (73, 3, 4),
+        ]);
+        let caches = |words: &[u128]| {
+            let code: Vec<_> = words.iter().map(|&raw| decode(raw)).collect();
+            let translated =
+                crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            // The cache's "no page yet" (u64::MAX).
+            translated
+                .spirv
+                .windows(2)
+                .any(|pair| pair == [u32::MAX, u32::MAX])
+        };
+        assert!(!caches(&[mov(4, 0x10000), mov(5, 0), load, EXIT]));
+        // 0-3: MOVs (R0 = 0, R1 = 3, R4/R5 the address); 4: LDG; 5: IADD3
+        // R0, R0, 1; 6: ISETP.LT P0, R0, R1; 7: @P0 BRA 4.
+        assert!(caches(&[
+            mov(0, 0),
+            mov(1, 3),
+            mov(4, 0x10000),
+            mov(5, 0),
+            load,
+            add(0, 0, 1),
+            less(0, 0, 1),
+            bra(7, 4, 0),
+            EXIT,
+        ]));
     }
 
     #[test]

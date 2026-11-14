@@ -476,11 +476,21 @@ shapes Mesa's `nir_opt_algebraic` turns into its `fmulz` and `ffmaz` (RADV:
 `NMin(|a|, |b|) == 0 ? +0 : a * b`, FFMA as
 `Fma(b == 0 ? 0 : a, a == 0 ? 0 : b, c + 0)` (`c + 0` is `c` but for -0, so
 a zero factor gives `+0 + c` exactly; the other operands and the fused sum
-are unchanged). Both are exact in Vulkan's semantics, whatever the driver
-does with them. With `.FTZ` a subnormal factor counts as zero where the
-host flushes 32-bit denormals, as for every other `.FTZ` operation (above);
-the earlier `|x| < smallest normal` test, which no pattern matches, is gone.
-Those with a rounding mode or a scale keep a select on the result.
+are unchanged). Without `.FTZ` both are exact as IEEE arithmetic. With
+`.FTZ` a subnormal factor must count as zero, which the `== 0` tests give
+only where 32-bit denormals are flushed: they are used only with
+`Options::denorm_flush_32` (the runtime sets it from the device's
+shaderDenormFlushToZeroFloat32, with denormBehaviorIndependence
+32_BIT_ONLY or ALL; RADV reports both), and the module then declares
+`OpExecutionMode DenormFlushToZero 32` (capability DenormFlushToZero; core
+in SPIR-V 1.4), so it is exact on any such driver rather than through
+RADV's default. Without the option, or in a program with a non-`.FTZ`
+operation that keeps denormals through f64 (`Options::float64`), `.FTZ`
+`.DNZ` multiplies keep the explicit `|x| < smallest normal` select. The
+declaration also flushes the program's rare non-`.FTZ` 32-bit operations
+(0.02% of the game's), which RADV and NVK already flush by default. Those
+with a rounding mode or a scale keep a select on the result. The simulator
+flushes 32-bit denormals in a module that declares it.
 `Needs::dnz` counts them (the survey example totals them; `SURVEY_KEYS`
 prints them per program). That the patterns fire is read from Mesa's source
 (the FMUL shape needs no fast-math flag; the FFMA one needs `nsz`, which
@@ -497,7 +507,12 @@ through each base (a uniform register, else the general register the
 address starts from) and its device base are kept in function variables:
 an access whose page is that page reuses them, compared at run time, so
 the reuse is exact for any address and the key only decides which accesses
-share a cache.
+share a cache. Only accesses whose base serves at least two global
+accesses in their block (each counted twice in a block that loops to its
+own start) use it: for a lone access the cache's load, compare, select and
+store cost more than the lookup it might save (measured in game: one
+draw's fragment and vertex programs 8% slower with the cache on every
+access).
 
 **Emission quality.** The driver's optimiser (NIR, ACO) does best on
 plain structured code, so the output aims for that:

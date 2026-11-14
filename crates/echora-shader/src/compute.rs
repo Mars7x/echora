@@ -273,13 +273,41 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     emitter.texture_views = texture_views(code, &emitter.handle_words);
+    emitter.memory.cached = memory::cached_accesses(code, &blocks);
+    // `.FTZ` `.DNZ` multiplies may rely on a declared 32-bit flush, unless
+    // an operation keeps denormals through f64 (`denormal`).
+    emitter.flush32 = layout.denorm_flush_32
+        && !code
+            .iter()
+            .any(|instruction| keeps_denormals(layout, instruction.op));
     // Structured control flow where the graph allows, else the dispatch
     // loop.
     if !emitter.structured(code, &blocks)? {
         emitter.program(code, &blocks)?;
     }
     emitter.mesh_end()?;
+    if emitter.declares_flush32 {
+        emitter.module.capability(capability::DENORM_FLUSH_TO_ZERO);
+        let entry = emitter.entry;
+        emitter
+            .module
+            .execution_mode(entry, execution::DENORM_FLUSH_TO_ZERO, &[32]);
+    }
     Ok(emitter)
+}
+
+/// Whether `op` keeps 32-bit denormals through f64 (the `operation` arms
+/// that take `Emitter::keeping_denormals`).
+fn keeps_denormals(layout: &Layout, op: Op) -> bool {
+    let keeps = |modes: FloatModes| layout.float64 && !modes.flush_to_zero && modes.rounding == 0;
+    match op {
+        Op::Fadd { modes, .. } => keeps(modes),
+        Op::Fmul {
+            modes, scale, dnz, ..
+        } => scale == 4 && !dnz && keeps(modes),
+        Op::Ffma { modes, dnz, .. } => !dnz && keeps(modes),
+        _ => false,
+    }
 }
 
 mod denormal;
@@ -410,6 +438,9 @@ pub struct Layout {
     /// FMUL and FFMA keep denormals exactly through f64 (see `denormal`),
     /// whatever the host does with 32-bit denormals.
     pub float64: bool,
+    /// The host flushes 32-bit denormals where the module declares it
+    /// (`Options::denorm_flush_32`).
+    pub denorm_flush_32: bool,
     /// Fragment programs: colour output 1 is render target 0's second blend
     /// source (Location 0, Index 1; `Options::dual_source_blend`).
     pub dual_source_blend: bool,
@@ -471,6 +502,7 @@ impl Layout {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            denorm_flush_32: false,
             dual_source_blend: false,
         }
     }
@@ -553,6 +585,11 @@ struct Emitter {
     txq_fallbacks: Vec<(u8, u32)>,
     /// `Needs::dnz`.
     dnz_counts: [u32; 3],
+    /// `.FTZ` `.DNZ` multiplies may rely on the module declaring the
+    /// 32-bit flush (`Options::denorm_flush_32`, no f64 denormal path).
+    flush32: bool,
+    /// The module declares DenormFlushToZero for 32 bits.
+    declares_flush32: bool,
     frag_colors: u32,
     push_fields: u32,
     /// A global store or atomic went through the page table
@@ -680,6 +717,8 @@ impl Emitter {
             txq_views: (0, 0),
             txq_fallbacks: Vec::new(),
             dnz_counts: [0; 3],
+            flush32: false,
+            declares_flush32: false,
             frag_colors: 0,
             push_fields: 0,
             page_table_stores: false,
@@ -1296,6 +1335,19 @@ impl Emitter {
         self.value(op::LOGICAL_OR, self.bool, &[a, b])
     }
 
+    /// Whether a `.DNZ` multiply with `modes` takes the zero-test shapes
+    /// (`dnz_product`, `dnz_fma`): without `.FTZ` they are exact as IEEE
+    /// arithmetic; with it only where the module declares the 32-bit
+    /// flush (which this then asks for), else the select tests subnormal
+    /// factors explicitly.
+    fn dnz_shape(&mut self, modes: FloatModes) -> bool {
+        if !modes.flush_to_zero {
+            return true;
+        }
+        self.declares_flush32 |= self.flush32;
+        self.flush32
+    }
+
     /// `product`, which is `a * b`, for a `.DNZ` multiply (NAK's `fmulz`):
     /// +0 when a factor is zero, whatever the other (Inf, NaN). Written
     /// `NMin(|a|, |b|) == 0 ? +0 : a * b`, the shape Mesa's
@@ -1660,7 +1712,7 @@ impl Emitter {
                     self.float(index, b)?,
                     self.float(index, c)?,
                 );
-                if dnz && modes.rounding == 0 {
+                if dnz && modes.rounding == 0 && self.dnz_shape(modes) {
                     self.dnz_counts[1] += 1;
                     let value = self.dnz_fma(a, b, c);
                     self.float_result(d.0, value, None, modes)?;
@@ -1718,7 +1770,7 @@ impl Emitter {
                     let negated = self.value(op::F_NEGATE, self.f32, &[value]);
                     self.glsl(self.f32, glsl::FMA, &[a, b, negated])
                 });
-                if dnz && modes.rounding == 0 && scale == 4 {
+                if dnz && modes.rounding == 0 && scale == 4 && self.dnz_shape(modes) {
                     self.dnz_counts[0] += 1;
                     value = self.dnz_product(a, b, value);
                 } else if dnz {
@@ -3959,6 +4011,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            denorm_flush_32: false,
             dual_source_blend: false,
         };
         let translated = valid_with(&words, &layout);
@@ -4215,6 +4268,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            denorm_flush_32: false,
             dual_source_blend: false,
         };
         valid_with(&words, &layout);
@@ -5112,6 +5166,7 @@ mod tests {
             loop_trace: false,
             vertex_trace: false,
             float64: false,
+            denorm_flush_32: false,
             dual_source_blend: false,
         };
         valid_with(&words, &layout);

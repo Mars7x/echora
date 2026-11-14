@@ -133,6 +133,17 @@ pub struct Options {
     /// FMUL and FFMA keep 32-bit denormals exactly, computed through f64
     /// where denormals occur, on hosts that flush them.
     pub float64: bool,
+    /// The device can flush 32-bit denormals when a module asks
+    /// (VkPhysicalDeviceFloatControlsProperties::
+    /// shaderDenormFlushToZeroFloat32) and sets 32-bit denormal behaviour
+    /// independently of the other widths (denormBehaviorIndependence
+    /// 32_BIT_ONLY or ALL). `.FTZ` `.DNZ` multiplies are then written in
+    /// the shapes Mesa turns into fmulz and ffmaz, and the module declares
+    /// DenormFlushToZero for 32 bits, so they are exact on any such
+    /// driver; without it they keep an explicit subnormal test. Not
+    /// declared in a program whose non-`.FTZ` operations keep denormals
+    /// through f64 (`float64`).
+    pub denorm_flush_32: bool,
 }
 
 /// The task or mesh pipeline state a program is translated against, as the

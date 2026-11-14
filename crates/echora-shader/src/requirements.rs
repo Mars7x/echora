@@ -31,6 +31,10 @@ fn capability_features(capability: u32) -> &'static [(&'static str, &'static str
     match capability {
         capability::FLOAT16 => &[("shaderFloat16", "Float16 (half arithmetic)")],
         capability::FLOAT64 => &[("shaderFloat64", "Float64 (exact denormals through f64)")],
+        capability::DENORM_FLUSH_TO_ZERO => &[(
+            "shaderDenormFlushToZeroFloat32",
+            "DenormFlushToZero (.FTZ .DNZ multiplies as fmulz and ffmaz)",
+        )],
         capability::INT64 => &[("shaderInt64", "Int64 (64-bit addresses and arithmetic)")],
         capability::IMAGE_GATHER_EXTENDED => &[(
             "shaderImageGatherExtended",

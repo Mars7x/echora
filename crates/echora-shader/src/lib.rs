@@ -102,6 +102,7 @@ pub fn translate_with_needs(
             loop_trace: loop_trace(),
             vertex_trace: vertex_trace(),
             float64: options.float64,
+            denorm_flush_32: options.denorm_flush_32,
             dual_source_blend: options.dual_source_blend,
         };
         // Offsets in errors and needs are from the program's start.
@@ -140,6 +141,7 @@ pub fn translate_with_needs(
         loop_trace: loop_trace(),
         vertex_trace: false,
         float64: options.float64,
+        denorm_flush_32: options.denorm_flush_32,
         dual_source_blend: false,
     };
     compute::translate_with_needs(&code, &layout)

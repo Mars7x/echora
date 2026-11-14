@@ -194,6 +194,7 @@ pub mod capability {
     pub const SHADER: u32 = 1;
     pub const FLOAT16: u32 = 9;
     pub const FLOAT64: u32 = 10;
+    pub const DENORM_FLUSH_TO_ZERO: u32 = 4465;
     pub const INT64: u32 = 11;
     pub const IMAGE_GATHER_EXTENDED: u32 = 25;
     pub const MIN_LOD: u32 = 42;
@@ -248,6 +249,7 @@ pub mod execution {
     pub const ORIGIN_UPPER_LEFT: u32 = 7;
     pub const DEPTH_REPLACING: u32 = 12;
     pub const LOCAL_SIZE: u32 = 17;
+    pub const DENORM_FLUSH_TO_ZERO: u32 = 4460;
     pub const TASK_EXT: u32 = 5364;
     pub const MESH_EXT: u32 = 5365;
     pub const OUTPUT_VERTICES: u32 = 26;
