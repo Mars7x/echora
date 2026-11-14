@@ -2517,12 +2517,35 @@ fn vec_fp_arith(
             format!("{float}::from_bits(x).mul_add({float}::from_bits(y), {float}::from_bits(z))"),
             "(zero(x) | zero(y)) & zero(z)",
         ),
+        // A quotient is zero exactly when the dividend is (the divisor is
+        // normal, below).
+        VecFpOp::Div => (
+            format!("{float}::from_bits(x) / {float}::from_bits(y)"),
+            "zero(x)",
+        ),
+        // FRECPS: 2 - n * m, one rounding; FRSQRTS: (3 - n * m) / 2, the
+        // halving exact while the result is normal. A zero result takes
+        // the exact path.
+        VecFpOp::RecipStep => (
+            format!("(-{float}::from_bits(x)).mul_add({float}::from_bits(y), 2.0)"),
+            "false",
+        ),
+        VecFpOp::RSqrtStep => (
+            format!("(-{float}::from_bits(x)).mul_add({float}::from_bits(y), 3.0) * 0.5"),
+            "false",
+        ),
         _ => (
             format!(
                 "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
             ),
             "(zero(x) | zero(y)) & zero(z)",
         ),
+    };
+    // A zero divisor raises DZC: only normal divisors run natively.
+    let divisor = if fp_op == VecFpOp::Div {
+        "normal(y)"
+    } else {
+        "usable(y)"
     };
     let operand_d = if fused {
         format!("let z = (d >> (lane * {width})) as {int}; fast &= usable(z);")
@@ -2536,9 +2559,11 @@ fn vec_fp_arith(
             format!("(1u128 << {}) - 1", lanes * width)
         };
         let closures = whole_vector_closures(width, &mask);
-        let second_usable = match element {
-            Some(_) => "usable(element)".to_owned(),
-            None => "usable_all(v)".to_owned(),
+        let second_usable = match (element, fp_op == VecFpOp::Div) {
+            (Some(_), _) => "usable(element)".to_owned(),
+            (None, false) => "usable_all(v)".to_owned(),
+            // A zero divisor raises DZC: only normal divisors here.
+            (None, true) => "normal_all(v)".to_owned(),
         };
         let lane_z = if fused {
             format!("let z = (d >> (lane * {width})) as {int};")
@@ -2550,10 +2575,11 @@ fn vec_fp_arith(
             "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
              let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
              let zero = |value: {int}| value & !{sign} == 0; \
+             let infinite = |value: {int}| value & !{sign} == {exponent}; \
              let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {closures} \
              let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
              && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable_all(n) && {second_usable}{d_usable}; \
-             let mut out = 0u128; \
+             let mut out = 0u128; let mut overflow = false; \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
              let raw = ({value}).to_bits(); \
@@ -2562,27 +2588,30 @@ fn vec_fp_arith(
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
              let raw = (out >> (lane * {width})) as {int}; \
-             fast &= normal(raw) | (zero(raw) & ({exact})); }} }} \
+             overflow |= infinite(raw); \
+             fast &= normal(raw) | infinite(raw) | (zero(raw) & ({exact})); }} }} \
              let _ = d; \
-             if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+             if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
         );
     }
     format!(
         "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
                  let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
                  let zero = |value: {int}| value & !{sign} == 0; \
+                 let infinite = |value: {int}| value & !{sign} == {exponent}; \
                  let usable = |value: {int}| normal(value) | zero(value); \
                  let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
                  && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
-                 let mut out = 0u128; \
+                 let mut out = 0u128; let mut overflow = false; \
                  for lane in 0..{lanes} {{ \
                  let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; \
-                 fast &= usable(x) & usable(y); {operand_d} \
+                 fast &= usable(x) & {divisor}; {operand_d} \
                  let raw = ({value}).to_bits(); \
-                 fast &= normal(raw) | (zero(raw) & ({exact})); \
+                 overflow |= infinite(raw); \
+                 fast &= normal(raw) | infinite(raw) | (zero(raw) & ({exact})); \
                  out |= u128::from(raw) << (lane * {width}); }} \
                  let _ = d; \
-                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+                 if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
     )
 }
 
@@ -2742,6 +2771,46 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
                  }} else {{\n{call}\n}} }}"
             ))
         }
+        // FCMEQ, FCMGE, FCMGT, FACGE, FACGT of normal-or-zero lanes: exact,
+        // raising nothing (a NaN raises IOC, a denormal IDC under FZ: the
+        // helper takes those), +0 equal to -0 as in IEEE comparison.
+        SimdOp::VecFp {
+            op:
+                fp_op @ (VecFpOp::CmEq | VecFpOp::CmGe | VecFpOp::CmGt | VecFpOp::AcGe | VecFpOp::AcGt),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } if scalar || q || size == FpSize::S => {
+            let (float, int, width, kit) = float_kit(size);
+            let lanes = if scalar {
+                1
+            } else if q {
+                128 / width
+            } else {
+                64 / width
+            };
+            let (abs, test) = match fp_op {
+                VecFpOp::CmEq => ("", "=="),
+                VecFpOp::CmGe => ("", ">="),
+                VecFpOp::CmGt => ("", ">"),
+                VecFpOp::AcGe => (".abs()", ">="),
+                _ => (".abs()", ">"),
+            };
+            let call = emit_call(op)?;
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
+                 let mut fast = {FP_MODE}; let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
+                 fast &= usable(x) & usable(y); \
+                 let hit = {float}::from_bits(x){abs} {test} {float}::from_bits(y){abs}; \
+                 out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }} \
+                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            ))
+        }
         SimdOp::VecFp {
             op: fp_op,
             size,
@@ -2780,7 +2849,14 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
             rm,
         } if matches!(
             fp_op,
-            VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+            VecFpOp::Add
+                | VecFpOp::Sub
+                | VecFpOp::Mul
+                | VecFpOp::MulAdd
+                | VecFpOp::MulSub
+                | VecFpOp::Div
+                | VecFpOp::RecipStep
+                | VecFpOp::RSqrtStep
         ) && (q || size == FpSize::S) =>
         {
             let width = if size == FpSize::S { 32 } else { 64 };

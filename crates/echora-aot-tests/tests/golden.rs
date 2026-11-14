@@ -23,7 +23,7 @@ fn default_emission_is_unchanged() {
 fn inline_vector_emission_is_unchanged() {
     assert_eq!(
         golden::INLINE_VECTOR_OUTPUT,
-        0x6110_55b0_1d16_950e,
+        0x031c_d746_2a89_c52c,
         "{:#018x}",
         golden::INLINE_VECTOR_OUTPUT
     );
