@@ -1314,8 +1314,7 @@ pub fn thunk_index(pc: u64) -> Option<usize> {
 /// fixed set, kept once, so recorded commands carry them without
 /// allocating.
 pub fn intern(name: &str) -> &'static str {
-    static NAMES: std::sync::RwLock<Option<std::collections::HashSet<&'static str>>> =
-        std::sync::RwLock::new(None);
+    static NAMES: std::sync::RwLock<Option<FastSet<&'static str>>> = std::sync::RwLock::new(None);
     if let Some(known) = NAMES
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3793,19 +3792,21 @@ impl Nvn {
     /// A call (`name`) waited for a replay to finish before it ran.
     pub fn note_replay_wait(&mut self, name: &str, time: std::time::Duration) {
         thread_local! {
-            static NAMES: std::cell::RefCell<HashMap<String, (&'static str, &'static str)>> =
-                std::cell::RefCell::new(HashMap::new());
+            static NAMES: std::cell::RefCell<FastMap<String, (&'static str, &'static str)>> =
+                std::cell::RefCell::new(FastMap::default());
         }
+        // Looked up without a new key's allocation once it exists.
         let (count, micros) = NAMES.with(|names| {
-            *names
-                .borrow_mut()
-                .entry(name.to_string())
-                .or_insert_with(|| {
-                    (
-                        Box::leak(format!("stat: replay finished for {name}").into_boxed_str()),
-                        Box::leak(format!("stat: replay finished us for {name}").into_boxed_str()),
-                    )
-                })
+            let mut names = names.borrow_mut();
+            if let Some(known) = names.get(name) {
+                return *known;
+            }
+            *names.entry(name.to_string()).or_insert_with(|| {
+                (
+                    Box::leak(format!("stat: replay finished for {name}").into_boxed_str()),
+                    Box::leak(format!("stat: replay finished us for {name}").into_boxed_str()),
+                )
+            })
         });
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat(count, 1);
@@ -3816,16 +3817,18 @@ impl Nvn {
     /// A guest thread held the NVN state `time` for call `name`.
     pub fn note_held(&mut self, name: &str, time: std::time::Duration) {
         thread_local! {
-            static NAMES: std::cell::RefCell<HashMap<String, &'static str>> =
-                std::cell::RefCell::new(HashMap::new());
+            static NAMES: std::cell::RefCell<FastMap<String, &'static str>> =
+                std::cell::RefCell::new(FastMap::default());
         }
+        // Looked up without a new key's allocation once it exists.
         let key = NAMES.with(|names| {
-            *names
-                .borrow_mut()
-                .entry(name.to_string())
-                .or_insert_with(|| {
-                    Box::leak(format!("stat: nvn held us by {name}").into_boxed_str())
-                })
+            let mut names = names.borrow_mut();
+            if let Some(known) = names.get(name) {
+                return *known;
+            }
+            *names.entry(name.to_string()).or_insert_with(|| {
+                Box::leak(format!("stat: nvn held us by {name}").into_boxed_str())
+            })
         });
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat(key, time.as_micros() as u64);
@@ -5910,7 +5913,7 @@ const TAGGED_STATES: [&str; 6] = [
 /// The contents of tagged state structures by tag (the structure's first
 /// word: content-addressed, so equal states share one): the kind, and
 /// what a Bind of it snapshots (`snapshot_states`), made once per tag.
-type StateTags = HashMap<u32, (String, std::sync::Arc<Vec<BTreeMap<String, Args>>>)>;
+type StateTags = FastMap<u32, (String, std::sync::Arc<Vec<BTreeMap<String, Args>>>)>;
 static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
 
 /// After a setter changed a state structure at `address`: its contents'
@@ -5937,15 +5940,20 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     use std::hash::{Hash, Hasher};
     // The entries themselves are hashed (formatting them for every setter
     // cost more than the setter), and the table is written only for a tag
-    // not seen yet.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // not seen yet. The fast hash is mixed at the end (a 64-bit finalizer),
+    // so the 32 bits kept depend on every word.
+    let mut hasher = FastHasher::default();
     kind.hash(&mut hasher);
     for (name, value) in props {
         name.hash(&mut hasher);
         value.x.hash(&mut hasher);
         value.v.hash(&mut hasher);
     }
-    let tag = (hasher.finish() as u32) | 1;
+    let mut mixed = hasher.finish();
+    mixed = (mixed ^ mixed >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ mixed >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    let tag = (mixed as u32) | 1;
     let known = STATE_TAGS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5955,7 +5963,7 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
         STATE_TAGS
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(FastMap::default)
             .entry(tag)
             .or_insert_with(|| {
                 let mut snapshot = props.clone();
