@@ -1008,7 +1008,7 @@ impl Nvn {
             "present {} objects {} bags {} views {} finalized {} images {} lists {} commands {commands} captured~{}MB recording {}",
             self.presented_frames,
             self.objects.len(),
-            super::read_shared(&self.bags).len(),
+            self.bags.len(),
             self.views.len(),
             self.finalized_storage.len(),
             self.images.len(),

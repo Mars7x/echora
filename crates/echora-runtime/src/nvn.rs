@@ -972,7 +972,45 @@ pub struct Bag {
 
 /// Builder and state bags by guest address, shared with workers that
 /// record command buffers without the NVN state's lock (see `Recorder`).
-type Bags = std::sync::Arc<std::sync::RwLock<BTreeMap<u64, Bag>>>;
+type Bags = std::sync::Arc<BagShards>;
+
+/// The bags in shards by address: state setters on several guest threads
+/// lock only the shard of the structure they set.
+#[derive(Debug, Default)]
+pub struct BagShards([std::sync::RwLock<BTreeMap<u64, Bag>>; 16]);
+
+impl BagShards {
+    /// The shard holding the bag at `address`.
+    fn at(&self, address: u64) -> &std::sync::RwLock<BTreeMap<u64, Bag>> {
+        let mixed = (address >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        &self.0[(mixed >> 60) as usize]
+    }
+
+    /// How many bags there are.
+    fn len(&self) -> usize {
+        self.0.iter().map(|shard| read_shared(shard).len()).sum()
+    }
+
+    /// The first `count` bags of `kind` at `base` or above, by address
+    /// (each shard's first `count`, merged).
+    fn kind_from(&self, base: u64, kind: &str, count: usize) -> Vec<(u64, Bag)> {
+        let mut found: Vec<(u64, Bag)> = self
+            .0
+            .iter()
+            .flat_map(|shard| {
+                read_shared(shard)
+                    .range(base..)
+                    .filter(|(_, bag)| bag.kind == kind)
+                    .take(count)
+                    .map(|(address, bag)| (*address, bag.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        found.sort_by_key(|(address, _)| *address);
+        found.truncate(count);
+        found
+    }
+}
 
 /// A recording command buffer's commands, and the command memory they use
 /// that its object does not count yet (its management calls fold it in).
@@ -1331,7 +1369,8 @@ fn registry_call(
         // nvnBufferInitialize(NVNbuffer*, const NVNbufferBuilder*): Storage
         // is (pool, offset, size) within an initialized pool.
         "nvnBufferInitialize" => {
-            let builder = bag_in(&read_shared(bags), x[1], "BufferBuilder").map_err(invalid)?;
+            let builder =
+                bag_in(&read_shared(bags.at(x[1])), x[1], "BufferBuilder").map_err(invalid)?;
             let device = builder
                 .get("Device")
                 .ok_or_else(|| invalid("builder device was never set".into()))?
@@ -1816,7 +1855,7 @@ impl Nvn {
             // The host queue keeps nothing there; the answer is the sum of
             // the command, compute and control sizes the builder set.
             "nvnQueueBuilderGetQueueMemorySize" => {
-                let bags = read_shared(&self.bags);
+                let bags = read_shared(self.bags.at(this));
                 let bag = bags
                     .get(&this)
                     .filter(|bag| bag.kind == "QueueBuilder")
@@ -2753,7 +2792,7 @@ impl Nvn {
                         self.object(x[2], "Texture").map_err(invalid)?;
                         if x[3] != 0 {
                             self.bag(x[3], "TextureView").map_err(invalid)?;
-                            let view = read_shared(&self.bags)[&x[3]].clone();
+                            let view = read_shared(self.bags.at(x[3]))[&x[3]].clone();
                             self.views.insert((this, id), view);
                         } else {
                             self.views.remove(&(this, id));
@@ -3307,7 +3346,7 @@ impl Nvn {
                 for (index, word) in words.iter_mut().enumerate() {
                     *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
                 }
-                let mut bags = write_shared(&self.bags);
+                let mut bags = write_shared(self.bags.at(this));
                 let bag = bags.entry(this).or_insert_with(|| Bag {
                     kind: kind.into(),
                     props: BTreeMap::new(),
@@ -5442,7 +5481,7 @@ impl Nvn {
     }
 
     fn bag(&self, address: u64, kind: &str) -> Result<BTreeMap<String, Args>, String> {
-        bag_in(&read_shared(&self.bags), address, kind)
+        bag_in(&read_shared(self.bags.at(address)), address, kind)
     }
 
     /// The handle workers record command buffers through without the NVN
@@ -5908,7 +5947,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
             command.states = snapshot;
             return;
         }
-        let mut props = read_shared(bags)
+        let mut props = read_shared(bags.at(base))
             .get(&base)
             .filter(|bag| bag.kind == kind)
             .map(|bag| bag.props.clone())
@@ -5924,12 +5963,10 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
         return;
     }
     command.states = std::sync::Arc::new(
-        read_shared(bags)
-            .range(base..)
-            .filter(|(_, bag)| bag.kind == kind)
-            .take(count)
+        bags.kind_from(base, kind, count)
+            .into_iter()
             .map(|(address, bag)| {
-                let mut props = bag.props.clone();
+                let mut props = bag.props;
                 // Element offset from the array start, as evidence of the layout.
                 props.insert(
                     "@Offset".into(),
@@ -6056,7 +6093,7 @@ fn bag_call(
     if bag_like && rest == "SetDefaults" {
         // Builders keep their device across SetDefaults: the application
         // sets the device first for some kinds (QueueBuilder).
-        let device = read_shared(bags)
+        let device = read_shared(bags.at(this))
             .get(&this)
             .and_then(|bag| bag.props.get("Device").copied());
         let mut bag = Bag {
@@ -6067,7 +6104,7 @@ fn bag_call(
             bag.props.insert("Device".into(), device);
         }
         tag_state(core, this, kind, &bag.props)?;
-        write_shared(bags).insert(this, bag);
+        write_shared(bags.at(this)).insert(this, bag);
         return Ok(true);
     }
     if bag_like {
@@ -6075,7 +6112,7 @@ fn bag_call(
             // Structures live in application memory (often the stack):
             // a setter of another kind at the same address means the old
             // structure's lifetime ended, so a new one starts there.
-            let mut bags = write_shared(bags);
+            let mut bags = write_shared(bags.at(this));
             let bag = bags
                 .entry(this)
                 .and_modify(|bag| {
@@ -6147,7 +6184,7 @@ fn bag_call(
             return Ok(true);
         }
         if let Some(property) = rest.strip_prefix("Get") {
-            let bags = read_shared(bags);
+            let bags = read_shared(bags.at(this));
             let bag = bags
                 .get(&this)
                 .filter(|bag| bag.kind == kind)
@@ -6265,7 +6302,12 @@ fn record_command(
     }
     snapshot_states(bags, core, &mut command);
     if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
-        let view = bag_in(&read_shared(bags), command.x[3], "TextureView").map_err(invalid)?;
+        let view = bag_in(
+            &read_shared(bags.at(command.x[3])),
+            command.x[3],
+            "TextureView",
+        )
+        .map_err(invalid)?;
         for (index, key) in ["Levels", "Layers"].iter().enumerate() {
             command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
         }
@@ -6274,7 +6316,12 @@ fn record_command(
         let bases = if command.x[2] == 0 {
             [0, 0]
         } else {
-            let view = bag_in(&read_shared(bags), command.x[2], "TextureView").map_err(invalid)?;
+            let view = bag_in(
+                &read_shared(bags.at(command.x[2])),
+                command.x[2],
+                "TextureView",
+            )
+            .map_err(invalid)?;
             ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
         };
         command.captured.extend(bases);
@@ -6286,7 +6333,8 @@ fn record_command(
             let bases = if view == 0 {
                 [0, 0]
             } else {
-                let view = bag_in(&read_shared(bags), view, "TextureView").map_err(invalid)?;
+                let view =
+                    bag_in(&read_shared(bags.at(view)), view, "TextureView").map_err(invalid)?;
                 ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
             };
             command.captured.extend(bases);
@@ -6304,7 +6352,8 @@ fn record_command(
         let mut formats = vec![0; count];
         for (index, view) in views.iter_mut().enumerate() {
             if *view != 0 {
-                let bag = bag_in(&read_shared(bags), *view, "TextureView").map_err(invalid)?;
+                let bag =
+                    bag_in(&read_shared(bags.at(*view)), *view, "TextureView").map_err(invalid)?;
                 if let (Some(format), Some(slot)) = (bag.get("Format"), formats.get_mut(index)) {
                     *slot = format.x[0];
                 }
