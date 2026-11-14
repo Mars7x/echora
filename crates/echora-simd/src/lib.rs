@@ -1249,8 +1249,62 @@ fn fast_vec_fp_lane(
     if !(usable(a) && usable(b)) {
         return None;
     }
+    match op {
+        // Ordered comparisons of numbers raise nothing (only a NaN does):
+        // all ones where the comparison holds (+0 equals -0).
+        VecFpOp::CmEq | VecFpOp::CmGe | VecFpOp::CmGt | VecFpOp::AcGe | VecFpOp::AcGt => {
+            let (a, b) = if matches!(op, VecFpOp::AcGe | VecFpOp::AcGt) {
+                (a & !format.sign_bit(), b & !format.sign_bit())
+            } else {
+                (a, b)
+            };
+            let holds = match size {
+                FpSize::S => {
+                    let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+                    match op {
+                        VecFpOp::CmEq => x == y,
+                        VecFpOp::CmGe | VecFpOp::AcGe => x >= y,
+                        _ => x > y,
+                    }
+                }
+                FpSize::D => {
+                    let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+                    match op {
+                        VecFpOp::CmEq => x == y,
+                        VecFpOp::CmGe | VecFpOp::AcGe => x >= y,
+                        _ => x > y,
+                    }
+                }
+            };
+            return Some(if holds { lane_mask(format.bits) } else { 0 });
+        }
+        // FMAX/FMIN of numbers raise nothing and return an operand: +0 is
+        // larger than -0, and of equal values the second.
+        VecFpOp::Max | VecFpOp::Min => {
+            let max = op == VecFpOp::Max;
+            if zero(a) && zero(b) {
+                return Some(if max { a & b } else { a | b });
+            }
+            let pick_a = match size {
+                FpSize::S => {
+                    let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+                    if max { x > y } else { x < y }
+                }
+                FpSize::D => {
+                    let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+                    if max { x > y } else { x < y }
+                }
+            };
+            return Some(if pick_a { a } else { b });
+        }
+        _ => {}
+    }
     let raw = match op {
         VecFpOp::Add => native!(size, a, b, |x, y| x + y),
+        // FABD is the subtraction's result made positive.
+        VecFpOp::AbsDiff => native!(size, a, b, |x, y| x - y),
+        // A zero divisor raises DZC (or is 0/0): the exact path.
+        VecFpOp::Div if normal(b) => native!(size, a, b, |x, y| x / y),
         VecFpOp::Sub => native!(size, a, b, |x, y| x - y),
         VecFpOp::Mul => native!(size, a, b, |x, y| x * y),
         VecFpOp::MulAdd | VecFpOp::MulSub if usable(d) => {
@@ -1295,8 +1349,8 @@ fn fast_vec_fp_lane(
     };
     let exact_zero = zero(raw)
         && match op {
-            VecFpOp::Add | VecFpOp::Sub => true,
-            VecFpOp::Mul => zero(a) || zero(b),
+            VecFpOp::Add | VecFpOp::Sub | VecFpOp::AbsDiff => true,
+            VecFpOp::Mul | VecFpOp::Div => zero(a) || zero(b),
             // A fused result of zero is exact when the unrounded value is
             // zero: in single precision the product is exact in double, and
             // so is a sum that cancels to zero (otherwise it underflowed).
@@ -1311,6 +1365,11 @@ fn fast_vec_fp_lane(
                     }
             }
         };
+    let raw = if op == VecFpOp::AbsDiff {
+        raw & !format.sign_bit()
+    } else {
+        raw
+    };
     (normal(raw) || exact_zero).then_some(raw)
 }
 
@@ -3940,6 +3999,80 @@ mod sticky_inexact_tests {
         }
         // The fast path was taken, not only the exact one.
         assert!(native > 1000, "{native} native lanes");
+    }
+
+    /// FABD, FDIV, FMAX, FMIN and the float compares through the
+    /// sticky-inexact fast path give the exact path's results and flags,
+    /// with FPCR.FZ set and clear, in both sizes: signed zeros, equal
+    /// values, cancellations, overflows, underflows and subnormals.
+    #[test]
+    fn fast_compares_and_selects_match_the_exact_path() {
+        let values: [f64; 14] = [
+            1.0, -2.5, 3.0e38, -3.0e38, 1.2e-38, 1.0e-40, 0.1, 7.0, -0.333, 0.0, -0.0, 1.5,
+            1.0e-30, -1.0e30,
+        ];
+        let lanes = |values: [f64; 4], size: FpSize| match size {
+            FpSize::S => values.iter().enumerate().fold(0u128, |acc, (lane, value)| {
+                acc | u128::from((*value as f32).to_bits()) << (32 * lane)
+            }),
+            FpSize::D => u128::from(values[0].to_bits()) | u128::from(values[1].to_bits()) << 64,
+        };
+        let mut native = 0;
+        for op in [
+            VecFpOp::AbsDiff,
+            VecFpOp::Div,
+            VecFpOp::Max,
+            VecFpOp::Min,
+            VecFpOp::CmEq,
+            VecFpOp::CmGe,
+            VecFpOp::CmGt,
+            VecFpOp::AcGe,
+            VecFpOp::AcGt,
+        ] {
+            for size in [FpSize::S, FpSize::D] {
+                for fpcr in [0, 1 << 24] {
+                    for (index, &a) in values.iter().enumerate() {
+                        for &b in &values {
+                            let c = values[(index + 3) % values.len()];
+                            let (n, m) = (lanes([a, b, c, a], size), lanes([b, a, b, a], size));
+                            let run = |fpsr: u32| {
+                                let mut cpu = Cpu {
+                                    fpcr,
+                                    fpsr,
+                                    ..Cpu::default()
+                                };
+                                cpu.vectors[1] = n;
+                                cpu.vectors[2] = m;
+                                vec_fp(&mut cpu, op, size, true, false, 0, 1, 2).unwrap();
+                                (cpu.vectors[0], cpu.fpsr)
+                            };
+                            let (exact, flags) = run(0);
+                            assert_eq!(
+                                run(FPSR_IXC),
+                                (exact, flags | FPSR_IXC),
+                                "{op:?} {size:?} fpcr {fpcr:#x} {a} {b} {c}"
+                            );
+                            let format = Format::of(size);
+                            let bits = size_bits(size);
+                            native += (0..lane_count(bits, true, false))
+                                .filter(|&lane| {
+                                    fast_vec_fp_lane(
+                                        format,
+                                        size,
+                                        op,
+                                        get_lane(n, bits, lane),
+                                        get_lane(m, bits, lane),
+                                        0,
+                                    )
+                                    .is_some()
+                                })
+                                .count();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(native > 5000, "{native} native lanes");
     }
 
     /// The whole-vector fast path gives every lane the exact path's result
