@@ -5680,8 +5680,8 @@ impl Nvn {
         command: &Command,
         fragment: u64,
         stages: &[std::sync::Arc<Translated>],
-        uniforms: &HashMap<(usize, u32), Vec<u8>>,
-        textures: &HashMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
+        uniforms: &echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+        textures: &echora_gpu::FastMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
         page_table: echora_shader_abi::PageTable,
     ) {
         let groups = match command.name.as_str() {
@@ -5753,8 +5753,8 @@ impl Nvn {
         command: &Command,
         fragment: u64,
         stages: &[std::sync::Arc<Translated>],
-        uniforms: &HashMap<(usize, u32), Vec<u8>>,
-        textures: &HashMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
+        uniforms: &echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+        textures: &echora_gpu::FastMap<(usize, u32), (TextureSource, echora_gpu::draw::Sampler)>,
         page_table: echora_shader_abi::PageTable,
         (fetch, base_vertex, first_instance): (&[echora_shader_abi::VertexAttribute], i32, u32),
     ) {
@@ -7075,10 +7075,10 @@ impl Nvn {
         }
         let keys_for_note = [keys.0, keys.1];
         // Bindings, through the inferred map.
-        let mut uniforms = HashMap::new();
-        let mut textures = HashMap::new();
-        let mut storage = HashMap::new();
-        let mut storage_in_place = HashMap::new();
+        let mut uniforms = echora_gpu::FastMap::default();
+        let mut textures = echora_gpu::FastMap::default();
+        let mut storage = echora_gpu::FastMap::default();
+        let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
         // address, by (stage index, binding).
         let mut storage_written = HashMap::new();

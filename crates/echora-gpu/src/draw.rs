@@ -396,15 +396,15 @@ pub struct Draw<'a> {
     pub first_instance: u32,
     /// Bytes for each uniform buffer binding, by (stage index in the
     /// program, binding).
-    pub uniforms: HashMap<(usize, u32), Vec<u8>>,
+    pub uniforms: crate::FastMap<(usize, u32), Vec<u8>>,
     /// Texture bindings by (stage index, binding).
-    pub textures: HashMap<(usize, u32), (TextureSource, Sampler)>,
+    pub textures: crate::FastMap<(usize, u32), (TextureSource, Sampler)>,
     /// Storage buffer contents by (stage index, binding). What a stage
     /// writes into them comes back (`Renderer::draw`).
-    pub storage: HashMap<(usize, u32), Vec<u8>>,
+    pub storage: crate::FastMap<(usize, u32), Vec<u8>>,
     /// Storage buffers shared with the GPU in place instead (see
     /// `Renderer::import_file`): buffer, offset and length.
-    pub storage_in_place: HashMap<(usize, u32), (vk::Buffer, u64, u64)>,
+    pub storage_in_place: crate::FastMap<(usize, u32), (vk::Buffer, u64, u64)>,
     pub fixed: Fixed,
     pub blends: Vec<Blend>,
     /// A task/mesh pipeline's workgroups (the program's first stages are
@@ -1390,14 +1390,14 @@ pub(crate) mod tests {
             base_vertex: 0,
             instances: 1,
             first_instance: 0,
-            uniforms: HashMap::from([(
+            uniforms: crate::FastMap::from_iter([(
                 (1, 0),
                 color.iter().flat_map(|value| value.to_le_bytes()).collect(),
             )]),
-            textures: HashMap::new(),
+            textures: crate::FastMap::default(),
             pool: Vec::new(),
-            storage: HashMap::new(),
-            storage_in_place: HashMap::new(),
+            storage: crate::FastMap::default(),
+            storage_in_place: crate::FastMap::default(),
             fixed: Fixed {
                 topology: vk::PrimitiveTopology::TRIANGLE_STRIP,
                 primitive_restart: false,

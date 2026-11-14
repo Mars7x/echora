@@ -4,7 +4,7 @@
 /// Multiply-rotate over 8-byte words, as rustc's FxHasher; not
 /// collision-resistant, which these keys need not be.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct FastHasher(u64);
+pub struct FastHasher(u64);
 
 impl std::hash::Hasher for FastHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -35,5 +35,4 @@ impl FastHasher {
 }
 
 /// A HashMap with [`FastHasher`].
-pub(crate) type FastMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
