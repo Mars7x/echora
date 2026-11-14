@@ -5282,6 +5282,11 @@ impl Worker {
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
                     let outcome = machine.boundary(result);
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
+                    // A queued present leaves the frame's work to the
+                    // replay thread.
+                    if crate::nvn::Nvn::replay_thread() && nvn.replay_paused() {
+                        shared.wake_replay();
+                    }
                     // A lookup added entry points: the machine's table must
                     // know their thunks are host calls.
                     if nvn.thunk_count() != machine.nvn.thunk_count() {

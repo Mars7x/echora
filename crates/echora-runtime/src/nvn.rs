@@ -3173,13 +3173,15 @@ impl Nvn {
                     .x[0];
                 // With a replay thread the present is queued behind the
                 // frame's work, as the console queues it, and the frame is
-                // shown when the replay reaches it; the caller goes on.
+                // shown when the replay reaches it; the caller goes on. The
+                // replay thread runs the work (woken after the call), not
+                // this call under the machine lock.
                 if Self::present_queued_mode() && !self.replaying && self.frame_capture.is_none() {
                     self.pending
                         .entry(this)
                         .or_default()
                         .push_back(QueueItem::Present { texture });
-                    self.pump_queues_handed_on(core)?;
+                    self.replay_paused = true;
                     return Ok(true);
                 }
                 self.present_frame(core, this, texture)?;
