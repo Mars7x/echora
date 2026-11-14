@@ -2392,6 +2392,21 @@ pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, Strin
 /// would, that is never.
 pub(crate) const FP_MODE: &str = "m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH | echora_guest::simd::FPCR_FZ16) == 0";
 
+/// After an inlined compare, FMAX or FMIN whose `bad` lanes (bit per lane)
+/// held a NaN or a denormal: those lanes of `out` are made again by the
+/// exact single-lane helper (which raises what they raise), the rest stay
+/// native, and the result is stored to `rd`.
+fn exact_lanes(fp_op: VecFpOp, size: FpSize, lanes: u32, width: u32, int: &str, rd: u8) -> String {
+    let p = "echora_guest::simd";
+    format!(
+        "for lane in 0..{lanes} {{ if bad >> lane & 1 != 0 {{ \
+         let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
+         let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, 0)?; \
+         out = out & !(u128::from({int}::MAX) << (lane * {width})) | u128::from(exact as {int}) << (lane * {width}); }} }} \
+         m.cpu.vectors[{rd}] = out;"
+    )
+}
+
 /// FMAX/FMIN/FMAXNM/FMINNM of two normal-or-zero lanes `x` and `y`: the
 /// larger or smaller, +0 above -0. With neither a NaN nor a denormal, the
 /// NaN-handling forms agree and nothing is raised.
@@ -2970,15 +2985,16 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
                 _ => (".abs()", ">"),
             };
             let call = emit_call(op)?;
+            let lanewise = exact_lanes(fp_op, size, lanes, width, int, rd);
             Some(format!(
                 "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
-                 let mut fast = {FP_MODE}; let mut out = 0u128; \
+                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; \
                  for lane in 0..{lanes} {{ \
                  let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
-                 fast &= usable(x) & usable(y); \
+                 bad |= u32::from(!(usable(x) & usable(y))) << lane; \
                  let hit = {float}::from_bits(x){abs} {test} {float}::from_bits(y){abs}; \
                  out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }} \
-                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+                 if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
             ))
         }
         SimdOp::VecFp {
@@ -2999,14 +3015,15 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
             let max = matches!(fp_op, VecFpOp::Max | VecFpOp::MaxNum);
             let value = min_max(max, float);
             let call = emit_call(op)?;
+            let lanewise = exact_lanes(fp_op, size, lanes, width, int, rd);
             Some(format!(
                 "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
-                 let mut fast = {FP_MODE}; let mut out = 0u128; \
+                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; \
                  for lane in 0..{lanes} {{ \
                  let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
-                 fast &= usable(x) & usable(y); \
+                 bad |= u32::from(!(usable(x) & usable(y))) << lane; \
                  out |= u128::from({value}) << (lane * {width}); }} \
-                 if fast {{ m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+                 if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
             ))
         }
         SimdOp::VecFp {
