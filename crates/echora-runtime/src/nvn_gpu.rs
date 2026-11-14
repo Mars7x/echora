@@ -9310,14 +9310,29 @@ pub(super) fn texture_sample(
 ) -> u64 {
     let mut sample = u64::from(format) << 48 ^ u64::from(width) << 24 ^ u64::from(height);
     sample ^= u64::from(depth_or_layers) << 40;
-    let mut chunk = [0u8; 64];
-    for index in 0..256u64 {
-        let offset = (storage_size.saturating_sub(64)) * index / 255;
-        if core.memory.read(base + offset, &mut chunk).is_ok() {
-            sample = (sample ^ hash_bytes(&chunk)).wrapping_mul(0x100_0000_01b3);
+    // The chunks are gathered first, so their reads (cache misses across a
+    // large texture) overlap, then hashed in four independent lanes.
+    let mut chunks = [[0u8; 64]; 256];
+    let mut read = [false; 256];
+    for (index, (chunk, read)) in chunks.iter_mut().zip(&mut read).enumerate() {
+        let offset = (storage_size.saturating_sub(64)) * index as u64 / 255;
+        *read = core.memory.read(base + offset, chunk).is_ok();
+    }
+    let mut lanes = [
+        sample,
+        !sample,
+        sample.rotate_left(17),
+        sample.rotate_left(41),
+    ];
+    for (index, (chunk, read)) in chunks.iter().zip(read).enumerate() {
+        if read {
+            let lane = &mut lanes[index % 4];
+            *lane = (*lane ^ hash_bytes(chunk)).wrapping_mul(0x100_0000_01b3);
         }
     }
-    sample
+    lanes.iter().fold(sample, |sample, lane| {
+        (sample ^ lane).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    })
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
