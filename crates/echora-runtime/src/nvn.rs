@@ -1771,6 +1771,20 @@ impl Nvn {
             _ => false,
         };
         if resolves {
+            if let Some(backend) = self.gpu.as_mut() {
+                backend.stat(
+                    match name {
+                        "nvnSyncWait" => "stat: resolves before nvnSyncWait",
+                        "nvnQueueFinish" => "stat: resolves before nvnQueueFinish",
+                        "nvnBufferInvalidateMappedRange" => {
+                            "stat: resolves before nvnBufferInvalidateMappedRange"
+                        }
+                        "nvnTextureReadTexels" => "stat: resolves before nvnTextureReadTexels",
+                        _ => "stat: resolves before nvnQueuePresentTexture",
+                    },
+                    1,
+                );
+            }
             if let Err(message) = self.resolve_storage(core, None) {
                 return Err(Trap::InvalidState {
                     message: format!("{name}: dispatch results: {message}"),
