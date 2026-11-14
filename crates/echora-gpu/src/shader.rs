@@ -63,6 +63,16 @@ pub fn abi_parameters(parameters: &Parameters) -> echora_shader_abi::Parameters 
 /// ECHORA_HMMA when the device allows it (`Gpu::new`).
 static MATRIX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Whether translated modules may declare 32-bit denormals flushed
+/// (`echora_shader_abi::Options::denorm_flush_32`, `Gpu::new`).
+static DENORM_FLUSH_32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the device flushes 32-bit denormals when a module
+/// declares DenormFlushToZero for 32 bits, independently of other widths.
+pub fn set_denorm_flush_32(on: bool) {
+    DENORM_FLUSH_32.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Lets the Rust translator use cooperative matrices for HMMA when the
 /// device multiplies 16x16x16 half matrices at subgroup scope.
 pub fn set_cooperative_matrix(shapes: &[crate::vulkan::CooperativeMatrixShape]) {
@@ -99,7 +109,12 @@ pub fn translate_rust(
     program: &[u8],
     parameters: &Parameters,
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
-    let translated = echora_shader::translate(program, &abi_parameters(parameters))?;
+    let options = echora_shader_abi::Options {
+        denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
+    let translated =
+        echora_shader::translate_with_options(program, &abi_parameters(parameters), &options)?;
     if translated.abi_version != ABI_VERSION {
         return Err(echora_shader_abi::Unsupported {
             reason: format!(

@@ -174,11 +174,23 @@ impl Gpu {
         // width where the driver allows it (RADV runs 64 by default).
         let mut size_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut object_properties = vk::PhysicalDeviceShaderObjectPropertiesEXT::default();
+        let mut properties12 = vk::PhysicalDeviceVulkan12Properties::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut size_control)
-            .push_next(&mut object_properties);
+            .push_next(&mut object_properties)
+            .push_next(&mut properties12);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+        // Modules may ask for 32-bit denormals flushed when the device does
+        // that for 32 bits independently of the other widths.
+        crate::shader::set_denorm_flush_32(
+            properties12.shader_denorm_flush_to_zero_float32 != 0
+                && matches!(
+                    properties12.denorm_behavior_independence,
+                    vk::ShaderFloatControlsIndependence::TYPE_32_ONLY
+                        | vk::ShaderFloatControlsIndependence::ALL
+                ),
+        );
         let shader_binary_version = (
             object_properties.shader_binary_uuid,
             object_properties.shader_binary_version,
