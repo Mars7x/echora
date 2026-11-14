@@ -6310,6 +6310,119 @@ mod tests {
     }
 
     #[test]
+    fn chained_packed_multiplies_reuse_a_and_the_accumulator_bit_for_bit() {
+        use crate::compute::MatrixPath;
+        // A chain as the upscaler's: pairs of HMMA.16816 sharing A (R0-R3)
+        // with B from R4/R6 and then R24/R26, accumulating in place in
+        // R16 and R20 after a first pair from C in R8 and R12. Run as is
+        // (the multiply reusing A and its previous D as C) and with MOV Rx,
+        // Rx after each HMMA (the same values, but the registers written,
+        // so every multiply stores and loads its fragments): the D bits
+        // must agree, and the chain must load fewer matrices.
+        let halves = |lane: usize, register: u8| {
+            let mut state = 0x5eed ^ (lane as u32) << 8 ^ u32::from(register) << 16;
+            let mut half = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let exponent = 11 + (state >> 8) % 6;
+                (state >> 16) & 0x8000 | exponent << 10 | state & 0x3ff
+            };
+            u64::from(half() | half() << 16)
+        };
+        let copy = |r: u128| word(&[(0, 12, 0x202), (16, 8, r), (32, 8, r), (72, 4, 0xf)]);
+        for single in [false, true] {
+            let hmma = |d: u128, b: u128, c: u128| {
+                word(&[
+                    (0, 12, 0x23c),
+                    (16, 8, d),
+                    (24, 8, 0),
+                    (32, 8, b),
+                    (64, 8, c),
+                    (75, 1, 1),
+                    (76, 1, u128::from(single)),
+                ])
+            };
+            let mut chain = vec![hmma(16, 4, 8), hmma(20, 6, 12)];
+            for step in 0..6 {
+                let b = if step % 2 == 0 { (24, 26) } else { (4, 6) };
+                chain.push(hmma(16, b.0, 16));
+                chain.push(hmma(20, b.1, 20));
+            }
+            // With MOVs: each HMMA's D (and A) registers rewritten.
+            let width = if single { 4 } else { 2 };
+            let mut defeated = Vec::new();
+            for &instruction in &chain {
+                defeated.push(instruction);
+                let d = (instruction >> 16) & 0xff;
+                for n in 0..width {
+                    defeated.push(copy(d + n));
+                }
+                defeated.push(copy(0));
+            }
+            let run = |program: &[u128]| {
+                let mut program = program.to_vec();
+                program.push(EXIT);
+                let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+                let layout = Layout {
+                    matrices: MatrixPath::Cooperative32,
+                    ..Layout::workgroup([32, 1, 1])
+                };
+                let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+                assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+                let mut loads = 0;
+                let mut at = 5;
+                while at < translated.spirv.len() {
+                    let word = translated.spirv[at];
+                    if word as u16 == op::COOPERATIVE_MATRIX_LOAD {
+                        loads += 1;
+                    }
+                    at += ((word >> 16) as usize).max(1);
+                }
+                let report = Machine::new(&translated.spirv).run_workgroup_with(
+                    32,
+                    32,
+                    |lane| {
+                        HashMap::from([
+                            (27, vec![lane as u64, 0, 0]),
+                            (29, vec![lane as u64]),
+                            (40, vec![0]),
+                            (41, vec![lane as u64]),
+                        ])
+                    },
+                    |lane| {
+                        (0..32u8)
+                            .filter_map(|n| {
+                                let value = if single && (8..16).contains(&n) {
+                                    let bits = halves(lane, n) as u16;
+                                    u64::from(f16_to_f32(bits).to_bits())
+                                } else {
+                                    halves(lane, n)
+                                };
+                                registers.get(&n).map(|&variable| (variable, vec![value]))
+                            })
+                            .collect()
+                    },
+                );
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                let d: Vec<Vec<u32>> = (0..32)
+                    .map(|lane| {
+                        (16..24u8)
+                            .filter_map(|n| registers.get(&n))
+                            .map(|v| report.invocations[lane][v][0] as u32)
+                            .collect()
+                    })
+                    .collect();
+                (d, loads)
+            };
+            let ((reused, fewer), (stored, all)) = (run(&chain), run(&defeated));
+            assert_eq!(reused, stored, "single {single}");
+            assert!(
+                fewer < all,
+                "single {single}: {fewer} loads, {all} without reuse"
+            );
+        }
+    }
+
+    #[test]
     fn packed_cooperative_multiplies_give_the_same_results() {
         use crate::compute::MatrixPath;
         // Halves with magnitudes in [2^-4, 2^4] from a sequence, as each

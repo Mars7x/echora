@@ -300,6 +300,20 @@ impl Emitter {
     }
 
     /// A subgroup barrier that orders workgroup memory.
+    /// The write versions of `count` registers from `base` (RZ: never
+    /// written).
+    fn versions(&self, base: u8, count: u8) -> Vec<u32> {
+        (0..count)
+            .map(|n| {
+                if base == 255 {
+                    0
+                } else {
+                    self.register_versions[usize::from(base.saturating_add(n))]
+                }
+            })
+            .collect()
+    }
+
     fn subgroup_barrier(&mut self) {
         let scope = self.constant(SCOPE_SUBGROUP);
         let semantics = self.constant(0x8 | 0x100);
@@ -516,9 +530,47 @@ impl Emitter {
         } else {
             (words, base, lane)
         };
+        // The last multiply's A matrix and D (as its C) are reused where
+        // their registers still hold them, in the same block (so the values
+        // dominate): the same SSA values the stores and loads would give
+        // again, bit for bit.
+        let block = self.function.block();
+        if self.matrix_reuse.block != Some(block) {
+            self.matrix_reuse = Reuse {
+                block: Some(block),
+                ..Reuse::default()
+            };
+        }
+        let a_count = if k16 { 4 } else { 2 };
+        let a_reused = match &self.matrix_reuse.a {
+            Some((base, k, versions, matrix)) if *base == a && *k == k16 => {
+                (*versions == self.versions(a, a_count)).then_some(*matrix)
+            }
+            _ => None,
+        };
+        let c_count = if single { 4 } else { 2 };
+        let c_reused = match &self.matrix_reuse.d {
+            Some((registers, wide, versions, product))
+                if *wide == single
+                    && registers.len() == halves_in.len()
+                    && registers
+                        .iter()
+                        .zip(halves_in)
+                        .all(|(&d, &(_, _, c))| d == c) =>
+            {
+                let current: Vec<u32> = halves_in
+                    .iter()
+                    .flat_map(|&(_, _, c)| self.versions(c, c_count))
+                    .collect();
+                (*versions == current).then_some(*product)
+            }
+            _ => None,
+        };
         // The previous multiply's lanes may still be reading D: wait
-        // before writing the fragments.
-        self.subgroup_barrier();
+        // before writing C where it was (A and B are elsewhere).
+        if c_reused.is_none() {
+            self.subgroup_barrier();
+        }
         let next = |base: u8, n: u8| {
             if base == 255 {
                 255
@@ -530,6 +582,9 @@ impl Emitter {
         // A: register j at row g + 8 (j & 1), word t + 4 (j >> 1); with K =
         // 8 (HMMA.1688), words 4-7 of each row are zero.
         for j in 0..4u32 {
+            if a_reused.is_some() {
+                break;
+            }
             let value = if k16 || j < 2 {
                 self.register_or_zero(next(a, j as u8))
             } else {
@@ -564,6 +619,9 @@ impl Emitter {
         // (from word 256); a 32-bit C's element i at (g + 8 (i >> 1), 2t +
         // (i & 1) + 8 n) of the float scratch.
         for (n, &(_, _, c)) in halves_in.iter().enumerate() {
+            if c_reused.is_some() {
+                break;
+            }
             if single {
                 for i in 0..4u32 {
                     let bits = self.register_or_zero(next(c, i as u8));
@@ -609,21 +667,31 @@ impl Emitter {
         } else {
             (self.scratch_element(words, self.u32, base, 256), eight)
         };
-        let a_matrix = self.value(
-            op::COOPERATIVE_MATRIX_LOAD,
-            a_type,
-            &[a_pointer, row_major, eight],
-        );
+        let a_matrix = match a_reused {
+            Some(matrix) => matrix,
+            None => self.value(
+                op::COOPERATIVE_MATRIX_LOAD,
+                a_type,
+                &[a_pointer, row_major, eight],
+            ),
+        };
+        if a_reused.is_none() {
+            let versions = self.versions(a, a_count);
+            self.matrix_reuse.a = Some((a, k16, versions, a_matrix));
+        }
         let b_matrix = self.value(
             op::COOPERATIVE_MATRIX_LOAD,
             b_type,
             &[b_pointer, column_major, eight],
         );
-        let c_matrix = self.value(
-            op::COOPERATIVE_MATRIX_LOAD,
-            c_type,
-            &[c_pointer, row_major, c_stride],
-        );
+        let c_matrix = match c_reused {
+            Some(product) => product,
+            None => self.value(
+                op::COOPERATIVE_MATRIX_LOAD,
+                c_type,
+                &[c_pointer, row_major, c_stride],
+            ),
+        };
         let product = self.value(
             op::COOPERATIVE_MATRIX_MUL_ADD,
             c_type,
@@ -656,6 +724,16 @@ impl Emitter {
                 }
             }
         }
+        // D, for the next multiply whose C it is (registers written back
+        // above; none when a D is RZ).
+        self.matrix_reuse.d = halves_in.iter().all(|&(d, _, _)| d != 255).then(|| {
+            let registers: Vec<u8> = halves_in.iter().map(|&(d, _, _)| d).collect();
+            let versions = registers
+                .iter()
+                .flat_map(|&d| self.versions(d, c_count))
+                .collect();
+            (registers, single, versions, product)
+        });
         Ok(())
     }
 
@@ -1271,4 +1349,15 @@ pub(crate) mod tests {
             }
         }
     }
+}
+
+/// What the last coop32 multiply (`cooperative_multiply_packed`) loaded,
+/// for the next to reuse in the same block: A's registers, K16, their
+/// write versions and the A matrix; D's registers (one per HMMA), whether
+/// 32-bit, their versions after the write back, and the product.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Reuse {
+    block: Option<(u32, u32)>,
+    a: Option<(u8, bool, Vec<u32>, u32)>,
+    d: Option<(Vec<u8>, bool, Vec<u32>, u32)>,
 }

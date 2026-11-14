@@ -568,6 +568,11 @@ struct Emitter {
     /// cooperative matrix is used.
     matrix_scratch: BTreeMap<u32, u32>,
     matrices_used: bool,
+    /// Each general register's write count, so that a cached value read
+    /// from registers (`matrix::Reuse`) knows they still hold it.
+    register_versions: Vec<u32>,
+    /// What the last coop32 multiply loaded, for the next to reuse.
+    matrix_reuse: matrix::Reuse,
     /// Texture pool arrays by binding, and the bindings used (bit n).
     pool_arrays: BTreeMap<u32, u32>,
     pool_bindings: u32,
@@ -690,6 +695,8 @@ impl Emitter {
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
+            register_versions: vec![0; 256],
+            matrix_reuse: matrix::Reuse::default(),
             pool_arrays: BTreeMap::new(),
             pool_bindings: 0,
             pool_capacity: None,
@@ -833,6 +840,7 @@ impl Emitter {
         if self.uniform {
             self.write_uniform(n.min(63), value);
         } else if n != 255 {
+            self.register_versions[usize::from(n)] += 1;
             let variable = self.register(n);
             self.store_variable(variable, value);
         }
