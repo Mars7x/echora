@@ -2819,7 +2819,18 @@ impl Nvn {
             // NVNboolean. Builder properties are kept for rendering; the
             // texture's storage stays the application's pool memory.
             "nvnTextureInitialize" => {
-                self.texture_epoch += 1;
+                // A structure holding no texture yet: nothing remembered can
+                // name it (finalizing one moved the epoch already, and a
+                // descriptor registers only an initialized texture), so only
+                // what is kept for its address goes; a texture made again
+                // over a live one changes everything keyed by the epoch.
+                if self.objects.contains_key(&this) {
+                    self.texture_epoch += 1;
+                } else {
+                    self.storage_memo.borrow_mut().1.remove(&this);
+                    self.size_memo.borrow_mut().1.remove(&this);
+                    self.target_shapes.1.remove(&this);
+                }
                 let builder = self.bag(x[1], "TextureBuilder").map_err(invalid)?;
                 self.require_device(&builder).map_err(invalid)?;
                 let previous = self
