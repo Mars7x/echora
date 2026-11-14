@@ -298,13 +298,19 @@ impl Renderer {
         let info = vk::PresentInfoKHR::default()
             .swapchains(&swapchains)
             .image_indices(&indices);
+        let held = self
+            .queue_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: the blit finished (flush waits) and left the image in
-        // PRESENT_SRC_KHR.
-        match unsafe {
+        // PRESENT_SRC_KHR; the queue is held.
+        let presented = unsafe {
             presenter
                 .swapchain_loader
                 .queue_present(self.gpu.queue, &info)
-        } {
+        };
+        drop(held);
+        match presented {
             Ok(suboptimal) => presenter.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => presenter.stale = true,
             Err(error) => return Err(format!("vkQueuePresentKHR: {error}")),

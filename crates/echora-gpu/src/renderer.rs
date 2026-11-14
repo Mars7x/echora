@@ -177,8 +177,79 @@ const MAX_SHARED_BYTES: u64 = 1 << 30;
 /// (a 1365x1365, 90-layer ASTC array with 11 levels, 852 MiB as RGBA8).
 const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
 
+/// The thread that submits recorded batches, in order, so the recording
+/// thread does not wait in vkQueueSubmit (about 1 ms a batch on RADV with
+/// the ~1,700 imported buffers the game's forest holds). The command
+/// buffer is ended before it is handed over: its pool is shared with the
+/// slots still recorded. ECHORA_SUBMIT_THREAD=0 submits on the recording
+/// thread.
+struct Submitter {
+    sender: Option<std::sync::mpsc::Sender<(vk::CommandBuffer, vk::Fence)>>,
+    /// The first submission error, returned by the next submission.
+    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Nanoseconds the thread spent in vkQueueSubmit, for the statistics.
+    submit_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Submitter {
+    fn new(gpu: &Gpu, queue_lock: std::sync::Arc<std::sync::Mutex<()>>) -> Result<Self, String> {
+        let (sender, receiver) = std::sync::mpsc::channel::<(vk::CommandBuffer, vk::Fence)>();
+        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let submit_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (device, queue) = (gpu.device.clone(), gpu.queue);
+        let thread = std::thread::Builder::new()
+            .name("echora-submit".into())
+            .spawn({
+                let (error, submit_ns) = (error.clone(), submit_ns.clone());
+                move || {
+                    for (commands, fence) in receiver {
+                        let buffers = [commands];
+                        let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+                        let start = std::time::Instant::now();
+                        let held = queue_lock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // SAFETY: the buffer was ended and is not touched
+                        // again until its fence signals; the queue is held.
+                        let result = unsafe { device.queue_submit(queue, &submit, fence) };
+                        drop(held);
+                        submit_ns.fetch_add(
+                            start.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if let Err(failure) = result.map_err(vk_error("vkQueueSubmit")) {
+                            error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert(failure);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("the submit thread: {error}"))?;
+        Ok(Self {
+            sender: Some(sender),
+            error,
+            submit_ns,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stop the thread once it has submitted everything handed to it.
+    fn stop(&mut self) {
+        self.sender = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub struct Renderer {
     pub gpu: Gpu,
+    /// Held while the queue is used (submissions, presents).
+    pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    submitter: Option<Submitter>,
     /// The texture pool's set (`crate::pool`), once a program reads it.
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
     /// The texture pool entries last bound, the target changes then, and
@@ -472,6 +543,13 @@ fn aspect(format: vk::Format) -> vk::ImageAspectFlags {
 
 impl Renderer {
     pub fn new(gpu: Gpu) -> Result<Self, String> {
+        let queue_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let submitter =
+            if std::env::var_os("ECHORA_SUBMIT_THREAD").is_some_and(|value| value == "0") {
+                None
+            } else {
+                Some(Submitter::new(&gpu, queue_lock.clone())?)
+            };
         let device = &gpu.device;
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(gpu.queue_family)
@@ -550,6 +628,8 @@ impl Renderer {
             fatal: None,
             gpu,
             pool,
+            queue_lock,
+            submitter,
             commands,
             fence,
             recording: false,
@@ -2545,21 +2625,51 @@ impl Renderer {
             .or_default() += (self.addressed.len() + self.superseded.len()) as u64;
         let start = std::time::Instant::now();
         let device = &self.gpu.device;
-        let buffers = [self.commands];
-        let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
-        // SAFETY: the buffer was begun; the fence is unsignaled.
-        unsafe {
-            device
-                .end_command_buffer(self.commands)
-                .map_err(vk_error("vkEndCommandBuffer"))?;
-            device
-                .queue_submit(self.gpu.queue, &submit, self.fence)
+        // SAFETY: the buffer was begun.
+        unsafe { device.end_command_buffer(self.commands) }
+            .map_err(vk_error("vkEndCommandBuffer"))?;
+        if let Some(submitter) = &self.submitter {
+            if let Some(error) = submitter
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                return Err(error);
+            }
+            submitter
+                .sender
+                .as_ref()
+                .ok_or("the submit thread has stopped")?
+                .send((self.commands, self.fence))
+                .map_err(|_| "the submit thread has stopped".to_string())?;
+            *self
+                .stats
+                .entry("stat: flush ns handing to the submit thread")
+                .or_default() += start.elapsed().as_nanos() as u64;
+            *self
+                .stats
+                .entry("stat: submit thread ns in vkQueueSubmit")
+                .or_default() += submitter
+                .submit_ns
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            let buffers = [self.commands];
+            let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+            let held = self
+                .queue_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: the buffer was ended; the fence is unsignaled; the
+            // queue is held.
+            unsafe { device.queue_submit(self.gpu.queue, &submit, self.fence) }
                 .map_err(vk_error("vkQueueSubmit"))?;
+            drop(held);
+            *self
+                .stats
+                .entry("stat: flush ns in vkQueueSubmit")
+                .or_default() += start.elapsed().as_nanos() as u64;
         }
-        *self
-            .stats
-            .entry("stat: flush ns in vkQueueSubmit")
-            .or_default() += start.elapsed().as_nanos() as u64;
         self.current_in_flight = true;
         Ok(())
     }
@@ -2570,9 +2680,20 @@ impl Renderer {
         if !self.current_in_flight {
             return Ok(());
         }
+        // A batch the submit thread failed to submit never signals.
+        if let Some(submitter) = &self.submitter
+            && let Some(error) = submitter
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            return Err(error);
+        }
         let wait_start = std::time::Instant::now();
         let device = &self.gpu.device;
-        // SAFETY: the fence belongs to a submitted batch.
+        // SAFETY: the fence belongs to a submitted batch (or one handed to
+        // the submit thread: the wait covers its submission).
         unsafe {
             device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
@@ -5562,6 +5683,9 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.flush();
+        if let Some(mut submitter) = self.submitter.take() {
+            submitter.stop();
+        }
         if let Some(occlusion) = self.occlusion.take() {
             occlusion.destroy(&self.gpu.device);
         }
