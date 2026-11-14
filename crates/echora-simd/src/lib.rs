@@ -1261,9 +1261,35 @@ fn fast_vec_fp_lane(
         && match op {
             VecFpOp::Add | VecFpOp::Sub => true,
             VecFpOp::Mul => zero(a) || zero(b),
-            _ => (zero(a) || zero(b)) && zero(d),
+            // A fused result of zero is exact when the unrounded value is
+            // zero: in single precision the product is exact in double, and
+            // so is a sum that cancels to zero (otherwise it underflowed).
+            _ => {
+                (zero(a) || zero(b)) && zero(d)
+                    || size == FpSize::S && {
+                        let x = f64::from(f32::from_bits(a as u32));
+                        let x = if op == VecFpOp::MulSub { -x } else { x };
+                        x * f64::from(f32::from_bits(b as u32))
+                            + f64::from(f32::from_bits(d as u32))
+                            == 0.0
+                    }
+            }
         };
     (normal(raw) || exact_zero).then_some(raw)
+}
+
+/// One lane of a vector whose fast path failed: natively when this lane
+/// qualifies (FPSR.IXC set and its operands and result as
+/// `fast_vec_fp_lane` requires: it raises nothing), exactly otherwise.
+/// Lanes are independent and flags only accumulate, so a NaN or an
+/// underflow in one lane leaves the others native.
+fn mixed_lane(fp: &mut Fp<'_>, op: VecFpOp, a: u64, b: u64, d: u64) -> u64 {
+    if fp.cpu.fpsr & FPSR_IXC != 0
+        && let Some(value) = fast_vec_fp_lane(fp.format, fp.size, op, a, b, d)
+    {
+        return value;
+    }
+    vec_fp_lane(fp, op, a, b, d)
 }
 
 fn vec_fp_lane(fp: &mut Fp<'_>, op: VecFpOp, a: u64, b: u64, d: u64) -> u64 {
@@ -1516,7 +1542,7 @@ pub fn vec_fp(
     }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
-        let value = vec_fp_lane(
+        let value = mixed_lane(
             &mut fp,
             op,
             get_lane(n, bits, lane),
@@ -1615,7 +1641,7 @@ pub fn vec_fp_element(
     }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
-        let value = vec_fp_lane(
+        let value = mixed_lane(
             &mut fp,
             op,
             get_lane(n, bits, lane),
