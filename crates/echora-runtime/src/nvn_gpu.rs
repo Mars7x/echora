@@ -7338,6 +7338,10 @@ impl Nvn {
             }
         }
 
+        if let Some((kind, since)) = binding_lap.take() {
+            binding_times[kind] += since.elapsed();
+        }
+        let tail_started = std::time::Instant::now();
         // Each stage's c0 holds its bound storage buffers' addresses and
         // sizes (slot i at the stage's table + 16 * i, `c0_storage_table`),
         // as the driver keeps them: a program that
@@ -7401,6 +7405,7 @@ impl Nvn {
                 }
             }
         }
+        let pool_started = std::time::Instant::now();
         // Texture pool entries, for stages that read the pool.
         let mut pool = Vec::new();
         for (index, stage) in stages.iter().enumerate() {
@@ -7408,11 +7413,16 @@ impl Nvn {
                 pool.extend(self.pool_entries(core, slots[index])?);
             }
         }
-        if let Some((kind, since)) = binding_lap {
-            binding_times[kind] += since.elapsed();
-        }
         {
             let backend = self.gpu.as_mut().unwrap();
+            backend.stat(
+                "stat: draw ns driver words",
+                (pool_started - tail_started).as_nanos() as u64,
+            );
+            backend.stat(
+                "stat: draw ns texture pool entries",
+                pool_started.elapsed().as_nanos() as u64,
+            );
             backend.stat("stat: texture binding memo hits", memo_hits);
             for (name, time) in [
                 "stat: draw ns binding uniform buffers",
