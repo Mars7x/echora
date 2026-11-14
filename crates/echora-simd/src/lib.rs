@@ -1509,6 +1509,11 @@ pub fn vec_fp(
         fp.cpu.vectors[rd as usize] = result;
         return Ok(());
     }
+    if stats::enabled() {
+        stats::note_vector("vec_fp", &fp, op, q, scalar, n, d, |lane| {
+            get_lane(m, bits, lane)
+        });
+    }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
         let value = vec_fp_lane(
@@ -1604,6 +1609,9 @@ pub fn vec_fp_element(
     if let Some(result) = fast_vector(&fp, op, q, scalar, n, d, |_| element) {
         fp.cpu.vectors[rd as usize] = result;
         return Ok(());
+    }
+    if stats::enabled() {
+        stats::note_vector("vec_fp_element", &fp, op, q, scalar, n, d, |_| element);
     }
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
@@ -4519,4 +4527,153 @@ pub fn __echora_simd_load_replicate(
     q: bool,
 ) -> Result<u64, Trap> {
     load_replicate(cpu, memory, address, rt, registers, bits, q)
+}
+
+/// ECHORA_SIMD_STATS=PATH (diagnostic): why vector float operations took
+/// the exact per-lane path instead of the native one, counted by helper,
+/// operation, size and the first reason found; PATH is rewritten with the
+/// counts every 100,000 of them.
+pub mod stats {
+    use super::{FPSR_IXC, Fp, FpSize, VecFpOp, get_lane, lane_count, size_bits};
+
+    static COUNTS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ECHORA_SIMD_STATS").is_some())
+    }
+
+    /// The counts so far, largest first, and clear them.
+    pub fn take() -> Vec<(String, u64)> {
+        let mut counts: Vec<_> = COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts
+    }
+
+    fn class(bits: u32, value: u64) -> &'static str {
+        let (exponent, mantissa) = if bits == 32 {
+            ((value >> 23) & 0xff, value & 0x7f_ffff)
+        } else {
+            ((value >> 52) & 0x7ff, value & 0xf_ffff_ffff_ffff)
+        };
+        let top = if bits == 32 { 0xff } else { 0x7ff };
+        match (exponent, mantissa) {
+            (0, 0) => "zero",
+            (0, _) => "subnormal",
+            (e, 0) if e == top => "infinity",
+            (e, _) if e == top => "nan",
+            _ => "normal",
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn note_vector(
+        helper: &str,
+        fp: &Fp<'_>,
+        op: VecFpOp,
+        q: bool,
+        scalar: bool,
+        n: u128,
+        d: u128,
+        m: impl Fn(u32) -> u64,
+    ) {
+        let bits = size_bits(fp.size);
+        let fused = matches!(op, VecFpOp::MulAdd | VecFpOp::MulSub);
+        let arithmetic = matches!(
+            op,
+            VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+        );
+        let reason = if !arithmetic {
+            "no native path".to_owned()
+        } else if fp.cpu.fpsr & FPSR_IXC == 0 {
+            "fpsr.ixc clear".to_owned()
+        } else {
+            let mut found = None;
+            for lane in 0..lane_count(bits, q, scalar) {
+                let (a, b, c) = (get_lane(n, bits, lane), m(lane), get_lane(d, bits, lane));
+                let operands = if fused { vec![a, b, c] } else { vec![a, b] };
+                if let Some(bad) = operands
+                    .iter()
+                    .map(|value| class(bits, *value))
+                    .find(|class| !matches!(*class, "zero" | "normal"))
+                {
+                    found = Some(format!("operand {bad}"));
+                    break;
+                }
+                let result = if bits == 32 {
+                    let (x, y, z) = (
+                        f32::from_bits(a as u32),
+                        f32::from_bits(b as u32),
+                        f32::from_bits(c as u32),
+                    );
+                    u64::from(
+                        match op {
+                            VecFpOp::Add => x + y,
+                            VecFpOp::Sub => x - y,
+                            VecFpOp::Mul => x * y,
+                            VecFpOp::MulAdd => x.mul_add(y, z),
+                            _ => (-x).mul_add(y, z),
+                        }
+                        .to_bits(),
+                    )
+                } else {
+                    let (x, y, z) = (f64::from_bits(a), f64::from_bits(b), f64::from_bits(c));
+                    match op {
+                        VecFpOp::Add => x + y,
+                        VecFpOp::Sub => x - y,
+                        VecFpOp::Mul => x * y,
+                        VecFpOp::MulAdd => x.mul_add(y, z),
+                        _ => (-x).mul_add(y, z),
+                    }
+                    .to_bits()
+                };
+                match class(bits, result) {
+                    "normal" => {}
+                    "zero" if matches!(op, VecFpOp::Add | VecFpOp::Sub) => {}
+                    "zero" => {
+                        found = Some("result zero from a product".to_owned());
+                        break;
+                    }
+                    other => {
+                        found = Some(format!("result {other}"));
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| "other".to_owned())
+        };
+        let size = match fp.size {
+            FpSize::S => "S",
+            FpSize::D => "D",
+        };
+        let key = format!(
+            "{helper} {op:?} {size} lanes {}: {reason}",
+            lane_count(bits, q, scalar)
+        );
+        let mut counts = COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counts = counts.get_or_insert_with(Default::default);
+        *counts.entry(key).or_default() += 1;
+        static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let total = TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if total.is_multiple_of(100_000)
+            && let Some(path) = std::env::var_os("ECHORA_SIMD_STATS")
+        {
+            let mut rows: Vec<_> = counts.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1));
+            let text: String = rows
+                .iter()
+                .map(|(key, count)| format!("{count} {key}\n"))
+                .collect();
+            let _ = std::fs::write(path, format!("total {total}\n{text}"));
+        }
+    }
 }
