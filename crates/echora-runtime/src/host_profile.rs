@@ -6,7 +6,10 @@
 //! `count address thread top` line per sampled address, host thread id (low
 //! 16 bits) and the word at the top of the stack, for offline
 //! symbolization. In a leaf without a frame (glibc's memcpy variants) that
-//! word is the caller's return address.
+//! word is the caller's return address. A fifth column names the guest
+//! thread the sampled host thread was running (`set_guest_thread`; 0 for
+//! none), so one guest thread's time can be told apart from the others
+//! sharing its workers.
 
 #![allow(unsafe_code)]
 
@@ -17,7 +20,19 @@ mod imp {
     const CAPACITY: usize = 1 << 21;
     static SAMPLES: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
     static TOPS: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
+    static GUESTS: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    std::thread_local! {
+        // Const-initialized and without a destructor: readable from the
+        // signal handler.
+        static GUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The guest thread this host thread runs from now on (0: none).
+    pub fn set_guest_thread(thread: u64) {
+        GUEST.with(|guest| guest.set(thread));
+    }
 
     extern "C" fn on_sample(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
         // SAFETY: the kernel passes a valid `ucontext_t` to SA_SIGINFO handlers.
@@ -41,6 +56,7 @@ mod imp {
                 Ordering::Relaxed,
             );
             TOPS[slot].store(top, Ordering::Relaxed);
+            GUESTS[slot].store(GUEST.with(std::cell::Cell::get), Ordering::Relaxed);
         }
     }
 
@@ -84,18 +100,26 @@ mod imp {
                 libc::setitimer(libc::ITIMER_VIRTUAL, &timer, std::ptr::null_mut());
             }
             let taken = NEXT.load(Ordering::Relaxed).min(CAPACITY);
-            let mut counts = std::collections::HashMap::<(u64, u64), u64>::new();
-            for (sample, top) in SAMPLES[..taken].iter().zip(&TOPS[..taken]) {
-                let key = (sample.load(Ordering::Relaxed), top.load(Ordering::Relaxed));
+            let mut counts = std::collections::HashMap::<(u64, u64, u64), u64>::new();
+            for ((sample, top), guest) in SAMPLES[..taken]
+                .iter()
+                .zip(&TOPS[..taken])
+                .zip(&GUESTS[..taken])
+            {
+                let key = (
+                    sample.load(Ordering::Relaxed),
+                    top.load(Ordering::Relaxed),
+                    guest.load(Ordering::Relaxed),
+                );
                 *counts.entry(key).or_default() += 1;
             }
             let mut counts: Vec<_> = counts.into_iter().collect();
             counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             let mut out = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
             out.push_str("--\n");
-            for ((sample, top), count) in counts {
+            for ((sample, top, guest), count) in counts {
                 let (thread, address) = (sample >> 48, sample & 0xffff_ffff_ffff);
-                out.push_str(&format!("{count} {address:#x} {thread} {top:#x}\n"));
+                out.push_str(&format!("{count} {address:#x} {thread} {top:#x} {guest}\n"));
             }
             if let Err(error) = std::fs::write(&self.path, out) {
                 eprintln!("host profile: write failed: {error}");
@@ -115,6 +139,8 @@ mod imp {
     }
 
     pub fn restart() {}
+
+    pub fn set_guest_thread(_: u64) {}
 }
 
-pub use imp::{Profile, restart, start};
+pub use imp::{Profile, restart, set_guest_thread, start};

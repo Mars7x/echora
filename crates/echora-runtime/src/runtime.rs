@@ -5173,6 +5173,7 @@ impl Worker {
                 let result = loop {
                     // Limits the host set since the last entry take effect.
                     self.core.rearm();
+                    crate::host_profile::set_guest_thread(self.core.current_thread_id);
                     match dispatch(&mut self.core) {
                         Ok(()) => {}
                         Err(Trap::MissingBlock { pc })
