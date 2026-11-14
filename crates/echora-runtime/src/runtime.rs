@@ -4884,7 +4884,34 @@ struct Shared<'a> {
     replay_failed: std::sync::Mutex<Option<Trap>>,
 }
 
-impl Shared<'_> {
+/// Attempts `Shared::lock_machine` makes before it sleeps on the lock,
+/// with `MACHINE_SPIN_PAUSES` spin hints between them: about 20 µs, longer
+/// than the lock is usually held (a few µs) and than a sleeping waiter
+/// takes to run again after its wake.
+const MACHINE_SPIN_TRIES: u32 = 256;
+const MACHINE_SPIN_PAUSES: u32 = 8;
+
+impl<'a> Shared<'a> {
+    /// The machine lock, spinning briefly before sleeping on it: holds are
+    /// a few µs, and a waiter put to sleep took longer to run again than
+    /// the hold it waited for.
+    fn lock_machine(&self) -> std::sync::MutexGuard<'_, &'a mut Machine> {
+        for _ in 0..MACHINE_SPIN_TRIES {
+            match self.machine.try_lock() {
+                Ok(machine) => return machine,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    for _ in 0..MACHINE_SPIN_PAUSES {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+        self.machine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Wake the replay thread (it has work left).
     fn wake_replay(&self) {
         let (pending, wake) = &self.replay_wake;
@@ -5191,10 +5218,7 @@ impl Worker {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
                 let waited = std::time::Instant::now();
-                let mut machine = shared
-                    .machine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut machine = shared.lock_machine();
                 let held = std::time::Instant::now();
                 machine.lock_free_nvn_calls += std::mem::take(&mut self.lock_free_calls);
                 machine.lock_free_yields += std::mem::take(&mut self.lock_free_yields);
@@ -5303,10 +5327,7 @@ impl Worker {
                 }
             }
             // Parked: wait for a runnable thread no other worker runs.
-            let mut machine = shared
-                .machine
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut machine = shared.lock_machine();
             machine.parked_workers += 1;
             // Parked workers' own lock use, reported as thread 10000 + index
             // (guest: rechecks; lock_held: microseconds holding the lock).
