@@ -6052,6 +6052,9 @@ mod tests {
         zero_handle_wait_args(&mut m, 1_000_000); // 1 ms, no objects
         m.core.cpu.regs[2] = 0;
         let continuation = m.core.cpu.clone();
+        // The deadline counts from the SVC: measured from there, a slow
+        // runner's setup below cannot shorten the wait seen.
+        let started = std::time::Instant::now();
         m.svc(0x18).unwrap();
         assert_eq!(m.pending_synchronization_wait, Some(m.current_thread_id()));
         assert!(matches!(
@@ -6059,7 +6062,6 @@ mod tests {
             Err(Trap::NoRunnableThreads { .. })
         ));
         assert_eq!(m.main_thread_state, ThreadState::Waiting);
-        let started = std::time::Instant::now();
         assert!(m.idle_until_runnable().unwrap());
         assert!(started.elapsed() >= std::time::Duration::from_millis(1));
         assert_eq!(m.main_thread_state, ThreadState::Runnable);
