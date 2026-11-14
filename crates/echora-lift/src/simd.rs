@@ -2571,14 +2571,34 @@ fn vec_fp_arith(
             String::new()
         };
         let d_usable = if fused { " && usable_all(d)" } else { "" };
+        // When a lane is not usable (a vector's unused lane often holds a
+        // NaN), the others still run natively: only that lane's operation
+        // is the exact helper's.
+        let lane_d = if fused {
+            "z as u64".to_owned()
+        } else {
+            "0".to_owned()
+        };
+        let lane_z_usable = if fused { " & usable(z)" } else { "" };
+        let lanewise = format!(
+            "let mut out = 0u128; \
+             for lane in 0..{lanes} {{ \
+             let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
+             let raw = ({value}).to_bits(); \
+             let native = usable(x) & {divisor}{lane_z_usable} & (normal(raw) | (zero(raw) & ({exact}))); \
+             let raw = if native {{ raw }} else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
+             out |= u128::from(raw) << (lane * {width}); }} \
+             m.cpu.vectors[{rd}] = out;"
+        );
         return format!(
             "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
              let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
              let zero = |value: {int}| value & !{sign} == 0; \
              let infinite = |value: {int}| value & !{sign} == {exponent}; \
              let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {closures} \
-             let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
-             && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable_all(n) && {second_usable}{d_usable}; \
+             let mode = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
+             && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
+             let mut fast = mode && usable_all(n) && {second_usable}{d_usable}; \
              let mut out = 0u128; let mut overflow = false; \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
@@ -2591,7 +2611,8 @@ fn vec_fp_arith(
              overflow |= infinite(raw); \
              fast &= normal(raw) | infinite(raw) | (zero(raw) & ({exact})); }} }} \
              let _ = d; \
-             if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+             if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} \
+             else if mode {{ {lanewise} }} else {{ {call} }} }}"
         );
     }
     format!(

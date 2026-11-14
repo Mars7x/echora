@@ -490,6 +490,15 @@ unsafe extern "Rust" {
         bytes: u8,
     ) -> Result<(), Trap>;
     #[allow(clippy::too_many_arguments)]
+    safe fn __echora_simd_vec_fp_lane(
+        cpu: &mut Cpu,
+        op: VecFpOp,
+        size: FpSize,
+        a: u64,
+        b: u64,
+        d: u64,
+    ) -> Result<u64, Trap>;
+    #[allow(clippy::too_many_arguments)]
     safe fn __echora_simd_vec_fp(
         cpu: &mut Cpu,
         op: VecFpOp,
@@ -962,6 +971,20 @@ pub fn store_pair(
     bytes: u8,
 ) -> Result<(), Trap> {
     __echora_simd_store_pair(cpu, memory, address, rt, rt2, bytes)
+}
+
+/// One lane of a vector float operation, exactly (inlined vector code
+/// whose other lanes ran natively).
+#[inline]
+pub fn vec_fp_lane(
+    cpu: &mut Cpu,
+    op: VecFpOp,
+    size: FpSize,
+    a: u64,
+    b: u64,
+    d: u64,
+) -> Result<u64, Trap> {
+    __echora_simd_vec_fp_lane(cpu, op, size, a, b, d)
 }
 
 #[allow(clippy::too_many_arguments)]

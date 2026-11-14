@@ -1608,6 +1608,20 @@ fn rsqrt_estimate_lane(fp: &mut Fp<'_>, value: u64) -> u64 {
 }
 
 /// Lanewise FP operation (vector, or scalar with `scalar`).
+/// One lane of a vector float operation (`vec_fp`'s lane `a`, `b`, `d`),
+/// exactly: for inlined vector code whose other lanes ran natively.
+pub fn vec_fp_lane_exact(
+    cpu: &mut Cpu,
+    op: VecFpOp,
+    size: FpSize,
+    a: u64,
+    b: u64,
+    d: u64,
+) -> Result<u64, Trap> {
+    let mut fp = Fp::new(cpu, size)?;
+    Ok(vec_fp_lane(&mut fp, op, a, b, d))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn vec_fp(
     cpu: &mut Cpu,
@@ -4471,6 +4485,18 @@ pub fn __echora_simd_store_pair(
     bytes: u8,
 ) -> Result<(), Trap> {
     store_pair(cpu, memory, address, rt, rt2, bytes)
+}
+
+#[unsafe(no_mangle)]
+pub fn __echora_simd_vec_fp_lane(
+    cpu: &mut Cpu,
+    op: VecFpOp,
+    size: FpSize,
+    a: u64,
+    b: u64,
+    d: u64,
+) -> Result<u64, Trap> {
+    vec_fp_lane_exact(cpu, op, size, a, b, d)
 }
 
 #[allow(clippy::too_many_arguments)]
