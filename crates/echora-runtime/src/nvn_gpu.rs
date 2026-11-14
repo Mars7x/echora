@@ -2091,11 +2091,8 @@ impl Nvn {
         core: &mut Guest,
         nvn: u32,
     ) -> Result<std::sync::Arc<[echora_gpu::pool::PoolEntry]>, String> {
-        // The renderer's counts from earlier pool writes.
-        let backend = self.gpu.as_mut().unwrap();
-        for (name, amount) in backend.renderer.take_stats() {
-            backend.stat(name, amount);
-        }
+        // (The renderer's counts from pool writes reach the statistics
+        // with the page table's at each present.)
         let key = (
             (
                 self.texture_epoch,
@@ -2110,7 +2107,37 @@ impl Nvn {
         if let Some((cached, list)) = self.pool_entry_cache.get(&nvn)
             && *cached == key
         {
-            return Ok(list.clone());
+            let list = list.clone();
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: pool entry lists reused", 1);
+            return Ok(list);
+        }
+        if let Some((cached, _)) = self.pool_entry_cache.get(&nvn) {
+            let backend = self.gpu.as_mut().unwrap();
+            for (changed, name) in [
+                (
+                    cached.0 != key.0,
+                    "stat: pool entry lists remade: memo stamp",
+                ),
+                (
+                    cached.1 != key.1,
+                    "stat: pool entry lists remade: GPU writes",
+                ),
+                (
+                    cached.2 != key.2,
+                    "stat: pool entry lists remade: registrations or queue",
+                ),
+                (
+                    cached.3 != key.3,
+                    "stat: pool entry lists remade: stage binds",
+                ),
+            ] {
+                if changed {
+                    backend.stat(name, 1);
+                }
+            }
         }
         let stage = u64::from(nvn);
         let mut handles: Vec<u64> = self
