@@ -2296,7 +2296,14 @@ fn emit_instruction_body(
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 match emit_plt_stub(output, pc, *target, true) {
                     Some(direct) => emit_call_predicted(output, next, direct),
-                    None => emit_call(output, next),
+                    None => match direct_call_window(pc, *target) {
+                        Some(window) => writeln!(
+                            output,
+                            "                if let Err(trap) = m.call_window({next:#x}, run_window_{window:x}) {{ return Err(trap); }}"
+                        )
+                        .unwrap(),
+                        None => emit_call(output, next),
+                    },
                 }
                 output.push_str(after_call);
             } else if emit_plt_stub(output, pc, *target, false).is_some() {
@@ -4078,6 +4085,13 @@ pub struct EmitOptions {
     /// path call `charge_block_slow` with `?`, keeping the checks' `Result`
     /// off the common path.
     pub split_ticks: bool,
+    /// A BL to a block with its own dispatch arm in the caller's region
+    /// calls that block's window function directly (`Core::call_window`)
+    /// instead of looking it up in the window table (`Core::call`).
+    /// Measured slower (kernels: calls -21%, the rest within noise): the
+    /// inlined call path at each site costs the caller's window more than
+    /// the table lookup it saves. Off by default.
+    pub direct_calls: bool,
 }
 
 thread_local! {
@@ -4127,6 +4141,36 @@ thread_local! {
     static UNTAGGED_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::split_ticks` of the emission running on this thread.
     static SPLIT_TICKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// With `EmitOptions::direct_calls`: the blocks with a dispatch arm and
+    /// the region size of the emission running on this thread.
+    static DIRECT_CALLS: std::cell::RefCell<Option<(BTreeSet<u64>, u32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets [`DIRECT_CALLS`] for as long as it lives.
+struct DirectCalls(Option<(BTreeSet<u64>, u32)>);
+
+impl DirectCalls {
+    fn set(calls: Option<(BTreeSet<u64>, u32)>) -> Self {
+        Self(DIRECT_CALLS.replace(calls))
+    }
+}
+
+impl Drop for DirectCalls {
+    fn drop(&mut self) {
+        DIRECT_CALLS.set(self.0.take());
+    }
+}
+
+/// The window to call directly for a BL at `from` to `target`
+/// (`EmitOptions::direct_calls`): `target`'s, when it is a block with a
+/// dispatch arm in `from`'s region.
+fn direct_call_window(from: u64, target: u64) -> Option<u64> {
+    DIRECT_CALLS.with_borrow(|calls| {
+        let (entered, region_bits) = calls.as_ref()?;
+        (entered.contains(&target) && target >> region_bits == from >> region_bits)
+            .then_some(target >> SPLIT_WINDOW_BITS)
+    })
 }
 
 /// Sets [`SPLIT_TICKS`] for as long as it lives.
@@ -4392,6 +4436,11 @@ pub fn emit_rust_split_to_with<E>(
     let _untagged_blocks = UntaggedBlocks::set(options.untagged_blocks);
     let _split_ticks = SplitTicks::set(options.split_ticks);
     let _plt = PltStubs::set((!options.stub_windows).then(|| Plt::of(translation, region_bits)));
+    let _direct_calls = DirectCalls::set(
+        options
+            .direct_calls
+            .then(|| (entered_blocks(translation), region_bits)),
+    );
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options

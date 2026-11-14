@@ -38,6 +38,9 @@ untagged-blocks = []
 # Blocks charge through a bool fast path, the checks only on its slow path
 # (EmitOptions::split_ticks).
 split-ticks = []
+# A BL to a block of the caller's region calls its window directly
+# (EmitOptions::direct_calls).
+direct-calls = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

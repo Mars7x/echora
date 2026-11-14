@@ -745,6 +745,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "dense-dispatch" => options.dense_dispatch = true,
             "untagged-blocks" => options.untagged_blocks = true,
             "split-ticks" => options.split_ticks = true,
+            "direct-calls" => options.direct_calls = true,
             "stub-windows" => options.stub_windows = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),

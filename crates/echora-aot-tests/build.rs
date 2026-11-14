@@ -41,6 +41,7 @@ fn options() -> EmitOptions {
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
         untagged_blocks: std::env::var_os("CARGO_FEATURE_UNTAGGED_BLOCKS").is_some(),
         split_ticks: std::env::var_os("CARGO_FEATURE_SPLIT_TICKS").is_some(),
+        direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
         stub_windows: false,
     }
 }
