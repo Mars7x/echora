@@ -780,6 +780,10 @@ impl Machine {
         let now = std::time::Instant::now();
         self.services.advance_audio(now, &mut self.memory);
         let mut woke = self.time_out_mutex_waits(now)?;
+        // Decided first, against the waits as they stand, then completed:
+        // completing a wait changes no object's signal, and the records are
+        // read in place (each scan cloned every parked record before).
+        let mut completions = Vec::new();
         for (id, record) in self.synchronization_waits.waiters() {
             let mut completion = None;
             for (index, &handle) in record.handles.iter().enumerate() {
@@ -788,27 +792,34 @@ impl Machine {
                     break;
                 }
             }
+            let mut timed_out = None;
             if completion.is_none() && record.deadline.is_some_and(|deadline| now >= deadline) {
                 // A finished SleepThread returns no result (W0 is written 0).
                 completion = Some(if record.sleep { (0, -1) } else { (0xea01, -1) });
-                if !record.sleep && self.debug_messages.len() < 256 {
-                    let objects: Vec<String> = record
-                        .handles
-                        .iter()
-                        .map(|&handle| match self.services.readable_event_kind(handle) {
-                            Some(kind) => format!("{handle:#x} {kind}"),
-                            None => format!("{handle:#x}"),
-                        })
-                        .collect();
-                    self.debug_messages.push(format!(
-                        "wait timed out: thread {id}, objects [{}]",
-                        objects.join(", ")
-                    ));
+                if !record.sleep {
+                    timed_out = Some(record.handles.clone());
                 }
             }
-            let Some((result, index)) = completion else {
-                continue;
-            };
+            if let Some(completion) = completion {
+                completions.push((id, completion, timed_out));
+            }
+        }
+        for (id, (result, index), timed_out) in completions {
+            if let Some(handles) = timed_out
+                && self.debug_messages.len() < 256
+            {
+                let objects: Vec<String> = handles
+                    .iter()
+                    .map(|&handle| match self.services.readable_event_kind(handle) {
+                        Some(kind) => format!("{handle:#x} {kind}"),
+                        None => format!("{handle:#x}"),
+                    })
+                    .collect();
+                self.debug_messages.push(format!(
+                    "wait timed out: thread {id}, objects [{}]",
+                    objects.join(", ")
+                ));
+            }
             if self.thread_state(id) != Some(ThreadState::Waiting) {
                 return Err(Trap::InvalidState {
                     message: "a parked synchronization wait belongs to a non-waiting thread".into(),

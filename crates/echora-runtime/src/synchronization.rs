@@ -725,12 +725,11 @@ impl ZeroHandleWaits {
     /// may now be signaled) or with a deadline. Address and condition
     /// waits without one end only when signaled (or cancelled), so the scan
     /// skips them without copying them.
-    pub(crate) fn waiters(&self) -> Vec<(u64, WaitRecord)> {
+    pub(crate) fn waiters(&self) -> impl Iterator<Item = (u64, &WaitRecord)> {
         self.waiting
             .iter()
             .filter(|(_, record)| !record.handles.is_empty() || record.deadline.is_some())
-            .map(|(&id, record)| (id, record.clone()))
-            .collect()
+            .map(|(&id, record)| (id, record))
     }
 
     fn insert_waiting(&mut self, id: u64, record: WaitRecord) {
