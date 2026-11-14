@@ -917,6 +917,13 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         flags.push("-C".into());
         flags.push(format!("link-arg=-Wl,-rpath,{libdir}"));
     }
+    // The translation is built on the machine that runs it, so it is
+    // compiled for that processor (on x86-64: FMA for FMLA and FMADD
+    // instead of a call to the dispatching `fmaf`, BMI2, LZCNT, AVX2);
+    // ECHORA_TARGET_CPU names another (`x86-64` for the baseline).
+    let target_cpu = std::env::var("ECHORA_TARGET_CPU").unwrap_or_else(|_| "native".into());
+    flags.push("-C".into());
+    flags.push(format!("target-cpu={target_cpu}"));
     let config = format!("[build]\nrustflags = {flags:?}\n");
     write_if_changed(&out.join(".cargo/config.toml"), &config)?;
     std::fs::write(
