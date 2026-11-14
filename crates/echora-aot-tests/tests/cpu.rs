@@ -31,6 +31,7 @@ fn calls_return_with_and_without_pauth_hints() {
 fn budget_stops_an_infinite_loop() {
     let mut m = Machine::new();
     m.core.max_steps = 5;
+    m.core.rearm();
     assert!(matches!(
         bounded_loop::run(&mut m),
         Err(Trap::Budget { steps: 5, .. })

@@ -65,6 +65,7 @@ impl Machine {
         core.cpu.pc = CODE_BASE;
         core.max_steps = 100;
         core.host_check_at = u64::MAX;
+        core.rearm();
         Self { memory, core }
     }
 
@@ -90,6 +91,7 @@ impl Machine {
         core.cpu.pc = code_base;
         core.max_steps = u64::MAX;
         core.host_check_at = u64::MAX;
+        core.rearm();
         Self { memory, core }
     }
 

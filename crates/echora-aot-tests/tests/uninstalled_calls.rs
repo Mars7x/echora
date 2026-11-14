@@ -29,6 +29,7 @@ fn calls_run_before_install() {
     m.core.cpu.regs[1] = 7;
     m.core.cpu.regs[2] = 11;
     m.core.host_check_at = u64::MAX;
+    m.core.rearm();
     let trap = loop {
         if let Err(trap) = kernel_code::dispatch(&mut m.core) {
             break trap;

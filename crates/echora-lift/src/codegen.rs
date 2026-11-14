@@ -1086,13 +1086,16 @@ fn structure_transfer(output: &mut String, rn: u8, post: Option<u8>, call: &str)
 /// fallthrough PC store is only emitted for a block's final instruction.
 /// `block_size` is set for a block's first instruction, which charges the
 /// whole block's accounting; every instruction still stores its own PC so a
-/// fault reports the exact instruction.
+/// fault reports the exact instruction. `resumable`: execution can resume
+/// at the block (it has its own dispatch arm), so its charge may take a
+/// host boundary first; an inlined block's never does.
 fn emit_instruction(
     output: &mut String,
     record: &TranslatedInstruction,
     last: bool,
     block_size: Option<usize>,
     check_entry: bool,
+    resumable: bool,
 ) {
     let pc = record.pc;
     let mut body = String::new();
@@ -1114,11 +1117,12 @@ fn emit_instruction(
         if check_entry {
             writeln!(output, "                m.enter_window()?;").unwrap();
         }
-        writeln!(
-            output,
-            "                m.tick_block_at({pc:#x}, {count})?;"
-        )
-        .unwrap();
+        let tick = if resumable {
+            "tick_block_at"
+        } else {
+            "tick_inline_block_at"
+        };
+        writeln!(output, "                m.{tick}({pc:#x}, {count})?;").unwrap();
     }
     output.push_str(&body);
 }
@@ -2698,12 +2702,18 @@ fn traced_pcs() -> &'static std::collections::BTreeSet<u64> {
 fn emit_block_cases(output: &mut String, blocks: &[BasicBlock], check_entry: bool) {
     for block in blocks {
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
-        emit_block_body(output, block, check_entry, false);
+        emit_block_body(output, block, check_entry, false, true);
         output.push_str("            }\n");
     }
 }
 
-fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, spin_head: bool) {
+fn emit_block_body(
+    output: &mut String,
+    block: &BasicBlock,
+    check_entry: bool,
+    spin_head: bool,
+    resumable: bool,
+) {
     if traced_pcs().contains(&block.start) {
         output.push_str("                m.trace_hit();\n");
     }
@@ -2723,6 +2733,7 @@ fn emit_block_body(output: &mut String, block: &BasicBlock, check_entry: bool, s
             index + 1 == count,
             block_size,
             check_entry,
+            resumable,
         );
     }
     FUSE.set(fuse);
@@ -2895,7 +2906,13 @@ fn emit_split_cases(
         .iter()
         .map(|block| {
             let mut body = String::new();
-            emit_block_body(&mut body, block, false, spin_heads.contains(&block.start));
+            emit_block_body(
+                &mut body,
+                block,
+                false,
+                spin_heads.contains(&block.start),
+                !inlined.contains(&block.start),
+            );
             (block.start, body)
         })
         .collect();
@@ -2931,7 +2948,13 @@ fn emit_structured_cases(
             .iter()
             .map(|block| {
                 let mut body = String::new();
-                emit_block_body(&mut body, block, false, spin_heads.contains(&block.start));
+                emit_block_body(
+                    &mut body,
+                    block,
+                    false,
+                    spin_heads.contains(&block.start),
+                    !inlined.contains(&block.start),
+                );
                 (block.start, body)
             })
             .collect(),
@@ -4339,7 +4362,10 @@ mod tests {
         assert!(window.contains("0x1000 => {") && window.contains("0x1010 => {"));
         assert!(!window.contains("0x1004 => {") && !window.contains("0x100c => {"));
         assert!(window.contains("m.cpu.pc = 0x1004;") && window.contains("m.cpu.pc = 0x100c;"));
-        assert!(window.contains("m.tick_block_at(0x1004, 2)?;"));
+        // Inlined blocks never take a host boundary (nothing resumes
+        // there); the join, which has its own arm, can.
+        assert!(window.contains("m.tick_inline_block_at(0x1004, 2)?;"));
+        assert!(window.contains("m.tick_block_at(0x1010, 1)?;"));
         assert_eq!(window.matches("next_pc = 0x1010;").count(), 2);
         assert!(!window.contains("next_pc = if"));
     }

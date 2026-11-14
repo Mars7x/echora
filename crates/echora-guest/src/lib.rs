@@ -372,21 +372,41 @@ impl Core {
     #[inline(always)]
     pub fn tick_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
         if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return self.block_limit(pc, count);
+            return self.block_limit(pc, count, true);
         }
         self.steps += count;
         self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
         Ok(())
     }
 
-    /// The exact checks for a block `stop` does not clear: the budget, a
-    /// host boundary, a preemption; otherwise the block runs.
+    /// `tick_block_at` for a block execution cannot resume at (generated
+    /// code inlined it into its only predecessor): it never takes a host
+    /// boundary, only the budget's trap; the next block that can take one
+    /// does.
+    #[inline(always)]
+    pub fn tick_inline_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
+        if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.block_limit(pc, count, false);
+        }
+        self.steps += count;
+        self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
+        Ok(())
+    }
+
+    /// The exact checks for a block `stop` does not clear: the budget,
+    /// and where `boundary` allows one, a host boundary or a preemption;
+    /// otherwise the block runs.
     #[cold]
     #[inline(never)]
-    fn block_limit(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
+    fn block_limit(&mut self, pc: u64, count: u64, boundary: bool) -> Result<(), Trap> {
         use std::sync::atomic::Ordering;
         if self.steps + count > self.max_steps {
             return self.block_budget_exhausted();
+        }
+        if !boundary {
+            self.steps += count;
+            self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
+            return Ok(());
         }
         // Stored before the flag is read: a preemption setting the flag
         // after the read stores 0 after this.

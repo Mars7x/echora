@@ -85,6 +85,7 @@ fn run_lifted(m: &mut Machine, entry: u64, state: &State) -> Result<(bool, State
             Err(Trap::HostBoundary) => {
                 m.core.spin_polls = 0;
                 m.core.host_check_at = u64::MAX;
+                m.core.rearm();
             }
             Err(trap) => break trap,
         }

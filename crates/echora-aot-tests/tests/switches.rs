@@ -81,6 +81,7 @@ fn run_lifted(
     m.core.spin_polls = 0;
     let next_check = |steps: u64| slice.map_or(u64::MAX, |slice| steps + slice);
     m.core.host_check_at = next_check(m.core.steps);
+    m.core.rearm();
     let trap = loop {
         match switch_code::dispatch(&mut m.core) {
             Ok(()) => continue,
@@ -88,6 +89,7 @@ fn run_lifted(
                 *boundaries += 1;
                 m.core.spin_polls = 0;
                 m.core.host_check_at = next_check(m.core.steps);
+                m.core.rearm();
             }
             Err(trap) => break trap,
         }

@@ -148,6 +148,7 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
     m.core.cpu.pc = KERNEL_BASE + entry;
     let other_thread = prepare(&mut m, name, scale);
     m.core.host_check_at = SLICE;
+    m.core.rearm();
     let mut flag_set = false;
     let start = Instant::now();
     loop {
@@ -174,6 +175,7 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
                 }
                 m.core.spin_polls = 0;
                 m.core.host_check_at = m.core.steps + SLICE;
+                m.core.rearm();
             }
             Trap::SupervisorCall { number: 7 } => break,
             other => panic!("{name}: {other:?} at {:#x}", m.core.cpu.pc),

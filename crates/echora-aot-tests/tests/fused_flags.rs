@@ -84,10 +84,14 @@ fn run_lifted(
     m.core.cpu.pc = entry;
     let next_check = |steps: u64| slice.map_or(u64::MAX, |slice| steps + slice);
     m.core.host_check_at = next_check(m.core.steps);
+    m.core.rearm();
     let trap = loop {
         match flag_code::dispatch(&mut m.core) {
             Ok(()) => continue,
-            Err(Trap::HostBoundary) => m.core.host_check_at = next_check(m.core.steps),
+            Err(Trap::HostBoundary) => {
+                m.core.host_check_at = next_check(m.core.steps);
+                m.core.rearm();
+            }
             Err(trap) => break trap,
         }
     };

@@ -168,6 +168,7 @@ fn load(core: &mut Core, context: &Context) {
 fn turn(core: &mut Core, slice: u64) -> Result<(u64, bool), Trap> {
     let start = core.steps;
     core.host_check_at = core.steps + slice;
+    core.rearm();
     loop {
         match exclusive_code::dispatch(core) {
             Ok(()) => continue,
@@ -284,6 +285,7 @@ fn check(contexts: usize, longest: u64) {
         .map(|_| {
             let mut core = Core::new(m.memory.view());
             core.max_steps = u64::MAX;
+            core.rearm();
             core
         })
         .collect();

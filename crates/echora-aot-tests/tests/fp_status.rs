@@ -53,6 +53,7 @@ fn run(
     m.core.cpu.nzcv = 0;
     m.core.cpu.pc = entry;
     m.core.host_check_at = u64::MAX;
+    m.core.rearm();
     let trap = loop {
         match dispatch(&mut m.core) {
             Ok(()) => continue,

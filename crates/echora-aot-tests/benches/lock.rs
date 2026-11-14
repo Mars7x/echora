@@ -174,6 +174,7 @@ fn worker(
     m.core.cpu.regs[0] = u64::MAX / 8;
     m.core.max_steps = u64::MAX;
     m.core.host_check_at = options.slice;
+    m.core.rearm();
     let mut totals = Totals::default();
     // Which slice ends skip the lock: a fixed pattern per worker.
     let mut fast_credit = index as f64 * 0.37 % 1.0;
@@ -253,6 +254,7 @@ fn worker(
         totals.waiting += queue_wait;
         m.core.spin_polls = 0;
         m.core.host_check_at = m.core.steps + options.slice;
+        m.core.rearm();
     }
     totals.instructions = m.core.steps;
     totals

@@ -35,12 +35,14 @@ fn run(core: &mut Core, entry: u64) -> u64 {
     core.cpu.pc = entry;
     core.max_steps = u64::MAX;
     core.host_check_at = u64::MAX;
+    core.rearm();
     loop {
         match concurrency_code::dispatch(core) {
             Ok(()) => {}
             Err(Trap::HostBoundary) => {
                 core.spin_polls = 0;
                 core.host_check_at = u64::MAX;
+                core.rearm();
             }
             Err(Trap::SupervisorCall { number: 7 }) => {
                 core.settle_block_trap();

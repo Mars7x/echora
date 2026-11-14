@@ -84,6 +84,7 @@ fn run_after(
         core.cpu.sp = DATA + DATA_SIZE - 0x1000 * (index as u64 + 1);
         core.cpu.pc = pc;
         core.max_steps = u64::MAX;
+        core.rearm();
     }
     for (index, mut core) in cores.into_iter().enumerate() {
         let done = done.clone();
@@ -97,6 +98,7 @@ fn run_after(
                 }
             };
             core.host_check_at = slice(&mut random, 0);
+            core.rearm();
             let result = loop {
                 match stress_code::dispatch(&mut core) {
                     Ok(()) => {}
@@ -107,6 +109,7 @@ fn run_after(
                         }
                         core.spin_polls = 0;
                         core.host_check_at = slice(&mut random, core.steps);
+                        core.rearm();
                     }
                     Err(Trap::SupervisorCall { number: 7 }) => {
                         core.settle_block_trap();
