@@ -7084,9 +7084,28 @@ impl Nvn {
         let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
         let (mut uniform_time, mut texture_time) = Default::default();
         let mut uniform_bytes = 0u64;
+        // Time per kind of binding (the statistics' "draw us binding ...").
+        let mut binding_times = [std::time::Duration::ZERO; 5];
+        let mut binding_lap: Option<(usize, std::time::Instant)> = None;
         for (index, stage) in stages.iter().enumerate() {
             let nvn = slots[index];
             for descriptor in &stage.descriptors {
+                let now = std::time::Instant::now();
+                if let Some((kind, since)) = binding_lap {
+                    binding_times[kind] += now - since;
+                }
+                let kind = match descriptor.kind() {
+                    DescriptorKind::UniformBuffer
+                        if descriptor.index >= 3 && descriptor.index != 24 =>
+                    {
+                        0
+                    }
+                    DescriptorKind::UniformBuffer => 1,
+                    DescriptorKind::StorageBuffer => 2,
+                    DescriptorKind::Texture | DescriptorKind::TextureBuffer => 3,
+                    _ => 4,
+                };
+                binding_lap = Some((kind, now));
                 match descriptor.kind() {
                     // Constant bank 24: root table 0 of the graphics
                     // pipeline (PushGraphicsConstants).
@@ -7387,6 +7406,24 @@ impl Nvn {
         for (index, stage) in stages.iter().enumerate() {
             if stage.texture_pool_bindings != 0 {
                 pool.extend(self.pool_entries(core, slots[index])?);
+            }
+        }
+        if let Some((kind, since)) = binding_lap {
+            binding_times[kind] += since.elapsed();
+        }
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            for (name, time) in [
+                "stat: draw ns binding uniform buffers",
+                "stat: draw ns binding driver constants",
+                "stat: draw ns binding storage buffers",
+                "stat: draw ns binding textures",
+                "stat: draw ns binding images and others",
+            ]
+            .into_iter()
+            .zip(binding_times)
+            {
+                backend.stat(name, time.as_nanos() as u64);
             }
         }
         phase(self, "stat: draw us bindings", &mut since);
