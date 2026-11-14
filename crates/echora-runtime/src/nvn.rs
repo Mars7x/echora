@@ -7100,6 +7100,10 @@ mod tests {
             "nvnQueuePresentTexture",
             &[queue, window, 0],
         );
+        // A queued present is shown when the replay (thread) reaches it.
+        while nvn.replay_paused() {
+            nvn.resume_replay(&mut core).unwrap();
+        }
         assert_eq!(nvn.presented_frames, 1);
     }
 
