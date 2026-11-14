@@ -5550,6 +5550,11 @@ impl Worker {
         let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
         let locked = std::time::Instant::now();
+        // Time this call let the lock go (its GPU-wait pauses, a replay
+        // in pieces) and waited to take it again: held time and wait time
+        // count only while it held or waited for the lock.
+        let mut released = std::time::Duration::ZERO;
+        let mut rewaited = std::time::Duration::ZERO;
         // An asynchronous replay's next piece runs before this call, so
         // whoever calls next moves it on (and what the call sees has run).
         // A call made under the machine lock (present) finishes it here
@@ -5642,9 +5647,13 @@ impl Worker {
                         Ok(true) => break,
                         Ok(false) => {
                             drop(nvn);
+                            let let_go = std::time::Instant::now();
                             std::thread::sleep(std::time::Duration::from_micros(pause));
                             pause = (pause * 2).min(100);
+                            let asked_again = std::time::Instant::now();
                             nvn = shared.lock_nvn();
+                            released += asked_again - let_go;
+                            rewaited += asked_again.elapsed();
                         }
                         Err(trap) => {
                             self.held_failed = Some(Some(trap));
@@ -5671,11 +5680,15 @@ impl Worker {
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
         while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
             drop(nvn);
+            let let_go = std::time::Instant::now();
             shared.hand_nvn_over();
+            let asked_again = std::time::Instant::now();
             nvn = shared
                 .nvn
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            released += asked_again - let_go;
+            rewaited += asked_again.elapsed();
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
@@ -5692,7 +5705,7 @@ impl Worker {
                 Some(crate::nvn::HostEntry::Proc(name)) => name,
                 _ => "other".into(),
             };
-            nvn.note_held(&name, locked.elapsed());
+            nvn.note_held(&name, locked.elapsed().saturating_sub(released + rewaited));
             if crate::timeline::on() {
                 let who = self.core.current_thread_id;
                 crate::timeline::span(who, "nvn-lock-wait", asked, locked);
@@ -5700,8 +5713,11 @@ impl Worker {
             }
         }
         drop(nvn);
-        self.nvn_lock_micros[0] += (locked - asked).as_micros() as u64;
-        self.nvn_lock_micros[1] += locked.elapsed().as_micros() as u64;
+        self.nvn_lock_micros[0] += (locked - asked + rewaited).as_micros() as u64;
+        self.nvn_lock_micros[1] += locked
+            .elapsed()
+            .saturating_sub(released + rewaited)
+            .as_micros() as u64;
         made
     }
 
