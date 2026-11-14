@@ -10155,6 +10155,66 @@ mod tests {
     }
 
     #[test]
+    fn loads_relative_to_a_uniform_base_reuse_the_last_page_s_lookup_exactly() {
+        use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
+        // R2UR UR4, R10 (the base, 0x10 pages up); then for each offset
+        // MOV R0, offset; LDG.E R(2 + n), [R0 + UR4]: pages 0x10, 0x10,
+        // 0x11, 0x10 again, 0x12 (unmapped: zero), 0x10. Each word read is
+        // the device word at its page's base plus the offset within it,
+        // whether its page's lookup was reused or made.
+        let base = 0x10u32 << PAGE_SHIFT;
+        let offsets = [0x0u32, 0x8, 0x1004, 0x10, 0x2000, 0x14];
+        let r2ur = word(&[(0, 12, 0x3c2), (16, 8, 4), (24, 8, 10)]);
+        let mut program = vec![mov(10, base), r2ur];
+        for (n, &offset) in offsets.iter().enumerate() {
+            program.push(mov(0, offset));
+            program.push(word(&[
+                (0, 12, 0x981),
+                (16, 8, 12 + n as u128),
+                (24, 8, 0),
+                (32, 6, 4),
+                (73, 3, 4),
+                (91, 1, 1),
+            ]));
+        }
+        program.push(EXIT);
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let table = 0x2000_0000u64;
+        let device = [0x3000_0000u64, 0x3000_1000];
+        let mut push = vec![0u8; 128];
+        let at = PUSH_PAGE_TABLE_OFFSET as usize;
+        push[at..at + 8].copy_from_slice(&table.to_le_bytes());
+        push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
+        push[at + 12..at + 16].copy_from_slice(&3u32.to_le_bytes());
+        let entries: Vec<u8> = [device[0], device[1], 0]
+            .iter()
+            .flat_map(|e| e.to_le_bytes())
+            .collect();
+        // Device word at byte b of page p: 0x1000 p + b.
+        let page = |p: u64| -> Vec<u8> {
+            (0..0x400u32)
+                .flat_map(|w| (0x1000 * p as u32 + 4 * w).to_le_bytes())
+                .collect()
+        };
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory: BTreeMap::from([(table, entries), (device[0], page(0)), (device[1], page(1))]),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let expected = [0x0u32, 0x8, 0x1004, 0x10, 0, 0x14];
+        for (n, &value) in expected.iter().enumerate() {
+            let got = report.invocations[0][&registers[&(12 + n as u8)]][0] as u32;
+            assert_eq!(got, value, "load {n} at offset {:#x}", offsets[n]);
+        }
+        assert_eq!(report.unmapped_pages, BTreeMap::from([(0x12, 1)]));
+    }
+
+    #[test]
     fn accesses_to_pages_the_table_does_not_map_are_counted() {
         use echora_shader_abi::{PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET};
         // MOV R4, 0x10000; MOV R5, 0; LDG.E R2, [R4.64]
