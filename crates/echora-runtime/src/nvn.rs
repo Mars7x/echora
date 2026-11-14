@@ -766,6 +766,7 @@ impl Nvn {
             self.render_queue = capture.render_queue;
             self.bump_binding_serial("stat: binding serial by a restored capture");
             let mut failed = None;
+            let draws_before = self.gpu_draw_count();
             let started = std::time::Instant::now();
             for (queue, command) in &capture.commands {
                 if let Some(queue) = *queue {
@@ -791,9 +792,10 @@ impl Nvn {
                 let _ = std::fs::write(
                     directory.join(format!("replay-{name}.txt")),
                     format!(
-                        "commands_us {} finished_us {}\n",
+                        "commands_us {} finished_us {} draws {}\n",
                         replayed.as_micros(),
-                        finished.as_micros()
+                        finished.as_micros(),
+                        self.gpu_draw_count() - draws_before
                     ),
                 );
                 if debug_var_os("ECHORA_REPLAY_NO_IMAGE").is_some() {

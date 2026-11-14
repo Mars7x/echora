@@ -653,6 +653,14 @@ impl Nvn {
         Ok((width, height, vk_format))
     }
 
+    /// Draws recorded so far (the statistics' count).
+    pub(super) fn gpu_draw_count(&self) -> u64 {
+        self.gpu
+            .as_ref()
+            .and_then(|backend| backend.stats.get("stat: draws").copied())
+            .unwrap_or(0)
+    }
+
     /// Resolve texture bindings anew (`binding_memo`), counted by `why`.
     pub(super) fn bump_binding_serial(&mut self, why: &'static str) {
         self.binding_serial += 1;
