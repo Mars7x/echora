@@ -29,6 +29,16 @@ pub struct PoolEntry {
     pub sampler_state: Sampler,
 }
 
+/// A pool entry of an upload as `bind_pool` resolved it: the entry, its
+/// (binding, index, sampler or view) descriptors and its integer flag.
+/// Valid while no view it names is destroyed (`forget_pool_views`).
+pub(crate) struct ResolvedEntry {
+    source: TextureSource,
+    sampler_state: Sampler,
+    wanted: Vec<(u32, u32, u64)>,
+    integer: bool,
+}
+
 pub(crate) struct TexturePool {
     descriptor_pool: vk::DescriptorPool,
     pub(crate) set: vk::DescriptorSet,
@@ -216,6 +226,21 @@ impl Renderer {
                 self.stat("stat: texture pool entries past capacity", 1);
                 continue;
             }
+            // An upload resolved before with the same source and sampler
+            // names the same sampler and views (render targets resolve
+            // every time: sampling them transitions and refreshes copies).
+            let upload = matches!(entry.source, TextureSource::Upload { .. });
+            if upload
+                && let Some(memo) = self.pool_entry_memo.get(&(entry.texture, entry.sampler))
+                && memo.sampler_state == entry.sampler_state
+                && memo.source.same_as(&entry.source)
+            {
+                wanted.extend_from_slice(&memo.wanted);
+                kinds.push((entry.texture, memo.integer));
+                self.stat("stat: texture pool entries reused", 1);
+                continue;
+            }
+            let first = wanted.len();
             let sampler = self.sampler(&entry.sampler_state)?;
             wanted.push((binding::SAMPLERS, entry.sampler, sampler.as_raw()));
             let (shape, format) = self.source_shape(&entry.source)?;
@@ -232,6 +257,16 @@ impl Renderer {
                     continue;
                 };
                 wanted.push((array, entry.texture, view.as_raw()));
+            }
+            if upload {
+                let resolved = ResolvedEntry {
+                    source: entry.source.clone(),
+                    sampler_state: entry.sampler_state,
+                    wanted: wanted[first..].to_vec(),
+                    integer,
+                };
+                self.pool_entry_memo
+                    .insert((entry.texture, entry.sampler), resolved);
             }
             if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = entry.source
                 && let Some(target) = self.existing_target(key)
@@ -375,6 +410,7 @@ impl Renderer {
     /// after its work completed) become null again.
     pub(crate) fn forget_pool_views(&mut self, views: &[vk::ImageView]) {
         self.pool_cache = None;
+        self.pool_entry_memo.clear();
         let Some(pool) = self.texture_pool.as_mut() else {
             return;
         };

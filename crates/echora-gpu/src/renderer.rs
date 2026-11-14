@@ -255,6 +255,9 @@ pub struct Renderer {
     /// The texture pool entries last bound, the target changes then, and
     /// the targets they read (`bind_pool`).
     pub(crate) pool_cache: Option<(Vec<crate::pool::PoolEntry>, u64, Vec<vk::Image>)>,
+    /// Each uploaded pool entry's resolved descriptors, by (texture,
+    /// sampler) index: reused while the entry is the same (`bind_pool`).
+    pub(crate) pool_entry_memo: FastMap<(u32, u32), crate::pool::ResolvedEntry>,
     /// Counts for the runtime's statistics (`take_stats`).
     pub(crate) stats: HashMap<&'static str, u64>,
     /// Rendering passes ended, by the source line that ended them (for
@@ -620,6 +623,7 @@ impl Renderer {
         let mut renderer = Self {
             texture_pool: None,
             pool_cache: None,
+            pool_entry_memo: FastMap::default(),
             stats: HashMap::new(),
             pass_ends: HashMap::new(),
             debug_buffers: Vec::new(),
