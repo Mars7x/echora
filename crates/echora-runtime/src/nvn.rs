@@ -3504,6 +3504,13 @@ impl Nvn {
     /// window, its submission, and the captures and dumps switches ask for.
     fn present_frame(&mut self, core: &mut Guest, this: u64, texture: u64) -> Result<bool, Trap> {
         let name = "nvnQueuePresentTexture";
+        // The renderer's counts since the last present reach the
+        // statistics (draws no longer forward them one by one).
+        if let Some(backend) = self.gpu() {
+            for (stat, amount) in backend.renderer.take_stats() {
+                backend.stat(stat, amount);
+            }
+        }
         let invalid = |message: String| Trap::InvalidState {
             message: format!("{name}: {message}"),
         };
