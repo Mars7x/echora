@@ -32,6 +32,9 @@ fp-status-locals = []
 window-memory = []
 # Split windows dispatch blocks on a dense index (EmitOptions::dense_dispatch).
 dense-dispatch = []
+# Blocks that cannot fail after their charge store no block tag
+# (EmitOptions::untagged_blocks).
+untagged-blocks = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

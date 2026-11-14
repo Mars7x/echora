@@ -708,13 +708,14 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     let simd = simd.to_string_lossy().into_owned();
 
     // Code generation options: inline-vector, fused-flags,
-    // whole-vector-checks, fp-status-locals and window-memory by default (the set
+    // whole-vector-checks, fp-status-locals, window-memory and untagged-blocks by default (the set
     // docs/codegen-speed.md measured: vector code about 5x, scalar FP about
     // 2x); ECHORA_LIFT_OPTIONS, comma-separated, replaces them (with
     // structured among the choices, and `flat` for none).
     let mut options = EmitOptions::default();
     let chosen = std::env::var("ECHORA_LIFT_OPTIONS").unwrap_or_else(|_| {
-        "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory".into()
+        "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks"
+            .into()
     });
     for option in chosen
         .split(',')
@@ -729,6 +730,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "fp-status-locals" => options.fp_status_locals = true,
             "window-memory" => options.window_memory = true,
             "dense-dispatch" => options.dense_dispatch = true,
+            "untagged-blocks" => options.untagged_blocks = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }

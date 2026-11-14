@@ -2725,10 +2725,11 @@ fn emit_block_body(
     }
     let count = block.instructions.len();
     let fuse = FUSE.replace(fusion(block));
+    let mut body = String::new();
     for (index, instruction) in block.instructions.iter().enumerate() {
         let block_size = (index == 0).then_some(count);
         emit_instruction(
-            output,
+            &mut body,
             instruction,
             index + 1 == count,
             block_size,
@@ -2737,6 +2738,28 @@ fn emit_block_body(
         );
     }
     FUSE.set(fuse);
+    // A block nothing in which can return an error past its charge never
+    // has a trap settled inside it: its charge need not tag it
+    // (`Core::settle_block_trap`).
+    if UNTAGGED_BLOCKS.get()
+        && let Some((tick, rest)) = body.split_once(")?;\n")
+        && !rest.contains('?')
+        && !rest.contains("Err(")
+        && !tick.contains("enter_window")
+    {
+        let untagged = tick
+            .replacen("m.tick_block_at(", "m.tick_untagged_block_at(", 1)
+            .replacen(
+                "m.tick_inline_block_at(",
+                "m.tick_untagged_inline_block_at(",
+                1,
+            );
+        output.push_str(&untagged);
+        output.push_str(")?;\n");
+        output.push_str(rest);
+    } else {
+        output.push_str(&body);
+    }
 }
 
 /// The blocks structured emission lets execution resume at, so the only
@@ -3386,6 +3409,9 @@ pub struct EmitOptions {
     /// rest within noise): the compare tree predicts better than one
     /// shared indirect jump. Off by default.
     pub dense_dispatch: bool,
+    /// Blocks that cannot return an error after their charge skip storing
+    /// the block tag (only a trap inside a block reads it).
+    pub untagged_blocks: bool,
 }
 
 thread_local! {
@@ -3431,6 +3457,23 @@ thread_local! {
     static WINDOW_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::dense_dispatch` of the emission running on this thread.
     static DENSE_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::untagged_blocks` of the emission running on this thread.
+    static UNTAGGED_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`UNTAGGED_BLOCKS`] for as long as it lives.
+struct UntaggedBlocks(bool);
+
+impl UntaggedBlocks {
+    fn set(on: bool) -> Self {
+        Self(UNTAGGED_BLOCKS.replace(on))
+    }
+}
+
+impl Drop for UntaggedBlocks {
+    fn drop(&mut self) {
+        UNTAGGED_BLOCKS.set(self.0);
+    }
 }
 
 /// Sets [`DENSE_DISPATCH`] for as long as it lives.
@@ -3663,6 +3706,7 @@ pub fn emit_rust_split_to_with<E>(
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _window_memory = WindowMemory::set(options.window_memory);
     let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
+    let _untagged_blocks = UntaggedBlocks::set(options.untagged_blocks);
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options

@@ -39,6 +39,7 @@ fn options() -> EmitOptions {
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
+        untagged_blocks: std::env::var_os("CARGO_FEATURE_UNTAGGED_BLOCKS").is_some(),
     }
 }
 

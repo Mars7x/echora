@@ -393,6 +393,29 @@ impl Core {
         Ok(())
     }
 
+    /// `tick_block_at` for a block nothing in which can return an error
+    /// after this charge (generated code checks): no trap is ever settled
+    /// inside it, so it stores no block tag.
+    #[inline(always)]
+    pub fn tick_untagged_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
+        if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.block_limit(pc, count, true);
+        }
+        self.steps += count;
+        Ok(())
+    }
+
+    /// `tick_inline_block_at` without the block tag, as
+    /// `tick_untagged_block_at`.
+    #[inline(always)]
+    pub fn tick_untagged_inline_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
+        if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.block_limit(pc, count, false);
+        }
+        self.steps += count;
+        Ok(())
+    }
+
     /// The exact checks for a block `stop` does not clear: the budget,
     /// and where `boundary` allows one, a host boundary or a preemption;
     /// otherwise the block runs.
