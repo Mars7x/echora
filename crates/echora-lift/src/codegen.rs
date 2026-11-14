@@ -2990,6 +2990,22 @@ fn emit_block_body(
         );
     }
     FUSE.set(fuse);
+    if SPLIT_TICKS.get()
+        && let Some((tick, rest)) = body.split_once(")?;\n")
+        && !tick.contains("enter_window")
+        && let Some((indent, call)) = tick.rsplit_once("m.tick_")
+        && let Some((kind, arguments)) = call.split_once('(')
+    {
+        // A block nothing in which can return an error past its charge
+        // never has a trap settled inside it: it need not be tagged.
+        let tagged = !(UNTAGGED_BLOCKS.get() && !rest.contains('?') && !rest.contains("Err("));
+        let resumable = kind == "block_at";
+        output.push_str(&format!(
+            "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
+        ));
+        output.push_str(rest);
+        return;
+    }
     // A block nothing in which can return an error past its charge never
     // has a trap settled inside it: its charge need not tag it
     // (`Core::settle_block_trap`).
@@ -3671,6 +3687,10 @@ pub struct EmitOptions {
     /// function directly where it is the predicted word
     /// (`Translation::got_words`) in the caller's region.
     pub stub_windows: bool,
+    /// Blocks charge through `Core::charge_block_at` and only on its slow
+    /// path call `charge_block_slow` with `?`, keeping the checks' `Result`
+    /// off the common path.
+    pub split_ticks: bool,
 }
 
 thread_local! {
@@ -3718,6 +3738,23 @@ thread_local! {
     static DENSE_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::untagged_blocks` of the emission running on this thread.
     static UNTAGGED_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::split_ticks` of the emission running on this thread.
+    static SPLIT_TICKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`SPLIT_TICKS`] for as long as it lives.
+struct SplitTicks(bool);
+
+impl SplitTicks {
+    fn set(on: bool) -> Self {
+        Self(SPLIT_TICKS.replace(on))
+    }
+}
+
+impl Drop for SplitTicks {
+    fn drop(&mut self) {
+        SPLIT_TICKS.set(self.0);
+    }
 }
 
 /// Sets [`UNTAGGED_BLOCKS`] for as long as it lives.
@@ -3966,6 +4003,7 @@ pub fn emit_rust_split_to_with<E>(
     let _window_memory = WindowMemory::set(options.window_memory);
     let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
     let _untagged_blocks = UntaggedBlocks::set(options.untagged_blocks);
+    let _split_ticks = SplitTicks::set(options.split_ticks);
     let _plt = PltStubs::set((!options.stub_windows).then(|| Plt::of(translation, region_bits)));
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(

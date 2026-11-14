@@ -40,6 +40,7 @@ fn options() -> EmitOptions {
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
         untagged_blocks: std::env::var_os("CARGO_FEATURE_UNTAGGED_BLOCKS").is_some(),
+        split_ticks: std::env::var_os("CARGO_FEATURE_SPLIT_TICKS").is_some(),
         stub_windows: false,
     }
 }

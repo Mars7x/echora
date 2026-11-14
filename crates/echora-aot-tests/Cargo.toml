@@ -35,6 +35,9 @@ dense-dispatch = []
 # Blocks that cannot fail after their charge store no block tag
 # (EmitOptions::untagged_blocks).
 untagged-blocks = []
+# Blocks charge through a bool fast path, the checks only on its slow path
+# (EmitOptions::split_ticks).
+split-ticks = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

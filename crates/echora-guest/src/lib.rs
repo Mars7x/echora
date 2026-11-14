@@ -416,6 +416,33 @@ impl Core {
         Ok(())
     }
 
+    /// The fast half of a block's charge: true when `stop` clears the
+    /// block and it is charged (tagged when `tagged`, as `tick_block_at`
+    /// or `tick_untagged_block_at`); false, charging nothing, when the
+    /// exact checks must run (`charge_block_slow`). Generated code keeps
+    /// the `Result` of those checks off this path, so the common case is
+    /// a compare and a store.
+    #[inline(always)]
+    pub fn charge_block_at(&mut self, pc: u64, count: u64, tagged: bool) -> bool {
+        if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.steps += count;
+        if tagged {
+            self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
+        }
+        true
+    }
+
+    /// The slow half of a block's charge, after `charge_block_at` returned
+    /// false: the exact checks of `tick_block_at` (`boundary`) or
+    /// `tick_inline_block_at`.
+    #[cold]
+    #[inline(never)]
+    pub fn charge_block_slow(&mut self, pc: u64, count: u64, boundary: bool) -> Result<(), Trap> {
+        self.block_limit(pc, count, boundary)
+    }
+
     /// The exact checks for a block `stop` does not clear: the budget,
     /// and where `boundary` allows one, a host boundary or a preemption;
     /// otherwise the block runs.
