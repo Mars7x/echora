@@ -994,20 +994,29 @@ impl BagShards {
     /// The first `count` bags of `kind` at `base` or above, by address
     /// (each shard's first `count`, merged).
     fn kind_from(&self, base: u64, kind: &str, count: usize) -> Vec<(u64, Bag)> {
-        let mut found: Vec<(u64, Bag)> = self
-            .0
+        // The shards in address order together, stopping at the `count`th
+        // match, as one map's `range(base..)` would.
+        let guards: Vec<_> = self.0.iter().map(read_shared).collect();
+        let mut cursors: Vec<_> = guards
             .iter()
-            .flat_map(|shard| {
-                read_shared(shard)
-                    .range(base..)
-                    .filter(|(_, bag)| bag.kind == kind)
-                    .take(count)
-                    .map(|(address, bag)| (*address, bag.clone()))
-                    .collect::<Vec<_>>()
-            })
+            .map(|shard| shard.range(base..).peekable())
             .collect();
-        found.sort_by_key(|(address, _)| *address);
-        found.truncate(count);
+        let mut found = Vec::new();
+        while found.len() < count {
+            let Some(next) = cursors
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, cursor)| cursor.peek().map(|(address, _)| (**address, index)))
+                .min()
+                .map(|(_, index)| index)
+            else {
+                break;
+            };
+            let (address, bag) = cursors[next].next().unwrap();
+            if bag.kind == kind {
+                found.push((*address, bag.clone()));
+            }
+        }
         found
     }
 }
