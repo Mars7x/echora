@@ -2842,7 +2842,7 @@ impl Machine {
         let nvn = std::sync::Mutex::new(std::mem::replace(&mut self.nvn, placeholder));
         let shared = Shared {
             machine: std::sync::Mutex::new(&mut *self),
-            wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
+            wake: (0..workers).map(|_| Kick::default()).collect(),
             nvn,
             nvn_waiters: std::sync::atomic::AtomicUsize::new(0),
             recorder,
@@ -2885,7 +2885,10 @@ impl Machine {
                     std::thread::Builder::new()
                         .name(format!("guest-worker-{index}"))
                         .stack_size(64 << 20)
-                        .spawn_scoped(scope, move || worker.run(shared, dispatch))
+                        .spawn_scoped(scope, move || {
+                            shared.wake[index].register();
+                            worker.run(shared, dispatch)
+                        })
                         .expect("spawn guest worker")
                 })
                 .collect();
@@ -4880,9 +4883,9 @@ struct Shared<'a> {
     /// ECHORA_STOP_WORLD (diagnostic): no guest code runs on any worker
     /// while one handles a boundary.
     world: Option<std::sync::RwLock<()>>,
-    /// Per worker: signaled when a thread its cores allow may have become
+    /// Per worker: kicked when a thread its cores allow may have become
     /// runnable, or the run stops.
-    wake: Vec<std::sync::Condvar>,
+    wake: Vec<Kick>,
     stop: std::sync::atomic::AtomicBool,
     /// Held while a worker runs guest code when ECHORA_SERIAL_GUEST is set:
     /// threads keep their cores but never execute at the same time, which
@@ -4964,8 +4967,62 @@ impl<'a> Shared<'a> {
     fn wake_workers(&self, workers: u64) {
         for (index, wake) in self.wake.iter().enumerate() {
             if workers & (1 << index) != 0 {
-                wake.notify_one();
+                wake.kick();
             }
+        }
+    }
+}
+
+/// A parked worker's wake-up: a flag its wakers set, then unpark the
+/// worker's host thread. The worker waits without the machine lock,
+/// spinning briefly first (a hand-off often comes within a few µs, sooner
+/// than a sleeping thread runs again), and takes the lock only once woken,
+/// where a Condvar tied to the lock woke it straight into the lock's queue.
+/// A kick that comes before the worker waits is kept in the flag.
+#[derive(Default)]
+struct Kick {
+    kicked: std::sync::atomic::AtomicBool,
+    thread: std::sync::OnceLock<std::thread::Thread>,
+}
+
+/// Flag checks `Kick::wait` spins through before it sleeps, with
+/// `MACHINE_SPIN_PAUSES` spin hints between them (about 20 µs).
+const KICK_SPIN_TRIES: u32 = 256;
+
+impl Kick {
+    /// Called on the worker's own host thread before it can wait.
+    fn register(&self) {
+        let _ = self.thread.set(std::thread::current());
+    }
+
+    fn kick(&self) {
+        self.kicked.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
+        }
+    }
+
+    /// Until kicked or `timeout` passes (park may also return early, so
+    /// the caller rechecks its state either way). Clears the kick.
+    fn wait(&self, timeout: std::time::Duration) {
+        for _ in 0..KICK_SPIN_TRIES {
+            if self.kicked.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            for _ in 0..MACHINE_SPIN_PAUSES {
+                std::hint::spin_loop();
+            }
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.kicked.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::park_timeout(deadline - now);
         }
     }
 }
@@ -5413,10 +5470,9 @@ impl Worker {
                             time[0] += 1;
                             time[2] += held_since.elapsed().as_micros() as u64;
                         }
-                        machine = shared.wake[usize::from(self.index)]
-                            .wait_timeout(machine, wait)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .0;
+                        drop(machine);
+                        shared.wake[usize::from(self.index)].wait(wait);
+                        machine = shared.lock_machine();
                         held_since = std::time::Instant::now();
                     }
                     Err(trap) => {
