@@ -30,6 +30,8 @@ fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access
 # path (EmitOptions::window_memory).
 window-memory = []
+# Split windows dispatch blocks on a dense index (EmitOptions::dense_dispatch).
+dense-dispatch = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

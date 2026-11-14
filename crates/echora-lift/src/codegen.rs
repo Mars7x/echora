@@ -3379,6 +3379,13 @@ pub struct EmitOptions {
     /// access path kept in a local (`GuestView::window_memory`), so its
     /// base and range test are not reloaded after every guest store.
     pub window_memory: bool,
+    /// Split windows dispatch their blocks on a dense index (the PC's
+    /// offset in the window, in instructions) instead of the PC itself, so
+    /// the compiler can use a jump table instead of a search of 64-bit
+    /// constants. Measured slower (kernels: memset -18%, calls -4%, the
+    /// rest within noise): the compare tree predicts better than one
+    /// shared indirect jump. Off by default.
+    pub dense_dispatch: bool,
 }
 
 thread_local! {
@@ -3422,6 +3429,23 @@ thread_local! {
     static FP_STATUS_LOCALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::window_memory` of the emission running on this thread.
     static WINDOW_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::dense_dispatch` of the emission running on this thread.
+    static DENSE_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`DENSE_DISPATCH`] for as long as it lives.
+struct DenseDispatch(bool);
+
+impl DenseDispatch {
+    fn set(on: bool) -> Self {
+        Self(DENSE_DISPATCH.replace(on))
+    }
+}
+
+impl Drop for DenseDispatch {
+    fn drop(&mut self) {
+        DENSE_DISPATCH.set(self.0);
+    }
 }
 
 /// Sets [`WINDOW_MEMORY`] for as long as it lives.
@@ -3638,6 +3662,7 @@ pub fn emit_rust_split_to_with<E>(
     let _inline_vector = InlineVector::set(options.inline_vector);
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _window_memory = WindowMemory::set(options.window_memory);
+    let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options
@@ -3726,14 +3751,44 @@ pub fn emit_rust_split_to_with<E>(
         } else {
             emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
         }
-        writeln!(
-            cases,
-            "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
-        )
-        .unwrap();
-        // Every completed block passes the boundary check, so a loop that
-        // stays inside one window still yields to the host scheduler.
-        cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
+        // Dense dispatch: each arm is the block's offset in the window in
+        // instructions; the matched value is the offset rotated right by
+        // two, so a misaligned PC or one outside the window (a huge value)
+        // matches no arm.
+        let dense = DENSE_DISPATCH.get() && structured.is_none();
+        let base = window << SPLIT_WINDOW_BITS;
+        if dense {
+            let mut indexed = String::with_capacity(cases.len());
+            for line in cases.split_inclusive('\n') {
+                let arm = line
+                    .strip_prefix("            0x")
+                    .and_then(|rest| rest.strip_suffix(" => {\n"))
+                    .and_then(|pc| u64::from_str_radix(pc, 16).ok())
+                    .filter(|pc| *pc >> SPLIT_WINDOW_BITS == *window);
+                match arm {
+                    Some(pc) => {
+                        writeln!(indexed, "            {} => {{", (pc - base) >> 2).unwrap();
+                    }
+                    None => indexed.push_str(line),
+                }
+            }
+            cases = indexed;
+            writeln!(
+                cases,
+                "            _ if next_pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
+            )
+            .unwrap();
+            cases.push_str("            _ => return Err(Trap::MissingBlock { pc: next_pc }),\n");
+        } else {
+            writeln!(
+                cases,
+                "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
+            )
+            .unwrap();
+            // Every completed block passes the boundary check, so a loop that
+            // stays inside one window still yields to the host scheduler.
+            cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
+        }
         let locals = RegisterLocals::of(&cases);
         // Structured trees leave dead code after their `break`s.
         let dead = if structured.is_some() {
@@ -3753,20 +3808,26 @@ pub fn emit_rust_split_to_with<E>(
             "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n",
         );
         let body = locals.rewrite(&cases);
+        let header = if dense {
+            format!(
+                "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
+            )
+        } else {
+            "    loop {\n        match next_pc {\n".to_owned()
+        };
         if WINDOW_MEMORY.get() {
             // Plain guest loads and stores through the window's copy of the
             // access path (exclusive, atomic and wider accesses stay on
             // `m.memory`).
-            output.push_str(
-                "    let wmem = m.memory.window_memory();\n    loop {\n        match next_pc {\n",
-            );
+            output.push_str("    let wmem = m.memory.window_memory();\n");
+            output.push_str(&header);
             output.push_str(
                 &body
                     .replace("m.memory.load_u", "wmem.load_u")
                     .replace("m.memory.store_u", "wmem.store_u"),
             );
         } else {
-            output.push_str("    loop {\n        match next_pc {\n");
+            output.push_str(&header);
             output.push_str(&body);
         }
         output.push_str(

@@ -728,6 +728,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "whole-vector-checks" => options.whole_vector_checks = true,
             "fp-status-locals" => options.fp_status_locals = true,
             "window-memory" => options.window_memory = true,
+            "dense-dispatch" => options.dense_dispatch = true,
             "flat" => {}
             other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
         }
