@@ -101,8 +101,8 @@ The work has now moved on to speed. Much of the time went into waiting
 rather than working: the CPU and GPU took turns instead of running side by
 side, one lock serialised the game's threads, and the GPU stopped to drain
 its work far more often than the game asked it to. Removing those waits
-took the opening movie from about 28 to about 54 pictures per second and the
-first 3D scene from about 2 to about 11 frames per second, with the frames
+took the opening movie from about 28 to about 56 pictures per second and the
+first 3D scene from about 2 to about 12 frames per second, with the frames
 checked against earlier ones after each step.
 
 Much of this work is general rather than specific to Ocarina of Time. The
@@ -138,6 +138,17 @@ back on when a GPU can't decode the movies keeps hand-written assembly for
 speed. Anything that goes beyond what the
 console does, such as frame rates above 60 or ultrawide, will be kept in a
 separate layer of enhancements that can be turned off.
+
+This is slower than taking shortcuts. A port can get a game running sooner
+by replacing the game's own copies of Nintendo's libraries with PC code, or
+by patching the game where something doesn't work yet. Echora does neither:
+the game's libraries run translated, as on the console, and everything
+beneath them is implemented. So each missing piece has to be found and built
+properly, and speed work has to make faithful code fast instead of skipping
+it. Writing it all in Rust from first principles, from the shader translator
+to an exact model of the CPU's floating-point behaviour, adds to that. In
+return, almost none of the work is specific to Ocarina of Time, so it carries
+over to other Switch 2 games.
 
 ## How it works
 
