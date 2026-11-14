@@ -326,6 +326,9 @@ pub struct Machine {
     /// flags that make a core's next block boundary reschedule.
     core_threads: Vec<Option<u64>>,
     preempt_flags: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Each core's block limit (`Core::stop`), lowered to 0 after its
+    /// preempt flag is set so its next block sees the flag.
+    preempt_stops: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Preemptions requested (a better-priority thread waited for a core).
     preemptions: u64,
     /// Several workers run: an idle boundary returns instead of sleeping.
@@ -447,6 +450,7 @@ impl Machine {
             double_dispatches: 0,
             core_threads: Vec::new(),
             preempt_flags: Vec::new(),
+            preempt_stops: Vec::new(),
             preemptions: 0,
             parallel: false,
             parked_workers: 0,
@@ -2025,8 +2029,11 @@ impl Machine {
             }
             if wanted {
                 if let Some(flag) = self.preempt_flags.get(core) {
-                    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         self.preemptions += 1;
+                    }
+                    if let Some(stop) = self.preempt_stops.get(core) {
+                        stop.store(0, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             }
@@ -2704,6 +2711,8 @@ impl Machine {
         }
         let _watch = crate::fault::watch(&self.core);
         loop {
+            // Limits the host set since the last entry take effect.
+            self.core.rearm();
             let result = dispatch(&mut self.core);
             if result.is_ok() {
                 continue;
@@ -2811,6 +2820,7 @@ impl Machine {
             core.parallel = true;
         }
         self.preempt_flags = cores.iter().map(|core| core.preempt.clone()).collect();
+        self.preempt_stops = cores.iter().map(|core| core.stop.clone()).collect();
         self.core_threads = vec![None; workers];
         self.core_threads[0] = Some(cores[0].current_thread_id);
         self.running.insert(cores[0].current_thread_id);
@@ -2895,6 +2905,7 @@ impl Machine {
         self.worker_core = None;
         self.core_threads.clear();
         self.preempt_flags.clear();
+        self.preempt_stops.clear();
         self.parked_workers = 0;
         // The first stop is the run's result; its core is the one reports see.
         let global = self.core.steps;
@@ -5160,6 +5171,8 @@ impl Worker {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
                 let result = loop {
+                    // Limits the host set since the last entry take effect.
+                    self.core.rearm();
                     match dispatch(&mut self.core) {
                         Ok(()) => {}
                         Err(Trap::MissingBlock { pc })

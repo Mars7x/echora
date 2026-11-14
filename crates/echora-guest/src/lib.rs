@@ -175,6 +175,13 @@ pub struct Core {
     /// Whether other host threads run guest code too (only then can
     /// `preempt` be set, so single-threaded runs skip the shared load).
     pub parallel: bool,
+    /// The step count past which a block takes the exact check
+    /// (`block_limit`): at most min(`max_steps`, `host_check_at`), and 0
+    /// to check at the next block. Each block start compares against it
+    /// alone. The host lowers it to 0 before running guest code after
+    /// changing either limit (`rearm`), and a thread that sets `preempt`
+    /// stores 0 into it after the flag.
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Spin-poll hints (YIELD, WFE, a compare-and-swap that cannot change
     /// memory) since the host last scheduled; past SPIN_POLL_LIMIT the
     /// thread gives up the processor at its next block boundary.
@@ -213,6 +220,7 @@ impl Core {
             host_check_at: 0,
             preempt: Default::default(),
             parallel: false,
+            stop: Default::default(),
             spin_polls: 0,
             slice_start: 0,
             recent: [ThreadPc::default(); RECENT_PCS],
@@ -358,14 +366,49 @@ impl Core {
 
     /// `tick_block` for a block at `pc`, which must be the current PC;
     /// translated code passes it as a constant, saving the PC's reload.
+    /// A block at a boundary (`steps` at or past `host_check_at`, or a
+    /// preemption) returns to the host before it runs, charging nothing:
+    /// the boundary the end of the previous block would have taken.
     #[inline(always)]
     pub fn tick_block_at(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
-        if self.steps + count > self.max_steps {
-            return self.block_budget_exhausted();
+        if self.steps + count > self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.block_limit(pc, count);
         }
         self.steps += count;
         self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
         Ok(())
+    }
+
+    /// The exact checks for a block `stop` does not clear: the budget, a
+    /// host boundary, a preemption; otherwise the block runs.
+    #[cold]
+    #[inline(never)]
+    fn block_limit(&mut self, pc: u64, count: u64) -> Result<(), Trap> {
+        use std::sync::atomic::Ordering;
+        if self.steps + count > self.max_steps {
+            return self.block_budget_exhausted();
+        }
+        // Stored before the flag is read: a preemption setting the flag
+        // after the read stores 0 after this.
+        self.stop
+            .store(self.max_steps.min(self.host_check_at), Ordering::SeqCst);
+        if self.steps >= self.host_check_at
+            || (self.parallel && self.preempt.load(Ordering::SeqCst))
+        {
+            self.block_tag = 0;
+            self.cpu.pc = pc;
+            return Err(Trap::HostBoundary);
+        }
+        self.steps += count;
+        self.block_tag = (pc + 4 * (count - 1)) | count << BLOCK_TAG_SHIFT;
+        Ok(())
+    }
+
+    /// The host changed `max_steps` or `host_check_at` (or may have):
+    /// the next block takes the exact checks, which set `stop` again.
+    #[inline]
+    pub fn rearm(&self) {
+        self.stop.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cold]
@@ -459,6 +502,7 @@ impl Core {
         self.spin_polls += 1;
         if self.spin_polls >= SPIN_POLL_LIMIT {
             self.host_check_at = self.host_check_at.min(self.steps);
+            self.rearm();
         }
     }
 
@@ -480,17 +524,11 @@ impl Core {
         }
     }
 
-    #[inline]
+    /// The end of a block. Host boundaries and preemptions are taken at
+    /// the start of the next block (`tick_block_at`), so nothing is
+    /// checked here.
+    #[inline(always)]
     pub fn finish_block(&mut self) -> Result<(), Trap> {
-        if self.steps >= self.host_check_at
-            || (self.parallel && self.preempt.load(std::sync::atomic::Ordering::Relaxed))
-        {
-            // The block ran to its end: settling must refund none of it,
-            // even when it loops to its own start (the next PC then lies in
-            // its range).
-            self.block_tag = 0;
-            return Err(Trap::HostBoundary);
-        }
         Ok(())
     }
 }
@@ -500,20 +538,64 @@ mod block_accounting_tests {
     use super::*;
 
     #[test]
-    fn a_boundary_after_a_block_looping_to_itself_refunds_nothing() {
+    fn a_boundary_before_a_block_charges_and_refunds_nothing() {
         let memory = memory::Memory::new(0x1_0000_0000);
         let mut core = Core::new(memory.view());
         core.max_steps = u64::MAX;
         core.host_check_at = 3;
         core.tick_block_at(0x1000, 3).unwrap();
+        assert!(core.finish_block().is_ok());
+        // The block loops to its own start: the boundary is taken there,
+        // before it runs again.
         core.cpu.pc = 0x1000;
-        assert!(matches!(core.finish_block(), Err(Trap::HostBoundary)));
+        assert!(matches!(
+            core.tick_block_at(0x1000, 3),
+            Err(Trap::HostBoundary)
+        ));
         core.settle_block_trap();
         assert_eq!(core.steps, 3);
         // A trap inside a block still charges only what ran.
+        core.host_check_at = u64::MAX;
+        core.rearm();
         core.tick_block_at(0x2000, 4).unwrap();
         core.cpu.pc = 0x2004;
         core.settle_block_trap();
         assert_eq!(core.steps, 3 + 2);
+    }
+
+    #[test]
+    fn a_budget_trap_at_a_block_start_charges_nothing() {
+        let memory = memory::Memory::new(0x1_0000_0000);
+        let mut core = Core::new(memory.view());
+        core.max_steps = 5;
+        core.host_check_at = u64::MAX;
+        core.tick_block_at(0x1000, 4).unwrap();
+        core.cpu.pc = 0x1010;
+        assert!(matches!(
+            core.tick_block_at(0x1010, 2),
+            Err(Trap::Budget { .. })
+        ));
+        core.settle_block_trap();
+        assert_eq!(core.steps, 4);
+    }
+
+    #[test]
+    fn a_preemption_stops_the_next_block() {
+        let memory = memory::Memory::new(0x1_0000_0000);
+        let mut core = Core::new(memory.view());
+        core.max_steps = u64::MAX;
+        core.host_check_at = u64::MAX;
+        core.parallel = true;
+        core.tick_block_at(0x1000, 2).unwrap();
+        // Another thread preempts: the flag, then the limit.
+        core.preempt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        core.stop.store(0, std::sync::atomic::Ordering::SeqCst);
+        core.cpu.pc = 0x1008;
+        assert!(matches!(
+            core.tick_block_at(0x1008, 2),
+            Err(Trap::HostBoundary)
+        ));
+        assert_eq!(core.steps, 2);
     }
 }
