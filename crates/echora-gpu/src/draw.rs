@@ -664,6 +664,7 @@ impl Renderer {
         } else {
             None
         };
+        self.lap("stat: renderer ns texture pool", &mut since);
         // Textures first: an upload may flush. Then room for everything
         // else, so nothing flushes while this draw is recorded.
         let mut bytes = 0;
@@ -712,7 +713,7 @@ impl Renderer {
         if matches!(draw.mesh, Some(MeshGroups::Indirect { .. })) {
             bytes += 32;
         }
-        self.lap("stat: renderer ns pool and views", &mut since);
+        self.lap("stat: renderer ns views and sizes", &mut since);
         self.reserve(bytes, descriptors)?;
         self.lap("stat: renderer ns reserve", &mut since);
         // Uploads and descriptor writes first: they record copies that must
