@@ -27,6 +27,9 @@ fused-flags = []
 whole-vector-checks = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
+# Split windows reach guest memory through a local copy of the access
+# path (EmitOptions::window_memory).
+window-memory = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

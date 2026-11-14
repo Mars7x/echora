@@ -3375,6 +3375,10 @@ pub struct EmitOptions {
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
     /// guest store.
     pub fp_status_locals: bool,
+    /// Split windows reach guest memory through a copy of the view's
+    /// access path kept in a local (`GuestView::window_memory`), so its
+    /// base and range test are not reloaded after every guest store.
+    pub window_memory: bool,
 }
 
 thread_local! {
@@ -3416,6 +3420,23 @@ impl Drop for InlineVector {
 thread_local! {
     /// `EmitOptions::fp_status_locals` of the emission running on this thread.
     static FP_STATUS_LOCALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::window_memory` of the emission running on this thread.
+    static WINDOW_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`WINDOW_MEMORY`] for as long as it lives.
+struct WindowMemory(bool);
+
+impl WindowMemory {
+    fn set(on: bool) -> Self {
+        Self(WINDOW_MEMORY.replace(on))
+    }
+}
+
+impl Drop for WindowMemory {
+    fn drop(&mut self) {
+        WINDOW_MEMORY.set(self.0);
+    }
 }
 
 /// Sets [`FP_STATUS_LOCALS`] for as long as it lives.
@@ -3616,6 +3637,7 @@ pub fn emit_rust_split_to_with<E>(
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let _inline_vector = InlineVector::set(options.inline_vector);
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
+    let _window_memory = WindowMemory::set(options.window_memory);
     let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
     let _fused_flags = FusedFlags::set(
         options
@@ -3728,9 +3750,25 @@ pub fn emit_rust_split_to_with<E>(
         // memory gets it after each block, where the boundary check and
         // anything leaving the window see it.
         output.push_str(
-            "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    loop {\n        match next_pc {\n",
+            "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n",
         );
-        output.push_str(&locals.rewrite(&cases));
+        let body = locals.rewrite(&cases);
+        if WINDOW_MEMORY.get() {
+            // Plain guest loads and stores through the window's copy of the
+            // access path (exclusive, atomic and wider accesses stay on
+            // `m.memory`).
+            output.push_str(
+                "    let wmem = m.memory.window_memory();\n    loop {\n        match next_pc {\n",
+            );
+            output.push_str(
+                &body
+                    .replace("m.memory.load_u", "wmem.load_u")
+                    .replace("m.memory.store_u", "wmem.store_u"),
+            );
+        } else {
+            output.push_str("    loop {\n        match next_pc {\n");
+            output.push_str(&body);
+        }
         output.push_str(
             "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
         );

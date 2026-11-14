@@ -95,7 +95,59 @@ fn orderings(acquire: bool, release: bool) -> (Ordering, Ordering) {
     }
 }
 
+/// A window's copy of a view's access path (`GuestView::window_memory`):
+/// generated code keeps it in locals, where a guest store (which may alias
+/// the `Core` through a raw pointer) cannot force its base and range test
+/// to be reloaded. The same accesses as the view's plain loads and stores:
+/// relaxed atomics, the same range test and faults.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowMemory(GuestAccess);
+
+impl WindowMemory {
+    #[inline(always)]
+    pub fn load_u8(self, address: u64) -> u8 {
+        self.0.load(address)
+    }
+    #[inline(always)]
+    pub fn load_u16(self, address: u64) -> u16 {
+        u16::from_le(self.0.load(address))
+    }
+    #[inline(always)]
+    pub fn load_u32(self, address: u64) -> u32 {
+        u32::from_le(self.0.load(address))
+    }
+    #[inline(always)]
+    pub fn load_u64(self, address: u64) -> u64 {
+        u64::from_le(self.0.load(address))
+    }
+    #[inline(always)]
+    pub fn store_u8(self, address: u64, value: u8) {
+        self.0.store(address, value)
+    }
+    #[inline(always)]
+    pub fn store_u16(self, address: u64, value: u16) {
+        self.0.store(address, value.to_le())
+    }
+    #[inline(always)]
+    pub fn store_u32(self, address: u64, value: u32) {
+        self.0.store(address, value.to_le())
+    }
+    #[inline(always)]
+    pub fn store_u64(self, address: u64, value: u64) {
+        self.0.store(address, value.to_le())
+    }
+}
+
 impl GuestView {
+    /// The view's access path, for a window to keep in locals
+    /// (`WindowMemory`). Valid while the view lives: its base and size
+    /// never change (mappings change page protections, not the
+    /// reservation).
+    #[inline(always)]
+    pub fn window_memory(&self) -> WindowMemory {
+        WindowMemory(self.access)
+    }
+
     /// A view of guest memory through `access`, `size` bytes long. The
     /// memory must outlive the view (the `Memory` that owns it lives as long
     /// as the machine).

@@ -37,6 +37,7 @@ fn options() -> EmitOptions {
         fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
         whole_vector_checks: std::env::var_os("CARGO_FEATURE_WHOLE_VECTOR_CHECKS").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
+        window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
     }
 }
 
