@@ -1760,15 +1760,18 @@ impl Nvn {
         // Where the CPU may look at what the GPU wrote (after waiting for
         // it, or invalidating its view of a mapped range), deferred
         // dispatch results are stored first; between those points they
-        // stay with the GPU (one wait for many dispatches).
-        if matches!(
-            name,
+        // stay with the GPU (one wait for many dispatches). A queued present
+        // does not wait for the GPU (the frame's work runs after it), so
+        // what the GPU wrote is stored at the next wait instead.
+        let resolves = match name {
             "nvnSyncWait"
-                | "nvnQueueFinish"
-                | "nvnBufferInvalidateMappedRange"
-                | "nvnTextureReadTexels"
-                | "nvnQueuePresentTexture"
-        ) {
+            | "nvnQueueFinish"
+            | "nvnBufferInvalidateMappedRange"
+            | "nvnTextureReadTexels" => true,
+            "nvnQueuePresentTexture" => !Self::present_queued_mode(),
+            _ => false,
+        };
+        if resolves {
             if let Err(message) = self.resolve_storage(core, None) {
                 return Err(Trap::InvalidState {
                     message: format!("{name}: dispatch results: {message}"),
