@@ -45,8 +45,8 @@ to be missing or incomplete.
 ## Performance
 
 - Runs are below full speed. The console runs the game at 60 frames per
-  second; here the opening movie averages about 52 pictures per second and
-  the first 3D scene runs at about 7 frames per second.
+  second; here the opening movie averages about 54 pictures per second and
+  the first 3D scene runs at about 11 frames per second.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its

@@ -17,7 +17,7 @@ when the code for it does.
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie averages about 52 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 7 frames per second (`ECHORA_PRESENT_RATE`), from about 28 and 2 before the waits between the CPU and GPU were removed. |
+| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie averages about 54 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 11 frames per second (`ECHORA_PRESENT_RATE`), from about 28 and 2 before the waits between the CPU and GPU were removed. |
 | 13. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 14. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 

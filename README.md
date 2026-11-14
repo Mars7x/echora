@@ -59,8 +59,8 @@ What doesn't work yet:
   it should be, the water is too red, and subtitles and the speaker's name
   are not drawn. Nothing past that scene has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, decoded on the GPU, averages about 52 pictures per second, and the
-  first 3D scene runs at about 7.
+  movie, decoded on the GPU, averages about 54 pictures per second, and the
+  first 3D scene runs at about 11.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
@@ -101,8 +101,8 @@ The work has now moved on to speed. Much of the time went into waiting
 rather than working: the CPU and GPU took turns instead of running side by
 side, one lock serialised the game's threads, and the GPU stopped to drain
 its work far more often than the game asked it to. Removing those waits
-took the opening movie from about 28 to about 52 pictures per second and the
-first 3D scene from about 2 to about 7 frames per second, with the frames
+took the opening movie from about 28 to about 54 pictures per second and the
+first 3D scene from about 2 to about 11 frames per second, with the frames
 checked against earlier ones after each step.
 
 Much of this work is general rather than specific to Ocarina of Time. The
