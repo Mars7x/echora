@@ -5080,7 +5080,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
 /// invalidate does not wait, as on the console: the GPU writes it makes
 /// visible are those of work replayed so far, which covers every fence the
 /// guest has seen signaled.
-fn needs_replayed(nvn: &crate::nvn::Nvn, name: &str, regs: &[u64; 31]) -> bool {
+fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -> bool {
     match name {
         "nvnSyncWait" => regs[1] != 0,
         "nvnQueueFinish" => true,
@@ -5088,15 +5088,34 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &str, regs: &[u64; 31]) -> bool {
         // A structure made again without being finalized (finalizing waits
         // already, so work queued since cannot name the old object).
         _ if name.ends_with("Initialize") => nvn.holds_object(regs[0]),
-        _ => {
-            name.ends_with("Finalize")
-                || name.contains("ReadTexels")
-                || name.contains("WriteTexels")
-                || name.contains("Register")
-                || name.contains("SetShaders")
-                || name.contains("MapVirtual")
-        }
+        _ => replay_sensitive_name(name),
     }
+}
+
+/// The part of `needs_replayed` its name alone decides, remembered per
+/// interned name: five substring searches on every held NVN call showed
+/// in thread 1's profile.
+fn replay_sensitive_name(name: &'static str) -> bool {
+    fn decide(name: &str) -> bool {
+        name.ends_with("Finalize")
+            || name.contains("ReadTexels")
+            || name.contains("WriteTexels")
+            || name.contains("Register")
+            || name.contains("SetShaders")
+            || name.contains("MapVirtual")
+    }
+    thread_local! {
+        static DECIDED: std::cell::RefCell<crate::nvn::FastMap<(usize, usize), bool>> =
+            std::cell::RefCell::default();
+    }
+    // A 'static name keeps its address, so the address and length name it.
+    let key = (name.as_ptr() as usize, name.len());
+    DECIDED.with(|decided| {
+        *decided
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| decide(name))
+    })
 }
 
 /// The `boundary_kinds` slot of a block's result: SVC numbers 0..0x80,
@@ -5538,7 +5557,7 @@ impl Worker {
                 && matches!(
                     nvn.entry(pc),
                     Some(crate::nvn::HostEntry::Proc(name))
-                        if needs_replayed(&nvn, &name, &self.core.cpu.regs)
+                        if needs_replayed(&nvn, name, &self.core.cpu.regs)
                 ));
         // A queued present waits only for the previous present's work.
         let queued_present = machine_call
@@ -5772,6 +5791,41 @@ impl Worker {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    /// Names decided once and asked again give the same answer as the
+    /// substring tests, also for names sharing a prefix.
+    #[test]
+    fn replay_sensitive_names_are_remembered_exactly() {
+        let names: [&'static str; 9] = [
+            "nvnTexturePoolFinalize",
+            "nvnTextureReadTexels",
+            "nvnTextureWriteTexelsStrided",
+            "nvnTexturePoolRegisterTexture",
+            "nvnProgramSetShaders",
+            "nvnMemoryPoolMapVirtual",
+            "nvnCommandBufferDrawElements",
+            "nvnQueueSubmitCommands",
+            "nvnTexturePoolRegister",
+        ];
+        for _ in 0..3 {
+            for name in names {
+                let direct = name.ends_with("Finalize")
+                    || [
+                        "ReadTexels",
+                        "WriteTexels",
+                        "Register",
+                        "SetShaders",
+                        "MapVirtual",
+                    ]
+                    .iter()
+                    .any(|part| name.contains(part));
+                assert_eq!(replay_sensitive_name(name), direct, "{name}");
+            }
+        }
+        assert!(!replay_sensitive_name(
+            &"nvnTexturePoolRegisterTexture"[..10]
+        ));
+    }
     use crate::memory::{
         ATTRIBUTE_LOCKED, EXECUTE, STATE_ALIAS_CODE_DATA, STATE_CODE, STATE_STACK, STATE_TLS,
     };
