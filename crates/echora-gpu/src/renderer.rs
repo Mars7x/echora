@@ -3959,9 +3959,10 @@ impl Renderer {
             return Ok(());
         };
         self.target_changes += 1;
+        // What `to` held goes once the work recorded so far has run
+        // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.targets.remove(&to) {
-            self.flush()?;
-            self.destroy_target(replaced);
+            self.retired_uploads.push(replaced);
         }
         self.targets.insert(to, target);
         self.fresh_targets.retain(|fresh| *fresh != from);
