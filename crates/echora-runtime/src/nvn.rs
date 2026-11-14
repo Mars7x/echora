@@ -3761,6 +3761,15 @@ impl Nvn {
         self.objects.contains_key(&address)
     }
 
+    /// Whether texture or sampler pool `pool` already has a descriptor
+    /// registered at `id` (a registration there replaces one queued work may
+    /// name).
+    pub fn descriptor_registered(&self, pool: u64, id: u64) -> bool {
+        self.objects
+            .get(&pool)
+            .is_none_or(|pool| pool.state.contains_key(&format!("Descriptor{id}")))
+    }
+
     /// Whether a queued present has not been shown yet.
     pub fn present_pending(&self) -> bool {
         self.pending

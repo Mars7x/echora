@@ -5088,6 +5088,16 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -
         // A structure made again without being finalized (finalizing waits
         // already, so work queued since cannot name the old object).
         _ if name.ends_with("Initialize") => nvn.holds_object(regs[0]),
+        // A first registration at a descriptor no queued work could have
+        // named yet goes on: the replay reads descriptors when it runs the
+        // work, as the console's GPU reads them from pool memory. Replacing
+        // one queued work may name waits.
+        "nvnTexturePoolRegisterTexture"
+        | "nvnTexturePoolRegisterImage"
+        | "nvnSamplerPoolRegisterSampler"
+        | "nvnSamplerPoolRegisterSamplerBuilder" => {
+            nvn.descriptor_registered(regs[0], regs[1] & 0xffff_ffff)
+        }
         _ => replay_sensitive_name(name),
     }
 }
@@ -5623,12 +5633,17 @@ impl Worker {
                         return false;
                     }
                 };
+                // Checked again after 10 µs, doubling up to 100 µs: a wait
+                // that ends soon is not held a whole 100 µs pause (the
+                // forest makes ~55 such waits per frame on thread 1).
+                let mut pause = 10;
                 loop {
                     match nvn.submission_done(serial, marker) {
                         Ok(true) => break,
                         Ok(false) => {
                             drop(nvn);
-                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            std::thread::sleep(std::time::Duration::from_micros(pause));
+                            pause = (pause * 2).min(100);
                             nvn = shared.lock_nvn();
                         }
                         Err(trap) => {
