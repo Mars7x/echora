@@ -2649,6 +2649,111 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; m.cpu.vectors[{rd}] = u128::from({value}); }}"
             ))
         }
+        // UZP, TRN, ZIP: every result lane is a lane of Vn or Vm, so the
+        // shuffle is shifts and masks (as `vec_permute`).
+        SimdOp::VecPermute {
+            op: permute,
+            bits,
+            q,
+            rd,
+            rn,
+            rm,
+        } => {
+            let bits = u32::from(bits);
+            let count = if q { 128 / bits } else { 64 / bits };
+            let half = count / 2;
+            let mask = if bits == 64 {
+                "u128::from(u64::MAX)".to_owned()
+            } else {
+                format!("{:#x}u128", (1u128 << bits) - 1)
+            };
+            let mut parts = Vec::new();
+            for lane in 0..count {
+                let (from_m, source) = match permute {
+                    VecPermuteOp::Uzp1 | VecPermuteOp::Uzp2 => {
+                        let odd = u32::from(permute == VecPermuteOp::Uzp2);
+                        let source = lane * 2 + odd;
+                        if source < count {
+                            (false, source)
+                        } else {
+                            (true, source - count)
+                        }
+                    }
+                    VecPermuteOp::Trn1 | VecPermuteOp::Trn2 => {
+                        let odd = u32::from(permute == VecPermuteOp::Trn2);
+                        (lane % 2 == 1, (lane & !1) + odd)
+                    }
+                    VecPermuteOp::Zip1 | VecPermuteOp::Zip2 => {
+                        let base = if permute == VecPermuteOp::Zip2 {
+                            half
+                        } else {
+                            0
+                        };
+                        (lane % 2 == 1, base + lane / 2)
+                    }
+                };
+                let register = if from_m { "v" } else { "n" };
+                parts.push(format!(
+                    "((({register} >> {}) & {mask}) << {})",
+                    source * bits,
+                    lane * bits
+                ));
+            }
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let _ = (n, v); m.cpu.vectors[{rd}] = {}; }}",
+                parts.join(" | ")
+            ))
+        }
+        // EXT: bytes `index`.. of Vm:Vn (Vn low), as `vec_ext`.
+        SimdOp::VecExt {
+            q,
+            rd,
+            rn,
+            rm,
+            index,
+        } => {
+            let shift = u32::from(index) * 8;
+            let value = match (q, shift) {
+                (true, 0) => "n".to_owned(),
+                (true, _) => format!("(n >> {shift}) | (v << {})", 128 - shift),
+                (false, 0) => "n & u128::from(u64::MAX)".to_owned(),
+                (false, _) => format!(
+                    "(((n & u128::from(u64::MAX)) >> {shift}) | (v << {})) & u128::from(u64::MAX)",
+                    64 - shift
+                ),
+            };
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; let _ = (n, v); m.cpu.vectors[{rd}] = {value}; }}"
+            ))
+        }
+        // Vector FABS / FNEG: the sign bits, natively unless FPCR.AH (its
+        // NaN handling leaves a NaN's sign) asks for the helper.
+        SimdOp::VecFpUnary {
+            op: unary @ (VecFpUnaryOp::Abs | VecFpUnaryOp::Neg),
+            size,
+            q,
+            scalar: false,
+            rd,
+            rn,
+            ..
+        } => {
+            let width: u32 = if size == FpSize::S { 32 } else { 64 };
+            let lanes = if q { 128 / width } else { 64 / width };
+            let mut signs = 0u128;
+            for lane in 0..lanes {
+                signs |= 1u128 << (lane * width + width - 1);
+            }
+            let used = if q { u128::MAX } else { u128::from(u64::MAX) };
+            let value = if unary == VecFpUnaryOp::Abs {
+                format!("n & {:#x}u128", used & !signs)
+            } else {
+                format!("(n ^ {signs:#x}u128) & {used:#x}u128")
+            };
+            let call = emit_call(op)?;
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; if m.cpu.fpcr & {p}::FPCR_AH == 0 {{ m.cpu.vectors[{rd}] = {value}; }} else {{ {call} }} }}"
+            ))
+        }
         SimdOp::FpMoveImmediate { size, rd, bits } => {
             let (_, int, _, _) = float_kit(size);
             Some(format!("m.cpu.vectors[{rd}] = u128::from({bits:#x}{int});"))
