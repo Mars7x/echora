@@ -159,9 +159,11 @@ pub struct Backend {
     /// (renderer target changes, texture epoch) it was built at: texture
     /// lookups scanned every target twice per binding.
     target_index: HashMap<u64, Vec<u64>>,
-    /// The render targets with more than one level, in the same index (a
-    /// texture over one of their levels resolves to them).
-    target_chains: Vec<u64>,
+    /// The levels above 0 of render targets with more than one level, by
+    /// the storage address each level starts at: (target, level, extent),
+    /// targets in `target_keys` order and levels ascending (a texture over one of
+    /// their levels resolves to them). Built with `target_index`.
+    target_levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
     target_index_stamp: Option<(u64, u64)>,
 }
 
@@ -247,7 +249,7 @@ impl Backend {
             shared_pieces: HashMap::new(),
             share_generation: 0,
             target_index: HashMap::new(),
-            target_chains: Vec::new(),
+            target_levels: HashMap::new(),
             target_index_stamp: None,
         }))
     }
@@ -2382,22 +2384,28 @@ impl Nvn {
             return;
         };
         let mut index: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut chains = Vec::new();
+        let mut levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>> = HashMap::new();
         for key in backend.renderer.target_keys() {
-            if let Some(base) = self.texture_storage(key) {
+            let base = self.texture_storage(key);
+            if let Some(base) = base {
                 index.entry(base).or_default().push(key);
             }
-            if backend
-                .renderer
-                .existing_target(key)
-                .is_some_and(|target| target.levels > 1)
-            {
-                chains.push(key);
+            let (Some(target), Some(base)) = (backend.renderer.existing_target(key), base) else {
+                continue;
+            };
+            if target.levels == 1 {
+                continue;
+            }
+            for (level, offset, extent) in self.target_level_offsets(key, target) {
+                levels
+                    .entry(base + offset)
+                    .or_default()
+                    .push((key, level, extent));
             }
         }
         let backend = self.gpu.as_mut().unwrap();
         backend.target_index = index;
-        backend.target_chains = chains;
+        backend.target_levels = levels;
         backend.target_index_stamp = Some((backend.renderer.target_changes, self.texture_epoch));
     }
 
@@ -2436,22 +2444,25 @@ impl Nvn {
         }
         let base = self.texture_storage(texture)?;
         let extent = extent?;
-        // The targets at this storage and those with levels, from the
-        // index when it is current (every target otherwise).
-        let candidates: Vec<u64> = if self.target_index_current() {
+        // From the index when it is current: the targets at this storage,
+        // then the target levels that start there.
+        if self.target_index_current() {
             let backend = self.gpu.as_ref()?;
-            backend
-                .target_index
-                .get(&base)
-                .into_iter()
-                .flatten()
-                .chain(backend.target_chains.iter())
-                .copied()
-                .collect()
-        } else {
-            renderer.target_keys()
-        };
-        for key in candidates {
+            for &key in backend.target_index.get(&base).into_iter().flatten() {
+                if renderer.existing_target(key).is_some_and(|target| {
+                    (target.width, target.height) == extent && same_format(target.format)
+                }) {
+                    return Some((key, 0));
+                }
+            }
+            return backend
+                .target_levels
+                .get(&base)?
+                .iter()
+                .find(|(_, _, level_extent)| *level_extent == extent)
+                .map(|&(key, level, _)| (key, level));
+        }
+        for key in renderer.target_keys() {
             let Some(target) = renderer.existing_target(key) else {
                 continue;
             };
@@ -2467,17 +2478,37 @@ impl Nvn {
             if !mips || target.levels == 1 || base <= target_base {
                 continue;
             }
-            let object = self.objects.get(&key)?;
-            let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
-            let Some(info) = get("Format").and_then(crate::nvn_format::info) else {
-                continue;
-            };
-            let depth = if get("Target") == Some(2) {
-                get("Depth").unwrap_or(1).max(1)
-            } else {
-                1
-            };
-            for level in 1..target.levels {
+            for (level, offset, level_extent) in self.target_level_offsets(key, target) {
+                if target_base + offset == base && level_extent == extent {
+                    return Some((key, level));
+                }
+            }
+        }
+        None
+    }
+
+    /// Each level above 0 of render target `key`: its offset from the
+    /// target's storage and its extent (none when the texture object is
+    /// gone or its format unknown).
+    fn target_level_offsets(
+        &self,
+        key: u64,
+        target: &echora_gpu::renderer::Target,
+    ) -> Vec<(u32, u64, (u32, u32))> {
+        let Some(object) = self.objects.get(&key) else {
+            return Vec::new();
+        };
+        let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
+        let Some(info) = get("Format").and_then(crate::nvn_format::info) else {
+            return Vec::new();
+        };
+        let depth = if get("Target") == Some(2) {
+            get("Depth").unwrap_or(1).max(1)
+        } else {
+            1
+        };
+        (1..target.levels)
+            .map(|level| {
                 let offset = crate::nvn_format::block_linear_level_offset(
                     info,
                     target.width,
@@ -2492,16 +2523,13 @@ impl Nvn {
                     ),
                     level,
                 );
-                let level_extent = (
+                let extent = (
                     (target.width >> level).max(1),
                     (target.height >> level).max(1),
                 );
-                if target_base + offset == base && level_extent == extent {
-                    return Some((key, level));
-                }
-            }
-        }
-        None
+                (level, offset, extent)
+            })
+            .collect()
     }
 
     /// The alias target (and its size) a draw renders the blocks of
