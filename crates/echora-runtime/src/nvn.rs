@@ -587,6 +587,11 @@ pub struct Nvn {
     /// Bound programs draws resolved, by the two BindProgram arguments,
     /// with the vertex attribute snapshot they were resolved with; valid
     /// for a (present, flush epoch) (see `bound_program`).
+    /// The vertex input types of the last vertex attribute snapshot a draw
+    /// asked for (`vertex_input_types`), with that snapshot (kept alive, so
+    /// its address names it).
+    #[serde(skip)]
+    input_types_memo: Option<(std::sync::Arc<Vec<BTreeMap<String, Args>>>, [u8; 32])>,
     #[serde(skip)]
     program_memo: (
         (u64, u64),

@@ -315,6 +315,19 @@ type TranslationKey = (
 
 /// Shader::AttributeType of each vertex attribute's format: integer formats
 /// must reach integer shader inputs.
+/// The part of a graphics program's identity beyond its stages' code: the
+/// vertex stage is translated for the bound attributes' integer or float
+/// types (`generic_input_types`), so the same code under other types is
+/// another program. Zero for all-float inputs (the code keys alone).
+fn input_types_key(types: &[u8; 32]) -> u64 {
+    if types.iter().all(|&kind| kind == 0) {
+        return 0;
+    }
+    let mut hasher = super::FastHasher::default();
+    std::hash::Hasher::write(&mut hasher, types);
+    std::hash::Hasher::finish(&hasher) | 1 << 62
+}
+
 fn generic_input_types(attributes: &[BTreeMap<String, super::Args>]) -> [u8; 32] {
     let mut types = [0; 32];
     for (location, props) in attributes.iter().enumerate().take(32) {
@@ -1520,6 +1533,27 @@ impl Nvn {
             })
             .copied()
             .ok_or_else(|| format!("bound program has no stage of type {wanted}"))
+    }
+
+    /// `generic_input_types` of the bound vertex attribute state, kept for
+    /// the snapshot asked for last.
+    fn vertex_input_types(&mut self) -> [u8; 32] {
+        let Some(states) = self
+            .render
+            .state
+            .get("BindVertexAttribState")
+            .map(|command| command.states.clone())
+        else {
+            return [0; 32];
+        };
+        if let Some((known, types)) = &self.input_types_memo
+            && Arc::ptr_eq(known, &states)
+        {
+            return *types;
+        }
+        let types = generic_input_types(&states);
+        self.input_types_memo = Some((states, types));
+        types
     }
 
     fn bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
@@ -7091,8 +7125,16 @@ impl Nvn {
             .and_then(|key| u64::from_str_radix(&key, 16).ok())
             .zip(super::debug_var_os("ECHORA_GPU_DUMP"))
             .filter(|_| self.sequencing());
+        // The program as built: the stages' code and, for the vertex stage,
+        // the input types it was translated for.
+        let types = if mesh_draw {
+            [0; 32]
+        } else {
+            self.vertex_input_types()
+        };
+        let built = (keys.0 ^ input_types_key(&types), keys.1);
         let backend = self.gpu.as_mut().unwrap();
-        if !backend.programs.contains_key(&keys) {
+        if !backend.programs.contains_key(&built) {
             // ECHORA_VERTEX_TRACE: each traced stage's record buffer (64
             // records of 128 words), its address in the stage's constants.
             let mut specialization = Vec::new();
@@ -7164,7 +7206,7 @@ impl Nvn {
                     &specialization
                 },
             )?;
-            backend.programs.insert(keys, program);
+            backend.programs.insert(built, program);
             if base_filter {
                 eprintln!(
                     "vertex trace program {:016x}/{:016x} trace constants per stage {:?}",
@@ -7179,7 +7221,7 @@ impl Nvn {
                     .create_program_specialized(stages.clone(), &specialization)?;
                 backend
                     .programs
-                    .insert((keys.0, keys.1 ^ TRACED_VARIANT), traced);
+                    .insert((built.0, built.1 ^ TRACED_VARIANT), traced);
             }
         }
         // ECHORA_VERTEX_TRACE_REPORT=<stage key>[,...]: every 60 presents,
@@ -8887,7 +8929,7 @@ impl Nvn {
         } else {
             Vec::new()
         };
-        let traced_variant = (keys.0, keys.1 ^ TRACED_VARIANT);
+        let traced_variant = (built.0, built.1 ^ TRACED_VARIANT);
         let program_keys = if super::debug_var("ECHORA_VERTEX_TRACE_BASE")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
@@ -8896,7 +8938,7 @@ impl Nvn {
         {
             traced_variant
         } else {
-            keys
+            built
         };
         let read_guest = |guest: u64, bytes: &mut [u8]| {
             core.memory
