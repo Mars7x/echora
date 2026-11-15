@@ -3973,12 +3973,16 @@ impl Nvn {
         loop {
             // A replay in pieces (`replay_budget`) stops here when its piece
             // is done; `resume_replay` goes on from this item.
-            // It also stops after any command once another thread waits for
-            // the NVN state (`NVN_WAITERS`): a recording thread waits for one
-            // command, not the rest of the piece.
+            // Once it has run a quarter of its commands it also stops when
+            // another thread waits for the NVN state (`NVN_WAITERS`): a
+            // recording thread waits for a short piece, and the replay
+            // still makes headway (stopping after every command starved
+            // it: spd160).
             if let Some(budget) = self.replay_budget.as_mut() {
+                let quarter = replay_chunk().unwrap_or(0) * 3 / 4;
                 if *budget == 0
-                    || progressed && NVN_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+                    || *budget <= quarter
+                        && NVN_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
                 {
                     self.replay_paused = true;
                     return Ok(progressed);
