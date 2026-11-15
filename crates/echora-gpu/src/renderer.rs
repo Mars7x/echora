@@ -1483,6 +1483,10 @@ impl Renderer {
                 // submission just sent (reset when that slot is reused,
                 // under work recorded now that still uses the set).
                 self.flush()?;
+                *self
+                    .stats
+                    .entry("stat: descriptor pool full mid-draw")
+                    .or_default() += 1;
                 // SAFETY: as above, the recorded slot's pool after the flush.
                 unsafe {
                     self.gpu

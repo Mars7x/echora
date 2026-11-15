@@ -5108,8 +5108,11 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -
         // one queued work may name waits.
         // Writing the same texture descriptor again changes nothing queued
         // work can read either.
+        // With one queue's work outstanding the registration is put behind
+        // it instead (`QueueItem::Register`).
         "nvnTexturePoolRegisterTexture" | "nvnTexturePoolRegisterImage" => {
             nvn.descriptor_registered(regs[0], regs[1] & 0xffff_ffff)
+                && nvn.pending_queues() > 1
                 && !nvn.registration_unchanged(
                     regs[0],
                     regs[1] & 0xffff_ffff,

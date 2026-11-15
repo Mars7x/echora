@@ -185,6 +185,22 @@ enum QueueItem {
     /// A present (with a replay thread): the frame is shown once earlier
     /// work has run.
     Present { texture: u64 },
+    /// A texture descriptor registered again (with a replay thread): work
+    /// submitted before it reads the old one, as when the registration
+    /// finished the replay first, without waiting for that work to run.
+    Register(Box<Registration>),
+}
+
+/// A descriptor registration, as `apply_registration` makes it: the pool,
+/// the id, sampler or texture, the descriptor and (textures) the view's
+/// properties when registered (`None`: no view).
+#[derive(Debug)]
+struct Registration {
+    pool: u64,
+    id: u32,
+    sampler: bool,
+    entry: Args,
+    view: Option<Option<Bag>>,
 }
 
 /// The ECHORA_* environment, read once: the draw path consulted debug
@@ -2837,41 +2853,27 @@ impl Nvn {
                 if id >= count {
                     return Err(invalid(format!("descriptor {id} outside a pool of {count}")));
                 }
-                // Handles naming this descriptor resolve anew (texture ids
-                // are bits 0..20 of a handle, sampler ids bits 20..32).
                 let sampler = rest.starts_with("RegisterSampler");
-                let keep = |handle: &u64, _: &mut ResolvedBinding| {
-                    let named = if sampler {
-                        handle >> 20 & 0xfff
-                    } else {
-                        handle & 0xf_ffff
-                    };
-                    named != u64::from(id)
-                };
-                self.binding_memo.1.retain(keep);
-                for (_, memo) in self.queue_memos.values_mut() {
-                    memo.retain(keep);
-                }
-                self.pool_inputs += 1;
                 let mut entry = Args::default();
-                match rest {
+                let view = match rest {
                     "RegisterSamplerBuilder" => {
                         self.bag(x[2], "SamplerBuilder").map_err(invalid)?;
+                        None
                     }
                     "RegisterSampler" => {
                         self.object(x[2], "Sampler").map_err(invalid)?;
+                        None
                     }
                     _ => {
                         self.object(x[2], "Texture").map_err(invalid)?;
                         if x[3] != 0 {
                             self.bag(x[3], "TextureView").map_err(invalid)?;
-                            let view = read_shared(self.bags.at(x[3]))[&x[3]].clone();
-                            self.views.insert((this, id), view);
+                            Some(Some(read_shared(self.bags.at(x[3]))[&x[3]].clone()))
                         } else {
-                            self.views.remove(&(this, id));
+                            Some(None)
                         }
                     }
-                }
+                };
                 entry.x[0] = x[2];
                 entry.x[1] = u64::from(rest == "RegisterImage");
                 // A hardware descriptor captures the texture as it is now:
@@ -2882,8 +2884,28 @@ impl Nvn {
                 // half, for ECHORA_HANDLE_LOG).
                 entry.x[2] = storage;
                 entry.x[3] = format & 0xffff_ffff | self.presented_frames << 32;
-                let pool = self.objects.get_mut(&this).unwrap();
-                pool.state.insert(format!("Descriptor{id}"), entry);
+                let registration = Registration {
+                    pool: this,
+                    id,
+                    sampler,
+                    entry,
+                    view,
+                };
+                // A texture descriptor registered again while one queue's
+                // work is still to run: the replay applies it in order.
+                if !sampler
+                    && Self::replay_thread()
+                    && !self.replaying
+                    && self.descriptor_registered(this, u64::from(id))
+                    && let Some(queue) = self.single_pending_queue()
+                {
+                    self.pending
+                        .get_mut(&queue)
+                        .unwrap()
+                        .push_back(QueueItem::Register(Box::new(registration)));
+                    return Ok(true);
+                }
+                self.apply_registration(registration);
                 return Ok(true);
             }
             // nvn{Texture,Sampler}PoolGetMemoryPool / GetMemoryOffset / GetSize:
@@ -3829,6 +3851,60 @@ impl Nvn {
             .is_some_and(|bag| bag == registered)
     }
 
+    /// The one queue with work still to run, when exactly one has some.
+    fn single_pending_queue(&self) -> Option<u64> {
+        let mut queues = self.pending.iter().filter(|(_, work)| !work.is_empty());
+        let (queue, _) = queues.next()?;
+        queues.next().is_none().then_some(*queue)
+    }
+
+    /// Whether more than one queue has work still to run (a registration
+    /// cannot then be put in order behind it: `needs_replayed`).
+    pub fn pending_queues(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|work| !work.is_empty())
+            .count()
+    }
+
+    /// Make descriptor `registration.id` of its pool describe its object:
+    /// handles naming it resolve anew (texture ids are bits 0..20 of a
+    /// handle, sampler ids bits 20..32).
+    fn apply_registration(&mut self, registration: Registration) {
+        let Registration {
+            pool,
+            id,
+            sampler,
+            entry,
+            view,
+        } = registration;
+        let keep = |handle: &u64, _: &mut ResolvedBinding| {
+            let named = if sampler {
+                handle >> 20 & 0xfff
+            } else {
+                handle & 0xf_ffff
+            };
+            named != u64::from(id)
+        };
+        self.binding_memo.1.retain(keep);
+        for (_, memo) in self.queue_memos.values_mut() {
+            memo.retain(keep);
+        }
+        self.pool_inputs += 1;
+        match view {
+            Some(Some(view)) => {
+                self.views.insert((pool, id), view);
+            }
+            Some(None) => {
+                self.views.remove(&(pool, id));
+            }
+            None => {}
+        }
+        if let Some(pool) = self.objects.get_mut(&pool) {
+            pool.state.insert(format!("Descriptor{id}"), entry);
+        }
+    }
+
     /// Whether a queued present has not been shown yet.
     pub fn present_pending(&self) -> bool {
         self.pending
@@ -4121,6 +4197,14 @@ impl Nvn {
                     let texture = *texture;
                     self.pending.get_mut(&queue).unwrap().pop_front();
                     self.present_frame(core, queue, texture)?;
+                    progressed = true;
+                }
+                QueueItem::Register(_) => {
+                    if let Some(QueueItem::Register(registration)) =
+                        self.pending.get_mut(&queue).unwrap().pop_front()
+                    {
+                        self.apply_registration(*registration);
+                    }
                     progressed = true;
                 }
                 QueueItem::WaitSync { sync } => {
