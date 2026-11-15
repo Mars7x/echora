@@ -337,11 +337,6 @@ pub struct Renderer {
     fresh_targets: Vec<u64>,
     /// Submissions that waited for the GPU, and the microseconds waited.
     pub flushes: u64,
-    /// The rendering pass left open after a draw (color views, depth view,
-    /// render area): the next draw into the same attachments continues it
-    /// instead of storing and loading them again. Any other recording
-    /// (`commands`) ends it.
-    pub(crate) open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
     completed_reads: Vec<(u64, Vec<u8>)>,
     next_read_token: u64,
     /// The other submission slots, the oldest submission first: while
@@ -391,9 +386,6 @@ pub struct Renderer {
     /// The condition draws and dispatches are gated on (`set_condition`):
     /// wanted, and active in the command buffer being recorded.
     condition: Option<(vk::Buffer, u64, bool)>,
-    condition_active: bool,
-    /// The active condition began inside the open rendering pass.
-    condition_inside: bool,
     /// A failure that must end the run rather than skip one draw (an upload
     /// over MAX_UPLOAD_BYTES): the runtime takes it after each draw and
     /// dispatch and stops with it.
@@ -436,6 +428,15 @@ struct Slot {
     serial: u64,
     /// Markers its commands set (`mark`), freed once it completes.
     markers: Vec<u64>,
+    /// The rendering pass left open after a draw (color views, depth view,
+    /// render area): the next draw into the same attachments continues it
+    /// instead of storing and loading them again. Any other recording
+    /// (`commands`) ends it.
+    open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
+    /// The wanted condition (`Renderer::condition`) is active in this
+    /// slot's command buffer, and began inside its open rendering pass.
+    condition_active: bool,
+    condition_inside: bool,
 }
 
 impl Slot {
@@ -615,6 +616,9 @@ impl Renderer {
                 in_flight: false,
                 serial: 0,
                 markers: Vec::new(),
+                open_pass: None,
+                condition_active: false,
+                condition_inside: false,
             });
         }
         let mut fences = [fence; SLOTS];
@@ -675,7 +679,6 @@ impl Renderer {
             view_infos: FastMap::default(),
             fresh_targets: Vec::new(),
             flushes: 0,
-            open_pass: None,
             completed_reads: Vec::new(),
             next_read_token: 0,
             targets_created: 0,
@@ -705,6 +708,9 @@ impl Renderer {
                 in_flight: false,
                 serial: 0,
                 markers: Vec::new(),
+                open_pass: None,
+                condition_active: false,
+                condition_inside: false,
             },
             markers: FastMap::default(),
             free_events: Vec::new(),
@@ -715,8 +721,6 @@ impl Renderer {
             submitted_labels: Vec::new(),
             occlusion: None,
             condition: None,
-            condition_active: false,
-            condition_inside: false,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -742,6 +746,11 @@ impl Renderer {
         Ok(renderer)
     }
 
+    /// Whether a rendering pass is open in the recorded slot.
+    pub(crate) fn pass_open(&self) -> bool {
+        self.slot.open_pass.is_some()
+    }
+
     pub(crate) fn device(&self) -> &ash::Device {
         &self.gpu.device
     }
@@ -759,18 +768,18 @@ impl Renderer {
     /// End the rendering pass a draw left open, if any.
     #[track_caller]
     pub(crate) fn end_pass(&mut self) {
-        if self.open_pass.is_some() {
+        if self.slot.open_pass.is_some() {
             *self
                 .pass_ends
                 .entry(std::panic::Location::caller())
                 .or_default() += 1;
             // A condition or a segment counting samples begun inside the
             // pass ends in it (the next draw begins the condition again).
-            if self.condition_active && self.condition_inside {
+            if self.slot.condition_active && self.slot.condition_inside {
                 self.end_condition();
             }
             let counting = self.occlusion_pass_ends(self.slot.commands);
-            self.open_pass = None;
+            self.slot.open_pass = None;
             // SAFETY: recording, inside the pass begun by `begin_rendering`.
             unsafe { self.gpu.device.cmd_end_rendering(self.slot.commands) };
             if counting {
@@ -864,7 +873,7 @@ impl Renderer {
         let Some((buffer, offset, _)) = self.condition else {
             return false;
         };
-        !self.condition_active
+        !self.slot.condition_active
             && self
                 .occlusion
                 .as_ref()
@@ -888,7 +897,7 @@ impl Renderer {
         let Some((buffer, offset, inverted)) = self.condition else {
             return Ok(());
         };
-        if self.condition_active {
+        if self.slot.condition_active {
             return Ok(());
         }
         let Some(conditional) = self.gpu.conditional_rendering.clone() else {
@@ -913,8 +922,8 @@ impl Renderer {
         // SAFETY: recording; the buffer is live, made for conditional
         // rendering, and its writes were made visible to all reads.
         unsafe { (conditional.fp().cmd_begin_conditional_rendering_ext)(commands, &begin) };
-        self.condition_active = true;
-        self.condition_inside = self.open_pass.is_some();
+        self.slot.condition_active = true;
+        self.slot.condition_inside = self.slot.open_pass.is_some();
         *self.stats.entry("stat: conditions begun").or_default() += 1;
         Ok(())
     }
@@ -922,10 +931,10 @@ impl Renderer {
     /// End the active condition (inside the rendering pass it began in, or
     /// outside any for one begun outside).
     pub(crate) fn end_condition(&mut self) {
-        if !self.condition_active {
+        if !self.slot.condition_active {
             return;
         }
-        if !self.condition_inside {
+        if !self.slot.condition_inside {
             self.end_pass();
         }
         if let Some(conditional) = self.gpu.conditional_rendering.as_ref() {
@@ -933,7 +942,7 @@ impl Renderer {
             // is where it began (its pass still open, or outside any).
             unsafe { (conditional.fp().cmd_end_conditional_rendering_ext)(self.slot.commands) };
         }
-        self.condition_active = false;
+        self.slot.condition_active = false;
     }
 
     /// Copy `bytes` into the ring at an `alignment`-aligned offset, flushing
@@ -5053,6 +5062,7 @@ impl Renderer {
             [0, 0, smallest_width, smallest_height]
         };
         if self
+            .slot
             .open_pass
             .as_ref()
             .is_some_and(|(open, open_depth, open_area)| {
@@ -5124,7 +5134,7 @@ impl Renderer {
         if counting {
             self.occlusion_pass_begun(commands);
         }
-        self.open_pass = Some((views, depth_view, whole));
+        self.slot.open_pass = Some((views, depth_view, whole));
         Ok(())
     }
 

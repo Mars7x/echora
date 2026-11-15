@@ -479,7 +479,7 @@ impl Renderer {
     fn next_segment(&mut self, begin: bool) -> Result<(), String> {
         // Inside a rendering pass when the active segment began in it and
         // the next can (no resolve, its query reset ahead).
-        if self.open_pass.is_some() {
+        if self.pass_open() {
             let fence = self.current_fence();
             let device = self.gpu.device.clone();
             let commands = self.recording_commands()?;
