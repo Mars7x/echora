@@ -407,7 +407,15 @@ runs, best): functions against window emission +11.5%/+22.6%, call
 summaries against functions +49.5%/+40.2% (974/997 against window
 emission's 585/580 Minstr/s, about 1.7x). `tests/calls.rs` runs its callers
 with summarized calls against the reference interpreter; a summary
-without a leaf's writes, or without its reads, fails it.
+without a leaf's writes, or without its reads, fails it. Through the function table
+(`function-table`, the path 84% of the game's BL sites need: relift14
+counts 796,334 BL sites, 125,946 of them to the caller's region) a
+summarized call is `function_at(i)(m)`, the same otherwise: calls kernel,
+functions and the table with summaries against without +37.9%/+32.5%
+(699/721 to 964/956 Minstr/s). `tests/early_exits.rs` has leaves that
+leave early, through a branch out of their region to code reading a
+register the caller held, and through an SVC; dropping the caller's store
+of held locals there fails it.
 
 ## Recommended set for the next rebuild (measured 2026-11)
 

@@ -110,6 +110,7 @@ fn split_programs(out: &mut String) {
     float_run_code(out);
     float_run_load_code(out);
     deferred_charge_code(out);
+    early_exit_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1252,6 +1253,7 @@ fn call_code(out: &mut String) {
         ("call_function_code", true, false, false),
         ("call_function_table_code", true, true, false),
         ("call_summary_code", true, false, true),
+        ("call_summary_table_code", true, true, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -2330,6 +2332,82 @@ fn float_run_load_code(out: &mut String) {
              pub const RUNS: (usize, usize) = ({runs}, {operations});"
         )
         .expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Leaves that leave early, for `tests/early_exits.rs`: a caller writes X4
+/// (which neither leaf touches), calls leaf A (X1 += 1, and with X5 nonzero
+/// a branch out of its region to code that adds X4 to X2 and returns), adds
+/// X4 and X1 into X6, and calls leaf B (X1 += 2, then SVC #7, which ends
+/// the run). Lifted with functions and call summaries, directly
+/// (`early_exit_code`) and through the function table
+/// (`early_exit_table_code`).
+fn early_exit_code(out: &mut String) {
+    const BASE: u64 = 0x160_0000;
+    let (leaf_a, leaf_b, far) = (BASE + 0x400, BASE + 0x800, BASE + 0x1_0000);
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let branch = |from: u64, to: u64| {
+        0x1400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0x1_0400 / 4];
+    let mut place = |address: u64, program: &[u32]| {
+        let at = ((address - BASE) / 4) as usize;
+        words[at..at + program.len()].copy_from_slice(program);
+    };
+    place(
+        BASE,
+        &[
+            0xd280_00e4, // movz x4, #7
+            bl(BASE + 4, leaf_a),
+            0x8b01_0086, // add x6, x4, x1
+            bl(BASE + 12, leaf_b),
+            0xd400_00e1, // svc #7
+        ],
+    );
+    place(
+        leaf_a,
+        &[
+            0x9100_0421,              // add x1, x1, #1
+            0xb500_0045,              // cbnz x5, +8
+            0xd65f_03c0,              // ret
+            branch(leaf_a + 12, far), // b far
+        ],
+    );
+    place(leaf_b, &[0x9100_0821, 0xd400_00e1]); // add x1, x1, #2; svc #7
+    place(far, &[0x8b04_0042, 0xd65f_03c0]); // add x2, x2, x4; ret
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "early exits".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &[BASE, far], words.len()).expect("early exits");
+    for (name, function_table) in [("early_exit_code", false), ("early_exit_table_code", true)] {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                functions: true,
+                function_table,
+                call_summaries: true,
+                ..options()
+            },
+        );
+        let summarized = regions
+            .iter()
+            .map(|(_, source)| source.matches("if m.cpu.pc != 0x").count())
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "/// Calls of leaves with an effect summary.\npub const SUMMARIZED_CALLS: usize = {summarized};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

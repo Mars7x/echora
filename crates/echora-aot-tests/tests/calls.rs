@@ -15,7 +15,7 @@ mod common;
 use common::*;
 use echora_aot_tests::{
     Core, Machine, READ, STATE_NORMAL, Trap, WRITE, call_code, call_function_code,
-    call_function_table_code, call_summary_code,
+    call_function_table_code, call_summary_code, call_summary_table_code,
 };
 use echora_lift::aarch64::{Instruction, decode};
 
@@ -201,6 +201,14 @@ fn lifted_functions_through_the_table_match_the_reference() {
 fn lifted_functions_with_call_summaries_match_the_reference() {
     const { assert!(call_summary_code::SUMMARIZED_CALLS > 0) };
     check(call_summary_code::dispatch);
+}
+
+/// The same with summarized calls through the function table.
+#[test]
+fn lifted_functions_with_call_summaries_through_the_table_match_the_reference() {
+    const { assert!(call_summary_table_code::SUMMARIZED_CALLS > 0) };
+    call_summary_table_code::install();
+    check(call_summary_table_code::dispatch);
 }
 
 fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
