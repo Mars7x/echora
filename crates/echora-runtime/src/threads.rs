@@ -394,6 +394,13 @@ impl ThreadCollection {
     /// Count the same pre-execution instruction boundary as Machine::tick.
     /// Runtime preserves the process-wide budget and commits its count only
     /// after this fallible child accounting succeeds.
+    /// Each child thread's instructions started so far.
+    pub(crate) fn instructions(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.threads
+            .iter()
+            .map(|(id, thread)| (*id, thread.instructions_started))
+    }
+
     pub(crate) fn note_instructions(&mut self, id: u64, count: u64) -> Result<(), Trap> {
         let thread = self
             .threads

@@ -1612,6 +1612,13 @@ const KINDS: &[&str] = &[
 /// while they wait): a replay in pieces stops early for them.
 pub static NVN_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// ECHORA_REPLAY_NO_HANDOVER (measuring): replay pieces run their whole
+/// budget even while other threads wait for the NVN state.
+fn hand_over_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ECHORA_REPLAY_NO_HANDOVER").is_none())
+}
+
 fn replay_chunk() -> Option<u32> {
     static CHUNK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let chunk = *CHUNK.get_or_init(|| {
@@ -3981,7 +3988,8 @@ impl Nvn {
             if let Some(budget) = self.replay_budget.as_mut() {
                 let quarter = replay_chunk().unwrap_or(0) * 3 / 4;
                 if *budget == 0
-                    || *budget <= quarter
+                    || hand_over_early()
+                        && *budget <= quarter
                         && NVN_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
                 {
                     self.replay_paused = true;

@@ -362,6 +362,9 @@ pub struct Machine {
     /// code, waiting for the machine lock and holding it (for finding the
     /// thread that bounds the frame rate).
     thread_time: BTreeMap<u64, [u64; 3]>,
+    /// Each thread's instructions started when the profile window began
+    /// (ECHORA_PROFILE_FROM), for the window's instructions per thread.
+    profile_instructions: BTreeMap<u64, u64>,
     /// Boundaries since the run started, for the stop-request check.
     stop_check_tick: u64,
 }
@@ -463,6 +466,7 @@ impl Machine {
             nvn_lock_stats: [0; 2],
             nvn_thread_wait: BTreeMap::new(),
             thread_time: BTreeMap::new(),
+            profile_instructions: BTreeMap::new(),
             stop_check_tick: 0,
         }
     }
@@ -2682,6 +2686,13 @@ impl Machine {
         }
     }
 
+    /// Every thread's instructions started so far (the main thread's too).
+    fn thread_instructions(&self) -> BTreeMap<u64, u64> {
+        let mut counts: BTreeMap<u64, u64> = self.threads.instructions().collect();
+        counts.insert(self.layout.main_thread_id, self.main_instructions_started);
+        counts
+    }
+
     /// Credit instructions counted by [`Core::tick`] to the active thread.
     fn flush_core_counts(&mut self) -> Result<(), Trap> {
         let count = self.core.steps - self.core.thread_steps_base;
@@ -3134,6 +3145,8 @@ impl Machine {
                     self.boundary_kinds.fill(0);
                     self.boundary_held.fill(0);
                     self.thread_time.clear();
+                    self.flush_core_counts()?;
+                    self.profile_instructions = self.thread_instructions();
                     self.pc_samples.clear();
                     self.services.reset_profile();
                     self.nvn.calls.clear();
@@ -4671,6 +4684,7 @@ impl Machine {
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
             "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
+            "thread_window_instructions":self.thread_instructions().into_iter().map(|(thread, count)| (thread.to_string(), count - self.profile_instructions.get(&thread).copied().unwrap_or(0))).collect::<BTreeMap<_, _>>(),
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
                 (boundary_kind_name(kind), *count)
