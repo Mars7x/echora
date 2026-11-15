@@ -41,6 +41,8 @@ pub struct Gpu {
     /// a dma-buf over guest memory's file (a udmabuf) can be imported as
     /// device memory, so guest buffers are shared with the GPU in place.
     pub dma_buf_import: Option<ash::khr::external_memory_fd::Device>,
+    /// VK_AMD_buffer_marker, only under ECHORA_HANG_MARKERS (debugging).
+    pub buffer_marker: Option<ash::amd::buffer_marker::Device>,
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
@@ -261,6 +263,13 @@ impl Gpu {
         if mesh_shader {
             enabled_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
         }
+        // ECHORA_HANG_MARKERS=<file> (debugging): a marker after each
+        // labelled piece of work names the one a GPU stall stopped in.
+        let buffer_marker =
+            std::env::var_os("ECHORA_HANG_MARKERS").is_some() && has(ash::amd::buffer_marker::NAME);
+        if buffer_marker {
+            enabled_extensions.push(ash::amd::buffer_marker::NAME.as_ptr());
+        }
         let conditional_rendering = supported_conditional.conditional_rendering != 0
             && has(ash::ext::conditional_rendering::NAME);
         if conditional_rendering {
@@ -431,6 +440,8 @@ impl Gpu {
             host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         let dma_buf_import =
             dma_buf_import.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        let buffer_marker =
+            buffer_marker.then(|| ash::amd::buffer_marker::Device::new(&instance, &device));
         let mesh_shader =
             mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
         let conditional_rendering = conditional_rendering
@@ -487,6 +498,7 @@ impl Gpu {
             cooperative_matrix,
             host_import,
             dma_buf_import,
+            buffer_marker,
             mesh_shader,
             conditional_rendering,
             depth_bias_control,

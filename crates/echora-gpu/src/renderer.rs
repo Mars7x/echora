@@ -383,6 +383,9 @@ pub struct Renderer {
     /// `completed_serial`, readable by other threads (a CPU wait answered
     /// without the NVN state lock).
     completed_shared: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ECHORA_HANG_MARKERS (debugging): the marker buffer and the labels of
+    /// the work after each marker.
+    hang: Option<HangMarkers>,
     /// Labels of the last submission (ECHORA_SLOW_SUBMITS reports them).
     submitted_labels: Vec<String>,
     /// Render targets created, and recreated because their shape changed.
@@ -697,6 +700,7 @@ impl Renderer {
             current_serial: 0,
             completed_serial: 0,
             completed_shared: Default::default(),
+            hang: None,
             submitted_labels: Vec::new(),
             occlusion: None,
             condition: None,
@@ -2723,6 +2727,25 @@ impl Renderer {
         let device = &self.gpu.device;
         // SAFETY: the fence belongs to a submitted batch (or one handed to
         // the submit thread: the wait covers its submission).
+        // Under ECHORA_HANG_MARKERS a wait over 2 s reports where the GPU
+        // stopped, then goes on waiting.
+        let limit = if self.hang.is_some() {
+            2_000_000_000
+        } else {
+            u64::MAX
+        };
+        let mut reported = false;
+        // SAFETY: as below.
+        while let Err(vk::Result::TIMEOUT) =
+            unsafe { device.wait_for_fences(&[self.fence], true, limit) }
+        {
+            if !reported {
+                reported = true;
+                if let Some(hang) = &self.hang {
+                    hang.report(self.current_serial);
+                }
+            }
+        }
         unsafe {
             device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
@@ -3659,6 +3682,7 @@ impl Renderer {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
             std::env::var_os("ECHORA_LAST_SUBMIT").is_some()
+                || std::env::var_os("ECHORA_HANG_MARKERS").is_some()
                 || std::env::var_os("ECHORA_SLOW_SUBMITS").is_some()
                 || std::env::var_os("ECHORA_SUBMIT_LOG").is_some()
                 || std::env::var_os("ECHORA_GPU_TIME").is_some_and(|value| value == "items")
@@ -3689,8 +3713,50 @@ impl Renderer {
 
     /// Debugging: name a piece of work in the current submission.
     pub fn label(&mut self, label: String) {
+        if self.gpu.buffer_marker.is_some() {
+            self.hang_mark(&label);
+        }
         if self.labels.len() < 4096 {
             self.labels.push(label);
+        }
+    }
+
+    /// ECHORA_HANG_MARKERS: a marker before the work `label` names, written
+    /// when the GPU has finished what came before it.
+    fn hang_mark(&mut self, label: &str) {
+        let Some(marker) = self.gpu.buffer_marker.clone() else {
+            return;
+        };
+        if self.hang.is_none() {
+            let Ok(buffer) = self.host_buffer(4, vk::BufferUsageFlags::TRANSFER_DST) else {
+                return;
+            };
+            buffer.write(0, &[0; 4]);
+            self.hang = Some(HangMarkers {
+                buffer,
+                next: 0,
+                labels: std::collections::VecDeque::new(),
+                path: std::env::var_os("ECHORA_HANG_MARKERS").unwrap_or_default(),
+            });
+        }
+        let Ok(commands) = self.commands() else {
+            return;
+        };
+        let hang = self.hang.as_mut().unwrap();
+        hang.next += 1;
+        // SAFETY: a recording command buffer and a live buffer of 4 bytes.
+        unsafe {
+            marker.cmd_write_buffer_marker(
+                commands,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                hang.buffer.buffer,
+                0,
+                hang.next,
+            );
+        }
+        hang.labels.push_back((hang.next, label.to_owned()));
+        if hang.labels.len() > 200_000 {
+            hang.labels.pop_front();
         }
     }
 
@@ -6232,5 +6298,36 @@ fn addressed_usage(usage: vk::BufferUsageFlags, addressable: bool) -> vk::Buffer
         usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
     } else {
         usage
+    }
+}
+
+/// ECHORA_HANG_MARKERS (debugging): each labelled piece of work is preceded
+/// by a VK_AMD_buffer_marker write of its number, done when the GPU has
+/// finished what came before; a stalled wait reads the last number written
+/// and names the work after it.
+struct HangMarkers {
+    buffer: HostBuffer,
+    next: u32,
+    labels: std::collections::VecDeque<(u32, String)>,
+    path: std::ffi::OsString,
+}
+
+impl HangMarkers {
+    /// Write where the GPU stopped: the work after the last marker passed
+    /// (the one it is in) and its neighbours.
+    fn report(&self, serial: u64) {
+        let passed = u32::from_le_bytes(self.buffer.read_bytes(4).try_into().unwrap_or([0; 4]));
+        let mut text = format!(
+            "GPU stalled over 2 s in submission {serial}: last marker passed {passed} of {}\n",
+            self.next
+        );
+        for (number, label) in &self.labels {
+            if number + 5 >= passed && *number <= passed + 20 {
+                let mark = if *number == passed { "-> " } else { "   " };
+                text.push_str(&format!("{mark}{number} {label}\n"));
+            }
+        }
+        eprintln!("{}", text.lines().next().unwrap_or_default());
+        let _ = std::fs::write(&self.path, text);
     }
 }
