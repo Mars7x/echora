@@ -1395,7 +1395,7 @@ impl Nvn {
     /// block (NVN2 control section: size at +0x3c, offset in the code at
     /// +0x40; from the reference implementation's GLSLC notes).
     fn stage_constants(&self, core: &Guest, bit: u32) -> Option<Vec<u8>> {
-        let bind = self.render.state.get(&format!("BindProgram@{bit}"))?;
+        let bind = self.render.state.get(super::program_key(bit))?;
         let stage = self.program_stage(core, bind.x[1], bit).ok()?;
         self.stage_constants_of(core, stage)
     }
@@ -1569,7 +1569,7 @@ impl Nvn {
             let bind = self
                 .render
                 .state
-                .get(&format!("BindProgram@{bit}"))
+                .get(super::program_key(bit))
                 .ok_or_else(|| format!("no program bound for stage {bit}"))?;
             let stage = self.program_stage(core, bind.x[1], bit)?;
             addresses.push(stage.x[0]);
@@ -1638,12 +1638,12 @@ impl Nvn {
     ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
         // As `bound_program`: the same binds within a present and with no
         // shader-code flush or program change since give the same stages.
-        let mut binds: Vec<(String, [u64; 8])> = self
+        let mut binds: Vec<(&'static str, [u64; 8])> = self
             .render
             .state
             .iter()
             .filter(|(key, _)| key.starts_with("BindProgram@"))
-            .map(|(key, bind)| (key.clone(), bind.x))
+            .map(|(key, bind)| (*key, bind.x))
             .collect();
         binds.sort_unstable();
         let stamp = (self.presented_frames, self.flush_epoch);
@@ -1671,7 +1671,7 @@ impl Nvn {
             .render
             .state
             .iter()
-            .filter(|(key, _)| key.starts_with("BindProgram@") && *key != "BindProgram@5")
+            .filter(|(key, _)| key.starts_with("BindProgram@") && **key != "BindProgram@5")
             .map(|(_, bind)| bind.x[1])
             .collect();
         // For the skip reasons: each bound bit's program and its stages'
@@ -4026,7 +4026,7 @@ impl Nvn {
                 .state
                 .keys()
                 .filter(|key| key.contains("/5/"))
-                .map(String::as_str)
+                .copied()
                 .collect();
             format!(
                 "program {:#x} uses [{}], bound [{}]",
@@ -7322,7 +7322,7 @@ impl Nvn {
                                     .state
                                     .keys()
                                     .filter(|key| key.starts_with("BindUniformBuffer/"))
-                                    .map(String::as_str)
+                                    .copied()
                                     .collect();
                                 bound.sort_unstable();
                                 format!(
@@ -7387,7 +7387,7 @@ impl Nvn {
                                     .state
                                     .keys()
                                     .filter(|key| key.starts_with(&format!("BindStorageBuffer/{nvn}/")))
-                                    .map(String::as_str)
+                                    .copied()
                                     .collect();
                                 format!(
                                     "storage buffer {nvn}/{slot} (c0+{:#x}) is not bound (bound [{}])",
@@ -9622,7 +9622,7 @@ fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, Strin
 /// The render state's key for a binding of `kind` (stage `stage`, if any)
 /// at `slot`, as "{kind}/{stage}/{slot}" or "{kind}/{slot}": made once
 /// each (draws looked a dozen up, each formatted anew).
-fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'static str {
+pub(super) fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'static str {
     thread_local! {
         static KEYS: std::cell::RefCell<
             HashMap<(usize, Option<u64>, u64), &'static str>,

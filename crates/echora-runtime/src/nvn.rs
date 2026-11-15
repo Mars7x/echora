@@ -579,7 +579,7 @@ pub struct Nvn {
     #[serde(skip)]
     mesh_program_memo: (
         (u64, u64),
-        HashMap<Vec<(String, [u64; 8])>, (gpu::BoundProgram, Vec<u32>, Vec<Args>)>,
+        HashMap<Vec<(&'static str, [u64; 8])>, (gpu::BoundProgram, Vec<u32>, Vec<Args>)>,
     ),
     /// SHADER_CODE pools' guest storage (start, size).
     #[serde(skip)]
@@ -663,7 +663,7 @@ pub struct RenderState {
     /// The latest submitted state command of each kind (viewports, bound
     /// programs, state objects, pools, resources). Kept for the host
     /// renderer; nothing consumes it until draws are implemented.
-    pub state: FastMap<String, Command>,
+    pub state: FastMap<&'static str, Command>,
     /// The texture handle bound at each (NVN stage, slot), as `state`
     /// holds it under `BindTexture/{stage}/{slot}`: draws that read the
     /// texture pool list a stage's handles without scanning `state`.
@@ -4430,7 +4430,7 @@ impl Nvn {
                     for (index, value) in rect.iter().enumerate() {
                         viewport.x[1 + index] = f32::from_bits(*value as u32) as i32 as u64;
                     }
-                    self.render.state.insert("SetViewport".into(), viewport);
+                    self.render.state.insert("SetViewport", viewport);
                 } else {
                     self.render.scissor = Some(rect.map(|value| value as u32 as i32));
                 }
@@ -4447,7 +4447,7 @@ impl Nvn {
                 range.name = "nvnCommandBufferSetDepthRange";
                 range.v[0] = command.captured[0];
                 range.v[1] = command.captured[1];
-                self.render.state.insert("SetDepthRange".into(), range);
+                self.render.state.insert("SetDepthRange", range);
                 Ok(())
             }
             // SetScissor(cmd, x, y, width, height).
@@ -4824,7 +4824,7 @@ impl Nvn {
                 Ok(())
             }
             name => {
-                let rest = without_prefix(&name, "nvnCommandBuffer");
+                let rest = without_prefix(name, "nvnCommandBuffer");
                 // Bind{Textures,Images,UniformBuffers,StorageBuffers}[Deferred]
                 // (cmd, stage, first, count, array): one binding per slot,
                 // as the singular command would make it.
@@ -4860,7 +4860,7 @@ impl Nvn {
                         }
                         self.render
                             .state
-                            .insert(format!("{single}/{}/{slot}", command.x[1]), bind);
+                            .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
                     }
                     return Ok(());
                 }
@@ -4874,9 +4874,9 @@ impl Nvn {
                         | "BindImage"
                         | "BindSeparateTexture"
                         | "BindSeparateSampler" => {
-                            format!("{rest}/{}/{}", command.x[1], command.x[2])
+                            gpu::bind_key(rest, Some(command.x[1]), command.x[2])
                         }
-                        "BindVertexBuffer" => format!("{rest}/{}", command.x[1]),
+                        "BindVertexBuffer" => gpu::bind_key(rest, None, command.x[1]),
                         // A blend state holds one target's factors (its
                         // BlendTarget, read at record time): each target
                         // keeps the latest state bound for it. The decal
@@ -4888,16 +4888,14 @@ impl Nvn {
                                 .first()
                                 .and_then(|state| state.get("BlendTarget"))
                                 .map_or(0, |value| value.x[0]);
-                            format!("{rest}/{target}")
+                            gpu::bind_key(rest, None, target)
                         }
                         // BindProgram(cmd, program, stage bits): a program
                         // replaces the stages its bits name (inferred).
                         "BindProgram" => {
                             for bit in 0..8 {
                                 if command.x[2] >> bit & 1 != 0 {
-                                    self.render
-                                        .state
-                                        .insert(format!("{rest}@{bit}"), command.clone());
+                                    self.render.state.insert(program_key(bit), command.clone());
                                 }
                             }
                             return Ok(());
@@ -4905,9 +4903,9 @@ impl Nvn {
                         // Another pool: every handle may name other entries.
                         "SetTexturePool" | "SetSamplerPool" => {
                             self.bump_binding_serial("stat: binding serial by a pool set");
-                            rest.into()
+                            rest
                         }
-                        _ => rest.into(),
+                        _ => rest,
                     };
                     if rest == "BindTexture"
                         && self
@@ -5431,7 +5429,7 @@ impl Nvn {
                     .iter()
                     .map(|props| props.iter().map(|(name, args)| (name, args.x)).collect())
                     .collect();
-                (key.clone(), serde_json::json!(elements))
+                (key.to_string(), serde_json::json!(elements))
             })
             .collect();
         let line = serde_json::json!({
@@ -6516,6 +6514,21 @@ fn release_list(list: std::sync::Arc<Vec<Command>>) {
 
 /// The singular command a plural bind stands for, and the words of each
 /// array entry (a handle, or a buffer range's address and size).
+/// `render.state`'s key for the program bound for stage bit `bit` (0..8).
+pub(crate) fn program_key(bit: u32) -> &'static str {
+    const KEYS: [&str; 8] = [
+        "BindProgram@0",
+        "BindProgram@1",
+        "BindProgram@2",
+        "BindProgram@3",
+        "BindProgram@4",
+        "BindProgram@5",
+        "BindProgram@6",
+        "BindProgram@7",
+    ];
+    KEYS[bit as usize]
+}
+
 fn plural_bind(rest: &str) -> Option<(&'static str, usize)> {
     match rest.trim_end_matches("Deferred") {
         "BindTextures" => Some(("BindTexture", 1)),
