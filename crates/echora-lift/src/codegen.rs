@@ -1452,7 +1452,9 @@ fn emit_plt_stub(
         }
         writeln!(
             output,
-            "                if let Err(trap) = m.tick_block_at({target:#x}, 4) {{ return Err(trap); }}"
+            "                {}let ticked = m.tick_block_at({target:#x}, 4); {}if let Err(trap) = ticked {{ return Err(trap); }}",
+            steps_out(),
+            steps_in()
         )
         .unwrap();
         for record in &stub.body {
@@ -1966,6 +1968,17 @@ impl RegisterLocals {
             match &piece.kind {
                 Kind::Plain => {
                     if let Some(out) = out.as_deref_mut() {
+                        // Core methods that read the step count.
+                        let reads_steps = [
+                            "m.finish_block()",
+                            "physical_counter_ticks",
+                            "m.spin_hint()",
+                            "m.trace_hit()",
+                        ];
+                        if reads_steps.iter().any(|text| line.contains(text)) {
+                            out.push_str(indent);
+                            out.push_str(steps_out());
+                        }
                         out.push_str(line);
                         out.push('\n');
                     }
@@ -1999,14 +2012,15 @@ impl RegisterLocals {
                     // runs, through the window table.
                     let held = state & !touched;
                     if let Some(out) = out.as_deref_mut() {
-                        let store = self.store_dirty(state & touched);
-                        let reload_writes = self.reload_subset(*writes);
-                        let store_held = self.store_dirty(held);
+                        let store = self.store_dirty(state & touched) + steps_out();
+                        let reload_writes = self.reload_subset(*writes) + steps_in();
+                        let store_held = self.store_dirty(held) + steps_out();
                         let early = if *propagate {
                             "return Ok(());".to_owned()
                         } else {
                             format!(
-                                "{store_held}let called = m.call({next:#x}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                                "{store_held}let called = m.call({next:#x}); {reload}{}if let Err(trap) = called {{ return Err(trap); }}",
+                                steps_in()
                             )
                         };
                         writeln!(
@@ -2025,10 +2039,11 @@ impl RegisterLocals {
                     // after (also on its error path, so the final store
                     // keeps what the callee left).
                     if let Some(out) = out.as_deref_mut() {
-                        let store = self.store_dirty(state);
+                        let store = self.store_dirty(state) + steps_out();
                         writeln!(
                             out,
-                            "{indent}{store}let called = {call}{arguments}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                            "{indent}{store}let called = {call}{arguments}); {reload}{}if let Err(trap) = called {{ return Err(trap); }}",
+                            steps_in()
                         )
                         .unwrap();
                     }
@@ -3652,6 +3667,24 @@ fn emit_block_body(
                 flush_pending(output);
             }
         }
+        if STEPS_LOCAL.get() {
+            // The count is the window's local: an untagged block's charge
+            // tests it against the stop word (the same relaxed load as
+            // `Core::charge_block_at`) without the `Core`; the exact checks
+            // and tagged charges go through the `Core`.
+            let count = count as u64;
+            if tagged {
+                output.push_str(&format!(
+                    "{indent}m.steps = *st; if !m.charge_block_at({arguments}, true) {{ let charged = m.charge_block_slow({arguments}, {resumable}); *st = m.steps; charged?; }} *st = m.steps;\n"
+                ));
+            } else {
+                output.push_str(&format!(
+                    "{indent}if *st + {count} <= m.stop.load(std::sync::atomic::Ordering::Relaxed) {{ *st += {count}; }} else {{ m.steps = *st; let charged = m.charge_block_slow({arguments}, {resumable}); *st = m.steps; charged?; }}\n"
+                ));
+            }
+            output.push_str(rest);
+            return;
+        }
         output.push_str(&format!(
             "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
         ));
@@ -4231,7 +4264,13 @@ fn emit_function(
     )
     .unwrap();
     output.push_str(&locals.load());
-    let pending = if deferred { ", pending: &mut u64" } else { "" };
+    let pending = if deferred {
+        ", pending: &mut u64"
+    } else if STEPS_LOCAL.get() {
+        ", st: &mut u64"
+    } else {
+        ""
+    };
     writeln!(
         output,
         "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R{pending}) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {entry:#x};"
@@ -4250,7 +4289,11 @@ fn emit_function(
         output.push_str("    loop {\n        match next_pc {\n");
         output.push_str(&body);
     }
-    if deferred {
+    if STEPS_LOCAL.get() && !deferred {
+        output.push_str(
+            "}\nm.cpu.pc = next_pc;\nif *st >= m.host_check_at || (m.parallel && m.preempt.load(std::sync::atomic::Ordering::Relaxed)) { m.steps = *st; m.finish_block()?; }\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
+        );
+    } else if deferred {
         output.push_str(
             "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
         );
@@ -4941,6 +4984,13 @@ pub struct EmitOptions {
     /// (filled by the root's `install`), instead of only those of the
     /// caller's region directly.
     pub function_table: bool,
+    /// With `split_ticks` (not with `deferred_charges`): a split window or
+    /// lifted function keeps the step count in a local; an untagged
+    /// block's charge tests it against the stop word without the `Core`,
+    /// and the count goes back to the `Core` before calls, the exact
+    /// checks, tagged charges, a host check, the counter, spin hints and
+    /// traces, and when the window leaves.
+    pub steps_local: bool,
     /// With `functions`: a call of a leaf function (no BL or BLR in it)
     /// stores only the dirty locals the leaf may read or write and reloads
     /// only those it may write (`leaf_summaries`); the rest stay in host
@@ -5045,6 +5095,29 @@ thread_local! {
     static PLT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static DIRECT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static FUSED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+thread_local! {
+    /// `EmitOptions::steps_local` of the region being emitted.
+    static STEPS_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With `EmitOptions::steps_local`: the window's step count into the
+/// `Core` (before anything that reads or charges it), and back.
+fn steps_out() -> &'static str {
+    if STEPS_LOCAL.get() {
+        "m.steps = *st; "
+    } else {
+        ""
+    }
+}
+
+fn steps_in() -> &'static str {
+    if STEPS_LOCAL.get() {
+        "*st = m.steps; "
+    } else {
+        ""
+    }
 }
 
 /// Restores a thread-local flag when it goes.
@@ -5427,6 +5500,7 @@ struct RegionSettings {
     untagged_blocks: UntaggedBlocks,
     split_ticks: SplitTicks,
     whole_vector_checks: WholeVectorChecks,
+    steps_local: Flag,
     plt: Flag,
     direct: Flag,
     fused: Flag,
@@ -5453,6 +5527,10 @@ impl RegionSettings {
             untagged_blocks: UntaggedBlocks::set(options.untagged_blocks),
             split_ticks: SplitTicks::set(options.split_ticks),
             whole_vector_checks: WholeVectorChecks::set(options.whole_vector_checks),
+            steps_local: Flag::set(
+                &STEPS_LOCAL,
+                options.steps_local && options.split_ticks && !options.deferred_charges,
+            ),
             plt: Flag::set(&PLT_ON, !options.stub_windows),
             direct: Flag::set(&DIRECT_ON, options.direct_calls),
             fused: Flag::set(&FUSED_ON, options.fused_flags),
@@ -5733,6 +5811,8 @@ pub fn emit_rust_split_to_regions<E>(
         output.push_str(
             if DEFERRED_CHARGES.get() {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, pending: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
+            } else if STEPS_LOCAL.get() {
+                "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, st: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             } else {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
@@ -5760,7 +5840,14 @@ pub fn emit_rust_split_to_regions<E>(
             output.push_str(&header);
             output.push_str(&body);
         }
-        if DEFERRED_CHARGES.get() {
+        if STEPS_LOCAL.get() && !DEFERRED_CHARGES.get() {
+            // The local count goes back before anything after the window
+            // sees the steps; a host check is taken where the `Core`'s
+            // would be (`Core::finish_block`, called only then).
+            output.push_str(
+                "}\nm.cpu.pc = next_pc;\nif *st >= m.host_check_at || (m.parallel && m.preempt.load(std::sync::atomic::Ordering::Relaxed)) { m.steps = *st; m.finish_block()?; }\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
+            );
+        } else if DEFERRED_CHARGES.get() {
             // The deferred blocks' instructions count before anything
             // after the window (the host's trap settling and checks) sees
             // the steps.

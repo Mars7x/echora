@@ -767,6 +767,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "direct-calls" => options.direct_calls = true,
                 "functions" => options.functions = true,
                 "function-table" => options.function_table = true,
+                "steps-local" => options.steps_local = true,
                 "call-summaries" => options.call_summaries = true,
                 "transitive-summaries" => options.transitive_summaries = true,
                 "deferred-charges" => options.deferred_charges = true,

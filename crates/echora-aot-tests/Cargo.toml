@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
+# With split-ticks: the step count in a window local (EmitOptions::steps_local).
+steps-local = []
 # With float-runs and inline-vector: S loads inside float runs
 # (EmitOptions::float_run_loads).
 float-run-loads = []

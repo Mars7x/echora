@@ -453,6 +453,37 @@ resuming at the RET) stores the caller's X30 before the SVC trap reaches
 the host, so the cause there is not yet seen, and the rule removes such
 calls from summarized ones whatever it was.
 
+## The step count in a window local (opt-in)
+
+`EmitOptions::steps_local` (`steps-local`, with split ticks, not with
+deferred charges): a split window or lifted function keeps the step count
+in a local (a parameter of its inlined body). An untagged block's charge
+is `if *st + n <= stop { *st += n } else { exact checks }` with the same
+relaxed load of the stop word as `Core::charge_block_at`, so a preemption
+is seen as soon as before; a tagged block's charge goes through the
+`Core` (its tag is private to echora-guest) with the count stored before
+and reloaded after. The count goes to the `Core` before calls (summarized
+ones too), the exact checks, a host check, counter reads, spin hints and
+traces, comes back after calls, and goes back when the window's body
+returns (every trap, SVC and exit passes there). The arm-end host check is
+inline (`Core::finish_block` only when it fires). No echora-guest change.
+
+`tests/steps_local.rs` compares final registers and steps, every host
+boundary's PC and step count (the host check due at every step) and the
+budget's trap (every budget) with per-block charging; `steps_local_calls.rs`
+does the same with the window table installed, so calls run in the
+caller's frame. Dropping the write-back after the body, or the reload
+after a call, fails them.
+
+Static counts on the aot-tests programs: 4,682 charges local, 125,959
+tagged (through the `Core`, with a store and reload around each: their
+blocks can trap after the charge). Kernels (game set vs game set plus
+steps-local, two rounds of seven runs, best): memset +66.7%/+79.7%, ldst
++46.8%/+50.5%, calls -20.3%/-16.3%, arith -7.8%/-15.4%, switch
+-13.7%/-6.8%, the rest within noise. The loops of untagged blocks gain; a
+call's tagged block pays the store and reload. A public way to set the
+block tag (an echora-guest change) would make tagged charges local too.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in

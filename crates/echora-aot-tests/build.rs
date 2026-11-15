@@ -44,6 +44,7 @@ fn options() -> EmitOptions {
         direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
         functions: std::env::var_os("CARGO_FEATURE_FUNCTIONS").is_some(),
         function_table: std::env::var_os("CARGO_FEATURE_FUNCTION_TABLE").is_some(),
+        steps_local: std::env::var_os("CARGO_FEATURE_STEPS_LOCAL").is_some(),
         call_summaries: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES").is_some(),
         transitive_summaries: std::env::var_os("CARGO_FEATURE_TRANSITIVE_SUMMARIES").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
@@ -2254,13 +2255,16 @@ fn deferred_charge_code(out: &mut String) {
     };
     let translation =
         discover(&[region], &[BASE, leaf, far], words.len()).expect("deferred charges");
-    for (name, deferred_charges) in [
-        ("deferred_charge_code", true),
-        ("deferred_charge_reference", false),
+    for (name, deferred_charges, steps_local) in [
+        ("deferred_charge_code", true, false),
+        ("deferred_charge_reference", false, false),
+        ("steps_local_code", false, true),
     ] {
         let options = EmitOptions {
             split_ticks: true,
             deferred_charges,
+            steps_local,
+            untagged_blocks: true,
             ..options()
         };
         let (root, regions) = split(&translation, options);
