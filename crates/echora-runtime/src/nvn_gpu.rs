@@ -6084,6 +6084,15 @@ impl Nvn {
                 write(format!("uniform-0-{binding}.bin"), bytes)?;
             }
         }
+        for ((stage_index, binding), &(guest, length)) in &draw.guest_uniforms {
+            if *stage_index == index
+                && let Some(read) = draw.read_guest
+            {
+                let mut bytes = vec![0; length];
+                read(guest, &mut bytes)?;
+                write(format!("uniform-0-{binding}.bin"), &bytes)?;
+            }
+        }
         for ((stage_index, binding), (source, _)) in &draw.textures {
             if *stage_index != index {
                 continue;
@@ -7265,6 +7274,7 @@ impl Nvn {
         let keys_for_note = [keys.0, keys.1];
         // Bindings, through the inferred map.
         let mut uniforms = echora_gpu::FastMap::default();
+        let mut guest_uniforms = echora_gpu::FastMap::default();
         let mut textures = echora_gpu::FastMap::default();
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
@@ -7336,11 +7346,14 @@ impl Nvn {
                         let size = bind.x[4].min(used.max(16)).min(64 << 10);
                         let address = bind.x[3];
                         self.resolve_gpu(core, address, size)?;
+                        // Read into the upload ring as the draw is recorded
+                        // (nothing writes the range before then: what the
+                        // GPU left there was just stored).
                         let started = std::time::Instant::now();
-                        let bytes = self.gpu_bytes(core, address, size)?;
+                        let guest = self.gpu_to_guest(address, size)?;
                         uniform_time += started.elapsed();
-                        uniform_bytes += bytes.len() as u64;
-                        uniforms.insert((index, descriptor.binding), bytes);
+                        uniform_bytes += size;
+                        guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
                         let mut bytes = match mesh_entries.get(index) {
@@ -8645,6 +8658,17 @@ impl Nvn {
                     bytes,
                 );
             }
+            for ((stage, binding), &(guest, length)) in
+                guest_uniforms.iter().filter(|_| index < most)
+            {
+                let mut bytes = vec![0; length];
+                if core.memory.read(guest, &mut bytes).is_ok() {
+                    let _ = std::fs::write(
+                        directory.join(format!("{prefix}-{index}-{stage}-{binding}.bin")),
+                        bytes,
+                    );
+                }
+            }
             // Its storage buffers too, as the draw reads them, named by
             // stage and constant-buffer offset (with their GPU address in
             // a listing).
@@ -8834,12 +8858,15 @@ impl Nvn {
             && !self.dumped_dispatches.contains(&(keys.1 ^ 0x6d65_7368))
             && !self.dumped_dispatches.contains(&(keys.1 ^ 0x7665_7274)))
         .then(|| {
-            (
-                stages.clone(),
-                uniforms.clone(),
-                textures.clone(),
-                page_table,
-            )
+            // Every uniform buffer's bytes, the guest-read ones included.
+            let mut all = uniforms.clone();
+            for (&key, &(guest, length)) in &guest_uniforms {
+                let mut bytes = vec![0; length];
+                if core.memory.read(guest, &mut bytes).is_ok() {
+                    all.insert(key, bytes);
+                }
+            }
+            (stages.clone(), all, textures.clone(), page_table)
         });
         let vertex_fetch_dump = if stage_dump.is_some() {
             vertex_fetch.clone()
@@ -8856,6 +8883,11 @@ impl Nvn {
             traced_variant
         } else {
             keys
+        };
+        let read_guest = |guest: u64, bytes: &mut [u8]| {
+            core.memory
+                .read(guest, bytes)
+                .map_err(|trap| format!("reading uniforms at {guest:#x}: {trap:?}"))
         };
         let draw = Draw {
             program: &backend.programs[&program_keys],
@@ -8876,6 +8908,8 @@ impl Nvn {
             instances,
             first_instance,
             uniforms,
+            guest_uniforms,
+            read_guest: Some(&read_guest),
             textures,
             storage,
             storage_in_place,

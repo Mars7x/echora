@@ -397,6 +397,12 @@ pub struct Draw<'a> {
     /// Bytes for each uniform buffer binding, by (stage index in the
     /// program, binding).
     pub uniforms: crate::FastMap<(usize, u32), Vec<u8>>,
+    /// Uniform buffer bindings read from guest memory (address, length)
+    /// straight into the upload ring as the draw is recorded, through
+    /// `read_guest`, instead of copied into `uniforms` first.
+    pub guest_uniforms: crate::FastMap<(usize, u32), (u64, usize)>,
+    /// Reads guest memory for `guest_uniforms`.
+    pub read_guest: Option<&'a dyn Fn(u64, &mut [u8]) -> Result<(), String>>,
     /// Texture bindings by (stage index, binding).
     pub textures: crate::FastMap<(usize, u32), (TextureSource, Sampler)>,
     /// Storage buffer contents by (stage index, binding). What a stage
@@ -693,7 +699,10 @@ impl Renderer {
                         descriptors[2] += 1;
                     }
                     _ => {
-                        let length = draw.uniforms.get(&key).map_or(16, Vec::len) as u64;
+                        let length = match draw.uniforms.get(&key) {
+                            Some(bytes) => bytes.len(),
+                            None => draw.guest_uniforms.get(&key).map_or(16, |read| read.1),
+                        } as u64;
                         bytes += length.max(16) + 256;
                         descriptors[0] += 1;
                     }
@@ -731,13 +740,28 @@ impl Renderer {
                 let key = (stage_index, descriptor.binding);
                 match descriptor.kind() {
                     DescriptorKind::UniformBuffer => {
-                        let bytes = draw
-                            .uniforms
-                            .get(&key)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[0; 16]);
-                        let (buffer, offset) = self.ring_upload(bytes, 256)?;
-                        let range = (bytes.len() as u64).max(16).next_multiple_of(16);
+                        let (buffer, offset, length) = match (
+                            draw.uniforms.get(&key),
+                            draw.guest_uniforms.get(&key),
+                            draw.read_guest,
+                        ) {
+                            (Some(bytes), ..) => {
+                                let (buffer, offset) = self.ring_upload(bytes, 256)?;
+                                (buffer, offset, bytes.len())
+                            }
+                            (None, Some(&(guest, length)), Some(read)) => {
+                                let (buffer, offset) =
+                                    self.ring_upload_with(length as u64, 256, |ring| {
+                                        read(guest, ring)
+                                    })?;
+                                (buffer, offset, length)
+                            }
+                            _ => {
+                                let (buffer, offset) = self.ring_upload(&[0; 16], 256)?;
+                                (buffer, offset, 16)
+                            }
+                        };
+                        let range = (length as u64).max(16).next_multiple_of(16);
                         writes.push((
                             descriptor.binding,
                             vk::DescriptorType::UNIFORM_BUFFER,
@@ -1395,6 +1419,8 @@ pub(crate) mod tests {
                 (1, 0),
                 color.iter().flat_map(|value| value.to_le_bytes()).collect(),
             )]),
+            guest_uniforms: crate::FastMap::default(),
+            read_guest: None,
             textures: crate::FastMap::default(),
             pool: Default::default(),
             storage: crate::FastMap::default(),

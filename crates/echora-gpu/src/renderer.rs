@@ -1359,6 +1359,27 @@ impl Renderer {
         Ok((self.ring.buffer, offset))
     }
 
+    /// `ring_upload` of `size` bytes that `fill` writes in place in the
+    /// ring (from guest memory, without a copy in between).
+    pub(crate) fn ring_upload_with(
+        &mut self,
+        size: u64,
+        alignment: u64,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<(vk::Buffer, u64), String> {
+        if size > RING_SIZE {
+            return Err(format!("{size}-byte upload exceeds the ring"));
+        }
+        let mut offset = self.ring_used.next_multiple_of(alignment);
+        if offset + size > RING_SIZE {
+            self.flush()?;
+            offset = 0;
+        }
+        fill(self.ring.slice_mut(offset as usize, size as usize))?;
+        self.ring_used = offset + size;
+        Ok((self.ring.buffer, offset))
+    }
+
     /// Make room, before recording one draw or dispatch, for `bytes` of
     /// ring uploads (alignment included) and one descriptor set holding
     /// `descriptors` of each pooled type, flushing first if either would
