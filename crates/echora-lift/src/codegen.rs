@@ -1171,6 +1171,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Set while a lifted function is emitted.
     static IN_FUNCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::transitive_summaries` of the emission on this thread.
+    static TRANSITIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The blocks a block that may defer its charge reaches by a constant
@@ -1849,6 +1851,7 @@ impl RegisterLocals {
                         callee: fields[1].to_owned(),
                         touched: number(fields[2]),
                         writes: number(fields[3]),
+                        propagate: fields[4] == "1",
                     };
                 }
                 if let Some((rest, call)) = CALL_PREFIXES.iter().find_map(|(prefix, call)| {
@@ -1983,6 +1986,7 @@ impl RegisterLocals {
                     callee,
                     touched,
                     writes,
+                    propagate,
                 } => {
                     // A leaf with a summary: only the dirty locals it may
                     // read or write are stored, and only those it may
@@ -1995,10 +1999,17 @@ impl RegisterLocals {
                         let store = self.store_dirty(state & touched);
                         let reload_writes = self.reload_subset(*writes);
                         let store_held = self.store_dirty(held);
+                        let early = if *propagate {
+                            "return Ok(());".to_owned()
+                        } else {
+                            format!(
+                                "{store_held}let called = m.call({next:#x}); {reload}if let Err(trap) = called {{ return Err(trap); }}"
+                            )
+                        };
                         writeln!(
                             out,
                             "{indent}{store}let called = {callee}(m); {reload_writes}if let Err(trap) = called {{ return Err(trap); }} \
-                             if m.cpu.pc != {next:#x} {{ {store_held}let called = m.call({next:#x}); {reload}if let Err(trap) = called {{ return Err(trap); }} }}"
+                             if m.cpu.pc != {next:#x} {{ {early} }}"
                         )
                         .unwrap();
                     }
@@ -2124,6 +2135,12 @@ enum Kind {
         callee: String,
         touched: Dirty,
         writes: Dirty,
+        /// In a lifted function with transitive summaries: a callee's
+        /// early return returns from this function too (its final store
+        /// writes every local), for the caller to continue, instead of
+        /// running other code here while a caller further out holds
+        /// locals.
+        propagate: bool,
     },
     /// A helper reading general registers in the `Core`, and writing them
     /// with `reload`.
@@ -2469,7 +2486,8 @@ fn emit_instruction_body(
                         };
                         writeln!(
                             output,
-                            "                {SUMMARIZED_CALL}{next:#x}, {callee}, {touched:#x}, {writes:#x}) {{ return Err(trap); }}"
+                            "                {SUMMARIZED_CALL}{next:#x}, {callee}, {touched:#x}, {writes:#x}, {}) {{ return Err(trap); }}",
+                            u8::from(IN_FUNCTION.get() && TRANSITIVE.get())
                         )
                         .unwrap();
                     }
@@ -3898,15 +3916,27 @@ pub struct CallReport {
     pub leaves: usize,
     /// BL sites whose target is such a leaf.
     pub leaf_sites: usize,
+    /// Functions that call others with a transitive summary
+    /// (`transitive_summaries`, through the function table).
+    pub summarized_callers: usize,
+    /// BL sites whose target is such a function.
+    pub summarized_caller_sites: usize,
 }
 
 /// [`CallReport`] of a translation with `region_bits`-bit regions.
 pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
     let lifted = functions(translation, region_bits);
     let leaves = leaf_summaries(translation, &lifted);
+    let transitive = transitive_summaries(translation, &lifted, region_bits, true);
+    let callers: BTreeSet<u64> = transitive
+        .keys()
+        .filter(|entry| !leaves.contains_key(entry))
+        .copied()
+        .collect();
     let mut report = CallReport {
         functions: lifted.len(),
         leaves: leaves.len(),
+        summarized_callers: callers.len(),
         ..CallReport::default()
     };
     for record in translation.instructions.values() {
@@ -3915,6 +3945,7 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
             report.sites += 1;
             report.same_region += usize::from(same);
             report.leaf_sites += usize::from(leaves.contains_key(&target));
+            report.summarized_caller_sites += usize::from(callers.contains(&target));
             if lifted.contains_key(&target) {
                 report.function_entries += 1;
                 report.same_region_functions += usize::from(same);
@@ -3964,11 +3995,161 @@ pub fn leaf_summaries(
     summaries
 }
 
+/// With `EmitOptions::transitive_summaries`: effect summaries for lifted
+/// functions that call others. A function has one when every call in it
+/// is of a function that has one and that this call reaches as a function
+/// (`function_call`: its region, or any through the table), it is not a
+/// PLT stub, the function is on no cycle of calls (so direct calls nest a
+/// bounded depth), and it has no BLR: then its summary is its own effects
+/// and its callees', to a fixpoint. No other code runs while it does: an
+/// early return of a callee inside it returns from it too (a summarized
+/// call in a lifted function propagates it), up to the caller that holds
+/// nothing or continues through the window table.
+/// A function's own effects and calls (`transitive_summaries`), None where
+/// a call is not of a lifted function reached as one.
+type OwnEffects = Option<(Dirty, Dirty, Vec<u64>)>;
+
+pub fn transitive_summaries(
+    translation: &Translation,
+    lifted: &BTreeMap<u64, Vec<u64>>,
+    region_bits: u32,
+    table: bool,
+) -> BTreeMap<u64, (Dirty, Dirty)> {
+    use Instruction::*;
+    let by_start: BTreeMap<u64, &BasicBlock> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block))
+        .collect();
+    let stubs = plt_stubs(translation);
+    let bits = |regs: crate::defuse::Regs| -> Dirty {
+        Dirty::from(regs.gpr & 0x7fff_ffff)
+            | if regs.sp { DIRTY_SP } else { 0 }
+            | if regs.nzcv { DIRTY_NZCV } else { 0 }
+    };
+    // Own effects and calls; None where a call is not of a lifted function
+    // reached as one.
+    let mut own: BTreeMap<u64, OwnEffects> = BTreeMap::new();
+    for (&entry, starts) in lifted {
+        let (mut touched, mut writes, mut calls) = (0, 0, Vec::new());
+        let mut valid = true;
+        for start in starts {
+            for record in &by_start[start].instructions {
+                match record.instruction {
+                    Branch { target, link: true } => {
+                        let reached = lifted.contains_key(&target)
+                            && !stubs.contains_key(&target)
+                            && (table || target >> region_bits == record.pc >> region_bits);
+                        if reached {
+                            calls.push(target);
+                        } else {
+                            valid = false;
+                        }
+                    }
+                    BranchReg { link: true, .. } => valid = false,
+                    _ => {}
+                }
+                let effects = crate::defuse::effects(&record.instruction);
+                touched |= bits(effects.reads) | bits(effects.writes);
+                writes |= bits(effects.writes);
+            }
+        }
+        own.insert(entry, valid.then_some((touched, writes, calls)));
+    }
+    // Functions on a cycle of calls have none.
+    let mut on_cycle = BTreeSet::new();
+    let mut state: BTreeMap<u64, u8> = BTreeMap::new();
+    fn visit(
+        entry: u64,
+        own: &BTreeMap<u64, OwnEffects>,
+        state: &mut BTreeMap<u64, u8>,
+        stack: &mut Vec<u64>,
+        on_cycle: &mut BTreeSet<u64>,
+    ) {
+        state.insert(entry, 1);
+        stack.push(entry);
+        if let Some(Some((_, _, calls))) = own.get(&entry) {
+            for &callee in calls {
+                match state.get(&callee).copied().unwrap_or(0) {
+                    0 => visit(callee, own, state, stack, on_cycle),
+                    1 => {
+                        let from = stack
+                            .iter()
+                            .position(|&e| e == callee)
+                            .expect("on the stack");
+                        on_cycle.extend(stack[from..].iter().copied());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        stack.pop();
+        state.insert(entry, 2);
+    }
+    for &entry in own.keys() {
+        if !state.contains_key(&entry) {
+            visit(entry, &own, &mut state, &mut Vec::new(), &mut on_cycle);
+        }
+    }
+    let mut summaries: BTreeMap<u64, Option<(Dirty, Dirty)>> = own
+        .iter()
+        .map(|(&entry, effects)| {
+            let summary = effects
+                .as_ref()
+                .filter(|_| !on_cycle.contains(&entry))
+                .map(|(touched, writes, _)| (*touched, *writes));
+            (entry, summary)
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (&entry, effects) in &own {
+            let Some((_, _, calls)) = effects else {
+                continue;
+            };
+            let Some(mut summary) = summaries[&entry] else {
+                continue;
+            };
+            let mut valid = true;
+            for callee in calls {
+                match summaries.get(callee).copied().flatten() {
+                    Some((touched, writes)) => {
+                        summary.0 |= touched;
+                        summary.1 |= writes;
+                    }
+                    None => valid = false,
+                }
+            }
+            let next = valid.then_some(summary);
+            if next != summaries[&entry] {
+                summaries.insert(entry, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    summaries
+        .into_iter()
+        .filter_map(|(entry, summary)| Some((entry, summary?)))
+        .collect()
+}
+
 thread_local! {
     /// With `EmitOptions::call_summaries`: the leaf summaries
     /// (`leaf_summaries`) of the emission running on this thread.
     static SUMMARIES: std::cell::RefCell<Option<BTreeMap<u64, (Dirty, Dirty)>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Restores [`TRANSITIVE`] when it goes.
+struct TransitiveSummaries(bool);
+
+impl Drop for TransitiveSummaries {
+    fn drop(&mut self) {
+        TRANSITIVE.set(self.0);
+    }
 }
 
 /// Restores [`SUMMARIES`] when it goes.
@@ -4719,6 +4900,10 @@ pub struct EmitOptions {
     /// only those it may write (`leaf_summaries`); the rest stay in host
     /// locals across the call.
     pub call_summaries: bool,
+    /// With `call_summaries`: functions that call others get transitive
+    /// summaries too (`transitive_summaries`), and a summarized call in a
+    /// lifted function returns from it when the callee returns early.
+    pub transitive_summaries: bool,
     /// Runs of at least `FLOAT_RUN_MINIMUM` scalar single-precision
     /// operations (`float_runs_in`) run as plain host arithmetic, checked
     /// once at the end, with the per-operation emission as the fallback
@@ -5225,8 +5410,15 @@ pub fn emit_rust_split_to_with<E>(
             table: options.function_table,
         }
     })));
+    let _transitive = TransitiveSummaries(TRANSITIVE.replace(options.transitive_summaries));
     let _summaries = Summaries(SUMMARIES.replace(
-        (options.functions && options.call_summaries).then(|| leaf_summaries(translation, &lifted)),
+        (options.functions && options.call_summaries).then(|| {
+            if options.transitive_summaries {
+                transitive_summaries(translation, &lifted, region_bits, options.function_table)
+            } else {
+                leaf_summaries(translation, &lifted)
+            }
+        }),
     ));
     let header = if options.functions && options.function_table {
         header + FUNCTION_TABLE_HELPER

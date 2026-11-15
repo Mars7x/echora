@@ -21,6 +21,9 @@ function-table = []
 # With functions: calls of leaf functions store and reload only what the
 # leaf may touch (EmitOptions::call_summaries).
 call-summaries = []
+# With call-summaries: functions that call others get transitive summaries
+# (EmitOptions::transitive_summaries).
+transitive-summaries = []
 # Scalar single-precision runs as plain host arithmetic checked once
 # (EmitOptions::float_runs).
 float-runs = []

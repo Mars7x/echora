@@ -417,6 +417,29 @@ leave early, through a branch out of their region to code reading a
 register the caller held, and through an SVC; dropping the caller's store
 of held locals there fails it.
 
+Transitive summaries (`transitive-summaries`, with call summaries): a
+function that calls others gets a summary when every call in it is of a
+lifted function with one that the call reaches as a function (its region,
+or any through the table), none is a PLT stub, it has no BLR, and it is on
+no cycle of calls (so direct calls nest a bounded depth); the summary is
+its own effects and its callees', to a fixpoint (`transitive_summaries`).
+No other code runs while it does: in a lifted function a summarized call
+whose callee returns early returns from the function too (its final store
+writes every local), up to the caller that holds nothing (a call through
+`Core::call_window`, which continues through the window table) or the
+window, which stores what it holds and continues with `Core::call`. A
+trap, an SVC, a host boundary (a slice end, a preemption) or the budget
+in a summarized callee comes back as an error, on which every caller's
+final store writes its locals. Coverage: the call test programs' 3
+functions that call others get summaries (163 BL sites; with the 239 to
+leaves, all 402); the kernels' calls are to leaves. New `calls2` kernel
+(a call of a function that keeps a frame and calls both leaves; game set
+plus functions, function-table and call-summaries, two rounds, best):
++7.1%/+7.7% with transitive summaries. `tests/early_exits.rs` has two
+levels (window, function, leaf) where the leaf leaves early into code
+reading registers both callers held; without the propagation, or with
+summaries missing a callee's effects, it fails.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

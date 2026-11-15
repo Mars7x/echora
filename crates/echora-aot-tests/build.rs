@@ -45,6 +45,7 @@ fn options() -> EmitOptions {
         functions: std::env::var_os("CARGO_FEATURE_FUNCTIONS").is_some(),
         function_table: std::env::var_os("CARGO_FEATURE_FUNCTION_TABLE").is_some(),
         call_summaries: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES").is_some(),
+        transitive_summaries: std::env::var_os("CARGO_FEATURE_TRANSITIVE_SUMMARIES").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
         float_run_loads: std::env::var_os("CARGO_FEATURE_FLOAT_RUN_LOADS").is_some(),
         deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
@@ -111,6 +112,7 @@ fn split_programs(out: &mut String) {
     float_run_load_code(out);
     deferred_charge_code(out);
     early_exit_code(out);
+    two_level_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1248,12 +1250,13 @@ fn call_code(out: &mut String) {
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
     // As split windows, and with lifted functions in one 64 KiB region (as
     // the game's regions hold code), whose calls between them are direct.
-    for (name, functions, function_table, call_summaries) in [
-        ("call_code", false, false, false),
-        ("call_function_code", true, false, false),
-        ("call_function_table_code", true, true, false),
-        ("call_summary_code", true, false, true),
-        ("call_summary_table_code", true, true, true),
+    for (name, functions, function_table, call_summaries, transitive_summaries) in [
+        ("call_code", false, false, false, false),
+        ("call_function_code", true, false, false, false),
+        ("call_function_table_code", true, true, false, false),
+        ("call_summary_code", true, false, true, false),
+        ("call_summary_table_code", true, true, true, false),
+        ("call_transitive_code", true, true, true, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -1264,6 +1267,7 @@ fn call_code(out: &mut String) {
                     functions: true,
                     function_table,
                     call_summaries,
+                    transitive_summaries,
                     ..options()
                 },
             )
@@ -2408,6 +2412,99 @@ fn early_exit_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "/// Calls of leaves with an effect summary.\npub const SUMMARIZED_CALLS: usize = {summarized};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Two levels of summarized calls for `tests/early_exits.rs`: window A
+/// writes X4 and X8 and calls function C, which saves X29/X30, writes X7,
+/// calls leaf D, adds X7 to X1, restores X29/X30 and returns; D adds X8 to
+/// X1 (only D reads X8: A stores it because C's summary includes D's), adds
+/// one, and with X5 nonzero branches out of its region to code that adds X4
+/// (held by A) and X7 (held by C) to X2 and returns into C. Lifted with
+/// transitive summaries, directly (`two_level_code`) and through the
+/// table (`two_level_table_code`).
+fn two_level_code(out: &mut String) {
+    const BASE: u64 = 0x180_0000 + 0x40_0000;
+    let (c, d, far) = (BASE + 0x400, BASE + 0x800, BASE + 0x1_0000);
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let branch = |from: u64, to: u64| {
+        0x1400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0x1_0400 / 4];
+    let mut place = |address: u64, program: &[u32]| {
+        let at = ((address - BASE) / 4) as usize;
+        words[at..at + program.len()].copy_from_slice(program);
+    };
+    place(
+        BASE,
+        &[
+            0xd280_00e4, // movz x4, #7
+            0xd280_0068, // movz x8, #3
+            bl(BASE + 8, c),
+            0x8b01_0086, // add x6, x4, x1
+            0xd400_00e1, // svc #7
+        ],
+    );
+    place(
+        c,
+        &[
+            0xa9bf_7bfd, // stp x29, x30, [sp, #-16]!
+            0xd280_00a7, // movz x7, #5
+            bl(c + 8, d),
+            0x8b07_0021, // add x1, x1, x7
+            0xa8c1_7bfd, // ldp x29, x30, [sp], #16
+            0xd65f_03c0, // ret
+        ],
+    );
+    place(
+        d,
+        &[
+            0x8b08_0021,         // add x1, x1, x8
+            0x9100_0421,         // add x1, x1, #1
+            0xb500_0045,         // cbnz x5, +8
+            0xd65f_03c0,         // ret
+            branch(d + 16, far), // b far
+        ],
+    );
+    place(far, &[0x8b04_0042, 0x8b07_0042, 0xd65f_03c0]); // add x2, x2, x4; add x2, x2, x7; ret
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "two levels".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &[BASE, far], words.len()).expect("two levels");
+    for (name, function_table) in [("two_level_code", false), ("two_level_table_code", true)] {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                functions: true,
+                function_table,
+                call_summaries: true,
+                transitive_summaries: true,
+                ..options()
+            },
+        );
+        let propagating = regions
+            .iter()
+            .map(|(_, source)| source.matches("{ return Ok(()); }").count())
+            .sum::<usize>();
+        let summarized = regions
+            .iter()
+            .map(|(_, source)| source.matches("if m.cpu.pc != 0x").count())
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "/// Summarized calls, and those that return early with their callee.\npub const SUMMARIZED_CALLS: usize = {summarized};\npub const PROPAGATING: usize = {propagating};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

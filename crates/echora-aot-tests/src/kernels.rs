@@ -35,10 +35,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("ldst", 0x2400),
     ("floats", 0x2800),
     ("floatld", 0x2c00),
+    ("calls2", 0x3000),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x3000;
+pub const KERNEL_SIZE: u64 = 0x3400;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -334,6 +335,26 @@ fn assemble() -> Assembler {
         ; b.ne <l1
         ; svc 7
         ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Calls two levels deep: each iteration calls a function that keeps
+        // a frame (X29/X30 on the stack) and calls both leaves. x0 =
+        // iterations; SP a stack.
+        ; ->calls2:
+        ; l1:
+        ; bl >mid
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+        ; mid:
+        ; stp x29, x30, [sp, -16]!
+        ; bl ->leaf_add
+        ; bl ->leaf_mix
+        ; ldp x29, x30, [sp], 16
+        ; ret
     );
     ops
 }

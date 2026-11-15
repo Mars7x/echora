@@ -708,14 +708,16 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     );
     let calls = echora_lift::codegen::call_report(&d.translation, region_bits);
     println!(
-        "BL sites: {}; same-region BL targets: {}; BL targets that are function entries: {} ({} in the caller's region); lifted functions: {} ({} leaves with effect summaries, {} BL sites to them)",
+        "BL sites: {}; same-region BL targets: {}; BL targets that are function entries: {} ({} in the caller's region); lifted functions: {} ({} leaves with effect summaries, {} BL sites to them; {} calling functions with transitive summaries, {} BL sites to them)",
         calls.sites,
         calls.same_region,
         calls.function_entries,
         calls.same_region_functions,
         calls.functions,
         calls.leaves,
-        calls.leaf_sites
+        calls.leaf_sites,
+        calls.summarized_callers,
+        calls.summarized_caller_sites
     );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
@@ -767,6 +769,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             "functions" => options.functions = true,
             "function-table" => options.function_table = true,
             "call-summaries" => options.call_summaries = true,
+            "transitive-summaries" => options.transitive_summaries = true,
             "deferred-charges" => options.deferred_charges = true,
             "stub-windows" => options.stub_windows = true,
             "float-runs" => options.float_runs = true,
