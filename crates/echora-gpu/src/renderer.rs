@@ -246,6 +246,10 @@ impl Submitter {
 }
 
 pub struct Renderer {
+    /// The submission slot being recorded: its command buffer, fence,
+    /// ring, descriptor pool and what they hold until it completes (the
+    /// per-draw recording helpers work on it).
+    slot: Slot,
     pub gpu: Gpu,
     /// Held while the queue is used (submissions, presents).
     pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
@@ -272,8 +276,6 @@ pub struct Renderer {
     /// (`debug_buffer`).
     debug_buffers: Vec<HostBuffer>,
     pool: vk::CommandPool,
-    commands: vk::CommandBuffer,
-    fence: vk::Fence,
     recording: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     targets: FastMap<u64, Target>,
@@ -283,16 +285,10 @@ pub struct Renderer {
     /// copy once the image holds them (`has_upload`), and `with_texels`
     /// reads them back from the image when needed again.
     upload_lengths: FastMap<u64, u64>,
-    /// Uploads forgotten, and targets made again at another shape, while
-    /// recorded work may still use them: destroyed after the next flush.
-    retired_uploads: Vec<Target>,
     /// Texel buffers made from guest buffer textures (shaders read them as
     /// samplerBuffer), by upload key: the generation copied, the buffer and
     /// its view.
     texel_buffers: FastMap<u64, (u64, HostBuffer, vk::BufferView)>,
-    /// Texel buffers (and page tables) replaced while recorded work may
-    /// still read them; a page table has no view (null).
-    retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
     /// Debugging (ECHORA_LAST_SUBMIT / ECHORA_SLOW_SUBMITS files): what
     /// the current submission records, to find work that stalls the GPU.
     labels: Vec<String>,
@@ -331,9 +327,6 @@ pub struct Renderer {
     udmabuf: Option<Option<std::fs::File>>,
     /// Spans that could not be shared: not tried again.
     shared_refused: std::collections::HashSet<(u64, u64)>,
-    /// Shared spans dropped while recorded work may still read them:
-    /// destroyed after the next flush.
-    retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Storage buffers kept on the GPU between dispatches (see
     /// `resident_buffer`), by the caller's key: buffer, memory, size.
     resident: FastMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
@@ -342,21 +335,8 @@ pub struct Renderer {
     view_infos: FastMap<vk::ImageView, ViewInfo>,
     /// Targets created since the caller last took them (to initialize).
     fresh_targets: Vec<u64>,
-    /// Host-visible ring for per-draw data, reset after each flush.
-    ring: HostBuffer,
-    ring_used: u64,
-    descriptor_pool: vk::DescriptorPool,
-    /// Descriptor sets, and descriptors of each pooled type (uniform
-    /// buffer, combined image sampler, storage buffer, storage image),
-    /// allocated since the pool was last reset.
-    sets_used: u32,
-    descriptors_used: [u32; 4],
     /// Submissions that waited for the GPU, and the microseconds waited.
     pub flushes: u64,
-    /// Ring ranges (token, offset, length) a dispatch wrote, copied out at
-    /// the next flush into `completed_reads` (dispatch results come back
-    /// when the work is next waited for, not one wait per dispatch).
-    pending_reads: Vec<(u64, u64, usize)>,
     /// The rendering pass left open after a draw (color views, depth view,
     /// render area): the next draw into the same attachments continues it
     /// instead of storing and loading them again. Any other recording
@@ -368,17 +348,9 @@ pub struct Renderer {
     /// their work runs on the GPU, the CPU records into the current one
     /// (see `flush_async`).
     spares: Vec<Slot>,
-    /// The recorded slot's markers (`mark`); live markers by id (event,
-    /// batch serial); events free for reuse; the next marker id.
-    current_markers: Vec<u64>,
     markers: FastMap<u64, (vk::Event, u64)>,
     free_events: Vec<vk::Event>,
     next_marker: u64,
-    /// The recorded slot's previous submission has not been waited for.
-    current_in_flight: bool,
-    /// Serial (`flushes` at submission) of the recorded slot's last
-    /// submission, and the highest serial known to have completed.
-    current_serial: u64,
     completed_serial: u64,
     /// `completed_serial`, readable by other threads (a CPU wait answered
     /// without the NVN state lock).
@@ -464,6 +436,43 @@ struct Slot {
     serial: u64,
     /// Markers its commands set (`mark`), freed once it completes.
     markers: Vec<u64>,
+}
+
+impl Slot {
+    /// The offset for `size` bytes at `alignment` in this slot's ring, or
+    /// none when they would not fit (the slot is then sealed and the next
+    /// one takes them).
+    fn ring_place(&mut self, size: u64, alignment: u64) -> Option<u64> {
+        let offset = self.ring_used.next_multiple_of(alignment);
+        (offset + size <= RING_SIZE).then(|| {
+            self.ring_used = offset + size;
+            offset
+        })
+    }
+
+    /// Whether one more draw's `bytes` of ring uploads (at the 256-byte
+    /// uniform alignment) and one descriptor set with `descriptors` of each
+    /// pooled type fit this slot.
+    fn holds(&self, bytes: u64, descriptors: [u32; 4]) -> bool {
+        let capacity = [MAX_SETS * 8, MAX_SETS * 16, MAX_SETS * 4, MAX_SETS * 4];
+        let pool_full = self.sets_used + 1 > MAX_SETS
+            || (0..4).any(|kind| self.descriptors_used[kind] + descriptors[kind] > capacity[kind]);
+        !pool_full && self.ring_used.next_multiple_of(256) + bytes <= RING_SIZE
+    }
+
+    /// Count one descriptor set with `descriptors` of each pooled type.
+    fn count_set(&mut self, descriptors: [u32; 4]) {
+        self.sets_used += 1;
+        for (used, more) in self.descriptors_used.iter_mut().zip(descriptors) {
+            *used += more;
+        }
+    }
+
+    /// Read `length` ring bytes at `offset` back under `token` once this
+    /// slot's work has completed.
+    fn defer_read(&mut self, token: u64, offset: u64, length: usize) {
+        self.pending_reads.push((token, offset, length));
+    }
 }
 
 /// Submission slots: the CPU records into one while the GPU runs the
@@ -641,16 +650,12 @@ impl Renderer {
             pool,
             queue_lock,
             submitter,
-            commands,
-            fence,
             recording: false,
             memory_types,
             targets: FastMap::default(),
             uploads: FastMap::default(),
             upload_lengths: FastMap::default(),
-            retired_uploads: Vec::new(),
             texel_buffers: FastMap::default(),
-            retired_texel_buffers: Vec::new(),
             labels: Vec::new(),
             work_items: 0,
             samplers: FastMap::default(),
@@ -666,17 +671,10 @@ impl Renderer {
             #[cfg(target_os = "linux")]
             udmabuf: None,
             shared_refused: Default::default(),
-            retired_shared: Vec::new(),
             resident: FastMap::default(),
             view_infos: FastMap::default(),
             fresh_targets: Vec::new(),
-            ring: HostBuffer::empty(),
-            ring_used: 0,
-            descriptor_pool,
-            sets_used: 0,
-            descriptors_used: [0; 4],
             flushes: 0,
-            pending_reads: Vec::new(),
             open_pass: None,
             completed_reads: Vec::new(),
             next_read_token: 0,
@@ -692,12 +690,25 @@ impl Renderer {
             last_attachments: Vec::new(),
             hazard_barriers: 0,
             spares,
-            current_markers: Vec::new(),
+            slot: Slot {
+                commands,
+                fence,
+                ring: HostBuffer::empty(),
+                ring_used: 0,
+                descriptor_pool,
+                sets_used: 0,
+                descriptors_used: [0; 4],
+                pending_reads: Vec::new(),
+                retired_uploads: Vec::new(),
+                retired_texel_buffers: Vec::new(),
+                retired_shared: Vec::new(),
+                in_flight: false,
+                serial: 0,
+                markers: Vec::new(),
+            },
             markers: FastMap::default(),
             free_events: Vec::new(),
             next_marker: 1,
-            current_in_flight: false,
-            current_serial: 0,
             completed_serial: 0,
             completed_shared: Default::default(),
             hang: None,
@@ -723,7 +734,7 @@ impl Renderer {
         // Addressable, where the device allows: vertex fetch tables are
         // read through their device address.
         let addressable = renderer.gpu.buffer_device_address;
-        renderer.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
+        renderer.slot.ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
         for index in 0..renderer.spares.len() {
             let ring = renderer.host_buffer_with(RING_SIZE, usage, addressable)?;
             renderer.spares[index].ring = ring;
@@ -758,12 +769,12 @@ impl Renderer {
             if self.condition_active && self.condition_inside {
                 self.end_condition();
             }
-            let counting = self.occlusion_pass_ends(self.commands);
+            let counting = self.occlusion_pass_ends(self.slot.commands);
             self.open_pass = None;
             // SAFETY: recording, inside the pass begun by `begin_rendering`.
-            unsafe { self.gpu.device.cmd_end_rendering(self.commands) };
+            unsafe { self.gpu.device.cmd_end_rendering(self.slot.commands) };
             if counting {
-                self.occlusion_pass_ended(self.commands);
+                self.occlusion_pass_ended(self.slot.commands);
             }
         }
     }
@@ -775,11 +786,14 @@ impl Renderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             // SAFETY: the buffer is idle (its slot's last submission was
             // waited for before it became current again).
-            unsafe { self.device().begin_command_buffer(self.commands, &begin) }
-                .map_err(vk_error("vkBeginCommandBuffer"))?;
+            unsafe {
+                self.device()
+                    .begin_command_buffer(self.slot.commands, &begin)
+            }
+            .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
             if let Some(timer) = self.timer.as_mut() {
-                timer.begin(&self.gpu.device, self.commands, self.fence);
+                timer.begin(&self.gpu.device, self.slot.commands, self.slot.fence);
             }
             if self.spares.iter().any(|spare| spare.in_flight) {
                 // Other slots' batches may still run: this one starts after
@@ -795,7 +809,7 @@ impl Renderer {
                         .entry("stat: barriers in recording_commands")
                         .or_default() += 1;
                     self.gpu.device.cmd_pipeline_barrier(
-                        self.commands,
+                        self.slot.commands,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
@@ -805,9 +819,9 @@ impl Renderer {
                     )
                 };
             }
-            self.occlusion_after_begin(self.commands);
+            self.occlusion_after_begin(self.slot.commands);
         }
-        Ok(self.commands)
+        Ok(self.slot.commands)
     }
 
     /// Whether render conditions can be evaluated on the GPU
@@ -819,7 +833,7 @@ impl Renderer {
     /// The fences of the submission slots (they keep their handles when
     /// the slots swap).
     pub(crate) fn slot_fences(&self) -> [vk::Fence; SLOTS] {
-        let mut fences = [self.fence; SLOTS];
+        let mut fences = [self.slot.fence; SLOTS];
         for (slot, spare) in fences[1..].iter_mut().zip(&self.spares) {
             *slot = spare.fence;
         }
@@ -827,7 +841,7 @@ impl Renderer {
     }
 
     pub(crate) fn current_fence(&self) -> vk::Fence {
-        self.fence
+        self.slot.fence
     }
 
     /// Gate the draws and dispatches recorded from now on on the 32-bit
@@ -917,7 +931,7 @@ impl Renderer {
         if let Some(conditional) = self.gpu.conditional_rendering.as_ref() {
             // SAFETY: recording; conditional rendering is active, and this
             // is where it began (its pass still open, or outside any).
-            unsafe { (conditional.fp().cmd_end_conditional_rendering_ext)(self.commands) };
+            unsafe { (conditional.fp().cmd_end_conditional_rendering_ext)(self.slot.commands) };
         }
         self.condition_active = false;
     }
@@ -1049,7 +1063,8 @@ impl Renderer {
             // one, which is freed with this slot's submission (rewriting it
             // in place waited for all of that work, once per pool shared).
             if let Some((old, _)) = self.page_table.take() {
-                self.retired_texel_buffers
+                self.slot
+                    .retired_texel_buffers
                     .push((old, vk::BufferView::null()));
             }
             let buffer =
@@ -1102,7 +1117,10 @@ impl Renderer {
         while done < length {
             let piece = (length - done).min(PIECE);
             let (source, offset) = self.ring_alloc(piece, 16)?;
-            fill(done, self.ring.slice_mut(offset as usize, piece as usize));
+            fill(
+                done,
+                self.slot.ring.slice_mut(offset as usize, piece as usize),
+            );
             self.copy_to_resident(key, at + done, source, offset, piece)?;
             done += piece;
         }
@@ -1335,13 +1353,20 @@ impl Renderer {
         if size > RING_SIZE {
             return Err(format!("{size}-byte read exceeds the ring"));
         }
-        let mut offset = self.ring_used.next_multiple_of(alignment);
-        if offset + size > RING_SIZE {
-            self.flush()?;
-            offset = 0;
+        let offset = self.ring_place(size, alignment)?;
+        Ok((self.slot.ring.buffer, offset))
+    }
+
+    /// Where `size` bytes at `alignment` go in the recorded slot's ring,
+    /// sealing the slot (a flush) first when they would not fit.
+    fn ring_place(&mut self, size: u64, alignment: u64) -> Result<u64, String> {
+        if let Some(offset) = self.slot.ring_place(size, alignment) {
+            return Ok(offset);
         }
-        self.ring_used = offset + size;
-        Ok((self.ring.buffer, offset))
+        self.flush()?;
+        self.slot
+            .ring_place(size, alignment)
+            .ok_or_else(|| format!("{size} bytes do not fit an empty ring"))
     }
 
     pub(crate) fn ring_upload(
@@ -1353,14 +1378,9 @@ impl Renderer {
         if size > RING_SIZE {
             return Err(format!("{size}-byte upload exceeds the ring"));
         }
-        let mut offset = self.ring_used.next_multiple_of(alignment);
-        if offset + size > RING_SIZE {
-            self.flush()?;
-            offset = 0;
-        }
-        self.ring.write(offset as usize, bytes);
-        self.ring_used = offset + size;
-        Ok((self.ring.buffer, offset))
+        let offset = self.ring_place(size, alignment)?;
+        self.slot.ring.write(offset as usize, bytes);
+        Ok((self.slot.ring.buffer, offset))
     }
 
     /// `ring_upload` of `size` bytes that `fill` writes in place in the
@@ -1374,14 +1394,9 @@ impl Renderer {
         if size > RING_SIZE {
             return Err(format!("{size}-byte upload exceeds the ring"));
         }
-        let mut offset = self.ring_used.next_multiple_of(alignment);
-        if offset + size > RING_SIZE {
-            self.flush()?;
-            offset = 0;
-        }
-        fill(self.ring.slice_mut(offset as usize, size as usize))?;
-        self.ring_used = offset + size;
-        Ok((self.ring.buffer, offset))
+        let offset = self.ring_place(size, alignment)?;
+        fill(self.slot.ring.slice_mut(offset as usize, size as usize))?;
+        Ok((self.slot.ring.buffer, offset))
     }
 
     /// Make room, before recording one draw or dispatch, for `bytes` of
@@ -1396,16 +1411,10 @@ impl Renderer {
         if bytes > RING_SIZE {
             return Err(format!("{bytes} bytes of uploads exceed the ring"));
         }
-        let capacity = [MAX_SETS * 8, MAX_SETS * 16, MAX_SETS * 4, MAX_SETS * 4];
-        let pool_full = self.sets_used + 1 > MAX_SETS
-            || (0..4).any(|kind| self.descriptors_used[kind] + descriptors[kind] > capacity[kind]);
-        if pool_full || self.ring_used.next_multiple_of(256) + bytes > RING_SIZE {
+        if !self.slot.holds(bytes, descriptors) {
             self.flush_async()?;
         }
-        self.sets_used += 1;
-        for (used, more) in self.descriptors_used.iter_mut().zip(descriptors) {
-            *used += more;
-        }
+        self.slot.count_set(descriptors);
         Ok(())
     }
 
@@ -1417,14 +1426,14 @@ impl Renderer {
     pub(crate) fn defer_ring_read(&mut self, offset: u64, length: usize) -> u64 {
         let token = self.next_read_token;
         self.next_read_token += 1;
-        self.pending_reads.push((token, offset, length));
+        self.slot.defer_read(token, offset, length);
         token
     }
 
     /// Whether deferred reads wait for a flush.
     /// Whether deferred reads wait in either slot.
     pub fn reads_pending(&self) -> bool {
-        !self.pending_reads.is_empty()
+        !self.slot.pending_reads.is_empty()
             || self
                 .spares
                 .iter()
@@ -1443,9 +1452,9 @@ impl Renderer {
     }
 
     pub(crate) fn ring_read(&self, offset: u64, length: usize) -> Vec<u8> {
-        assert!(offset + length as u64 <= self.ring.size);
+        assert!(offset + length as u64 <= self.slot.ring.size);
         // SAFETY: in bounds of the mapped ring; the GPU work has completed.
-        unsafe { std::slice::from_raw_parts(self.ring.mapped.add(offset as usize), length) }
+        unsafe { std::slice::from_raw_parts(self.slot.ring.mapped.add(offset as usize), length) }
             .to_vec()
     }
 
@@ -1456,7 +1465,7 @@ impl Renderer {
     ) -> Result<vk::DescriptorSet, String> {
         let layouts = [layout];
         let info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
+            .descriptor_pool(self.slot.descriptor_pool)
             .set_layouts(&layouts);
         // SAFETY: the pool and layout are live.
         match unsafe { self.gpu.device.allocate_descriptor_sets(&info) } {
@@ -1993,7 +2002,7 @@ impl Renderer {
             {
                 reused = Some(old);
             } else {
-                self.retired_uploads.push(old);
+                self.slot.retired_uploads.push(old);
             }
         }
         // A guest texture's upload never needs more than this: a larger one
@@ -2035,7 +2044,8 @@ impl Renderer {
                 self.host_buffer(texels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
             staging.write(0, texels);
             let buffer = staging.buffer;
-            self.retired_texel_buffers
+            self.slot
+                .retired_texel_buffers
                 .push((staging, vk::BufferView::null()));
             (buffer, 0)
         } else {
@@ -2058,7 +2068,7 @@ impl Renderer {
         let commands = match self.commands() {
             Ok(commands) => commands,
             Err(error) => {
-                self.retired_uploads.push(target);
+                self.slot.retired_uploads.push(target);
                 return Err(error);
             }
         };
@@ -2389,7 +2399,7 @@ impl Renderer {
         }
         // Submitted: spare slots up to it can still be running (the
         // recorded one was waited for before it became current again).
-        if self.current_in_flight {
+        if self.slot.in_flight {
             self.finish_current()?;
         }
         for index in 0..self.spares.len() {
@@ -2442,7 +2452,7 @@ impl Renderer {
         let id = self.next_marker;
         self.next_marker += 1;
         self.markers.insert(id, (event, self.flushes + 1));
-        self.current_markers.push(id);
+        self.slot.markers.push(id);
         self.stat("stat: markers set", 1);
         Ok(Some(id))
     }
@@ -2485,7 +2495,7 @@ impl Renderer {
                 self.swap_with(index);
             }
         }
-        if self.current_in_flight && signaled(self, self.fence) {
+        if self.slot.in_flight && signaled(self, self.slot.fence) {
             self.finish_current()?;
         }
         Ok(())
@@ -2532,34 +2542,17 @@ impl Renderer {
 
     /// Exchange the recorded slot with spare `index`.
     fn swap_with(&mut self, index: usize) {
-        let spare = &mut self.spares[index];
-        std::mem::swap(&mut self.commands, &mut spare.commands);
-        std::mem::swap(&mut self.fence, &mut spare.fence);
-        std::mem::swap(&mut self.ring, &mut spare.ring);
-        std::mem::swap(&mut self.ring_used, &mut spare.ring_used);
-        std::mem::swap(&mut self.descriptor_pool, &mut spare.descriptor_pool);
-        std::mem::swap(&mut self.sets_used, &mut spare.sets_used);
-        std::mem::swap(&mut self.descriptors_used, &mut spare.descriptors_used);
-        std::mem::swap(&mut self.pending_reads, &mut spare.pending_reads);
-        std::mem::swap(&mut self.retired_uploads, &mut spare.retired_uploads);
-        std::mem::swap(
-            &mut self.retired_texel_buffers,
-            &mut spare.retired_texel_buffers,
-        );
-        std::mem::swap(&mut self.retired_shared, &mut spare.retired_shared);
-        std::mem::swap(&mut self.current_in_flight, &mut spare.in_flight);
-        std::mem::swap(&mut self.current_serial, &mut spare.serial);
-        std::mem::swap(&mut self.current_markers, &mut spare.markers);
+        std::mem::swap(&mut self.slot, &mut self.spares[index]);
     }
 
     /// End and submit the current slot's command buffer.
     fn submit_current(&mut self) -> Result<(), String> {
         self.end_pass();
         self.end_condition();
-        self.occlusion_before_submit(self.commands);
+        self.occlusion_before_submit(self.slot.commands);
         // Ring bytes the host reads back (storage a draw wrote) are made
         // visible to it once the submission completes.
-        if !self.pending_reads.is_empty() {
+        if !self.slot.pending_reads.is_empty() {
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -2570,7 +2563,7 @@ impl Renderer {
                     .entry("stat: barriers in submit_current")
                     .or_default() += 1;
                 self.gpu.device.cmd_pipeline_barrier(
-                    self.commands,
+                    self.slot.commands,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::HOST,
                     vk::DependencyFlags::empty(),
@@ -2582,7 +2575,7 @@ impl Renderer {
         }
         self.recording = false;
         self.flushes += 1;
-        self.current_serial = self.flushes;
+        self.slot.serial = self.flushes;
         self.work_items = 0;
         let labels = std::mem::take(&mut self.labels);
         // The one before stays beside it (`.prev`): with two submissions in
@@ -2626,7 +2619,7 @@ impl Renderer {
         }
         self.submitted_labels = labels;
         if let Some(timer) = &self.timer {
-            timer.end(&self.gpu.device, self.commands, self.fence);
+            timer.end(&self.gpu.device, self.slot.commands, self.slot.fence);
         }
         *self.stats.entry("stat: submissions").or_default() += 1;
         *self
@@ -2659,7 +2652,7 @@ impl Renderer {
         let start = std::time::Instant::now();
         let device = &self.gpu.device;
         // SAFETY: the buffer was begun.
-        unsafe { device.end_command_buffer(self.commands) }
+        unsafe { device.end_command_buffer(self.slot.commands) }
             .map_err(vk_error("vkEndCommandBuffer"))?;
         if let Some(submitter) = &self.submitter {
             if let Some(error) = submitter
@@ -2674,7 +2667,7 @@ impl Renderer {
                 .sender
                 .as_ref()
                 .ok_or("the submit thread has stopped")?
-                .send((self.commands, self.fence))
+                .send((self.slot.commands, self.slot.fence))
                 .map_err(|_| "the submit thread has stopped".to_string())?;
             *self
                 .stats
@@ -2687,7 +2680,7 @@ impl Renderer {
                 .submit_ns
                 .swap(0, std::sync::atomic::Ordering::Relaxed);
         } else {
-            let buffers = [self.commands];
+            let buffers = [self.slot.commands];
             let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
             let held = self
                 .queue_lock
@@ -2695,7 +2688,7 @@ impl Renderer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: the buffer was ended; the fence is unsignaled; the
             // queue is held.
-            unsafe { device.queue_submit(self.gpu.queue, &submit, self.fence) }
+            unsafe { device.queue_submit(self.gpu.queue, &submit, self.slot.fence) }
                 .map_err(vk_error("vkQueueSubmit"))?;
             drop(held);
             *self
@@ -2703,14 +2696,14 @@ impl Renderer {
                 .entry("stat: flush ns in vkQueueSubmit")
                 .or_default() += start.elapsed().as_nanos() as u64;
         }
-        self.current_in_flight = true;
+        self.slot.in_flight = true;
         Ok(())
     }
 
     /// Wait for the current slot's submission, then free what it retired,
     /// collect its deferred reads and make the slot ready to record.
     fn finish_current(&mut self) -> Result<(), String> {
-        if !self.current_in_flight {
+        if !self.slot.in_flight {
             return Ok(());
         }
         // A batch the submit thread failed to submit never signals.
@@ -2737,32 +2730,35 @@ impl Renderer {
         let mut reported = false;
         // SAFETY: as below.
         while let Err(vk::Result::TIMEOUT) =
-            unsafe { device.wait_for_fences(&[self.fence], true, limit) }
+            unsafe { device.wait_for_fences(&[self.slot.fence], true, limit) }
         {
             if !reported {
                 reported = true;
                 if let Some(hang) = &self.hang {
-                    hang.report(self.current_serial);
+                    hang.report(self.slot.serial);
                 }
             }
         }
         unsafe {
             device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .wait_for_fences(&[self.slot.fence], true, u64::MAX)
                 .map_err(vk_error("vkWaitForFences"))?;
             device
-                .reset_fences(&[self.fence])
+                .reset_fences(&[self.slot.fence])
                 .map_err(vk_error("vkResetFences"))?;
             device
-                .reset_command_buffer(self.commands, vk::CommandBufferResetFlags::empty())
+                .reset_command_buffer(self.slot.commands, vk::CommandBufferResetFlags::empty())
                 .map_err(vk_error("vkResetCommandBuffer"))?;
             device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+                .reset_descriptor_pool(
+                    self.slot.descriptor_pool,
+                    vk::DescriptorPoolResetFlags::empty(),
+                )
                 .map_err(vk_error("vkResetDescriptorPool"))?;
         }
-        self.current_in_flight = false;
+        self.slot.in_flight = false;
         // Its markers are passed: their events are reset for reuse.
-        for id in std::mem::take(&mut self.current_markers) {
+        for id in std::mem::take(&mut self.slot.markers) {
             if let Some((event, _)) = self.markers.remove(&id) {
                 // SAFETY: the batch that set it has completed.
                 if unsafe { self.gpu.device.reset_event(event) }.is_ok() {
@@ -2770,12 +2766,16 @@ impl Renderer {
                 }
             }
         }
-        self.completed_serial = self.completed_serial.max(self.current_serial);
+        self.completed_serial = self.completed_serial.max(self.slot.serial);
         self.completed_shared
             .store(self.completed_serial, std::sync::atomic::Ordering::Release);
         self.flush_wait_microseconds += wait_start.elapsed().as_micros() as u64;
         if let Some(timer) = self.timer.as_mut() {
-            timer.finished(&self.gpu.device, self.fence, self.flush_wait_microseconds);
+            timer.finished(
+                &self.gpu.device,
+                self.slot.fence,
+                self.flush_wait_microseconds,
+            );
         }
         // ECHORA_SLOW_SUBMITS_MS: the wait that counts as slow (1000).
         let slow = std::env::var("ECHORA_SLOW_SUBMITS_MS")
@@ -2800,13 +2800,13 @@ impl Renderer {
             }
         }
         // The work has completed: forgotten uploads can go.
-        for target in std::mem::take(&mut self.retired_uploads) {
+        for target in std::mem::take(&mut self.slot.retired_uploads) {
             self.destroy_target(target);
         }
-        for (buffer, view) in std::mem::take(&mut self.retired_texel_buffers) {
+        for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        for (buffer, memory) in std::mem::take(&mut self.retired_shared) {
+        for (buffer, memory) in std::mem::take(&mut self.slot.retired_shared) {
             // SAFETY: the work reading it has completed.
             unsafe {
                 self.gpu.device.destroy_buffer(buffer, None);
@@ -2815,13 +2815,13 @@ impl Renderer {
         }
         // Deferred results leave the ring before its next use overwrites
         // them.
-        for (token, offset, length) in std::mem::take(&mut self.pending_reads) {
+        for (token, offset, length) in std::mem::take(&mut self.slot.pending_reads) {
             let bytes = self.ring_read(offset, length);
             self.completed_reads.push((token, bytes));
         }
-        self.ring_used = 0;
-        self.sets_used = 0;
-        self.descriptors_used = [0; 4];
+        self.slot.ring_used = 0;
+        self.slot.sets_used = 0;
+        self.slot.descriptors_used = [0; 4];
         Ok(())
     }
 
@@ -2886,7 +2886,7 @@ impl Renderer {
         if let Some((_, old, old_view)) =
             self.texel_buffers.insert(*key, (*generation, buffer, view))
         {
-            self.retired_texel_buffers.push((old, old_view));
+            self.slot.retired_texel_buffers.push((old, old_view));
         }
         Ok(view)
     }
@@ -2972,7 +2972,7 @@ impl Renderer {
         while self.shared_bytes > MAX_SHARED_BYTES && self.shared.len() > 1 {
             let ((_, dropped), buffer, memory) = self.shared.remove(0);
             self.shared_bytes -= dropped;
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
         }
         Ok(Some((imported.0, offset - start)))
     }
@@ -3045,7 +3045,7 @@ impl Renderer {
         };
         let Some(address) = self.buffer_address(buffer) else {
             self.stat("stat: shared spans without a device address", 1);
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
             return Ok(None);
         };
         let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
@@ -3078,7 +3078,7 @@ impl Renderer {
     pub fn take_superseded(&mut self, count: usize) {
         let count = count.min(self.superseded.len());
         for (_, _, buffer, memory, _) in self.superseded.drain(..count) {
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
         }
         self.dropped_shared_span = false;
     }
@@ -3100,7 +3100,7 @@ impl Renderer {
             if start < offset || end < start + span {
                 self.dropped_shared_span = true;
             }
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
         }
         // Joined-away spans of the range keep old pages too: the table is
         // built whole before more work is recorded.
@@ -3110,7 +3110,7 @@ impl Renderer {
         self.superseded = kept;
         for (_, _, buffer, memory, _) in gone {
             self.dropped_shared_span = true;
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
         }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
             .into_iter()
@@ -3118,7 +3118,7 @@ impl Renderer {
         self.shared = kept;
         for ((_, span), buffer, memory) in dropped {
             self.shared_bytes -= span;
-            self.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((buffer, memory));
         }
         self.shared_refused
             .retain(|(start, span)| !(*start < end && offset < start + span));
@@ -3489,10 +3489,10 @@ impl Renderer {
             let flat = |shape: ImageShape| matches!(shape, ImageShape::D2 { layers: 1 });
             if (old.width, old.format) == (width, format) && flat(old.shape) && flat(shape) {
                 self.create_target_keeping(key, &old, height, levels)?;
-                self.retired_uploads.push(old);
+                self.slot.retired_uploads.push(old);
                 return Ok(&self.targets[&key]);
             }
-            self.retired_uploads.push(old);
+            self.slot.retired_uploads.push(old);
         }
         if !self.targets.contains_key(&key) {
             let scale = self.scale_for(key, width, height, shape);
@@ -3708,7 +3708,13 @@ impl Renderer {
                 words.get(2..4).map_or(label.clone(), |kind| kind.join(" "))
             })
             .unwrap_or_default();
-        timer.item(&self.gpu.device, self.commands, self.fence, &name, start);
+        timer.item(
+            &self.gpu.device,
+            self.slot.commands,
+            self.slot.fence,
+            &name,
+            start,
+        );
     }
 
     /// Debugging: name a piece of work in the current submission.
@@ -3765,12 +3771,12 @@ impl Renderer {
         vec![
             ("targets", self.targets.len()),
             ("uploads", self.uploads.len()),
-            ("retired uploads", self.retired_uploads.len()),
+            ("retired uploads", self.slot.retired_uploads.len()),
             ("samplers", self.samplers.len()),
             ("extra views", self.extra_views.len()),
             ("view infos", self.view_infos.len()),
             ("written", self.written.len()),
-            ("pending reads", self.pending_reads.len()),
+            ("pending reads", self.slot.pending_reads.len()),
             ("completed reads", self.completed_reads.len()),
             ("fresh targets", self.fresh_targets.len()),
         ]
@@ -4053,7 +4059,7 @@ impl Renderer {
         // What `to` held goes once the work recorded so far has run
         // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.targets.remove(&to) {
-            self.retired_uploads.push(replaced);
+            self.slot.retired_uploads.push(replaced);
         }
         self.targets.insert(to, target);
         self.fresh_targets.retain(|fresh| *fresh != from);
@@ -5255,7 +5261,7 @@ impl Renderer {
     pub fn forget_upload(&mut self, key: u64) {
         for key in [key, key ^ 1 << 63] {
             if let Some((_, target)) = self.uploads.remove(&key) {
-                self.retired_uploads.push(target);
+                self.slot.retired_uploads.push(target);
             }
             self.upload_lengths.remove(&key);
         }
@@ -5813,12 +5819,14 @@ impl Drop for Renderer {
                     .into_iter()
                     .map(|(_, _, buffer, memory, _)| (buffer, memory)),
             );
-        let retired = std::mem::take(&mut self.retired_shared).into_iter().chain(
-            self.spares
-                .iter_mut()
-                .flat_map(|spare| std::mem::take(&mut spare.retired_shared))
-                .collect::<Vec<_>>(),
-        );
+        let retired = std::mem::take(&mut self.slot.retired_shared)
+            .into_iter()
+            .chain(
+                self.spares
+                    .iter_mut()
+                    .flat_map(|spare| std::mem::take(&mut spare.retired_shared))
+                    .collect::<Vec<_>>(),
+            );
         for (buffer, memory) in shared.chain(retired) {
             // SAFETY: the flush above finished every use of the buffer.
             unsafe {
@@ -5832,16 +5840,16 @@ impl Drop for Renderer {
         for (_, (_, target)) in std::mem::take(&mut self.uploads) {
             self.destroy_target(target);
         }
-        for target in std::mem::take(&mut self.retired_uploads) {
+        for target in std::mem::take(&mut self.slot.retired_uploads) {
             self.destroy_target(target);
         }
         for (_, (_, buffer, view)) in std::mem::take(&mut self.texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        for (buffer, view) in std::mem::take(&mut self.retired_texel_buffers) {
+        for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        let ring = std::mem::replace(&mut self.ring, HostBuffer::empty());
+        let ring = std::mem::replace(&mut self.slot.ring, HostBuffer::empty());
         ring.destroy(&self.gpu.device);
         for index in 0..self.spares.len() {
             let ring = std::mem::replace(&mut self.spares[index].ring, HostBuffer::empty());
@@ -5858,14 +5866,14 @@ impl Drop for Renderer {
             }
             self.gpu
                 .device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
+                .destroy_descriptor_pool(self.slot.descriptor_pool, None);
             for spare in &self.spares {
                 self.gpu
                     .device
                     .destroy_descriptor_pool(spare.descriptor_pool, None);
                 self.gpu.device.destroy_fence(spare.fence, None);
             }
-            self.gpu.device.destroy_fence(self.fence, None);
+            self.gpu.device.destroy_fence(self.slot.fence, None);
             for (_, (event, _)) in std::mem::take(&mut self.markers) {
                 self.gpu.device.destroy_event(event, None);
             }
