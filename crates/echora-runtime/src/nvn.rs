@@ -4850,10 +4850,20 @@ impl Nvn {
                     };
                     for (index, value) in values.chunks(words).take(count).enumerate() {
                         let slot = command.x[2] + index as u64;
-                        let mut bind = command.clone();
-                        bind.name = intern(&format!("nvnCommandBuffer{single}"));
-                        bind.captured = Vec::new();
-                        bind.x = [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0];
+                        // Built directly: a clone would copy the whole
+                        // captured array per slot only to drop it.
+                        let mut bind = Command {
+                            name: match single {
+                                "BindTexture" => "nvnCommandBufferBindTexture",
+                                "BindImage" => "nvnCommandBufferBindImage",
+                                "BindUniformBuffer" => "nvnCommandBufferBindUniformBuffer",
+                                _ => "nvnCommandBufferBindStorageBuffer",
+                            },
+                            x: [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0],
+                            v: command.v,
+                            captured: Vec::new(),
+                            states: command.states.clone(),
+                        };
                         if words == 2 {
                             bind.x[4] = value[1];
                         }
