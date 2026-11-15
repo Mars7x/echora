@@ -479,11 +479,72 @@ after a call, fails them.
 Static counts on the aot-tests programs: 4,682 charges local, 125,959
 tagged (through the `Core`, with a store and reload around each: their
 blocks can trap after the charge). Kernels (game set vs game set plus
-steps-local, two rounds of seven runs, best): memset +66.7%/+79.7%, ldst
-+46.8%/+50.5%, calls -20.3%/-16.3%, arith -7.8%/-15.4%, switch
--13.7%/-6.8%, the rest within noise. The loops of untagged blocks gain; a
-call's tagged block pays the store and reload. A public way to set the
-block tag (an echora-guest change) would make tagged charges local too.
+steps-local, each kernel run alone, alternating, best of seven): memset
+2539 to 4124 Minstr/s (+62%), ldst 4435 to 5844 (+32%), calls2 flat, calls
+-2% to -4% (the full suite's runs showed -10% to -20%, mostly noise of
+the machine).
+
+The calls loss is not the syncs. At a window call the store before the
+tagged charge is the only extra instruction (LLVM drops the explicit one
+before the call, the charge having just synced the count); the callee
+loads the count on entry and stores it on leaving, as base's charges do.
+Testing the local first and charging through the `Core` only when it
+passes keeps that store (the relaxed load of the stop word lies between)
+and adds a second load: no gain. A public `Core::tag_block` (an
+echora-guest change, tried locally) makes the tagged fast path
+`*st += n` and the tag alone, the caller's code then matching base
+instruction for instruction, and calls measured the same: the rest is
+layout. Lifted functions are called through `WindowFn`, so passing the
+local to them would need a second entry per function; not done.
+
+## Vector float unary operations inlined (opt-in)
+
+`EmitOptions::inline_vector_unary` (`inline-vector-unary`, with
+`inline-vector`): vector FSQRT, FCVTZS/FCVTZU (to integers, toward zero),
+FRSQRTE, FRECPE and FRINT* (4S, 2S, 2D, and the scalar forms that exist)
+no longer call `vec_fp_unary` for the whole vector. Under the FPCR the
+helper accepts (round to nearest, no AH or FZ16; it traps otherwise, and so
+does the inlined code, through the helper), each lane runs natively when
+that is the helper's result and the helper raises nothing for it:
+
+- FSQRT: a positive normal or a zero.
+- FCVTZS/FCVTZU: a normal or a zero whose truncation fits the integer
+  (the helper raises IOC otherwise; it models no IXC for conversions).
+- FRINT*: a normal or a zero, with the host's rounding of the same
+  direction (ties to even, up, down, toward zero, ties away).
+- FRECPE: a normal whose reciprocal is normal (biased exponent below
+  2 * bias - 1): the 8-bit estimate from the top fraction bits, the
+  exponent 2 * bias - 1 - e, the sign kept.
+- FRSQRTE: a positive normal: the helper's table (its low bytes, a
+  384-byte constant in the emitted code) indexed by the exponent's parity
+  and top fraction bits, the exponent (3 * bias - 1 - e) / 2.
+
+Any other lane (NaN, infinity, denormal, negative square root, out of
+range conversion, an estimate with a denormal result) goes through the
+helper's scalar form alone, in Vd, which is written last; the helper
+raises what that lane raises (IOC, IDC, DZC, UFC), and FZ and DN apply as
+in the helper. No echora-guest change.
+
+`tests/vector_unary.rs` runs every form of every operation from V1 into V0
+and into V1 itself, from edge lanes and random bits, under FZ and DN on
+and off and random FPSR flags, against the same instructions lifted with
+the helper for every lane: vector registers, FPCR, FPSR and the trap must
+agree, also under a rounding mode the helpers trap on. FRECPE (positive and
+negative) and FRSQRTE are compared for every fraction of an even and an
+odd exponent. Letting a negative square root, 2^31 for FCVTZS, -1 for
+FCVTZU, a denormal-result FRECPE or a denormal FRINT through natively, or
+an off-by-one estimate, fails them.
+
+Kernels (game set vs game set plus `inline-vector-unary`, two rounds of
+seven runs, best): `convert` (FMUL, FCVTZS, FCVTZU) 80.8 to 363.3 and
+81.6 to 365.3 Minstr/s (+349%, +348%). `vnorm` (FMUL, FRSQRTE, FMUL,
+FRSQRTS, FMUL, FMUL), each binary alone, alternating, three times: 151 to
+278-286 Minstr/s (+84% to +89%); with the estimate computed from a
+correctly rounded square root instead of the table (exact as well) it was
+3% slower than the helper, the division and square root per lane costing
+more than the call. The other kernels have
+no such operation: memset (+88%, +89%) and switch (+32%, +29%) moved with
+code layout, the rest within noise.
 
 ## Options on some regions only
 

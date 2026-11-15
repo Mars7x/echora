@@ -36,10 +36,12 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("floats", 0x2800),
     ("floatld", 0x2c00),
     ("calls2", 0x3000),
+    ("vnorm", 0x3400),
+    ("convert", 0x3800),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x3400;
+pub const KERNEL_SIZE: u64 = 0x3c00;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -355,6 +357,60 @@ fn assemble() -> Assembler {
         ; bl ->leaf_mix
         ; ldp x29, x30, [sp], 16
         ; ret
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Normalises 4-lane vectors: x * (1 / sqrt(x * x)) with the
+        // estimate FRSQRTE refined once by FRSQRTS. x0 = repetitions,
+        // x1 = source, x2 = destination, x3 = vectors.
+        ; ->vnorm:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr q0, [x6], 16
+        ; fmul v1.s4, v0.s4, v0.s4
+        ; frsqrte v2.s4, v1.s4
+        ; fmul v3.s4, v2.s4, v2.s4
+        ; frsqrts v3.s4, v1.s4, v3.s4
+        ; fmul v2.s4, v2.s4, v3.s4
+        ; fmul v4.s4, v0.s4, v2.s4
+        ; str q4, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Scales 4-lane vectors by 1.5 and converts them to integers toward
+        // zero, signed and unsigned, summing both. x0 = repetitions, x1 =
+        // source, x2 = destination, x3 = vectors.
+        ; ->convert:
+        ; fmov s5, 1.5
+        ; dup v5.s4, v5.s[0]
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr q0, [x6], 16
+        ; fmul v1.s4, v0.s4, v5.s4
+        ; fcvtzs v2.s4, v1.s4
+        ; fcvtzu v3.s4, v1.s4
+        ; add v4.s4, v2.s4, v3.s4
+        ; str q4, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
     );
     ops
 }

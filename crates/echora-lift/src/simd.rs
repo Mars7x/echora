@@ -2427,6 +2427,129 @@ thread_local! {
     static WHOLE_VECTOR_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// `EmitOptions::inline_vector_unary` of the emission on this thread.
+    static INLINE_VECTOR_UNARY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets whether vector FSQRT, FCVTZS/FCVTZU (toward zero), FRSQRTE, FRECPE
+/// and FRINT* are inlined (`EmitOptions::inline_vector_unary`); returns
+/// the previous setting.
+pub(crate) fn set_inline_vector_unary(on: bool) -> bool {
+    INLINE_VECTOR_UNARY.replace(on)
+}
+
+/// FPRSqrtEstimate's table for inputs 128..512 (low bytes of the 9-bit
+/// estimates; the top bit is always set): the smallest b >= 512 with
+/// a * (b + 1)^2 >= 2^28, halved up, where a is the input made odd (below
+/// 256) or even (from 256) on the 9-bit scale.
+fn rsqrt_estimates() -> [u8; 384] {
+    std::array::from_fn(|index| {
+        let input = index as u64 + 128;
+        let a = if input < 256 {
+            input * 2 + 1
+        } else {
+            ((input >> 1) << 1) * 2 + 2
+        };
+        let mut b = 512u64;
+        while a * (b + 1) * (b + 1) < 1 << 28 {
+            b += 1;
+        }
+        b.div_ceil(2) as u8
+    })
+}
+
+/// One lane of an inlined vector FSQRT, FCVTZS/FCVTZU (toward zero, no
+/// fraction bits), FRSQRTE, FRECPE or FRINT*: `(native, raw)`, whether the
+/// host's `raw` (from the lane `x`, the float `f`) is the exact helper's
+/// result with no flag raised, or `None` for another operation. Every
+/// expression is defined for any lane (wrapping, in-range indices), as
+/// lanes that are not native compute it too.
+fn unary_lane(unary: VecFpUnaryOp, size: FpSize) -> Option<(String, String)> {
+    let (int, fraction, bias, mask): (&str, u32, u64, u64) = match size {
+        FpSize::S => ("u32", 23, 127, 0xff),
+        FpSize::D => ("u64", 52, 1023, 0x7ff),
+    };
+    Some(match unary {
+        // Square roots of positive normals are normal; of a zero, that
+        // zero. Neither raises anything (the helper models no IXC here).
+        VecFpUnaryOp::Sqrt => (
+            "usable(x) & ((x & sign == 0) | zero(x))".to_owned(),
+            "f.sqrt().to_bits()".to_owned(),
+        ),
+        VecFpUnaryOp::Round(rounding) => {
+            let function = match rounding {
+                Rounding::Nearest => "round_ties_even",
+                Rounding::Plus => "ceil",
+                Rounding::Minus => "floor",
+                Rounding::Zero => "trunc",
+                Rounding::Away => "round",
+            };
+            ("usable(x)".to_owned(), format!("f.{function}().to_bits()"))
+        }
+        // Toward zero: in range exactly when the truncated value fits (no
+        // IOC); a fraction raises nothing in the helper.
+        VecFpUnaryOp::ToSigned(Rounding::Zero) => match size {
+            FpSize::S => (
+                "usable(x) & (f >= -2147483648.0) & (f < 2147483648.0)".to_owned(),
+                "f as i32 as u32".to_owned(),
+            ),
+            FpSize::D => (
+                "usable(x) & (f >= -9223372036854775808.0) & (f < 9223372036854775808.0)"
+                    .to_owned(),
+                "f as i64 as u64".to_owned(),
+            ),
+        },
+        VecFpUnaryOp::ToUnsigned(Rounding::Zero) => match size {
+            FpSize::S => (
+                "usable(x) & (f > -1.0) & (f < 4294967296.0)".to_owned(),
+                "f as u32".to_owned(),
+            ),
+            FpSize::D => (
+                "usable(x) & (f > -1.0) & (f < 18446744073709551616.0)".to_owned(),
+                "f as u64".to_owned(),
+            ),
+        },
+        // FPRecipEstimate of a normal whose reciprocal is normal (biased
+        // exponent below 2 * bias - 1; above, the result is denormal, or
+        // under FZ zero with UFC): the 8-bit estimate of the top 8
+        // fraction bits, the exponent 2 * bias - 1 - e, the sign kept.
+        VecFpUnaryOp::RecipEstimate => {
+            let top = 2 * bias - 1;
+            (
+                format!("normal(x) & ((x >> {fraction}) & {mask:#x} < {top})"),
+                format!(
+                    "{{ let e = (x >> {fraction}) & {mask:#x}; let s = 256 | ((x >> {shift}) & 0xff) as u32;                      let estimate = ((1u32 << 19) / (2 * s + 1)).div_ceil(2) as {int};                      (x & sign) | ({top}{int}.wrapping_sub(e) << {fraction}) | ((estimate & 0xff) << {shift}) }}",
+                    shift = fraction - 8,
+                ),
+            )
+        }
+        // FPRSqrtEstimate of a positive normal: the 8-bit estimate of the
+        // exponent's parity and the top fraction bits (the helper's table,
+        // as the low bytes of `rsqrt_estimates`), the exponent
+        // (3 * bias - 1 - e) / 2.
+        VecFpUnaryOp::RSqrtEstimate => {
+            let top = 3 * bias - 1;
+            let table: String = rsqrt_estimates()
+                .iter()
+                .map(|byte| format!("\\x{byte:02x}"))
+                .collect();
+            (
+                "normal(x) & (x & sign == 0)".to_owned(),
+                format!(
+                    "{{ const ESTIMATES: [u8; 384] = *b\"{table}\"; let e = (x >> {fraction}) & {mask:#x}; \
+                     let s = if e & 1 == 0 {{ 256 | ((x >> {even}) & 0xff) }} else {{ 128 | ((x >> {odd}) & 0x7f) }}; \
+                     let estimate = ESTIMATES[(s - 128) as usize] as {int}; \
+                     ((({top}{int} - e) / 2) << {fraction}) | (estimate << {even}) }}",
+                    even = fraction - 8,
+                    odd = fraction - 7,
+                ),
+            )
+        }
+        _ => return None,
+    })
+}
+
 /// Sets whether inlined vector float operations check their operands and
 /// results a whole vector at a time (`EmitOptions::whole_vector_checks`);
 /// returns the previous setting.
@@ -2664,6 +2787,48 @@ fn vec_fp_arith(
 pub fn emit_inline(op: &SimdOp) -> Option<String> {
     let p = "echora_guest::simd";
     match *op {
+        // Vector FSQRT, FCVTZS/FCVTZU, FRSQRTE, FRECPE, FRINT* (with
+        // `EmitOptions::inline_vector_unary`): under the FPCR the helper
+        // accepts (where it never traps), each lane natively where that is
+        // the helper's result with no flag (`unary_lane`), any other lane
+        // through the helper's scalar form, in Vd (written last), so it
+        // alone raises what it raises.
+        SimdOp::VecFpUnary {
+            op: unary,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            fbits: 0,
+        } if INLINE_VECTOR_UNARY.get()
+            && (scalar || q || size == FpSize::S)
+            && unary_lane(unary, size).is_some() =>
+        {
+            let (native, raw) = unary_lane(unary, size)?;
+            let (float, int, width, kit) = float_kit(size);
+            let lanes = if scalar {
+                1
+            } else if q {
+                128 / width
+            } else {
+                64 / width
+            };
+            let call = emit_call(op)?;
+            let path = vec_fp_unary_path(unary);
+            Some(format!(
+                "{{ let n = m.cpu.vectors[{rn}]; {kit} \
+                 if {FP_MODE} {{ let mut out = 0u128; \
+                 for lane in 0..{lanes} {{ \
+                 let x = (n >> (lane * {width})) as {int}; let f = {float}::from_bits(x); let _ = f; \
+                 let raw: {int} = if {native} {{ {raw} }} else {{ \
+                 m.cpu.vectors[{rd}] = u128::from(x); \
+                 {p}::vec_fp_unary(&mut m.cpu, {p}::{path}, {p}::FpSize::{size:?}, false, true, {rd}, {rd}, 0)?; \
+                 m.cpu.vectors[{rd}] as {int} }}; \
+                 out |= u128::from(raw) << (lane * {width}); }} \
+                 m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
+            ))
+        }
         SimdOp::FpUnary {
             op: unary @ (FpUnaryOp::Abs | FpUnaryOp::Neg | FpUnaryOp::Mov),
             size,

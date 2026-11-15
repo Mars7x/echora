@@ -4939,6 +4939,12 @@ pub struct EmitOptions {
     /// operands and results a whole vector at a time
     /// (`crate::simd::set_whole_vector_checks`) instead of lane by lane.
     pub whole_vector_checks: bool,
+    /// With `inline_vector`: vector FSQRT, FCVTZS/FCVTZU (integer, toward
+    /// zero), FRSQRTE, FRECPE and FRINT* run natively per lane where the
+    /// lane gives the exact helper's result and flags
+    /// (`crate::simd::set_inline_vector_unary`); any other lane goes
+    /// through the helper alone (its scalar form), never the whole vector.
+    pub inline_vector_unary: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5155,6 +5161,15 @@ impl WholeVectorChecks {
 impl Drop for WholeVectorChecks {
     fn drop(&mut self) {
         crate::simd::set_whole_vector_checks(self.0);
+    }
+}
+
+/// Restores `crate::simd`'s inlined unary operations when it goes.
+struct InlineVectorUnary(bool);
+
+impl Drop for InlineVectorUnary {
+    fn drop(&mut self) {
+        crate::simd::set_inline_vector_unary(self.0);
     }
 }
 
@@ -5502,6 +5517,7 @@ struct RegionSettings {
     untagged_blocks: UntaggedBlocks,
     split_ticks: SplitTicks,
     whole_vector_checks: WholeVectorChecks,
+    inline_vector_unary: InlineVectorUnary,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5529,6 +5545,9 @@ impl RegionSettings {
             untagged_blocks: UntaggedBlocks::set(options.untagged_blocks),
             split_ticks: SplitTicks::set(options.split_ticks),
             whole_vector_checks: WholeVectorChecks::set(options.whole_vector_checks),
+            inline_vector_unary: InlineVectorUnary(crate::simd::set_inline_vector_unary(
+                options.inline_vector_unary,
+            )),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,

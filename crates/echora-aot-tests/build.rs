@@ -36,6 +36,7 @@ fn options() -> EmitOptions {
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED").is_some(),
         fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
         whole_vector_checks: std::env::var_os("CARGO_FEATURE_WHOLE_VECTOR_CHECKS").is_some(),
+        inline_vector_unary: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_UNARY").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -322,6 +323,7 @@ fn main() {
     // hashes of the default emission.
     flag_code(&mut out);
     fp_status_code(&mut out);
+    vector_unary_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -564,6 +566,104 @@ fn fp_status_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/vector_unary.rs`: vector FSQRT, FCVTZS/FCVTZU,
+/// FRECPE, FRSQRTE and FRINT* (4S, 2S, 2D, and the scalar forms that
+/// exist), one instruction from V1 into V0 (or V1 itself) and an SVC each.
+/// Lifted with `EmitOptions::inline_vector_unary` (`vector_unary_code`)
+/// and without (`vector_unary_reference`: the helper for every lane).
+fn vector_unary_code(out: &mut String) {
+    const BASE: u64 = 0x1c0_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    // (name, U, a, opcode, scalar form exists)
+    const OPS: &[(&str, u32, u32, u32, bool)] = &[
+        ("fsqrt", 1, 1, 0x1f, false),
+        ("fcvtzs", 0, 1, 0x1b, true),
+        ("fcvtzu", 1, 1, 0x1b, true),
+        ("frecpe", 0, 1, 0x1d, true),
+        ("frsqrte", 1, 1, 0x1d, true),
+        ("frintn", 0, 0, 0x18, false),
+        ("frintp", 0, 1, 0x18, false),
+        ("frintm", 0, 0, 0x19, false),
+        ("frintz", 0, 1, 0x19, false),
+        ("frinta", 1, 0, 0x18, false),
+    ];
+    // (form, Q, sz, scalar)
+    const FORMS: &[(&str, u32, u32, bool)] = &[
+        ("4s", 1, 0, false),
+        ("2s", 0, 0, false),
+        ("2d", 1, 1, false),
+        ("s", 0, 0, true),
+        ("d", 0, 1, true),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    // (name, form, entry, in place)
+    let mut programs: Vec<(String, String, u64, bool)> = Vec::new();
+    for &(name, u, a, opcode, has_scalar) in OPS {
+        for &(form, q, sz, scalar) in FORMS {
+            if scalar && !has_scalar {
+                continue;
+            }
+            for in_place in [false, true] {
+                let base = if scalar { 0x5e20_0800 } else { 0x0e20_0800 };
+                let rd = u32::from(in_place);
+                let word =
+                    base | q << 30 | u << 29 | (a << 1 | sz) << 22 | opcode << 12 | 1 << 5 | rd;
+                programs.push((
+                    name.to_owned(),
+                    form.to_owned(),
+                    BASE + 4 * words.len() as u64,
+                    in_place,
+                ));
+                words.push(word);
+                words.push(SVC_EXIT);
+            }
+        }
+    }
+    let entries: Vec<u64> = programs.iter().map(|program| program.2).collect();
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "vector_unary".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("vector_unary");
+    for (name, inline) in [
+        ("vector_unary_code", true),
+        ("vector_unary_reference", false),
+    ] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            inline_vector_unary: inline,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        // Inlined instructions: those with a lane fallback in the emission.
+        let inlined: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches(", false, true, ").count())
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "/// (operation, form, entry, Vd is Vn)").expect("write");
+        writeln!(
+            out,
+            "pub const PROGRAMS: &[(&str, &str, u64, bool)] = &{programs:#x?};"
+        )
+        .expect("write");
+        writeln!(out, "/// Instructions emitted with a native lane path.\npub const INLINED: usize = {inlined};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

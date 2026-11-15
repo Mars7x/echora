@@ -48,6 +48,9 @@ fused-flags = []
 # With inline-vector: check inlined vector float operations a whole
 # vector at a time (EmitOptions::whole_vector_checks).
 whole-vector-checks = []
+# With inline-vector: vector FSQRT, FCVTZS/FCVTZU, FRSQRTE, FRECPE and
+# FRINT* per lane natively where exact (EmitOptions::inline_vector_unary).
+inline-vector-unary = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access
