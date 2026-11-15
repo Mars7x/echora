@@ -1294,6 +1294,52 @@ fn call_code(out: &mut String) {
         }
         writeln!(out, "{root}\n}}").expect("write");
     }
+    // Mixed: every other 1 KiB region with functions, the table and
+    // (transitive) summaries, the others with the base options, so calls
+    // cross between regions with and without them both ways.
+    let listed: std::collections::BTreeSet<u64> = translation
+        .blocks
+        .iter()
+        .map(|block| block.start >> 10)
+        .filter(|region| region % 2 == 0)
+        .collect();
+    LIFTED.set(LIFTED.get() + translation.instructions.len());
+    let mut regions = Vec::new();
+    let root = echora_lift::codegen::emit_rust_split_to_regions(
+        &translation,
+        10,
+        options(),
+        EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            ..options()
+        },
+        &listed,
+        &mut |region, source| {
+            regions.push((region, source));
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .expect("no sink errors");
+    let functions = regions
+        .iter()
+        .map(|(_, source)| source.matches("pub fn run_function_").count())
+        .sum::<usize>();
+    let unlisted_functions = regions
+        .iter()
+        .filter(|(region, _)| !listed.contains(region))
+        .map(|(_, source)| {
+            source.matches("run_function_").count() + source.matches("function_at(").count()
+        })
+        .sum::<usize>();
+    writeln!(out, "pub mod call_mixed_code {{").expect("write");
+    writeln!(out, "/// Lifted functions, and mentions of functions in unlisted regions.\npub const FUNCTIONS: usize = {functions};\npub const UNLISTED_FUNCTIONS: usize = {unlisted_functions};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
 }
 
 /// Loop programs for `tests/loops.rs`: counted loops (X25) with a mid-loop
@@ -2540,13 +2586,14 @@ fn svc_wrapper_code(out: &mut String) {
     };
     let mut words = vec![0u32; 0x800 / 4];
     let program = [
-        0xd280_0003,           // movz x3, #0
-        0x9100_0463,           // L: add x3, x3, #1
-        bl(BASE + 8, wrapper), // bl wrapper
-        0x9100_0442,           // add x2, x2, #1
-        0xeb09_007f,           // cmp x3, x9
-        0x54ff_ff8b,           // b.lt L
-        0xd400_00e1,           // svc #7
+        0xd280_0003,            // movz x3, #0
+        0x9100_0463,            // L: add x3, x3, #1
+        0x9100_06d6,            // add x22, x22, #1 (callee-saved, in the call's block)
+        bl(BASE + 12, wrapper), // bl wrapper
+        0x9100_0442,            // add x2, x2, #1
+        0xeb09_007f,            // cmp x3, x9
+        0x54ff_ff6b,            // b.lt L
+        0xd400_00e1,            // svc #7
     ];
     words[..program.len()].copy_from_slice(&program);
     words[0x100..0x102].copy_from_slice(&[0xd400_06a1, 0xd65f_03c0]); // svc #0x35; ret

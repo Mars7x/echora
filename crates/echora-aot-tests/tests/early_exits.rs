@@ -144,8 +144,10 @@ fn an_svc_wrapper_s_return_finds_the_caller_s_link_register() {
     for dispatch in [svc_wrapper_code::dispatch, svc_wrapper_table_code::dispatch] {
         for count in [1, 3] {
             let regs = run_svc_wrapper(dispatch, count).unwrap();
-            // Every call returns to its caller: X2 counts the calls.
-            assert_eq!((regs[2], regs[3]), (count, count));
+            // Every call returns to its caller: X2 counts the calls, and
+            // X22, written in each call's own block, reaches the Core
+            // before the SVC goes to the host.
+            assert_eq!((regs[2], regs[3], regs[22]), (count, count, count));
         }
     }
 }

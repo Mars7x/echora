@@ -678,7 +678,8 @@ fn translation_dir(input: &std::path::Path, cache: &std::path::Path) -> Result<(
 }
 
 fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<PathBuf> {
-    use echora_lift::codegen::{EmitOptions, emit_rust_split_to_with};
+    use echora_lift::codegen::{EmitOptions, emit_rust_split_to_regions};
+    use std::collections::BTreeSet;
 
     if !(10..=24).contains(&region_bits) {
         bail!("region-bits must be between 10 and 24");
@@ -745,47 +746,90 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     // docs/codegen-speed.md measured: vector code about 5x, scalar FP about
     // 2x); ECHORA_LIFT_OPTIONS, comma-separated, replaces them (with
     // structured among the choices, and `flat` for none).
-    let mut options = EmitOptions::default();
-    let chosen = std::env::var("ECHORA_LIFT_OPTIONS").unwrap_or_else(|_| {
-        "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs"
-            .into()
-    });
-    for option in chosen
-        .split(',')
-        .map(str::trim)
-        .filter(|option| !option.is_empty())
-    {
-        match option {
-            "structured" => options.structured = true,
-            "inline-vector" => options.inline_vector = true,
-            "fused-flags" => options.fused_flags = true,
-            "whole-vector-checks" => options.whole_vector_checks = true,
-            "fp-status-locals" => options.fp_status_locals = true,
-            "window-memory" => options.window_memory = true,
-            "dense-dispatch" => options.dense_dispatch = true,
-            "untagged-blocks" => options.untagged_blocks = true,
-            "split-ticks" => options.split_ticks = true,
-            "direct-calls" => options.direct_calls = true,
-            "functions" => options.functions = true,
-            "function-table" => options.function_table = true,
-            "call-summaries" => options.call_summaries = true,
-            "transitive-summaries" => options.transitive_summaries = true,
-            "deferred-charges" => options.deferred_charges = true,
-            "stub-windows" => options.stub_windows = true,
-            "float-runs" => options.float_runs = true,
-            "float-run-loads" => options.float_run_loads = true,
-            "flat" => {}
-            other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
+    // The default options (the set docs/codegen-speed.md measured).
+    const DEFAULT_OPTIONS: &str = "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs";
+    let apply = |options: &mut EmitOptions, list: &str| -> Result<()> {
+        for option in list
+            .split(',')
+            .map(str::trim)
+            .filter(|option| !option.is_empty())
+        {
+            match option {
+                "structured" => options.structured = true,
+                "inline-vector" => options.inline_vector = true,
+                "fused-flags" => options.fused_flags = true,
+                "whole-vector-checks" => options.whole_vector_checks = true,
+                "fp-status-locals" => options.fp_status_locals = true,
+                "window-memory" => options.window_memory = true,
+                "dense-dispatch" => options.dense_dispatch = true,
+                "untagged-blocks" => options.untagged_blocks = true,
+                "split-ticks" => options.split_ticks = true,
+                "direct-calls" => options.direct_calls = true,
+                "functions" => options.functions = true,
+                "function-table" => options.function_table = true,
+                "call-summaries" => options.call_summaries = true,
+                "transitive-summaries" => options.transitive_summaries = true,
+                "deferred-charges" => options.deferred_charges = true,
+                "stub-windows" => options.stub_windows = true,
+                "float-runs" => options.float_runs = true,
+                "float-run-loads" => options.float_run_loads = true,
+                "flat" => {}
+                other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
+            }
         }
+        Ok(())
+    };
+    // ECHORA_LIFT_OPTIONS_REGIONS: region ids as in the crate names
+    // (gen-r-<id>), comma-separated, as the value or in the file it names.
+    // Those regions get the defaults plus ECHORA_LIFT_OPTIONS; every other
+    // region the defaults alone, byte for byte as without the variable (so
+    // only the listed regions rebuild). Without it, ECHORA_LIFT_OPTIONS
+    // replaces the defaults for every region, as before.
+    let listed_regions: BTreeSet<u64> = match std::env::var("ECHORA_LIFT_OPTIONS_REGIONS") {
+        Ok(value) => {
+            let text = if std::path::Path::new(value.trim()).is_file() {
+                std::fs::read_to_string(value.trim())
+                    .with_context(|| format!("read {}", value.trim()))?
+            } else {
+                value
+            };
+            text.split([',', '\n', ' '])
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| {
+                    u64::from_str_radix(id.trim_start_matches("gen-r-"), 16)
+                        .with_context(|| format!("region id {id:?} in ECHORA_LIFT_OPTIONS_REGIONS"))
+                })
+                .collect::<Result<_>>()?
+        }
+        Err(_) => BTreeSet::new(),
+    };
+    let mut options = EmitOptions::default();
+    let mut listed_options = EmitOptions::default();
+    let extra = std::env::var("ECHORA_LIFT_OPTIONS").ok();
+    if listed_regions.is_empty() {
+        apply(&mut options, extra.as_deref().unwrap_or(DEFAULT_OPTIONS))?;
+        listed_options = options;
+    } else {
+        apply(&mut options, DEFAULT_OPTIONS)?;
+        apply(&mut listed_options, DEFAULT_OPTIONS)?;
+        apply(&mut listed_options, extra.as_deref().unwrap_or(""))?;
+        println!(
+            "per-region options: {} regions (ECHORA_LIFT_OPTIONS_REGIONS) get the defaults plus {:?}; the others the defaults ({DEFAULT_OPTIONS})",
+            listed_regions.len(),
+            extra.as_deref().unwrap_or("")
+        );
     }
 
     let start = Instant::now();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
-    let root = emit_rust_split_to_with(
+    let root = emit_rust_split_to_regions(
         &d.translation,
         region_bits,
         options,
+        listed_options,
+        &listed_regions,
         &mut |region, source| {
             let dir = out.join("regions").join(format!("{region:x}"));
             let manifest = format!(
@@ -800,6 +844,22 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         },
     )?;
     let emit_time = start.elapsed();
+    if !listed_regions.is_empty() {
+        let emitted: BTreeSet<u64> = regions.iter().copied().collect();
+        let (present, missing): (Vec<u64>, Vec<u64>) = listed_regions
+            .iter()
+            .partition(|region| emitted.contains(region));
+        let names = |list: &[u64]| {
+            list.iter()
+                .map(|region| format!("gen-r-{region:x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        println!("regions with the listed options: {}", names(&present));
+        if !missing.is_empty() {
+            println!("listed regions that do not exist: {}", names(&missing));
+        }
+    }
 
     // Remove regions that no longer exist.
     if let Ok(entries) = std::fs::read_dir(out.join("regions")) {

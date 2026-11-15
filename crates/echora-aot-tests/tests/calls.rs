@@ -15,7 +15,8 @@ mod common;
 use common::*;
 use echora_aot_tests::{
     Core, Machine, READ, STATE_NORMAL, Trap, WRITE, call_code, call_function_code,
-    call_function_table_code, call_summary_code, call_summary_table_code, call_transitive_code,
+    call_function_table_code, call_mixed_code, call_summary_code, call_summary_table_code,
+    call_transitive_code,
 };
 use echora_lift::aarch64::{Instruction, decode};
 
@@ -216,6 +217,16 @@ fn lifted_functions_with_call_summaries_through_the_table_match_the_reference() 
 fn lifted_functions_with_transitive_summaries_match_the_reference() {
     call_transitive_code::install();
     check(call_transitive_code::dispatch);
+}
+
+/// Every other region with functions, the table and summaries, the others
+/// without: calls across in both directions.
+#[test]
+fn lifted_functions_in_some_regions_match_the_reference() {
+    const { assert!(call_mixed_code::FUNCTIONS > 0) };
+    const { assert!(call_mixed_code::UNLISTED_FUNCTIONS == 0) };
+    call_mixed_code::install();
+    check(call_mixed_code::dispatch);
 }
 
 fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {

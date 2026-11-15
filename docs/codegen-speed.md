@@ -453,6 +453,32 @@ resuming at the RET) stores the caller's X30 before the SVC trap reaches
 the host, so the cause there is not yet seen, and the rule removes such
 calls from summarized ones whatever it was.
 
+## Options on some regions only
+
+`ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in
+the crate names, `gen-r-<id>`, as the value or in the file it names): the
+listed regions get the default options plus `ECHORA_LIFT_OPTIONS`, every
+other region the defaults, byte for byte as without the variable, so a
+relift rebuilds only the listed crates. Without it `ECHORA_LIFT_OPTIONS`
+replaces the defaults everywhere, as before. The lift prints the listed
+regions it emitted with those options and any listed ids that match no
+region.
+
+`codegen::emit_rust_split_to_regions` runs the analyses (resume blocks,
+PLT stubs, liveness, structured trees, functions, summaries) once and
+switches each region's settings when its first window starts. Lifted
+functions exist only in regions whose options have `functions`: a BL in
+another region keeps `Core::call`, a BL to such a region's code from a
+region with functions is an ordinary call too (the function set holds
+only emitted functions), and the function table lists only emitted
+functions, installed only into regions that use it. A function gets a
+transitive summary only when its own region propagates early returns.
+With an empty list the emission is the single-option emission, byte for
+byte (the golden hashes do not move). `tests/calls.rs` lifts its callers
+with every other region holding functions, the table and transitive
+summaries and the rest without, so calls cross both ways, against the
+reference interpreter; the unlisted regions must name no function.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

@@ -1442,6 +1442,9 @@ fn emit_plt_stub(
     target: u64,
     link: bool,
 ) -> Option<Option<(u64, u64)>> {
+    if !PLT_ON.get() {
+        return None;
+    }
     PLT.with_borrow(|plt| {
         let (stub, direct) = plt.as_ref()?.site(from, target, link)?;
         if !link {
@@ -3854,7 +3857,7 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
 /// with its index in the function table, and the region bits; with
 /// `EmitOptions::function_table`, calls go through the table.
 struct FunctionSet {
-    entries: BTreeMap<u64, usize>,
+    entries: std::rc::Rc<BTreeMap<u64, usize>>,
     region_bits: u32,
     table: bool,
 }
@@ -4179,7 +4182,7 @@ pub fn transitive_summaries(
 thread_local! {
     /// With `EmitOptions::call_summaries`: the leaf summaries
     /// (`leaf_summaries`) of the emission running on this thread.
-    static SUMMARIES: std::cell::RefCell<Option<BTreeMap<u64, (Dirty, Dirty)>>> =
+    static SUMMARIES: std::cell::RefCell<Option<SummaryMap>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -4192,8 +4195,11 @@ impl Drop for TransitiveSummaries {
     }
 }
 
+/// Effect summaries by function entry, shared between regions.
+type SummaryMap = std::rc::Rc<BTreeMap<u64, (Dirty, Dirty)>>;
+
 /// Restores [`SUMMARIES`] when it goes.
-struct Summaries(Option<BTreeMap<u64, (Dirty, Dirty)>>);
+struct Summaries(Option<SummaryMap>);
 
 impl Drop for Summaries {
     fn drop(&mut self) {
@@ -5018,8 +5024,41 @@ impl DeferredCharges {
 impl Drop for DeferredCharges {
     fn drop(&mut self) {
         DEFERRED_CHARGES.set(self.0);
+    }
+}
+
+/// Clears the deferred charges' analyses (`RESUME`, `PENDING`) when it goes.
+struct DeferredAnalyses;
+
+impl Drop for DeferredAnalyses {
+    fn drop(&mut self) {
         RESUME.set(None);
         PENDING.set(None);
+    }
+}
+
+thread_local! {
+    /// Per region of a split emission: whether PLT stubs run inline
+    /// (`!EmitOptions::stub_windows`), BLs call windows directly
+    /// (`direct_calls`) and flag setters fuse (`fused_flags`), over the
+    /// analyses the emission set once.
+    static PLT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static DIRECT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static FUSED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Restores a thread-local flag when it goes.
+struct Flag(&'static std::thread::LocalKey<std::cell::Cell<bool>>, bool);
+
+impl Flag {
+    fn set(key: &'static std::thread::LocalKey<std::cell::Cell<bool>>, on: bool) -> Self {
+        Self(key, key.replace(on))
+    }
+}
+
+impl Drop for Flag {
+    fn drop(&mut self) {
+        self.0.set(self.1);
     }
 }
 
@@ -5095,6 +5134,9 @@ impl Drop for DirectCalls {
 /// (`EmitOptions::direct_calls`): `target`'s, when it is a block with a
 /// dispatch arm in `from`'s region.
 fn direct_call_window(from: u64, target: u64) -> Option<u64> {
+    if !DIRECT_ON.get() {
+        return None;
+    }
     DIRECT_CALLS.with_borrow(|calls| {
         let (entered, region_bits) = calls.as_ref()?;
         (entered.contains(&target) && target >> region_bits == from >> region_bits)
@@ -5223,6 +5265,9 @@ fn fusion(block: &BasicBlock) -> Option<(u64, u8)> {
         _ => false,
     };
     if !fusable || condition >= 14 {
+        return None;
+    }
+    if !FUSED_ON.get() {
         return None;
     }
     FUSED_FLAGS.with_borrow(|live| {
@@ -5357,12 +5402,107 @@ pub fn emit_rust_split_to_with<E>(
     options: EmitOptions,
     sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
 ) -> Result<String, E> {
+    emit_rust_split_to_regions(
+        translation,
+        region_bits,
+        options,
+        options,
+        &BTreeSet::new(),
+        sink,
+    )
+}
+
+/// The thread-local settings of one region's emission
+/// (`emit_rust_split_to_regions`): set when the region starts, restored
+/// when it goes.
+#[allow(dead_code)]
+struct RegionSettings {
+    inline_vector: InlineVector,
+    float_runs: FloatRuns,
+    float_run_loads: FloatRunLoads,
+    deferred_charges: DeferredCharges,
+    fp_status_locals: FpStatusLocals,
+    window_memory: WindowMemory,
+    dense_dispatch: DenseDispatch,
+    untagged_blocks: UntaggedBlocks,
+    split_ticks: SplitTicks,
+    whole_vector_checks: WholeVectorChecks,
+    plt: Flag,
+    direct: Flag,
+    fused: Flag,
+    functions: Functions,
+    transitive: TransitiveSummaries,
+    summaries: Summaries,
+}
+
+impl RegionSettings {
+    fn set(
+        options: EmitOptions,
+        region_bits: u32,
+        functions: &std::rc::Rc<BTreeMap<u64, usize>>,
+        summaries: &Option<SummaryMap>,
+    ) -> Self {
+        Self {
+            inline_vector: InlineVector::set(options.inline_vector),
+            float_runs: FloatRuns::set(options.float_runs),
+            float_run_loads: FloatRunLoads(FLOAT_RUN_LOADS.replace(options.float_run_loads)),
+            deferred_charges: DeferredCharges::set(options.deferred_charges && options.split_ticks),
+            fp_status_locals: FpStatusLocals::set(options.fp_status_locals),
+            window_memory: WindowMemory::set(options.window_memory),
+            dense_dispatch: DenseDispatch::set(options.dense_dispatch),
+            untagged_blocks: UntaggedBlocks::set(options.untagged_blocks),
+            split_ticks: SplitTicks::set(options.split_ticks),
+            whole_vector_checks: WholeVectorChecks::set(options.whole_vector_checks),
+            plt: Flag::set(&PLT_ON, !options.stub_windows),
+            direct: Flag::set(&DIRECT_ON, options.direct_calls),
+            fused: Flag::set(&FUSED_ON, options.fused_flags),
+            functions: Functions(FUNCTIONS.replace(options.functions.then(|| FunctionSet {
+                entries: functions.clone(),
+                region_bits,
+                table: options.function_table,
+            }))),
+            transitive: TransitiveSummaries(TRANSITIVE.replace(options.transitive_summaries)),
+            summaries: Summaries(
+                SUMMARIES.replace(
+                    (options.functions && options.call_summaries)
+                        .then(|| summaries.clone())
+                        .flatten(),
+                ),
+            ),
+        }
+    }
+}
+
+/// [`emit_rust_split_to_with`], with `listed` instead of `base` for the
+/// regions in `regions` (region indices, as in the crate names `gen-r-<x>`):
+/// options can be tried on some regions while the others keep `base`'s
+/// emission byte for byte. Analyses run once over the whole translation;
+/// lifted functions exist only in regions whose options have `functions`
+/// (so a BL elsewhere, or to a function of such a region from elsewhere,
+/// keeps `Core::call`, and the function table holds only emitted
+/// functions), and a function has a transitive summary only when its own
+/// region's options have `transitive_summaries`.
+pub fn emit_rust_split_to_regions<E>(
+    translation: &Translation,
+    region_bits: u32,
+    base: EmitOptions,
+    listed: EmitOptions,
+    regions: &BTreeSet<u64>,
+    sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
+) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
-    let _inline_vector = InlineVector::set(options.inline_vector);
-    let _float_runs = FloatRuns::set(options.float_runs);
-    let _float_run_loads = FloatRunLoads(FLOAT_RUN_LOADS.replace(options.float_run_loads));
-    let _deferred_charges = DeferredCharges::set(options.deferred_charges && options.split_ticks);
-    if DEFERRED_CHARGES.get() {
+    let options_of = |region: u64| {
+        if regions.contains(&region) {
+            listed
+        } else {
+            base
+        }
+    };
+    let used =
+        |pick: fn(&EmitOptions) -> bool| pick(&base) || (!regions.is_empty() && pick(&listed));
+    // Analyses some region's emission needs, set once.
+    let _deferred = DeferredAnalyses;
+    if used(|o| o.deferred_charges && o.split_ticks) {
         let resume = resume_blocks(translation);
         PENDING.set(Some(pending_reach(
             translation,
@@ -5371,24 +5511,13 @@ pub fn emit_rust_split_to_with<E>(
         )));
         RESUME.set(Some(resume));
     }
-    let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
-    let _window_memory = WindowMemory::set(options.window_memory);
-    let _dense_dispatch = DenseDispatch::set(options.dense_dispatch);
-    let _untagged_blocks = UntaggedBlocks::set(options.untagged_blocks);
-    let _split_ticks = SplitTicks::set(options.split_ticks);
-    let _plt = PltStubs::set((!options.stub_windows).then(|| Plt::of(translation, region_bits)));
+    let _plt = PltStubs::set(used(|o| !o.stub_windows).then(|| Plt::of(translation, region_bits)));
     let _direct_calls = DirectCalls::set(
-        options
-            .direct_calls
-            .then(|| (entered_blocks(translation), region_bits)),
+        used(|o| o.direct_calls).then(|| (entered_blocks(translation), region_bits)),
     );
-    let _whole_vector_checks = WholeVectorChecks::set(options.whole_vector_checks);
-    let _fused_flags = FusedFlags::set(
-        options
-            .fused_flags
-            .then(|| crate::liveness::live_out(translation)),
-    );
-    let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if options.structured {
+    let _fused_flags =
+        FusedFlags::set(used(|o| o.fused_flags).then(|| crate::liveness::live_out(translation)));
+    let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if used(|o| o.structured) {
         // Every block execution can resume at is an entry of its tree, so
         // the tree is the window's only copy of its code.
         crate::structure::analyze_windows_resuming(
@@ -5428,43 +5557,58 @@ pub fn emit_rust_split_to_with<E>(
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
          pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
     );
-    let header = format!(
+    let plain_header = format!(
         "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{{Core as Machine, Trap}};\n{AT_HELPER}"
     );
+    let header_of = |options: EmitOptions| {
+        if options.functions && options.function_table {
+            plain_header.clone() + FUNCTION_TABLE_HELPER
+        } else {
+            plain_header.clone()
+        }
+    };
     let finish_region = |_region: u64, source: String| unindent(&source);
     let mut current: Option<(u64, String)> = None;
-    // Lifted functions, emitted after their region's windows.
-    let lifted = if options.functions {
+    // Lifted functions, emitted after their region's windows: only those of
+    // regions whose options have them.
+    let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
         functions(translation, region_bits)
+            .into_iter()
+            .filter(|(entry, _)| options_of(entry >> region_bits).functions)
+            .collect()
     } else {
         BTreeMap::new()
     };
-    let _functions = Functions(FUNCTIONS.replace(options.functions.then(|| {
-        FunctionSet {
-            entries: lifted
-                .keys()
-                .enumerate()
-                .map(|(index, &entry)| (entry, index))
-                .collect(),
-            region_bits,
-            table: options.function_table,
-        }
-    })));
-    let _transitive = TransitiveSummaries(TRANSITIVE.replace(options.transitive_summaries));
-    let _summaries = Summaries(SUMMARIES.replace(
-        (options.functions && options.call_summaries).then(|| {
-            if options.transitive_summaries {
-                transitive_summaries(translation, &lifted, region_bits, options.function_table)
-            } else {
-                leaf_summaries(translation, &lifted)
+    let function_indices: std::rc::Rc<BTreeMap<u64, usize>> = std::rc::Rc::new(
+        lifted
+            .keys()
+            .enumerate()
+            .map(|(index, &entry)| (entry, index))
+            .collect(),
+    );
+    // Summaries: leaves' are their own; a transitive summary only for a
+    // function whose region propagates early returns.
+    let summaries = used(|o| o.functions && o.call_summaries).then(|| {
+        let mut summaries = leaf_summaries(translation, &lifted);
+        for options in [base, listed] {
+            if options.functions && options.call_summaries && options.transitive_summaries {
+                let own: BTreeMap<u64, Vec<u64>> = lifted
+                    .iter()
+                    .filter(|(entry, _)| options_of(*entry >> region_bits) == options)
+                    .map(|(entry, starts)| (*entry, starts.clone()))
+                    .collect();
+                let reached =
+                    transitive_summaries(translation, &lifted, region_bits, options.function_table);
+                summaries.extend(
+                    reached
+                        .into_iter()
+                        .filter(|(entry, _)| own.contains_key(entry)),
+                );
             }
-        }),
-    ));
-    let header = if options.functions && options.function_table {
-        header + FUNCTION_TABLE_HELPER
-    } else {
-        header
-    };
+        }
+        std::rc::Rc::new(summaries)
+    });
+    let mut settings: Option<RegionSettings> = None;
     let mut regions_seen: Vec<u64> = Vec::new();
     let by_start: BTreeMap<u64, &BasicBlock> = translation
         .blocks
@@ -5495,18 +5639,30 @@ pub fn emit_rust_split_to_with<E>(
                 region_functions(index, &mut source);
                 sink(index, finish_region(index, source))?;
             }
-            current = Some((region, header.clone()));
+            // The region's options: the previous region's settings go first,
+            // so each starts from the thread's own.
+            drop(settings.take());
+            settings = Some(RegionSettings::set(
+                options_of(region),
+                region_bits,
+                &function_indices,
+                &summaries,
+            ));
+            current = Some((region, header_of(options_of(region))));
         }
         let output = &mut current.as_mut().expect("region set above").1;
         // A window lies within one page, and page permissions change only in
         // SVCs, which leave the window: one execute check on entry covers
         // every block run before it returns.
         let mut cases = String::new();
-        let structured = trees.get(window).and_then(|analysis| {
-            let tree = analysis.structure.as_ref()?;
-            analysis.control_entries().next()?;
-            Some((analysis, tree))
-        });
+        let structured = trees
+            .get(window)
+            .filter(|_| options_of(region).structured)
+            .and_then(|analysis| {
+                let tree = analysis.structure.as_ref()?;
+                analysis.control_entries().next()?;
+                Some((analysis, tree))
+            });
         if let Some((analysis, tree)) = structured {
             // No boundary comes before a block that is not an entry, so
             // execution never resumes there and the tree needs no other
@@ -5623,6 +5779,7 @@ pub fn emit_rust_split_to_with<E>(
         region_functions(index, &mut source);
         sink(index, finish_region(index, source))?;
     }
+    drop(settings);
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
@@ -5635,8 +5792,9 @@ pub fn emit_rust_split_to_with<E>(
         .unwrap();
     }
     root.push_str("];\n");
-    if options.functions && options.function_table {
-        // The lifted functions by index, which every region gets a copy of.
+    if used(|o| o.functions && o.function_table) {
+        // The lifted functions by index, which every region using the table
+        // gets a copy of.
         root.push_str("\nstatic FUNCTION_TABLE: &[WindowFn] = &[\n");
         for &entry in lifted.keys() {
             writeln!(
@@ -5648,7 +5806,10 @@ pub fn emit_rust_split_to_with<E>(
         }
         root.push_str("];\n");
         let mut installs = String::new();
-        for region in &regions_seen {
+        for region in regions_seen.iter().filter(|region| {
+            let options = options_of(**region);
+            options.functions && options.function_table
+        }) {
             writeln!(
                 installs,
                 "    gen_r_{region:x}::install_functions(FUNCTION_TABLE);"
