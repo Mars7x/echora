@@ -465,8 +465,9 @@ is seen as soon as before; a tagged block's charge goes through the
 and reloaded after. The count goes to the `Core` before calls (summarized
 ones too), the exact checks, a host check, counter reads, spin hints and
 traces, comes back after calls, and goes back when the window's body
-returns (every trap, SVC and exit passes there). The arm-end host check is
-inline (`Core::finish_block` only when it fires). No echora-guest change.
+returns (every trap, SVC and exit passes there). `Core::finish_block` at
+an arm's end reads no step count (the charges take host boundaries), so it
+needs no store of the local. No echora-guest change.
 
 `tests/steps_local.rs` compares final registers and steps, every host
 boundary's PC and step count (the host check due at every step) and the

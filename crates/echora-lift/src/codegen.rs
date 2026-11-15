@@ -1450,13 +1450,19 @@ fn emit_plt_stub(
         if !link {
             writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
         }
-        writeln!(
-            output,
-            "                {}let ticked = m.tick_block_at({target:#x}, 4); {}if let Err(trap) = ticked {{ return Err(trap); }}",
-            steps_out(),
-            steps_in()
-        )
-        .unwrap();
+        if STEPS_LOCAL.get() {
+            writeln!(
+                output,
+                "                m.steps = *st; let ticked = m.tick_block_at({target:#x}, 4); *st = m.steps; if let Err(trap) = ticked {{ return Err(trap); }}"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                output,
+                "                if let Err(trap) = m.tick_block_at({target:#x}, 4) {{ return Err(trap); }}"
+            )
+            .unwrap();
+        }
         for record in &stub.body {
             emit_instruction_body(output, record, false, true);
         }
@@ -1969,13 +1975,9 @@ impl RegisterLocals {
                 Kind::Plain => {
                     if let Some(out) = out.as_deref_mut() {
                         // Core methods that read the step count.
-                        let reads_steps = [
-                            "m.finish_block()",
-                            "physical_counter_ticks",
-                            "m.spin_hint()",
-                            "m.trace_hit()",
-                        ];
-                        if reads_steps.iter().any(|text| line.contains(text)) {
+                        let reads_steps =
+                            ["physical_counter_ticks", "m.spin_hint()", "m.trace_hit()"];
+                        if STEPS_LOCAL.get() && reads_steps.iter().any(|text| line.contains(text)) {
                             out.push_str(indent);
                             out.push_str(steps_out());
                         }
@@ -4291,7 +4293,7 @@ fn emit_function(
     }
     if STEPS_LOCAL.get() && !deferred {
         output.push_str(
-            "}\nm.cpu.pc = next_pc;\nif *st >= m.host_check_at || (m.parallel && m.preempt.load(std::sync::atomic::Ordering::Relaxed)) { m.steps = *st; m.finish_block()?; }\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
+            "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
         );
     } else if deferred {
         output.push_str(
@@ -5842,10 +5844,11 @@ pub fn emit_rust_split_to_regions<E>(
         }
         if STEPS_LOCAL.get() && !DEFERRED_CHARGES.get() {
             // The local count goes back before anything after the window
-            // sees the steps; a host check is taken where the `Core`'s
-            // would be (`Core::finish_block`, called only then).
+            // sees the steps. `Core::finish_block` reads no step count
+            // (host checks are the charges' since split ticks), so it needs
+            // no store of the local before it.
             output.push_str(
-                "}\nm.cpu.pc = next_pc;\nif *st >= m.host_check_at || (m.parallel && m.preempt.load(std::sync::atomic::Ordering::Relaxed)) { m.steps = *st; m.finish_block()?; }\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
+                "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
             );
         } else if DEFERRED_CHARGES.get() {
             // The deferred blocks' instructions count before anything

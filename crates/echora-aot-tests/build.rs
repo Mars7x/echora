@@ -2264,7 +2264,7 @@ fn deferred_charge_code(out: &mut String) {
             split_ticks: true,
             deferred_charges,
             steps_local,
-            untagged_blocks: true,
+            untagged_blocks: steps_local,
             ..options()
         };
         let (root, regions) = split(&translation, options);
