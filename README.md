@@ -59,8 +59,8 @@ What doesn't work yet:
   it should be, the water is too red, and subtitles and the speaker's name
   are not drawn. Nothing past that scene has been reached.
 - Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, decoded on the GPU, averages about 56 pictures per second, and the
-  first 3D scene runs at about 12.
+  movie, decoded on the GPU, now plays at that full speed, but the first 3D
+  scene runs at about 14.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
@@ -157,13 +157,13 @@ The work has now moved on to speed. Much of the time went into waiting
 rather than working: the CPU and GPU took turns instead of running side by
 side, one lock serialised the game's threads, and the GPU stopped to drain
 its work far more often than the game asked it to. Removing those waits
-took the opening movie from about 28 to about 56 pictures per second and the
-first 3D scene from about 2 to about 12 frames per second, with the frames
-checked against earlier ones after each step.
+took the opening movie from about 28 to its full 60 pictures per second and
+the first 3D scene from about 2 to about 14 frames per second, with the
+frames checked against earlier ones after each step.
 
 The next step is the rest of the way to the console's 60 frames per
-second for the opening movie and that scene, mostly by making each of the
-game's draws cheaper to turn into Vulkan work. After that come the scene's
+second for that scene, by making each of the game's draws cheaper to turn
+into Vulkan work and the translated game code faster. After that come the scene's
 last faults and gameplay.
 
 ## Building
