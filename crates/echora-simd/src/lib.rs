@@ -1722,6 +1722,9 @@ pub fn vec_fp_lane_exact(
     b: u64,
     d: u64,
 ) -> Result<u64, Trap> {
+    if stats::enabled() {
+        stats::note_lane(op, size, a, b);
+    }
     let mut fp = Fp::new(cpu, size)?;
     Ok(vec_fp_lane(&mut fp, op, a, b, d))
 }
@@ -5167,10 +5170,28 @@ pub mod stats {
             FpSize::S => "S",
             FpSize::D => "D",
         };
-        let key = format!(
+        add(format!(
             "{helper} {op:?} {size} lanes {}: {reason}",
             lane_count(bits, q, scalar)
-        );
+        ));
+    }
+
+    /// One lane inlined vector code left to the exact helper
+    /// (`vec_fp_lane`): its operation and its operands' classes.
+    pub(super) fn note_lane(op: VecFpOp, size: FpSize, a: u64, b: u64) {
+        let (bits, size) = match size {
+            FpSize::S => (32, "S"),
+            FpSize::D => (64, "D"),
+        };
+        add(format!(
+            "vec_fp_lane {op:?} {size}: {} {}",
+            class(bits, a),
+            class(bits, b)
+        ));
+    }
+
+    /// Count `key`; every 100000th count rewrites the ECHORA_SIMD_STATS file.
+    fn add(key: String) {
         let mut counts = COUNTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
