@@ -1899,6 +1899,22 @@ impl Nvn {
     }
 
     /// Guest bytes at GPU address `address`, `size` long.
+    /// `gpu_bytes` into `bytes` (resized to `size`), reusing its storage.
+    fn gpu_bytes_into(
+        &self,
+        core: &Guest,
+        address: u64,
+        size: u64,
+        bytes: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let guest = self.gpu_to_guest(address, size)?;
+        bytes.clear();
+        bytes.resize(size as usize, 0);
+        core.memory
+            .read(guest, bytes)
+            .map_err(|trap| format!("reading GPU {address:#x}: {trap:?}"))
+    }
+
     fn gpu_bytes(&self, core: &Guest, address: u64, size: u64) -> Result<Vec<u8>, String> {
         let guest = self.gpu_to_guest(address, size)?;
         let mut bytes = vec![0u8; size as usize];
@@ -7263,11 +7279,12 @@ impl Nvn {
             return Ok(());
         }
         let keys_for_note = [keys.0, keys.1];
-        // Bindings, through the inferred map.
-        let mut uniforms = echora_gpu::FastMap::default();
-        let mut textures = echora_gpu::FastMap::default();
-        let mut storage = echora_gpu::FastMap::default();
-        let mut storage_in_place = echora_gpu::FastMap::default();
+        // Bindings, through the inferred map (in the maps the last draw
+        // left, emptied).
+        let mut uniforms = std::mem::take(&mut self.draw_scratch.uniforms);
+        let mut textures = std::mem::take(&mut self.draw_scratch.textures);
+        let mut storage = std::mem::take(&mut self.draw_scratch.storage);
+        let mut storage_in_place = std::mem::take(&mut self.draw_scratch.storage_in_place);
         // Copied storage buffers a stage writes: guest address and GPU
         // address, by (stage index, binding).
         let mut storage_written = HashMap::default();
@@ -7280,13 +7297,12 @@ impl Nvn {
         let mut binding_times = [std::time::Duration::ZERO; 5];
         let mut memo_hits = 0u64;
         let mut binding_lap: Option<(usize, std::time::Instant)> = None;
+        // Timed per binding only when profiling (a clock read per binding,
+        // thousands per frame).
+        let timing = super::debug_var_os("ECHORA_NVN_PROFILE").is_some();
         for (index, stage) in stages.iter().enumerate() {
             let nvn = slots[index];
             for descriptor in &stage.descriptors {
-                let now = std::time::Instant::now();
-                if let Some((kind, since)) = binding_lap {
-                    binding_times[kind] += now - since;
-                }
                 let kind = match descriptor.kind() {
                     DescriptorKind::UniformBuffer
                         if descriptor.index >= 3 && descriptor.index != 24 =>
@@ -7298,7 +7314,13 @@ impl Nvn {
                     DescriptorKind::Texture | DescriptorKind::TextureBuffer => 3,
                     _ => 4,
                 };
-                binding_lap = Some((kind, now));
+                if timing {
+                    let now = std::time::Instant::now();
+                    if let Some((kind, since)) = binding_lap {
+                        binding_times[kind] += now - since;
+                    }
+                    binding_lap = Some((kind, now));
+                }
                 match descriptor.kind() {
                     // Constant bank 24: root table 0 of the graphics
                     // pipeline (PushGraphicsConstants).
@@ -7337,7 +7359,8 @@ impl Nvn {
                         let address = bind.x[3];
                         self.resolve_gpu(core, address, size)?;
                         let started = std::time::Instant::now();
-                        let bytes = self.gpu_bytes(core, address, size)?;
+                        let mut bytes = self.draw_scratch.spare.pop().unwrap_or_default();
+                        self.gpu_bytes_into(core, address, size, &mut bytes)?;
                         uniform_time += started.elapsed();
                         uniform_bytes += bytes.len() as u64;
                         uniforms.insert((index, descriptor.binding), bytes);
@@ -9012,6 +9035,28 @@ impl Nvn {
                 eprintln!("draw dump {:016x}: {error}", keys.1);
             }
         }
+        // The binding maps and their byte buffers go back for the next draw.
+        let Draw {
+            mut uniforms,
+            mut textures,
+            mut storage,
+            mut storage_in_place,
+            ..
+        } = draw;
+        let scratch = &mut self.draw_scratch;
+        for (_, bytes) in uniforms.drain().chain(storage.drain()) {
+            if scratch.spare.len() < 64 {
+                scratch.spare.push(bytes);
+            }
+        }
+        textures.clear();
+        storage_in_place.clear();
+        (
+            scratch.uniforms,
+            scratch.textures,
+            scratch.storage,
+            scratch.storage_in_place,
+        ) = (uniforms, textures, storage, storage_in_place);
         if let Some((key, directory)) = snap.filter(|snap| Some(snap.0) == probe_target) {
             let sequence = self.sequence;
             let target = backend.renderer.existing_target(key).unwrap();
@@ -9192,6 +9237,17 @@ fn dense_sample(core: &Guest, base: u64, length: u64) -> u64 {
         sample = sample.rotate_left(7) ^ hash_bytes(&piece);
     }
     sample
+}
+
+/// A draw's binding maps and spare byte buffers between draws
+/// (`Nvn::draw_scratch`).
+#[derive(Debug, Default)]
+pub(super) struct DrawScratch {
+    uniforms: echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
+    storage: echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    storage_in_place: echora_gpu::FastMap<(usize, u32), (vk::Buffer, u64, u64)>,
+    spare: Vec<Vec<u8>>,
 }
 
 /// A memory pool mirrored in a device-local buffer while compute shaders
