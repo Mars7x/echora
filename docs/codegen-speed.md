@@ -366,6 +366,39 @@ different regions and its emission does not change: layout noise.
 `tests/calls.rs` runs its callers against the reference interpreter with
 functions in one region, directly and through the table.
 
+### Call summaries for leaf functions (opt-in)
+
+`EmitOptions::call_summaries` (`call-summaries`, with functions): a leaf
+function (no BL or BLR in it, so nothing else runs while it does) gets an
+effect summary from `crate::defuse` over all its instructions: the
+general registers, SP and NZCV it may read or write, and those it may
+write (`codegen::leaf_summaries`). A call of a leaf stores only the dirty
+locals it may read or write (a register it may write is stored too: the
+write may not happen, and the reload must find the caller's value), runs
+the leaf's host function directly (one frame: no other code can run in
+it, so no depth limit is needed), and reloads only what it may write; the
+caller's other locals stay in host registers. FPCR and FPSR are stored and
+reloaded as before.
+
+Exits: a trap, SVC, host boundary or the budget comes back as an error,
+on which the caller's final store writes every local it holds before the
+host sees the `Core`; a leaf that leaves before returning (its PC not the
+return address: a branch out of the function or region, BR) has the
+caller store everything it holds before continuing through the window
+table, so no other code ever sees a stale `Core`. Non-leaf callees keep
+the full store and reload; summarizing them needs every callee's
+summary and a guarantee that none returns early (else the callee's own
+fallback runs foreign code while the caller holds locals), a later step.
+
+Coverage: the kernels' two lifted functions are both leaves (2 of 2 BL
+sites); the call test programs have 5 leaves among 8 functions, 239 of
+402 BL sites. Calls kernel (64 KiB regions, game set, two rounds of seven
+runs, best): functions against window emission +11.5%/+22.6%, call
+summaries against functions +49.5%/+40.2% (974/997 against window
+emission's 585/580 Minstr/s, about 1.7x). `tests/calls.rs` runs its callers
+with summarized calls against the reference interpreter; a summary
+without a leaf's writes, or without its reads, fails it.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

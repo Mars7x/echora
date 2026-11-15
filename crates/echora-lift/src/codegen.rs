@@ -1665,6 +1665,24 @@ impl RegisterLocals {
         text
     }
 
+    /// `reload`, of only the locals in `which` (FPCR and FPSR as `reload`).
+    fn reload_subset(&self, which: Dirty) -> String {
+        let mut text = String::new();
+        for &index in &self.used {
+            if which & 1 << index != 0 {
+                write!(text, "r.x{index} = m.cpu.regs[{index}]; ").unwrap();
+            }
+        }
+        if self.sp_used && which & DIRTY_SP != 0 {
+            text.push_str("r.sp = m.cpu.sp; ");
+        }
+        if self.flags && which & DIRTY_NZCV != 0 {
+            text.push_str("r.fl.nzcv = m.cpu.nzcv; ");
+        }
+        text.push_str(&self.reload_fp_status());
+        text
+    }
+
     /// `store`, of only the locals in `dirty` (FPCR and FPSR as `store`).
     fn store_dirty(&self, dirty: Dirty) -> String {
         let mut text = String::new();
@@ -1740,6 +1758,23 @@ impl RegisterLocals {
                 None
             };
             let kind = kind.unwrap_or_else(|| {
+                if let Some(rest) = line.trim_start().strip_prefix(SUMMARIZED_CALL) {
+                    let fields: Vec<&str> = rest
+                        .split_once(") {")
+                        .expect("a summarized call")
+                        .0
+                        .split(", ")
+                        .collect();
+                    let number = |text: &str| {
+                        Dirty::from_str_radix(text.trim_start_matches("0x"), 16).expect("a number")
+                    };
+                    return Kind::Summarized {
+                        next: number(fields[0]),
+                        callee: fields[1].to_owned(),
+                        touched: number(fields[2]),
+                        writes: number(fields[3]),
+                    };
+                }
                 if let Some((rest, call)) = CALL_PREFIXES.iter().find_map(|(prefix, call)| {
                     Some((line.trim_start().strip_prefix(prefix)?, call))
                 }) {
@@ -1867,6 +1902,34 @@ impl RegisterLocals {
                         state &= !DIRTY_NZCV;
                     }
                 }
+                Kind::Summarized {
+                    next,
+                    callee,
+                    touched,
+                    writes,
+                } => {
+                    // A leaf with a summary: only the dirty locals it may
+                    // read or write are stored, and only those it may
+                    // write reloaded; the rest stay in host locals. A leaf
+                    // that leaves before returning (its PC not the return
+                    // address) gets the rest stored before anything else
+                    // runs, through the window table.
+                    let held = state & !touched;
+                    if let Some(out) = out.as_deref_mut() {
+                        let store = self.store_dirty(state & touched);
+                        let reload_writes = self.reload_subset(*writes);
+                        let store_held = self.store_dirty(held);
+                        writeln!(
+                            out,
+                            "{indent}{store}let called = {callee}(m); {reload_writes}if let Err(trap) = called {{ return Err(trap); }} \
+                             if m.cpu.pc != {next:#x} {{ {store_held}let called = m.call({next:#x}); {reload}if let Err(trap) = called {{ return Err(trap); }} }}"
+                        )
+                        .unwrap();
+                    }
+                    if top {
+                        state = held;
+                    }
+                }
                 Kind::Call(call, arguments) => {
                     // The callee runs on the Core: store before, reload
                     // after (also on its error path, so the final store
@@ -1960,6 +2023,10 @@ fn successors(rest: &str) -> Option<Vec<u64>> {
     Some(vec![hex(taken)?, hex(other)?])
 }
 
+/// The line a summarized call is emitted as (`emit_summarized_call`),
+/// which `RegisterLocals::rewrite` replaces.
+const SUMMARIZED_CALL: &str = "if let Err(trap) = m.call_summarized(";
+
 /// Guest state a window's locals may hold that the `Core` does not:
 /// general register n at bit n, SP and NZCV above.
 type Dirty = u64;
@@ -1973,6 +2040,15 @@ enum Kind {
     Flags,
     /// A call into other windows: the `Core` method and its arguments.
     Call(&'static str, String),
+    /// A call of a lifted leaf function with an effect summary
+    /// (`EmitOptions::call_summaries`): its return address, the callee,
+    /// and the locals it may read or write, and those it may write.
+    Summarized {
+        next: u64,
+        callee: String,
+        touched: Dirty,
+        writes: Dirty,
+    },
     /// A helper reading general registers in the `Core`, and writing them
     /// with `reload`.
     Helper {
@@ -2307,6 +2383,21 @@ fn emit_instruction_body(
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 match emit_plt_stub(output, pc, *target, true) {
                     Some(direct) => emit_call_predicted(output, next, direct),
+                    None if function_call(pc, *target).is_some()
+                        && let Some((touched, writes)) =
+                            SUMMARIES.with_borrow(|summaries| summaries.as_ref()?.get(target).copied()) =>
+                    {
+                        flush_pending(output);
+                        let callee = match function_call(pc, *target) {
+                            Some(Some(index)) => format!("function_at({index})"),
+                            _ => format!("run_function_{target:x}"),
+                        };
+                        writeln!(
+                            output,
+                            "                {SUMMARIZED_CALL}{next:#x}, {callee}, {touched:#x}, {writes:#x}) {{ return Err(trap); }}"
+                        )
+                        .unwrap();
+                    }
                     None if function_call(pc, *target).is_some() => {
                         flush_pending(output);
                         let callee = match function_call(pc, *target) {
@@ -3727,13 +3818,19 @@ pub struct CallReport {
     pub same_region_functions: usize,
     /// Lifted functions.
     pub functions: usize,
+    /// Of those, leaves with an effect summary (`leaf_summaries`).
+    pub leaves: usize,
+    /// BL sites whose target is such a leaf.
+    pub leaf_sites: usize,
 }
 
 /// [`CallReport`] of a translation with `region_bits`-bit regions.
 pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
     let lifted = functions(translation, region_bits);
+    let leaves = leaf_summaries(translation, &lifted);
     let mut report = CallReport {
         functions: lifted.len(),
+        leaves: leaves.len(),
         ..CallReport::default()
     };
     for record in translation.instructions.values() {
@@ -3741,6 +3838,7 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
             let same = target >> region_bits == record.pc >> region_bits;
             report.sites += 1;
             report.same_region += usize::from(same);
+            report.leaf_sites += usize::from(leaves.contains_key(&target));
             if lifted.contains_key(&target) {
                 report.function_entries += 1;
                 report.same_region_functions += usize::from(same);
@@ -3748,6 +3846,62 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
         }
     }
     report
+}
+
+/// The effect summaries of the lifted leaf functions (no BL or BLR in
+/// them, so nothing else runs while they do): by entry, the general
+/// registers, SP and NZCV they may read or write (`Dirty` bits), and those
+/// they may write, from `crate::defuse` over all their instructions.
+pub fn leaf_summaries(
+    translation: &Translation,
+    lifted: &BTreeMap<u64, Vec<u64>>,
+) -> BTreeMap<u64, (Dirty, Dirty)> {
+    let mut summaries = BTreeMap::new();
+    let by_start: BTreeMap<u64, &BasicBlock> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block))
+        .collect();
+    let bits = |regs: crate::defuse::Regs| -> Dirty {
+        Dirty::from(regs.gpr & 0x7fff_ffff)
+            | if regs.sp { DIRTY_SP } else { 0 }
+            | if regs.nzcv { DIRTY_NZCV } else { 0 }
+    };
+    'functions: for (&entry, starts) in lifted {
+        let (mut touched, mut writes): (Dirty, Dirty) = (0, 0);
+        for start in starts {
+            for record in &by_start[start].instructions {
+                if matches!(
+                    record.instruction,
+                    Instruction::Branch { link: true, .. }
+                        | Instruction::BranchReg { link: true, .. }
+                ) {
+                    continue 'functions;
+                }
+                let effects = crate::defuse::effects(&record.instruction);
+                touched |= bits(effects.reads) | bits(effects.writes);
+                writes |= bits(effects.writes);
+            }
+        }
+        summaries.insert(entry, (touched, writes));
+    }
+    summaries
+}
+
+thread_local! {
+    /// With `EmitOptions::call_summaries`: the leaf summaries
+    /// (`leaf_summaries`) of the emission running on this thread.
+    static SUMMARIES: std::cell::RefCell<Option<BTreeMap<u64, (Dirty, Dirty)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores [`SUMMARIES`] when it goes.
+struct Summaries(Option<BTreeMap<u64, (Dirty, Dirty)>>);
+
+impl Drop for Summaries {
+    fn drop(&mut self) {
+        SUMMARIES.set(self.0.take());
+    }
 }
 
 /// A lifted function's host function (`functions`): as a window's, over
@@ -4482,6 +4636,11 @@ pub struct EmitOptions {
     /// (filled by the root's `install`), instead of only those of the
     /// caller's region directly.
     pub function_table: bool,
+    /// With `functions`: a call of a leaf function (no BL or BLR in it)
+    /// stores only the dirty locals the leaf may read or write and reloads
+    /// only those it may write (`leaf_summaries`); the rest stay in host
+    /// locals across the call.
+    pub call_summaries: bool,
     /// Runs of at least `FLOAT_RUN_MINIMUM` scalar single-precision
     /// operations (`float_runs_in`) run as plain host arithmetic, checked
     /// once at the end, with the per-operation emission as the fallback
@@ -4981,6 +5140,9 @@ pub fn emit_rust_split_to_with<E>(
             table: options.function_table,
         }
     })));
+    let _summaries = Summaries(SUMMARIES.replace(
+        (options.functions && options.call_summaries).then(|| leaf_summaries(translation, &lifted)),
+    ));
     let header = if options.functions && options.function_table {
         header + FUNCTION_TABLE_HELPER
     } else {

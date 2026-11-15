@@ -44,6 +44,7 @@ fn options() -> EmitOptions {
         direct_calls: std::env::var_os("CARGO_FEATURE_DIRECT_CALLS").is_some(),
         functions: std::env::var_os("CARGO_FEATURE_FUNCTIONS").is_some(),
         function_table: std::env::var_os("CARGO_FEATURE_FUNCTION_TABLE").is_some(),
+        call_summaries: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES").is_some(),
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
         float_run_loads: std::env::var_os("CARGO_FEATURE_FLOAT_RUN_LOADS").is_some(),
         deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
@@ -1246,10 +1247,11 @@ fn call_code(out: &mut String) {
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
     // As split windows, and with lifted functions in one 64 KiB region (as
     // the game's regions hold code), whose calls between them are direct.
-    for (name, functions, function_table) in [
-        ("call_code", false, false),
-        ("call_function_code", true, false),
-        ("call_function_table_code", true, true),
+    for (name, functions, function_table, call_summaries) in [
+        ("call_code", false, false, false),
+        ("call_function_code", true, false, false),
+        ("call_function_table_code", true, true, false),
+        ("call_summary_code", true, false, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -1259,6 +1261,7 @@ fn call_code(out: &mut String) {
                 EmitOptions {
                     functions: true,
                     function_table,
+                    call_summaries,
                     ..options()
                 },
             )
@@ -1269,11 +1272,16 @@ fn call_code(out: &mut String) {
             .iter()
             .map(|(_, source)| source.matches("run_function_").count())
             .sum::<usize>();
+        let summarized = regions
+            .iter()
+            .map(|(_, source)| source.matches("if m.cpu.pc != 0x").count())
+            .sum::<usize>();
         writeln!(out, "pub mod {name} {{").expect("write");
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "pub const CALLERS: &[u64] = &{caller_addresses:#x?};").expect("write");
         writeln!(out, "/// Lifted functions and direct calls named in the emission.\npub const FUNCTION_NAMES: usize = {direct};").expect("write");
+        writeln!(out, "/// Calls of leaves with an effect summary.\npub const SUMMARIZED_CALLS: usize = {summarized};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

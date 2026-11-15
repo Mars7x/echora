@@ -15,7 +15,7 @@ mod common;
 use common::*;
 use echora_aot_tests::{
     Core, Machine, READ, STATE_NORMAL, Trap, WRITE, call_code, call_function_code,
-    call_function_table_code,
+    call_function_table_code, call_summary_code,
 };
 use echora_lift::aarch64::{Instruction, decode};
 
@@ -193,6 +193,14 @@ fn lifted_functions_match_the_reference() {
 fn lifted_functions_through_the_table_match_the_reference() {
     call_function_table_code::install();
     check(call_function_table_code::dispatch);
+}
+
+/// The same with calls of leaves storing and reloading only what their
+/// effect summaries say they may touch.
+#[test]
+fn lifted_functions_with_call_summaries_match_the_reference() {
+    const { assert!(call_summary_code::SUMMARIZED_CALLS > 0) };
+    check(call_summary_code::dispatch);
 }
 
 fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
