@@ -1139,7 +1139,6 @@ fn emit_instruction(
 /// the callee's PC, so this is not a `?` (those get the caller's PC stored
 /// on their error path).
 fn emit_call(output: &mut String, next: u64) {
-    flush_pending(output);
     writeln!(
         output,
         "                if let Err(trap) = m.call({next:#x}) {{ return Err(trap); }}"
@@ -1147,9 +1146,87 @@ fn emit_call(output: &mut String, next: u64) {
     .unwrap();
 }
 
+/// With `EmitOptions::deferred_charges`: whether the pending count may be
+/// nonzero where the block at `start` charges: a block that may defer its
+/// charge (`PENDING`) reaches it by a constant successor, or one in its
+/// window leaves by a computed one (every block of the window then
+/// flushes), or it is emitted in a lifted function (which flushes every
+/// charge). Elsewhere the count is zero: a window starts at zero, every
+/// charge that keeps its own resets it, and a call comes after its block's
+/// charge.
+fn pending_may_be_set(start: u64) -> bool {
+    IN_FUNCTION.get()
+        || PENDING.with_borrow(|pending| {
+            pending.as_ref().is_none_or(|(reached, windows)| {
+                reached.contains(&start) || windows.contains(&(start >> SPLIT_WINDOW_BITS))
+            })
+        })
+}
+
+thread_local! {
+    /// With `EmitOptions::deferred_charges`: the blocks a block that may
+    /// defer reaches by a constant successor, and the windows one leaves
+    /// from by a computed successor (`pending_may_be_set`).
+    static PENDING: std::cell::RefCell<Option<(BTreeSet<u64>, BTreeSet<u64>)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while a lifted function is emitted.
+    static IN_FUNCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The blocks a block that may defer its charge reaches by a constant
+/// successor, and the windows such a block leaves by a computed one. A
+/// block may defer unless it keeps its host boundary (in `resume` and not
+/// inlined) or calls or makes an SVC (a superset of the blocks that defer:
+/// the emitted check also sees traps and counter reads).
+fn pending_reach(
+    translation: &Translation,
+    resume: &BTreeSet<u64>,
+    inlined: &BTreeSet<u64>,
+) -> (BTreeSet<u64>, BTreeSet<u64>) {
+    use Instruction::*;
+    let (mut reached, mut windows) = (BTreeSet::new(), BTreeSet::new());
+    for block in &translation.blocks {
+        let calls_or_traps = block.instructions.iter().any(|record| {
+            matches!(
+                record.instruction,
+                Branch { link: true, .. } | BranchReg { link: true, .. } | Svc { .. }
+            )
+        });
+        if calls_or_traps || (resume.contains(&block.start) && !inlined.contains(&block.start)) {
+            continue;
+        }
+        let last = block
+            .instructions
+            .last()
+            .expect("blocks have an instruction");
+        let next = last.pc.wrapping_add(4);
+        match &last.instruction {
+            Branch {
+                target,
+                link: false,
+            } => {
+                reached.insert(*target);
+            }
+            BranchCond { target, .. }
+            | CompareBranch { target, .. }
+            | TestBranch { target, .. } => {
+                reached.insert(*target);
+                reached.insert(next);
+            }
+            instruction if instruction.ends_block() => {
+                windows.insert(block.start >> SPLIT_WINDOW_BITS);
+            }
+            _ => {
+                reached.insert(next);
+            }
+        }
+    }
+    (reached, windows)
+}
+
 /// With `EmitOptions::deferred_charges`: the deferred blocks' instructions
-/// added to the steps, where the `Core` must count them (a callee's checks,
-/// a charge's check).
+/// added to the steps, where the `Core` must count them (a charge's
+/// check).
 fn flush_pending(output: &mut String) {
     if DEFERRED_CHARGES.get() {
         output.push_str("                m.steps += *pending; *pending = 0;\n");
@@ -1165,7 +1242,6 @@ fn emit_call_predicted(output: &mut String, next: u64, direct: Option<(u64, u64)
         emit_call(output, next);
         return;
     };
-    flush_pending(output);
     writeln!(
         output,
         "                if {} == {predicted:#x} {{",
@@ -2387,7 +2463,6 @@ fn emit_instruction_body(
                         && let Some((touched, writes)) =
                             SUMMARIES.with_borrow(|summaries| summaries.as_ref()?.get(target).copied()) =>
                     {
-                        flush_pending(output);
                         let callee = match function_call(pc, *target) {
                             Some(Some(index)) => format!("function_at({index})"),
                             _ => format!("run_function_{target:x}"),
@@ -2399,7 +2474,6 @@ fn emit_instruction_body(
                         .unwrap();
                     }
                     None if function_call(pc, *target).is_some() => {
-                        flush_pending(output);
                         let callee = match function_call(pc, *target) {
                             Some(Some(index)) => {
                                 writeln!(output, "                let callee = function_at({index});").unwrap();
@@ -3553,7 +3627,9 @@ fn emit_block_body(
                 output.push_str(rest);
                 return;
             }
-            flush_pending(output);
+            if pending_may_be_set(block.start) {
+                flush_pending(output);
+            }
         }
         output.push_str(&format!(
             "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
@@ -3916,7 +3992,9 @@ fn emit_function(
     spin_heads: &BTreeSet<u64>,
 ) {
     let mut cases = String::new();
+    let outer = IN_FUNCTION.replace(true);
     emit_split_cases(&mut cases, blocks, inlined, spin_heads);
+    IN_FUNCTION.set(outer);
     cases.push_str("            _ => return Ok(()),\n");
     let locals = RegisterLocals::of(&cases);
     let deferred = DEFERRED_CHARGES.get();
@@ -4716,6 +4794,7 @@ impl Drop for DeferredCharges {
     fn drop(&mut self) {
         DEFERRED_CHARGES.set(self.0);
         RESUME.set(None);
+        PENDING.set(None);
     }
 }
 
@@ -5059,7 +5138,13 @@ pub fn emit_rust_split_to_with<E>(
     let _float_run_loads = FloatRunLoads(FLOAT_RUN_LOADS.replace(options.float_run_loads));
     let _deferred_charges = DeferredCharges::set(options.deferred_charges && options.split_ticks);
     if DEFERRED_CHARGES.get() {
-        RESUME.set(Some(resume_blocks(translation)));
+        let resume = resume_blocks(translation);
+        PENDING.set(Some(pending_reach(
+            translation,
+            &resume,
+            &inlined_blocks(translation),
+        )));
+        RESUME.set(Some(resume));
     }
     let _fp_status_locals = FpStatusLocals::set(options.fp_status_locals);
     let _window_memory = WindowMemory::set(options.window_memory);

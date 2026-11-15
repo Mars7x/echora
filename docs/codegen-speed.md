@@ -282,6 +282,16 @@ game set plus deferred-charges, two rounds of seven runs): memset
 checks registers and steps against per-block charging, with a host
 boundary at every step of the run.
 
+Flushes: a charge adds the pending count first only where a block that
+may defer reaches it by a constant successor, or one in its window leaves
+by a computed successor (then every block of the window does), or in a
+lifted function (every charge); calls never do, as they follow their
+block's charge. In game regions every charge and call used to flush
+(gen-r-710510: 2918 charges, 4485 flushes, 1184 deferred blocks), and the
+translated code took about 20% more samples in the forest; on the
+aot-tests programs the flushes fall from 127,032 to 9,849 (125,427
+charges, 1,741 deferred blocks).
+
 ## Lifted functions (design, opt-in prototype)
 
 Today a guest call (BL) stores the caller window's written locals, runs
