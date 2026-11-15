@@ -408,6 +408,10 @@ pub struct Nvn {
     /// only ones it can find unshared; thousands are live).
     #[serde(skip)]
     new_pools: Vec<u64>,
+    /// A draw's binding maps and spare byte buffers, kept between draws so
+    /// each draw does not allocate them anew.
+    #[serde(skip)]
+    draw_scratch: gpu::DrawScratch,
     /// `texture_storage` answers by texture, at an object generation.
     #[serde(skip)]
     /// `texture_storage_size` results, kept as `storage_memo` is.
