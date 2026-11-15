@@ -1464,19 +1464,33 @@ impl Renderer {
         layout: vk::DescriptorSetLayout,
     ) -> Result<vk::DescriptorSet, String> {
         let layouts = [layout];
-        let info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.slot.descriptor_pool)
-            .set_layouts(&layouts);
+        let info = |pool| {
+            vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts)
+        };
         // SAFETY: the pool and layout are live.
-        match unsafe { self.gpu.device.allocate_descriptor_sets(&info) } {
+        match unsafe {
+            self.gpu
+                .device
+                .allocate_descriptor_sets(&info(self.slot.descriptor_pool))
+        } {
             Ok(sets) => Ok(sets[0]),
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
                 // Sets already written stay valid until their work is done.
+                // The flush makes another slot the one recorded: the set
+                // comes from that slot's pool, not from the pool of the
+                // submission just sent (reset when that slot is reused,
+                // under work recorded now that still uses the set).
                 self.flush()?;
-                // SAFETY: as above, after the pool was reset by the flush.
-                unsafe { self.gpu.device.allocate_descriptor_sets(&info) }
-                    .map(|sets| sets[0])
-                    .map_err(vk_error("vkAllocateDescriptorSets"))
+                // SAFETY: as above, the recorded slot's pool after the flush.
+                unsafe {
+                    self.gpu
+                        .device
+                        .allocate_descriptor_sets(&info(self.slot.descriptor_pool))
+                }
+                .map(|sets| sets[0])
+                .map_err(vk_error("vkAllocateDescriptorSets"))
             }
             Err(error) => Err(format!("vkAllocateDescriptorSets: {error}")),
         }
