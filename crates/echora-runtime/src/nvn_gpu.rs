@@ -5016,19 +5016,21 @@ impl Nvn {
                 let waited_serial = backend
                     .page_table_write_serial
                     .min(backend.observable_serial);
-                crate::timeline::span(
-                    u64::MAX - 3,
-                    &format!(
-                        "page-table-wait serial {waited_serial} recorded {} completed {}",
-                        backend.renderer.recorded_serial(),
-                        backend
-                            .renderer
-                            .completed_handle()
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    ),
-                    started,
-                    started,
-                );
+                if crate::timeline::on() {
+                    crate::timeline::span(
+                        u64::MAX - 3,
+                        &format!(
+                            "page-table-wait serial {waited_serial} recorded {} completed {}",
+                            backend.renderer.recorded_serial(),
+                            backend
+                                .renderer
+                                .completed_handle()
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                        started,
+                        started,
+                    );
+                }
                 // A marker at the last signal the GPU has passed already
                 // covers what is waited for up to it.
                 let marked = backend.observable_marker.is_some_and(|marker| {
