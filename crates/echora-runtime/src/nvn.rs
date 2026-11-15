@@ -313,7 +313,10 @@ impl std::hash::Hasher for FastHasher {
     }
 
     fn finish(&self) -> u64 {
-        self.0
+        // The well-mixed high bits rotated down: the maps index buckets by
+        // the low bits, which a multiply leaves zero for aligned keys (64-
+        // byte aligned addresses used 64 of 4096 buckets).
+        self.0.rotate_left(26)
     }
 }
 
