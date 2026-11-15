@@ -2844,7 +2844,7 @@ impl Machine {
             machine: std::sync::Mutex::new(&mut *self),
             wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
             nvn,
-            nvn_waiters: std::sync::atomic::AtomicUsize::new(0),
+            nvn_waiters: &crate::nvn::NVN_WAITERS,
             recorder,
             thunks,
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -4866,7 +4866,7 @@ struct Shared<'a> {
     nvn: std::sync::Mutex<crate::nvn::Nvn>,
     /// Threads waiting for `nvn` (a replay in pieces hands it over to them
     /// between pieces; the mutex alone gives it straight back).
-    nvn_waiters: std::sync::atomic::AtomicUsize,
+    nvn_waiters: &'static std::sync::atomic::AtomicUsize,
     /// Records calls on recording command buffers without the NVN state's
     /// lock (see `Worker::recorded_nvn_call`).
     recorder: crate::nvn::Recorder,

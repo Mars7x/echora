@@ -1608,6 +1608,10 @@ const KINDS: &[&str] = &[
 
 /// Commands a replay runs before it lets other threads' NVN calls in
 /// (ECHORA_REPLAY_CHUNK, default 64; 0 runs it whole).
+/// Threads waiting to take the NVN state's lock (the runtime counts them
+/// while they wait): a replay in pieces stops early for them.
+pub static NVN_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn replay_chunk() -> Option<u32> {
     static CHUNK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let chunk = *CHUNK.get_or_init(|| {
@@ -3969,8 +3973,13 @@ impl Nvn {
         loop {
             // A replay in pieces (`replay_budget`) stops here when its piece
             // is done; `resume_replay` goes on from this item.
+            // It also stops after any command once another thread waits for
+            // the NVN state (`NVN_WAITERS`): a recording thread waits for one
+            // command, not the rest of the piece.
             if let Some(budget) = self.replay_budget.as_mut() {
-                if *budget == 0 {
+                if *budget == 0
+                    || progressed && NVN_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+                {
                     self.replay_paused = true;
                     return Ok(progressed);
                 }
