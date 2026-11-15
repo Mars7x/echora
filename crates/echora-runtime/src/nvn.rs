@@ -3789,6 +3789,46 @@ impl Nvn {
             .is_none_or(|pool| pool.state.contains_key(&format!("Descriptor{id}")))
     }
 
+    /// Whether texture pool `pool`'s RegisterTexture or RegisterImage
+    /// (`image`) of `texture` with view `view` at `id` would write the
+    /// descriptor already there: the same texture, as it is now (storage
+    /// and format), the same kind and the same view. Queued work reading
+    /// that descriptor reads the same either way.
+    pub fn registration_unchanged(
+        &self,
+        pool: u64,
+        id: u64,
+        texture: u64,
+        view: u64,
+        image: bool,
+    ) -> bool {
+        let Some(entry) = self
+            .objects
+            .get(&pool)
+            .and_then(|pool| pool.state.get(&format!("Descriptor{id}")))
+        else {
+            return false;
+        };
+        let (storage, format) = self.texture_identity(texture).unwrap_or((0, 0));
+        if entry.x[0] != texture
+            || entry.x[1] != u64::from(image)
+            || entry.x[2] != storage
+            || entry.x[3] & 0xffff_ffff != format & 0xffff_ffff
+        {
+            return false;
+        }
+        let registered = self.views.get(&(pool, id as u32));
+        if view == 0 {
+            return registered.is_none();
+        }
+        let Some(registered) = registered else {
+            return false;
+        };
+        read_shared(self.bags.at(view))
+            .get(&view)
+            .is_some_and(|bag| bag == registered)
+    }
+
     /// Whether a queued present has not been shown yet.
     pub fn present_pending(&self) -> bool {
         self.pending

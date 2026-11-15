@@ -5106,10 +5106,19 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -
         // named yet goes on: the replay reads descriptors when it runs the
         // work, as the console's GPU reads them from pool memory. Replacing
         // one queued work may name waits.
-        "nvnTexturePoolRegisterTexture"
-        | "nvnTexturePoolRegisterImage"
-        | "nvnSamplerPoolRegisterSampler"
-        | "nvnSamplerPoolRegisterSamplerBuilder" => {
+        // Writing the same texture descriptor again changes nothing queued
+        // work can read either.
+        "nvnTexturePoolRegisterTexture" | "nvnTexturePoolRegisterImage" => {
+            nvn.descriptor_registered(regs[0], regs[1] & 0xffff_ffff)
+                && !nvn.registration_unchanged(
+                    regs[0],
+                    regs[1] & 0xffff_ffff,
+                    regs[2],
+                    regs[3],
+                    name == "nvnTexturePoolRegisterImage",
+                )
+        }
+        "nvnSamplerPoolRegisterSampler" | "nvnSamplerPoolRegisterSamplerBuilder" => {
             nvn.descriptor_registered(regs[0], regs[1] & 0xffff_ffff)
         }
         _ => replay_sensitive_name(name),
