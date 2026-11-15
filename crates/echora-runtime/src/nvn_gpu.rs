@@ -9001,7 +9001,15 @@ impl Nvn {
                 setup_end.elapsed().as_micros() as u64,
             ]
         });
-        let draw_label = format!("draw {:016x}/{:016x}", keys.0, keys.1);
+        // Only the trace switches below read it (a format per draw else).
+        let draw_label = if super::debug_var_os("ECHORA_TARGET_TRACE").is_some()
+            || super::debug_var_os("ECHORA_MEMORY_TRACE").is_some()
+            || super::debug_var_os("ECHORA_DEPTH_TRACE_TEXEL").is_some()
+        {
+            format!("draw {:016x}/{:016x}", keys.0, keys.1)
+        } else {
+            String::new()
+        };
         // ECHORA_GPU_UPLOAD_DUMP=<dir> with a traced program: each level of
         // the uploads it samples, once, as upload-<key>-<level>.ppm (RGB)
         // and .pgm (alpha).
