@@ -3955,6 +3955,43 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
     report
 }
 
+/// Whether a lifted function's body (`starts`) leaves only by its own
+/// return (RET, RETAA, RETAB) or a trap after a call returns: every
+/// branch, fallthrough and call return point stays in the body, and no
+/// block ends in an SVC, BR or another end. A function that can end by
+/// running on outside its body (after an SVC, through a resume point, by a
+/// branch out) gets no summary, so the code it reaches never relies on a
+/// caller's held local.
+fn exits_only_by_return(starts: &[u64], by_start: &BTreeMap<u64, &BasicBlock>) -> bool {
+    use Instruction::*;
+    let body: BTreeSet<u64> = starts.iter().copied().collect();
+    starts.iter().all(|start| {
+        let block = by_start[start];
+        let last = block
+            .instructions
+            .last()
+            .expect("blocks have an instruction");
+        let next = last.pc.wrapping_add(4);
+        match &last.instruction {
+            BranchReg {
+                rn: 30,
+                link: false,
+            }
+            | PAuthDisabledReturn { .. } => true,
+            Branch {
+                target,
+                link: false,
+            } => body.contains(target),
+            Branch { link: true, .. } | BranchReg { link: true, .. } => body.contains(&next),
+            BranchCond { target, .. }
+            | CompareBranch { target, .. }
+            | TestBranch { target, .. } => body.contains(target) && body.contains(&next),
+            instruction if instruction.ends_block() => false,
+            _ => body.contains(&next),
+        }
+    })
+}
+
 /// The effect summaries of the lifted leaf functions (no BL or BLR in
 /// them, so nothing else runs while they do): by entry, the general
 /// registers, SP and NZCV they may read or write (`Dirty` bits), and those
@@ -3975,6 +4012,9 @@ pub fn leaf_summaries(
             | if regs.nzcv { DIRTY_NZCV } else { 0 }
     };
     'functions: for (&entry, starts) in lifted {
+        if !exits_only_by_return(starts, &by_start) {
+            continue;
+        }
         let (mut touched, mut writes): (Dirty, Dirty) = (0, 0);
         for start in starts {
             for record in &by_start[start].instructions {
@@ -4032,7 +4072,7 @@ pub fn transitive_summaries(
     let mut own: BTreeMap<u64, OwnEffects> = BTreeMap::new();
     for (&entry, starts) in lifted {
         let (mut touched, mut writes, mut calls) = (0, 0, Vec::new());
-        let mut valid = true;
+        let mut valid = exits_only_by_return(starts, &by_start);
         for start in starts {
             for record in &by_start[start].instructions {
                 match record.instruction {

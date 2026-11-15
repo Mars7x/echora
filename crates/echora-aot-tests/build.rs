@@ -113,6 +113,7 @@ fn split_programs(out: &mut String) {
     deferred_charge_code(out);
     early_exit_code(out);
     two_level_code(out);
+    svc_wrapper_code(out);
 }
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -2345,9 +2346,10 @@ fn float_run_load_code(out: &mut String) {
 
 /// Leaves that leave early, for `tests/early_exits.rs`: a caller writes X4
 /// (which neither leaf touches), calls leaf A (X1 += 1, and with X5 nonzero
-/// a branch out of its region to code that adds X4 to X2 and returns), adds
-/// X4 and X1 into X6, and calls leaf B (X1 += 2, then SVC #7, which ends
-/// the run). Lifted with functions and call summaries, directly
+/// it points X30 out of its region before its RET, to code that adds X4 to
+/// X2 and branches back to the caller), adds X4 and X1 into X6, and calls
+/// leaf B (X1 += 2, then SVC #7, which ends the run: B can end outside its
+/// body, so it gets no summary). Lifted with functions and call summaries, directly
 /// (`early_exit_code`) and through the function table
 /// (`early_exit_table_code`).
 fn early_exit_code(out: &mut String) {
@@ -2374,17 +2376,22 @@ fn early_exit_code(out: &mut String) {
             0xd400_00e1, // svc #7
         ],
     );
+    let adr = |from: u64, to: u64, rd: u32| {
+        let imm = to.wrapping_sub(from) as u32 & 0x1f_ffff;
+        0x1000_0000 | (imm & 3) << 29 | (imm >> 2) << 5 | rd
+    };
     place(
         leaf_a,
         &[
             0x9100_0421,              // add x1, x1, #1
-            0xb500_0045,              // cbnz x5, +8
+            0xb400_0045,              // cbz x5, +8
+            adr(leaf_a + 8, far, 30), // adr x30, far
             0xd65f_03c0,              // ret
-            branch(leaf_a + 12, far), // b far
         ],
     );
     place(leaf_b, &[0x9100_0821, 0xd400_00e1]); // add x1, x1, #2; svc #7
-    place(far, &[0x8b04_0042, 0xd65f_03c0]); // add x2, x2, x4; ret
+    // add x2, x2, x4; b back to the caller after its first call.
+    place(far, &[0x8b04_0042, branch(far + 4, BASE + 8)]);
     let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     let region = CodeRegion {
         name: "early exits".into(),
@@ -2423,8 +2430,9 @@ fn early_exit_code(out: &mut String) {
 /// writes X4 and X8 and calls function C, which saves X29/X30, writes X7,
 /// calls leaf D, adds X7 to X1, restores X29/X30 and returns; D adds X8 to
 /// X1 (only D reads X8: A stores it because C's summary includes D's), adds
-/// one, and with X5 nonzero branches out of its region to code that adds X4
-/// (held by A) and X7 (held by C) to X2 and returns into C. Lifted with
+/// one, and with X5 nonzero points X30 out of its region before its RET, to
+/// code that adds X4 (held by A) and X7 (held by C) to X2 and branches back
+/// into C after its call. Lifted with
 /// transitive summaries, directly (`two_level_code`) and through the
 /// table (`two_level_table_code`).
 fn two_level_code(out: &mut String) {
@@ -2462,17 +2470,22 @@ fn two_level_code(out: &mut String) {
             0xd65f_03c0, // ret
         ],
     );
+    let adr = |from: u64, to: u64, rd: u32| {
+        let imm = to.wrapping_sub(from) as u32 & 0x1f_ffff;
+        0x1000_0000 | (imm & 3) << 29 | (imm >> 2) << 5 | rd
+    };
     place(
         d,
         &[
-            0x8b08_0021,         // add x1, x1, x8
-            0x9100_0421,         // add x1, x1, #1
-            0xb500_0045,         // cbnz x5, +8
-            0xd65f_03c0,         // ret
-            branch(d + 16, far), // b far
+            0x8b08_0021,          // add x1, x1, x8
+            0x9100_0421,          // add x1, x1, #1
+            0xb400_0045,          // cbz x5, +8
+            adr(d + 12, far, 30), // adr x30, far
+            0xd65f_03c0,          // ret
         ],
     );
-    place(far, &[0x8b04_0042, 0x8b07_0042, 0xd65f_03c0]); // add x2, x2, x4; add x2, x2, x7; ret
+    // add x2, x2, x4; add x2, x2, x7; b back into C after its call.
+    place(far, &[0x8b04_0042, 0x8b07_0042, branch(far + 8, c + 12)]);
     let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     let region = CodeRegion {
         name: "two levels".into(),
@@ -2505,6 +2518,68 @@ fn two_level_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "/// Summarized calls, and those that return early with their callee.\npub const SUMMARIZED_CALLS: usize = {summarized};\npub const PROPAGATING: usize = {propagating};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// An SVC wrapper, as SDKs write them, for `tests/early_exits.rs`: a caller
+/// loop (X3 counts to X9) calls a function that is `SVC #0x35` and a RET,
+/// where the RET is a resume point (after the SVC) and so not in the
+/// function's body; the host completes the SVC and resumes at the RET,
+/// which needs the caller's X30 in the `Core`. Lifted with functions and
+/// call summaries, directly (`svc_wrapper_code`) and through the table
+/// (`svc_wrapper_table_code`).
+fn svc_wrapper_code(out: &mut String) {
+    const BASE: u64 = 0x1d0_0000;
+    let wrapper = BASE + 0x400;
+    let bl = |from: u64, to: u64| {
+        0x9400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32) & 0x03ff_ffff)
+    };
+    let mut words = vec![0u32; 0x800 / 4];
+    let program = [
+        0xd280_0003,           // movz x3, #0
+        0x9100_0463,           // L: add x3, x3, #1
+        bl(BASE + 8, wrapper), // bl wrapper
+        0x9100_0442,           // add x2, x2, #1
+        0xeb09_007f,           // cmp x3, x9
+        0x54ff_ff8b,           // b.lt L
+        0xd400_00e1,           // svc #7
+    ];
+    words[..program.len()].copy_from_slice(&program);
+    words[0x100..0x102].copy_from_slice(&[0xd400_06a1, 0xd65f_03c0]); // svc #0x35; ret
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "svc wrapper".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &[BASE], words.len()).expect("svc wrapper");
+    for (name, function_table) in [
+        ("svc_wrapper_code", false),
+        ("svc_wrapper_table_code", true),
+    ] {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                functions: true,
+                function_table,
+                call_summaries: true,
+                ..options()
+            },
+        );
+        let summarized = regions
+            .iter()
+            .map(|(_, source)| source.matches("if m.cpu.pc != 0x").count())
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "/// Calls of leaves with an effect summary.\npub const SUMMARIZED_CALLS: usize = {summarized};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

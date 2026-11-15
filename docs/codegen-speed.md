@@ -440,6 +440,19 @@ levels (window, function, leaf) where the leaf leaves early into code
 reading registers both callers held; without the propagation, or with
 summaries missing a callee's effects, it fails.
 
+Only a function that leaves solely by its own return (RET, RETAA, RETAB),
+with every branch, fallthrough and call return point in its body and no
+block ending in an SVC, a BR or another end, gets a summary (leaf or
+transitive). An SVC wrapper (`SVC`; the RET after it is a resume point,
+outside the body) gets none: it could end by running on outside its body,
+where code relies on registers in the `Core`. With call-summaries the game
+(spd162) hung in a lock loop calling such wrappers through the table;
+the wrapper path as reproduced here (`tests/early_exits.rs`: a caller
+loop around an SDK-style SVC wrapper, the host completing the SVC and
+resuming at the RET) stores the caller's X30 before the SVC trap reaches
+the host, so the cause there is not yet seen, and the rule removes such
+calls from summarized ones whatever it was.
+
 ## Recommended set for the next rebuild (measured 2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`

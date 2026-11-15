@@ -1,13 +1,14 @@
-//! Summarized calls of leaves that leave early (`build.rs`'s
-//! `early_exit_code`): leaf A branches out of its region to code that reads
-//! a register the caller held in a local across the call, and leaf B ends
-//! the run with an SVC. Both must see the caller's value in the `Core`.
+//! Summarized calls whose callee returns somewhere else (`build.rs`'s
+//! `early_exit_code`, `two_level_code`): a leaf points X30 out of its
+//! region before its RET, to code that reads registers its callers held in
+//! locals across the calls. Functions that can end outside their body (an
+//! SVC, an SVC wrapper whose RET is a resume point) get no summary.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
 use echora_aot_tests::{
-    Core, Machine, Trap, early_exit_code, early_exit_table_code, two_level_code,
-    two_level_table_code,
+    Core, Machine, Trap, early_exit_code, early_exit_table_code, svc_wrapper_code,
+    svc_wrapper_table_code, two_level_code, two_level_table_code,
 };
 
 fn run(dispatch: fn(&mut Core) -> Result<(), Trap>, x5: u64) -> [u64; 31] {
@@ -36,8 +37,10 @@ fn run(dispatch: fn(&mut Core) -> Result<(), Trap>, x5: u64) -> [u64; 31] {
 
 #[test]
 fn early_exits_see_the_caller_s_held_registers() {
-    const { assert!(early_exit_code::SUMMARIZED_CALLS >= 2) };
-    const { assert!(early_exit_table_code::SUMMARIZED_CALLS >= 2) };
+    // Leaf A's call is summarized; B (which can end outside its body) is
+    // not.
+    const { assert!(early_exit_code::SUMMARIZED_CALLS == 1) };
+    const { assert!(early_exit_table_code::SUMMARIZED_CALLS == 1) };
     early_exit_table_code::install();
     for dispatch in [early_exit_code::dispatch, early_exit_table_code::dispatch] {
         for x5 in [0, 1] {
@@ -93,6 +96,56 @@ fn an_inner_early_exit_sees_every_caller_s_held_registers() {
             assert_eq!(regs[1], 19, "x5 {x5}");
             assert_eq!(regs[6], 26, "x5 {x5}");
             assert_eq!(regs[2], if x5 == 0 { 100 } else { 112 }, "x5 {x5}");
+        }
+    }
+}
+
+/// Runs the SVC wrapper program: the host completes SVC #0x35 (X0 = 0)
+/// and resumes after it, as the runtime does.
+fn run_svc_wrapper(
+    dispatch: fn(&mut Core) -> Result<(), Trap>,
+    count: u64,
+) -> Result<[u64; 31], String> {
+    let words = svc_wrapper_code::WORDS;
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut m = Machine::with_layout(
+        svc_wrapper_code::BASE,
+        &image,
+        (image.len() as u64).next_multiple_of(0x1000),
+        0x80_0000,
+        0x1000,
+    );
+    m.core.cpu.regs[9] = count;
+    m.core.cpu.regs[30] = 0xdead_0000;
+    m.core.cpu.pc = svc_wrapper_code::BASE;
+    m.core.max_steps = 10_000;
+    m.core.rearm();
+    loop {
+        match dispatch(&mut m.core) {
+            Ok(()) => continue,
+            Err(Trap::SupervisorCall { number: 7 }) => break,
+            Err(Trap::SupervisorCall { number: 0x35 }) => {
+                m.core.settle_block_trap();
+                m.core.cpu.regs[0] = 0;
+                m.core.cpu.pc += 4;
+            }
+            Err(trap) => return Err(format!("{trap:?} at {:#x}", m.core.cpu.pc)),
+        }
+    }
+    Ok(m.core.cpu.regs)
+}
+
+#[test]
+fn an_svc_wrapper_s_return_finds_the_caller_s_link_register() {
+    // The wrapper ends by running on past its body (the RET after the SVC is
+    // a resume point): no summary.
+    const { assert!(svc_wrapper_code::SUMMARIZED_CALLS == 0) };
+    svc_wrapper_table_code::install();
+    for dispatch in [svc_wrapper_code::dispatch, svc_wrapper_table_code::dispatch] {
+        for count in [1, 3] {
+            let regs = run_svc_wrapper(dispatch, count).unwrap();
+            // Every call returns to its caller: X2 counts the calls.
+            assert_eq!((regs[2], regs[3]), (count, count));
         }
     }
 }
