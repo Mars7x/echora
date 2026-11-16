@@ -5071,8 +5071,14 @@ impl Nvn {
                             return Ok(());
                         }
                         // Another pool: every handle may name other entries.
+                        // Setting the pool already set changes nothing
+                        // (each list sets its pools at its start); the same
+                        // pool's registrations evict their own ids.
                         "SetTexturePool" | "SetSamplerPool" => {
-                            self.bump_binding_serial("stat: binding serial by a pool set");
+                            if self.render.state.get(rest).map(|set| set.x[1]) != Some(command.x[1])
+                            {
+                                self.bump_binding_serial("stat: binding serial by a pool set");
+                            }
                             rest
                         }
                         _ => rest,
