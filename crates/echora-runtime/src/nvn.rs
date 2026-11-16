@@ -5834,6 +5834,47 @@ impl Nvn {
             }
         }
         // Each pool reached, whole.
+        // Pointers held in the task and mesh stages' storage buffers (the
+        // first 4 KiB of each), one level deep: an 8-byte value inside a
+        // pool's GPU range is followed (`pointer` lines), as are the
+        // addresses in ECHORA_TASK_DUMP_ADDRESSES (hex, comma-separated).
+        let mut pointers: Vec<u64> = debug_var("ECHORA_TASK_DUMP_ADDRESSES")
+            .ok()
+            .map(|list| {
+                list.split(',')
+                    .filter_map(|item| {
+                        u64::from_str_radix(item.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (key, bind) in &self.render.state {
+            if !(key.starts_with("BindStorageBuffer/6/") || key.starts_with("BindStorageBuffer/7/"))
+            {
+                continue;
+            }
+            let length = bind.x[4].min(4096) & !7;
+            let Ok(guest) = self.gpu_to_guest(bind.x[3], length) else {
+                continue;
+            };
+            let mut bytes = vec![0u8; length as usize];
+            if core.memory.read(guest, &mut bytes).is_err() {
+                continue;
+            }
+            for word in bytes.as_chunks::<8>().0 {
+                let value = u64::from_le_bytes(*word);
+                if value != 0 && self.pool_for(value).is_some() && !pointers.contains(&value) {
+                    pointers.push(value);
+                }
+            }
+        }
+        for &pointer in &pointers {
+            text += &format!(
+                "pointer {pointer:#x}: resolves to {:x?}\n",
+                self.pool_for(pointer)
+            );
+            addresses.push(pointer);
+        }
         let addresses_reached: Vec<u64> = addresses.clone();
         let mut pools: Vec<(u64, u64, u64)> = Vec::new();
         for address in addresses.into_iter().filter(|address| *address != 0) {
