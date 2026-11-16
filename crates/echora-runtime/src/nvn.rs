@@ -5054,7 +5054,7 @@ impl Nvn {
                 // read by later draws, indirect data, texture invalidates).
                 if rest == "Barrier" {
                     if let Some(backend) = self.gpu() {
-                        backend.renderer.guest_barrier().map_err(stop)?;
+                        backend.renderer.guest_barrier(command.x[1]).map_err(stop)?;
                     }
                     return Ok(());
                 }

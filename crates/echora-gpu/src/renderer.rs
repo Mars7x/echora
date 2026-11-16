@@ -4695,8 +4695,16 @@ impl Renderer {
     /// The game's nvnCommandBufferBarrier: its work so far is ordered
     /// before what follows and its writes made visible (a full barrier,
     /// ending an open pass, whatever the order and invalidate bits ask).
-    pub fn guest_barrier(&mut self) -> Result<(), String> {
+    /// `bits` (NVNbarrierBits) are counted per combination.
+    pub fn guest_barrier(&mut self, bits: u64) -> Result<(), String> {
+        static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        let names = NAMES.get_or_init(|| {
+            (0..256)
+                .map(|bits| &*format!("stat: guest barriers bits {bits:#04x}").leak())
+                .collect()
+        });
         *self.stats.entry("stat: guest barriers").or_default() += 1;
+        *self.stats.entry(names[(bits & 0xff) as usize]).or_default() += 1;
         self.memory_barrier()
     }
 
