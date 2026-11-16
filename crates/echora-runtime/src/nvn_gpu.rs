@@ -7407,9 +7407,24 @@ impl Nvn {
         }
         let keys_for_note = [keys.0, keys.1];
         // Bindings, through the inferred map.
-        let mut uniforms = echora_gpu::FastMap::default();
-        let mut guest_uniforms = echora_gpu::FastMap::default();
-        let mut textures = echora_gpu::FastMap::default();
+        // Sized for the program's bindings: filled per draw, grown would
+        // reallocate a few times each draw.
+        let count = |kinds: &[DescriptorKind]| {
+            stages
+                .iter()
+                .flat_map(|stage| &stage.descriptors)
+                .filter(|descriptor| kinds.contains(&descriptor.kind()))
+                .count()
+        };
+        let uniform_count = count(&[DescriptorKind::UniformBuffer]);
+        let mut uniforms =
+            echora_gpu::FastMap::with_capacity_and_hasher(uniform_count, Default::default());
+        let mut guest_uniforms =
+            echora_gpu::FastMap::with_capacity_and_hasher(uniform_count, Default::default());
+        let mut textures = echora_gpu::FastMap::with_capacity_and_hasher(
+            count(&[DescriptorKind::Texture, DescriptorKind::TextureBuffer]),
+            Default::default(),
+        );
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
