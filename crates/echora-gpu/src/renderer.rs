@@ -2103,6 +2103,20 @@ impl Renderer {
         // 852 MiB pushed host memory past its limit).
         let chunked = texels.len() as u64 > RING_SIZE
             && (0..by_offset.len()).all(|index| region_bytes(index) <= RING_SIZE);
+        let big = texels.len() as u64 > RING_SIZE;
+        if big || Self::labelling() {
+            let text = format!(
+                "present - upload {key:#x} {width}x{height} {shape:?} {format:?} levels {level_count} bytes {} chunked {chunked} reused {}",
+                texels.len(),
+                reused.is_some()
+            );
+            if big {
+                eprintln!("gpu: {}", &text[10..]);
+            }
+            if Self::labelling() {
+                self.label(text);
+            }
+        }
         // The texels are staged before the image exists, so a failure
         // leaves nothing behind. Other uploads larger than the ring get a
         // staging buffer of their own, destroyed with the submission's
@@ -2340,6 +2354,12 @@ impl Renderer {
                 ..Default::default()
             })
             .collect();
+        if length > RING_SIZE {
+            eprintln!("gpu: with_texels {key:#x} reads back {length} bytes");
+        }
+        if Self::labelling() {
+            self.label(format!("present - with_texels {key:#x} bytes {length}"));
+        }
         let commands = self.commands()?;
         // SAFETY: recording; the upload image is live, in GENERAL layout
         // and made with TRANSFER_SRC; the buffer holds every region.
@@ -3800,7 +3820,8 @@ impl Renderer {
         }
     }
 
-    /// ECHORA_HANG_MARKER_KINDS=draw,dispatch (debugging): mark only work
+    /// ECHORA_HANG_MARKER_KINDS=draw,dispatch,upload,with_texels
+    /// (debugging): mark only work
     /// whose label names one of these kinds ("present N <kind> ..."); all
     /// work is marked without it.
     fn hang_mark_kind(label: &str) -> bool {
