@@ -629,6 +629,9 @@ pub struct Nvn {
     /// Mesh draws written by ECHORA_TASK_DUMP so far.
     #[serde(skip)]
     mesh_draws_dumped: u32,
+    /// The present ECHORA_TASK_DUMP=first dumps (the first with a mesh draw).
+    #[serde(skip)]
+    task_dump_present: Option<u64>,
     #[serde(skip)]
     input_types_memo: Option<(std::sync::Arc<Vec<BTreeMap<String, Args>>>, [u8; 32])>,
     /// The last vertex attribute and stream snapshots a draw read, with
@@ -5170,13 +5173,17 @@ impl Nvn {
                         }
                     }
                     // ECHORA_TASK_DUMP=PRESENT,DIR (debugging, works without
-                    // a GPU): the first mesh draws at that present, with
-                    // their stages and every buffer they bind, for the
-                    // shader simulator (`dump_mesh_draw`).
+                    // a GPU): the first mesh draws at that present (`first`:
+                    // the first present with any), with their stages and
+                    // every buffer they bind, for the shader simulator
+                    // (`dump_mesh_draw`).
                     if rest.starts_with("DrawMeshTasks")
                         && let Ok(value) = debug_var("ECHORA_TASK_DUMP")
                         && let Some((present, directory)) = value.split_once(',')
-                        && present.parse::<u64>() == Ok(self.presented_frames)
+                        && (present.parse::<u64>() == Ok(self.presented_frames)
+                            || present == "first"
+                                && *self.task_dump_present.get_or_insert(self.presented_frames)
+                                    == self.presented_frames)
                     {
                         let number = self.mesh_draws_dumped;
                         if number < 64 {
