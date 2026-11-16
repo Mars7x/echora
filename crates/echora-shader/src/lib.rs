@@ -761,6 +761,44 @@ mod tests {
     }
 
     #[test]
+    fn a_task_program_starts_the_mesh_workgroups_it_counted() {
+        // Whatever the payload's memory held before: a program that writes
+        // no count starts none, one that writes 2 starts two, and no count
+        // passes VK_EXT_mesh_shader's minimum maxMeshWorkGroupCount.
+        let registers = mesh_registers(64, 64, 32, 32 | 1 << 12);
+        let started = |count: Option<u128>| {
+            let mut task = header(1, 1, &[]);
+            let mut words = vec![
+                isbe(false, 0, 255, 0, 3, 2, false),
+                isbe(true, 0, 255, 0x14, 3, 2, true),
+            ];
+            if let Some(count) = count {
+                words.push(word(&[
+                    (0, 12, 0x802),
+                    (72, 4, 0xf),
+                    (16, 8, 1),
+                    (32, 32, count),
+                ]));
+                words.push(isbe(true, 1, 255, 4, 3, 2, true));
+            }
+            words.push(EXIT);
+            task.extend(bytes(&words));
+            let translated = validated_with(&task, &mesh_parameters(true, registers, None));
+            let report =
+                crate::sim::Machine::new(&translated.spirv).simulate(&crate::sim::Inputs {
+                    workgroup_count: [1, 1, 1],
+                    payload: vec![0xa5; 4096],
+                    ..Default::default()
+                });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            report.mesh_tasks
+        };
+        assert_eq!(started(None), Some([0, 1, 1]));
+        assert_eq!(started(Some(2)), Some([2, 1, 1]));
+        assert_eq!(started(Some(0x1234_5678)), Some([65535, 1, 1]));
+    }
+
+    #[test]
     fn mesh_programs_refuse_what_they_cannot_express() {
         let mut program = header(1, 3, &POSITION_AND_GENERIC);
         program.extend(bytes(&[EXIT]));

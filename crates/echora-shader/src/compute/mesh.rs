@@ -58,6 +58,10 @@ const DECORATION_PER_PRIMITIVE: u32 = 5271;
 /// Elements per group of stage buffer lines.
 const GROUP: u32 = 32;
 
+/// The most mesh workgroups a task workgroup starts here
+/// (VK_EXT_mesh_shader's minimum maxMeshWorkGroupCount per dimension).
+const MESH_WORKGROUPS: u32 = 65535;
+
 /// A task or mesh program's variables.
 #[derive(Debug)]
 pub(super) struct MeshState {
@@ -210,13 +214,42 @@ impl Emitter {
         let body_id = state.body;
         let body = std::mem::replace(&mut self.function, main);
         body.finish(&mut self.module);
+        // The counts the program reports start at zero: a task program
+        // whose threads all cull writes no mesh workgroup count (the one
+        // thread that would is the first of none), and a mesh program may
+        // write no primitive count. The payload and workgroup variables
+        // hold anything until written, and an unwritten count of billions
+        // of mesh workgroups keeps the GPU past the kernel's job limit
+        // (the forest's foliage draws reset it at the area's load).
+        let mesh = self.mesh_layout();
+        let (payload, primitive_count) = {
+            let state = self.mesh.as_ref().expect("mesh variables");
+            (state.payload, state.count)
+        };
+        let invocation = self.scalar_builtin(BUILTIN_LOCAL_INVOCATION_INDEX);
+        let zero = self.constant(0);
+        let first = self.value(op::I_EQUAL, self.bool, &[invocation, zero]);
+        self.when(first, |e| {
+            let pointer = if mesh.task {
+                let one = e.constant(1);
+                let payload = payload.expect("a task payload");
+                e.word_pointer(payload, storage::TASK_PAYLOAD_WORKGROUP_EXT, one)
+            } else {
+                primitive_count
+            };
+            e.function.emit(op::STORE, &[pointer, zero]);
+            Ok(())
+        })?;
+        self.barrier();
         self.value(op::FUNCTION_CALL, self.void, &[body_id]);
         self.barrier();
-        let mesh = self.mesh_layout();
         if mesh.task {
-            let payload = self.mesh.as_ref().and_then(|state| state.payload);
             let payload = payload.expect("a task payload");
             let count = self.word(payload, storage::TASK_PAYLOAD_WORKGROUP_EXT, 1);
+            // No more than VK_EXT_mesh_shader's minimum
+            // maxMeshWorkGroupCount: a larger count is not a valid one.
+            let most = self.constant(MESH_WORKGROUPS);
+            let count = self.glsl(self.u32, glsl::U_MIN, &[count, most]);
             let one = self.constant(1);
             self.function
                 .emit(op::EMIT_MESH_TASKS_EXT, &[count, one, one, payload]);
@@ -678,7 +711,11 @@ impl Emitter {
             for corner in 0..corners {
                 let offset = e.constant(corner);
                 let at = e.value(op::I_ADD, e.u32, &[first, offset]);
-                corner_values.push(e.bounded_word(map, storage::WORKGROUP, at, map_words));
+                // An index is one of the vertices set above (a map byte
+                // never written holds anything).
+                let index = e.bounded_word(map, storage::WORKGROUP, at, map_words);
+                let last = e.constant(mesh.max_vertices - 1);
+                corner_values.push(e.glsl(e.u32, glsl::U_MIN, &[index, last]));
             }
             let value = e.vector(e.u32, &corner_values);
             let pointer = e.module.pointer(storage::OUTPUT, index_type);
