@@ -9865,6 +9865,40 @@ fn draw_phase_timing() -> bool {
 /// at `slot`, as "{kind}/{stage}/{slot}" or "{kind}/{slot}": made once
 /// each (draws looked a dozen up, each formatted anew).
 pub(super) fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'static str {
+    // The common kinds, stages and slots come from a table made once (a
+    // map entry per lookup showed ~5% of the replay thread's samples).
+    const KINDS: [&str; 5] = [
+        "BindTexture",
+        "BindImage",
+        "BindUniformBuffer",
+        "BindStorageBuffer",
+        "BindVertexBuffer",
+    ];
+    const STAGES: usize = 9;
+    const SLOTS: usize = 128;
+    static TABLE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    if let Some(kind_index) = KINDS.iter().position(|known| *known == kind)
+        && stage.is_none_or(|stage| stage < STAGES as u64 - 1)
+        && slot < SLOTS as u64
+    {
+        let table = TABLE.get_or_init(|| {
+            let mut table = Vec::with_capacity(KINDS.len() * STAGES * SLOTS);
+            for kind in KINDS {
+                for stage in 0..STAGES {
+                    for slot in 0..SLOTS {
+                        let key = match stage {
+                            0 => format!("{kind}/{slot}"),
+                            stage => format!("{kind}/{}/{slot}", stage - 1),
+                        };
+                        table.push(&*Box::leak(key.into_boxed_str()));
+                    }
+                }
+            }
+            table
+        });
+        let stage_index = stage.map_or(0, |stage| stage as usize + 1);
+        return table[(kind_index * STAGES + stage_index) * SLOTS + slot as usize];
+    }
     thread_local! {
         static KEYS: std::cell::RefCell<
             HashMap<(usize, Option<u64>, u64), &'static str>,
@@ -9882,4 +9916,22 @@ pub(super) fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'s
                 Box::leak(key.into_boxed_str())
             })
     })
+}
+
+#[cfg(test)]
+mod bind_key_tests {
+    use super::bind_key;
+
+    #[test]
+    fn bind_keys_name_kind_stage_and_slot() {
+        assert_eq!(bind_key("BindTexture", Some(4), 7), "BindTexture/4/7");
+        assert_eq!(bind_key("BindVertexBuffer", None, 3), "BindVertexBuffer/3");
+        assert_eq!(bind_key("BindSeparateSampler", Some(1), 2), "BindSeparateSampler/1/2");
+        assert_eq!(bind_key("BindImage", Some(0), 200), "BindImage/0/200");
+        let kind = String::from("BindUniformBuffer").leak();
+        assert!(std::ptr::eq(
+            bind_key(kind, Some(2), 5),
+            bind_key("BindUniformBuffer", Some(2), 5)
+        ));
+    }
 }
