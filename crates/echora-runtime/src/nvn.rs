@@ -5193,7 +5193,10 @@ impl Nvn {
                     // the first present with any), with their stages and
                     // every buffer they bind, for the shader simulator
                     // (`dump_mesh_draw`).
+                    // ECHORA_TASK_DUMP_INDIRECT: indirect ones only.
                     if rest.starts_with("DrawMeshTasks")
+                        && (rest.ends_with("Indirect")
+                            || debug_var_os("ECHORA_TASK_DUMP_INDIRECT").is_none())
                         && let Ok(value) = debug_var("ECHORA_TASK_DUMP")
                         && let Some((present, directory)) = value.split_once(',')
                         && (present.parse::<u64>() == Ok(self.presented_frames)
@@ -5757,6 +5760,13 @@ impl Nvn {
         let mut addresses: Vec<u64> = Vec::new();
         if command.name.ends_with("Indirect") {
             addresses.push(command.x[1]);
+            let words: Option<Vec<u32>> =
+                self.gpu_to_guest(command.x[1], 16).ok().and_then(|guest| {
+                    (0..4)
+                        .map(|index| core.memory.read_u32(guest + index * 4).ok())
+                        .collect()
+                });
+            text += &format!("indirect record words {words:x?}\n");
         }
         for (key, bind) in &self.render.state {
             let Some(bit) = key.strip_prefix("BindProgram@") else {
@@ -5796,6 +5806,18 @@ impl Nvn {
         binds.sort_unstable_by_key(|(key, _)| **key);
         for (key, bind) in binds {
             text += &format!("bind {key} x {:x?}\n", &bind.x[1..6]);
+            // A uniform block's bytes as the draw reads them:
+            // uniform-STAGE-SLOT.bin (BindUniformBuffer(cmd, stage, slot,
+            // address, size)).
+            if key.starts_with("BindUniformBuffer/") && bind.x[3] != 0 {
+                let size = bind.x[4].min(0x10000);
+                let mut bytes = vec![0u8; size as usize];
+                if let Ok(guest) = self.gpu_to_guest(bind.x[3], size)
+                    && core.memory.read(guest, &mut bytes).is_ok()
+                {
+                    write(format!("uniform-{}-{}.bin", bind.x[1], bind.x[2]), &bytes)?;
+                }
+            }
             if key.starts_with("BindUniformBuffer")
                 || key.starts_with("BindStorageBuffer")
                 || key.starts_with("BindVertexBuffer")
