@@ -416,6 +416,10 @@ pub struct Nvn {
     /// a lookup misses (see `pool_for`).
     #[serde(skip)]
     pool_ranges: std::cell::RefCell<Vec<[u64; 6]>>,
+    /// `object_generation` when `pool_ranges` was built: while it holds,
+    /// every range's pool is live at its address and is not checked again.
+    #[serde(skip)]
+    pool_ranges_generation: std::cell::Cell<Option<u64>>,
     /// Bumped whenever an object is created or removed, or a virtual pool
     /// is remapped: what `texture_storage` answers can change only then.
     #[serde(skip)]
@@ -2197,6 +2201,7 @@ impl Nvn {
                     }
                 }
                 self.pool_ranges.borrow_mut().clear();
+                self.pool_ranges_generation.set(None);
                 self.object_generation += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
@@ -5686,7 +5691,8 @@ impl Nvn {
     /// is a binary search and a short walk back; a range whose pool object
     /// is gone, or a miss, rebuilds the cache from the live pools.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let find = |ranges: &[[u64; 6]]| {
+        let current = self.pool_ranges_generation.get() == Some(self.object_generation);
+        let find = |ranges: &[[u64; 6]], current: bool| {
             let after = ranges.partition_point(|range| range[2] <= address);
             ranges[..after]
                 .iter()
@@ -5694,14 +5700,15 @@ impl Nvn {
                 .take_while(|range| address < range[5])
                 .find_map(|&[key, pool_gpu, gpu, size, memory, _]| {
                     let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
-                    let live = self.objects.get(&key).is_some_and(|pool| {
+                    let live = current
+                        || self.objects.get(&key).is_some_and(|pool| {
                         pool.kind == "MemoryPool"
                             && pool.state.get("GpuAddress").map(|args| args.x[0]) == Some(pool_gpu)
                     });
                     live.then_some((memory + offset, size - offset))
                 })
         };
-        if let Some(found) = find(&self.pool_ranges.borrow()) {
+        if let Some(found) = find(&self.pool_ranges.borrow(), current) {
             return Some(found);
         }
         let mut ranges: Vec<[u64; 6]> = Vec::new();
@@ -5743,8 +5750,9 @@ impl Nvn {
             end = end.max(range[2].saturating_add(range[3]));
             range[5] = end;
         }
-        let found = find(&ranges);
+        let found = find(&ranges, true);
         *self.pool_ranges.borrow_mut() = ranges;
+        self.pool_ranges_generation.set(Some(self.object_generation));
         found
     }
 
