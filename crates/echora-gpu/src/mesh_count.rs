@@ -54,13 +54,14 @@ impl MeshCount {
         let device = renderer.device();
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
         let log = renderer.host_buffer_with(u64::from(LOGGED) * 4, usage, true)?;
-        log.write(0, &vec![0; LOGGED as usize * 4]);
+        // Unwritten entries read u32::MAX: work the GPU never reached.
+        log.write(0, &vec![0xff; LOGGED as usize * 4]);
         let log_address = renderer
             .buffer_address(log.buffer)
             .ok_or("bounded mesh counts need buffer device addresses")?;
         // Three words a probe (the program writes x, y and z).
         let probes = renderer.host_buffer_with(u64::from(PROBES) * 12, usage, true)?;
-        probes.write(0, &vec![0; PROBES as usize * 12]);
+        probes.write(0, &vec![0xff; PROBES as usize * 12]);
         let probes_address = renderer
             .buffer_address(probes.buffer)
             .ok_or("bounded mesh counts need buffer device addresses")?;
@@ -126,8 +127,13 @@ impl MeshCount {
             diagnostic_bound("ECHORA_DIAG_DISPATCH_AXIS", TASK_WORKGROUPS),
         );
         let mut cut = 0;
+        let mut unrun = 0;
         for draw in from..self.next {
             let count = counts[(draw % u64::from(LOGGED)) as usize];
+            if count == u32::MAX {
+                unrun += 1;
+                continue;
+            }
             largest = largest.max(count);
             cut += u32::from(count > diagnostic);
             if count > TASK_WORKGROUPS {
@@ -137,7 +143,7 @@ impl MeshCount {
             }
         }
         eprintln!(
-            "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}, {cut} past the bound {diagnostic}",
+            "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}, {cut} past the bound {diagnostic}, {unrun} not run by the GPU yet",
             self.next
         );
         if self.probed > 0 {
@@ -147,7 +153,12 @@ impl MeshCount {
                 .as_chunks::<12>()
                 .0
                 .iter()
-                .map(|probe| format!("{:#x}", u32::from_le_bytes(probe[..4].try_into().unwrap())))
+                .map(
+                    |probe| match u32::from_le_bytes(probe[..4].try_into().unwrap()) {
+                        u32::MAX => "not run".to_string(),
+                        word => format!("{word:#x}"),
+                    },
+                )
                 .collect();
             eprintln!("gpu: probed words as the GPU read them ({why}): {words:?}");
         }
