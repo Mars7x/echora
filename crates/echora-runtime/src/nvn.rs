@@ -633,6 +633,12 @@ pub struct Nvn {
     /// (its sharing into the page table waits for the next present).
     #[serde(skip)]
     pool_made_at: HashMap<u64, u64>,
+    /// ECHORA_UNPOOLED_LOG: finalized pools (GPU address, size, present),
+    /// and the unpooled addresses already logged.
+    #[serde(skip)]
+    finalized_pools: Vec<(u64, u64, u64)>,
+    #[serde(skip)]
+    unpooled_seen: std::collections::HashSet<u64>,
     /// The present ECHORA_TASK_DUMP=first dumps (the first with a mesh draw).
     #[serde(skip)]
     task_dump_present: Option<u64>,
@@ -3434,6 +3440,19 @@ impl Nvn {
                 }
                 if kind == "MemoryPool" {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
+                    // ECHORA_UNPOOLED_LOG: finalized pools' GPU ranges.
+                    if debug_var_os("ECHORA_UNPOOLED_LOG").is_some() {
+                        let object = &self.objects[&this];
+                        if let (Some(gpu), Some(storage)) =
+                            (object.state.get("GpuAddress"), object.builder.get("Storage"))
+                        {
+                            self.finalized_pools.push((
+                                gpu.x[0],
+                                storage.x[1],
+                                self.presented_frames,
+                            ));
+                        }
+                    }
                     self.gpu_forget_pool(base);
                     // Another live pool over the same memory loses the
                     // shared span with it (spans are kept by base): it is
@@ -5142,6 +5161,27 @@ impl Nvn {
                         backend.renderer.guest_barrier(command.x[1]).map_err(stop)?;
                     }
                     return Ok(());
+                }
+                // ECHORA_UNPOOLED_LOG (debugging, works without a GPU): a
+                // storage or uniform buffer bound at an address no pool
+                // holds, once per address, with the pools finalized over it.
+                if matches!(rest, "BindStorageBuffer" | "BindUniformBuffer")
+                    && command.x[3] != 0
+                    && debug_var_os("ECHORA_UNPOOLED_LOG").is_some()
+                    && self.pool_for(command.x[3]).is_none()
+                    && self.unpooled_seen.insert(command.x[3])
+                {
+                    let address = command.x[3];
+                    let finalized: Vec<(u64, u64, u64)> = self
+                        .finalized_pools
+                        .iter()
+                        .copied()
+                        .filter(|&(gpu, size, _)| (gpu..gpu + size).contains(&address))
+                        .collect();
+                    eprintln!(
+                        "unpooled bind present {} {rest} stage {} slot {} at {address:#x} size {:#x}: finalized pools over it (gpu, size, present) {finalized:x?}",
+                        self.presented_frames, command.x[1], command.x[2], command.x[4]
+                    );
                 }
                 if is_state_command(rest) {
                     // Per-slot bindings are kept per stage and slot; the
