@@ -6724,7 +6724,9 @@ pub(crate) fn program_key(bit: u32) -> &'static str {
 }
 
 fn plural_bind(rest: &str) -> Option<(&'static str, usize)> {
-    match rest.trim_end_matches("Deferred") {
+    // strip_suffix, not trim_end_matches: this runs for every replayed
+    // command, and a &str pattern search sets up a searcher per call.
+    match rest.strip_suffix("Deferred").unwrap_or(rest) {
         "BindTextures" => Some(("BindTexture", 1)),
         "BindImages" => Some(("BindImage", 1)),
         "BindUniformBuffers" => Some(("BindUniformBuffer", 2)),
