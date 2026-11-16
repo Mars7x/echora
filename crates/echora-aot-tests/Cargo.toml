@@ -57,6 +57,10 @@ inline-vector-int = []
 # With inline-vector: FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP per lane natively
 # where exact (EmitOptions::inline_vector_pairwise).
 inline-vector-pairwise = []
+# With inline-vector: scalar FMOV to/from general registers, SCVTF/UCVTF,
+# FCVT*S/U, FCVT S<->D, FSQRT, FRINT* and FCCMP natively where exact
+# (EmitOptions::inline_fp_scalar).
+inline-fp-scalar = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access

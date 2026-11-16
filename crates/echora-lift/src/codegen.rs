@@ -4955,6 +4955,12 @@ pub struct EmitOptions {
     /// lane natively under the inlined float operations' rules, any other
     /// lane through the exact single-lane helper.
     pub inline_vector_pairwise: bool,
+    /// With `inline_vector`: scalar float moves (FMOV to and from general
+    /// registers), conversions (SCVTF, UCVTF, FCVT*S/U to general
+    /// registers, FCVT between single and double), FSQRT, FRINT* and
+    /// FCCMP as native code where exact, the helper otherwise
+    /// (`crate::simd_scalar`).
+    pub inline_fp_scalar: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5199,6 +5205,15 @@ struct InlineVectorPairwise(bool);
 impl Drop for InlineVectorPairwise {
     fn drop(&mut self) {
         crate::simd_int::set_inline_vector_pairwise(self.0);
+    }
+}
+
+/// Restores `crate::simd_scalar`'s inlined scalar operations when it goes.
+struct InlineFpScalar(bool);
+
+impl Drop for InlineFpScalar {
+    fn drop(&mut self) {
+        crate::simd_scalar::set_inline_fp_scalar(self.0);
     }
 }
 
@@ -5549,6 +5564,7 @@ struct RegionSettings {
     inline_vector_unary: InlineVectorUnary,
     inline_vector_int: InlineVectorInt,
     inline_vector_pairwise: InlineVectorPairwise,
+    inline_fp_scalar: InlineFpScalar,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5585,6 +5601,9 @@ impl RegionSettings {
             inline_vector_pairwise: InlineVectorPairwise(
                 crate::simd_int::set_inline_vector_pairwise(options.inline_vector_pairwise),
             ),
+            inline_fp_scalar: InlineFpScalar(crate::simd_scalar::set_inline_fp_scalar(
+                options.inline_fp_scalar,
+            )),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,

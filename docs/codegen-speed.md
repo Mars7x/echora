@@ -600,6 +600,58 @@ operations: memset (-47%, -47%) and switch (-18%, -14%) moved with code
 layout (memset has measured both about 1,850 and 3,500 Minstr/s from
 unchanged code in these runs), the rest within noise.
 
+## Scalar float moves and conversions (opt-in)
+
+Static helper calls in the game's 100 hottest regions (88% of samples)
+count the fallbacks of already inlined code with the main-path calls: the
+large ones (`vec_fp_lane` 38k, `fp_binary` 34k, `vec_fp` 29k, `fp_ternary`
+14k, `fp_compare` 13k, `vec_fp_element` 10k) are the exact helper behind
+inlined FADD/FMUL/FMADD/FCMP and their vector forms, run only for lanes
+that are not normal or zero. What `emit_inline` never takes (every
+decodable word asked): FMOV between general and FP registers
+(`fp_move_from_general` 4.5k, `fp_move_to_general` 1.2k), the scalar
+conversions (`int_to_fp` 1.3k, `fp_convert` 1.0k, `fp_to_int` 1.0k,
+`simd_int_to_fp` 0.8k), scalar FSQRT and FRINT* (`fp_unary` 1.5k) and
+FCCMP (0.9k); then TBL (1.1k) and FMAXV and the like.
+
+`EmitOptions::inline_fp_scalar` (`inline-fp-scalar`, with `inline-vector`)
+takes that group (`crate::simd_scalar`):
+
+- FMOV to and from general registers, upper halves included: a bit move,
+  no helper.
+- SCVTF/UCVTF from a general or an FP register: the helper's own host
+  conversion once the FPCR is one it accepts (it checks nothing else).
+- FCVT{N,P,M,Z,A}{S,U} to a general register: a normal or zero operand
+  whose rounded value fits (the helper raises IOC otherwise, and models no
+  IXC for conversions).
+- FCVT between single and double: a normal or zero operand whose result is
+  normal or zero (no flush, no overflow, no NaN conversion).
+- FSQRT, FRINT* and FRINTX: as their vector forms (`inline-vector-unary`).
+- FCCMP/FCCMPE: the immediate flags when the condition fails, else the
+  compare as FCMP is inlined.
+
+Everything else calls the helper, on a line of its own: register locals are
+stored before and reloaded after a line that calls a helper, which undid a
+native write to the destination on the same line (the first version of
+FCVTZS lost its result that way; the test caught it).
+
+`tests/fp_scalar.rs` samples random words of the group (every operation
+and form, up to four words each, FCCMP's every condition and immediate),
+lifted with the option and without, and runs each from float and integer
+edge values and random bits, random NZCV, under FZ and DN on and off and a
+rounding mode the helpers trap on: every register, NZCV, FPSR and the trap
+must agree; the lift with the option keeps no FMOV helper call. FCVTZS
+admitting 2^31, FCVT without the result check, FSQRT of negatives
+natively, FMOV to an upper half clearing the lower, FCCMP's immediate
+flags dropped, UCVTF of a W register signed, or FRINTX rounding ties away
+each fail it.
+
+Kernels (game set vs game set plus `inline-fp-scalar`, two rounds of seven
+runs, best): `fpscalar` (FMOV both ways, SCVTF, FCVTZS, FCVT both ways,
+FSQRT, FRINTM, FCCMP, FADD) 369.8 to 846.5 and 366.2 to 892.6 Minstr/s
+(+129%, +144%); the other kernels have none of these operations and are
+within noise.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in

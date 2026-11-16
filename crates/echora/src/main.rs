@@ -762,6 +762,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "inline-vector-unary" => options.inline_vector_unary = true,
                 "inline-vector-int" => options.inline_vector_int = true,
                 "inline-vector-pairwise" => options.inline_vector_pairwise = true,
+                "inline-fp-scalar" => options.inline_fp_scalar = true,
                 "fp-status-locals" => options.fp_status_locals = true,
                 "window-memory" => options.window_memory = true,
                 "dense-dispatch" => options.dense_dispatch = true,

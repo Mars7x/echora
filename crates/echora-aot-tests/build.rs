@@ -39,6 +39,7 @@ fn options() -> EmitOptions {
         inline_vector_unary: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_UNARY").is_some(),
         inline_vector_int: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_INT").is_some(),
         inline_vector_pairwise: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_PAIRWISE").is_some(),
+        inline_fp_scalar: std::env::var_os("CARGO_FEATURE_INLINE_FP_SCALAR").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -327,6 +328,7 @@ fn main() {
     fp_status_code(&mut out);
     vector_unary_code(&mut out);
     vector_int_code(&mut out);
+    fp_scalar_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -832,6 +834,124 @@ fn vector_int_code(out: &mut String) {
         .expect("write");
         writeln!(out, "/// Integer and move helper calls left in the emission.\npub const HELPER_CALLS: usize = {helpers};").expect("write");
         writeln!(out, "/// Single-lane float helper calls (pairwise fallbacks).\npub const LANE_CALLS: usize = {pairwise_lanes};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/fp_scalar.rs`: random words of the scalar float
+/// moves, conversions, FSQRT, FRINT* and FCCMP (up to 4 of each operation
+/// and form), one word and an SVC each. Lifted with
+/// `EmitOptions::inline_fp_scalar` (`fp_scalar_code`) and without
+/// (`fp_scalar_reference`).
+fn fp_scalar_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+    use echora_lift::simd::SimdOp;
+
+    const BASE: u64 = 0x220_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let family = |op: &SimdOp| {
+        matches!(
+            op,
+            SimdOp::FpMoveToGeneral { .. }
+                | SimdOp::FpMoveFromGeneral { .. }
+                | SimdOp::IntToFp { .. }
+                | SimdOp::SimdIntToFp { .. }
+                | SimdOp::FpToInt { .. }
+                | SimdOp::FpConvert { .. }
+                | SimdOp::FpUnary { .. }
+                | SimdOp::FpConditionalCompare { .. }
+        )
+    };
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut state = 0x0f5c_a1a2_0000_0007u64;
+    for _ in 0..3_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // The scalar floating-point space (bits 28..24 = 11110).
+        let word = (state as u32 & !0x1f00_0000) | 0x1e00_0000;
+        let Instruction::Simd(op) = decode(word, 0) else {
+            continue;
+        };
+        if !family(&op) {
+            continue;
+        }
+        // The operation and form without its registers.
+        let text = format!("{op:?}");
+        let mut key = String::new();
+        for (index, part) in text.split(", ").enumerate() {
+            let register = ["rd: ", "rn: ", "rm: "].iter().any(|field| {
+                part.trim_start_matches(|c: char| c != 'r')
+                    .starts_with(field)
+            });
+            if index == 0 || !register {
+                key.push_str(part);
+                key.push(',');
+            }
+        }
+        let count = seen.entry(key).or_default();
+        if *count >= 4 {
+            continue;
+        }
+        *count += 1;
+        entries.push(BASE + 4 * words.len() as u64);
+        words.push(word);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "fp_scalar".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("fp_scalar");
+    for (name, inline) in [("fp_scalar_code", true), ("fp_scalar_reference", false)] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            inline_fp_scalar: inline,
+            // As game builds lift: helper calls then pass FPCR and FPSR
+            // through window locals.
+            fp_status_locals: true,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        // FMOV to and from general registers never needs its helper.
+        let moves: usize = regions
+            .iter()
+            .map(|(_, source)| {
+                source
+                    .matches("echora_guest::simd::fp_move_to_general(")
+                    .count()
+                    + source
+                        .matches("echora_guest::simd::fp_move_from_general(")
+                        .count()
+            })
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Operations and forms sampled.\npub const FORMS: usize = {};",
+            seen.len()
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// FMOV helper calls left in the emission.\npub const MOVE_CALLS: usize = {moves};"
+        )
+        .expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

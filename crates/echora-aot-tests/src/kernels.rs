@@ -40,10 +40,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("convert", 0x3800),
     ("intvec", 0x3c00),
     ("fpairs", 0x4000),
+    ("fpscalar", 0x4400),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x4400;
+pub const KERNEL_SIZE: u64 = 0x4800;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -469,6 +470,38 @@ fn assemble() -> Assembler {
         ; faddp s5, v4.s2
         ; str q4, [x7], 16
         ; str s5, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Scalar float moves and conversions: FMOV both ways, SCVTF,
+        // FCVTZS, FCVT both ways, FSQRT, FRINTM and FCCMP. x0 =
+        // repetitions, x1 = source, x2 = destination, x3 = floats.
+        ; ->fpscalar:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr s0, [x6], 4
+        ; fmov w9, s0
+        ; scvtf s1, w8
+        ; fcvtzs w10, s1
+        ; fcvt d2, s1
+        ; fsqrt d3, d2
+        ; frintm d4, d3
+        ; fcvt s5, d4
+        ; cmp w10, w8
+        ; fccmp s5, s1, 0, eq
+        ; fmov s6, w9
+        ; fadd s7, s6, s5
+        ; str s7, [x7], 4
         ; subs x8, x8, 1
         ; b.ne <l2
         ; subs x0, x0, 1

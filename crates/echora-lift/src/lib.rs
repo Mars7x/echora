@@ -33,5 +33,6 @@ pub mod dispatch;
 pub mod liveness;
 pub mod simd;
 mod simd_int;
+mod simd_scalar;
 pub mod spin;
 pub mod structure;
