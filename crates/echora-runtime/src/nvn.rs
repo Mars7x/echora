@@ -5034,6 +5034,16 @@ impl Nvn {
                     }
                     return Ok(());
                 }
+                // nvnCommandBufferBarrier(cmd, NVNbarrierBits): draws in an
+                // open pass and the work before have no ordering of their
+                // own beyond what the game asks for here (storage writes
+                // read by later draws, indirect data, texture invalidates).
+                if rest == "Barrier" {
+                    if let Some(backend) = self.gpu() {
+                        backend.renderer.guest_barrier().map_err(stop)?;
+                    }
+                    return Ok(());
+                }
                 if is_state_command(rest) {
                     // Per-slot bindings are kept per stage and slot; the
                     // others keep their latest command.

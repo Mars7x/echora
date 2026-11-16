@@ -4692,6 +4692,14 @@ impl Renderer {
         self.memory_barrier()
     }
 
+    /// The game's nvnCommandBufferBarrier: its work so far is ordered
+    /// before what follows and its writes made visible (a full barrier,
+    /// ending an open pass, whatever the order and invalidate bits ask).
+    pub fn guest_barrier(&mut self) -> Result<(), String> {
+        *self.stats.entry("stat: guest barriers").or_default() += 1;
+        self.memory_barrier()
+    }
+
     /// A full memory barrier; everything written before is visible after.
     #[track_caller]
     pub(crate) fn memory_barrier(&mut self) -> Result<(), String> {
