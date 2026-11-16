@@ -125,6 +125,12 @@ pub struct Backend {
     /// (in place, pending storage, resident ranges): a memoized binding
     /// checked at this generation needs no new check.
     gpu_writes: u64,
+    /// Bumped whenever a resident pool's `gpu_dirty` ranges shrink.
+    dirty_removals: u64,
+    /// Every resident pool's `gpu_dirty` ranges, merged and sorted, as of
+    /// (`gpu_writes`, `dirty_removals`): `gpu_writes_pending` searches it
+    /// instead of every pool (ranges only grow where `gpu_writes` bumps).
+    dirty_index: std::cell::RefCell<((u64, u64), Vec<std::ops::Range<u64>>)>,
     /// A program storing through the page table was recorded since the
     /// last wait for it: its stores land in guest memory or a resident
     /// pool's copy with no range recorded (see `resolve_gpu_written`).
@@ -241,6 +247,8 @@ impl Backend {
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             gpu_writes: 0,
+            dirty_removals: 0,
+            dirty_index: std::cell::RefCell::new(((u64::MAX, 0), Vec::new())),
             page_table_writes: false,
             page_table_write_serial: 0,
             observable_serial: 0,
@@ -710,6 +718,7 @@ impl Nvn {
                 if start < end {
                     // The CPU's bytes are newer there than the GPU's.
                     remove_range(&mut pool.gpu_dirty, start..end);
+                    backend.dirty_removals += 1;
                     add_range(&mut pool.guest_dirty, start..end);
                 }
             }
@@ -759,6 +768,7 @@ impl Nvn {
                 // Both copies hold the cleared words once the fill runs.
                 remove_range(&mut pool.guest_dirty, piece.clone());
                 remove_range(&mut pool.gpu_dirty, piece.clone());
+                backend.dirty_removals += 1;
                 fills.push((pool.base, piece));
             }
         }
@@ -5085,17 +5095,34 @@ impl Nvn {
         };
         let overlaps =
             |written: &std::ops::Range<u64>| written.start < range.end && range.start < written.end;
-        backend.in_place_writes.iter().any(overlaps)
+        if backend.in_place_writes.iter().any(overlaps)
             || backend
                 .pending_storage
                 .iter()
                 .any(|(_, guest, ..)| overlaps(guest))
-            || backend.resident.values().any(|pool| {
-                let at = pool
-                    .gpu_dirty
-                    .partition_point(|dirty| dirty.end <= range.start);
-                pool.gpu_dirty.get(at).is_some_and(overlaps)
-            })
+        {
+            return true;
+        }
+        let mut index = backend.dirty_index.borrow_mut();
+        let stamp = (backend.gpu_writes, backend.dirty_removals);
+        if index.0 != stamp {
+            let mut ranges: Vec<std::ops::Range<u64>> = backend
+                .resident
+                .values()
+                .flat_map(|pool| pool.gpu_dirty.iter().cloned())
+                .collect();
+            ranges.sort_unstable_by_key(|range| range.start);
+            let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                match merged.last_mut() {
+                    Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                    _ => merged.push(range),
+                }
+            }
+            *index = (stamp, merged);
+        }
+        let at = index.1.partition_point(|dirty| dirty.end <= range.start);
+        index.1.get(at).is_some_and(overlaps)
     }
 
     pub(super) fn resolve_storage(
@@ -5295,7 +5322,9 @@ impl Nvn {
             core.memory
                 .write(piece.start, &bytes)
                 .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-            if let Some(pool) = self.gpu.as_mut().unwrap().resident.get_mut(&base) {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.dirty_removals += 1;
+            if let Some(pool) = backend.resident.get_mut(&base) {
                 if whole {
                     pool.gpu_dirty.clear();
                 } else {
@@ -5312,6 +5341,7 @@ impl Nvn {
     pub(super) fn gpu_forget_pool(&mut self, base: u64) {
         if let Some(backend) = self.gpu.as_mut() {
             backend.resident.remove(&base);
+            backend.dirty_removals += 1;
             // Its pages may be released and reused: shared spans of them
             // would keep the old ones.
             if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
