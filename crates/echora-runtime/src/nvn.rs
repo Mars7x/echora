@@ -629,6 +629,10 @@ pub struct Nvn {
     /// Mesh draws written by ECHORA_TASK_DUMP so far.
     #[serde(skip)]
     mesh_draws_dumped: u32,
+    /// ECHORA_TASK_DUMP: the present each memory pool object was made at
+    /// (its sharing into the page table waits for the next present).
+    #[serde(skip)]
+    pool_made_at: HashMap<u64, u64>,
     /// The present ECHORA_TASK_DUMP=first dumps (the first with a mesh draw).
     #[serde(skip)]
     task_dump_present: Option<u64>,
@@ -5796,7 +5800,7 @@ impl Nvn {
         // Each pool reached, whole.
         let mut pools: Vec<(u64, u64, u64)> = Vec::new();
         for address in addresses.into_iter().filter(|address| *address != 0) {
-            for (_, pool) in &self.objects {
+            for (object, pool) in &self.objects {
                 if pool.kind != "MemoryPool" {
                     continue;
                 }
@@ -5811,6 +5815,12 @@ impl Nvn {
                     && !pools.iter().any(|known| known.0 == gpu)
                 {
                     pools.push((gpu, memory, size));
+                    let flags = pool.builder.get("Flags").map_or(0, |flags| flags.x[0]);
+                    text += &format!(
+                        "pool {gpu:#x} object {object:#x} flags {flags:#x} made at present {:?} (now {})\n",
+                        self.pool_made_at.get(object),
+                        self.presented_frames
+                    );
                 }
             }
         }
@@ -6118,6 +6128,9 @@ impl Nvn {
         if kind == "MemoryPool" {
             self.memory_pools.insert(address);
             self.new_pools.push(address);
+            if debug_var_os("ECHORA_TASK_DUMP").is_some() {
+                self.pool_made_at.insert(address, self.presented_frames);
+            }
         }
         self.objects.insert(
             address,
