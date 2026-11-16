@@ -6022,6 +6022,11 @@ impl Nvn {
         write("draw.txt".into(), text.as_bytes())
     }
 
+    /// Presents so far.
+    pub fn presents(&self) -> u64 {
+        self.presented_frames
+    }
+
     /// Debug aid for shader translation: with ECHORA_SHADER_DIR set, write
     /// each stage's code (up to 64 KiB, clipped to its memory pool) and
     /// control section (first 4 KiB) as stage-<key>.{code,control}. The code

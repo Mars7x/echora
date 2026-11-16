@@ -3666,6 +3666,19 @@ impl Machine {
         if self.svc_trace.len() < 4096 {
             self.svc_trace.push(event);
         }
+        // ECHORA_MEMORY_LOG (debugging): each heap resize and memory
+        // unmap or map, with the present it happened at (released pages
+        // under a span the GPU imported keep their old contents there).
+        if matches!(number, 0x01 | 0x04 | 0x05 | 0x2c | 0x2d)
+            && crate::nvn::debug_var_os("ECHORA_MEMORY_LOG").is_some()
+        {
+            eprintln!(
+                "memory svc {number:#x} present {} args {:x?} heap size {:#x}",
+                self.nvn.presents(),
+                &args[..3],
+                self.heap_size
+            );
+        }
         match number {
             0x01 => {
                 // Raw Horizon SVC ABI: size is X1; result/base return in X0/X1.
