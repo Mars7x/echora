@@ -6,9 +6,26 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{
-    Core, Machine, Trap, early_exit_code, early_exit_table_code, svc_wrapper_code,
-    svc_wrapper_table_code, two_level_code, two_level_table_code,
+use echora_aot_tests::{Core, Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_early_exit.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_svc_wrapper.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_two_level.rs"));
+}
+use lifted::{
+    early_exit_code, early_exit_table_code, svc_wrapper_code, svc_wrapper_table_code,
+    two_level_code, two_level_table_code,
 };
 
 fn run(dispatch: fn(&mut Core) -> Result<(), Trap>, x5: u64) -> [u64; 31] {

@@ -22,8 +22,23 @@ mod common;
 use std::collections::HashMap;
 
 use common::*;
-use echora_aot_tests::{Core, Machine, Trap, exclusive_code};
+use echora_aot_tests::{Core, Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_exclusive.rs"));
+}
 use echora_lift::aarch64::{Instruction, decode};
+use lifted::exclusive_code;
 
 const STATES_PER_SEQUENCE: usize = 12;
 const SVC_EXIT: u32 = 0xd400_00e1;

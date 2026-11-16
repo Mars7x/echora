@@ -15,7 +15,22 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{Machine, Trap, fp_status_code, fp_status_reference};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_fp_status.rs"));
+}
+use lifted::{fp_status_code, fp_status_reference};
 
 /// Float bit patterns that make the helpers raise or check something.
 const FLOATS: &[u32] = &[

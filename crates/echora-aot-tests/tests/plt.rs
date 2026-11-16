@@ -7,7 +7,22 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{Machine, Trap, plt_code};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_plt.rs"));
+}
+use lifted::plt_code;
 
 const DATA_SIZE: u64 = 0x1000;
 /// Instructions the caller runs: its own 7, four per stub run (four), the

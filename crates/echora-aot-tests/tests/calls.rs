@@ -13,12 +13,26 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{
-    Core, Machine, READ, STATE_NORMAL, Trap, WRITE, call_code, call_function_code,
-    call_function_table_code, call_mixed_code, call_summary_code, call_summary_table_code,
-    call_transitive_code,
-};
+use echora_aot_tests::{Core, Machine, READ, STATE_NORMAL, Trap, WRITE};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_call.rs"));
+}
 use echora_lift::aarch64::{Instruction, decode};
+use lifted::{
+    call_code, call_function_code, call_function_table_code, call_mixed_code, call_summary_code,
+    call_summary_table_code, call_transitive_code,
+};
 
 const STATES_PER_CALLER: usize = 16;
 const STACK: u64 = 0xc0_0000;

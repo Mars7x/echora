@@ -9,10 +9,23 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{
-    Machine, Trap, float_run_code, float_run_load_code, float_run_load_reference,
-    float_run_reference,
-};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_float_run.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_float_run_load.rs"));
+}
+use lifted::{float_run_code, float_run_load_code, float_run_load_reference, float_run_reference};
 
 const STATES_PER_PROGRAM: usize = 400;
 const FZ: u32 = 1 << 24;

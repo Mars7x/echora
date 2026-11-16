@@ -17,7 +17,22 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{Machine, Trap, fp_scalar_code, fp_scalar_reference};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_fp_scalar.rs"));
+}
+use lifted::{fp_scalar_code, fp_scalar_reference};
 
 const FPCR_FZ: u32 = 1 << 24;
 const FPCR_DN: u32 = 1 << 25;

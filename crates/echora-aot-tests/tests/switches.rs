@@ -12,8 +12,23 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{Machine, Trap, switch_code};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_switch.rs"));
+}
 use echora_lift::aarch64::{Instruction, decode};
+use lifted::switch_code;
 
 const STATES_PER_PROGRAM: usize = 16;
 const SVC_EXIT: u32 = 0xd400_00e1;

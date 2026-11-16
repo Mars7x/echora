@@ -106,29 +106,53 @@ fn split(
 
 /// Every program lifted through split emission (what real builds use).
 fn split_programs(out: &mut String) {
-    kernel_code(out);
-    semantic_code(out);
-    simd_semantic_code(out);
-    fp_semantic_code(out);
-    simd_memory_code(out);
-    sequence_code(out);
-    call_code(out);
-    loop_code(out);
-    exclusive_code(out);
-    switch_code(out);
-    spin_candidates(out);
-    irreducible_candidates(out);
-    concurrency_code(out);
-    stress_code(out);
-    plt_code(out);
-    spill_code(out);
-    float_run_code(out);
-    float_run_load_code(out);
-    deferred_charge_code(out);
-    early_exit_code(out);
-    two_level_code(out);
-    svc_wrapper_code(out);
+    for (_, generate) in SPLIT_PROGRAMS {
+        generate(out);
+    }
 }
+
+/// The split programs' lifts, in the golden hashes' order, by the file of
+/// `OUT_DIR` each is written to (`lifted_<name>.rs`, see `main`): a test
+/// includes only the lifts it runs, so no one compilation holds them all
+/// (one crate with every lift took 9 GB to check). `kernel` goes into the
+/// library (`programs.rs`): the benchmarks and several tests use it.
+type Generator = fn(&mut String);
+const SPLIT_PROGRAMS: &[(&str, Generator)] = &[
+    ("kernel", kernel_code),
+    ("semantic", semantic_code),
+    ("simd_semantic", simd_semantic_code),
+    ("fp_semantic", fp_semantic_code),
+    ("simd_memory", simd_memory_code),
+    ("sequence", sequence_code),
+    ("call", call_code),
+    ("loop", loop_code),
+    ("exclusive", exclusive_code),
+    ("switch", switch_code),
+    ("spin_candidates", spin_candidates),
+    ("irreducible_candidates", irreducible_candidates),
+    ("concurrency", concurrency_code),
+    ("stress", stress_code),
+    ("plt", plt_code),
+    ("spill", spill_code),
+    ("float_run", float_run_code),
+    ("float_run_load", float_run_load_code),
+    ("deferred_charge", deferred_charge_code),
+    ("early_exit", early_exit_code),
+    ("two_level", two_level_code),
+    ("svc_wrapper", svc_wrapper_code),
+];
+
+/// Lifted outside the golden hashes, each to its own file as
+/// `SPLIT_PROGRAMS`.
+const OTHER_PROGRAMS: &[(&str, Generator)] = &[
+    ("flag", flag_code),
+    ("fp_status", fp_status_code),
+    ("vector_unary", vector_unary_code),
+    ("vector_int", vector_int_code),
+    ("fp_scalar", fp_scalar_code),
+    ("vector_misc", vector_misc_code),
+    ("fallback_count", fallback_count_code),
+];
 
 /// Hashes of the split programs' emitted Rust with the default options and
 /// with inline_vector alone (what game builds use), whatever this build's
@@ -331,18 +355,17 @@ fn main() {
     let translation = discover(&[region(&words)], &entries, 400).expect("sharded_hole");
     module(&mut out, "sharded_hole", &emit_rust(&translation));
 
-    split_programs(&mut out);
-    // Lifted with fused flags whatever the features, outside the golden
-    // hashes of the default emission.
-    flag_code(&mut out);
-    fp_status_code(&mut out);
-    vector_unary_code(&mut out);
-    vector_int_code(&mut out);
-    fp_scalar_code(&mut out);
-    vector_misc_code(&mut out);
-    fallback_count_code(&mut out);
-
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    for &(name, generate) in SPLIT_PROGRAMS.iter().chain(OTHER_PROGRAMS) {
+        if name == "kernel" {
+            generate(&mut out);
+            continue;
+        }
+        let mut text = String::new();
+        generate(&mut text);
+        std::fs::write(out_dir.join(format!("lifted_{name}.rs")), text)
+            .expect("write a generated lift");
+    }
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
     golden(&out_dir);
     if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
@@ -463,7 +486,10 @@ fn flag_code(out: &mut String) {
         };
         words.extend_from_slice(&program);
         // One program per 1 KiB window.
-        words.resize(words.len().next_multiple_of(256), SVC_EXIT);
+        // The rest of the window UDF: each program ends at an SVC, and
+        // discovery stops at the UDF after it (padding of SVCs was lifted
+        // as hundreds of blocks a window).
+        words.resize(words.len().next_multiple_of(256), 0);
         entries.push(start);
         programs.push((start, fuses));
     };

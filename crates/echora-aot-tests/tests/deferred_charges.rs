@@ -5,7 +5,22 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{Core, Machine, Trap, deferred_charge_code, deferred_charge_reference};
+use echora_aot_tests::{Core, Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_deferred_charge.rs"));
+}
+use lifted::{deferred_charge_code, deferred_charge_reference};
 
 type Dispatch = fn(&mut Core) -> Result<(), Trap>;
 

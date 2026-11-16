@@ -15,12 +15,27 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{Machine, Trap, simd_semantic_code};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_simd_semantic.rs"));
+}
 use echora_lift::aarch64::{Instruction, decode};
 use echora_lift::simd::{
     CryptoOp, SimdOp, VecAcrossOp, VecIntOp, VecLongOp, VecNarrowOp, VecPermuteOp, VecShiftOp,
     VecUnaryOp, VectorLogicalOp,
 };
+use lifted::simd_semantic_code;
 
 const STATES_PER_WORD: usize = 16;
 const STRIDE: u64 = 12;

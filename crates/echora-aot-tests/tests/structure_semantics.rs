@@ -20,13 +20,35 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
-use echora_aot_tests::{
-    call_code, irreducible_candidates, loop_code, sequence_code, spin_candidates, switch_code,
-};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_call.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/lifted_irreducible_candidates.rs"
+    ));
+    include!(concat!(env!("OUT_DIR"), "/lifted_loop.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_sequence.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_spin_candidates.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lifted_switch.rs"));
+}
 use echora_lift::aarch64::{Instruction, decode};
 use echora_lift::codegen::{CodeRegion, discover_with_tables};
 use echora_lift::structure::{
     DEFAULT_WINDOW_BITS, StructureOptions, Structured, analyze_windows_with,
+};
+use lifted::{
+    call_code, irreducible_candidates, loop_code, sequence_code, spin_candidates, switch_code,
 };
 
 const STATES_PER_ENTRY: usize = 6;

@@ -6,7 +6,22 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::{Machine, Trap, spill_code};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_spill.rs"));
+}
+use lifted::spill_code;
 
 fn run(entry: u64, registers: &[(usize, u64)]) -> [u64; 31] {
     let words = spill_code::WORDS;

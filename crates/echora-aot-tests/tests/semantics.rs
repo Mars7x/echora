@@ -18,8 +18,23 @@
 mod common;
 
 use common::*;
-use echora_aot_tests::{Machine, Trap, semantic_code};
+use echora_aot_tests::{Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_semantic.rs"));
+}
 use echora_lift::aarch64::{Address, Instruction, decode};
+use lifted::semantic_code;
 
 const STATES_PER_WORD: usize = 24;
 /// Bytes per entry: the instruction, SVC #7 and SVC #8.

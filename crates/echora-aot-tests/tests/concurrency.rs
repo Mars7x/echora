@@ -15,7 +15,22 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use echora_aot_tests::{Core, Machine, Trap, concurrency_code};
+use echora_aot_tests::{Core, Machine, Trap};
+
+/// The lifts this test runs (`build.rs` writes each to its own file, so
+/// that no one compilation holds every lift).
+#[allow(
+    missing_debug_implementations,
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    unreachable_code
+)]
+mod lifted {
+    include!(concat!(env!("OUT_DIR"), "/lifted_concurrency.rs"));
+}
+use lifted::concurrency_code;
 
 const DATA: u64 = 0x200_0000;
 const FLAG: u64 = DATA;
