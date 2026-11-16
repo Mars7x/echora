@@ -639,6 +639,9 @@ pub struct Nvn {
     finalized_pools: Vec<(u64, u64, u64)>,
     #[serde(skip)]
     unpooled_seen: std::collections::HashSet<u64>,
+    /// ECHORA_TASK_DUMP_KEY: draws dumped so far.
+    #[serde(skip)]
+    key_draws_dumped: u32,
     /// ECHORA_DISPATCH_DUMP: the present being dumped and its dispatches.
     #[serde(skip)]
     dispatch_dump: (u64, u32),
@@ -5352,6 +5355,27 @@ impl Nvn {
                             Err(error) => eprintln!("dispatch dump {number}: {error}"),
                         }
                     }
+                    // ECHORA_TASK_DUMP_KEY=<stage key>,DIR (debugging, works
+                    // without a GPU): the first 64 draws whose bound programs
+                    // have that stage, dumped as ECHORA_TASK_DUMP dumps mesh
+                    // draws (key-draw-NN).
+                    if rest.starts_with("Draw")
+                        && let Ok(value) = debug_var("ECHORA_TASK_DUMP_KEY")
+                        && let Some((wanted, directory)) = value.split_once(',')
+                        && self.key_draws_dumped < 64
+                        && self
+                            .bound_stage_keys(core)
+                            .iter()
+                            .any(|key| format!("{key:016x}") == wanted)
+                    {
+                        let number = self.key_draws_dumped;
+                        self.key_draws_dumped += 1;
+                        let directory =
+                            std::path::Path::new(directory).join(format!("key-draw-{number:02}"));
+                        if let Err(error) = self.dump_mesh_draw(core, command, &directory, true) {
+                            eprintln!("key draw dump {number}: {error}");
+                        }
+                    }
                     // ECHORA_TASK_DUMP_INDIRECT: indirect ones only.
                     if rest.starts_with("DrawMeshTasks")
                         && (rest.ends_with("Indirect")
@@ -6160,6 +6184,29 @@ impl Nvn {
         }
         write("draw.txt".into(), text.as_bytes())?;
         Ok(pools)
+    }
+
+    /// The stage keys of every bound program (as ECHORA_SHADER_DIR names
+    /// them).
+    fn bound_stage_keys(&self, core: &Guest) -> Vec<u64> {
+        let mut keys = Vec::new();
+        for (key, bind) in &self.render.state {
+            if !key.starts_with("BindProgram@") {
+                continue;
+            }
+            let Some(object) = self.objects.get(&bind.x[1]) else {
+                continue;
+            };
+            for index in 0..6 {
+                if let Some(stage) = object.state.get(&format!("Stage{index}"))
+                    && let Some((_, stage_key)) = self.stage_code(core, stage.x[0])
+                    && !keys.contains(&stage_key)
+                {
+                    keys.push(stage_key);
+                }
+            }
+        }
+        keys
     }
 
     /// Presents so far.
