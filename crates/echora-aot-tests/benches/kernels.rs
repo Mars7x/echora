@@ -134,6 +134,20 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
             m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
         }
+        "intvec" => {
+            regs[0] = 500 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 16;
+        }
+        "fpairs" => {
+            regs[0] = 500 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 32;
+            m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
+            m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
+        }
         "vnorm" | "convert" => {
             regs[0] = 500 * scale;
             regs[1] = VECTOR_A;

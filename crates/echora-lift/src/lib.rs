@@ -32,5 +32,6 @@ pub mod defuse;
 pub mod dispatch;
 pub mod liveness;
 pub mod simd;
+mod simd_int;
 pub mod spin;
 pub mod structure;

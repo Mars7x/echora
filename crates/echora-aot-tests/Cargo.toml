@@ -51,6 +51,12 @@ whole-vector-checks = []
 # With inline-vector: vector FSQRT, FCVTZS/FCVTZU, FRSQRTE, FRECPE and
 # FRINT* per lane natively where exact (EmitOptions::inline_vector_unary).
 inline-vector-unary = []
+# With inline-vector: vector integer operations and element moves as
+# native code (EmitOptions::inline_vector_int).
+inline-vector-int = []
+# With inline-vector: FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP per lane natively
+# where exact (EmitOptions::inline_vector_pairwise).
+inline-vector-pairwise = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access

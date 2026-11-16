@@ -760,6 +760,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "fused-flags" => options.fused_flags = true,
                 "whole-vector-checks" => options.whole_vector_checks = true,
                 "inline-vector-unary" => options.inline_vector_unary = true,
+                "inline-vector-int" => options.inline_vector_int = true,
+                "inline-vector-pairwise" => options.inline_vector_pairwise = true,
                 "fp-status-locals" => options.fp_status_locals = true,
                 "window-memory" => options.window_memory = true,
                 "dense-dispatch" => options.dense_dispatch = true,

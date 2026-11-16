@@ -38,10 +38,12 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("calls2", 0x3000),
     ("vnorm", 0x3400),
     ("convert", 0x3800),
+    ("intvec", 0x3c00),
+    ("fpairs", 0x4000),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x3c00;
+pub const KERNEL_SIZE: u64 = 0x4400;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -405,6 +407,68 @@ fn assemble() -> Assembler {
         ; fcvtzu v3.s4, v1.s4
         ; add v4.s4, v2.s4, v3.s4
         ; str q4, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Integer vector work on halfwords: saturating add, shift,
+        // multiply, compare, saturating narrow, widen, maximum across,
+        // and moves to and from a general register. x0 = repetitions, x1
+        // = source, x2 = destination, x3 = vectors.
+        ; ->intvec:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr q0, [x6], 16
+        ; ldr q1, [x7]
+        ; sqadd v2.h8, v0.h8, v1.h8
+        ; sshr v3.h8, v2.h8, 2
+        ; mul v4.h8, v3.h8, v0.h8
+        ; cmgt v5.h8, v4.h8, v1.h8
+        ; sqxtn v6.b8, v4.h8
+        ; ushll v7.h8, v6.b8, 0
+        ; umaxv h8, v7.h8
+        ; umov w9, v8.h[0]
+        ; add x10, x10, x9
+        ; dup v9.h8, w9
+        ; and v7.b16, v7.b16, v5.b16
+        ; add v7.h8, v7.h8, v9.h8
+        ; str q7, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Float pairwise operations on 4-lane vectors: sums, maxima,
+        // minima and a scalar pairwise sum. x0 = repetitions, x1 =
+        // source, x2 = destination, x3 = vector pairs.
+        ; ->fpairs:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr q0, [x6], 16
+        ; ldr q1, [x6], 16
+        ; faddp v2.s4, v0.s4, v1.s4
+        ; fmaxp v3.s4, v0.s4, v2.s4
+        ; fminnmp v4.s4, v3.s4, v1.s4
+        ; faddp s5, v4.s2
+        ; str q4, [x7], 16
+        ; str s5, [x7], 16
         ; subs x8, x8, 1
         ; b.ne <l2
         ; subs x0, x0, 1

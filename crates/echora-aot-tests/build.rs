@@ -37,6 +37,8 @@ fn options() -> EmitOptions {
         fused_flags: std::env::var_os("CARGO_FEATURE_FUSED_FLAGS").is_some(),
         whole_vector_checks: std::env::var_os("CARGO_FEATURE_WHOLE_VECTOR_CHECKS").is_some(),
         inline_vector_unary: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_UNARY").is_some(),
+        inline_vector_int: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_INT").is_some(),
+        inline_vector_pairwise: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_PAIRWISE").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -324,6 +326,7 @@ fn main() {
     flag_code(&mut out);
     fp_status_code(&mut out);
     vector_unary_code(&mut out);
+    vector_int_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -646,6 +649,9 @@ fn vector_unary_code(out: &mut String) {
             inline_vector: true,
             whole_vector_checks: true,
             inline_vector_unary: inline,
+            // As game builds lift: helper calls then pass FPCR and FPSR
+            // through window locals.
+            fp_status_locals: true,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -664,6 +670,168 @@ fn vector_unary_code(out: &mut String) {
         )
         .expect("write");
         writeln!(out, "/// Instructions emitted with a native lane path.\npub const INLINED: usize = {inlined};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/vector_int.rs`: random words of the vector integer
+/// operations, element moves and float pairwise operations (up to 2 of
+/// each operation and form, as decoded), one word and an SVC each. Lifted
+/// with `EmitOptions::inline_vector_int` and `inline_vector_pairwise`
+/// (`vector_int_code`) and without (`vector_int_reference`).
+fn vector_int_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+    use echora_lift::simd::SimdOp;
+
+    const BASE: u64 = 0x200_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    // Helper calls the inlined lift must not keep (the float pairwise
+    // helper stays for FPCR modes the inline code does not take).
+    const INTEGER_HELPERS: &[&str] = &[
+        "vec_int(",
+        "vec_int_element(",
+        "vec_int_pairwise(",
+        "vec_unary(",
+        "vec_shift(",
+        "vec_shift_long(",
+        "vec_long(",
+        "vec_long_element(",
+        "vec_narrow(",
+        "vec_pairwise_long(",
+        "vec_across(",
+        "move_immediate(",
+        "modify_immediate(",
+        "dup_element(",
+        "dup_general(",
+        "insert_element(",
+        "insert_general(",
+        "move_to_general(",
+    ];
+    let family = |op: &SimdOp| {
+        matches!(
+            op,
+            SimdOp::VecInt { .. }
+                | SimdOp::VecIntElement { .. }
+                | SimdOp::VecIntPairwise { .. }
+                | SimdOp::VecUnary { .. }
+                | SimdOp::VecShift { .. }
+                | SimdOp::VecShiftLong { .. }
+                | SimdOp::VecLong { .. }
+                | SimdOp::VecLongElement { .. }
+                | SimdOp::VecNarrow { .. }
+                | SimdOp::VecPairwiseLong { .. }
+                | SimdOp::VecAcross { .. }
+                | SimdOp::MoveImmediate { .. }
+                | SimdOp::ModifyImmediate { .. }
+                | SimdOp::DupElement { .. }
+                | SimdOp::DupGeneral { .. }
+                | SimdOp::InsertElement { .. }
+                | SimdOp::InsertGeneral { .. }
+                | SimdOp::MoveToGeneral { .. }
+                | SimdOp::VecFpPairwise { .. }
+        )
+    };
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut per_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut state = 0x5eed_0f1e_2d3c_4b5au64;
+    for _ in 0..3_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // The SIMD data-processing space (op0 x111).
+        let word = (state as u32 & !0x0e00_0000) | 0x0e00_0000;
+        let Instruction::Simd(op) = decode(word, 0) else {
+            continue;
+        };
+        if !family(&op) {
+            continue;
+        }
+        let text = format!("{op:?}");
+        // The operation and form without its registers; at most 2 words
+        // each, and 500 per kind of operation (immediates and indices make
+        // many forms).
+        let mut key = String::new();
+        for (index, part) in text.split(", ").enumerate() {
+            let register = ["rd: ", "rn: ", "rm: "].iter().any(|field| {
+                part.trim_start_matches(|c: char| c != 'r')
+                    .starts_with(field)
+            });
+            if index == 0 || !register {
+                key.push_str(part);
+                key.push(',');
+            }
+        }
+        let kind = text.split(' ').next().unwrap_or_default().to_owned();
+        if *per_kind.get(&kind).unwrap_or(&0) >= 500 {
+            continue;
+        }
+        let count = seen.entry(key).or_default();
+        if *count >= 2 {
+            continue;
+        }
+        *count += 1;
+        *per_kind.entry(kind).or_default() += 1;
+        entries.push(BASE + 4 * words.len() as u64);
+        words.push(word);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "vector_int".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("vector_int");
+    for (name, inline) in [("vector_int_code", true), ("vector_int_reference", false)] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            inline_vector_int: inline,
+            inline_vector_pairwise: inline,
+            // As game builds lift: helper calls then pass FPCR and FPSR
+            // through window locals.
+            fp_status_locals: true,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        let helpers: usize = regions
+            .iter()
+            .map(|(_, source)| {
+                INTEGER_HELPERS
+                    .iter()
+                    .map(|helper| {
+                        source
+                            .matches(&format!("echora_guest::simd::{helper}"))
+                            .count()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let pairwise_lanes: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches("echora_guest::simd::vec_fp_lane(").count())
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Operations and forms sampled.\npub const FORMS: usize = {};",
+            seen.len()
+        )
+        .expect("write");
+        writeln!(out, "/// Integer and move helper calls left in the emission.\npub const HELPER_CALLS: usize = {helpers};").expect("write");
+        writeln!(out, "/// Single-lane float helper calls (pairwise fallbacks).\npub const LANE_CALLS: usize = {pairwise_lanes};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

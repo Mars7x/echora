@@ -2786,6 +2786,10 @@ fn vec_fp_arith(
 /// subtract have no flags and always run natively.
 pub fn emit_inline(op: &SimdOp) -> Option<String> {
     let p = "echora_guest::simd";
+    if let Some(code) = crate::simd_int::emit_int(op).or_else(|| crate::simd_int::emit_pairwise(op))
+    {
+        return Some(code);
+    }
     match *op {
         // Vector FSQRT, FCVTZS/FCVTZU, FRSQRTE, FRECPE, FRINT* (with
         // `EmitOptions::inline_vector_unary`): under the FPCR the helper

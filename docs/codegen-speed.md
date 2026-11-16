@@ -546,6 +546,60 @@ more than the call. The other kernels have
 no such operation: memset (+88%, +89%) and switch (+32%, +29%) moved with
 code layout, the rest within noise.
 
+## Vector integer operations, element moves and float pairwise (opt-in)
+
+What an `inline-vector` lift still sent to helpers (every decodable SIMD
+word sampled, `simd::emit_inline` asked of each): every vector integer
+operation but ADD and SUB, every element move (DUP, INS, UMOV/SMOV, MOVI,
+ORR/BIC immediate), the pairwise and across-lanes forms, and among floats
+FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP, FMAXV and the like, FABD, FMULX,
+conversions other than those of `inline-vector-unary`, and the scalar
+FSQRT and FRINT*; also TBL/TBX, SDOT/UDOT, PMULL and the crypto
+instructions.
+
+`EmitOptions::inline_vector_int` (`inline-vector-int`, with
+`inline-vector`) writes out the helpers' own lane functions for the
+operation's lane width: three-same (`int_lane`: compares, MUL/MLA/MLS,
+min/max, absolute differences, halving and rounding-halving adds,
+saturating adds and subtracts, SQDMULH/SQRDMULH, the register shifts
+SSHL/USHL/SRSHL/URSHL/SQSHL/UQSHL/SQRSHL/UQRSHL), by element, pairwise
+(ADDP, SMAXP, ...), unary (ABS, NEG, NOT, CNT, CLZ, CLS, RBIT, REV*,
+compares against zero), shifts by immediate (SHL, SSHR, USHR, SSRA, USRA,
+SRSHR, URSHR, SRSRA, URSRA, SQSHL, UQSHL, SQSHLU, SHRN), SSHLL/USHLL, the
+widening operations (SADDL, SSUBW, SMULL, SMLAL, SABAL, ...), the
+narrowing ones (XTN, SQXTN, UQXTN, SQXTUN, with their shifting and rounding
+forms), SADDLP/UADDLP/SADALP/UADALP, ADDV/SMAXV/UMINV/SADDLV/UADDLV, and
+the element moves. The same arithmetic (i128 where the helper widens), the
+same saturation and FPSR.QC, the same zeroing of what Vd's form does not
+write; nothing traps. `EmitOptions::inline_vector_pairwise`
+(`inline-vector-pairwise`): FADDP, FMAXP, FMINP, FMAXNMP and FMINNMP per
+result lane natively when the pair is normal or zero (and for FADDP the sum
+normal or zero, under FPSR.IXC already set, as the other inlined float
+operations), any other lane through the exact single-lane helper.
+
+`tests/vector_int.rs` samples random words of every such operation and
+form (4,612 forms, up to two words each), lifted with the options and
+without, and runs each from vector registers of edge lanes (0, 1, all
+ones, the sign bit, the largest positive, float edges, shift counts at
+every lane width in every byte) and random bits, with FZ, DN, QC and IXC
+varied and a rounding mode the float helpers trap on: every register, FPSR
+and the trap must agree. The lift with the options must keep no integer or
+move helper call. Dropping QC, reversing REV's order, misplacing the upper
+half of a narrow, not clearing a W register's upper half (UMOV), letting a
+NaN pair through FADDP, replicating DUP over 16 bytes for a 64-bit vector,
+an off-by-one CLS or SRSHR rounding constant, or SSHL's shift of exactly
+the lane width each fail it. Its lifts, like `vector_unary`'s, keep FPCR
+and FPSR in window locals as game builds do.
+
+Kernels (game set vs game set plus both options, two rounds of seven
+runs, best): `intvec` (halfword SQADD, SSHR, MUL, CMGT, SQXTN, USHLL,
+UMAXV, UMOV, DUP, AND, ADD) 55.8 to 484.2 and 56.6 to 483.0 Minstr/s
+(+768%, +754%); `fpairs` (FADDP, FMAXP, FMINNMP, scalar FADDP) 72.5 to
+449.7 and 72.4 to 468.9 (+520%, +548%). Kernels without these
+operations: memset (-47%, -47%) and switch (-18%, -14%) moved with code
+layout (memset has measured both about 1,850 and 3,500 Minstr/s from
+unchanged code in these runs), the rest within noise.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in

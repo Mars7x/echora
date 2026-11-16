@@ -4945,6 +4945,16 @@ pub struct EmitOptions {
     /// (`crate::simd::set_inline_vector_unary`); any other lane goes
     /// through the helper alone (its scalar form), never the whole vector.
     pub inline_vector_unary: bool,
+    /// With `inline_vector`: vector integer operations (three-same, by
+    /// element, pairwise, unary, shifts by immediate, widening, narrowing,
+    /// across lanes) and element moves (DUP, INS, UMOV/SMOV, MOVI, ORR/BIC
+    /// immediate) as native code: the helpers' lane functions written out
+    /// for the operation's lane width (`crate::simd_int`).
+    pub inline_vector_int: bool,
+    /// With `inline_vector`: FADDP, FMAXP, FMINP, FMAXNMP and FMINNMP per
+    /// lane natively under the inlined float operations' rules, any other
+    /// lane through the exact single-lane helper.
+    pub inline_vector_pairwise: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5170,6 +5180,25 @@ struct InlineVectorUnary(bool);
 impl Drop for InlineVectorUnary {
     fn drop(&mut self) {
         crate::simd::set_inline_vector_unary(self.0);
+    }
+}
+
+/// Restores `crate::simd_int`'s inlined integer operations when it goes.
+struct InlineVectorInt(bool);
+
+impl Drop for InlineVectorInt {
+    fn drop(&mut self) {
+        crate::simd_int::set_inline_vector_int(self.0);
+    }
+}
+
+/// Restores `crate::simd_int`'s inlined float pairwise operations when it
+/// goes.
+struct InlineVectorPairwise(bool);
+
+impl Drop for InlineVectorPairwise {
+    fn drop(&mut self) {
+        crate::simd_int::set_inline_vector_pairwise(self.0);
     }
 }
 
@@ -5518,6 +5547,8 @@ struct RegionSettings {
     split_ticks: SplitTicks,
     whole_vector_checks: WholeVectorChecks,
     inline_vector_unary: InlineVectorUnary,
+    inline_vector_int: InlineVectorInt,
+    inline_vector_pairwise: InlineVectorPairwise,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5548,6 +5579,12 @@ impl RegionSettings {
             inline_vector_unary: InlineVectorUnary(crate::simd::set_inline_vector_unary(
                 options.inline_vector_unary,
             )),
+            inline_vector_int: InlineVectorInt(crate::simd_int::set_inline_vector_int(
+                options.inline_vector_int,
+            )),
+            inline_vector_pairwise: InlineVectorPairwise(
+                crate::simd_int::set_inline_vector_pairwise(options.inline_vector_pairwise),
+            ),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,
