@@ -189,6 +189,11 @@ struct Submitter {
     error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Nanoseconds the thread spent in vkQueueSubmit, for the statistics.
     submit_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Batches handed to the thread, and those whose vkQueueSubmit has
+    /// returned: a batch's fence and command buffer are the call's until
+    /// then, even once the fence has signalled.
+    handed: u64,
+    submitted: std::sync::Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -197,11 +202,13 @@ impl Submitter {
         let (sender, receiver) = std::sync::mpsc::channel::<(vk::CommandBuffer, vk::Fence)>();
         let error = std::sync::Arc::new(std::sync::Mutex::new(None));
         let submit_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let submitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (device, queue) = (gpu.device.clone(), gpu.queue);
         let thread = std::thread::Builder::new()
             .name("echora-submit".into())
             .spawn({
-                let (error, submit_ns) = (error.clone(), submit_ns.clone());
+                let (error, submit_ns, submitted) =
+                    (error.clone(), submit_ns.clone(), submitted.clone());
                 move || {
                     for (commands, fence) in receiver {
                         let buffers = [commands];
@@ -214,6 +221,7 @@ impl Submitter {
                         // again until its fence signals; the queue is held.
                         let result = unsafe { device.queue_submit(queue, &submit, fence) };
                         drop(held);
+                        submitted.fetch_add(1, std::sync::atomic::Ordering::Release);
                         submit_ns.fetch_add(
                             start.elapsed().as_nanos() as u64,
                             std::sync::atomic::Ordering::Relaxed,
@@ -232,6 +240,8 @@ impl Submitter {
             sender: Some(sender),
             error,
             submit_ns,
+            handed: 0,
+            submitted,
             thread: Some(thread),
         })
     }
@@ -433,6 +443,9 @@ struct Slot {
     retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
+    /// The submit thread's batch number of this slot's last submission (0:
+    /// submitted on the recording thread).
+    handed: u64,
     /// Serial of its last submission.
     serial: u64,
     /// Markers its commands set (`mark`), freed once it completes.
@@ -673,6 +686,7 @@ impl Renderer {
                 retired_texel_buffers: Vec::new(),
                 retired_shared: Vec::new(),
                 in_flight: false,
+                handed: 0,
                 serial: 0,
                 markers: Vec::new(),
                 open_pass: None,
@@ -767,6 +781,7 @@ impl Renderer {
                 retired_texel_buffers: Vec::new(),
                 retired_shared: Vec::new(),
                 in_flight: false,
+                handed: 0,
                 serial: 0,
                 markers: Vec::new(),
                 open_pass: None,
@@ -2579,21 +2594,33 @@ impl Renderer {
         Ok(())
     }
 
+    /// Whether the submit thread's vkQueueSubmit of batch `handed` has
+    /// returned (always, for batches submitted on this thread).
+    fn submit_returned(&self, handed: u64) -> bool {
+        self.submitter.as_ref().is_none_or(|submitter| {
+            submitter
+                .submitted
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= handed
+        })
+    }
+
     /// Note the submissions that have finished, without waiting: their
     /// slots are freed and `completed_handle` moves on.
     pub fn poll_completed(&mut self) -> Result<(), String> {
-        let signaled = |renderer: &Self, fence: vk::Fence| {
-            // SAFETY: the fence is live.
-            unsafe { renderer.gpu.device.get_fence_status(fence) }.unwrap_or(false)
+        let signaled = |renderer: &Self, slot: &Slot| {
+            // SAFETY: the fence is live, and no vkQueueSubmit uses it now.
+            renderer.submit_returned(slot.handed)
+                && unsafe { renderer.gpu.device.get_fence_status(slot.fence) }.unwrap_or(false)
         };
         for index in 0..self.spares.len() {
-            if self.spares[index].in_flight && signaled(self, self.spares[index].fence) {
+            if self.spares[index].in_flight && signaled(self, &self.spares[index]) {
                 self.swap_with(index);
                 self.finish_current()?;
                 self.swap_with(index);
             }
         }
-        if self.slot.in_flight && signaled(self, self.slot.fence) {
+        if self.slot.in_flight && signaled(self, &self.slot) {
             self.finish_current()?;
         }
         Ok(())
@@ -2752,7 +2779,7 @@ impl Renderer {
         // SAFETY: the buffer was begun.
         unsafe { device.end_command_buffer(self.slot.commands) }
             .map_err(vk_error("vkEndCommandBuffer"))?;
-        if let Some(submitter) = &self.submitter {
+        if let Some(submitter) = &mut self.submitter {
             if let Some(error) = submitter
                 .error
                 .lock()
@@ -2767,6 +2794,8 @@ impl Renderer {
                 .ok_or("the submit thread has stopped")?
                 .send((self.slot.commands, self.slot.fence))
                 .map_err(|_| "the submit thread has stopped".to_string())?;
+            submitter.handed += 1;
+            self.slot.handed = submitter.handed;
             *self
                 .stats
                 .entry("stat: flush ns handing to the submit thread")
@@ -2815,6 +2844,11 @@ impl Renderer {
             return Err(error);
         }
         let wait_start = std::time::Instant::now();
+        // A fence is the submit thread's while its vkQueueSubmit runs (the
+        // call holds it exclusively): waited on once that call returned.
+        while !self.submit_returned(self.slot.handed) {
+            std::thread::yield_now();
+        }
         let device = &self.gpu.device;
         // SAFETY: the fence belongs to a submitted batch (or one handed to
         // the submit thread: the wait covers its submission).
