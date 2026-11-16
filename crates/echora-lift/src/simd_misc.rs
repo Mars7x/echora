@@ -71,6 +71,10 @@ pub(crate) fn emit_transfer(op: &SimdOp) -> Option<String> {
     if !ON.get() {
         return None;
     }
+    transfer(op).map(|code| crate::simd::census_mark("misc", code))
+}
+
+fn transfer(op: &SimdOp) -> Option<String> {
     match *op {
         SimdOp::TransferSingle {
             rt,

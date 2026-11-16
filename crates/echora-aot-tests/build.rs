@@ -45,6 +45,7 @@ fn options() -> EmitOptions {
         // A build flag, not an emission choice: these programs are built
         // by this crate's own flags.
         align_windows: false,
+        census: false,
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -76,6 +77,9 @@ fn kernel_options() -> EmitOptions {
     }
     EmitOptions {
         structured: std::env::var_os("CARGO_FEATURE_STRUCTURED_KERNELS").is_some(),
+        // Markers for `KERNEL_CENSUS` (comments: the kernels compile the
+        // same).
+        census: true,
         ..options()
     }
 }
@@ -1208,6 +1212,32 @@ fn kernel_code(out: &mut String) {
         )
     };
     writeln!(out, "pub mod kernel_code {{").expect("write");
+    // The census of each kernel's window (and the leaf functions'), as a
+    // Markdown table (`echora_lift::census`).
+    let mut rows = Vec::new();
+    let mut named: Vec<(u64, &str)> = kernels::KERNEL_ENTRIES
+        .iter()
+        .map(|&(name, offset)| ((kernels::KERNEL_BASE + offset) >> 10, name))
+        .collect();
+    named.push(((kernels::KERNEL_BASE + 0x1000) >> 10, "(leaf functions)"));
+    for (_, source) in &regions {
+        for (function, counts) in echora_lift::census::census(source) {
+            let label = named
+                .iter()
+                .find(|(window, _)| function == format!("run_window_{window:x}"))
+                .map_or(function.clone(), |(_, name)| (*name).to_owned());
+            rows.push((label, counts));
+        }
+    }
+    // Not in the golden hashes' emissions (which hash this module's text).
+    if MODE.get().is_none() {
+        writeln!(
+            out,
+            "/// The census of the kernels' windows (`echora_lift::census::table`).\npub const KERNEL_CENSUS: &str = {:?};",
+            echora_lift::census::table(&rows)
+        )
+        .expect("write");
+    }
     for (region, source) in regions {
         let source = match source.find("\n#[inline(never)]") {
             Some(at) if pad != 0 => format!("{}\n{padding}{}", &source[..at], &source[at..]),

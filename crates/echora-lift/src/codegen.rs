@@ -4972,6 +4972,10 @@ pub struct EmitOptions {
     /// to the workspace's rustflags), so a window's loops sit at the same
     /// place in their 64-byte fetch lines whatever code comes before it.
     pub align_windows: bool,
+    /// Each inlined operation's code starts with a `/*inline:<option>*/`
+    /// comment naming the option that inlined it, for `crate::census`;
+    /// nothing compiled changes.
+    pub census: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5225,6 +5229,15 @@ struct InlineFpScalar(bool);
 impl Drop for InlineFpScalar {
     fn drop(&mut self) {
         crate::simd_scalar::set_inline_fp_scalar(self.0);
+    }
+}
+
+/// Restores `crate::simd`'s census markers when it goes.
+struct Census(bool);
+
+impl Drop for Census {
+    fn drop(&mut self) {
+        crate::simd::set_census(self.0);
     }
 }
 
@@ -5671,6 +5684,7 @@ struct RegionSettings {
     inline_fp_scalar: InlineFpScalar,
     inline_vector_misc: InlineVectorMisc,
     count_fallbacks: Flag,
+    census: Census,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5714,6 +5728,7 @@ impl RegionSettings {
                 options.inline_vector_misc,
             )),
             count_fallbacks: Flag::set(&COUNT_FALLBACKS, options.count_fallbacks),
+            census: Census(crate::simd::set_census(options.census)),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,

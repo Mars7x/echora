@@ -2785,14 +2785,55 @@ fn vec_fp_arith(
 /// runs, from the unchanged registers. Vector logic and integer add and
 /// subtract have no flags and always run natively.
 pub fn emit_inline(op: &SimdOp) -> Option<String> {
-    let p = "echora_guest::simd";
-    if let Some(code) = crate::simd_int::emit_int(op)
-        .or_else(|| crate::simd_int::emit_pairwise(op))
-        .or_else(|| crate::simd_scalar::emit_fp_scalar(op))
-        .or_else(|| crate::simd_misc::emit_misc(op))
-    {
-        return Some(code);
+    let (source, code) = if let Some(code) = crate::simd_int::emit_int(op) {
+        ("int", code)
+    } else if let Some(code) = crate::simd_int::emit_pairwise(op) {
+        ("pairwise", code)
+    } else if let Some(code) = crate::simd_scalar::emit_fp_scalar(op) {
+        ("fp-scalar", code)
+    } else if let Some(code) = crate::simd_misc::emit_misc(op) {
+        ("misc", code)
+    } else {
+        let unary = matches!(
+            *op,
+            SimdOp::VecFpUnary { op: unary, size, q, scalar, fbits: 0, .. }
+                if INLINE_VECTOR_UNARY.get()
+                    && (scalar || q || size == FpSize::S)
+                    && unary_lane(unary, size).is_some()
+        );
+        (
+            if unary { "unary" } else { "vector" },
+            emit_inline_base(op)?,
+        )
+    };
+    Some(census_mark(source, code))
+}
+
+thread_local! {
+    /// `EmitOptions::census` of the region being emitted.
+    static CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets whether inlined operations carry census markers
+/// (`EmitOptions::census`); returns the previous setting.
+pub(crate) fn set_census(on: bool) -> bool {
+    CENSUS.replace(on)
+}
+
+/// `code` with a `/*inline:source*/` marker for `crate::census` when
+/// `EmitOptions::census` is on (a comment: nothing compiled changes).
+pub(crate) fn census_mark(source: &str, code: String) -> String {
+    if CENSUS.get() {
+        format!("/*inline:{source}*/{code}")
+    } else {
+        code
     }
+}
+
+/// `emit_inline` for the operations `inline_vector` (and
+/// `inline_vector_unary`) inline.
+fn emit_inline_base(op: &SimdOp) -> Option<String> {
+    let p = "echora_guest::simd";
     match *op {
         // Vector FSQRT, FCVTZS/FCVTZU, FRSQRTE, FRECPE, FRINT* (with
         // `EmitOptions::inline_vector_unary`): under the FPCR the helper

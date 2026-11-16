@@ -27,6 +27,7 @@
 extern crate echora_simd;
 
 pub mod aarch64;
+pub mod census;
 pub mod codegen;
 pub mod defuse;
 pub mod dispatch;

@@ -763,6 +763,58 @@ about 16 * (CV / d)^2 runs of each build, alternating, compared by median
 spread between them as noise: a single relink can move a hot loop's speed
 by a third.
 
+## Where emitted code spends its operations (census)
+
+`echora_lift::census` counts, per window or lifted function of emitted
+Rust, guest loads and stores by width (direct through the window's view
+of memory, or checked: `read`/`write`, LDP/STP of Q registers, atomics
+and exclusives), calls and indirect branches, flag computations kept and
+fused, stores and reloads of register locals inside the body (NZCV, FPCR
+and FPSR among them), block charges, helper calls by helper (fallbacks
+inside inlined code included) and inlined operations by the option that
+inlined them (`EmitOptions::census` marks them with comments; nothing
+compiled changes). aot-tests' `kernel_code::KERNEL_CENSUS` is the table
+for the kernels as built; `cargo test --release -p echora-aot-tests
+--features <options> --test census -- --nocapture` prints it. With the
+game set and `inline-vector-unary`, `-int`, `-pairwise`,
+`inline-fp-scalar` and `inline-vector-misc`:
+
+| function | loads 1/2/4/8 | stores 1/2/4/8 | checked | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| arith | 0/0/0/0 | 0/0/0/0 | 0 | 0 | 0 | 1/0 | 0 (0) | 0 (0) | 4 | - | - |
+| memcpy | 0/0/0/0 | 0/0/0/0 | 4 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| memset | 0/0/0/0 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| calls | 0/0/0/0 | 0/0/0/0 | 0 | 2 | 0 | 1/0 | 4 (1) | 6 (2) | 5 | - | - |
+| (leaf functions) | 0/0/0/0 | 0/0/0/0 | 0 | 0 | 2 | 0/0 | 0 (0) | 0 (0) | 2 | - | - |
+| switch | 0/1/0/0 | 0/0/0/0 | 0 | 0 | 1 | 1/0 | 0 (0) | 0 (0) | 12 | - | - |
+| vector | 0/0/0/4 | 0/0/0/0 | 0 | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 5 | vec_fp 3, vec_fp_lane 3 | vector 3 |
+| poll | 0/0/0/0 | 0/0/0/0 | 1 | 0 | 0 | 0/0 | 0 (0) | 0 (0) | 3 | - | - |
+| scalar | 0/0/1/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 1 (1) | 7 (7) | 5 | fp_binary 1, fp_compare 1, fp_ternary 1 | vector 5 |
+| ldst | 0/0/0/1 | 0/0/0/1 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| floats | 0/0/3/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
+| floatld | 0/0/4/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
+| calls2 | 0/0/0/2 | 0/0/0/2 | 0 | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - |
+| vnorm | 0/0/0/2 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 |
+| convert | 0/0/0/2 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 |
+| intvec | 0/0/0/4 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 |
+| fpairs | 0/0/0/4 | 0/0/1/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 |
+| fpscalar | 0/0/1/0 | 0/0/1/0 | 0 | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 |
+| misc | 0/0/0/2 | 0/0/0/0 | 3 | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 |
+
+The slowest kernels per guest instruction are the vector float ones
+(vector, vnorm, misc, fpairs: 280 to 470 Minstr/s against 1,600 to 5,400
+for the integer ones): none of their hot paths calls a helper (every
+helper call left is a fallback, and `count-fallbacks` counts none in any
+kernel) or spills, so what they spend is the inlined float operations
+themselves, 3 to 11 a loop, each testing its operands and results and
+the FPCR. memcpy moves Q register pairs through the checked
+`Cpu::load_q_pair`/`store_q_pair` (4 checked accesses a loop, 1,590
+Minstr/s against ldst's 5,400 with direct ones): a direct path for LDP/STP
+of Q registers, as LDR/STR of Q already have, is the next candidate the
+numbers point at. The FPCR and FPSR reloads (up to 34 a window) are
+around those fallback calls, off the hot paths; switch spends its
+operations on block charges (12 for 11 blocks).
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in
