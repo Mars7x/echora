@@ -3792,12 +3792,30 @@ impl Renderer {
 
     /// Debugging: name a piece of work in the current submission.
     pub fn label(&mut self, label: String) {
-        if self.gpu.buffer_marker.is_some() {
+        if self.gpu.buffer_marker.is_some() && Self::hang_mark_kind(&label) {
             self.hang_mark(&label);
         }
         if self.labels.len() < 4096 {
             self.labels.push(label);
         }
+    }
+
+    /// ECHORA_HANG_MARKER_KINDS=draw,dispatch (debugging): mark only work
+    /// whose label names one of these kinds ("present N <kind> ..."); all
+    /// work is marked without it.
+    fn hang_mark_kind(label: &str) -> bool {
+        static KINDS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+        let kinds = KINDS.get_or_init(|| {
+            std::env::var("ECHORA_HANG_MARKER_KINDS")
+                .ok()
+                .map(|kinds| kinds.split(',').map(str::to_owned).collect())
+        });
+        kinds.as_ref().is_none_or(|kinds| {
+            label
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|kind| kinds.iter().any(|wanted| wanted == kind))
+        })
     }
 
     /// ECHORA_HANG_MARKERS: a marker before the work `label` names, written
