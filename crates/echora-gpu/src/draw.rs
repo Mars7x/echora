@@ -1297,6 +1297,13 @@ impl Renderer {
             }
             // The pass stays open for the next draw into the same targets.
         }
+        // ECHORA_PASS_PER_DRAW (debugging): end the pass after every draw,
+        // as hang markers before each draw did (they kept the forest load
+        // from hanging), without the markers' cache flushes and events.
+        static PASS_PER_DRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PASS_PER_DRAW.get_or_init(|| std::env::var_os("ECHORA_PASS_PER_DRAW").is_some()) {
+            self.end_pass();
+        }
         self.time_item(false);
         self.lap("stat: renderer ns commands", &mut since);
         Ok(written

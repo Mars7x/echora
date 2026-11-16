@@ -4703,8 +4703,22 @@ impl Renderer {
                 .map(|bits| &*format!("stat: guest barriers bits {bits:#04x}").leak())
                 .collect()
         });
-        *self.stats.entry("stat: guest barriers").or_default() += 1;
+        let total = self.stats.entry("stat: guest barriers").or_default();
+        *total += 1;
+        // A run that hangs never reports its stats: the counts so far go
+        // to the log every 20,000 barriers.
+        let report = *total % 20_000 == 0;
         *self.stats.entry(names[(bits & 0xff) as usize]).or_default() += 1;
+        if report {
+            let mut counts: Vec<(&str, u64)> = self
+                .stats
+                .iter()
+                .filter(|(name, _)| name.starts_with("stat: guest barriers"))
+                .map(|(name, count)| (*name, *count))
+                .collect();
+            counts.sort_unstable();
+            eprintln!("gpu: guest barriers so far {counts:?}");
+        }
         self.memory_barrier()
     }
 
