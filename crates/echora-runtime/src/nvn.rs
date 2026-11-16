@@ -355,6 +355,8 @@ type ResolvedBinding = (
     echora_gpu::draw::Sampler,
     Option<std::ops::Range<u64>>,
     u64,
+    // The present it was resolved or last revalidated in.
+    u64,
 );
 
 /// A render target's width, height, format, mip levels and shape.

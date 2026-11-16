@@ -2191,7 +2191,9 @@ impl Nvn {
             self.texture_epoch,
             self.gpu.as_ref().unwrap().renderer.target_changes,
             self.binding_serial,
-            self.presented_frames,
+            // Across presents: entries are revalidated per present
+            // (`memoized_binding`).
+            0,
         );
         if self.binding_memo.0 != stamp {
             self.binding_memo = (stamp, Default::default());
@@ -2236,6 +2238,7 @@ impl Nvn {
                     sampler_state,
                     storage,
                     self.gpu_writes_now(),
+                    self.presented_frames,
                 ),
             );
             entries.push(echora_gpu::pool::PoolEntry {
@@ -4969,7 +4972,28 @@ impl Nvn {
         handle: u64,
     ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
         let now = self.gpu_writes_now();
-        let (source, sampler, storage, checked) = self.binding_memo.1.get(&handle)?;
+        let frame = self.presented_frames;
+        let (source, _, _, _, present) = self.binding_memo.1.get(&handle)?;
+        // From an earlier present: a render target's binding holds while
+        // the target set is unchanged (the stamp) and no blocks drawn since
+        // wait to be copied into it (`texture_source` brings those in); an
+        // upload is checked against guest memory once per present, so it
+        // is resolved again.
+        if *present != frame {
+            let current = match source {
+                echora_gpu::draw::TextureSource::Target(key)
+                | echora_gpu::draw::TextureSource::TargetView { key, .. } => {
+                    !self.block_aliases.contains_key(key)
+                }
+                _ => false,
+            };
+            if !current {
+                return None;
+            }
+            self.binding_memo.1.get_mut(&handle).unwrap().4 = frame;
+            return self.memoized_binding(handle);
+        }
+        let (source, sampler, storage, checked, _) = self.binding_memo.1.get(&handle)?;
         if *checked != now {
             if storage
                 .as_ref()
@@ -7520,7 +7544,9 @@ impl Nvn {
                             self.texture_epoch,
                             self.gpu.as_ref().unwrap().renderer.target_changes,
                             self.binding_serial,
-                            self.presented_frames,
+                            // Across presents: entries are revalidated per
+                            // present (`memoized_binding`).
+                            0,
                         );
                         if self.binding_memo.0 != stamp {
                             let old = self.binding_memo.0;
@@ -7588,7 +7614,13 @@ impl Nvn {
                         let sampler = self.binding_sampler(handle, &source);
                         self.binding_memo.1.insert(
                             handle,
-                            (source.clone(), sampler, storage, self.gpu_writes_now()),
+                            (
+                                source.clone(),
+                                sampler,
+                                storage,
+                                self.gpu_writes_now(),
+                                self.presented_frames,
+                            ),
                         );
                         textures.insert((index, descriptor.binding), (source, sampler));
                     }
