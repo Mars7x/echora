@@ -96,6 +96,10 @@ impl Renderer {
                 }
             }
         }
+        // An indirect dispatch's bounded group counts (`bounded_indirect`).
+        if dispatch.indirect.is_some() {
+            bytes += 32;
+        }
         self.reserve(bytes, descriptors)?;
         let mut writes = Vec::new();
         let mut images = Vec::new();
@@ -240,6 +244,20 @@ impl Renderer {
                 .update_descriptor_sets(&descriptor_writes, &[])
         };
         let objects = self.gpu.shader_objects()?.clone();
+        // The group counts an indirect dispatch reads, bounded by the
+        // device's limit on the GPU (`mesh_count`), before the condition.
+        let indirect = match dispatch.indirect {
+            Some(source) => {
+                let (ring, at) = self.ring_upload(&[0; 12], 16)?;
+                if self.bounded_indirect(source, (ring, at), 3)? {
+                    Some((ring, at))
+                } else {
+                    self.stat("stat: dispatch counts read unbounded", 1);
+                    Some(source)
+                }
+            }
+            None => None,
+        };
         // Gated on the guest's render condition, as the hardware gates
         // compute too.
         let commands = self.commands()?;
@@ -322,7 +340,7 @@ impl Renderer {
                     &[],
                 );
             }
-            match dispatch.indirect {
+            match indirect {
                 Some((buffer, offset)) => device.cmd_dispatch_indirect(commands, buffer, offset),
                 None => {
                     let [x, y, z] = dispatch.groups;

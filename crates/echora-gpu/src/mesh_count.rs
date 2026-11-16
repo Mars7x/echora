@@ -98,11 +98,13 @@ impl MeshCount {
             let count = counts[(draw % u64::from(LOGGED)) as usize];
             largest = largest.max(count);
             if count > TASK_WORKGROUPS {
-                eprintln!("gpu: indirect mesh draw {draw}: count {count} past {TASK_WORKGROUPS}");
+                eprintln!(
+                    "gpu: indirect draw or dispatch {draw}: count {count} past {TASK_WORKGROUPS}"
+                );
             }
         }
         eprintln!(
-            "gpu: indirect mesh counts of draws {from}..{} ({why}): largest {largest}",
+            "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}",
             self.next
         );
     }
@@ -118,15 +120,19 @@ impl MeshCount {
 }
 
 impl Renderer {
-    /// Record, outside a rendering pass, the move of the group count at
-    /// `source` (its buffer and offset) into `target`'s first word,
-    /// bounded by TASK_WORKGROUPS, ordered after earlier writes and before
-    /// the indirect draw that reads it. False when the device cannot
-    /// address the buffers (the caller copies the count unbounded).
-    pub(crate) fn bounded_mesh_count(
+    /// Record, outside a rendering pass and any render condition, the move
+    /// of `words` group counts (1: an NVN mesh draw's one, the target's y
+    /// and z set to 1; 3: a dispatch's x, y and z) at `source` (its buffer
+    /// and offset) into `target`, each bounded by TASK_WORKGROUPS (also
+    /// the minimum maxComputeWorkGroupCount), ordered after earlier writes
+    /// and before the indirect draw or dispatch that reads them. False
+    /// when the device cannot address the buffers (the caller copies the
+    /// counts unbounded).
+    pub(crate) fn bounded_indirect(
         &mut self,
         source: (vk::Buffer, u64),
         target: (vk::Buffer, u64),
+        words: u32,
     ) -> Result<bool, String> {
         let (Some(source_address), Some(target_address)) =
             (self.buffer_address(source.0), self.buffer_address(target.0))
@@ -137,6 +143,8 @@ impl Renderer {
             self.mesh_count = Some(MeshCount::new(self)?);
         }
         let commands = self.commands()?;
+        // A condition left active would gate the program as well.
+        self.end_condition();
         let mesh_count = self.mesh_count.as_mut().expect("made above");
         let slot = mesh_count.next % u64::from(LOGGED);
         mesh_count.next += 1;
@@ -148,7 +156,7 @@ impl Renderer {
         .iter()
         .flat_map(|word| word.to_le_bytes())
         .chain(TASK_WORKGROUPS.to_le_bytes())
-        .chain([0; 4])
+        .chain(words.to_le_bytes())
         .collect();
         let (pipeline, layout) = (mesh_count.pipeline, mesh_count.layout);
         // The count an earlier pass wrote is read by the program.
@@ -213,9 +221,10 @@ pub(crate) fn logging() -> bool {
     *ON.get_or_init(|| std::env::var_os("ECHORA_MESH_COUNT_LOG").is_some())
 }
 
-/// One invocation: `*target = min(*source, bound); *log = *source` (u32).
-/// The push constants hold the source, target and log addresses (u64),
-/// then the bound.
+/// One invocation: for each of the 3 words, `target[i] = i < words ?
+/// min(source[i], bound) : 1`, and `*log` the largest source word used
+/// (u32). The push constants hold the source, target and log addresses
+/// (u64), then the bound and the word count.
 fn bound_program() -> Vec<u32> {
     use spirv::{capability, decoration, execution, glsl, op, storage};
     let mut module = Module::new();
@@ -225,14 +234,15 @@ fn bound_program() -> Vec<u32> {
     module.memory_model(capability::ADDRESSING_PHYSICAL_STORAGE_BUFFER64, 1);
     let glsl_set = module.glsl();
     let void = module.void();
+    let bool_type = module.bool();
     let u32_type = module.u32();
     let u64_type = module.u64();
     let block = module.ty(Type::Struct {
-        members: vec![u64_type, u64_type, u64_type, u32_type],
+        members: vec![u64_type, u64_type, u64_type, u32_type, u32_type],
     });
     module.decorate(block, decoration::BLOCK, &[]);
-    for member in 0..4 {
-        module.member_decorate(block, member, decoration::OFFSET, &[member * 8]);
+    for (member, offset) in [0, 8, 16, 24, 28].into_iter().enumerate() {
+        module.member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
     }
     let push_pointer = module.pointer(storage::PUSH_CONSTANT, block);
     let push = module.global_variable(push_pointer, storage::PUSH_CONSTANT);
@@ -243,9 +253,11 @@ fn bound_program() -> Vec<u32> {
         result: void,
         parameters: Vec::new(),
     });
-    let members: Vec<u32> = (0..4)
+    let members: Vec<u32> = (0..5)
         .map(|value| module.constant(u32_type, value))
         .collect();
+    let one = module.constant(u32_type, 1);
+    let zero = module.constant(u32_type, 0);
     let mut main = Function::new(&mut module, void, function_type);
     let field = |main: &mut Function, module: &mut Module, member: usize, pointer, ty| {
         let at = main.value(module, op::ACCESS_CHAIN, pointer, &[push, members[member]]);
@@ -255,19 +267,43 @@ fn bound_program() -> Vec<u32> {
     let target = field(&mut main, &mut module, 1, push_u64, u64_type);
     let log = field(&mut main, &mut module, 2, push_u64, u64_type);
     let bound = field(&mut main, &mut module, 3, push_u32, u32_type);
-    // Memory operand Aligned (2), 4.
-    let source = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[source]);
-    let count = main.value(&mut module, op::LOAD, u32_type, &[source, 2, 4]);
-    let bounded = main.value(
-        &mut module,
-        op::EXT_INST,
-        u32_type,
-        &[glsl_set, glsl::U_MIN, count, bound],
-    );
-    let target = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target]);
-    main.emit(op::STORE, &[target, bounded, 2, 4]);
+    let words = field(&mut main, &mut module, 4, push_u32, u32_type);
+    let offsets: Vec<u32> = (0..3u64)
+        .map(|index| module.constant64(u64_type, index * 4))
+        .collect();
+    let mut largest = zero;
+    for index in 0..3u32 {
+        let offset = offsets[index as usize];
+        let source_at = main.value(&mut module, op::I_ADD, u64_type, &[source, offset]);
+        let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offset]);
+        // Memory operand Aligned (2), 4.
+        let source_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[source_at]);
+        let count = main.value(&mut module, op::LOAD, u32_type, &[source_at, 2, 4]);
+        let used = main.value(
+            &mut module,
+            op::U_LESS_THAN,
+            bool_type,
+            &[members[index as usize], words],
+        );
+        let bounded = main.value(
+            &mut module,
+            op::EXT_INST,
+            u32_type,
+            &[glsl_set, glsl::U_MIN, count, bound],
+        );
+        let value = main.value(&mut module, op::SELECT, u32_type, &[used, bounded, one]);
+        let target_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target_at]);
+        main.emit(op::STORE, &[target_at, value, 2, 4]);
+        let raw = main.value(&mut module, op::SELECT, u32_type, &[used, count, zero]);
+        largest = main.value(
+            &mut module,
+            op::EXT_INST,
+            u32_type,
+            &[glsl_set, glsl::U_MAX, largest, raw],
+        );
+    }
     let log = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[log]);
-    main.emit(op::STORE, &[log, count, 2, 4]);
+    main.emit(op::STORE, &[log, largest, 2, 4]);
     main.emit(op::RETURN, &[]);
     let entry_point = main.id;
     main.finish(&mut module);
