@@ -765,6 +765,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "inline-fp-scalar" => options.inline_fp_scalar = true,
                 "inline-vector-misc" => options.inline_vector_misc = true,
                 "count-fallbacks" => options.count_fallbacks = true,
+                "align-windows" => options.align_windows = true,
                 "fp-status-locals" => options.fp_status_locals = true,
                 "window-memory" => options.window_memory = true,
                 "dense-dispatch" => options.dense_dispatch = true,
@@ -1026,6 +1027,16 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
     let target_cpu = std::env::var("ECHORA_TARGET_CPU").unwrap_or_else(|_| "native".into());
     flags.push("-C".into());
     flags.push(format!("target-cpu={target_cpu}"));
+    // align-windows: every function 64-byte aligned, so code added or
+    // removed elsewhere does not move a window's loops within their 64-byte
+    // fetch lines (the speed of a hot loop can change by a third with
+    // that position; docs/codegen-speed.md). It is a build flag: the
+    // emission is unchanged, and it applies to every crate of the build,
+    // listed regions or not.
+    if options.align_windows || (!listed_regions.is_empty() && listed_options.align_windows) {
+        flags.push("-C".into());
+        flags.push("llvm-args=-align-all-functions=6".into());
+    }
     let config = format!("[build]\nrustflags = {flags:?}\n");
     write_if_changed(&out.join(".cargo/config.toml"), &config)?;
     std::fs::write(

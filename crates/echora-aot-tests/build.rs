@@ -42,6 +42,9 @@ fn options() -> EmitOptions {
         inline_fp_scalar: std::env::var_os("CARGO_FEATURE_INLINE_FP_SCALAR").is_some(),
         inline_vector_misc: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_MISC").is_some(),
         count_fallbacks: std::env::var_os("CARGO_FEATURE_COUNT_FALLBACKS").is_some(),
+        // A build flag, not an emission choice: these programs are built
+        // by this crate's own flags.
+        align_windows: false,
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -284,6 +287,7 @@ fn main() {
     println!("cargo::rerun-if-changed=src/programs.rs");
     println!("cargo::rerun-if-changed=src/kernels.rs");
     println!("cargo::rerun-if-changed=src/stress.rs");
+    println!("cargo::rerun-if-env-changed=ECHORA_KERNEL_PAD");
     let mut out = String::new();
     for (name, words) in PROGRAMS {
         let translation = discover(&[region(words)], &[CODE_BASE], 100)
@@ -1186,8 +1190,29 @@ fn kernel_code(out: &mut String) {
     // the kernels' functions stay in their region.
     LIFTED.set(LIFTED.get() + translation.instructions.len());
     let (root, regions) = emit_rust_split_with(&translation, 16, kernel_options());
+    // ECHORA_KERNEL_PAD=n (measuring layout sensitivity): a function of n
+    // kept additions before the kernels' windows in their region, so the
+    // same generated code lands at other addresses.
+    let pad: usize = std::env::var("ECHORA_KERNEL_PAD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let padding = if pad == 0 {
+        String::new()
+    } else {
+        let sum: String = (0..pad)
+            .map(|index| format!(" + std::hint::black_box({index}u64)"))
+            .collect();
+        format!(
+            "#[inline(never)]\nfn layout_pad() -> u64 {{ 0{sum} }}\n#[used]\nstatic LAYOUT_PAD: fn() -> u64 = layout_pad;\n"
+        )
+    };
     writeln!(out, "pub mod kernel_code {{").expect("write");
     for (region, source) in regions {
+        let source = match source.find("\n#[inline(never)]") {
+            Some(at) if pad != 0 => format!("{}\n{padding}{}", &source[..at], &source[at..]),
+            _ => source,
+        };
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");

@@ -4966,6 +4966,12 @@ pub struct EmitOptions {
     /// `FALLBACKS`); the root's `fallback_counts` sums them over the
     /// regions and `print_fallback_counts` prints them.
     pub count_fallbacks: bool,
+    /// For the build, not the emission (nothing generated changes): the
+    /// translation's crates are compiled with every function aligned to
+    /// 64 bytes (`echora lift` adds `-C llvm-args=-align-all-functions=6`
+    /// to the workspace's rustflags), so a window's loops sit at the same
+    /// place in their 64-byte fetch lines whatever code comes before it.
+    pub align_windows: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every

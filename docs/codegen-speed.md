@@ -714,6 +714,55 @@ generated code is the same in both builds, and their windows' machine code
 is the same instruction for instruction, at another address (ldst's window
 at 0x3d020 against 0x3cd50): alignment, from the added code before it.
 
+## Layout sensitivity and aligned functions (opt-in build flag)
+
+Adding code to the kernels once cost arith 11-18% and ldst 19-34% in both
+rounds, with their generated and machine code unchanged and only at
+another address. Measured on this machine (Intel Xeon, family 6 model
+207, Emerald Rapids; the JCC erratum of Skylake-era cores does not apply):
+`ECHORA_KERNEL_PAD=n` (aot-tests `build.rs`) puts a function of n kept
+additions before the kernels' windows, moving the same code by 0, 64, 80,
+96, 128 and 144 bytes (pads 0, 1, 2, 3, 5, 8: shifts of 0, 16 and 32
+modulo 64). Each binary ran each kernel six times alternating with the
+others, best of seven each time, pinned to one CPU.
+
+Without alignment, the best rate follows the hot loop's place in its
+64-byte lines: memset 2,868, 3,120 and 3,704 Minstr/s at shift 0, 1,792 to
+1,915 at shift 32; ldst 4,577 to 5,853 at shift 0, 3,482 to 4,162 at 32.
+The hot loops are 63 to 118 bytes and always cross a line (ldst's: 113
+bytes, eight guest-level loads, stores and checks); where they start
+decides how many 64-byte fetch windows of the decoded-instruction cache
+they take. Spread of the best rate over the six layouts: memset 75%, ldst
+50%, switch 43%, arith 21%.
+
+`-C llvm-args=-align-loops=64` does not reach these loops: their headers
+have a fallthrough predecessor, and LLVM leaves such a header unaligned.
+`-C llvm-args=-align-all-functions=6` (every function 64-byte aligned) does
+fix the place of every loop relative to the lines: it then depends only on
+its own function's code. Spread with it: memset 22%, ldst 27%, switch 23%,
+arith 23% — the noise floor, as three binaries with every window at the
+same address differ as much (medians ldst 2,469 to 3,394, arith 2,618 to
+3,921). The mean moves either way, as each loop lands where its function
+puts it: arith +10%, switch +15%, ldst -18%, memset -20%. It makes speed
+reproducible, not higher.
+
+`EmitOptions::align_windows` (`align-windows`) is that flag: `echora lift`
+adds it to the translation's `.cargo/config.toml` rustflags; nothing
+generated changes (it applies to every crate of the build, listed regions
+or not). Use it on both builds of a comparison, so that code added in one
+place does not move the loops of every other region.
+
+Comparing two game builds: on this machine one best-of-seven kernel rate
+varies by 18% (coefficient of variation, quartiles 12-24%). Measure the
+noise of the game's own metric first (two runs of the same build, several
+times), then, with CV the run-to-run variation and d the change to see,
+about 16 * (CV / d)^2 runs of each build, alternating, compared by median
+(a 5% change at CV 10% needs 64 runs a side; at CV 18%, 200). Without
+`align-windows` on both, also relink each build at three or more layouts
+(any unrelated code change moves everything after it) and count the
+spread between them as noise: a single relink can move a hot loop's speed
+by a third.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in
