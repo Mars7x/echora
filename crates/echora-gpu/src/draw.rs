@@ -73,6 +73,20 @@ pub struct VertexStream {
     pub stride: u32,
     pub divisor: u32,
     pub data: Vec<u8>,
+    /// Guest bytes (address, length) read straight into the ring through
+    /// the draw's `read_guest`, instead of copied into `data` first.
+    pub guest: Option<(u64, usize)>,
+}
+
+impl VertexStream {
+    /// The stream's length in bytes.
+    pub fn len(&self) -> usize {
+        self.guest.map_or(self.data.len(), |(_, length)| length)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -401,7 +415,7 @@ pub struct Draw<'a> {
     /// straight into the upload ring as the draw is recorded, through
     /// `read_guest`, instead of copied into `uniforms` first.
     pub guest_uniforms: crate::FastMap<(usize, u32), (u64, usize)>,
-    /// Reads guest memory for `guest_uniforms`.
+    /// Reads guest memory for `guest_uniforms` and guest vertex streams.
     pub read_guest: Option<&'a dyn Fn(u64, &mut [u8]) -> Result<(), String>>,
     /// Texture bindings by (stage index, binding).
     pub textures: crate::FastMap<(usize, u32), (TextureSource, Sampler)>,
@@ -712,7 +726,7 @@ impl Renderer {
         bytes += draw
             .streams
             .iter()
-            .map(|stream| stream.data.len() as u64 + 16)
+            .map(|stream| stream.len() as u64 + 16)
             .sum::<u64>();
         bytes += match &draw.indices {
             Indices::None => 0,
@@ -888,7 +902,12 @@ impl Renderer {
         // Vertex streams and indices.
         let mut vertex_buffers = Vec::new();
         for stream in &draw.streams {
-            vertex_buffers.push(self.ring_upload(&stream.data, 16)?);
+            vertex_buffers.push(match (stream.guest, draw.read_guest) {
+                (Some((guest, length)), Some(read)) if length > 0 => {
+                    self.ring_upload_with(length as u64, 16, |bytes| read(guest, bytes))?
+                }
+                _ => self.ring_upload(&stream.data, 16)?,
+            });
         }
         let index = match &draw.indices {
             Indices::None => None,
@@ -1408,6 +1427,7 @@ pub(crate) mod tests {
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
                     .collect(),
+                guest: None,
             }],
             indices: Indices::None,
             count: 4,

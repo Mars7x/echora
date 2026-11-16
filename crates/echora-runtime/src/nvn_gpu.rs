@@ -8115,6 +8115,7 @@ impl Nvn {
                     stride: stride as u32,
                     divisor: value(props, "Divisor") as u32,
                     data: Vec::new(),
+                    guest: None,
                 });
                 continue;
             };
@@ -8142,14 +8143,16 @@ impl Nvn {
                     };
                     let (address, size) = (bind.x[2] + skip, reach.saturating_sub(skip));
                     self.resolve_gpu(core, address, size)?;
-                    self.gpu_bytes(core, address, size)?
+                    // Read into the ring when recorded, not copied here.
+                    Some((self.gpu_to_guest(address, size)?, size as usize))
                 }
-                _ => Vec::new(),
+                _ => None,
             };
             streams.push(VertexStream {
                 stride: value(props, "Stride") as u32,
                 divisor: value(props, "Divisor") as u32,
-                data,
+                data: Vec::new(),
+                guest: data,
             });
         }
         // ECHORA_FETCH_BEYOND=<stage key>[,...] (debugging): each bound
@@ -8210,6 +8213,7 @@ impl Nvn {
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
                     .collect(),
+                guest: None,
             });
             attributes.extend(unformatted.into_iter().map(|location| VertexAttribute {
                 location,
@@ -8245,12 +8249,12 @@ impl Nvn {
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams
             .iter()
-            .map(|stream| stream.data.len())
+            .map(VertexStream::len)
             .sum::<usize>();
         if geometry_bytes > 1 << 20 && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let strides: Vec<(u32, u32, usize)> = streams
                 .iter()
-                .map(|stream| (stream.stride, stream.divisor, stream.data.len()))
+                .map(|stream| (stream.stride, stream.divisor, stream.len()))
                 .collect();
             let note = format!(
                 "flow large geometry {:016x}/{:016x} {} {:?} vertex range {vertex_start}..{vertex_end} count {count} streams {strides:?}",
@@ -8934,7 +8938,14 @@ impl Nvn {
             };
             let vertices = streams
                 .first()
-                .map(|stream| floats(&stream.data, if traced_program { 64 } else { 9 }))
+                .map(|stream| {
+                    let mut bytes = stream.data.clone();
+                    if let Some((guest, length)) = stream.guest {
+                        bytes = vec![0; length];
+                        let _ = core.memory.read(guest, &mut bytes);
+                    }
+                    floats(&bytes, if traced_program { 64 } else { 9 })
+                })
                 .unwrap_or_default();
             let mut uniform_summary: Vec<String> = uniforms
                 .iter()
@@ -9063,7 +9074,7 @@ impl Nvn {
         let read_guest = |guest: u64, bytes: &mut [u8]| {
             core.memory
                 .read(guest, bytes)
-                .map_err(|trap| format!("reading uniforms at {guest:#x}: {trap:?}"))
+                .map_err(|trap| format!("reading guest bytes at {guest:#x}: {trap:?}"))
         };
         let draw = Draw {
             program: &backend.programs[&program_keys],
