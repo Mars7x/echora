@@ -128,9 +128,10 @@ pub struct Backend {
     /// Bumped whenever a resident pool's `gpu_dirty` ranges shrink.
     dirty_removals: u64,
     /// Every resident pool's `gpu_dirty` ranges, merged and sorted, as of
-    /// (`gpu_writes`, `dirty_removals`): `gpu_writes_pending` searches it
-    /// instead of every pool (ranges only grow where `gpu_writes` bumps).
-    dirty_index: std::cell::RefCell<((u64, u64), Vec<std::ops::Range<u64>>)>,
+    /// `dirty_removals`: `gpu_writes_pending` searches it instead of every
+    /// pool. A range added to a pool is added here too; it is rebuilt only
+    /// after ranges shrink (rebuilding per GPU write slowed spd200 ~27%).
+    dirty_index: std::cell::RefCell<(u64, Vec<std::ops::Range<u64>>)>,
     /// A program storing through the page table was recorded since the
     /// last wait for it: its stores land in guest memory or a resident
     /// pool's copy with no range recorded (see `resolve_gpu_written`).
@@ -248,7 +249,7 @@ impl Backend {
             in_place_writes: Vec::new(),
             gpu_writes: 0,
             dirty_removals: 0,
-            dirty_index: std::cell::RefCell::new(((u64::MAX, 0), Vec::new())),
+            dirty_index: std::cell::RefCell::new((u64::MAX, Vec::new())),
             page_table_writes: false,
             page_table_write_serial: 0,
             observable_serial: 0,
@@ -4373,6 +4374,10 @@ impl Nvn {
                                     .find(|pool| pool.contains(guest))
                                 {
                                     add_range(&mut pool.gpu_dirty, guest..guest + length);
+                                    add_range(
+                                        &mut backend.dirty_index.get_mut().1,
+                                        guest..guest + length,
+                                    );
                                     backend.gpu_writes += 1;
                                 }
                             }
@@ -5109,7 +5114,7 @@ impl Nvn {
             return true;
         }
         let mut index = backend.dirty_index.borrow_mut();
-        let stamp = (backend.gpu_writes, backend.dirty_removals);
+        let stamp = backend.dirty_removals;
         if index.0 != stamp {
             let mut ranges: Vec<std::ops::Range<u64>> = backend
                 .resident
@@ -5239,7 +5244,8 @@ impl Nvn {
                             .collect();
                     }
                     for piece in pieces {
-                        add_range(&mut pool.gpu_dirty, piece);
+                        add_range(&mut pool.gpu_dirty, piece.clone());
+                        add_range(&mut backend.dirty_index.get_mut().1, piece);
                     }
                     backend.gpu_writes += 1;
                 }
@@ -7118,6 +7124,7 @@ impl Nvn {
             .find(|pool| pool.base <= guest && guest + 16 <= pool.base + pool.size)
         {
             add_range(&mut pool.gpu_dirty, guest..guest + 16);
+            add_range(&mut backend.dirty_index.get_mut().1, guest..guest + 16);
             backend.gpu_writes += 1;
         }
         backend.samples_reports.insert(address);
