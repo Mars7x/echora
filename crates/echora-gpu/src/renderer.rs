@@ -440,6 +440,11 @@ struct Slot {
 }
 
 impl Slot {
+    /// Whether `size` bytes at `alignment` fit this slot's ring.
+    fn ring_fits(&self, size: u64, alignment: u64) -> bool {
+        self.ring_used.next_multiple_of(alignment) + size <= RING_SIZE
+    }
+
     /// The offset for `size` bytes at `alignment` in this slot's ring, or
     /// none when they would not fit (the slot is then sealed and the next
     /// one takes them).
@@ -473,6 +478,51 @@ impl Slot {
     /// slot's work has completed.
     fn defer_read(&mut self, token: u64, offset: u64, length: usize) {
         self.pending_reads.push((token, offset, length));
+    }
+
+    /// `bytes` copied into this slot's ring at `alignment`: the buffer
+    /// and offset, or none when the ring is full (the slot is sealed and
+    /// the next one takes them).
+    fn upload(&mut self, bytes: &[u8], alignment: u64) -> Option<(vk::Buffer, u64)> {
+        let offset = self.ring_place(bytes.len() as u64, alignment)?;
+        self.ring.write(offset as usize, bytes);
+        Some((self.ring.buffer, offset))
+    }
+
+    /// `size` bytes of this slot's ring that `fill` writes in place, or
+    /// none when the ring is full (`fill` is then not called).
+    fn upload_with(
+        &mut self,
+        size: u64,
+        alignment: u64,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let Some(offset) = self.ring_place(size, alignment) else {
+            return Ok(None);
+        };
+        fill(self.ring.slice_mut(offset as usize, size as usize))?;
+        Ok(Some((self.ring.buffer, offset)))
+    }
+
+    /// A descriptor set of `layout` from this slot's pool, or none when
+    /// the pool is full.
+    fn allocate_set(
+        &self,
+        device: &ash::Device,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<Option<vk::DescriptorSet>, String> {
+        let layouts = [layout];
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool and layout are live.
+        match unsafe { device.allocate_descriptor_sets(&info) } {
+            Ok(sets) => Ok(Some(sets[0])),
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                Ok(None)
+            }
+            Err(error) => Err(format!("vkAllocateDescriptorSets: {error}")),
+        }
     }
 }
 
@@ -1387,9 +1437,13 @@ impl Renderer {
         if size > RING_SIZE {
             return Err(format!("{size}-byte upload exceeds the ring"));
         }
-        let offset = self.ring_place(size, alignment)?;
-        self.slot.ring.write(offset as usize, bytes);
-        Ok((self.slot.ring.buffer, offset))
+        if let Some(placed) = self.slot.upload(bytes, alignment) {
+            return Ok(placed);
+        }
+        self.flush()?;
+        self.slot
+            .upload(bytes, alignment)
+            .ok_or_else(|| format!("{size} bytes do not fit an empty ring"))
     }
 
     /// `ring_upload` of `size` bytes that `fill` writes in place in the
@@ -1403,9 +1457,13 @@ impl Renderer {
         if size > RING_SIZE {
             return Err(format!("{size}-byte upload exceeds the ring"));
         }
-        let offset = self.ring_place(size, alignment)?;
-        fill(self.slot.ring.slice_mut(offset as usize, size as usize))?;
-        Ok((self.slot.ring.buffer, offset))
+        // `fill` runs once, in whichever slot takes the bytes.
+        if !self.slot.ring_fits(size, alignment) {
+            self.flush()?;
+        }
+        self.slot
+            .upload_with(size, alignment, fill)?
+            .ok_or_else(|| format!("{size} bytes do not fit an empty ring"))
     }
 
     /// Make room, before recording one draw or dispatch, for `bytes` of
@@ -1472,41 +1530,22 @@ impl Renderer {
         &mut self,
         layout: vk::DescriptorSetLayout,
     ) -> Result<vk::DescriptorSet, String> {
-        let layouts = [layout];
-        let info = |pool| {
-            vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(pool)
-                .set_layouts(&layouts)
-        };
-        // SAFETY: the pool and layout are live.
-        match unsafe {
-            self.gpu
-                .device
-                .allocate_descriptor_sets(&info(self.slot.descriptor_pool))
-        } {
-            Ok(sets) => Ok(sets[0]),
-            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
-                // Sets already written stay valid until their work is done.
-                // The flush makes another slot the one recorded: the set
-                // comes from that slot's pool, not from the pool of the
-                // submission just sent (reset when that slot is reused,
-                // under work recorded now that still uses the set).
-                self.flush()?;
-                *self
-                    .stats
-                    .entry("stat: descriptor pool full mid-draw")
-                    .or_default() += 1;
-                // SAFETY: as above, the recorded slot's pool after the flush.
-                unsafe {
-                    self.gpu
-                        .device
-                        .allocate_descriptor_sets(&info(self.slot.descriptor_pool))
-                }
-                .map(|sets| sets[0])
-                .map_err(vk_error("vkAllocateDescriptorSets"))
-            }
-            Err(error) => Err(format!("vkAllocateDescriptorSets: {error}")),
+        if let Some(set) = self.slot.allocate_set(&self.gpu.device, layout)? {
+            return Ok(set);
         }
+        // Sets already written stay valid until their work is done. The
+        // flush makes another slot the one recorded: the set comes from
+        // that slot's pool, not from the pool of the submission just sent
+        // (reset when that slot is reused, under work recorded now that
+        // still uses the set).
+        self.flush()?;
+        *self
+            .stats
+            .entry("stat: descriptor pool full mid-draw")
+            .or_default() += 1;
+        self.slot
+            .allocate_set(&self.gpu.device, layout)?
+            .ok_or_else(|| "vkAllocateDescriptorSets: an empty pool is full".to_string())
     }
 
     /// The image view a texture binding of the shader's `texture_type`
