@@ -360,6 +360,9 @@ pub struct Renderer {
     /// Changes to the set of targets (created, recreated, moved,
     /// removed): an index of them by key is current while this holds.
     pub target_changes: u64,
+    /// The keys of the targets made, remade or moved since the last
+    /// `take_changed_targets` (what `target_changes` counted).
+    changed_targets: Vec<u64>,
     pub targets_recreated: u64,
     /// Scaled targets replaced by guest-resolution ones (`keep_unscaled`).
     pub descaled: u64,
@@ -733,6 +736,7 @@ impl Renderer {
             next_read_token: 0,
             targets_created: 0,
             target_changes: 0,
+            changed_targets: Vec::new(),
             targets_recreated: 0,
             descaled: 0,
             scale: Scale::from_env(),
@@ -3547,6 +3551,7 @@ impl Renderer {
             // The old image goes once the work recorded so far has run
             // (retired with this batch), not after a wait for it all.
             self.target_changes += 1;
+            self.changed_targets.push(key);
             let old = self.targets.remove(&key).unwrap();
             // The same memory taller or shorter, as the application
             // re-initializes a texture over it (a shadow map 2048 wide and
@@ -3576,6 +3581,7 @@ impl Renderer {
             let chain = target.levels > 1 && bc_block_bytes(target.format).is_none();
             self.register_views(&target);
             self.target_changes += 1;
+            self.changed_targets.push(key);
             self.targets.insert(key, target);
             if tiny {
                 self.fresh_targets.push(key);
@@ -3600,6 +3606,7 @@ impl Renderer {
         self.targets_created += 1;
         self.register_views(&target);
         self.target_changes += 1;
+        self.changed_targets.push(key);
         self.targets.insert(key, target);
         self.transition(key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
@@ -4014,6 +4021,7 @@ impl Renderer {
         self.register_views(&target);
         let old = self.targets.insert(key, target).unwrap();
         self.target_changes += 1;
+        self.changed_targets.push(key);
         self.transition(key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
         let filter = if is_depth(format) {
@@ -4122,6 +4130,8 @@ impl Renderer {
             return Ok(());
         };
         self.target_changes += 1;
+        self.changed_targets.push(from);
+        self.changed_targets.push(to);
         // What `to` held goes once the work recorded so far has run
         // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.targets.remove(&to) {
@@ -4130,6 +4140,11 @@ impl Renderer {
         self.targets.insert(to, target);
         self.fresh_targets.retain(|fresh| *fresh != from);
         Ok(())
+    }
+
+    /// The keys of targets made, remade or moved since the last call.
+    pub fn take_changed_targets(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.changed_targets)
     }
 
     /// Targets created since the last call.

@@ -863,6 +863,10 @@ impl Nvn {
         identity: Option<(u64, u64)>,
     ) {
         self.texture_epoch += 1;
+        self.binding_evictions.push((
+            texture,
+            [previous.0, identity.map_or(0, |(storage, _)| storage)],
+        ));
         if self.depth_traced(texture) {
             eprintln!(
                 "depth trace present {} texture {texture:x} now {identity:x?} (was {previous:x?}): targets move",
@@ -2188,13 +2192,15 @@ impl Nvn {
         // Resolved handles are kept for the present as the draw path's
         // bindings are (`binding_memo`, same stamp).
         let stamp = (
-            self.texture_epoch,
-            self.gpu.as_ref().unwrap().renderer.target_changes,
+            self.binding_epoch,
+            0,
             self.binding_serial,
             // Across presents: entries are revalidated per present
-            // (`memoized_binding`).
+            // (`memoized_binding`); texture and target changes evict what
+            // they touch (`evict_bindings`).
             0,
         );
+        self.evict_bindings();
         if self.binding_memo.0 != stamp {
             self.binding_memo = (stamp, Default::default());
         }
@@ -2239,6 +2245,7 @@ impl Nvn {
                     storage,
                     self.gpu_writes_now(),
                     self.presented_frames,
+                    texture,
                 ),
             );
             entries.push(echora_gpu::pool::PoolEntry {
@@ -4973,7 +4980,7 @@ impl Nvn {
     ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
         let now = self.gpu_writes_now();
         let frame = self.presented_frames;
-        let (source, _, _, _, present) = self.binding_memo.1.get(&handle)?;
+        let (source, _, _, _, present, _) = self.binding_memo.1.get(&handle)?;
         // From an earlier present: a render target's binding holds while
         // the target set is unchanged (the stamp) and no blocks drawn since
         // wait to be copied into it (`texture_source` brings those in); an
@@ -4993,7 +5000,7 @@ impl Nvn {
             self.binding_memo.1.get_mut(&handle).unwrap().4 = frame;
             return self.memoized_binding(handle);
         }
-        let (source, sampler, storage, checked, _) = self.binding_memo.1.get(&handle)?;
+        let (source, sampler, storage, checked, _, _) = self.binding_memo.1.get(&handle)?;
         if *checked != now {
             if storage
                 .as_ref()
@@ -5006,6 +5013,62 @@ impl Nvn {
             return Some(binding);
         }
         Some((source.clone(), *sampler))
+    }
+
+    /// Drop the memoized bindings that targets made, remade or moved since
+    /// (the renderer's keys) and textures moved or finalized
+    /// (`binding_evictions`) may change: those sampling such a target, of
+    /// such a texture, or over its storage (another object's binding there
+    /// may now resolve to a render target). The other bindings stay.
+    fn evict_bindings(&mut self) {
+        let targets = self
+            .gpu
+            .as_mut()
+            .map(|backend| backend.renderer.take_changed_targets())
+            .unwrap_or_default();
+        if targets.is_empty() && self.binding_evictions.is_empty() {
+            return;
+        }
+        let mut keys: super::FastSet<u64> = super::FastSet::default();
+        let mut bases: super::FastSet<u64> = super::FastSet::default();
+        for key in targets {
+            keys.insert(key);
+            if let Some(base) = self.texture_storage(key) {
+                bases.insert(base);
+            }
+        }
+        for (texture, storages) in std::mem::take(&mut self.binding_evictions) {
+            keys.insert(texture);
+            bases.extend(storages.into_iter().filter(|base| *base != 0));
+        }
+        let stale = |entry: &super::ResolvedBinding| {
+            let source_key = match &entry.0 {
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => Some(key),
+                _ => None,
+            };
+            source_key.is_some_and(|key| keys.contains(&key))
+                || keys.contains(&entry.5)
+                || entry
+                    .2
+                    .as_ref()
+                    .is_some_and(|storage| bases.iter().any(|base| storage.contains(base)))
+        };
+        let before = self.binding_memo.1.len();
+        self.binding_memo.1.retain(|_, entry| !stale(entry));
+        let mut evicted = before != self.binding_memo.1.len();
+        for (_, memo) in self.queue_memos.values_mut() {
+            let before = memo.len();
+            memo.retain(|_, entry| !stale(entry));
+            evicted |= before != memo.len();
+        }
+        if evicted {
+            // Pool entry lists made from them are made again.
+            self.pool_inputs += 1;
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: binding memo evictions", 1);
+        }
     }
 
     /// Whether GPU writes not yet in guest memory overlap `range` (what
@@ -7541,13 +7604,16 @@ impl Nvn {
                         // Valid within a present (textures are revalidated
                         // once per present); registrations evict their ids.
                         let stamp = (
-                            self.texture_epoch,
-                            self.gpu.as_ref().unwrap().renderer.target_changes,
+                            self.binding_epoch,
+                            0,
                             self.binding_serial,
                             // Across presents: entries are revalidated per
-                            // present (`memoized_binding`).
+                            // present (`memoized_binding`); texture and
+                            // target changes evict what they touch
+                            // (`evict_bindings`).
                             0,
                         );
+                        self.evict_bindings();
                         if self.binding_memo.0 != stamp {
                             let old = self.binding_memo.0;
                             let backend = self.gpu.as_mut().unwrap();
@@ -7620,6 +7686,7 @@ impl Nvn {
                                 storage,
                                 self.gpu_writes_now(),
                                 self.presented_frames,
+                                texture,
                             ),
                         );
                         textures.insert((index, descriptor.binding), (source, sampler));

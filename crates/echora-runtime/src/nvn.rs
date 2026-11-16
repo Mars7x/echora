@@ -350,12 +350,14 @@ pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault
 /// A texture handle's resolved binding: its source, its sampler and the
 /// guest range of the texture's storage (checked for GPU writes on reuse)
 /// and the GPU write generation it was last checked at.
-type ResolvedBinding = (
+pub(crate) type ResolvedBinding = (
     echora_gpu::draw::TextureSource,
     echora_gpu::draw::Sampler,
     Option<std::ops::Range<u64>>,
     u64,
     // The present it was resolved or last revalidated in.
+    u64,
+    // The texture object the handle named.
     u64,
 );
 
@@ -429,6 +431,15 @@ pub struct Nvn {
     /// only ones it can find unshared; thousands are live).
     #[serde(skip)]
     new_pools: Vec<u64>,
+    /// Texture objects and storage bases whose memoized bindings go before
+    /// the memo is next used (`evict_bindings`): a texture moved, finalized
+    /// or made again, instead of emptying the whole memo.
+    #[serde(skip)]
+    binding_evictions: Vec<(u64, [u64; 2])>,
+    /// Changes the binding memo cannot evict by texture (a texture made
+    /// again over a live one, a window going): the memo starts empty.
+    #[serde(skip)]
+    binding_epoch: u64,
     /// `texture_storage` answers by texture, at an object generation.
     #[serde(skip)]
     /// `texture_storage_size` results, kept as `storage_memo` is.
@@ -3066,6 +3077,7 @@ impl Nvn {
                 // over a live one changes everything keyed by the epoch.
                 if self.objects.contains_key(&this) {
                     self.texture_epoch += 1;
+                    self.binding_epoch += 1;
                 } else {
                     self.storage_memo.borrow_mut().1.remove(&this);
                     self.size_memo.borrow_mut().1.remove(&this);
@@ -3127,6 +3139,12 @@ impl Nvn {
                 // the texture epoch stay.
                 if name != "nvnCommandBufferFinalize" {
                     self.texture_epoch += 1;
+                    match self.texture_storage(this) {
+                        Some(base) if name == "nvnTextureFinalize" => {
+                            self.binding_evictions.push((this, [base, 0]));
+                        }
+                        _ => self.binding_epoch += 1,
+                    }
                 }
                 let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
