@@ -386,6 +386,9 @@ pub struct Renderer {
     timer: Option<crate::timing::GpuTimer>,
     /// The SAMPLES_PASSED counter and its occlusion queries, once used.
     pub(crate) occlusion: Option<crate::occlusion::Occlusion>,
+    /// The indirect mesh draws' bounded group counts, once used
+    /// (`bounded_mesh_count`).
+    pub(crate) mesh_count: Option<crate::mesh_count::MeshCount>,
     /// The condition draws and dispatches are gated on (`set_condition`):
     /// wanted, and active in the command buffer being recorded.
     condition: Option<(vk::Buffer, u64, bool)>,
@@ -774,6 +777,7 @@ impl Renderer {
             hang: None,
             submitted_labels: Vec::new(),
             occlusion: None,
+            mesh_count: None,
             condition: None,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
@@ -5941,6 +5945,9 @@ impl Drop for Renderer {
         }
         if let Some(occlusion) = self.occlusion.take() {
             occlusion.destroy(&self.gpu.device);
+        }
+        if let Some(mesh_count) = self.mesh_count.take() {
+            mesh_count.destroy(&self.gpu.device);
         }
         if let Some(timer) = self.timer.take() {
             timer.destroy(&self.gpu.device);

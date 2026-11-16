@@ -935,44 +935,10 @@ impl Renderer {
             Some(MeshGroups::Indirect { buffer, offset }) => {
                 let words: Vec<u8> = [0u32, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
                 let (ring, at) = self.ring_upload(&words, 16)?;
-                let commands = self.commands()?;
-                let copy = vk::BufferCopy {
-                    src_offset: offset,
-                    dst_offset: at,
-                    size: 4,
-                };
-                let barrier = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ);
-                // The count an earlier pass wrote is read by the copy.
-                let written = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                // SAFETY: recording, outside rendering; both ranges exist.
-                unsafe {
-                    *self.stats.entry("stat: barriers in draw").or_default() += 1;
-                    self.gpu.device.cmd_pipeline_barrier(
-                        commands,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[written],
-                        &[],
-                        &[],
-                    );
-                    self.gpu
-                        .device
-                        .cmd_copy_buffer(commands, buffer, ring, &[copy]);
-                    *self.stats.entry("stat: barriers in draw").or_default() += 1;
-                    self.gpu.device.cmd_pipeline_barrier(
-                        commands,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::DRAW_INDIRECT,
-                        vk::DependencyFlags::empty(),
-                        &[barrier],
-                        &[],
-                        &[],
-                    );
+                // Bounded by the device's limit on the GPU (`mesh_count`);
+                // copied as it is where buffers have no addresses.
+                if !self.bounded_mesh_count((buffer, offset), (ring, at))? {
+                    self.copy_mesh_count((buffer, offset), (ring, at))?;
                 }
                 Some((ring, at))
             }
@@ -1326,6 +1292,58 @@ impl Renderer {
 pub(crate) fn words_as_bytes(words: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding and u8 has alignment 1.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 4) }
+}
+
+impl Renderer {
+    /// Copy an indirect mesh draw's group count from `source` into
+    /// `target` as it is (no bound), on devices whose buffers have no
+    /// addresses.
+    fn copy_mesh_count(
+        &mut self,
+        (buffer, offset): (vk::Buffer, u64),
+        (ring, at): (vk::Buffer, u64),
+    ) -> Result<(), String> {
+        let commands = self.commands()?;
+        let copy = vk::BufferCopy {
+            src_offset: offset,
+            dst_offset: at,
+            size: 4,
+        };
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ);
+        // The count an earlier pass wrote is read by the copy.
+        let written = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        // SAFETY: recording, outside rendering; both ranges exist.
+        unsafe {
+            *self.stats.entry("stat: barriers in draw").or_default() += 1;
+            self.gpu.device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[written],
+                &[],
+                &[],
+            );
+            self.gpu
+                .device
+                .cmd_copy_buffer(commands, buffer, ring, &[copy]);
+            *self.stats.entry("stat: barriers in draw").or_default() += 1;
+            self.gpu.device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ mod fast_map;
 
 pub use fast_map::FastMap;
 pub mod loop_guard;
+mod mesh_count;
 mod occlusion;
 pub mod pool;
 pub mod present;
