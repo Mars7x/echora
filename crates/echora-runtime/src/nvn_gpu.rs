@@ -8315,10 +8315,7 @@ impl Nvn {
             backend.page_table_write_serial = backend.renderer.recorded_serial();
         }
         phase(self, "stat: draw us geometry", &mut since);
-        let geometry_bytes = streams
-            .iter()
-            .map(VertexStream::len)
-            .sum::<usize>();
+        let geometry_bytes = streams.iter().map(VertexStream::len).sum::<usize>();
         if geometry_bytes > 1 << 20 && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let strides: Vec<(u32, u32, usize)> = streams
                 .iter()
@@ -10017,7 +10014,10 @@ mod bind_key_tests {
     fn bind_keys_name_kind_stage_and_slot() {
         assert_eq!(bind_key("BindTexture", Some(4), 7), "BindTexture/4/7");
         assert_eq!(bind_key("BindVertexBuffer", None, 3), "BindVertexBuffer/3");
-        assert_eq!(bind_key("BindSeparateSampler", Some(1), 2), "BindSeparateSampler/1/2");
+        assert_eq!(
+            bind_key("BindSeparateSampler", Some(1), 2),
+            "BindSeparateSampler/1/2"
+        );
         assert_eq!(bind_key("BindImage", Some(0), 200), "BindImage/0/200");
         let kind = String::from("BindUniformBuffer").leak();
         assert!(std::ptr::eq(

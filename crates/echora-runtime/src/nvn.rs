@@ -5711,9 +5711,10 @@ impl Nvn {
                     let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
                     let live = current
                         || self.objects.get(&key).is_some_and(|pool| {
-                        pool.kind == "MemoryPool"
-                            && pool.state.get("GpuAddress").map(|args| args.x[0]) == Some(pool_gpu)
-                    });
+                            pool.kind == "MemoryPool"
+                                && pool.state.get("GpuAddress").map(|args| args.x[0])
+                                    == Some(pool_gpu)
+                        });
                     live.then_some((memory + offset, size - offset))
                 })
         };
@@ -5761,7 +5762,8 @@ impl Nvn {
         }
         let found = find(&ranges, true);
         *self.pool_ranges.borrow_mut() = ranges;
-        self.pool_ranges_generation.set(Some(self.object_generation));
+        self.pool_ranges_generation
+            .set(Some(self.object_generation));
         found
     }
 
