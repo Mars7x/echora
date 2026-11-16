@@ -537,6 +537,20 @@ impl Emitter {
         let written = self.value(op::LOAD, self.u32, &[count]);
         let maximum = self.constant(mesh.max_primitives);
         let primitives = self.glsl(self.u32, glsl::U_MIN, &[written, maximum]);
+        // Every mesh program reads its grid size (a running workgroup's
+        // is never 0, so the count is unchanged). RADV before 26.2.5
+        // (radv_emit_userdata_mesh) leaves a mesh shader that reads neither
+        // the grid size nor the draw index with the previous vertex
+        // shader's user-SGPR state: after a vertex shader with a vertex
+        // input prolog (draw index on, three SGPRs), a mesh draw writes a
+        // SET_SH_REG sequence of three registers with one value, the
+        // command processor takes the next packet as register data, and
+        // the GPU hangs (the forest-load ring timeouts on the RX 9070 XT,
+        // Mesa 25.2.8).
+        let groups = self.builtin(BUILTIN_NUM_WORKGROUPS, 0);
+        let zero = self.constant(0);
+        let empty = self.value(op::I_EQUAL, self.bool, &[groups, zero]);
+        let primitives = self.value(op::SELECT, self.u32, &[empty, zero, primitives]);
         let vertices = self.constant(mesh.max_vertices);
         self.function
             .emit(op::SET_MESH_OUTPUTS_EXT, &[vertices, primitives]);
