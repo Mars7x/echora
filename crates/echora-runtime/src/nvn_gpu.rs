@@ -4777,6 +4777,9 @@ impl Nvn {
                         Some(&(_, address, _)) => address,
                         None => {
                             let (index, address) = backend.renderer.debug_buffer(64 << 10)?;
+                            backend
+                                .renderer
+                                .mark_loop_trace(index, format!("dispatch {:016x}", key.0));
                             backend.loop_traces.insert(key.0, (index, address, 0));
                             address
                         }
@@ -7435,6 +7438,10 @@ impl Nvn {
                             Some(&(_, address, _)) => address,
                             None => {
                                 let (buffer, address) = backend.renderer.debug_buffer(64 << 10)?;
+                                backend.renderer.mark_loop_trace(
+                                    buffer,
+                                    format!("draw {:016x}/{:016x} stage {index}", keys.0, keys.1),
+                                );
                                 backend
                                     .loop_traces
                                     .insert(trace, (buffer, address, self.presented_frames));

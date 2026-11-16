@@ -275,6 +275,9 @@ pub struct Renderer {
     /// Debugging buffers shaders write through device addresses
     /// (`debug_buffer`).
     debug_buffers: Vec<HostBuffer>,
+    /// ECHORA_LOOP_TRACE buffers (index, the program it counts), reported
+    /// when a wait stalls or the device is lost (`report_loop_traces`).
+    loop_trace_buffers: Vec<(usize, String)>,
     pool: vk::CommandPool,
     recording: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
@@ -703,6 +706,7 @@ impl Renderer {
             stats: FastMap::default(),
             pass_ends: FastMap::default(),
             debug_buffers: Vec::new(),
+            loop_trace_buffers: Vec::new(),
             timer,
             shader_cache: None,
             fatal: None,
@@ -2818,7 +2822,10 @@ impl Renderer {
         // stopped, then goes on waiting.
         // So does one with ECHORA_MESH_COUNT_LOG: the indirect mesh counts
         // read since the last report.
-        let limit = if self.hang.is_some() || crate::mesh_count::logging() {
+        let limit = if self.hang.is_some()
+            || crate::mesh_count::logging()
+            || !self.loop_trace_buffers.is_empty()
+        {
             2_000_000_000
         } else {
             u64::MAX
@@ -2836,6 +2843,7 @@ impl Renderer {
                 if let Some(mesh_count) = &self.mesh_count {
                     mesh_count.report_pending("GPU stalled over 2 s");
                 }
+                self.report_loop_traces("GPU stalled over 2 s");
             }
         }
         unsafe {
@@ -2845,6 +2853,7 @@ impl Renderer {
                     if let Some(mesh_count) = &self.mesh_count {
                         mesh_count.report_pending("fence wait failed");
                     }
+                    self.report_loop_traces("fence wait failed");
                     vk_error("vkWaitForFences")(error)
                 })?;
             device
@@ -5446,6 +5455,40 @@ impl Renderer {
     }
 
     /// Debugging: a `debug_buffer`'s bytes as they are now.
+    /// Name debug buffer `index` as a loop trace of `program`.
+    pub fn mark_loop_trace(&mut self, index: usize, program: String) {
+        self.loop_trace_buffers.push((index, program));
+    }
+
+    /// Each loop trace's loops with invocations the budget stopped, and
+    /// each loop's most iterations (when a wait stalls or fails: the trace
+    /// otherwise reports every 60 presents, after a hang never).
+    fn report_loop_traces(&self, why: &str) {
+        for (index, program) in &self.loop_trace_buffers {
+            let Some(buffer) = self.debug_buffers.get(*index) else {
+                continue;
+            };
+            let words: Vec<u32> = buffer
+                .read_bytes(64 << 10)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect();
+            for (number, entry) in words.chunks_exact(4).enumerate() {
+                if entry[0] != 0 && (entry[2] != 0 || entry[1] >= 256) {
+                    eprintln!(
+                        "loop trace ({why}) {program} loop {number} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
+                        entry[3].wrapping_sub(1),
+                        entry[0],
+                        entry[1],
+                        entry[2]
+                    );
+                }
+            }
+        }
+    }
+
     pub fn read_debug_buffer(&self, index: usize) -> Vec<u8> {
         self.debug_buffers
             .get(index)
