@@ -18,6 +18,8 @@ echora-shader-abi.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+# The workgroup simulator, to run the renderer's own small programs in tests.
+echora-shader = { workspace = true, features = ["sim"] }
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 
 [lints]

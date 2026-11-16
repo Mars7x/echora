@@ -453,6 +453,102 @@ fn bound_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// The bound program run once in the simulator: the three target words
+    /// and the logged word, for `source` words, a per-word `bound`, the
+    /// number of `words` used and a `product` bound (0: none).
+    fn bounded(source: [u32; 3], bound: u32, words: u32, product: u32) -> ([u32; 3], u32) {
+        use echora_shader::sim::{Inputs, Machine};
+        const SOURCE: u64 = 0x1000;
+        const TARGET: u64 = 0x2000;
+        const LOG: u64 = 0x3000;
+        let push: Vec<u8> = [SOURCE, TARGET, LOG]
+            .iter()
+            .flat_map(|address| address.to_le_bytes())
+            .chain(
+                [bound, words, product]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes()),
+            )
+            .collect();
+        let bytes = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+        let memory = [
+            (SOURCE, bytes(&source)),
+            (TARGET, bytes(&[0xdead_beef; 3])),
+            (LOG, bytes(&[0xdead_beef])),
+        ]
+        .into_iter()
+        .collect();
+        let report = Machine::new(&super::bound_program()).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory,
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let word = |address: u64, index: usize| {
+            let region = &report.memory[&address];
+            u32::from_le_bytes(region[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        (
+            [word(TARGET, 0), word(TARGET, 1), word(TARGET, 2)],
+            word(LOG, 0),
+        )
+    }
+
+    #[test]
+    fn a_mesh_count_is_bounded_and_its_other_groups_are_one() {
+        // One word used: the count as it is below the bound, the bound
+        // above it; y and z are 1 whatever follows the count in memory.
+        assert_eq!(bounded([5, 77, 88], 65535, 1, 0), ([5, 1, 1], 5));
+        assert_eq!(bounded([0, 77, 88], 65535, 1, 0), ([0, 1, 1], 0));
+        assert_eq!(bounded([65535, 0, 0], 65535, 1, 0), ([65535, 1, 1], 65535));
+        assert_eq!(
+            bounded([0x3f80_0000, 9, 9], 65535, 1, 0),
+            ([65535, 1, 1], 0x3f80_0000)
+        );
+        assert_eq!(bounded([u32::MAX, 0, 0], 64, 1, 0), ([64, 1, 1], u32::MAX));
+        // A probe: the word as it is.
+        assert_eq!(
+            bounded([0x1234_5678, 0, 0], u32::MAX, 1, 0),
+            ([0x1234_5678, 1, 1], 0x1234_5678)
+        );
+    }
+
+    #[test]
+    fn dispatch_groups_are_bounded_per_axis_and_in_all() {
+        // Three words used, each bounded; the largest raw word is logged.
+        assert_eq!(bounded([120, 68, 1], 65535, 3, 0), ([120, 68, 1], 120));
+        assert_eq!(
+            bounded([70000, 3, u32::MAX], 65535, 3, 0),
+            ([65535, 3, 65535], u32::MAX)
+        );
+        // The diagnostic's bounds: 64 an axis, 256 in all. Within both, as
+        // they are; past the product, x alone and y, z 1.
+        assert_eq!(bounded([16, 16, 1], 64, 3, 256), ([16, 16, 1], 16));
+        assert_eq!(bounded([16, 16, 2], 64, 3, 256), ([16, 1, 1], 16));
+        assert_eq!(
+            bounded([u32::MAX, u32::MAX, u32::MAX], 64, 3, 256),
+            ([64, 1, 1], u32::MAX)
+        );
+        assert_eq!(bounded([1000, 1, 1], 64, 3, 16), ([16, 1, 1], 1000));
+        // No group count is ever more than the product bound.
+        for source in [
+            [64, 64, 64],
+            [3, 100, 7],
+            [1, 1, 300],
+            [0, 5, 5],
+            [64, 4, 1],
+        ] {
+            let ([x, y, z], _) = bounded(source, 64, 3, 256);
+            assert!(
+                u64::from(x) * u64::from(y) * u64::from(z) <= 256,
+                "{source:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_bound_program_is_valid_spirv() {
         let words = super::bound_program();
