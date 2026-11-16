@@ -120,9 +120,16 @@ impl MeshCount {
             .reported
             .max(self.next.saturating_sub(u64::from(LOGGED)));
         let mut largest = 0;
+        // Counts a diagnostic bound cut (the tighter of the task and
+        // per-axis bounds; the log keeps one largest word a record).
+        let diagnostic = diagnostic_bound("ECHORA_DIAG_TASK_GROUPS", TASK_WORKGROUPS).min(
+            diagnostic_bound("ECHORA_DIAG_DISPATCH_AXIS", TASK_WORKGROUPS),
+        );
+        let mut cut = 0;
         for draw in from..self.next {
             let count = counts[(draw % u64::from(LOGGED)) as usize];
             largest = largest.max(count);
+            cut += u32::from(count > diagnostic);
             if count > TASK_WORKGROUPS {
                 eprintln!(
                     "gpu: indirect draw or dispatch {draw}: count {count} past {TASK_WORKGROUPS}"
@@ -130,7 +137,7 @@ impl MeshCount {
             }
         }
         eprintln!(
-            "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}",
+            "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}, {cut} past the bound {diagnostic}",
             self.next
         );
         if self.probed > 0 {
