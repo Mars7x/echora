@@ -3449,7 +3449,15 @@ impl Nvn {
                                 })
                         })
                         .collect();
-                    if base != 0 {
+                    if base != 0 && !others.is_empty() {
+                        // ECHORA_POOL_SHARE_LOG (debugging, works without a
+                        // GPU): each such finalize.
+                        if debug_var_os("ECHORA_POOL_SHARE_LOG").is_some() {
+                            eprintln!(
+                                "pool share: present {} finalize {this:#x} over {base:#x} leaves live {others:x?}",
+                                self.presented_frames
+                            );
+                        }
                         self.new_pools.extend(others);
                     }
                     self.code_pools.remove(&base);
