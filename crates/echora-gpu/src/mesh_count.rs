@@ -21,6 +21,18 @@ pub(crate) const TASK_WORKGROUPS: u32 = 65535;
 /// Counts kept in the log, the oldest overwritten.
 const LOGGED: u32 = 65536;
 
+/// Words ECHORA_DIAG_PROBE reads through the GPU's view (`probe_device_words`).
+const PROBES: u32 = 64;
+
+/// A bound from a diagnostic variable (tighter than the device limit, so a
+/// diagnostic run cannot flood the GPU through wrong counts), else `limit`.
+fn diagnostic_bound(name: &str, limit: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(limit, |bound| bound.min(limit))
+}
+
 pub(crate) struct MeshCount {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
@@ -30,6 +42,11 @@ pub(crate) struct MeshCount {
     /// Draws recorded, and the last one the log was read up to.
     next: u64,
     reported: u64,
+    /// ECHORA_DIAG_PROBE: words read through the device addresses the page
+    /// table gives (u32 each), and how many are in use.
+    probes: HostBuffer,
+    probes_address: u64,
+    probed: u32,
 }
 
 impl MeshCount {
@@ -41,9 +58,15 @@ impl MeshCount {
         let log_address = renderer
             .buffer_address(log.buffer)
             .ok_or("bounded mesh counts need buffer device addresses")?;
+        // Three words a probe (the program writes x, y and z).
+        let probes = renderer.host_buffer_with(u64::from(PROBES) * 12, usage, true)?;
+        probes.write(0, &vec![0; PROBES as usize * 12]);
+        let probes_address = renderer
+            .buffer_address(probes.buffer)
+            .ok_or("bounded mesh counts need buffer device addresses")?;
         let range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(32);
+            .size(40);
         let ranges = [range];
         let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
         // SAFETY: a valid device and create info; destroyed in `destroy`.
@@ -76,6 +99,9 @@ impl MeshCount {
             log_address,
             next: 0,
             reported: 0,
+            probes,
+            probes_address,
+            probed: 0,
         })
     }
 
@@ -107,6 +133,17 @@ impl MeshCount {
             "gpu: indirect counts of draws and dispatches {from}..{} ({why}): largest {largest}",
             self.next
         );
+        if self.probed > 0 {
+            let words: Vec<String> = self
+                .probes
+                .read_bytes(self.probed as usize * 12)
+                .as_chunks::<12>()
+                .0
+                .iter()
+                .map(|probe| format!("{:#x}", u32::from_le_bytes(probe[..4].try_into().unwrap())))
+                .collect();
+            eprintln!("gpu: probed words as the GPU read them ({why}): {words:?}");
+        }
     }
 
     pub(crate) fn destroy(self, device: &ash::Device) {
@@ -116,6 +153,7 @@ impl MeshCount {
             device.destroy_pipeline_layout(self.layout, None);
         }
         self.log.destroy(device);
+        self.probes.destroy(device);
     }
 }
 
@@ -142,22 +180,91 @@ impl Renderer {
         if self.mesh_count.is_none() {
             self.mesh_count = Some(MeshCount::new(self)?);
         }
+        // ECHORA_DIAG_TASK_GROUPS (a mesh draw's task workgroups) and
+        // ECHORA_DIAG_DISPATCH_AXIS / ECHORA_DIAG_DISPATCH_GROUPS (a
+        // dispatch's per axis and in all): diagnostic runs only.
+        static BOUNDS: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+        let (task_bound, axis_bound, product_bound) = *BOUNDS.get_or_init(|| {
+            (
+                diagnostic_bound("ECHORA_DIAG_TASK_GROUPS", TASK_WORKGROUPS),
+                diagnostic_bound("ECHORA_DIAG_DISPATCH_AXIS", TASK_WORKGROUPS),
+                diagnostic_bound("ECHORA_DIAG_DISPATCH_GROUPS", u32::MAX),
+            )
+        });
+        let (bound, product) = if words == 1 {
+            (task_bound, 0)
+        } else {
+            (
+                axis_bound,
+                if product_bound == u32::MAX {
+                    0
+                } else {
+                    product_bound
+                },
+            )
+        };
+        self.record_bound_program(
+            source_address + source.1,
+            target_address + target.1,
+            words,
+            bound,
+            product,
+            true,
+        )?;
+        Ok(true)
+    }
+
+    /// ECHORA_DIAG_PROBE (diagnostic): record reads of the u32 words at
+    /// these device addresses (as the page table resolves guest
+    /// addresses), in command order, into the probe buffer; reported with
+    /// the counts.
+    pub fn probe_device_words(&mut self, addresses: &[u64]) -> Result<(), String> {
+        if self.mesh_count.is_none() {
+            self.mesh_count = Some(MeshCount::new(self)?);
+        }
+        for &address in addresses {
+            let mesh_count = self.mesh_count.as_mut().expect("made above");
+            if mesh_count.probed >= PROBES {
+                break;
+            }
+            let slot = mesh_count.probes_address + u64::from(mesh_count.probed) * 12;
+            mesh_count.probed += 1;
+            self.record_bound_program(address, slot, 1, u32::MAX, 0, false)?;
+        }
+        Ok(())
+    }
+
+    /// The bound program over one record (see `bound_program`), outside a
+    /// rendering pass and any condition, ordered after earlier writes and
+    /// before indirect reads; `logged` keeps the count in the log.
+    fn record_bound_program(
+        &mut self,
+        source: u64,
+        target: u64,
+        words: u32,
+        bound: u32,
+        product: u32,
+        logged: bool,
+    ) -> Result<(), String> {
         let commands = self.commands()?;
         // A condition left active would gate the program as well.
         self.end_condition();
         let mesh_count = self.mesh_count.as_mut().expect("made above");
-        let slot = mesh_count.next % u64::from(LOGGED);
-        mesh_count.next += 1;
-        let push: Vec<u8> = [
-            source_address + source.1,
-            target_address + target.1,
-            mesh_count.log_address + slot * 4,
-        ]
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .chain(TASK_WORKGROUPS.to_le_bytes())
-        .chain(words.to_le_bytes())
-        .collect();
+        let log = if logged {
+            let slot = mesh_count.next % u64::from(LOGGED);
+            mesh_count.next += 1;
+            mesh_count.log_address + slot * 4
+        } else {
+            target
+        };
+        let push: Vec<u8> = [source, target, log]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .chain(bound.to_le_bytes())
+            .chain(words.to_le_bytes())
+            .chain(product.to_le_bytes())
+            .chain([0; 4])
+            .collect();
         let (pipeline, layout) = (mesh_count.pipeline, mesh_count.layout);
         // The count an earlier pass wrote is read by the program.
         let written = vk::MemoryBarrier::default()
@@ -193,8 +300,10 @@ impl Renderer {
                 &[],
             );
         }
-        self.mesh_count_report();
-        Ok(true)
+        if logged {
+            self.mesh_count_report();
+        }
+        Ok(())
     }
 
     /// ECHORA_MESH_COUNT_LOG (debugging): every 30 indirect mesh draws
@@ -238,10 +347,10 @@ fn bound_program() -> Vec<u32> {
     let u32_type = module.u32();
     let u64_type = module.u64();
     let block = module.ty(Type::Struct {
-        members: vec![u64_type, u64_type, u64_type, u32_type, u32_type],
+        members: vec![u64_type, u64_type, u64_type, u32_type, u32_type, u32_type],
     });
     module.decorate(block, decoration::BLOCK, &[]);
-    for (member, offset) in [0, 8, 16, 24, 28].into_iter().enumerate() {
+    for (member, offset) in [0, 8, 16, 24, 28, 32].into_iter().enumerate() {
         module.member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
     }
     let push_pointer = module.pointer(storage::PUSH_CONSTANT, block);
@@ -253,7 +362,7 @@ fn bound_program() -> Vec<u32> {
         result: void,
         parameters: Vec::new(),
     });
-    let members: Vec<u32> = (0..5)
+    let members: Vec<u32> = (0..6)
         .map(|value| module.constant(u32_type, value))
         .collect();
     let one = module.constant(u32_type, 1);
@@ -268,14 +377,14 @@ fn bound_program() -> Vec<u32> {
     let log = field(&mut main, &mut module, 2, push_u64, u64_type);
     let bound = field(&mut main, &mut module, 3, push_u32, u32_type);
     let words = field(&mut main, &mut module, 4, push_u32, u32_type);
+    let product = field(&mut main, &mut module, 5, push_u32, u32_type);
     let offsets: Vec<u32> = (0..3u64)
         .map(|index| module.constant64(u64_type, index * 4))
         .collect();
     let mut largest = zero;
-    for index in 0..3u32 {
-        let offset = offsets[index as usize];
-        let source_at = main.value(&mut module, op::I_ADD, u64_type, &[source, offset]);
-        let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offset]);
+    let mut values = Vec::new();
+    for index in 0..3usize {
+        let source_at = main.value(&mut module, op::I_ADD, u64_type, &[source, offsets[index]]);
         // Memory operand Aligned (2), 4.
         let source_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[source_at]);
         let count = main.value(&mut module, op::LOAD, u32_type, &[source_at, 2, 4]);
@@ -283,7 +392,7 @@ fn bound_program() -> Vec<u32> {
             &mut module,
             op::U_LESS_THAN,
             bool_type,
-            &[members[index as usize], words],
+            &[members[index], words],
         );
         let bounded = main.value(
             &mut module,
@@ -291,9 +400,7 @@ fn bound_program() -> Vec<u32> {
             u32_type,
             &[glsl_set, glsl::U_MIN, count, bound],
         );
-        let value = main.value(&mut module, op::SELECT, u32_type, &[used, bounded, one]);
-        let target_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target_at]);
-        main.emit(op::STORE, &[target_at, value, 2, 4]);
+        values.push(main.value(&mut module, op::SELECT, u32_type, &[used, bounded, one]));
         let raw = main.value(&mut module, op::SELECT, u32_type, &[used, count, zero]);
         largest = main.value(
             &mut module,
@@ -301,6 +408,31 @@ fn bound_program() -> Vec<u32> {
             u32_type,
             &[glsl_set, glsl::U_MAX, largest, raw],
         );
+    }
+    // A product bound (nonzero): past it, x alone (bounded by it) and y, z 1.
+    let xy = main.value(&mut module, op::I_MUL, u32_type, &[values[0], values[1]]);
+    let xyz = main.value(&mut module, op::I_MUL, u32_type, &[xy, values[2]]);
+    let capped = main.value(&mut module, op::I_NOT_EQUAL, bool_type, &[product, zero]);
+    let over = main.value(&mut module, op::U_GREATER_THAN, bool_type, &[xyz, product]);
+    let limit = main.value(&mut module, op::LOGICAL_AND, bool_type, &[capped, over]);
+    let x_capped = main.value(
+        &mut module,
+        op::EXT_INST,
+        u32_type,
+        &[glsl_set, glsl::U_MIN, values[0], product],
+    );
+    values[0] = main.value(
+        &mut module,
+        op::SELECT,
+        u32_type,
+        &[limit, x_capped, values[0]],
+    );
+    values[1] = main.value(&mut module, op::SELECT, u32_type, &[limit, one, values[1]]);
+    values[2] = main.value(&mut module, op::SELECT, u32_type, &[limit, one, values[2]]);
+    for index in 0..3usize {
+        let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offsets[index]]);
+        let target_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target_at]);
+        main.emit(op::STORE, &[target_at, values[index], 2, 4]);
     }
     let log = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[log]);
     main.emit(op::STORE, &[log, largest, 2, 4]);

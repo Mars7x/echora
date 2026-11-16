@@ -62,6 +62,18 @@ const GROUP: u32 = 32;
 /// (VK_EXT_mesh_shader's minimum maxMeshWorkGroupCount per dimension).
 const MESH_WORKGROUPS: u32 = 65535;
 
+/// MESH_WORKGROUPS, or ECHORA_DIAG_MESH_PER_TASK (diagnostic runs only: a
+/// tighter bound so wrong task inputs cannot flood the GPU).
+fn mesh_workgroups_bound() -> u32 {
+    static BOUND: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        std::env::var("ECHORA_DIAG_MESH_PER_TASK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map_or(MESH_WORKGROUPS, |bound: u32| bound.min(MESH_WORKGROUPS))
+    })
+}
+
 /// A task or mesh program's variables.
 #[derive(Debug)]
 pub(super) struct MeshState {
@@ -248,7 +260,7 @@ impl Emitter {
             let count = self.word(payload, storage::TASK_PAYLOAD_WORKGROUP_EXT, 1);
             // No more than VK_EXT_mesh_shader's minimum
             // maxMeshWorkGroupCount: a larger count is not a valid one.
-            let most = self.constant(MESH_WORKGROUPS);
+            let most = self.constant(mesh_workgroups_bound());
             let count = self.glsl(self.u32, glsl::U_MIN, &[count, most]);
             let one = self.constant(1);
             self.function

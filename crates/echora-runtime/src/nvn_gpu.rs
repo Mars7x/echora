@@ -1916,7 +1916,13 @@ impl Nvn {
                 if first != 0 {
                     return Err(format!("mesh tasks from group {first}"));
                 }
-                Ok(MeshGroups::Direct([count, 1, 1]))
+                // ECHORA_DIAG_TASK_GROUPS (diagnostic runs only), as the
+                // indirect draws' bound.
+                let bound = super::debug_var("ECHORA_DIAG_TASK_GROUPS")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(u32::MAX);
+                Ok(MeshGroups::Direct([count.min(bound), 1, 1]))
             }
             "nvnCommandBufferDrawMeshTasksIndirect" => {
                 let address = command.x[1];
@@ -1937,6 +1943,7 @@ impl Nvn {
                         self.presented_frames
                     );
                 }
+                self.diagnostic_probe(core)?;
                 if let Some((buffer, offset)) = self.indirect_arguments(core, guest)? {
                     return Ok(MeshGroups::Indirect { buffer, offset });
                 }
@@ -1948,6 +1955,51 @@ impl Nvn {
             }
             other => Err(format!("{other} is not modeled on the GPU")),
         }
+    }
+
+    /// ECHORA_DIAG_PROBE=GPU address,... (diagnostic): at the first
+    /// indirect mesh draw, each address's page table entry and the u32 the
+    /// CPU sees there (printed now), and the u32 the GPU reads through that
+    /// entry in command order (printed with the indirect counts, also when
+    /// a wait stalls or the device is lost).
+    fn diagnostic_probe(&mut self, core: &mut Guest) -> Result<(), String> {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Ok(list) = super::debug_var("ECHORA_DIAG_PROBE") else {
+            return Ok(());
+        };
+        if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        use echora_shader_abi::PAGE_SHIFT;
+        let table = self.page_table(core)?;
+        let addresses: Vec<u64> = list
+            .split(',')
+            .filter_map(|item| u64::from_str_radix(item.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let mut device = Vec::new();
+        for address in addresses {
+            let entry = self.gpu.as_ref().and_then(|backend| {
+                let build = backend.page_build.as_ref()?;
+                let index = (address >> PAGE_SHIFT).checked_sub(build.first)? as usize;
+                build.entries.get(index).copied()
+            });
+            let cpu = self
+                .gpu_to_guest(address, 4)
+                .ok()
+                .and_then(|guest| core.memory.read_u32(guest).ok());
+            eprintln!(
+                "probe present {} GPU {address:#x}: table {:#x}+{} pages, entry {entry:x?}, CPU word {cpu:x?}",
+                self.presented_frames, table.first_page, table.page_count
+            );
+            if let Some(entry) = entry.filter(|entry| *entry != 0) {
+                device.push(entry + (address & ((1 << PAGE_SHIFT) - 1)));
+            }
+        }
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .probe_device_words(&device)
     }
 
     /// Guest bytes at GPU address `address`, `size` long.
