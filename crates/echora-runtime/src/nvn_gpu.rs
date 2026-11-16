@@ -2487,6 +2487,7 @@ impl Nvn {
         let Some(backend) = self.gpu.as_ref() else {
             return;
         };
+        let started = std::time::Instant::now();
         let mut index: HashMap<u64, Vec<u64>> = HashMap::default();
         let mut levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>> = HashMap::default();
         for key in backend.renderer.target_keys() {
@@ -2511,6 +2512,11 @@ impl Nvn {
         backend.target_index = index;
         backend.target_levels = levels;
         backend.target_index_stamp = Some((backend.renderer.target_changes, self.texture_epoch));
+        backend.stat("stat: target index rebuilds", 1);
+        backend.stat(
+            "stat: target index rebuild us",
+            started.elapsed().as_micros() as u64,
+        );
     }
 
     /// The render target (and its mip level) a texture object's storage
