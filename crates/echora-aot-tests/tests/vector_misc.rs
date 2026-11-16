@@ -279,3 +279,74 @@ fn inlined_operations_match_the_helpers() {
             .join("\n")
     );
 }
+
+/// Every word from the edge tables (`common::edge_vectors`, which include
+/// table indices around 16 * n as bytes), general registers inside the
+/// data for loads and stores and the register edges for the rest, data of
+/// a fixed pattern, under three FPCR and FPSR settings.
+#[test]
+fn inlined_operations_match_the_helpers_on_edge_tables() {
+    let words = vector_misc_code::WORDS;
+    let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut m = Machine::with_layout(vector_misc_code::BASE, &image, code_size, DATA, DATA_SIZE);
+    let mut edges = edge_vectors();
+    // Table indices at the ends of one to four table registers.
+    for index in [15u8, 16, 31, 32, 47, 48, 63, 64, 255] {
+        edges.push(u128::from_le_bytes([index; 16]));
+    }
+    let statuses = [(0, 0), (FPCR_FZ, 0x10), (FPCR_FZ | FPCR_DN, 0x10)];
+    let data: Vec<u8> = (0..DATA_SIZE)
+        .map(|index| (index * 37 + 11) as u8)
+        .collect();
+    let mut failures = Vec::new();
+    'words: for (index, &entry) in vector_misc_code::ENTRIES.iter().enumerate() {
+        let memory = matches!(
+            echora_lift::aarch64::decode(words[index * 2], entry),
+            echora_lift::aarch64::Instruction::Simd(
+                echora_lift::simd::SimdOp::TransferSingle { .. }
+                    | echora_lift::simd::SimdOp::TransferMultiple { .. }
+                    | echora_lift::simd::SimdOp::LoadReplicate { .. }
+            )
+        );
+        for step in [7, 11] {
+            for first in 0..edges.len() {
+                for status in statuses {
+                    let state = State {
+                        vectors: std::array::from_fn(|v| edges[(v * step + first) % edges.len()]),
+                        regs: std::array::from_fn(|x| {
+                            if memory {
+                                DATA + ((x * step + first) as u64 * 24) % (DATA_SIZE - 128)
+                            } else {
+                                REGISTER_EDGES[(x + first) % REGISTER_EDGES.len()]
+                            }
+                        }),
+                        sp: DATA + 0x400,
+                        data: data.clone(),
+                        status,
+                    };
+                    let expected = run(vector_misc_reference::dispatch, &mut m, entry, &state);
+                    let actual = run(vector_misc_code::dispatch, &mut m, entry, &state);
+                    if actual != expected {
+                        failures.push(format!(
+                            "{:?} with edges from {first} (step {step}) under {status:x?}",
+                            echora_lift::aarch64::decode(words[index * 2], entry)
+                        ));
+                        continue 'words;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} words: {}",
+        failures.len(),
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

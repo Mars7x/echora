@@ -238,3 +238,74 @@ fn inlined_integer_and_pairwise_operations_match_the_helpers() {
             .join("\n")
     );
 }
+
+/// Every word from the edge tables (`common::edge_vectors`): each vector
+/// register holds one edge splatted over its lanes, a different one per
+/// register (two mappings, so that operand pairs vary), general registers
+/// the register edges, under three FPCR and FPSR settings. Every form the
+/// options cover keeps its native path; none matches its helper only on
+/// random inputs.
+#[test]
+fn inlined_integer_and_pairwise_operations_match_the_helpers_on_edge_tables() {
+    let words = vector_int_code::WORDS;
+    let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut m = Machine::with_layout(
+        vector_int_code::BASE,
+        &image,
+        code_size,
+        0x1000_0000,
+        0x1000,
+    );
+    let edges = edge_vectors();
+    let statuses = [
+        (0, 0),
+        (FPCR_FZ, FPSR_IXC | FPSR_QC),
+        (FPCR_FZ | FPCR_DN, FPSR_IXC),
+    ];
+    let mut failures = Vec::new();
+    'words: for (index, &entry) in vector_int_code::ENTRIES.iter().enumerate() {
+        for step in [7, 11] {
+            for first in 0..edges.len() {
+                let vectors: [u128; 32] =
+                    std::array::from_fn(|v| edges[(v * step + first) % edges.len()]);
+                let regs: [u64; 31] =
+                    std::array::from_fn(|x| REGISTER_EDGES[(x + first) % REGISTER_EDGES.len()]);
+                for status in statuses {
+                    let expected = run(
+                        vector_int_reference::dispatch,
+                        &mut m,
+                        entry,
+                        (&vectors, &regs),
+                        status,
+                    );
+                    let actual = run(
+                        vector_int_code::dispatch,
+                        &mut m,
+                        entry,
+                        (&vectors, &regs),
+                        status,
+                    );
+                    if actual != expected {
+                        failures.push(format!(
+                            "{:?} with edges from {first} (step {step}) under {status:x?}",
+                            echora_lift::aarch64::decode(words[index * 2], entry)
+                        ));
+                        continue 'words;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} words: {}",
+        failures.len(),
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

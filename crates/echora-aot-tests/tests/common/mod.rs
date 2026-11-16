@@ -871,3 +871,89 @@ pub fn difference(expected: &State, actual: &State) -> String {
     }
     parts.join("; ")
 }
+
+/// Edge vectors for the inlined vector and float operations' tables: every
+/// lane the same edge value, at each lane width (0, 1, all ones, the sign
+/// bit alone, the largest positive, the most negative plus one), shift
+/// counts at and around every lane width in every byte, and float edges in
+/// single and double lanes (signed zeros, denormals, the smallest normal,
+/// the largest finite, infinities, quiet and signalling NaNs with
+/// payloads, halves, the integer range ends of the conversions).
+pub fn edge_vectors() -> Vec<u128> {
+    let splat = |value: u64, bits: u32| -> u128 {
+        (0..128 / bits).fold(0u128, |vector, lane| {
+            vector | u128::from(value & mask(bits)) << (lane * bits)
+        })
+    };
+    let mut vectors = Vec::new();
+    for bits in [8, 16, 32, 64] {
+        let sign = 1u64 << (bits - 1);
+        for value in [0, 1, u64::MAX, sign, sign - 1, sign + 1] {
+            vectors.push(splat(value, bits));
+        }
+    }
+    for count in [1i8, 7, 8, 9, 16, 31, 32, 33, 63, 64, 65] {
+        for count in [count, count.wrapping_neg()] {
+            vectors.push(splat(u64::from(count as u8), 8));
+        }
+    }
+    const SINGLES: [u32; 18] = [
+        0x8000_0000,
+        0x0000_0001,
+        0x807f_ffff,
+        0x0080_0000,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_0001,
+        0xffc1_2345,
+        0x7f80_0001,
+        0xffa0_0000,
+        0x3f00_0000,
+        0xbfc0_0000,
+        0x4f00_0000,
+        0xcf00_0000,
+        0x4f80_0000,
+        0x3f80_0000,
+    ];
+    for value in SINGLES {
+        vectors.push(splat(u64::from(value), 32));
+    }
+    const DOUBLES: [u64; 16] = [
+        0x8000_0000_0000_0000,
+        0x0000_0000_0000_0001,
+        0x0010_0000_0000_0000,
+        0x7fef_ffff_ffff_ffff,
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_0001,
+        0xfff8_1234_5678_9abc,
+        0x7ff0_0000_0000_0001,
+        0xfff4_0000_0000_0000,
+        0x3fe0_0000_0000_0000,
+        0xbff8_0000_0000_0000,
+        0x43e0_0000_0000_0000,
+        0xc3e0_0000_0000_0000,
+        0x43f0_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+    ];
+    for value in DOUBLES {
+        vectors.push(splat(value, 64));
+    }
+    vectors
+}
+
+/// General register edges: 0, 1, all ones, the W and X sign bits and the
+/// values next to them, and the W range end.
+pub const REGISTER_EDGES: [u64; 9] = [
+    0,
+    1,
+    u64::MAX,
+    0x8000_0000,
+    0x7fff_ffff,
+    0xffff_ffff,
+    0x8000_0000_0000_0000,
+    0x7fff_ffff_ffff_ffff,
+    0x8000_0000_0000_0001,
+];

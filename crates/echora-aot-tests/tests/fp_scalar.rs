@@ -228,3 +228,57 @@ fn inlined_scalar_operations_match_the_helpers() {
             .join("\n")
     );
 }
+
+/// Every word from the edge tables (`common::edge_vectors`, the low lane
+/// of each the operand), general registers the register edges and the
+/// float edges as bits, every NZCV, under three FPCR and FPSR settings.
+#[test]
+fn inlined_scalar_operations_match_the_helpers_on_edge_tables() {
+    let words = fp_scalar_code::WORDS;
+    let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut m = Machine::with_layout(fp_scalar_code::BASE, &image, code_size, 0x1000_0000, 0x1000);
+    let edges = edge_vectors();
+    let integers: Vec<u64> = REGISTER_EDGES
+        .iter()
+        .copied()
+        .chain(SINGLES.iter().map(|&value| u64::from(value)))
+        .chain(DOUBLES.iter().copied())
+        .collect();
+    let statuses = [(0, 0), (FPCR_FZ, 0x10), (FPCR_FZ | FPCR_DN, 0x10)];
+    let mut failures = Vec::new();
+    'words: for (index, &entry) in fp_scalar_code::ENTRIES.iter().enumerate() {
+        for step in [7, 11] {
+            for first in 0..edges.len() {
+                let vectors: [u128; 32] =
+                    std::array::from_fn(|v| edges[(v * step + first) % edges.len()]);
+                let regs: [u64; 31] =
+                    std::array::from_fn(|x| integers[(x * step + first) % integers.len()]);
+                let nzcv = (first % 16) as u8;
+                for status in statuses {
+                    let state = (&vectors, &regs, nzcv);
+                    let expected = run(fp_scalar_reference::dispatch, &mut m, entry, state, status);
+                    let actual = run(fp_scalar_code::dispatch, &mut m, entry, state, status);
+                    if actual != expected {
+                        failures.push(format!(
+                            "{:?} with edges from {first} (step {step}) under {status:x?}",
+                            echora_lift::aarch64::decode(words[index * 2], entry)
+                        ));
+                        continue 'words;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} words: {}",
+        failures.len(),
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
