@@ -5300,7 +5300,7 @@ impl Nvn {
                         }
                     }
                     // ECHORA_TASK_DUMP=PRESENT,DIR (debugging, works without
-                    // a GPU): the first mesh draws at that present (`first`:
+                    // a GPU): the first 160 mesh draws at that present (`first`:
                     // the first present with any), with their stages and
                     // every buffer they bind, for the shader simulator
                     // (`dump_mesh_draw`).
@@ -5388,7 +5388,7 @@ impl Nvn {
                                     == self.presented_frames)
                     {
                         let number = self.mesh_draws_dumped;
-                        if number < 64 {
+                        if number < 160 {
                             self.mesh_draws_dumped += 1;
                             let directory =
                                 std::path::Path::new(directory).join(format!("draw-{number:02}"));
