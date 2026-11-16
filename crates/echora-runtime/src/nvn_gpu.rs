@@ -32,6 +32,9 @@ pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
     pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize), bool)>,
+    /// The entries virtual pools' mappings set (cleared before the next
+    /// build sets them again).
+    virtual_pages: Vec<usize>,
 }
 
 pub struct Backend {
@@ -5482,18 +5485,72 @@ impl Nvn {
                 Some((storage.x[0], storage.x[1], gpu, flags))
             })
             .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
-            // GPU_NO_ACCESS (8): a physical pool the GPU reaches only
-            // through a virtual pool's mappings, never at its own address.
-            .filter(|&(_, _, _, flags)| flags & 8 == 0)
+            // A GPU_NO_ACCESS (8) physical pool, which the GPU reaches only
+            // through virtual pools' mappings, is mapped at its own address
+            // too: its pages are what the mappings take.
             .collect();
+        // Virtual pools' mappings (MapVirtual): (virtual GPU address, the
+        // physical pool's GPU address, size), each range page-aligned. The
+        // GPU reaches a virtual pool's range through them, as through any
+        // other memory: a program storing or loading there by address read
+        // zero before (the forest's streamed data, culling lists and
+        // indirect records live in virtual pools).
+        let mut mappings: Vec<(u64, u64, u64)> = Vec::new();
+        for address in &self.memory_pools {
+            let Some(pool) = self
+                .objects
+                .get(address)
+                .filter(|pool| pool.kind == "MemoryPool")
+            else {
+                continue;
+            };
+            let Some(virtual_gpu) = pool.state.get("GpuAddress").map(|args| args.x[0]) else {
+                continue;
+            };
+            if pool
+                .builder
+                .get("Storage")
+                .is_none_or(|storage| storage.x[0] != 0)
+            {
+                continue;
+            }
+            for (name, mapping) in &pool.state {
+                let Some(offset) = name
+                    .strip_prefix(super::VIRTUAL_MAPPING)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                else {
+                    continue;
+                };
+                let [physical, physical_offset, size, _] = mapping.x;
+                let Some(physical_gpu) = self
+                    .objects
+                    .get(&physical)
+                    .and_then(|target| target.state.get("GpuAddress"))
+                    .map(|args| args.x[0])
+                else {
+                    continue;
+                };
+                mappings.push((virtual_gpu + offset, physical_gpu + physical_offset, size));
+            }
+        }
         let first = pools
             .iter()
             .map(|(_, _, gpu, _)| gpu >> PAGE_SHIFT)
+            .chain(
+                mappings
+                    .iter()
+                    .map(|(virtual_gpu, ..)| virtual_gpu >> PAGE_SHIFT),
+            )
             .min()
             .unwrap_or(0);
         let end = pools
             .iter()
             .map(|(_, size, gpu, _)| (gpu + size).div_ceil(PAGE_SIZE))
+            .chain(
+                mappings
+                    .iter()
+                    .map(|(virtual_gpu, _, size)| (virtual_gpu + size).div_ceil(PAGE_SIZE)),
+            )
             .max()
             .unwrap_or(first);
         // A table past 16 million pages (64 GiB) means the pools are not
@@ -5556,7 +5613,14 @@ impl Nvn {
         let mut entries = match previous {
             Some(built) => {
                 built_pools = built.pools;
-                built.entries
+                let mut entries = built.entries;
+                // Mappings are set again below, from their pools' pages.
+                for page in built.virtual_pages {
+                    if let Some(entry) = entries.get_mut(page) {
+                        *entry = 0;
+                    }
+                }
+                entries
             }
             None => vec![0u64; count],
         };
@@ -5630,7 +5694,24 @@ impl Nvn {
             let mapped = self.pool_share_signature(base, flags);
             built_pools.insert(pool, (mapped, !complete && !checked));
         }
+        // Each virtual mapping's pages take its physical pages' entries.
+        let mut virtual_pages = Vec::new();
+        for (virtual_gpu, physical_gpu, size) in mappings {
+            for page in 0..size.div_ceil(PAGE_SIZE) {
+                let from = ((physical_gpu >> PAGE_SHIFT) + page).checked_sub(first);
+                let to = ((virtual_gpu >> PAGE_SHIFT) + page).checked_sub(first);
+                let (Some(from), Some(to)) = (from, to) else {
+                    continue;
+                };
+                let (from, to) = (from as usize, to as usize);
+                if let (Some(&entry), true) = (entries.get(from), to < entries.len()) {
+                    entries[to] = entry;
+                    virtual_pages.push(to);
+                }
+            }
+        }
         let backend = self.gpu.as_mut().unwrap();
+        backend.stat("stat: page table virtual pages", virtual_pages.len() as u64);
         // The renderer's counts from the spans just shared (refusals).
         for (name, amount) in backend.renderer.take_stats() {
             backend.stat(name, amount);
@@ -5647,6 +5728,7 @@ impl Nvn {
             first,
             entries,
             pools: built_pools,
+            virtual_pages,
         });
         backend.stat(
             "stat: page table pinned MiB",
