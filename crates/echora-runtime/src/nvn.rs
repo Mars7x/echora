@@ -3434,6 +3434,24 @@ impl Nvn {
                 if kind == "MemoryPool" {
                     let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
                     self.gpu_forget_pool(base);
+                    // Another live pool over the same memory loses the
+                    // shared span with it (spans are kept by base): it is
+                    // shared again at the next present.
+                    let others: Vec<u64> = self
+                        .memory_pools
+                        .iter()
+                        .copied()
+                        .filter(|&other| {
+                            other != this
+                                && self.objects.get(&other).is_some_and(|pool| {
+                                    pool.builder.get("Storage").map(|storage| storage.x[0])
+                                        == Some(base)
+                                })
+                        })
+                        .collect();
+                    if base != 0 {
+                        self.new_pools.extend(others);
+                    }
                     self.code_pools.remove(&base);
                     self.flush_epoch += 1;
                     self.pool_epoch += 1;

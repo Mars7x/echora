@@ -5473,6 +5473,41 @@ impl Nvn {
             return Ok(table);
         }
         let started = std::time::Instant::now();
+        // Host-visible pools with no recorded span (never shared, or their
+        // span dropped with another pool over the same memory): shared at
+        // the next present. Mapped meanwhile only by a build that can look
+        // spans up, they read zero to the GPU; the forest's task programs,
+        // reading a header of zeros there, loop in every workgroup.
+        let unshared: Vec<u64> = self
+            .gpu
+            .as_ref()
+            .map(|backend| {
+                self.memory_pools
+                    .iter()
+                    .copied()
+                    .filter(|address| {
+                        self.objects.get(address).is_some_and(|pool| {
+                            let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
+                            pool.kind == "MemoryPool"
+                                && flags & 6 != 0
+                                && pool.builder.get("Storage").is_some_and(|storage| {
+                                    storage.x[0] != 0
+                                        && !backend.shared_pools.contains_key(&storage.x[0])
+                                        && !backend.shared_pieces.contains_key(&storage.x[0])
+                                })
+                        })
+                    })
+                    .filter(|address| !self.new_pools.contains(address))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !unshared.is_empty() {
+            self.gpu.as_mut().unwrap().stat(
+                "stat: page table pools queued for sharing",
+                unshared.len() as u64,
+            );
+            self.new_pools.extend(unshared);
+        }
         let pools: Vec<(u64, u64, u64, u64)> = self
             .memory_pools
             .iter()
