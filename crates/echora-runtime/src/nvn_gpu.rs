@@ -7051,7 +7051,9 @@ impl Nvn {
                 guest_dirty: Vec::new(),
                 gpu_dirty: Vec::new(),
             });
+        let mut dropped_dirty = false;
         if created || fresh || pool.size != size {
+            dropped_dirty = !pool.gpu_dirty.is_empty();
             *pool = ResidentPool {
                 base,
                 size,
@@ -7060,6 +7062,10 @@ impl Nvn {
                 guest_dirty: vec![base..base + size],
                 gpu_dirty: Vec::new(),
             };
+        }
+        // Its GPU-dirty ranges went with the old mirror: the index rebuilds.
+        if dropped_dirty {
+            backend.dirty_removals += 1;
         }
         if overwritten {
             remove_range(&mut pool.guest_dirty, guest..guest + length);
