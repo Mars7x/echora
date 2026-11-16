@@ -7334,6 +7334,30 @@ impl Nvn {
                         values.push((constant.id, pixel));
                         continue;
                     }
+                    // ECHORA_LOOP_TRACE: the stage's loop counters, as a
+                    // dispatch's (`draw_loop_trace_key`).
+                    if let meaning @ (echora_shader_abi::SpecMeaning::LoopTraceLow
+                    | echora_shader_abi::SpecMeaning::LoopTraceHigh) = constant.meaning
+                    {
+                        let trace = draw_loop_trace_key(keys, index);
+                        let address = match backend.loop_traces.get(&trace) {
+                            Some(&(_, address, _)) => address,
+                            None => {
+                                let (buffer, address) = backend.renderer.debug_buffer(64 << 10)?;
+                                backend
+                                    .loop_traces
+                                    .insert(trace, (buffer, address, self.presented_frames));
+                                address
+                            }
+                        };
+                        let half = if meaning == echora_shader_abi::SpecMeaning::LoopTraceLow {
+                            address as u32
+                        } else {
+                            (address >> 32) as u32
+                        };
+                        values.push((constant.id, half));
+                        continue;
+                    }
                     let low = match constant.meaning {
                         echora_shader_abi::SpecMeaning::VertexTraceLow => true,
                         echora_shader_abi::SpecMeaning::VertexTraceHigh => false,
@@ -7399,6 +7423,40 @@ impl Nvn {
                     .programs
                     .insert((built.0, built.1 ^ TRACED_VARIANT), traced);
             }
+        }
+        // ECHORA_LOOP_TRACE: every 60 presents, each traced stage's loops
+        // that ran, as for dispatches.
+        for index in 0..stages.len() {
+            let trace = draw_loop_trace_key(keys, index);
+            let Some(&(buffer, address, reported)) = backend.loop_traces.get(&trace) else {
+                continue;
+            };
+            if self.presented_frames < reported + 60 {
+                continue;
+            }
+            let words: Vec<u32> = backend
+                .renderer
+                .read_debug_buffer(buffer)
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            for (loop_index, entry) in words.chunks_exact(4).enumerate() {
+                if entry[0] != 0 {
+                    eprintln!(
+                        "loop trace present {} draw {:016x}/{:016x} stage {index} loop {loop_index} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
+                        self.presented_frames,
+                        keys.0,
+                        keys.1,
+                        entry[3].wrapping_sub(1),
+                        entry[0],
+                        entry[1],
+                        entry[2]
+                    );
+                }
+            }
+            backend
+                .loop_traces
+                .insert(trace, (buffer, address, self.presented_frames));
         }
         // ECHORA_VERTEX_TRACE_REPORT=<stage key>[,...]: every 60 presents,
         // the records a traced program's stages wrote (from earlier draws).
@@ -10017,6 +10075,12 @@ pub(super) struct ParsedStream {
 pub(super) struct ParsedVertexState {
     attributes: Vec<ParsedAttribute>,
     streams: Vec<ParsedStream>,
+}
+
+/// ECHORA_LOOP_TRACE: the `loop_traces` key of a draw program's stage
+/// (dispatches use their program key).
+fn draw_loop_trace_key(keys: (u64, u64), stage: usize) -> u64 {
+    keys.0 ^ keys.1.rotate_left(21) ^ (stage as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 #[cfg(test)]
