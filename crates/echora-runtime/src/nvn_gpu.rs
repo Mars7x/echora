@@ -4996,7 +4996,12 @@ impl Nvn {
     ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
         let now = self.gpu_writes_now();
         let frame = self.presented_frames;
-        let (source, _, _, _, present, _) = self.binding_memo.1.get(&handle)?;
+        let entry = self.binding_memo.1.get(&handle)?;
+        // The common case: checked at this present and GPU-write generation.
+        if entry.4 == frame && entry.3 == now {
+            return Some((entry.0.clone(), entry.1));
+        }
+        let (source, _, _, _, present, _) = entry;
         // From an earlier present: a render target's binding holds while
         // the target set is unchanged (the stamp) and no blocks drawn since
         // wait to be copied into it (`texture_source` brings those in); an
