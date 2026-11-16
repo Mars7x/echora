@@ -5052,7 +5052,12 @@ impl Nvn {
                 // open pass and the work before have no ordering of their
                 // own beyond what the game asks for here (storage writes
                 // read by later draws, indirect data, texture invalidates).
+                // ECHORA_GUEST_BARRIERS=0 (debugging) drops them as before,
+                // to measure what they cost.
                 if rest == "Barrier" {
+                    if debug_var_os("ECHORA_GUEST_BARRIERS").is_some_and(|value| value == "0") {
+                        return Ok(());
+                    }
                     if let Some(backend) = self.gpu() {
                         backend.renderer.guest_barrier(command.x[1]).map_err(stop)?;
                     }
