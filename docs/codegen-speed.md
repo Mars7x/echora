@@ -652,6 +652,68 @@ FSQRT, FRINTM, FCCMP, FADD) 369.8 to 846.5 and 366.2 to 892.6 Minstr/s
 (+129%, +144%); the other kernels have none of these operations and are
 within noise.
 
+## The remaining vector forms (opt-in)
+
+`EmitOptions::inline_vector_misc` (`inline-vector-misc`, with
+`inline-vector`), `crate::simd_misc`:
+
+- TBL/TBX: the byte lookup over the table registers, out-of-range indices
+  zero (TBL) or Vd's byte (TBX).
+- LD1-LD4/ST1-ST4 (single structure, to a lane), LD1R-LD4R and
+  LD1-LD4/ST1-ST4 (multiple structures): the helper's own single
+  `GuestView::read` or `write` of the whole transfer, into a buffer on the
+  stack instead of a heap vector, then the lanes placed as the helper
+  places them (all registers of a load written after the read). The same
+  access, the same fault (a guest access outside mapped memory ends the
+  process either way) and nothing written before it.
+- FABD and FMULX (vector, scalar, by element): per lane, natively for
+  normal or zero operands whose result is normal or an exact zero, under
+  FPSR.IXC already set, as the inlined arithmetic (FMULX of such operands
+  is FMUL); any other lane through the exact single-lane helper.
+- FMAXV/FMINV/FMAXNMV/FMINNMV: the helper's tree natively when all four
+  lanes are normal or zero (the forms agree then and raise nothing), else
+  the helper.
+- FCVT*S/U and SCVTF/UCVTF with fraction bits (scalar, to and from general
+  registers), the vector FCVT*S/U in a directed rounding or with fraction
+  bits (per lane, a normal or zero lane whose scaled, rounded value fits;
+  any other lane through the helper's scalar form) and vector SCVTF/UCVTF
+  (the helper's own arithmetic once the FPCR is accepted).
+
+INS and DUP from a general register are `inline-vector-int`'s already.
+
+`tests/vector_misc.rs` samples random words of these (one of each form,
+120 of each kind), lifted with the option and without, and runs each from
+vectors of float edges, table indices around the tables' sizes and random
+bits, general registers and SP inside the data (for the other operations
+every other run edge values), data of random bytes, FZ and DN on and off
+and a rounding mode the float helpers trap on: every register, the data,
+FPSR and the trap must agree; the lift with the option keeps no TBL or
+structure transfer helper call.
+
+## Counting helper fallbacks (debugging, opt-in)
+
+`EmitOptions::count_fallbacks` (`count-fallbacks`): every helper call inside
+inlined code (the exact helper an inlined operation falls back to) first
+adds one to its counter in the region's `FALLBACKS` (relaxed atomics, one
+per helper in `FALLBACK_HELPERS`, the last for any other). The root's
+`fallback_counts()` sums them over the regions and
+`print_fallback_counts()` prints them, most first; with the option the
+runner prints them when the run returns, and every
+`ECHORA_FALLBACK_COUNTS_EVERY` seconds when that is set (a run that is
+killed returns nothing). Without the option nothing in the emission or the
+runner changes. `tests/fallback_counts.rs`: operands the inlined FADD,
+FSQRT and FMLA take natively count nothing, a NaN lane counts one call of
+the helper each falls back to.
+
+Kernels (game set vs game set plus `inline-vector-misc`, two rounds of
+seven runs, best): `misc` (LD1R, a lane load and store, TBL, FABD, FMULX,
+FMAXV, a fixed-point SCVTF) 51.7 to 294.4 and 52.8 to 294.5 Minstr/s
+(+469%, +458%). arith (-17.5%, -10.7%) and ldst (-33.5%, -19.3%) fell in
+both rounds and alone, alternating (ldst about 5,400 against 4,300): their
+generated code is the same in both builds, and their windows' machine code
+is the same instruction for instruction, at another address (ldst's window
+at 0x3d020 against 0x3cd50): alignment, from the added code before it.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in

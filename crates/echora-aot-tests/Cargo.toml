@@ -61,6 +61,13 @@ inline-vector-pairwise = []
 # FCVT*S/U, FCVT S<->D, FSQRT, FRINT* and FCCMP natively where exact
 # (EmitOptions::inline_fp_scalar).
 inline-fp-scalar = []
+# With inline-vector: TBL/TBX, lane/replicate/multiple-structure loads and
+# stores, FABD, FMULX, FMAXV and kin, and the remaining conversions as
+# native code (EmitOptions::inline_vector_misc).
+inline-vector-misc = []
+# Debugging: count each inlined operation's helper fallbacks
+# (EmitOptions::count_fallbacks).
+count-fallbacks = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access

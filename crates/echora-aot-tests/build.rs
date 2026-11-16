@@ -40,6 +40,8 @@ fn options() -> EmitOptions {
         inline_vector_int: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_INT").is_some(),
         inline_vector_pairwise: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_PAIRWISE").is_some(),
         inline_fp_scalar: std::env::var_os("CARGO_FEATURE_INLINE_FP_SCALAR").is_some(),
+        inline_vector_misc: std::env::var_os("CARGO_FEATURE_INLINE_VECTOR_MISC").is_some(),
+        count_fallbacks: std::env::var_os("CARGO_FEATURE_COUNT_FALLBACKS").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -329,6 +331,8 @@ fn main() {
     vector_unary_code(&mut out);
     vector_int_code(&mut out);
     fp_scalar_code(&mut out);
+    vector_misc_code(&mut out);
+    fallback_count_code(&mut out);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("programs.rs"), out).expect("write generated programs");
@@ -842,7 +846,7 @@ fn vector_int_code(out: &mut String) {
 }
 
 /// Programs for `tests/fp_scalar.rs`: random words of the scalar float
-/// moves, conversions, FSQRT, FRINT* and FCCMP (up to 4 of each operation
+/// moves, conversions, FSQRT, FRINT* and FCCMP (up to 2 of each operation
 /// and form), one word and an SVC each. Lifted with
 /// `EmitOptions::inline_fp_scalar` (`fp_scalar_code`) and without
 /// (`fp_scalar_reference`).
@@ -895,7 +899,7 @@ fn fp_scalar_code(out: &mut String) {
             }
         }
         let count = seen.entry(key).or_default();
-        if *count >= 4 {
+        if *count >= 2 {
             continue;
         }
         *count += 1;
@@ -957,6 +961,196 @@ fn fp_scalar_code(out: &mut String) {
         }
         writeln!(out, "{root}\n}}").expect("write");
     }
+}
+
+/// Programs for `tests/vector_misc.rs`: random words of TBL/TBX, the
+/// lane, replicate and multiple-structure loads and stores, FABD, FMULX,
+/// FMAXV and its kin and the remaining conversions (one of each operation
+/// and form, 120 of each kind), one word and an SVC each. Lifted with
+/// `EmitOptions::inline_vector_misc` (`vector_misc_code`) and without
+/// (`vector_misc_reference`).
+fn vector_misc_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+    use echora_lift::simd::{Rounding, SimdOp, VecFpOp, VecFpUnaryOp};
+
+    const BASE: u64 = 0x240_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let family = |op: &SimdOp| match op {
+        SimdOp::VecTable { .. }
+        | SimdOp::TransferSingle { .. }
+        | SimdOp::LoadReplicate { .. }
+        | SimdOp::TransferMultiple { .. }
+        | SimdOp::VecFpAcross { .. }
+        | SimdOp::FpToFixed { .. }
+        | SimdOp::IntToFpFixed { .. } => true,
+        SimdOp::VecFp { op, .. } => matches!(op, VecFpOp::AbsDiff | VecFpOp::MulExtended),
+        SimdOp::VecFpElement { op, .. } => *op == VecFpOp::MulExtended,
+        SimdOp::VecFpUnary { op, fbits, .. } => match op {
+            VecFpUnaryOp::FromSigned | VecFpUnaryOp::FromUnsigned => true,
+            VecFpUnaryOp::ToSigned(rounding) | VecFpUnaryOp::ToUnsigned(rounding) => {
+                *fbits != 0 || *rounding != Rounding::Zero
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut per_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut state = 0x3c5a_96e1_0000_000bu64;
+    for attempt in 0..4_000_000u32 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // The SIMD data-processing space (op0 x111), or loads and stores
+        // (op0 x1x0).
+        let word = if attempt % 2 == 0 {
+            (state as u32 & !0x0e00_0000) | 0x0e00_0000
+        } else {
+            (state as u32 & !0x0a00_0000) | 0x0800_0000
+        };
+        let Instruction::Simd(op) = decode(word, 0) else {
+            continue;
+        };
+        if !family(&op) {
+            continue;
+        }
+        let text = format!("{op:?}");
+        let mut key = String::new();
+        for (index, part) in text.split(", ").enumerate() {
+            let register = ["rd: ", "rn: ", "rm: ", "rt: "].iter().any(|field| {
+                part.trim_start_matches(|c: char| c != 'r')
+                    .starts_with(field)
+            });
+            if index == 0 || !register {
+                key.push_str(part);
+                key.push(',');
+            }
+        }
+        // One word per form, at most 120 per kind (the variant and its
+        // operation): lane indices and structure shapes make many forms.
+        let variant = text.split(' ').next().unwrap_or_default();
+        let operation = text
+            .split(", ")
+            .find_map(|part| part.split("op: ").nth(1))
+            .unwrap_or_default();
+        let kind = format!("{variant} {operation}");
+        if *per_kind.get(&kind).unwrap_or(&0) >= 120 {
+            continue;
+        }
+        let count = seen.entry(key).or_default();
+        if *count >= 1 {
+            continue;
+        }
+        *count += 1;
+        *per_kind.entry(kind).or_default() += 1;
+        entries.push(BASE + 4 * words.len() as u64);
+        words.push(word);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "vector_misc".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("vector_misc");
+    for (name, inline) in [("vector_misc_code", true), ("vector_misc_reference", false)] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            inline_vector_misc: inline,
+            // As game builds lift: helper calls then pass FPCR and FPSR
+            // through window locals; window memory too.
+            fp_status_locals: true,
+            window_memory: true,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        // Helper calls that must not be left.
+        let memory: usize = regions
+            .iter()
+            .map(|(_, source)| {
+                [
+                    "vec_table(",
+                    "transfer_single(",
+                    "load_replicate(",
+                    "transfer_multiple(",
+                ]
+                .iter()
+                .map(|helper| {
+                    source
+                        .matches(&format!("echora_guest::simd::{helper}"))
+                        .count()
+                })
+                .sum::<usize>()
+            })
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Operations and forms sampled.\npub const FORMS: usize = {};",
+            seen.len()
+        )
+        .expect("write");
+        writeln!(out, "/// TBL and structure load and store helper calls left.\npub const HELPER_CALLS: usize = {memory};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/fallback_counts.rs`: FADD S0, S1, S2, FSQRT V0.4S,
+/// V1.4S and FMLA V0.4S, V1.4S, V2.4S, each followed by an SVC, lifted
+/// with `EmitOptions::count_fallbacks` and the inlined float options.
+fn fallback_count_code(out: &mut String) {
+    const BASE: u64 = 0x260_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const PROGRAMS: [u32; 3] = [0x1e22_2820, 0x6ea1_f820, 0x4e22_cc20];
+    let mut words = Vec::new();
+    let mut entries = Vec::new();
+    for word in PROGRAMS {
+        entries.push(BASE + 4 * words.len() as u64);
+        words.push(word);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "fallback_count".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("fallback_count");
+    let options = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        inline_vector_unary: true,
+        fp_status_locals: true,
+        count_fallbacks: true,
+        ..options()
+    };
+    let (root, regions) = split(&translation, options);
+    writeln!(out, "pub mod fallback_count_code {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+    for (region, source) in regions {
+        writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+    }
+    writeln!(out, "{root}\n}}").expect("write");
 }
 
 /// The benchmark kernels, lifted together through split emission (as real

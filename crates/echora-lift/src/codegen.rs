@@ -3479,14 +3479,10 @@ fn emit_instruction_body(
                 load,
                 post,
             } => {
-                structure_transfer(
-                    output,
-                    *rn,
-                    *post,
-                    &format!(
-                        "echora_guest::simd::transfer_multiple(&mut m.cpu, &mut m.memory, address, {rt}, {registers}, {structure}, {bits}, {q}, {load})?"
-                    ),
-                );
+                let call = crate::simd_misc::emit_transfer(op).unwrap_or_else(|| format!(
+                    "echora_guest::simd::transfer_multiple(&mut m.cpu, &mut m.memory, address, {rt}, {registers}, {structure}, {bits}, {q}, {load})?"
+                ));
+                structure_transfer(output, *rn, *post, &call);
             }
             SimdOp::TransferSingle {
                 rt,
@@ -3497,14 +3493,10 @@ fn emit_instruction_body(
                 load,
                 post,
             } => {
-                structure_transfer(
-                    output,
-                    *rn,
-                    *post,
-                    &format!(
-                        "echora_guest::simd::transfer_single(&mut m.cpu, &mut m.memory, address, {rt}, {registers}, {bits}, {index}, {load})?"
-                    ),
-                );
+                let call = crate::simd_misc::emit_transfer(op).unwrap_or_else(|| format!(
+                    "echora_guest::simd::transfer_single(&mut m.cpu, &mut m.memory, address, {rt}, {registers}, {bits}, {index}, {load})?"
+                ));
+                structure_transfer(output, *rn, *post, &call);
             }
             SimdOp::LoadReplicate {
                 rt,
@@ -3514,14 +3506,10 @@ fn emit_instruction_body(
                 q,
                 post,
             } => {
-                structure_transfer(
-                    output,
-                    *rn,
-                    *post,
-                    &format!(
-                        "echora_guest::simd::load_replicate(&mut m.cpu, &m.memory, address, {rt}, {registers}, {bits}, {q})?"
-                    ),
-                );
+                let call = crate::simd_misc::emit_transfer(op).unwrap_or_else(|| format!(
+                    "echora_guest::simd::load_replicate(&mut m.cpu, &m.memory, address, {rt}, {registers}, {bits}, {q})?"
+                ));
+                structure_transfer(output, *rn, *post, &call);
             }
             SimdOp::LoadLiteral { rt, bytes, address } => {
                 // A typed literal where inlined code calls methods on it;
@@ -3537,7 +3525,14 @@ fn emit_instruction_body(
                 let inline = INLINE_VECTOR
                     .get()
                     .then(|| crate::simd::emit_inline(other))
-                    .flatten();
+                    .flatten()
+                    .map(|text| {
+                        if COUNT_FALLBACKS.get() {
+                            count_fallbacks(&text)
+                        } else {
+                            text
+                        }
+                    });
                 let call = inline.unwrap_or_else(|| {
                     crate::simd::emit_call(other).expect("non-memory SIMD operation")
                 });
@@ -4961,6 +4956,16 @@ pub struct EmitOptions {
     /// FCCMP as native code where exact, the helper otherwise
     /// (`crate::simd_scalar`).
     pub inline_fp_scalar: bool,
+    /// With `inline_vector`: TBL/TBX, the lane, replicate and
+    /// multiple-structure loads and stores, FABD, FMULX, FMAXV and its
+    /// kin, and the remaining conversions as native code
+    /// (`crate::simd_misc`).
+    pub inline_vector_misc: bool,
+    /// Debugging: each helper call an inlined operation falls back to
+    /// first adds one to a per-helper counter (the region's
+    /// `FALLBACKS`); the root's `fallback_counts` sums them over the
+    /// regions and `print_fallback_counts` prints them.
+    pub count_fallbacks: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5215,6 +5220,99 @@ impl Drop for InlineFpScalar {
     fn drop(&mut self) {
         crate::simd_scalar::set_inline_fp_scalar(self.0);
     }
+}
+
+/// Restores `crate::simd_misc`'s inlined operations when it goes.
+struct InlineVectorMisc(bool);
+
+impl Drop for InlineVectorMisc {
+    fn drop(&mut self) {
+        crate::simd_misc::set_inline_vector_misc(self.0);
+    }
+}
+
+thread_local! {
+    /// `EmitOptions::count_fallbacks` of the region being emitted.
+    static COUNT_FALLBACKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The helpers inlined code falls back to, by counter index
+/// (`EmitOptions::count_fallbacks`); the last counts any other.
+const FALLBACK_HELPERS: &[&str] = &[
+    "vec_fp_lane",
+    "vec_fp",
+    "vec_fp_element",
+    "vec_fp_unary",
+    "vec_fp_pairwise",
+    "vec_fp_across",
+    "fp_binary",
+    "fp_ternary",
+    "fp_compare",
+    "fp_conditional_compare",
+    "fp_unary",
+    "fp_convert",
+    "fp_to_int",
+    "fp_to_fixed",
+    "int_to_fp",
+    "int_to_fp_fixed",
+    "simd_int_to_fp",
+    "other",
+];
+
+/// Each helper call in inlined code `text` wrapped as a block that first
+/// adds one to its counter in the region's `FALLBACKS`
+/// (`EmitOptions::count_fallbacks`).
+fn count_fallbacks(text: &str) -> String {
+    const PATH: &str = "echora_guest::simd::";
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(at) = rest.find(PATH) {
+        let name_start = at + PATH.len();
+        let name_len = rest[name_start..]
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len() - name_start);
+        let open = name_start + name_len;
+        // A constant or a type path, not a call.
+        if name_len == 0 || !rest[open..].starts_with('(') {
+            out.push_str(&rest[..open.max(name_start)]);
+            rest = &rest[open.max(name_start)..];
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, c) in rest[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            out.push_str(rest);
+            return out;
+        };
+        let name = &rest[name_start..open];
+        let index = FALLBACK_HELPERS
+            .iter()
+            .position(|helper| *helper == name)
+            .unwrap_or(FALLBACK_HELPERS.len() - 1);
+        out.push_str(&rest[..at]);
+        write!(
+            out,
+            "{{ FALLBACKS[{index}].fetch_add(1, std::sync::atomic::Ordering::Relaxed); {} }}",
+            &rest[at..=close]
+        )
+        .unwrap();
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Sets [`INLINE_VECTOR`] for as long as it lives.
@@ -5565,6 +5663,8 @@ struct RegionSettings {
     inline_vector_int: InlineVectorInt,
     inline_vector_pairwise: InlineVectorPairwise,
     inline_fp_scalar: InlineFpScalar,
+    inline_vector_misc: InlineVectorMisc,
+    count_fallbacks: Flag,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5604,6 +5704,10 @@ impl RegionSettings {
             inline_fp_scalar: InlineFpScalar(crate::simd_scalar::set_inline_fp_scalar(
                 options.inline_fp_scalar,
             )),
+            inline_vector_misc: InlineVectorMisc(crate::simd_misc::set_inline_vector_misc(
+                options.inline_vector_misc,
+            )),
+            count_fallbacks: Flag::set(&COUNT_FALLBACKS, options.count_fallbacks),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,
@@ -5716,11 +5820,19 @@ pub fn emit_rust_split_to_regions<E>(
         "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{{Core as Machine, Trap}};\n{AT_HELPER}"
     );
     let header_of = |options: EmitOptions| {
-        if options.functions && options.function_table {
+        let mut header = if options.functions && options.function_table {
             plain_header.clone() + FUNCTION_TABLE_HELPER
         } else {
             plain_header.clone()
+        };
+        if options.count_fallbacks {
+            header.push_str(&format!(
+                "/// Calls of each helper inlined code fell back to (`FALLBACK_HELPERS` of the root).\n\
+                 pub static FALLBACKS: [std::sync::atomic::AtomicU64; {count}] = [const {{ std::sync::atomic::AtomicU64::new(0) }}; {count}];\n",
+                count = FALLBACK_HELPERS.len()
+            ));
         }
+        header
     };
     let finish_region = |_region: u64, source: String| unindent(&source);
     let mut current: Option<(u64, String)> = None;
@@ -5957,6 +6069,27 @@ pub fn emit_rust_split_to_regions<E>(
         .unwrap();
     }
     root.push_str("];\n");
+    if used(|o| o.count_fallbacks) {
+        let count = FALLBACK_HELPERS.len();
+        let tables: String = regions_seen
+            .iter()
+            .filter(|region| options_of(**region).count_fallbacks)
+            .map(|region| format!("&gen_r_{region:x}::FALLBACKS, "))
+            .collect();
+        writeln!(
+            root,
+            "\n/// The helpers counted in each region's `FALLBACKS`.\npub const FALLBACK_HELPERS: [&str; {count}] = {FALLBACK_HELPERS:?};\n\
+             /// Fallback calls so far, per helper, over every region that counts them.\n\
+             pub fn fallback_counts() -> [u64; {count}] {{\n    let mut counts = [0u64; {count}];\n    \
+             for table in [{tables}] {{\n        for (count, slot) in counts.iter_mut().zip(table.iter()) {{\n            \
+             *count += slot.load(std::sync::atomic::Ordering::Relaxed);\n        }}\n    }}\n    counts\n}}\n\
+             /// The fallback counts on standard error, most first.\n\
+             pub fn print_fallback_counts() {{\n    let counts = fallback_counts();\n    \
+             let mut named: Vec<(u64, &str)> = counts.iter().copied().zip(FALLBACK_HELPERS).filter(|(count, _)| *count != 0).collect();\n    \
+             named.sort_unstable_by(|a, b| b.cmp(a));\n    eprintln!(\"helper fallbacks: {{named:?}}\");\n}}"
+        )
+        .unwrap();
+    }
     if used(|o| o.functions && o.function_table) {
         // The lifted functions by index, which every region using the table
         // gets a copy of.

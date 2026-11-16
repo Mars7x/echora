@@ -2789,6 +2789,7 @@ pub fn emit_inline(op: &SimdOp) -> Option<String> {
     if let Some(code) = crate::simd_int::emit_int(op)
         .or_else(|| crate::simd_int::emit_pairwise(op))
         .or_else(|| crate::simd_scalar::emit_fp_scalar(op))
+        .or_else(|| crate::simd_misc::emit_misc(op))
     {
         return Some(code);
     }

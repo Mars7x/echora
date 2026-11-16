@@ -41,10 +41,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("intvec", 0x3c00),
     ("fpairs", 0x4000),
     ("fpscalar", 0x4400),
+    ("misc", 0x4800),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x4800;
+pub const KERNEL_SIZE: u64 = 0x4c00;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -502,6 +503,37 @@ fn assemble() -> Assembler {
         ; fmov s6, w9
         ; fadd s7, s6, s5
         ; str s7, [x7], 4
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // The remaining vector forms: a replicating load, a lane load and
+        // store, TBL, FABD, FMULX, FMAXV and a fixed-point SCVTF. x0 =
+        // repetitions, x1 = source, x2 = destination, x3 = vectors.
+        ; ->misc:
+        ; movi v20.b16, 3
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ld1r {v0.s4}, [x6]
+        ; ldr q1, [x6], 16
+        ; ld1 {v1.s}[2], [x7]
+        ; tbl v2.b16, {v1.b16}, v20.b16
+        ; fabd v3.s4, v0.s4, v1.s4
+        ; fmulx v4.s4, v3.s4, v1.s4
+        ; fmaxv s5, v4.s4
+        ; scvtf v6.s4, v20.s4, 4
+        ; fadd v6.s4, v6.s4, v5.s4
+        ; st1 {v6.s}[1], [x7], 4
+        ; add x7, x7, 12
         ; subs x8, x8, 1
         ; b.ne <l2
         ; subs x0, x0, 1

@@ -763,6 +763,8 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "inline-vector-int" => options.inline_vector_int = true,
                 "inline-vector-pairwise" => options.inline_vector_pairwise = true,
                 "inline-fp-scalar" => options.inline_fp_scalar = true,
+                "inline-vector-misc" => options.inline_vector_misc = true,
+                "count-fallbacks" => options.count_fallbacks = true,
                 "fp-status-locals" => options.fp_status_locals = true,
                 "window-memory" => options.window_memory = true,
                 "dense-dispatch" => options.dense_dispatch = true,
@@ -966,10 +968,24 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             runtime.to_string_lossy()
         ),
     )?;
-    write_if_changed(
-        &out.join("runner/src/main.rs"),
-        &RUNNER_MAIN.replace("    // EXPECTED\n", &expected),
-    )?;
+    // With count-fallbacks, the runner prints the helper fallback counts
+    // when the run returns, and every ECHORA_FALLBACK_COUNTS_EVERY seconds
+    // if that is set (a run that is killed returns nothing).
+    let mut runner_main = RUNNER_MAIN.replace("    // EXPECTED\n", &expected);
+    if options.count_fallbacks || (!listed_regions.is_empty() && listed_options.count_fallbacks) {
+        runner_main = runner_main
+            .replacen(
+                "    let start = std::time::Instant::now();\n",
+                "    if let Some(seconds) = std::env::var(\"ECHORA_FALLBACK_COUNTS_EVERY\")\n        .ok()\n        .and_then(|value| value.parse::<u64>().ok())\n    {\n        std::thread::spawn(move || loop {\n            std::thread::sleep(std::time::Duration::from_secs(seconds.max(1)));\n            echora_translation::print_fallback_counts();\n        });\n    }\n    let start = std::time::Instant::now();\n",
+                1,
+            )
+            .replacen(
+                "    let elapsed = start.elapsed();\n",
+                "    let elapsed = start.elapsed();\n    echora_translation::print_fallback_counts();\n",
+                1,
+            );
+    }
+    write_if_changed(&out.join("runner/src/main.rs"), &runner_main)?;
     // Generated code is compiled at a moderate level; the guest crate, the
     // runtime it calls into and the runtime's AV1 decoder (several times
     // slower at level 1) get full optimization.

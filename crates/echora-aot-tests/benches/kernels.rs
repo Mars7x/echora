@@ -140,6 +140,14 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             regs[2] = VECTOR_B;
             regs[3] = BUFFER / 16;
         }
+        "misc" => {
+            regs[0] = 500 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 16;
+            m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
+            m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
+        }
         "fpscalar" => {
             regs[0] = 200 * scale;
             regs[1] = VECTOR_A;
