@@ -639,6 +639,9 @@ pub struct Nvn {
     finalized_pools: Vec<(u64, u64, u64)>,
     #[serde(skip)]
     unpooled_seen: std::collections::HashSet<u64>,
+    /// ECHORA_DISPATCH_DUMP: the present being dumped and its dispatches.
+    #[serde(skip)]
+    dispatch_dump: (u64, u32),
     /// The present ECHORA_TASK_DUMP=first dumps (the first with a mesh draw).
     #[serde(skip)]
     task_dump_present: Option<u64>,
@@ -5298,6 +5301,41 @@ impl Nvn {
                     // the first present with any), with their stages and
                     // every buffer they bind, for the shader simulator
                     // (`dump_mesh_draw`).
+                    // ECHORA_DISPATCH_DUMP=FROM,DIR (debugging, works without
+                    // a GPU): each dispatch from present FROM on, as
+                    // ECHORA_TASK_DUMP writes a draw but without pools (the
+                    // draw dump of the same present has them), in
+                    // DIR/present-P/dispatch-NN; the last three presents are
+                    // kept until ECHORA_TASK_DUMP's present, which stays.
+                    if rest.starts_with("Dispatch")
+                        && let Ok(value) = debug_var("ECHORA_DISPATCH_DUMP")
+                        && let Some((from, directory)) = value.split_once(',')
+                        && from
+                            .parse::<u64>()
+                            .is_ok_and(|from| self.presented_frames >= from)
+                        && self
+                            .task_dump_present
+                            .is_none_or(|present| present == self.presented_frames)
+                    {
+                        let present = self.presented_frames;
+                        if self.dispatch_dump.0 != present {
+                            self.dispatch_dump = (present, 0);
+                            if self.task_dump_present.is_none() && present >= 3 {
+                                let _ = std::fs::remove_dir_all(
+                                    std::path::Path::new(directory)
+                                        .join(format!("present-{}", present - 3)),
+                                );
+                            }
+                        }
+                        let number = self.dispatch_dump.1;
+                        self.dispatch_dump.1 += 1;
+                        let directory = std::path::Path::new(directory)
+                            .join(format!("present-{present}"))
+                            .join(format!("dispatch-{number:03}"));
+                        if let Err(error) = self.dump_mesh_draw(core, command, &directory, false) {
+                            eprintln!("dispatch dump {number}: {error}");
+                        }
+                    }
                     // ECHORA_TASK_DUMP_INDIRECT: indirect ones only.
                     if rest.starts_with("DrawMeshTasks")
                         && (rest.ends_with("Indirect")
@@ -5314,7 +5352,8 @@ impl Nvn {
                             self.mesh_draws_dumped += 1;
                             let directory =
                                 std::path::Path::new(directory).join(format!("draw-{number:02}"));
-                            if let Err(error) = self.dump_mesh_draw(core, command, &directory) {
+                            if let Err(error) = self.dump_mesh_draw(core, command, &directory, true)
+                            {
                                 eprintln!("task dump {number}: {error}");
                             }
                         }
@@ -5851,6 +5890,7 @@ impl Nvn {
         core: &Guest,
         command: &Command,
         directory: &std::path::Path,
+        with_pools: bool,
     ) -> Result<(), String> {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         let write = |name: String, bytes: &[u8]| {
@@ -5952,7 +5992,9 @@ impl Nvn {
             })
             .unwrap_or_default();
         for (key, bind) in &self.render.state {
-            if !(key.starts_with("BindStorageBuffer/6/") || key.starts_with("BindStorageBuffer/7/"))
+            if !(key.starts_with("BindStorageBuffer/5/")
+                || key.starts_with("BindStorageBuffer/6/")
+                || key.starts_with("BindStorageBuffer/7/"))
             {
                 continue;
             }
@@ -6087,7 +6129,7 @@ impl Nvn {
                 }
             }
         }
-        for (gpu, memory, size) in pools {
+        for (gpu, memory, size) in pools.into_iter().filter(|_| with_pools) {
             let length = size.min(256 << 20);
             let mut bytes = vec![0u8; length as usize];
             core.memory
