@@ -43,6 +43,10 @@ pub struct Gpu {
     pub dma_buf_import: Option<ash::khr::external_memory_fd::Device>,
     /// VK_AMD_buffer_marker, only under ECHORA_HANG_MARKERS (debugging).
     pub buffer_marker: Option<ash::amd::buffer_marker::Device>,
+    /// ECHORA_DEPTH_COMPRESSION=0 (debugging) with
+    /// VK_EXT_image_compression_control: depth targets are made without the
+    /// driver's compression (on AMD its hierarchical depth and stencil).
+    pub uncompressed_depth: bool,
     /// VK_EXT_mesh_shader with task and mesh stages: the guest's task and
     /// mesh pipelines can draw.
     pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
@@ -156,7 +160,10 @@ impl Gpu {
         let mut supported_conditional =
             vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut supported_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
+        let mut supported_compression =
+            vk::PhysicalDeviceImageCompressionControlFeaturesEXT::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut supported_compression)
             .push_next(&mut supported11)
             .push_next(&mut supported12)
             .push_next(&mut supported13)
@@ -269,6 +276,15 @@ impl Gpu {
             std::env::var_os("ECHORA_HANG_MARKERS").is_some() && has(ash::amd::buffer_marker::NAME);
         if buffer_marker {
             enabled_extensions.push(ash::amd::buffer_marker::NAME.as_ptr());
+        }
+        // ECHORA_DEPTH_COMPRESSION=0 (debugging): depth targets without the
+        // driver's compression, to tell a stall in it from one in the work.
+        let uncompressed_depth = std::env::var_os("ECHORA_DEPTH_COMPRESSION")
+            .is_some_and(|value| value == "0")
+            && supported_compression.image_compression_control != 0
+            && has(ash::ext::image_compression_control::NAME);
+        if uncompressed_depth {
+            enabled_extensions.push(ash::ext::image_compression_control::NAME.as_ptr());
         }
         let conditional_rendering = supported_conditional.conditional_rendering != 0
             && has(ash::ext::conditional_rendering::NAME);
@@ -414,6 +430,12 @@ impl Gpu {
         if depth_bias_control {
             device_info = device_info.push_next(&mut enable_bias);
         }
+        let mut enable_compression =
+            vk::PhysicalDeviceImageCompressionControlFeaturesEXT::default()
+                .image_compression_control(true);
+        if uncompressed_depth {
+            device_info = device_info.push_next(&mut enable_compression);
+        }
         let mut enable_clock =
             vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_subgroup_clock(true);
         if subgroup_clock {
@@ -499,6 +521,7 @@ impl Gpu {
             host_import,
             dma_buf_import,
             buffer_marker,
+            uncompressed_depth,
             mesh_shader,
             conditional_rendering,
             depth_bias_control,

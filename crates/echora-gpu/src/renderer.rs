@@ -3864,7 +3864,19 @@ impl Renderer {
 
     /// ECHORA_HANG_MARKERS: a marker before the work `label` names, written
     /// when the GPU has finished what came before it.
+    /// ECHORA_HANG_MARKER_STAGE=top writes it when the GPU reaches it
+    /// instead (the work before it may still run), and
+    /// ECHORA_HANG_MARKER_IN_PASS=1 leaves an open rendering pass open:
+    /// together they mark the work without ordering it.
     fn hang_mark(&mut self, label: &str) {
+        static TOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let top = *TOP.get_or_init(|| {
+            std::env::var_os("ECHORA_HANG_MARKER_STAGE").is_some_and(|value| value == "top")
+        });
+        static IN_PASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let in_pass = *IN_PASS.get_or_init(|| {
+            std::env::var_os("ECHORA_HANG_MARKER_IN_PASS").is_some_and(|value| value == "1")
+        });
         let Some(marker) = self.gpu.buffer_marker.clone() else {
             return;
         };
@@ -3880,7 +3892,12 @@ impl Renderer {
                 path: std::env::var_os("ECHORA_HANG_MARKERS").unwrap_or_default(),
             });
         }
-        let Ok(commands) = self.commands() else {
+        let commands = if in_pass {
+            self.recording_commands()
+        } else {
+            self.commands()
+        };
+        let Ok(commands) = commands else {
             return;
         };
         let hang = self.hang.as_mut().unwrap();
@@ -3889,7 +3906,11 @@ impl Renderer {
         unsafe {
             marker.cmd_write_buffer_marker(
                 commands,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                if top {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                } else {
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                },
                 hang.buffer.buffer,
                 0,
                 hang.next,
@@ -4581,6 +4602,11 @@ impl Renderer {
             .initial_layout(vk::ImageLayout::UNDEFINED);
         if twin.is_some() {
             info = info.push_next(&mut format_list);
+        }
+        let mut uncompressed =
+            vk::ImageCompressionControlEXT::default().flags(vk::ImageCompressionFlagsEXT::DISABLED);
+        if self.gpu.uncompressed_depth && is_depth(format) {
+            info = info.push_next(&mut uncompressed);
         }
         let device = self.device();
         // SAFETY: valid create info; destroyed by destroy_target.
