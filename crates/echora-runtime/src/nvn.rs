@@ -626,6 +626,9 @@ pub struct Nvn {
     /// The vertex input types of the last vertex attribute snapshot a draw
     /// asked for (`vertex_input_types`), with that snapshot (kept alive, so
     /// its address names it).
+    /// Mesh draws written by ECHORA_TASK_DUMP so far.
+    #[serde(skip)]
+    mesh_draws_dumped: u32,
     #[serde(skip)]
     input_types_memo: Option<(std::sync::Arc<Vec<BTreeMap<String, Args>>>, [u8; 32])>,
     /// The last vertex attribute and stream snapshots a draw read, with
@@ -5166,6 +5169,25 @@ impl Nvn {
                             self.log_draw(core, command, path);
                         }
                     }
+                    // ECHORA_TASK_DUMP=PRESENT,DIR (debugging, works without
+                    // a GPU): the first mesh draws at that present, with
+                    // their stages and every buffer they bind, for the
+                    // shader simulator (`dump_mesh_draw`).
+                    if rest.starts_with("DrawMeshTasks")
+                        && let Ok(value) = debug_var("ECHORA_TASK_DUMP")
+                        && let Some((present, directory)) = value.split_once(',')
+                        && present.parse::<u64>() == Ok(self.presented_frames)
+                    {
+                        let number = self.mesh_draws_dumped;
+                        if number < 64 {
+                            self.mesh_draws_dumped += 1;
+                            let directory =
+                                std::path::Path::new(directory).join(format!("draw-{number:02}"));
+                            if let Err(error) = self.dump_mesh_draw(core, command, &directory) {
+                                eprintln!("task dump {number}: {error}");
+                            }
+                        }
+                    }
                 }
                 if rest == "CopyTextureToTexture" && self.gpu().is_some() {
                     if let Err(error) = self.gpu_copy_texture(core, command) {
@@ -5684,6 +5706,117 @@ impl Nvn {
         {
             let _ = writeln!(file, "{line}");
         }
+    }
+
+    /// ECHORA_TASK_DUMP: one mesh draw into `directory`: `draw.txt` (the
+    /// command, each bound program's stages with their code and control
+    /// addresses and keys, every per-slot binding), `stage-<key>.code` and
+    /// `.control` per stage, and each memory pool any binding or the
+    /// indirect record reaches, whole (up to 256 MiB), as
+    /// `pool-<gpu address>.bin`, so the program's pointers find guest
+    /// memory as the GPU would.
+    fn dump_mesh_draw(
+        &self,
+        core: &Guest,
+        command: &Command,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let write = |name: String, bytes: &[u8]| {
+            std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
+        };
+        let mut text = format!(
+            "present {} {} x {:x?}\n",
+            self.presented_frames,
+            command.name,
+            &command.x[..6]
+        );
+        let mut addresses: Vec<u64> = Vec::new();
+        if command.name.ends_with("Indirect") {
+            addresses.push(command.x[1]);
+        }
+        for (key, bind) in &self.render.state {
+            let Some(bit) = key.strip_prefix("BindProgram@") else {
+                continue;
+            };
+            text += &format!("program bit {bit} object {:#x}\n", bind.x[1]);
+            let Some(object) = self.objects.get(&bind.x[1]) else {
+                continue;
+            };
+            for index in 0..6 {
+                let Some(stage) = object.state.get(&format!("Stage{index}")) else {
+                    continue;
+                };
+                let Some((code, stage_key)) = self.stage_code(core, stage.x[0]) else {
+                    continue;
+                };
+                let kind = code.get(..4).map_or(0, |word| {
+                    (u32::from_le_bytes(word.try_into().unwrap()) >> 10) & 0xf
+                });
+                text += &format!(
+                    "stage {index} key {stage_key:016x} kind {kind} code {:#x} control {:#x}\n",
+                    stage.x[0], stage.x[1]
+                );
+                write(format!("stage-{stage_key:016x}.code"), &code)?;
+                let mut control = vec![0u8; 4096];
+                if core.memory.read(stage.x[1], &mut control).is_ok() {
+                    write(format!("stage-{stage_key:016x}.control"), &control)?;
+                }
+            }
+        }
+        let mut binds: Vec<(&&str, &Command)> = self
+            .render
+            .state
+            .iter()
+            .filter(|(key, _)| key.contains('/'))
+            .collect();
+        binds.sort_unstable_by_key(|(key, _)| **key);
+        for (key, bind) in binds {
+            text += &format!("bind {key} x {:x?}\n", &bind.x[1..6]);
+            if key.starts_with("BindUniformBuffer")
+                || key.starts_with("BindStorageBuffer")
+                || key.starts_with("BindVertexBuffer")
+            {
+                addresses.push(
+                    bind.x[if key.starts_with("BindVertexBuffer") {
+                        2
+                    } else {
+                        3
+                    }],
+                );
+            }
+        }
+        // Each pool reached, whole.
+        let mut pools: Vec<(u64, u64, u64)> = Vec::new();
+        for address in addresses.into_iter().filter(|address| *address != 0) {
+            for (_, pool) in &self.objects {
+                if pool.kind != "MemoryPool" {
+                    continue;
+                }
+                let (Some(gpu), Some(storage)) =
+                    (pool.state.get("GpuAddress"), pool.builder.get("Storage"))
+                else {
+                    continue;
+                };
+                let (gpu, memory, size) = (gpu.x[0], storage.x[0], storage.x[1]);
+                if memory != 0
+                    && (gpu..gpu + size).contains(&address)
+                    && !pools.iter().any(|known| known.0 == gpu)
+                {
+                    pools.push((gpu, memory, size));
+                }
+            }
+        }
+        for (gpu, memory, size) in pools {
+            let length = size.min(256 << 20);
+            let mut bytes = vec![0u8; length as usize];
+            core.memory
+                .read(memory, &mut bytes)
+                .map_err(|trap| format!("pool {gpu:#x}: {trap:?}"))?;
+            text += &format!("pool {gpu:#x} size {size:#x} dumped {length:#x}\n");
+            write(format!("pool-{gpu:x}.bin"), &bytes)?;
+        }
+        write("draw.txt".into(), text.as_bytes())
     }
 
     /// Debug aid for shader translation: with ECHORA_SHADER_DIR set, write
