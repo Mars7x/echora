@@ -5357,20 +5357,55 @@ impl Nvn {
     /// for an attribute state reading NVN `format`: its stream's bound
     /// buffer, stride and divisor. A stream with no buffer reads as
     /// unbound.
-    fn fetch_entry(
-        &self,
-        attribute: &BTreeMap<String, super::Args>,
-        streams: &[BTreeMap<String, super::Args>],
-        format: u32,
-    ) -> Result<echora_shader_abi::VertexAttribute, String> {
+    /// The vertex attribute and stream snapshots bound now, parsed once
+    /// per pair of snapshots (`vertex_state_memo`): their props are
+    /// string-keyed maps, looked up per attribute and stream per draw.
+    fn parsed_vertex_state(
+        &mut self,
+        attributes: &Arc<Vec<BTreeMap<String, super::Args>>>,
+        streams: &Arc<Vec<BTreeMap<String, super::Args>>>,
+    ) -> Arc<ParsedVertexState> {
+        if let Some((known_attributes, known_streams, parsed)) = &self.vertex_state_memo
+            && Arc::ptr_eq(known_attributes, attributes)
+            && Arc::ptr_eq(known_streams, streams)
+        {
+            return parsed.clone();
+        }
         let value = |props: &BTreeMap<String, super::Args>, key: &str| {
             props.get(key).map_or(0, |args| args.x[0])
         };
+        let parsed = Arc::new(ParsedVertexState {
+            attributes: attributes
+                .iter()
+                .map(|props| ParsedAttribute {
+                    format: value(props, "Format") as u32,
+                    stream: value(props, "StreamIndex"),
+                    // SetFormat(state, format, relative offset).
+                    offset: props.get("Format").map_or(0, |args| args.x[1]),
+                })
+                .collect(),
+            streams: streams
+                .iter()
+                .map(|props| ParsedStream {
+                    stride: value(props, "Stride"),
+                    divisor: value(props, "Divisor"),
+                })
+                .collect(),
+        });
+        self.vertex_state_memo = Some((attributes.clone(), streams.clone(), parsed.clone()));
+        parsed
+    }
+
+    fn fetch_entry(
+        &self,
+        attribute: &ParsedAttribute,
+        streams: &[ParsedStream],
+    ) -> Result<echora_shader_abi::VertexAttribute, String> {
+        let format = attribute.format;
         let encoded =
             vertex_format(format).ok_or_else(|| format!("vertex attribute format {format}"))?;
-        let stream = value(attribute, "StreamIndex") as usize;
-        // SetFormat(state, format, relative offset).
-        let offset = attribute.get("Format").map_or(0, |args| args.x[1]);
+        let stream = attribute.stream as usize;
+        let offset = attribute.offset;
         let (Some(props), Some(bind)) = (
             streams.get(stream),
             self.render
@@ -5384,8 +5419,8 @@ impl Nvn {
         }
         Ok(echora_shader_abi::VertexAttribute {
             address: bind.x[2] + offset,
-            stride: value(props, "Stride") as u32,
-            divisor: value(props, "Divisor") as u32,
+            stride: props.stride as u32,
+            divisor: props.divisor as u32,
             format: encoded.encode(),
             size: bind.x[3].saturating_sub(offset).min(u64::from(u32::MAX)) as u32,
             reserved: [0; 2],
@@ -7918,13 +7953,14 @@ impl Nvn {
         // (0): read as (0, 0, 0, 1), the usual value of an attribute with no
         // vertex data (inferred; NVN's documentation is not public).
         let mut unformatted = Vec::new();
-        for (location, props) in attribute_states.iter().enumerate() {
+        let parsed = self.parsed_vertex_state(&attribute_states, &stream_states);
+        for (location, attribute) in parsed.attributes.iter().enumerate() {
             if stages[0].loaded_generics >> location & 1 == 0 {
                 continue;
             }
-            let format = value(props, "Format") as u32;
+            let format = attribute.format;
             if pulling {
-                vertex_fetch[location] = self.fetch_entry(props, &stream_states, format)?;
+                vertex_fetch[location] = self.fetch_entry(attribute, &parsed.streams)?;
                 continue;
             }
             if format == 0 {
@@ -7935,9 +7971,8 @@ impl Nvn {
                 vk_format(format).ok_or_else(|| format!("vertex attribute format {format}"))?;
             attributes.push(VertexAttribute {
                 location: location as u32,
-                stream: value(props, "StreamIndex") as u32,
-                // SetFormat(state, format, relative offset).
-                offset: props.get("Format").map_or(0, |args| args.x[1]) as u32,
+                stream: attribute.stream as u32,
+                offset: attribute.offset as u32,
                 format: vk_format,
             });
         }
@@ -8120,10 +8155,8 @@ impl Nvn {
             Some(min) => (min as i64 + i64::from(base_vertex)).max(0) as u64,
         }
         .min(vertex_end);
-        let per_vertex = |props: &BTreeMap<String, super::Args>| {
-            value(props, "Divisor") == 0 && value(props, "Stride") != 0
-        };
-        let shifted = !pulling && vertex_start > 0 && stream_states.iter().any(per_vertex);
+        let per_vertex = |props: &ParsedStream| props.divisor == 0 && props.stride != 0;
+        let shifted = !pulling && vertex_start > 0 && parsed.streams.iter().any(per_vertex);
         // Each stream's bytes per vertex the loaded attributes reach (past
         // the furthest attribute's offset and size): a stream no attribute
         // reads is not read, and a stride-0 one (the same element for every
@@ -8137,13 +8170,13 @@ impl Nvn {
             *entry = (*entry).max(end);
         }
         let mut streams = Vec::new();
-        for (index, props) in stream_states.iter().enumerate() {
+        for (index, props) in parsed.streams.iter().enumerate() {
             // Only the vertices this draw can reach are read.
-            let stride = value(props, "Stride");
+            let stride = props.stride;
             let Some(&element) = needed.get(&(index as u32)) else {
                 streams.push(VertexStream {
                     stride: stride as u32,
-                    divisor: value(props, "Divisor") as u32,
+                    divisor: props.divisor as u32,
                     data: Vec::new(),
                     guest: None,
                 });
@@ -8160,7 +8193,7 @@ impl Nvn {
                 .get(bind_key("BindVertexBuffer", None, index as u64))
             {
                 Some(bind) if bind.x[3] > skip => {
-                    let divisor = value(props, "Divisor");
+                    let divisor = props.divisor;
                     let reach = if stride == 0 {
                         element.min(bind.x[3])
                     } else if divisor != 0 {
@@ -8179,8 +8212,8 @@ impl Nvn {
                 _ => None,
             };
             streams.push(VertexStream {
-                stride: value(props, "Stride") as u32,
-                divisor: value(props, "Divisor") as u32,
+                stride: props.stride as u32,
+                divisor: props.divisor as u32,
                 data: Vec::new(),
                 guest: data,
             });
@@ -9946,6 +9979,29 @@ pub(super) fn bind_key(kind: &'static str, stage: Option<u64>, slot: u64) -> &'s
                 Box::leak(key.into_boxed_str())
             })
     })
+}
+
+/// A vertex attribute's props (`parsed_vertex_state`): SetFormat's
+/// format and relative offset, and its stream.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ParsedAttribute {
+    format: u32,
+    stream: u64,
+    offset: u64,
+}
+
+/// A vertex stream's props (`parsed_vertex_state`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ParsedStream {
+    stride: u64,
+    divisor: u64,
+}
+
+/// The vertex attribute and stream snapshots' props a draw reads.
+#[derive(Debug)]
+pub(super) struct ParsedVertexState {
+    attributes: Vec<ParsedAttribute>,
+    streams: Vec<ParsedStream>,
 }
 
 #[cfg(test)]

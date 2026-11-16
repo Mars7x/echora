@@ -628,6 +628,15 @@ pub struct Nvn {
     /// its address names it).
     #[serde(skip)]
     input_types_memo: Option<(std::sync::Arc<Vec<BTreeMap<String, Args>>>, [u8; 32])>,
+    /// The last vertex attribute and stream snapshots a draw read, with
+    /// their props parsed (`parsed_vertex_state`), the snapshots kept
+    /// alive so their addresses name them.
+    #[serde(skip)]
+    vertex_state_memo: Option<(
+        std::sync::Arc<Vec<BTreeMap<String, Args>>>,
+        std::sync::Arc<Vec<BTreeMap<String, Args>>>,
+        std::sync::Arc<gpu::ParsedVertexState>,
+    )>,
     #[serde(skip)]
     program_memo: (
         (u64, u64),
