@@ -5834,6 +5834,7 @@ impl Nvn {
             }
         }
         // Each pool reached, whole.
+        let addresses_reached: Vec<u64> = addresses.clone();
         let mut pools: Vec<(u64, u64, u64)> = Vec::new();
         for address in addresses.into_iter().filter(|address| *address != 0) {
             for (object, pool) in &self.objects {
@@ -5855,6 +5856,64 @@ impl Nvn {
                     text += &format!(
                         "pool {gpu:#x} object {object:#x} flags {flags:#x} made at present {:?} (now {})\n",
                         self.pool_made_at.get(object),
+                        self.presented_frames
+                    );
+                }
+            }
+        }
+        // Virtual pools any address lands in: each mapping (virtual GPU
+        // range -> physical pool's GPU address and offset), and the
+        // physical pools dumped as the others are.
+        let mut virtuals: Vec<u64> = Vec::new();
+        for (_, pool) in &self.objects {
+            if pool.kind != "MemoryPool" {
+                continue;
+            }
+            let (Some(gpu), Some(storage)) =
+                (pool.state.get("GpuAddress"), pool.builder.get("Storage"))
+            else {
+                continue;
+            };
+            let (gpu, size) = (gpu.x[0], storage.x[1]);
+            if storage.x[0] != 0
+                || !addresses_reached
+                    .iter()
+                    .any(|address| (gpu..gpu + size).contains(address))
+                || virtuals.contains(&gpu)
+            {
+                continue;
+            }
+            virtuals.push(gpu);
+            text += &format!("virtual pool {gpu:#x} size {size:#x}\n");
+            for (name, mapping) in &pool.state {
+                let Some(offset) = name
+                    .strip_prefix(VIRTUAL_MAPPING)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                else {
+                    continue;
+                };
+                let [physical, physical_offset, length, _] = mapping.x;
+                let Some(target) = self.objects.get(&physical) else {
+                    continue;
+                };
+                let (Some(physical_gpu), Some(physical_storage)) = (
+                    target.state.get("GpuAddress"),
+                    target.builder.get("Storage"),
+                ) else {
+                    continue;
+                };
+                let physical_gpu = physical_gpu.x[0];
+                text += &format!(
+                    "mapping {:#x}+{length:#x} -> {:#x} (pool {physical_gpu:#x} +{physical_offset:#x})\n",
+                    gpu + offset,
+                    physical_gpu + physical_offset
+                );
+                if !pools.iter().any(|known| known.0 == physical_gpu) {
+                    pools.push((physical_gpu, physical_storage.x[0], physical_storage.x[1]));
+                    text += &format!(
+                        "pool {physical_gpu:#x} object {physical:#x} flags {:#x} made at present {:?} (now {}) (behind virtual {gpu:#x})\n",
+                        target.builder.get("Flags").map_or(0, |flags| flags.x[0]),
+                        self.pool_made_at.get(&physical),
                         self.presented_frames
                     );
                 }
