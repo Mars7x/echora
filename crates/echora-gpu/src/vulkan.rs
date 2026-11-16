@@ -286,6 +286,10 @@ impl Gpu {
         if uncompressed_depth {
             enabled_extensions.push(ash::ext::image_compression_control::NAME.as_ptr());
         }
+        // Said either way when asked for: off silently without the extension.
+        if std::env::var_os("ECHORA_DEPTH_COMPRESSION").is_some() {
+            eprintln!("gpu: depth targets uncompressed: {uncompressed_depth}");
+        }
         let conditional_rendering = supported_conditional.conditional_rendering != 0
             && has(ash::ext::conditional_rendering::NAME);
         if conditional_rendering {
