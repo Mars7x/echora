@@ -5002,6 +5002,35 @@ impl Nvn {
                 // Bind{Textures,Images,UniformBuffers,StorageBuffers}[Deferred]
                 // (cmd, stage, first, count, array): one binding per slot,
                 // as the singular command would make it.
+                // ECHORA_WORK_LOG=FROM-TO (debugging, works without a GPU):
+                // each work command, barrier and program bind replayed at
+                // presents FROM..TO, with an indirect mesh draw's guest
+                // bytes at its address.
+                if let Some(range) = debug_var("ECHORA_WORK_LOG").ok().and_then(|value| {
+                    let (from, to) = value.split_once('-')?;
+                    Some(from.parse::<u64>().ok()?..to.parse::<u64>().ok()?)
+                }) && range.contains(&self.presented_frames)
+                    && (is_work_command(rest) || matches!(rest, "Barrier" | "BindProgram"))
+                {
+                    let mut line = format!(
+                        "work present {} {rest} x {:x?}",
+                        self.presented_frames,
+                        &command.x[..6]
+                    );
+                    if rest == "DrawMeshTasksIndirect" {
+                        let words = self.gpu_to_guest(command.x[1], 16).ok().and_then(|guest| {
+                            (0..4)
+                                .map(|index| core.memory.read_u32(guest + index * 4).ok())
+                                .collect::<Option<Vec<u32>>>()
+                        });
+                        line.push_str(&format!(" guest words {words:?}"));
+                    }
+                    if rest.starts_with("Draw") || rest.starts_with("Dispatch") {
+                        let program = self.render.state.get("BindProgram").map(|bind| bind.x[1]);
+                        line.push_str(&format!(" program {program:x?}"));
+                    }
+                    eprintln!("{line}");
+                }
                 if let Some((single, words)) = plural_bind(rest) {
                     let count = (command.x[3] as usize).min(32);
                     let values = if rest.ends_with("Deferred") {
