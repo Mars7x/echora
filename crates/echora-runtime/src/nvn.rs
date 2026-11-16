@@ -3451,6 +3451,25 @@ impl Nvn {
                                 storage.x[1],
                                 self.presented_frames,
                             ));
+                            let range = gpu.x[0]..gpu.x[0] + storage.x[1];
+                            let mut stale: Vec<&str> = self
+                                .render
+                                .state
+                                .iter()
+                                .filter(|(key, bind)| {
+                                    (key.starts_with("BindStorageBuffer/")
+                                        || key.starts_with("BindUniformBuffer/"))
+                                        && range.contains(&bind.x[3])
+                                })
+                                .map(|(key, _)| *key)
+                                .collect();
+                            stale.sort_unstable();
+                            if !stale.is_empty() {
+                                eprintln!(
+                                    "unpooled finalize present {} pool {:#x}+{:#x} leaves bound {stale:?}",
+                                    self.presented_frames, gpu.x[0], storage.x[1]
+                                );
+                            }
                         }
                     }
                     self.gpu_forget_pool(base);
