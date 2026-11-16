@@ -2234,8 +2234,6 @@ impl Nvn {
                 self.pool_ranges.borrow_mut().clear();
                 self.pool_ranges_generation.set(None);
                 self.object_generation += 1;
-                // The GPU page table maps the virtual range anew.
-                self.pool_epoch += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -7437,7 +7435,7 @@ fn texture_default(property: &str) -> Option<Args> {
 
 /// State-key prefix of a virtual pool's mapping (followed by the virtual
 /// offset in hex): physical pool, physical offset, size.
-pub(crate) const VIRTUAL_MAPPING: &str = "VirtualMapping/";
+const VIRTUAL_MAPPING: &str = "VirtualMapping/";
 
 /// Whether `name` is a plausible NVN entry-point name (ASCII identifier with
 /// the `nvn` prefix). Lookups of anything else stop explicitly.
