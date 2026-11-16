@@ -777,29 +777,32 @@ compiled changes). aot-tests' `kernel_code::KERNEL_CENSUS` is the table
 for the kernels as built; `cargo test --release -p echora-aot-tests
 --features <options> --test census -- --nocapture` prints it. With the
 game set and `inline-vector-unary`, `-int`, `-pairwise`,
-`inline-fp-scalar` and `inline-vector-misc`:
+`inline-fp-scalar`, `inline-vector-misc` and `direct-q-pairs` (the
+checked column gives in brackets the accesses made by an out-of-line call,
+`Cpu::load_q_pair`/`store_q_pair`: 4 of memcpy's 4 without
+`direct-q-pairs`):
 
-| function | loads 1/2/4/8 | stores 1/2/4/8 | checked | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |
+| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| arith | 0/0/0/0 | 0/0/0/0 | 0 | 0 | 0 | 1/0 | 0 (0) | 0 (0) | 4 | - | - |
-| memcpy | 0/0/0/0 | 0/0/0/0 | 4 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| memset | 0/0/0/0 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| calls | 0/0/0/0 | 0/0/0/0 | 0 | 2 | 0 | 1/0 | 4 (1) | 6 (2) | 5 | - | - |
-| (leaf functions) | 0/0/0/0 | 0/0/0/0 | 0 | 0 | 2 | 0/0 | 0 (0) | 0 (0) | 2 | - | - |
-| switch | 0/1/0/0 | 0/0/0/0 | 0 | 0 | 1 | 1/0 | 0 (0) | 0 (0) | 12 | - | - |
-| vector | 0/0/0/4 | 0/0/0/0 | 0 | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 5 | vec_fp 3, vec_fp_lane 3 | vector 3 |
-| poll | 0/0/0/0 | 0/0/0/0 | 1 | 0 | 0 | 0/0 | 0 (0) | 0 (0) | 3 | - | - |
-| scalar | 0/0/1/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 1 (1) | 7 (7) | 5 | fp_binary 1, fp_compare 1, fp_ternary 1 | vector 5 |
-| ldst | 0/0/0/1 | 0/0/0/1 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| floats | 0/0/3/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
-| floatld | 0/0/4/0 | 0/0/1/0 | 0 | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
-| calls2 | 0/0/0/2 | 0/0/0/2 | 0 | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - |
-| vnorm | 0/0/0/2 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 |
-| convert | 0/0/0/2 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 |
-| intvec | 0/0/0/4 | 0/0/0/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 |
-| fpairs | 0/0/0/4 | 0/0/1/2 | 0 | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 |
-| fpscalar | 0/0/1/0 | 0/0/1/0 | 0 | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 |
-| misc | 0/0/0/2 | 0/0/0/0 | 3 | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 |
+| arith | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/0 | 0 (0) | 0 (0) | 4 | - | - |
+| memcpy | 0/0/0/0 | 0/0/0/0 | 4 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| memset | 0/0/0/0 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| calls | 0/0/0/0 | 0/0/0/0 | 0 (0) | 2 | 0 | 1/0 | 4 (1) | 6 (2) | 5 | - | - |
+| (leaf functions) | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 2 | 0/0 | 0 (0) | 0 (0) | 2 | - | - |
+| switch | 0/1/0/0 | 0/0/0/0 | 0 (0) | 0 | 1 | 1/0 | 0 (0) | 0 (0) | 12 | - | - |
+| vector | 0/0/0/4 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 5 | vec_fp 3, vec_fp_lane 3 | vector 3 |
+| poll | 0/0/0/0 | 0/0/0/0 | 1 (0) | 0 | 0 | 0/0 | 0 (0) | 0 (0) | 3 | - | - |
+| scalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 1 (1) | 7 (7) | 5 | fp_binary 1, fp_compare 1, fp_ternary 1 | vector 5 |
+| ldst | 0/0/0/1 | 0/0/0/1 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
+| floats | 0/0/3/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
+| floatld | 0/0/4/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
+| calls2 | 0/0/0/2 | 0/0/0/2 | 0 (0) | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - |
+| vnorm | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 |
+| convert | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 |
+| intvec | 0/0/0/4 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 |
+| fpairs | 0/0/0/4 | 0/0/1/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 |
+| fpscalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 |
+| misc | 0/0/0/2 | 0/0/0/0 | 3 (0) | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 |
 
 The slowest kernels per guest instruction are the vector float ones
 (vector, vnorm, misc, fpairs: 280 to 470 Minstr/s against 1,600 to 5,400
@@ -807,13 +810,45 @@ for the integer ones): none of their hot paths calls a helper (every
 helper call left is a fallback, and `count-fallbacks` counts none in any
 kernel) or spills, so what they spend is the inlined float operations
 themselves, 3 to 11 a loop, each testing its operands and results and
-the FPCR. memcpy moves Q register pairs through the checked
-`Cpu::load_q_pair`/`store_q_pair` (4 checked accesses a loop, 1,590
-Minstr/s against ldst's 5,400 with direct ones): a direct path for LDP/STP
-of Q registers, as LDR/STR of Q already have, is the next candidate the
-numbers point at. The FPCR and FPSR reloads (up to 34 a window) are
+the FPCR. memcpy moved its Q register pairs through the out-of-line
+`Cpu::load_q_pair`/`store_q_pair` (4 a loop, 1,590 Minstr/s against
+ldst's 5,400 with direct accesses); `direct-q-pairs` writes their body out
+(below: +7.9%), and its accesses stay range-checked copies. The FPCR and FPSR reloads (up to 34 a window) are
 around those fallback calls, off the hot paths; switch spends its
 operations on block charges (12 for 11 blocks).
+
+## LDP/STP of Q registers written out (opt-in)
+
+`Cpu::load_q_pair`/`store_q_pair` (out of line in echora-guest) make one
+`GuestView::read`/`write` of the 32 bytes: a range test against the guest
+address space (a memory fault trap, nothing moved, when it fails) and one
+copy; inside the space, page permissions fault in the host and end the
+process, as for every other access. `EmitOptions::direct_q_pairs`
+(`direct-q-pairs`) writes that body out in place of the call: the same
+`read`/`write`, both registers written after the read, the base's
+writeback after the access as before. The semantics are the call's by
+construction.
+
+`tests/q_pairs.rs` runs LDP and STP in every addressing form at offsets
+-1024, -16, 0, 16 and 1008, with an ordinary base or SP, and a store then
+an overlapping load, lifted with the option and without: inside mapped
+memory (pairs across a page boundary among them) registers, SP, data and
+the trap agree; past the end of the address space (straddling it, at it,
+far past, wrapping) both trap alike with nothing moved and no writeback;
+on unmapped memory inside the space (straddling the data's end, a page
+past it) each run is a child process, and the fault message and signal
+agree. (LDP with both registers the same does not decode.) Swapping the
+halves, or dropping the range test, fails it.
+
+memcpy, every function 64-byte aligned (`align-windows`' flag), 30
+alternating rounds of seven runs, pinned: median 1,636 Minstr/s without,
+1,765 with (+7.9%, a 95% interval of +5.7% to +11.6% by resampling: not
+noise). The census shows the Q pairs' 4 checked accesses no longer out of
+line. A first version that read and wrote the pairs as eight direct
+8-byte accesses (after the same range test) was 27% slower (1,582 to
+1,149, interval -27.9% to -26.8%): each 8-byte guest access is a relaxed
+atomic, so the compiler cannot merge them into the 16-byte moves of the
+call's copy, and echora-guest has no 16-byte direct access.
 
 ## Options on some regions only
 

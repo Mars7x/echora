@@ -68,6 +68,9 @@ inline-vector-misc = []
 # Debugging: count each inlined operation's helper fallbacks
 # (EmitOptions::count_fallbacks).
 count-fallbacks = []
+# LDP/STP of Q registers through direct accesses after the checked calls'
+# range test (EmitOptions::direct_q_pairs).
+direct-q-pairs = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access

@@ -23,6 +23,10 @@ pub struct Census {
     /// acquire/release forms. (LDR/STR of SIMD registers left to the
     /// `load`/`store` helpers count under `helpers`.)
     pub checked_accesses: usize,
+    /// Of `checked_accesses`, those made by an out-of-line call
+    /// (`Cpu::load_q_pair`/`store_q_pair`; `EmitOptions::direct_q_pairs`
+    /// writes their body out instead).
+    pub out_of_line: usize,
     /// Calls of other guest code: `Core::call` (through the window table),
     /// `call_window` and direct calls of lifted functions or windows.
     pub calls: usize,
@@ -101,9 +105,12 @@ fn count_line(line: &str, counts: &mut Census) {
             counts.stores[index] += line.matches(&format!("{path}store_u{width}(")).count();
         }
     }
+    for out_of_line in ["load_q_pair(", "store_q_pair("] {
+        let calls = line.matches(out_of_line).count();
+        counts.checked_accesses += calls;
+        counts.out_of_line += calls;
+    }
     for checked in [
-        "load_q_pair(",
-        "store_q_pair(",
         "m.memory.read(",
         "m.memory.write(",
         "m.memory.load_acquire",
@@ -187,7 +194,7 @@ fn count_line(line: &str, counts: &mut Census) {
 /// inlined operations.
 pub fn table(rows: &[(String, Census)]) -> String {
     let mut text = String::from(
-        "| function | loads 1/2/4/8 | stores 1/2/4/8 | checked | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |\n\
+        "| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |\n\
          |---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for (label, c) in rows {
@@ -210,10 +217,11 @@ pub fn table(rows: &[(String, Census)]) -> String {
         };
         writeln!(
             text,
-            "| {label} | {} | {} | {} | {} | {} | {}/{} | {} ({}) | {} ({}) | {} | {} | {} |",
+            "| {label} | {} | {} | {} ({}) | {} | {} | {}/{} | {} ({}) | {} ({}) | {} | {} | {} |",
             widths(&c.loads),
             widths(&c.stores),
             c.checked_accesses,
+            c.out_of_line,
             c.calls,
             c.indirect_branches,
             c.flags_set,
@@ -257,6 +265,7 @@ next_pc = target;
 /*inline:vector*/{ if fast { } else { echora_guest::simd::vec_fp(&mut m.cpu, echora_guest::simd::VecFpOp::Add, echora_guest::simd::FpSize::S, true, false, 0, 1, 2)?; } }
 let moved: u64 = { m.memory.read(address, &mut buffer)?; 16u64 };
 m.cpu.load_q_pair(&m.memory, address, 0, 1)?;
+{ let mut bytes = [0u8; 32]; m.memory.read(address, &mut bytes)?; }
 }
 let result = body(m, &mut r);
 m.cpu.regs[0] = r.x0;
@@ -278,7 +287,9 @@ let result = body(m, &mut r);
         assert_eq!(name, "run_window_400");
         assert_eq!(c.loads, [1, 0, 0, 1]);
         assert_eq!(c.stores, [0, 0, 1, 0]);
-        assert_eq!(c.checked_accesses, 2);
+        // Two `read`s and an out-of-line Q pair.
+        assert_eq!(c.checked_accesses, 3);
+        assert_eq!(c.out_of_line, 1);
         assert_eq!(c.calls, 1);
         assert_eq!(c.indirect_branches, 1);
         assert_eq!((c.flags_set, c.flags_fused), (1, 1));
@@ -301,6 +312,6 @@ let result = body(m, &mut r);
     fn the_table_has_a_row_per_function() {
         let text = table(&census(SAMPLE));
         assert_eq!(text.lines().count(), 4);
-        assert!(text.contains("| run_window_400 | 1/0/0/1 | 0/0/1/0 | 2 | 1 | 1 | 1/1 | 2 (1) | 2 (1) | 1 | vec_fp 1 | int 1, vector 1 |"));
+        assert!(text.contains("| run_window_400 | 1/0/0/1 | 0/0/1/0 | 3 (1) | 1 | 1 | 1/1 | 2 (1) | 2 (1) | 1 | vec_fp 1 | int 1, vector 1 |"));
     }
 }

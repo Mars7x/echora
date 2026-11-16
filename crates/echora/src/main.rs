@@ -766,6 +766,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
                 "inline-vector-misc" => options.inline_vector_misc = true,
                 "count-fallbacks" => options.count_fallbacks = true,
                 "align-windows" => options.align_windows = true,
+                "direct-q-pairs" => options.direct_q_pairs = true,
                 "fp-status-locals" => options.fp_status_locals = true,
                 "window-memory" => options.window_memory = true,
                 "dense-dispatch" => options.dense_dispatch = true,

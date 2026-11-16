@@ -3241,7 +3241,31 @@ fn emit_instruction_body(
                     writeback: *writeback,
                 },
             );
-            if *load {
+            if DIRECT_Q_PAIRS.get() {
+                // `EmitOptions::direct_q_pairs`: the body of
+                // `Cpu::load_q_pair`/`store_q_pair` written out, the same
+                // single `GuestView::read`/`write` of the 32 bytes (its
+                // range check and trap, then one copy) and both registers
+                // written after the read. Eight direct 8-byte accesses
+                // instead (single-copy atomic each, so never merged) made
+                // memcpy 27% slower than the out-of-line call.
+                if *load {
+                    writeln!(
+                        output,
+                        "                {{ let mut bytes = [0u8; 32]; m.memory.read(address, &mut bytes)?; \
+                         let mut first = [0u8; 16]; first.copy_from_slice(&bytes[..16]); let mut second = [0u8; 16]; second.copy_from_slice(&bytes[16..]); \
+                         m.cpu.vectors[{rt}] = u128::from_le_bytes(first); m.cpu.vectors[{rt2}] = u128::from_le_bytes(second); }}"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        output,
+                        "                {{ let mut bytes = [0u8; 32]; bytes[..16].copy_from_slice(&m.cpu.vectors[{rt}].to_le_bytes()); bytes[16..].copy_from_slice(&m.cpu.vectors[{rt2}].to_le_bytes()); \
+                         m.memory.write(address, &bytes)?; }}"
+                    )
+                    .unwrap();
+                }
+            } else if *load {
                 writeln!(
                     output,
                     "                m.cpu.load_q_pair(&m.memory, address, {rt}, {rt2})?;"
@@ -4976,6 +5000,10 @@ pub struct EmitOptions {
     /// comment naming the option that inlined it, for `crate::census`;
     /// nothing compiled changes.
     pub census: bool,
+    /// LDP/STP of Q registers with the body of `Cpu::load_q_pair`/
+    /// `store_q_pair` written out in place of the call: the same single
+    /// range-checked `GuestView::read`/`write` of the 32 bytes.
+    pub direct_q_pairs: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5248,6 +5276,11 @@ impl Drop for InlineVectorMisc {
     fn drop(&mut self) {
         crate::simd_misc::set_inline_vector_misc(self.0);
     }
+}
+
+thread_local! {
+    /// `EmitOptions::direct_q_pairs` of the region being emitted.
+    static DIRECT_Q_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -5685,6 +5718,7 @@ struct RegionSettings {
     inline_vector_misc: InlineVectorMisc,
     count_fallbacks: Flag,
     census: Census,
+    direct_q_pairs: Flag,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5729,6 +5763,7 @@ impl RegionSettings {
             )),
             count_fallbacks: Flag::set(&COUNT_FALLBACKS, options.count_fallbacks),
             census: Census(crate::simd::set_census(options.census)),
+            direct_q_pairs: Flag::set(&DIRECT_Q_PAIRS, options.direct_q_pairs),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,

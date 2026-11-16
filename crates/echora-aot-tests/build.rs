@@ -46,6 +46,7 @@ fn options() -> EmitOptions {
         // by this crate's own flags.
         align_windows: false,
         census: false,
+        direct_q_pairs: std::env::var_os("CARGO_FEATURE_DIRECT_Q_PAIRS").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -152,6 +153,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("fp_scalar", fp_scalar_code),
     ("vector_misc", vector_misc_code),
     ("fallback_count", fallback_count_code),
+    ("q_pair", q_pair_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1185,6 +1187,114 @@ fn fallback_count_code(out: &mut String) {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
+}
+
+/// Programs for `tests/q_pairs.rs`: LDP and STP of Q registers in every
+/// addressing form (signed offset, pre-index, post-index) at offsets
+/// across the immediate's range, with the base register an ordinary one or
+/// SP, and STP followed by an LDP whose bytes overlap it; each followed by an SVC. Lifted with
+/// `EmitOptions::direct_q_pairs` (`q_pair_code`) and without
+/// (`q_pair_reference`), with window memory and FPCR/FPSR locals as game
+/// builds.
+fn q_pair_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+
+    const BASE: u64 = 0x280_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    // (store opcode, load opcode) per form: signed offset, pre-index,
+    // post-index.
+    const FORMS: [(&str, u32, u32); 3] = [
+        ("offset", 0xad00_0000, 0xad40_0000),
+        ("pre", 0xad80_0000, 0xadc0_0000),
+        ("post", 0xac80_0000, 0xacc0_0000),
+    ];
+    let encode = |opcode: u32, imm7: i32, rt2: u32, rn: u32, rt: u32| {
+        opcode | ((imm7 as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
+    };
+    // (description, words)
+    let mut programs: Vec<(String, Vec<u32>)> = Vec::new();
+    for (form, store, load) in FORMS {
+        for imm7 in [-64, -1, 0, 1, 63] {
+            for (rt, rt2, rn) in [(0, 1, 2), (30, 31, 31), (5, 6, 7)] {
+                programs.push((
+                    format!("stp q{rt}, q{rt2}, x{rn} {form} {imm7}"),
+                    vec![encode(store, imm7, rt2, rn, rt)],
+                ));
+                programs.push((
+                    format!("ldp q{rt}, q{rt2}, x{rn} {form} {imm7}"),
+                    vec![encode(load, imm7, rt2, rn, rt)],
+                ));
+            }
+            // LDP with both destinations the same register is
+            // CONSTRAINED UNPREDICTABLE and does not decode (a Q pair's
+            // registers and its base never alias: one is a vector, the
+            // other a general register).
+        }
+    }
+    // STP then an LDP of overlapping bytes (16 apart, and the same).
+    for (first, second) in [(0, 1), (0, 0), (1, 0)] {
+        programs.push((
+            format!("stp q0, q1, x2 offset {first}; ldp q3, q4, x2 offset {second}"),
+            vec![
+                encode(FORMS[0].1, first, 1, 2, 0),
+                encode(FORMS[0].2, second, 4, 2, 3),
+            ],
+        ));
+    }
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    for (name, program) in &programs {
+        for &word in program {
+            assert!(
+                matches!(decode(word, 0), Instruction::LoadStoreVectorPair { .. }),
+                "{name}: {word:#010x}"
+            );
+        }
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(name.clone());
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "q_pairs".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("q_pairs");
+    for (name, direct) in [("q_pair_code", true), ("q_pair_reference", false)] {
+        let options = EmitOptions {
+            direct_q_pairs: direct,
+            window_memory: true,
+            fp_status_locals: true,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        let out_of_line: usize = regions
+            .iter()
+            .map(|(_, source)| {
+                echora_lift::census::census(source)
+                    .iter()
+                    .map(|(_, counts)| counts.out_of_line)
+                    .sum::<usize>()
+            })
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "/// Out-of-line `load_q_pair`/`store_q_pair` calls left (`echora_lift::census`).\npub const OUT_OF_LINE: usize = {out_of_line};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
 }
 
 /// The benchmark kernels, lifted together through split emission (as real
