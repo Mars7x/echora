@@ -5861,6 +5861,30 @@ impl Nvn {
                 }
             }
         }
+        // Each address no dumped pool holds: what `pool_for` resolves it to
+        // (a virtual pool's mapping) and the nearest pool below it.
+        for &address in addresses_reached.iter().filter(|address| **address != 0) {
+            if pools
+                .iter()
+                .any(|&(gpu, _, size)| (gpu..gpu + size).contains(&address))
+            {
+                continue;
+            }
+            let nearest = self
+                .objects
+                .iter()
+                .filter(|(_, pool)| pool.kind == "MemoryPool")
+                .filter_map(|(object, pool)| {
+                    let gpu = pool.state.get("GpuAddress")?.x[0];
+                    let storage = pool.builder.get("Storage")?;
+                    (gpu <= address).then_some((gpu, *object, storage.x[0], storage.x[1]))
+                })
+                .max_by_key(|&(gpu, ..)| gpu);
+            text += &format!(
+                "unpooled {address:#x}: resolves to {:x?}, nearest pool below (gpu, object, storage, size) {nearest:x?}\n",
+                self.pool_for(address)
+            );
+        }
         // Virtual pools any address lands in: each mapping (virtual GPU
         // range -> physical pool's GPU address and offset), and the
         // physical pools dumped as the others are.
