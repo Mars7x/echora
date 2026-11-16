@@ -466,7 +466,7 @@ impl Renderer {
     }
 
     /// The counts noted since the last call.
-    pub fn take_stats(&mut self) -> HashMap<&'static str, u64> {
+    pub fn take_stats(&mut self) -> crate::fast_map::FastMap<&'static str, u64> {
         // Named once per source line, so each name is kept for the run.
         static NAMES: std::sync::Mutex<
             Vec<(&'static std::panic::Location<'static>, &'static str)>,

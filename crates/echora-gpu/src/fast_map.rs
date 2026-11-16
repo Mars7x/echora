@@ -39,3 +39,5 @@ impl FastHasher {
 
 /// A HashMap with [`FastHasher`].
 pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+/// A HashSet with [`FastHasher`].
+pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FastHasher>>;

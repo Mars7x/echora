@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::fast_map::FastMap;
+use crate::fast_map::{FastMap, FastSet};
 
 use ash::vk;
 
@@ -267,11 +267,11 @@ pub struct Renderer {
     /// sampler) index: reused while the entry is the same (`bind_pool`).
     pub(crate) pool_entry_memo: FastMap<(u32, u32), crate::pool::ResolvedEntry>,
     /// Counts for the runtime's statistics (`take_stats`).
-    pub(crate) stats: HashMap<&'static str, u64>,
+    pub(crate) stats: FastMap<&'static str, u64>,
     /// Rendering passes ended, by the source line that ended them (for
     /// the statistics: a pass that ends between draws costs a store and
     /// load of every attachment).
-    pub(crate) pass_ends: HashMap<&'static std::panic::Location<'static>, u64>,
+    pub(crate) pass_ends: FastMap<&'static std::panic::Location<'static>, u64>,
     /// Debugging buffers shaders write through device addresses
     /// (`debug_buffer`).
     debug_buffers: Vec<HostBuffer>,
@@ -370,7 +370,7 @@ pub struct Renderer {
     scale: Scale,
     /// Targets kept at the guest's resolution: compute passes write them
     /// as storage images, or they were bound with an unscaled target.
-    unscaled: std::collections::HashSet<u64>,
+    unscaled: FastSet<u64>,
     /// Color clears limited by the scissor to part of the target.
     pub partial_clears: u64,
     pub flush_wait_microseconds: u64,
@@ -378,7 +378,7 @@ pub struct Renderer {
     /// attachments of the last rendering pass: a pass or transfer that
     /// reads one of them (or another pass that writes one) waits for
     /// those writes first.
-    written: std::collections::HashSet<vk::Image>,
+    written: FastSet<vk::Image>,
     last_attachments: Vec<vk::Image>,
     /// Memory barriers recorded for those hazards.
     pub hazard_barriers: u64,
@@ -697,8 +697,8 @@ impl Renderer {
             texture_pool: None,
             pool_cache: None,
             pool_entry_memo: FastMap::default(),
-            stats: HashMap::new(),
-            pass_ends: HashMap::new(),
+            stats: FastMap::default(),
+            pass_ends: FastMap::default(),
             debug_buffers: Vec::new(),
             timer,
             shader_cache: None,
@@ -740,10 +740,10 @@ impl Renderer {
             targets_recreated: 0,
             descaled: 0,
             scale: Scale::from_env(),
-            unscaled: std::collections::HashSet::new(),
+            unscaled: FastSet::default(),
             partial_clears: 0,
             flush_wait_microseconds: 0,
-            written: std::collections::HashSet::new(),
+            written: FastSet::default(),
             last_attachments: Vec::new(),
             hazard_barriers: 0,
             spares,
