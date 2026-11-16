@@ -5329,11 +5329,27 @@ impl Nvn {
                         }
                         let number = self.dispatch_dump.1;
                         self.dispatch_dump.1 += 1;
-                        let directory = std::path::Path::new(directory)
-                            .join(format!("present-{present}"))
-                            .join(format!("dispatch-{number:03}"));
-                        if let Err(error) = self.dump_mesh_draw(core, command, &directory, false) {
-                            eprintln!("dispatch dump {number}: {error}");
+                        let present_directory =
+                            std::path::Path::new(directory).join(format!("present-{present}"));
+                        let directory = present_directory.join(format!("dispatch-{number:03}"));
+                        match self.dump_mesh_draw(core, command, &directory, false) {
+                            // The pools the present's dispatches reach, each
+                            // once, in present-P/pools/pool-<gpu>.bin.
+                            Ok(pools) => {
+                                let pools_directory = present_directory.join("pools");
+                                let _ = std::fs::create_dir_all(&pools_directory);
+                                for (gpu, memory, size) in pools {
+                                    let path = pools_directory.join(format!("pool-{gpu:x}.bin"));
+                                    if path.exists() {
+                                        continue;
+                                    }
+                                    let mut bytes = vec![0u8; size.min(256 << 20) as usize];
+                                    if core.memory.read(memory, &mut bytes).is_ok() {
+                                        let _ = std::fs::write(path, bytes);
+                                    }
+                                }
+                            }
+                            Err(error) => eprintln!("dispatch dump {number}: {error}"),
                         }
                     }
                     // ECHORA_TASK_DUMP_INDIRECT: indirect ones only.
@@ -5891,7 +5907,7 @@ impl Nvn {
         command: &Command,
         directory: &std::path::Path,
         with_pools: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<(u64, u64, u64)>, String> {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         let write = |name: String, bytes: &[u8]| {
             std::fs::write(directory.join(&name), bytes).map_err(|error| format!("{name}: {error}"))
@@ -6129,7 +6145,11 @@ impl Nvn {
                 }
             }
         }
-        for (gpu, memory, size) in pools.into_iter().filter(|_| with_pools) {
+        if !with_pools {
+            write("draw.txt".into(), text.as_bytes())?;
+            return Ok(pools);
+        }
+        for &(gpu, memory, size) in &pools {
             let length = size.min(256 << 20);
             let mut bytes = vec![0u8; length as usize];
             core.memory
@@ -6138,7 +6158,8 @@ impl Nvn {
             text += &format!("pool {gpu:#x} size {size:#x} dumped {length:#x}\n");
             write(format!("pool-{gpu:x}.bin"), &bytes)?;
         }
-        write("draw.txt".into(), text.as_bytes())
+        write("draw.txt".into(), text.as_bytes())?;
+        Ok(pools)
     }
 
     /// Presents so far.
