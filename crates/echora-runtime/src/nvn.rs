@@ -2137,7 +2137,10 @@ impl Nvn {
                 // the GPU past the kernel's job limit. A call reaching
                 // memory through a worker's view cannot share (the next
                 // present does).
-                if core.memory.can_share() {
+                // ECHORA_SHARE_AT_INIT=0 (debugging): only at presents, as before.
+                if core.memory.can_share()
+                    && !debug_var_os("ECHORA_SHARE_AT_INIT").is_some_and(|value| value == "0")
+                {
                     self.share_new_pools(core);
                 }
                 core.cpu.regs[0] = 1;

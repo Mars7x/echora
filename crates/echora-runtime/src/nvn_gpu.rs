@@ -5527,9 +5527,13 @@ impl Nvn {
         // the next present. Mapped meanwhile only by a build that can look
         // spans up, they read zero to the GPU; the forest's task programs,
         // reading a header of zeros there, loop in every workgroup.
+        // ECHORA_QUEUE_UNSHARED=0 (debugging): not queued, as before.
+        let queue_unshared =
+            !super::debug_var_os("ECHORA_QUEUE_UNSHARED").is_some_and(|value| value == "0");
         let unshared: Vec<u64> = self
             .gpu
             .as_ref()
+            .filter(|_| queue_unshared)
             .map(|backend| {
                 self.memory_pools
                     .iter()
