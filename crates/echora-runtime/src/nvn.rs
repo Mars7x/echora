@@ -5131,6 +5131,23 @@ impl Nvn {
                         };
                         if words == 2 {
                             bind.x[4] = value[1];
+                            // ECHORA_UNPOOLED_LOG, as for single binds.
+                            if value[0] != 0
+                                && debug_var_os("ECHORA_UNPOOLED_LOG").is_some()
+                                && self.pool_for(value[0]).is_none()
+                                && self.unpooled_seen.insert(value[0])
+                            {
+                                let finalized: Vec<(u64, u64, u64)> = self
+                                    .finalized_pools
+                                    .iter()
+                                    .copied()
+                                    .filter(|&(gpu, size, _)| (gpu..gpu + size).contains(&value[0]))
+                                    .collect();
+                                eprintln!(
+                                    "unpooled bind present {} {rest} stage {} slot {slot} at {:#x} size {:#x}: finalized pools over it (gpu, size, present) {finalized:x?}",
+                                    self.presented_frames, command.x[1], value[0], value[1]
+                                );
+                            }
                         }
                         if single == "BindTexture"
                             && self
