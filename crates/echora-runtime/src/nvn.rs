@@ -2128,6 +2128,18 @@ impl Nvn {
                     },
                 );
                 self.pool_epoch += 1;
+                // The GPU reaches the pool from now on, as on the console:
+                // shared into the page table here, not at the next present.
+                // GPU work recorded before that present but replayed ahead
+                // of it read zero for the pool (an unmapped page), and the
+                // forest's task programs, given zeros, loop in every
+                // workgroup until the loop budget: their first frame ran
+                // the GPU past the kernel's job limit. A call reaching
+                // memory through a worker's view cannot share (the next
+                // present does).
+                if core.memory.can_share() {
+                    self.share_new_pools(core);
+                }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
