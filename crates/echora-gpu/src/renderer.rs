@@ -2816,7 +2816,9 @@ impl Renderer {
         // the submit thread: the wait covers its submission).
         // Under ECHORA_HANG_MARKERS a wait over 2 s reports where the GPU
         // stopped, then goes on waiting.
-        let limit = if self.hang.is_some() {
+        // So does one with ECHORA_MESH_COUNT_LOG: the indirect mesh counts
+        // read since the last report.
+        let limit = if self.hang.is_some() || crate::mesh_count::logging() {
             2_000_000_000
         } else {
             u64::MAX
@@ -2831,12 +2833,20 @@ impl Renderer {
                 if let Some(hang) = &self.hang {
                     hang.report(self.slot.serial);
                 }
+                if let Some(mesh_count) = &self.mesh_count {
+                    mesh_count.report_pending("GPU stalled over 2 s");
+                }
             }
         }
         unsafe {
             device
                 .wait_for_fences(&[self.slot.fence], true, u64::MAX)
-                .map_err(vk_error("vkWaitForFences"))?;
+                .map_err(|error| {
+                    if let Some(mesh_count) = &self.mesh_count {
+                        mesh_count.report_pending("fence wait failed");
+                    }
+                    vk_error("vkWaitForFences")(error)
+                })?;
             device
                 .reset_fences(&[self.slot.fence])
                 .map_err(vk_error("vkResetFences"))?;

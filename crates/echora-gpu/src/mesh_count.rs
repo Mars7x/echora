@@ -79,6 +79,34 @@ impl MeshCount {
         })
     }
 
+    /// The counts read since the last report: each past the bound, then
+    /// the largest (ECHORA_MESH_COUNT_LOG; also when a wait stalls or the
+    /// device is lost, as the log is readable at any moment).
+    pub(crate) fn report_pending(&self, why: &str) {
+        let bytes = self.log.read_bytes(LOGGED as usize * 4);
+        let counts: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        let from = self
+            .reported
+            .max(self.next.saturating_sub(u64::from(LOGGED)));
+        let mut largest = 0;
+        for draw in from..self.next {
+            let count = counts[(draw % u64::from(LOGGED)) as usize];
+            largest = largest.max(count);
+            if count > TASK_WORKGROUPS {
+                eprintln!("gpu: indirect mesh draw {draw}: count {count} past {TASK_WORKGROUPS}");
+            }
+        }
+        eprintln!(
+            "gpu: indirect mesh counts of draws {from}..{} ({why}): largest {largest}",
+            self.next
+        );
+    }
+
     pub(crate) fn destroy(self, device: &ash::Device) {
         // SAFETY: the renderer is idle when it is destroyed.
         unsafe {
@@ -161,43 +189,28 @@ impl Renderer {
         Ok(true)
     }
 
-    /// ECHORA_MESH_COUNT_LOG (debugging): every 1024 indirect mesh draws,
-    /// the largest count read since the last report and how many were past
-    /// the bound (from the log the GPU has written so far).
+    /// ECHORA_MESH_COUNT_LOG (debugging): every 30 indirect mesh draws
+    /// (about a forest frame's), the counts read since the last report as
+    /// far as the GPU has written them.
     fn mesh_count_report(&mut self) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("ECHORA_MESH_COUNT_LOG").is_some()) {
+        if !logging() {
             return;
         }
         let Some(mesh_count) = self.mesh_count.as_mut() else {
             return;
         };
-        if mesh_count.next < mesh_count.reported + 1024 {
+        if mesh_count.next < mesh_count.reported + 30 {
             return;
         }
-        let bytes = mesh_count.log.read_bytes(LOGGED as usize * 4);
-        let counts: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| u32::from_le_bytes(*word))
-            .collect();
-        let from = mesh_count
-            .reported
-            .max(mesh_count.next.saturating_sub(u64::from(LOGGED)));
-        let mut largest = 0;
-        let mut over = 0;
-        for draw in from..mesh_count.next {
-            let count = counts[(draw % u64::from(LOGGED)) as usize];
-            largest = largest.max(count);
-            over += u32::from(count > TASK_WORKGROUPS);
-        }
-        eprintln!(
-            "gpu: indirect mesh counts of draws {from}..{}: largest {largest}, {over} past {TASK_WORKGROUPS}",
-            mesh_count.next
-        );
+        mesh_count.report_pending("periodic");
         mesh_count.reported = mesh_count.next;
     }
+}
+
+/// Whether ECHORA_MESH_COUNT_LOG is set.
+pub(crate) fn logging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ECHORA_MESH_COUNT_LOG").is_some())
 }
 
 /// One invocation: `*target = min(*source, bound); *log = *source` (u32).

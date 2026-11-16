@@ -938,6 +938,7 @@ impl Renderer {
                 // Bounded by the device's limit on the GPU (`mesh_count`);
                 // copied as it is where buffers have no addresses.
                 if !self.bounded_mesh_count((buffer, offset), (ring, at))? {
+                    self.stat("stat: mesh counts copied unbounded", 1);
                     self.copy_mesh_count((buffer, offset), (ring, at))?;
                 }
                 Some((ring, at))
