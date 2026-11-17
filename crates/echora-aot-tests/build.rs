@@ -47,6 +47,7 @@ fn options() -> EmitOptions {
         align_windows: false,
         census: false,
         direct_q_pairs: std::env::var_os("CARGO_FEATURE_DIRECT_Q_PAIRS").is_some(),
+        vector_float_runs: std::env::var_os("CARGO_FEATURE_VECTOR_FLOAT_RUNS").is_some(),
         fp_status_locals: std::env::var_os("CARGO_FEATURE_FP_STATUS_LOCALS").is_some(),
         window_memory: std::env::var_os("CARGO_FEATURE_WINDOW_MEMORY").is_some(),
         dense_dispatch: std::env::var_os("CARGO_FEATURE_DENSE_DISPATCH").is_some(),
@@ -154,6 +155,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("vector_misc", vector_misc_code),
     ("fallback_count", fallback_count_code),
     ("q_pair", q_pair_code),
+    ("vector_run", vector_run_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1290,6 +1292,117 @@ fn q_pair_code(out: &mut String) {
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
         writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
         writeln!(out, "/// Out-of-line `load_q_pair`/`store_q_pair` calls left (`echora_lift::census`).\npub const OUT_OF_LINE: usize = {out_of_line};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/vector_runs.rs`: two to six vector float arithmetic
+/// operations in a row (`echora_lift::simd::vector_run_op`: FADD, FSUB,
+/// FMUL, FMLA, FMLS, FDIV, FRECPS, FRSQRTS and the by-element forms, each
+/// size), on V0 to V3 so that results feed later operations and registers
+/// alias, a quarter of them with an MSR FPCR, X5 in the middle (which
+/// splits the run), each followed by an SVC. Lifted with
+/// `EmitOptions::vector_float_runs` (`vector_run_code`) and without
+/// (`vector_run_reference`), with the game's other options.
+fn vector_run_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+
+    const BASE: u64 = 0x2a0_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const MSR_FPCR_X5: u32 = 0xd51b_4405;
+    // Eligible words, one per form, registers narrowed to V0-V3 (Vm of a
+    // by-element form: bits 16-19, M clear).
+    let mut pool: Vec<u32> = Vec::new();
+    let mut forms = std::collections::BTreeSet::new();
+    let mut state = 0x7e57_a11e_0000_0013u64;
+    for _ in 0..2_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let word = (state as u32 & !0x0e00_0000) | 0x0e00_0000;
+        let Instruction::Simd(op) = decode(word, 0) else {
+            continue;
+        };
+        if !echora_lift::simd::vector_run_op(&op) {
+            continue;
+        }
+        let narrowed = word & !0x001f_03ff | (state >> 32) as u32 & 0x0003_0063;
+        let Instruction::Simd(narrowed_op) = decode(narrowed, 0) else {
+            continue;
+        };
+        if !echora_lift::simd::vector_run_op(&narrowed_op) {
+            continue;
+        }
+        let text = format!("{narrowed_op:?}");
+        let form: String = text.split(" rd:").next().unwrap_or(&text).to_owned();
+        if forms.insert(form) {
+            pool.push(narrowed);
+        }
+    }
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for program in 0..600u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let length = 2 + (state % 5) as usize;
+        entries.push(BASE + 4 * words.len() as u64);
+        for index in 0..length {
+            if program % 4 == 0 && index == length / 2 {
+                words.push(MSR_FPCR_X5);
+            }
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            words.push(pool[(state % pool.len() as u64) as usize]);
+        }
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "vector_run".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("vector_run");
+    for (name, runs) in [("vector_run_code", true), ("vector_run_reference", false)] {
+        let options = EmitOptions {
+            inline_vector: true,
+            whole_vector_checks: true,
+            fp_status_locals: true,
+            window_memory: true,
+            untagged_blocks: true,
+            split_ticks: true,
+            vector_float_runs: runs,
+            ..options()
+        };
+        let (root, regions) = split(&translation, options);
+        let formed: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches("let o0 = ").count())
+            .sum();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(
+            out,
+            "/// Forms sampled.\npub const FORMS: usize = {};",
+            forms.len()
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Vector float runs formed.\npub const RUNS: usize = {formed};"
+        )
+        .expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

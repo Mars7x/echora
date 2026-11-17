@@ -777,32 +777,33 @@ compiled changes). aot-tests' `kernel_code::KERNEL_CENSUS` is the table
 for the kernels as built; `cargo test --release -p echora-aot-tests
 --features <options> --test census -- --nocapture` prints it. With the
 game set and `inline-vector-unary`, `-int`, `-pairwise`,
-`inline-fp-scalar`, `inline-vector-misc` and `direct-q-pairs` (the
+`inline-fp-scalar`, `inline-vector-misc`, `direct-q-pairs` and
+`vector-float-runs` (the
 checked column gives in brackets the accesses made by an out-of-line call,
 `Cpu::load_q_pair`/`store_q_pair`: 4 of memcpy's 4 without
 `direct-q-pairs`):
 
-| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| arith | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/0 | 0 (0) | 0 (0) | 4 | - | - |
-| memcpy | 0/0/0/0 | 0/0/0/0 | 4 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| memset | 0/0/0/0 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| calls | 0/0/0/0 | 0/0/0/0 | 0 (0) | 2 | 0 | 1/0 | 4 (1) | 6 (2) | 5 | - | - |
-| (leaf functions) | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 2 | 0/0 | 0 (0) | 0 (0) | 2 | - | - |
-| switch | 0/1/0/0 | 0/0/0/0 | 0 (0) | 0 | 1 | 1/0 | 0 (0) | 0 (0) | 12 | - | - |
-| vector | 0/0/0/4 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 5 | vec_fp 3, vec_fp_lane 3 | vector 3 |
-| poll | 0/0/0/0 | 0/0/0/0 | 1 (0) | 0 | 0 | 0/0 | 0 (0) | 0 (0) | 3 | - | - |
-| scalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 1 (1) | 7 (7) | 5 | fp_binary 1, fp_compare 1, fp_ternary 1 | vector 5 |
-| ldst | 0/0/0/1 | 0/0/0/1 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - |
-| floats | 0/0/3/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
-| floatld | 0/0/4/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 |
-| calls2 | 0/0/0/2 | 0/0/0/2 | 0 (0) | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - |
-| vnorm | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 |
-| convert | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 |
-| intvec | 0/0/0/4 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 |
-| fpairs | 0/0/0/4 | 0/0/1/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 |
-| fpscalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 |
-| misc | 0/0/0/2 | 0/0/0/0 | 3 (0) | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 |
+| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined | float tests (mode) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| arith | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/0 | 0 (0) | 0 (0) | 4 | - | - | 0 (0) |
+| memcpy | 0/0/0/0 | 0/0/0/0 | 4 (4) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - | 0 (0) |
+| memset | 0/0/0/0 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - | 0 (0) |
+| calls | 0/0/0/0 | 0/0/0/0 | 0 (0) | 2 | 0 | 1/0 | 4 (1) | 6 (2) | 5 | - | - | 0 (0) |
+| (leaf functions) | 0/0/0/0 | 0/0/0/0 | 0 (0) | 0 | 2 | 0/0 | 0 (0) | 0 (0) | 2 | - | - | 0 (0) |
+| switch | 0/1/0/0 | 0/0/0/0 | 0 (0) | 0 | 1 | 1/0 | 0 (0) | 0 (0) | 12 | - | - | 0 (0) |
+| vector | 0/0/0/4 | 0/0/0/0 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 5 | vec_fp 3, vec_fp_lane 3 | vector 3 | 13 (1) |
+| poll | 0/0/0/0 | 0/0/0/0 | 1 (0) | 0 | 0 | 0/0 | 0 (0) | 0 (0) | 3 | - | - | 0 (0) |
+| scalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 1 (1) | 7 (7) | 5 | fp_binary 1, fp_compare 1, fp_ternary 1 | vector 5 | 7 (3) |
+| ldst | 0/0/0/1 | 0/0/0/1 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | - | 0 (0) |
+| floats | 0/0/3/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 | 15 (1) |
+| floatld | 0/0/4/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 | 27 (5) |
+| calls2 | 0/0/0/2 | 0/0/0/2 | 0 (0) | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - | 0 (0) |
+| vnorm | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 | 21 (3) |
+| convert | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 | 9 (3) |
+| intvec | 0/0/0/4 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 | 0 (0) |
+| fpairs | 0/0/0/4 | 0/0/1/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 | 31 (4) |
+| fpscalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 | 8 (8) |
+| misc | 0/0/0/2 | 0/0/0/0 | 3 (0) | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 | 17 (5) |
 
 The slowest kernels per guest instruction are the vector float ones
 (vector, vnorm, misc, fpairs: 280 to 470 Minstr/s against 1,600 to 5,400
@@ -849,6 +850,57 @@ line. A first version that read and wrote the pairs as eight direct
 1,149, interval -27.9% to -26.8%): each 8-byte guest access is a relaxed
 atomic, so the compiler cannot merge them into the 16-byte moves of the
 call's copy, and echora-guest has no 16-byte direct access.
+
+## Vector float runs (opt-in)
+
+The vector float kernels spend their operations in the inlined float
+operations' tests: forcing every operation's fast path (wrong, as a bound)
+made vector 89% and vnorm 158% faster. `EmitOptions::vector_float_runs`
+(`vector-float-runs`, with `inline-vector`) treats two or more consecutive
+vector float arithmetic operations of a block (the forms `vec_fp_arith`
+inlines: FADD, FSUB, FMUL, FMLA, FMLS, FDIV, FRECPS, FRSQRTS and the
+by-element forms; not a block's first or last instruction) as one run,
+emitted twice:
+
+- the fast copy computes every operation on locals, a result feeding the
+  operations after it without going through the register file; it tests
+  the FPCR mode and FPSR.IXC once for the run, each operand vector from
+  before the run once with the whole-vector tests (an operand that is an
+  earlier result of the run, of the same lane width and lanes, is not
+  tested again: it was tested as a result), and each result with
+  `normal_all`, lane by lane only when that fails (a zero must be exact);
+  an overflow is not taken (it raises OFC). It writes nothing until every
+  test has passed, and then raises nothing;
+- otherwise the exact copy runs: the operations as each is emitted alone,
+  from the run's start, so every fallback (the single-lane helper, the
+  whole helper under another FPCR) raises its flags in today's order.
+
+Nothing between a run's operations writes FPCR, calls a helper or leaves
+the block: they are consecutive (an MSR FPCR ends a run). The census
+(above, with the option) counts the tests of the path taken when the fast
+copies commit: vector 23 to 13 test sites (FPCR mode tests 3 to 1), vnorm
+36 to 21 (6 to 3); misc and fpairs hold no such run (17 and 31, unchanged).
+
+`tests/vector_runs.rs` lifts 600 programs of two to six such operations on
+V0 to V3 (results feed later operations, registers alias; a quarter write
+FPCR from X5 in the middle), with and without the option, and runs each
+from mostly ordinary lanes with float edges (NaN payloads, signalling NaNs,
+denormals, infinities, zeros, the extremes) among them, so an exceptional
+lane falls mid-run, under the three FPCR and FPSR settings, FPSR without
+IXC and a trapping rounding mode, X5 any of them: vectors, FPCR, FPSR and
+the trap agree. Dropping the result test, treating every operand as
+tested, committing only the first register written or dropping the IXC
+condition fails it; a divisor tested as usable instead of normal does not
+(a zero divisor's result is infinite or a NaN, which the result test
+rejects).
+
+Kernels, every function 64-byte aligned, 20 alternating rounds of seven
+runs, pinned, medians with a 95% interval by resampling: vector 261 to 304
+Minstr/s (+16.8%, +10.1% to +23.7%), vnorm 239 to 318 (+33.5%, +30.9% to
++35.8%); misc and fpairs (no runs) +0.4% and +0.1%, within noise. A first
+version that tested every lane of every operand and result one at a time
+had fewer test sites but was slower (vector -8.5%, vnorm -4.3%): the
+whole-vector tests cost less than per-lane ones.
 
 ## Options on some regions only
 

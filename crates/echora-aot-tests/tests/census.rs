@@ -30,5 +30,5 @@ fn the_kernel_census_matches_the_kernels() {
     // intvec: no helper call left in the default kernel lift is required
     // here; its inlined operations are counted by option only when the
     // features inline them, so only the row's presence is checked.
-    assert_eq!(row("intvec").len(), 12);
+    assert_eq!(row("intvec").len(), 13);
 }

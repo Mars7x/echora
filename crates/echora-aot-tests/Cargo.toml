@@ -71,6 +71,9 @@ count-fallbacks = []
 # LDP/STP of Q registers through direct accesses after the checked calls'
 # range test (EmitOptions::direct_q_pairs).
 direct-q-pairs = []
+# With inline-vector: consecutive vector float arithmetic as one fast copy
+# checked once (EmitOptions::vector_float_runs).
+vector-float-runs = []
 # Keep FPCR and FPSR in window locals (EmitOptions::fp_status_locals).
 fp-status-locals = []
 # Split windows reach guest memory through a local copy of the access

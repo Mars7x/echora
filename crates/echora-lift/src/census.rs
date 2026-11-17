@@ -53,6 +53,13 @@ pub struct Census {
     /// Operations inlined, by the option that inlined them (`vector` for
     /// `inline_vector` itself).
     pub inlined: BTreeMap<String, usize>,
+    /// Float operand and result tests (`usable`, `normal` and their
+    /// whole-vector forms) and FPCR mode tests in the emitted text, outside
+    /// the exact copies of float runs (which run only when a run's fast
+    /// copy does not commit): the tests the path taken when every lane is
+    /// ordinary holds, each counted once however many lanes it tests.
+    pub float_tests: usize,
+    pub mode_tests: usize,
 }
 
 /// The census of each function in `source` (a region's emitted Rust), in
@@ -61,6 +68,7 @@ pub fn census(source: &str) -> Vec<(String, Census)> {
     let mut functions = Vec::new();
     let mut current: Option<(String, Census)> = None;
     let mut in_body = false;
+    let mut exact_copy = false;
     for line in source.lines() {
         if let Some(name) = function_name(line) {
             if let Some(done) = current.take() {
@@ -84,12 +92,52 @@ pub fn census(source: &str) -> Vec<(String, Census)> {
         if !in_body {
             continue;
         }
+        if line.contains("/*exact*/") {
+            exact_copy = true;
+        }
+        if !exact_copy {
+            count_tests(line, counts);
+        }
+        if line.contains("/*end exact*/") {
+            exact_copy = false;
+        }
         count_line(line, counts);
     }
     if let Some(done) = current {
         functions.push(done);
     }
     functions
+}
+
+/// `Census::float_tests` and `mode_tests` of a line: calls of the test
+/// closures, not their definitions.
+fn count_tests(line: &str, counts: &mut Census) {
+    // The test closures' definitions (`let usable = |value| normal(value)
+    // | zero(value);`) call each other: not tests.
+    let mut text = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = ["let usable", "let normal", "let plain"]
+        .iter()
+        .filter_map(|definition| rest.find(definition))
+        .min()
+    {
+        text.push_str(&rest[..at]);
+        rest = rest[at..].find(';').map_or("", |end| &rest[at + end + 1..]);
+    }
+    text.push_str(rest);
+    let line = text.as_str();
+    for test in ["usable(", "normal(", "usable_all(", "normal_all("] {
+        counts.float_tests += line
+            .match_indices(test)
+            .filter(|&(at, _)| {
+                // A call, not part of a longer name (`usable_all(` is not
+                // `all(`), nor the closure's own definition.
+                let before = line[..at].chars().next_back();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .count();
+    }
+    counts.mode_tests += line.matches("FPCR_RMODE").count();
 }
 
 fn function_name(line: &str) -> Option<&str> {
@@ -194,8 +242,8 @@ fn count_line(line: &str, counts: &mut Census) {
 /// inlined operations.
 pub fn table(rows: &[(String, Census)]) -> String {
     let mut text = String::from(
-        "| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| function | loads 1/2/4/8 | stores 1/2/4/8 | checked (out of line) | calls | indirect | flags kept/fused | spills (status) | reloads (status) | charges | helper calls | inlined | float tests (mode) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for (label, c) in rows {
         let join = |map: &BTreeMap<String, usize>| {
@@ -217,7 +265,7 @@ pub fn table(rows: &[(String, Census)]) -> String {
         };
         writeln!(
             text,
-            "| {label} | {} | {} | {} ({}) | {} | {} | {}/{} | {} ({}) | {} ({}) | {} | {} | {} |",
+            "| {label} | {} | {} | {} ({}) | {} | {} | {}/{} | {} ({}) | {} ({}) | {} | {} | {} | {} ({}) |",
             widths(&c.loads),
             widths(&c.stores),
             c.checked_accesses,
@@ -232,7 +280,9 @@ pub fn table(rows: &[(String, Census)]) -> String {
             c.status_reloads,
             c.charges,
             join(&c.helpers),
-            join(&c.inlined)
+            join(&c.inlined),
+            c.float_tests,
+            c.mode_tests
         )
         .expect("writing to a String does not fail");
     }
@@ -263,6 +313,10 @@ m.cpu.regs[0] = r.x0; m.cpu.nzcv = r.fl.nzcv; let called = m.call(0x100010); r.x
 next_pc = target;
 /*inline:int*/{ let vn = m.cpu.vectors[1]; }
 /*inline:vector*/{ if fast { } else { echora_guest::simd::vec_fp(&mut m.cpu, echora_guest::simd::VecFpOp::Add, echora_guest::simd::FpSize::S, true, false, 0, 1, 2)?; } }
+let mode = m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH) == 0; let usable = |value: u32| normal(value) | zero(value); good &= usable(x) & normal(raw);
+if !committed {/*exact*/
+good &= usable(y); let mode = m.cpu.fpcr & echora_guest::simd::FPCR_RMODE == 0;
+}/*end exact*/
 let moved: u64 = { m.memory.read(address, &mut buffer)?; 16u64 };
 m.cpu.load_q_pair(&m.memory, address, 0, 1)?;
 { let mut bytes = [0u8; 32]; m.memory.read(address, &mut bytes)?; }
@@ -298,6 +352,8 @@ let result = body(m, &mut r);
         assert_eq!((c.spills, c.status_spills), (2, 1));
         assert_eq!((c.reloads, c.status_reloads), (2, 1));
         assert_eq!(c.charges, 1);
+        // The closure's definition and the exact copy's tests do not count.
+        assert_eq!((c.float_tests, c.mode_tests), (2, 1));
         assert_eq!(c.helpers.get("vec_fp"), Some(&1));
         assert_eq!(c.helpers.len(), 1);
         assert_eq!(c.inlined.get("int"), Some(&1));

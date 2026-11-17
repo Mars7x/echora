@@ -3625,6 +3625,12 @@ fn emit_block_body(
     } else {
         Vec::new()
     };
+    // Vector float runs hold no scalar float run's operation: disjoint.
+    let vector_runs = if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
+        vector_runs_in(block)
+    } else {
+        Vec::new()
+    };
     let mut skip_to = 0;
     for (index, instruction) in block.instructions.iter().enumerate() {
         if index < skip_to {
@@ -3632,6 +3638,16 @@ fn emit_block_body(
         }
         if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
             emit_float_run(
+                &mut body,
+                &block.instructions[index..end],
+                check_entry,
+                resumable,
+            );
+            skip_to = end;
+            continue;
+        }
+        if let Some(&(_, end)) = vector_runs.iter().find(|&&(start, _)| start == index) {
+            emit_vector_run(
                 &mut body,
                 &block.instructions[index..end],
                 check_entry,
@@ -3832,11 +3848,90 @@ fn emit_float_run(
         crate::simd::FP_MODE
     )
     .unwrap();
-    output.push_str("                if !committed {\n");
+    // The exact copy, marked for `crate::census` (which counts the tests of
+    // the path taken when the fast copy commits).
+    let (open, close) = if crate::simd::census_on() {
+        ("/*exact*/", "/*end exact*/")
+    } else {
+        ("", "")
+    };
+    writeln!(output, "                if !committed {{{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
-    output.push_str("                }\n                }\n");
+    writeln!(output, "                }}{close}\n                }}").unwrap();
+}
+
+/// Vector float runs in `block` (`EmitOptions::vector_float_runs`): as
+/// `float_runs_in`, maximal sequences of two or more consecutive vector
+/// float arithmetic operations (`crate::simd::vector_run_op`), not the
+/// block's first instruction (which charges the block) or its last.
+/// Nothing between two of a run's operations writes FPCR, calls a helper
+/// or leaves the block: they are consecutive instructions.
+fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
+    let count = block.instructions.len();
+    let mut runs = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if !held(&block.instructions[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < count && held(&block.instructions[index]) {
+            index += 1;
+        }
+        if index - start >= 2 {
+            runs.push((start, index));
+        }
+    }
+    runs
+}
+
+/// A vector float run (`vector_runs_in`), emitted twice: the fast copy
+/// (`crate::simd::vector_run_fast`), committed only when FPCR is in the
+/// inline paths' mode, FPSR already holds the sticky IXC and every lane is
+/// what each operation's own fast path takes (it then raises nothing); else
+/// the exact copy, each operation as it is emitted alone, from the run's
+/// start: the fast copy wrote nothing, so the exact copy's helpers raise
+/// the flags they raise today, in the same order.
+fn emit_vector_run(
+    output: &mut String,
+    run: &[TranslatedInstruction],
+    check_entry: bool,
+    resumable: bool,
+) {
+    let ops: Vec<SimdOp> = run
+        .iter()
+        .map(|record| match &record.instruction {
+            Instruction::Simd(op) => *op,
+            _ => unreachable!("vector runs hold SIMD operations"),
+        })
+        .collect();
+    let (fast, finals) = crate::simd::vector_run_fast(&ops);
+    let commits: String = finals
+        .iter()
+        .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+        .collect();
+    writeln!(
+        output,
+        "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
+        crate::simd::FP_MODE
+    )
+    .unwrap();
+    // The exact copy, marked for `crate::census` (which counts the tests of
+    // the path taken when the fast copy commits).
+    let (open, close) = if crate::simd::census_on() {
+        ("/*exact*/", "/*end exact*/")
+    } else {
+        ("", "")
+    };
+    writeln!(output, "                if !committed {{{open}").unwrap();
+    for record in run {
+        emit_instruction(output, record, false, None, check_entry, resumable);
+    }
+    writeln!(output, "                }}{close}\n                }}").unwrap();
 }
 
 /// Blocks a lifted function may hold at most (`EmitOptions::functions`);
@@ -5004,6 +5099,14 @@ pub struct EmitOptions {
     /// `store_q_pair` written out in place of the call: the same single
     /// range-checked `GuestView::read`/`write` of the 32 bytes.
     pub direct_q_pairs: bool,
+    /// With `inline_vector`: two or more consecutive vector float
+    /// arithmetic operations of a block (`crate::simd::vector_run_op`) as
+    /// one fast copy on locals, the FPCR mode and FPSR.IXC tested once and
+    /// an operand that is an earlier result not tested again, committed
+    /// only when every lane is what each operation's own fast path takes;
+    /// otherwise the operations as each is emitted alone, from the run's
+    /// start (`emit_vector_run`).
+    pub vector_float_runs: bool,
     /// Keep FPCR and FPSR in window locals, like the general registers:
     /// stored and reloaded around each helper or call that takes the `Cpu`
     /// (helpers read FPCR and raise FPSR flags), not reloaded after every
@@ -5276,6 +5379,11 @@ impl Drop for InlineVectorMisc {
     fn drop(&mut self) {
         crate::simd_misc::set_inline_vector_misc(self.0);
     }
+}
+
+thread_local! {
+    /// `EmitOptions::vector_float_runs` of the region being emitted.
+    static VECTOR_FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -5719,6 +5827,7 @@ struct RegionSettings {
     count_fallbacks: Flag,
     census: Census,
     direct_q_pairs: Flag,
+    vector_float_runs: Flag,
     steps_local: Flag,
     plt: Flag,
     direct: Flag,
@@ -5764,6 +5873,7 @@ impl RegionSettings {
             count_fallbacks: Flag::set(&COUNT_FALLBACKS, options.count_fallbacks),
             census: Census(crate::simd::set_census(options.census)),
             direct_q_pairs: Flag::set(&DIRECT_Q_PAIRS, options.direct_q_pairs),
+            vector_float_runs: Flag::set(&VECTOR_FLOAT_RUNS, options.vector_float_runs),
             steps_local: Flag::set(
                 &STEPS_LOCAL,
                 options.steps_local && options.split_ticks && !options.deferred_charges,

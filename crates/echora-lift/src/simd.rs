@@ -2601,43 +2601,12 @@ fn whole_vector_closures(width: u32, mask: &str) -> String {
     )
 }
 
-/// Inlined lanewise FADD/FSUB/FMUL/FMLA/FMLS under the helpers' fast-path
-/// guard (see [`emit_inline`]); `element` takes the second operand from
-/// lane `index` of `rm` in every lane (the by-element forms).
-#[allow(clippy::too_many_arguments)]
-fn vec_fp_arith(
-    fp_op: VecFpOp,
-    size: FpSize,
-    lanes: u32,
-    rd: u8,
-    rn: u8,
-    rm: u8,
-    element: Option<u8>,
-    call: &str,
-) -> String {
-    let p = "echora_guest::simd";
-    let (float, int, width, exponent, sign) = match size {
-        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
-        FpSize::D => (
-            "f64",
-            "u64",
-            64,
-            "0x7ff0_0000_0000_0000u64",
-            "0x8000_0000_0000_0000u64",
-        ),
-    };
-    let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
-    let (second, lane_y) = match element {
-        Some(index) => (
-            format!("let element = (m.cpu.vectors[{rm}] >> ({index} * {width})) as {int};"),
-            "element".to_owned(),
-        ),
-        None => (
-            format!("let v = m.cpu.vectors[{rm}];"),
-            format!("(v >> (lane * {width})) as {int}"),
-        ),
-    };
-    let (value, exact) = match fp_op {
+/// One lane of an inlined vector float arithmetic operation (`x` from Vn,
+/// `y` from Vm or its element, `z` from Vd for the fused forms): the
+/// host's value, and when a zero result is exact (the inline paths take a
+/// zero only then).
+fn arith_lane(fp_op: VecFpOp, float: &str) -> (String, &'static str) {
+    match fp_op {
         VecFpOp::Add => (
             format!("{float}::from_bits(x) + {float}::from_bits(y)"),
             "true",
@@ -2678,7 +2647,46 @@ fn vec_fp_arith(
             ),
             "(zero(x) | zero(y)) & zero(z)",
         ),
+    }
+}
+
+/// Inlined lanewise FADD/FSUB/FMUL/FMLA/FMLS under the helpers' fast-path
+/// guard (see [`emit_inline`]); `element` takes the second operand from
+/// lane `index` of `rm` in every lane (the by-element forms).
+#[allow(clippy::too_many_arguments)]
+fn vec_fp_arith(
+    fp_op: VecFpOp,
+    size: FpSize,
+    lanes: u32,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+    element: Option<u8>,
+    call: &str,
+) -> String {
+    let p = "echora_guest::simd";
+    let (float, int, width, exponent, sign) = match size {
+        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+        FpSize::D => (
+            "f64",
+            "u64",
+            64,
+            "0x7ff0_0000_0000_0000u64",
+            "0x8000_0000_0000_0000u64",
+        ),
     };
+    let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+    let (second, lane_y) = match element {
+        Some(index) => (
+            format!("let element = (m.cpu.vectors[{rm}] >> ({index} * {width})) as {int};"),
+            "element".to_owned(),
+        ),
+        None => (
+            format!("let v = m.cpu.vectors[{rm}];"),
+            format!("(v >> (lane * {width})) as {int}"),
+        ),
+    };
+    let (value, exact) = arith_lane(fp_op, float);
     // A zero divisor raises DZC: only normal divisors run natively.
     let divisor = if fp_op == VecFpOp::Div {
         "normal(y)"
@@ -2818,6 +2826,11 @@ thread_local! {
 /// (`EmitOptions::census`); returns the previous setting.
 pub(crate) fn set_census(on: bool) -> bool {
     CENSUS.replace(on)
+}
+
+/// Whether `EmitOptions::census` markers are on.
+pub(crate) fn census_on() -> bool {
+    CENSUS.get()
 }
 
 /// `code` with a `/*inline:source*/` marker for `crate::census` when
@@ -3407,6 +3420,196 @@ pub fn float_run_load(op: &SimdOp) -> bool {
             ..
         }
     )
+}
+
+/// Whether `op` is vector float arithmetic a vector float run can hold
+/// (`EmitOptions::vector_float_runs`): the forms `vec_fp_arith` inlines.
+pub fn vector_run_op(op: &SimdOp) -> bool {
+    match *op {
+        SimdOp::VecFp {
+            op: fp_op,
+            size,
+            q,
+            scalar: false,
+            ..
+        } => {
+            matches!(
+                fp_op,
+                VecFpOp::Add
+                    | VecFpOp::Sub
+                    | VecFpOp::Mul
+                    | VecFpOp::MulAdd
+                    | VecFpOp::MulSub
+                    | VecFpOp::Div
+                    | VecFpOp::RecipStep
+                    | VecFpOp::RSqrtStep
+            ) && (q || size == FpSize::S)
+        }
+        SimdOp::VecFpElement {
+            op: fp_op,
+            size,
+            q,
+            scalar,
+            ..
+        } => {
+            matches!(
+                fp_op,
+                VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+            ) && (scalar || q || size == FpSize::S)
+        }
+        _ => false,
+    }
+}
+
+/// The fast copy of a vector float run (`crate::codegen`'s
+/// `emit_vector_run`): each operation's lanes as host arithmetic on
+/// locals, as `vec_fp_arith`'s fast path computes them, chaining a
+/// result to the operations after it in the run without storing it. `good`
+/// is cleared where a lane is not what that fast path takes: an operand
+/// that is not normal or zero (a divisor that is not normal), or a result
+/// that is not normal or an exact zero (an overflow too, which raises
+/// OFC: the exact copy takes it). An operand that is an earlier result of
+/// the run, of the same lane width and as many lanes or more, is not
+/// tested again: it was tested as a result. Returns the code and the
+/// vector registers it writes with their final values' locals.
+pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
+    // Register -> (its value's local, (lane width, lanes) its lanes are
+    // known normal or zero in, when an earlier result of the run).
+    type Values = std::collections::BTreeMap<u8, (String, Option<(u32, u32)>)>;
+    fn read(values: &mut Values, code: &mut String, register: u8) -> (String, Option<(u32, u32)>) {
+        values
+            .entry(register)
+            .or_insert_with(|| {
+                code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
+                (format!("v{register}"), None)
+            })
+            .clone()
+    }
+    let mut values: Values = Default::default();
+    let mut code = String::new();
+    let mut written: Vec<u8> = Vec::new();
+    for (index, op) in ops.iter().enumerate() {
+        let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
+            SimdOp::VecFp {
+                op: fp_op,
+                size,
+                q,
+                rd,
+                rn,
+                rm,
+                ..
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                (
+                    fp_op,
+                    size,
+                    if q { 128 / width } else { 64 / width },
+                    rd,
+                    rn,
+                    rm,
+                    None,
+                )
+            }
+            SimdOp::VecFpElement {
+                op: fp_op,
+                size,
+                q,
+                scalar,
+                rd,
+                rn,
+                rm,
+                index,
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                let lanes = if scalar {
+                    1
+                } else if q {
+                    128 / width
+                } else {
+                    64 / width
+                };
+                (fp_op, size, lanes, rd, rn, rm, Some(index))
+            }
+            _ => unreachable!("vector runs hold vector float arithmetic"),
+        };
+        let (float, int, width, kit) = float_kit(size);
+        let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+        // Whether `proof` covers lanes 0..`needed` of this width.
+        let covers = |proof: Option<(u32, u32)>, needed: u32| {
+            proof.is_some_and(|(proven_width, proven)| proven_width == width && proven >= needed)
+        };
+        let (n, n_proof) = read(&mut values, &mut code, rn);
+        let (v, v_proof) = read(&mut values, &mut code, rm);
+        // Whole-vector tests, as `vec_fp_arith`'s whole-vector checks: each
+        // operand vector once (not lane by lane), skipped for an earlier
+        // result of the run that covers the lanes; the result tested lane
+        // by lane only when it is not all normal (a zero must be exact).
+        let mask = if lanes * width == 128 {
+            "u128::MAX".to_owned()
+        } else {
+            format!("(1u128 << {}) - 1", lanes * width)
+        };
+        let whole = whole_vector_closures(width, &mask);
+        let mut checks = Vec::new();
+        if !covers(n_proof, lanes) {
+            checks.push(format!("usable_all({n})"));
+        }
+        let (element_value, y) = match element {
+            Some(lane) => {
+                if !covers(v_proof, u32::from(lane) + 1) {
+                    checks.push("usable(element)".to_owned());
+                }
+                (
+                    format!(
+                        "let element = ({v} >> {}) as {int}; ",
+                        u32::from(lane) * width
+                    ),
+                    "element".to_owned(),
+                )
+            }
+            None => {
+                // A zero divisor raises DZC: only normal divisors.
+                if fp_op == VecFpOp::Div {
+                    checks.push(format!("normal_all({v})"));
+                } else if !covers(v_proof, lanes) {
+                    checks.push(format!("usable_all({v})"));
+                }
+                (String::new(), format!("({v} >> (lane * {width})) as {int}"))
+            }
+        };
+        let z = if fused {
+            let (d, d_proof) = read(&mut values, &mut code, rd);
+            if !covers(d_proof, lanes) {
+                checks.push(format!("usable_all({d})"));
+            }
+            format!("let z = ({d} >> (lane * {width})) as {int}; ")
+        } else {
+            String::new()
+        };
+        let (value, exact) = arith_lane(fp_op, float);
+        let operand_checks = if checks.is_empty() {
+            String::new()
+        } else {
+            format!("good &= {}; ", checks.join(" && "))
+        };
+        code.push_str(&format!(
+            "let o{index} = {{ {kit} {whole} {element_value}let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
+             let x = ({n} >> (lane * {width})) as {int}; let y = {y}; {z}\
+             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} {operand_checks}\
+             if !normal_all(out) {{ for lane in 0..{lanes}u32 {{ \
+             let x = ({n} >> (lane * {width})) as {int}; let y = {y}; {z}let raw = (out >> (lane * {width})) as {int}; \
+             good &= normal(raw) | (zero(raw) & ({exact})); }} }} out }}; "
+        ));
+        values.insert(rd, (format!("o{index}"), Some((width, lanes))));
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    let finals = written
+        .iter()
+        .map(|&register| (register, values[&register].0.clone()))
+        .collect();
+    (code, finals)
 }
 
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every
