@@ -1329,13 +1329,23 @@ fn vector_run_code(out: &mut String) {
         if !echora_lift::simd::vector_run_op(&op) {
             continue;
         }
-        let narrowed = word & !0x001f_03ff | (state >> 32) as u32 & 0x0003_0063;
+        // Rd, Rn and Vm narrowed; for a form with no Vm (bits 16-20 part of
+        // its opcode, as FMAXV's), Rd and Rn alone.
+        let random = (state >> 32) as u32;
+        let narrowed = [
+            word & !0x001f_03ff | random & 0x0003_0063,
+            word & !0x0000_03ff | random & 0x0000_0063,
+        ]
+        .into_iter()
+        .find(|&candidate| {
+            matches!(decode(candidate, 0), Instruction::Simd(op) if echora_lift::simd::vector_run_op(&op))
+        });
+        let Some(narrowed) = narrowed else {
+            continue;
+        };
         let Instruction::Simd(narrowed_op) = decode(narrowed, 0) else {
             continue;
         };
-        if !echora_lift::simd::vector_run_op(&narrowed_op) {
-            continue;
-        }
         let text = format!("{narrowed_op:?}");
         let form: String = text.split(" rd:").next().unwrap_or(&text).to_owned();
         if forms.insert(form) {

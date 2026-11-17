@@ -7,7 +7,8 @@
 //! registers alias; a quarter write FPCR from X5 in the middle (which ends
 //! a run there). Each runs from vectors whose lanes are mostly ordinary
 //! values and sometimes float edges (NaN payloads, signalling NaNs,
-//! denormals, infinities, zeros, the extremes), so an exceptional lane
+//! denormals, infinities, zeros, the extremes, and adjacent lanes whose
+//! pairwise sum overflows, is denormal or meets a NaN), so an exceptional lane
 //! falls in the middle of a run, in an operand or a result; under the
 //! three FPCR and FPSR settings of the edge-table tests, FPSR without IXC
 //! (no run commits) and a rounding mode the helpers trap on, with X5 any
@@ -41,7 +42,7 @@ const FPCR_DN: u32 = 1 << 25;
 const FPCR_RP: u32 = 1 << 22;
 const FPSR_IXC: u32 = 1 << 4;
 
-const SINGLE_EDGES: [u32; 14] = [
+const SINGLE_EDGES: [u32; 16] = [
     0x7fc0_0001,
     0xffc1_2345,
     0x7f80_0001,
@@ -53,11 +54,13 @@ const SINGLE_EDGES: [u32; 14] = [
     0x0000_0000,
     0x8000_0000,
     0x7f7f_ffff,
+    0xff7f_ffff,
     0x0080_0000,
+    0x8080_0000,
     0x0080_0001,
     0x3f80_0000,
 ];
-const DOUBLE_EDGES: [u64; 12] = [
+const DOUBLE_EDGES: [u64; 14] = [
     0x7ff8_0000_0000_0001,
     0xfff8_1234_5678_9abc,
     0x7ff0_0000_0000_0001,
@@ -67,9 +70,23 @@ const DOUBLE_EDGES: [u64; 12] = [
     0x0000_0000_0000_0000,
     0x8000_0000_0000_0000,
     0x7fef_ffff_ffff_ffff,
+    0xffef_ffff_ffff_ffff,
     0x0010_0000_0000_0000,
+    0x8010_0000_0000_0000,
     0x0010_0000_0000_0001,
     0x3ff0_0000_0000_0000,
+];
+/// Adjacent lanes whose pairwise sum (FADDP) overflows, is denormal, or
+/// meets a NaN, in singles and doubles.
+const SINGLE_PAIRS: [[u32; 2]; 3] = [
+    [0x7f7f_ffff, 0x7f7f_ffff],
+    [0x0080_0001, 0x8080_0000],
+    [0x7fc0_0001, 0x3f80_0000],
+];
+const DOUBLE_PAIRS: [[u64; 2]; 3] = [
+    [0x7fef_ffff_ffff_ffff, 0x7fef_ffff_ffff_ffff],
+    [0x0010_0000_0000_0001, 0x8010_0000_0000_0000],
+    [0x7ff8_0000_0000_0001, 0x3ff0_0000_0000_0000],
 ];
 /// Ordinary values: results stay normal through a few operations.
 const SINGLE_ORDINARY: [f32; 8] = [1.5, -2.25, 0.75, 3.0, -0.5, 1.25, 10.0, -7.5];
@@ -112,8 +129,20 @@ fn run(
     }
 }
 
-/// A vector of single or double lanes, mostly ordinary, a quarter edges.
+/// A vector of single or double lanes, mostly ordinary, a quarter edges;
+/// one in eight of adjacent edge pairs (`SINGLE_PAIRS`, `DOUBLE_PAIRS`).
 fn vector(random: &mut Random) -> u128 {
+    if random.next().is_multiple_of(8) {
+        return if random.next().is_multiple_of(2) {
+            (0..2).fold(0u128, |vector, pair| {
+                let [a, b] = SINGLE_PAIRS[random.next() as usize % SINGLE_PAIRS.len()];
+                vector | (u128::from(a) | u128::from(b) << 32) << (64 * pair)
+            })
+        } else {
+            let [a, b] = DOUBLE_PAIRS[random.next() as usize % DOUBLE_PAIRS.len()];
+            u128::from(a) | u128::from(b) << 64
+        };
+    }
     if random.next().is_multiple_of(2) {
         (0..4).fold(0u128, |vector, lane| {
             let value = if random.next().is_multiple_of(4) {

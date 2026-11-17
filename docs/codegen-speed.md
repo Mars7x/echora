@@ -798,12 +798,12 @@ checked column gives in brackets the accesses made by an out-of-line call,
 | floats | 0/0/3/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 | 15 (1) |
 | floatld | 0/0/4/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 24 (24) | 5 | fp_binary 9, fp_ternary 2, fp_unary 1 | fp-scalar 1, vector 11 | 27 (5) |
 | calls2 | 0/0/0/2 | 0/0/0/2 | 0 (0) | 3 | 1 | 1/0 | 11 (1) | 15 (3) | 7 | - | - | 0 (0) |
-| vnorm | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 | 21 (3) |
-| convert | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 | 9 (3) |
+| vnorm | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 12 (12) | 24 (24) | 5 | vec_fp 5, vec_fp_lane 5, vec_fp_unary 2 | unary 1, vector 5 | 14 (1) |
+| convert | 0/0/0/2 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 6 (6) | 12 (12) | 6 | vec_fp 1, vec_fp_lane 1, vec_fp_unary 4 | int 1, unary 2, vector 3 | 6 (1) |
 | intvec | 0/0/0/4 | 0/0/0/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 0 (0) | 5 | - | int 9, vector 2 | 0 (0) |
-| fpairs | 0/0/0/4 | 0/0/1/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 | 31 (4) |
+| fpairs | 0/0/0/4 | 0/0/1/2 | 0 (0) | 0 | 0 | 1/1 | 0 (0) | 34 (34) | 5 | vec_fp_lane 13, vec_fp_pairwise 4 | pairwise 4 | 21 (1) |
 | fpscalar | 0/0/1/0 | 0/0/1/0 | 0 (0) | 0 | 0 | 2/1 | 15 (3) | 29 (20) | 5 | fp_binary 1, fp_compare 1, fp_convert 2, fp_to_int 1, fp_unary 2, int_to_fp 1 | fp-scalar 9, vector 2 | 8 (8) |
-| misc | 0/0/0/2 | 0/0/0/0 | 3 (0) | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 | 17 (5) |
+| misc | 0/0/0/2 | 0/0/0/0 | 3 (0) | 0 | 0 | 1/1 | 8 (8) | 16 (16) | 6 | vec_fp 3, vec_fp_across 1, vec_fp_lane 3, vec_fp_unary 1 | int 1, misc 8, vector 1 | 8 (1) |
 
 The slowest kernels per guest instruction are the vector float ones
 (vector, vnorm, misc, fpairs: 280 to 470 Minstr/s against 1,600 to 5,400
@@ -901,6 +901,49 @@ Minstr/s (+16.8%, +10.1% to +23.7%), vnorm 239 to 318 (+33.5%, +30.9% to
 version that tested every lane of every operand and result one at a time
 had fewer test sites but was slower (vector -8.5%, vnorm -4.3%): the
 whole-vector tests cost less than per-lane ones.
+
+### More forms in a run
+
+A run also holds the forms below, each under the conditions its own inline
+path takes a lane in (stated where `crate::simd::run_other` emits it), so
+vnorm's run is no longer cut in two by its FRSQRTE, and misc's and
+fpairs' float operations form runs of their own:
+
+- FMAX/FMIN/FMAXNM/FMINNM: both lanes normal or zero (then the
+  NaN-handling forms agree and nothing is raised); the result, one of
+  them (+0 above -0), is normal or zero.
+- FCMEQ/FCMGE/FCMGT/FACGE/FACGT and the compares against zero: lanes
+  normal or zero; the result is an integer mask, never taken as a tested
+  float operand by a later operation.
+- FABD, FMULX (and by element): as the inlined arithmetic.
+- FABS/FNEG: the sign bits, nothing tested; the result as tested as its
+  operand.
+- FSQRT, FRINT*, FRECPE, FRSQRTE, FCVT*S/U toward zero: each lane under
+  `inline-vector-unary`'s own condition (a positive normal for the
+  estimates, whose results are then normal; a fitting truncation for the
+  conversions, whose results are integers).
+- SCVTF/UCVTF: nothing tested (an integer converts to a normal or a zero).
+- FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP: each pair normal or zero, and an
+  FADDP sum normal or zero.
+- FMAXV/FMINV/FMAXNMV/FMINNMV: all four lanes normal or zero.
+
+`tests/vector_runs.rs` samples all of them (197 forms), with adjacent
+lanes whose pairwise sum overflows, is denormal or meets a NaN added to
+its inputs. A mutation of each new form's rule fails it: FMAX/FMIN,
+FABD/FMULX, the compares against zero or FMAXV without their operand
+tests, a compare's mask or an FCVT's integer taken as a tested float, FABS
+or FNEG passing on a test its operand did not have, the unary forms
+without their native condition, FADDP without its result test, FABD
+without clearing the sign.
+
+The census, with the option, counts the committing path's float tests
+(FPCR mode tests): vnorm 36 (6) to 14 (1), misc 17 (5) to 8 (1), fpairs 31
+(4) to 21 (1), vector 23 (3) to 13 (1). Kernels, every function 64-byte
+aligned, 20 alternating rounds of seven runs, pinned, medians with a 95%
+interval by resampling: vector 265 to 304 Minstr/s (+14.7%, +13.4% to
++18.2%), vnorm 239 to 393 (+64.2%, +61.0% to +71.6%), misc 246 to 286
+(+16.2%, +14.3% to +18.0%), fpairs 377 to 515 (+36.8%, +32.4% to +41.4%):
+none within noise.
 
 ## Options on some regions only
 

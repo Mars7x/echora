@@ -3444,6 +3444,7 @@ pub fn vector_run_op(op: &SimdOp) -> bool {
                     | VecFpOp::RecipStep
                     | VecFpOp::RSqrtStep
             ) && (q || size == FpSize::S)
+                || run_other_op(op)
         }
         SimdOp::VecFpElement {
             op: fp_op,
@@ -3454,10 +3455,517 @@ pub fn vector_run_op(op: &SimdOp) -> bool {
         } => {
             matches!(
                 fp_op,
-                VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub
+                VecFpOp::Add
+                    | VecFpOp::Sub
+                    | VecFpOp::Mul
+                    | VecFpOp::MulAdd
+                    | VecFpOp::MulSub
+                    | VecFpOp::MulExtended
             ) && (scalar || q || size == FpSize::S)
         }
+        _ => run_other_op(op),
+    }
+}
+
+/// The forms a vector float run holds besides `vec_fp_arith`'s
+/// (`run_other`): FMAX/FMIN/FMAXNM/FMINNM, the compares, FABD, FMULX,
+/// FABS/FNEG, the compares against zero, the unary operations
+/// `inline_vector_unary` inlines (FSQRT, FRINT*, FRECPE, FRSQRTE, FCVT*
+/// toward zero), SCVTF/UCVTF, the pairwise operations and FMAXV and its
+/// kin.
+fn run_other_op(op: &SimdOp) -> bool {
+    match *op {
+        SimdOp::VecFp {
+            op: fp_op,
+            size,
+            q,
+            scalar,
+            ..
+        } => match fp_op {
+            VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum => {
+                !scalar && (q || size == FpSize::S)
+            }
+            VecFpOp::CmEq
+            | VecFpOp::CmGe
+            | VecFpOp::CmGt
+            | VecFpOp::AcGe
+            | VecFpOp::AcGt
+            | VecFpOp::AbsDiff
+            | VecFpOp::MulExtended => scalar || q || size == FpSize::S,
+            _ => false,
+        },
+        SimdOp::VecFpUnary {
+            op: unary,
+            size,
+            q,
+            scalar,
+            fbits,
+            ..
+        } => {
+            (scalar || q || size == FpSize::S)
+                && match unary {
+                    VecFpUnaryOp::Abs | VecFpUnaryOp::Neg => !scalar,
+                    VecFpUnaryOp::CmEqZero
+                    | VecFpUnaryOp::CmGeZero
+                    | VecFpUnaryOp::CmGtZero
+                    | VecFpUnaryOp::CmLeZero
+                    | VecFpUnaryOp::CmLtZero
+                    | VecFpUnaryOp::FromSigned
+                    | VecFpUnaryOp::FromUnsigned => true,
+                    _ => fbits == 0 && unary_lane(unary, size).is_some(),
+                }
+        }
+        SimdOp::VecFpPairwise {
+            op: fp_op,
+            size,
+            q,
+            scalar,
+            ..
+        } => {
+            matches!(
+                fp_op,
+                VecFpOp::Add | VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum
+            ) && (scalar || q || size == FpSize::S)
+        }
+        SimdOp::VecFpAcross { op: fp_op, .. } => matches!(
+            fp_op,
+            VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum
+        ),
         _ => false,
+    }
+}
+
+/// Whether `proof` (a run's earlier result: the lane width and lanes it
+/// is known normal or zero in) covers lanes 0..`needed` of `width`.
+fn run_covers(proof: Option<(u32, u32)>, width: u32, needed: u32) -> bool {
+    proof.is_some_and(|(proven_width, proven)| proven_width == width && proven >= needed)
+}
+
+/// A run's register values: register -> (its value's local, (lane width,
+/// lanes) its lanes are known normal or zero in, when an earlier result of
+/// the run).
+type RunValues = std::collections::BTreeMap<u8, (String, Option<(u32, u32)>)>;
+
+/// A run's operation that is not `vec_fp_arith`'s (`run_other_op`): its
+/// fast code (`let o{index} = ...;`, `good` cleared where its own inline
+/// path would not take a lane) and the proof of its result: the lanes it
+/// leaves normal or zero, or `None` (integer lanes: a compare's mask or a
+/// conversion's integer must be tested again as a float operand).
+fn run_other(
+    op: &SimdOp,
+    index: usize,
+    values: &mut RunValues,
+    code: &mut String,
+) -> (u8, Option<(u32, u32)>) {
+    let mut read = |register: u8| {
+        values
+            .entry(register)
+            .or_insert_with(|| {
+                code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
+                (format!("v{register}"), None)
+            })
+            .clone()
+    };
+    let lanes_of = |size: FpSize, q: bool, scalar: bool| {
+        let width = if size == FpSize::S { 32 } else { 64 };
+        let lanes = if scalar {
+            1
+        } else if q {
+            128 / width
+        } else {
+            64 / width
+        };
+        (width, lanes)
+    };
+    let p = "echora_guest::simd";
+    let (rd, size, body, proof) = match *op {
+        // FMAX/FMIN/FMAXNM/FMINNM: both lanes normal or zero (then the
+        // NaN-handling forms agree and nothing is raised); the result, one
+        // of them (+0 above -0), is normal or zero.
+        SimdOp::VecFp {
+            op: fp_op @ (VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let (v, v_proof) = read(rm);
+            let mut checks = Vec::new();
+            if !run_covers(n_proof, width, lanes) {
+                checks.push("usable(x)");
+            }
+            if !run_covers(v_proof, width, lanes) {
+                checks.push("usable(y)");
+            }
+            let value = min_max(matches!(fp_op, VecFpOp::Max | VecFpOp::MaxNum), float);
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; let y = ({v} >> (lane * {width})) as {int}; \
+                     {} let raw: {int} = {value}; out |= u128::from(raw) << (lane * {width}); }}",
+                    tests(&checks)
+                ),
+                Some((width, lanes)),
+            )
+        }
+        // FCMEQ, FCMGE, FCMGT, FACGE, FACGT: both lanes normal or zero
+        // (no NaN to raise IOC, no denormal to flush); the result is a
+        // mask of integer lanes, not a float operand.
+        SimdOp::VecFp {
+            op:
+                fp_op @ (VecFpOp::CmEq | VecFpOp::CmGe | VecFpOp::CmGt | VecFpOp::AcGe | VecFpOp::AcGt),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let (v, v_proof) = read(rm);
+            let mut checks = Vec::new();
+            if !run_covers(n_proof, width, lanes) {
+                checks.push("usable(x)");
+            }
+            if !run_covers(v_proof, width, lanes) {
+                checks.push("usable(y)");
+            }
+            let (abs, test) = match fp_op {
+                VecFpOp::CmEq => ("", "=="),
+                VecFpOp::CmGe => ("", ">="),
+                VecFpOp::CmGt => ("", ">"),
+                VecFpOp::AcGe => (".abs()", ">="),
+                _ => (".abs()", ">"),
+            };
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; let y = ({v} >> (lane * {width})) as {int}; \
+                     {} let hit = {float}::from_bits(x){abs} {test} {float}::from_bits(y){abs}; \
+                     out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }}",
+                    tests(&checks)
+                ),
+                None,
+            )
+        }
+        // FABD, FMULX (and FMULX by element): normal or zero operands and
+        // a normal result or an exact zero, as the inlined arithmetic
+        // (FMULX of such operands is FMUL; |x - y| is zero only for equal
+        // operands).
+        SimdOp::VecFp {
+            op: fp_op @ (VecFpOp::AbsDiff | VecFpOp::MulExtended),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        }
+        | SimdOp::VecFpElement {
+            op: fp_op @ VecFpOp::MulExtended,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+            ..
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let (v, v_proof) = read(rm);
+            let element = match *op {
+                SimdOp::VecFpElement { index, .. } => Some(index),
+                _ => None,
+            };
+            let mut checks = Vec::new();
+            if !run_covers(n_proof, width, lanes) {
+                checks.push("usable(x)");
+            }
+            let y = match element {
+                Some(lane) => {
+                    if !run_covers(v_proof, width, u32::from(lane) + 1) {
+                        checks.push("usable(y)");
+                    }
+                    format!("({v} >> {}) as {int}", u32::from(lane) * width)
+                }
+                None => {
+                    if !run_covers(v_proof, width, lanes) {
+                        checks.push("usable(y)");
+                    }
+                    format!("({v} >> (lane * {width})) as {int}")
+                }
+            };
+            let (value, exact) = if fp_op == VecFpOp::AbsDiff {
+                (
+                    format!("({float}::from_bits(x) - {float}::from_bits(y)).to_bits() & !sign"),
+                    "true",
+                )
+            } else {
+                (
+                    format!("({float}::from_bits(x) * {float}::from_bits(y)).to_bits()"),
+                    "zero(x) | zero(y)",
+                )
+            };
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; let y = {y}; \
+                     {} let raw: {int} = {value}; good &= normal(raw) | (zero(raw) & ({exact})); \
+                     out |= u128::from(raw) << (lane * {width}); }}",
+                    tests(&checks)
+                ),
+                Some((width, lanes)),
+            )
+        }
+        // FABS/FNEG: the sign bits (FPCR.AH is clear in the run's mode);
+        // nothing tested. The result is as normal or zero as the operand.
+        SimdOp::VecFpUnary {
+            op: unary @ (VecFpUnaryOp::Abs | VecFpUnaryOp::Neg),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            ..
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (_, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let value = if unary == VecFpUnaryOp::Abs {
+                "x & !sign"
+            } else {
+                "x ^ sign"
+            };
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; \
+                     let raw: {int} = {value}; out |= u128::from(raw) << (lane * {width}); }}"
+                ),
+                run_covers(n_proof, width, lanes).then_some((width, lanes)),
+            )
+        }
+        // The compares against zero: a normal or zero lane; an integer mask.
+        SimdOp::VecFpUnary {
+            op:
+                unary @ (VecFpUnaryOp::CmEqZero
+                | VecFpUnaryOp::CmGeZero
+                | VecFpUnaryOp::CmGtZero
+                | VecFpUnaryOp::CmLeZero
+                | VecFpUnaryOp::CmLtZero),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            ..
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let test = match unary {
+                VecFpUnaryOp::CmEqZero => "==",
+                VecFpUnaryOp::CmGeZero => ">=",
+                VecFpUnaryOp::CmGtZero => ">",
+                VecFpUnaryOp::CmLeZero => "<=",
+                _ => "<",
+            };
+            let checks: Vec<&str> = if run_covers(n_proof, width, lanes) {
+                Vec::new()
+            } else {
+                vec!["usable(x)"]
+            };
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; {} \
+                     let hit = {float}::from_bits(x) {test} 0.0; out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }}",
+                    tests(&checks)
+                ),
+                None,
+            )
+        }
+        // SCVTF/UCVTF (any fraction bits): the helper's arithmetic, nothing
+        // tested (an integer converts to a normal or a zero, raising
+        // nothing the helper models).
+        SimdOp::VecFpUnary {
+            op: unary @ (VecFpUnaryOp::FromSigned | VecFpUnaryOp::FromUnsigned),
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            fbits,
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (_, int, _, _) = float_kit(size);
+            let (n, _) = read(rn);
+            let scale = format!(
+                "f64::from_bits({:#x}u64)",
+                ((1023 - i64::from(fbits)) as u64) << 52
+            );
+            let signed = unary == VecFpUnaryOp::FromSigned;
+            let value = match (size, fbits == 0, signed) {
+                (FpSize::S, true, true) => {
+                    "u64::from((a as u32 as i32 as f32).to_bits())".to_owned()
+                }
+                (FpSize::S, true, false) => "u64::from((a as u32 as f32).to_bits())".to_owned(),
+                (FpSize::S, false, true) => {
+                    format!("u64::from(((f64::from(a as u32 as i32) * {scale}) as f32).to_bits())")
+                }
+                (FpSize::S, false, false) => {
+                    format!("u64::from(((f64::from(a as u32) * {scale}) as f32).to_bits())")
+                }
+                (FpSize::D, true, true) => "(a as i64 as f64).to_bits()".to_owned(),
+                (FpSize::D, true, false) => "(a as f64).to_bits()".to_owned(),
+                (FpSize::D, false, true) => format!("((a as i64 as f64) * {scale}).to_bits()"),
+                (FpSize::D, false, false) => format!("((a as f64) * {scale}).to_bits()"),
+            };
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let a = ({n} >> (lane * {width})) as {int} as u64; \
+                     let raw = {value} as {int}; out |= u128::from(raw) << (lane * {width}); }}"
+                ),
+                Some((width, lanes)),
+            )
+        }
+        // FSQRT, FRINT*, FRECPE, FRSQRTE, FCVT*S/U toward zero: each lane
+        // under its own native condition (`unary_lane`: a positive normal
+        // for the estimates, a positive normal or zero for FSQRT, a fitting
+        // truncation for FCVT*). The float results are normal or zero (an
+        // estimate's exponent is at least 1 for the lanes taken); FCVT's
+        // are integers.
+        SimdOp::VecFpUnary {
+            op: unary,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            ..
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, _) = read(rn);
+            let (native, raw) = unary_lane(unary, size).expect("run_other_op checked");
+            let integer = matches!(
+                unary,
+                VecFpUnaryOp::ToSigned(_) | VecFpUnaryOp::ToUnsigned(_)
+            );
+            (
+                rd,
+                size,
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; let f = {float}::from_bits(x); let _ = f; \
+                     good &= {native}; let raw: {int} = {raw}; out |= u128::from(raw) << (lane * {width}); }}"
+                ),
+                (!integer).then_some((width, lanes)),
+            )
+        }
+        // FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP: each pair normal or zero, and
+        // for FADDP the sum normal or zero (an add's zero is exact), as
+        // `inline_vector_pairwise`.
+        SimdOp::VecFpPairwise {
+            op: fp_op,
+            size,
+            q,
+            scalar,
+            rd,
+            rn,
+            rm,
+        } => {
+            let (width, lanes) = lanes_of(size, q, scalar);
+            let (float, int, _, _) = float_kit(size);
+            let (n, n_proof) = read(rn);
+            let (v, v_proof) = read(rm);
+            let half = lanes / 2;
+            let mut body = String::new();
+            for lane in 0..lanes {
+                let (source, proof, pair) = if scalar || lane < half {
+                    (&n, n_proof, lane)
+                } else {
+                    (&v, v_proof, lane - half)
+                };
+                let needed = if scalar { 2 } else { lanes };
+                let checks: Vec<&str> = if run_covers(proof, width, needed) {
+                    Vec::new()
+                } else {
+                    vec!["usable(x)", "usable(y)"]
+                };
+                let (value, result) = match fp_op {
+                    VecFpOp::Add => (
+                        format!("({float}::from_bits(x) + {float}::from_bits(y)).to_bits()"),
+                        "good &= normal(raw) | zero(raw); ",
+                    ),
+                    VecFpOp::Max | VecFpOp::MaxNum => (min_max(true, float), ""),
+                    _ => (min_max(false, float), ""),
+                };
+                body.push_str(&format!(
+                    "{{ let x = ({source} >> {}) as {int}; let y = ({source} >> {}) as {int}; {} let raw: {int} = {value}; {result}\
+                     out |= u128::from(raw) << {}; }} ",
+                    pair * 2 * width,
+                    (pair * 2 + 1) * width,
+                    tests(&checks),
+                    lane * width
+                ));
+            }
+            (rd, size, body, Some((width, lanes)))
+        }
+        // FMAXV/FMINV/FMAXNMV/FMINNMV (four singles): every lane normal or
+        // zero; the helper's tree; the result one of them, in lane 0.
+        SimdOp::VecFpAcross { op: fp_op, rd, rn } => {
+            let (n, n_proof) = read(rn);
+            let checks: Vec<&str> = if run_covers(n_proof, 32, 4) {
+                Vec::new()
+            } else {
+                vec!["usable(lane(0)) & usable(lane(1)) & usable(lane(2)) & usable(lane(3))"]
+            };
+            let max = matches!(fp_op, VecFpOp::Max | VecFpOp::MaxNum);
+            let compare = if max { ">" } else { "<" };
+            let both = if max { "x & y" } else { "x | y" };
+            (
+                rd,
+                FpSize::S,
+                format!(
+                    "let lane = |i: u32| ({n} >> (i * 32)) as u32; {} \
+                     let pick = |x: u32, y: u32| if zero(x) && zero(y) {{ {both} }} else if f32::from_bits(x) {compare} f32::from_bits(y) {{ x }} else {{ y }}; \
+                     out = u128::from(pick(pick(lane(0), lane(1)), pick(lane(2), lane(3))));",
+                    tests(&checks)
+                ),
+                Some((32, 1)),
+            )
+        }
+        _ => unreachable!("run_other_op checked {op:?} and {p}"),
+    };
+    let (_, _, _, kit) = float_kit(size);
+    code.push_str(&format!(
+        "let o{index} = {{ {kit} let mut out = 0u128; {body} out }}; "
+    ));
+    (rd, proof)
+}
+
+/// `good &= a & b ...;`, or nothing.
+fn tests(checks: &[&str]) -> String {
+    if checks.is_empty() {
+        String::new()
+    } else {
+        format!("good &= {};", checks.join(" & "))
     }
 }
 
@@ -3473,10 +3981,11 @@ pub fn vector_run_op(op: &SimdOp) -> bool {
 /// tested again: it was tested as a result. Returns the code and the
 /// vector registers it writes with their final values' locals.
 pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
-    // Register -> (its value's local, (lane width, lanes) its lanes are
-    // known normal or zero in, when an earlier result of the run).
-    type Values = std::collections::BTreeMap<u8, (String, Option<(u32, u32)>)>;
-    fn read(values: &mut Values, code: &mut String, register: u8) -> (String, Option<(u32, u32)>) {
+    fn read(
+        values: &mut RunValues,
+        code: &mut String,
+        register: u8,
+    ) -> (String, Option<(u32, u32)>) {
         values
             .entry(register)
             .or_insert_with(|| {
@@ -3485,10 +3994,34 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
             })
             .clone()
     }
-    let mut values: Values = Default::default();
+    let mut values: RunValues = Default::default();
     let mut code = String::new();
     let mut written: Vec<u8> = Vec::new();
     for (index, op) in ops.iter().enumerate() {
+        if !matches!(
+            *op,
+            SimdOp::VecFp {
+                op: VecFpOp::Add
+                    | VecFpOp::Sub
+                    | VecFpOp::Mul
+                    | VecFpOp::MulAdd
+                    | VecFpOp::MulSub
+                    | VecFpOp::Div
+                    | VecFpOp::RecipStep
+                    | VecFpOp::RSqrtStep,
+                ..
+            } | SimdOp::VecFpElement {
+                op: VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub,
+                ..
+            }
+        ) {
+            let (rd, proof) = run_other(op, index, &mut values, &mut code);
+            values.insert(rd, (format!("o{index}"), proof));
+            if !written.contains(&rd) {
+                written.push(rd);
+            }
+            continue;
+        }
         let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
             SimdOp::VecFp {
                 op: fp_op,
