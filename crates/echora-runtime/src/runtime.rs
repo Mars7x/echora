@@ -2900,6 +2900,16 @@ impl Machine {
                         .expect("spawn guest worker")
                 })
                 .collect();
+            // The audio renderer's frames are rendered as they come due by
+            // a thread of their own (ECHORA_AUDIO_THREAD=0: by whichever
+            // guest thread scans the waits next, as before).
+            if crate::nvn::debug_var_os("ECHORA_AUDIO_THREAD").is_none_or(|value| value != "0") {
+                let shared = &shared;
+                std::thread::Builder::new()
+                    .name("echora-audio".into())
+                    .spawn_scoped(scope, move || audio_thread(shared))
+                    .expect("spawn audio thread");
+            }
             if let Some(core) = replay_core {
                 let shared = &shared;
                 std::thread::Builder::new()
@@ -4993,6 +5003,52 @@ impl<'a> Shared<'a> {
             if workers & (1 << index) != 0 {
                 wake.notify_one();
             }
+        }
+    }
+}
+
+/// Renders the audio renderers' frames (and releases finished audio-out
+/// buffers) when they come due, under the machine lock as a guest thread's
+/// wait scan does, and wakes parked workers when an event was signaled.
+/// A frame is a third of a millisecond of mixing every 5 ms: done by the
+/// guest threads' own scans it came out of the time of whichever thread
+/// reached a boundary first, in the forest scene 4 to 9% of each thread of
+/// the frame's chain. The scans still call `advance_audio`; they find the
+/// frame rendered.
+fn audio_thread(shared: &Shared) {
+    // How long to sleep with nothing due: a renderer started meanwhile is
+    // picked up within this.
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(2);
+    let mut deadline: Option<std::time::Instant> = None;
+    while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        match deadline {
+            Some(at) if at <= now => {}
+            Some(at) => {
+                std::thread::sleep(at.saturating_duration_since(now).min(IDLE));
+                if at > std::time::Instant::now() {
+                    continue;
+                }
+            }
+            None => std::thread::sleep(IDLE),
+        }
+        let signaled = {
+            let mut machine = shared.lock_machine();
+            let machine = &mut **machine;
+            let rendered = std::time::Instant::now();
+            let signaled = machine
+                .services
+                .next_audio_deadline()
+                .is_some_and(|at| at <= rendered)
+                && machine
+                    .services
+                    .advance_audio(rendered, &mut machine.memory);
+            deadline = machine.services.next_audio_deadline();
+            crate::timeline::span(0, "audio", rendered, std::time::Instant::now());
+            signaled
+        };
+        if signaled {
+            shared.wake_workers(u64::MAX);
         }
     }
 }
