@@ -5011,54 +5011,68 @@ impl<'a> Shared<'a> {
     }
 }
 
-/// Renders the audio renderers' frames (and releases finished audio-out
-/// buffers) when they come due, under the machine lock as a guest thread's
-/// wait scan does, and wakes parked workers when an event was signaled.
-/// A frame is a third of a millisecond of mixing every 5 ms: done by the
-/// guest threads' own scans it came out of the time of whichever thread
-/// reached a boundary first, in the forest scene 4 to 9% of each thread of
-/// the frame's chain. The scans still call `advance_audio`; they find the
-/// frame rendered.
+/// Renders the audio renderers' frames when they come due, holding only
+/// the renderer's own lock: the mixing is a third of a millisecond every
+/// 5 ms, and under the machine lock (as the wait scans did it) every guest
+/// thread reaching a boundary meanwhile waited for it; in the forest scene
+/// it was 4 to 9% of each thread of the frame's chain plus their waits.
+/// Guest memory is read through a flat view, as guest threads read it. The
+/// machine lock is taken only to pick up the renderers and afterwards to
+/// signal the frame's event, hand the samples to the device and wake
+/// parked workers.
 fn audio_thread(shared: &Shared) {
-    // How long to sleep with nothing due: a renderer started meanwhile is
-    // picked up within this.
+    // How long to sleep with nothing due: a renderer made or started
+    // meanwhile is picked up within this.
     const IDLE: std::time::Duration = std::time::Duration::from_millis(2);
-    // The thread asks for the machine lock this long before a frame is due
-    // and renders it then, as of its due time: woken only at the deadline
-    // it lost every frame to a guest thread's scan (they reach the lock
-    // thousands of times a second; a sleeping thread wakes late). A frame
-    // is so rendered at most this much early.
-    const EARLY: std::time::Duration = std::time::Duration::from_micros(300);
-    let mut deadline: Option<std::time::Instant> = None;
+    let (mut renderers, view) = {
+        let mut machine = shared.lock_machine();
+        machine.services.set_audio_thread();
+        (
+            machine.services.shared_renderers(),
+            crate::services::ViewAudio(std::cell::RefCell::new(machine.memory.view())),
+        )
+    };
     while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
         let now = std::time::Instant::now();
+        let deadline = renderers
+            .iter()
+            .filter_map(|renderer| crate::services::lock_renderer(renderer).next_deadline())
+            .min();
         match deadline {
-            Some(at) if at <= now + EARLY => {}
+            Some(at) if at <= now => {}
             Some(at) => {
-                std::thread::sleep(at.saturating_duration_since(now + EARLY).min(IDLE));
-                if at > std::time::Instant::now() + EARLY {
-                    continue;
-                }
+                std::thread::sleep(at.saturating_duration_since(now).min(IDLE));
+                continue;
             }
-            None => std::thread::sleep(IDLE),
+            None => {
+                std::thread::sleep(IDLE);
+                // Renderers the game opened since.
+                renderers = shared.lock_machine().services.shared_renderers();
+                continue;
+            }
+        }
+        let started = std::time::Instant::now();
+        let rendered: Vec<usize> = renderers
+            .iter()
+            .enumerate()
+            .filter(|(_, renderer)| {
+                crate::services::lock_renderer(renderer).advance(started, Some(&view))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        crate::timeline::span(0, "audio", started, std::time::Instant::now());
+        if rendered.is_empty() {
+            continue;
         }
         let signaled = {
             let mut machine = shared.lock_machine();
-            let machine = &mut **machine;
-            let started = std::time::Instant::now();
-            let due = machine
-                .services
-                .next_audio_deadline()
-                .filter(|at| *at <= started + EARLY);
-            let signaled = due.is_some_and(|at| {
-                machine
-                    .services
-                    .advance_audio(at.max(started), &mut machine.memory)
-            });
-            deadline = machine.services.next_audio_deadline();
-            if due.is_some() {
-                machine.audio_thread_frames += 1;
-                crate::timeline::span(0, "audio", started, std::time::Instant::now());
+            machine.audio_thread_frames += rendered.len() as u64;
+            let mut signaled = false;
+            for id in rendered {
+                signaled |= machine.services.renderer_frames_rendered(id);
+            }
+            if machine.services.shared_renderers().len() != renderers.len() {
+                renderers = machine.services.shared_renderers();
             }
             signaled
         };

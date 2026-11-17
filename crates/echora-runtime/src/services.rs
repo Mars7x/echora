@@ -1057,7 +1057,13 @@ pub struct Services {
     audio_device_output_event: Option<ReadableEventId>,
     audio_outs: Vec<AudioOutState>,
     /// Renderer sessions and their system events.
-    audio_renderers: Vec<(crate::audio_renderer::Renderer, Option<ReadableEventId>)>,
+    /// Each renderer behind a lock of its own: the audio thread renders
+    /// its frames holding only that (`audio_thread`), and the renderer's
+    /// service calls take it under the machine lock.
+    audio_renderers: Vec<(SharedRenderer, Option<ReadableEventId>)>,
+    /// The audio thread renders the renderers' frames: the wait scans
+    /// leave them to it (`advance_audio`, `next_audio_deadline`).
+    audio_thread: bool,
     /// Each renderer's host stream, opened when its device sink first
     /// produces samples (None inside: no host audio).
     audio_renderer_hosts: BTreeMap<usize, Option<(std::sync::mpsc::Sender<Vec<u8>>, u32)>>,
@@ -1245,6 +1251,7 @@ impl Default for Services {
             audio_device_output_event: None,
             audio_outs: Vec::new(),
             audio_renderers: Vec::new(),
+            audio_thread: false,
             audio_renderer_hosts: BTreeMap::new(),
             opus_decoders: Vec::new(),
             audio_volume_auto_tune: false,
@@ -1434,6 +1441,35 @@ fn downmix_to_stereo(samples: &[i16]) -> Vec<i16> {
         }
     }
     stereo
+}
+
+/// An audio renderer and its lock (`Services::audio_renderers`).
+pub(crate) type SharedRenderer = std::sync::Arc<std::sync::Mutex<crate::audio_renderer::Renderer>>;
+
+/// A renderer's lock (held for one service call, or by the audio thread
+/// for the frames it renders).
+pub(crate) fn lock_renderer(
+    renderer: &SharedRenderer,
+) -> std::sync::MutexGuard<'_, crate::audio_renderer::Renderer> {
+    renderer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Guest memory as the audio thread reads wave buffers from it, without
+/// the machine lock: the flat view guest threads use, which reads any
+/// address of the guest's space (the checked memory refuses unmapped
+/// ones, which a renderer takes as an unreadable buffer).
+pub(crate) struct ViewAudio(pub(crate) std::cell::RefCell<echora_guest::view::GuestView>);
+
+impl crate::audio_mix::Source for ViewAudio {
+    fn read(&self, address: u64, out: &mut [u8]) -> bool {
+        self.0.borrow().read(address, out).is_ok()
+    }
+
+    fn write(&self, address: u64, bytes: &[u8]) -> bool {
+        self.0.borrow_mut().write(address, bytes).is_ok()
+    }
 }
 
 /// Guest memory as the audio renderer decodes wave buffers from it.
@@ -4281,8 +4317,12 @@ impl Services {
                     return Err(invalid("audio renderer capacity exhausted"));
                 }
                 let id = self.audio_renderers.len();
-                self.audio_renderers
-                    .push((crate::audio_renderer::Renderer::new(parameters), None));
+                self.audio_renderers.push((
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::audio_renderer::Renderer::new(parameters),
+                    )),
+                    None,
+                ));
                 self.reply_new_object(call, ServiceObject::AudioRenderer { id }, AOC_INTERFACE_ID)
             }
             (ServiceObject::AudioRenderer { id }, _) => self.audio_renderer(*id, call),
@@ -6023,13 +6063,14 @@ impl Services {
     pub(crate) fn advance_audio(&mut self, now: std::time::Instant, memory: &mut Memory) -> bool {
         let mut signaled = false;
         let source = GuestAudio(std::cell::RefCell::new(memory));
+        // With the audio thread the renderers' frames are its work.
         for id in 0..self.audio_renderers.len() {
-            let (renderer, event) = &mut self.audio_renderers[id];
-            if renderer.advance(now, Some(&source)) {
-                if let Some(event) = event.and_then(|id| self.readable_events.get_mut(&id)) {
-                    event.signaled = true;
-                    signaled = true;
-                }
+            if self.audio_thread {
+                break;
+            }
+            let rendered = lock_renderer(&self.audio_renderers[id].0).advance(now, Some(&source));
+            if rendered {
+                signaled |= self.signal_renderer_frame(id);
             }
             self.play_renderer(id);
         }
@@ -6045,8 +6086,48 @@ impl Services {
     }
 
     /// Send what renderer `id` mixed for its device sink to the host.
+    /// Signal renderer `id`'s frame event. Returns whether it has one.
+    fn signal_renderer_frame(&mut self, id: usize) -> bool {
+        let event = self.audio_renderers[id].1;
+        match event.and_then(|id| self.readable_events.get_mut(&id)) {
+            Some(event) => {
+                event.signaled = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The audio thread takes over the renderers' frames from the wait
+    /// scans.
+    pub(crate) fn set_audio_thread(&mut self) {
+        self.audio_thread = true;
+    }
+
+    /// The renderers, for the audio thread to render without the machine
+    /// lock.
+    pub(crate) fn shared_renderers(&self) -> Vec<SharedRenderer> {
+        self.audio_renderers
+            .iter()
+            .map(|(renderer, _)| renderer.clone())
+            .collect()
+    }
+
+    /// After the audio thread rendered frames of renderer `id`: its event
+    /// is signaled and its samples go to the device. Returns whether an
+    /// event was signaled.
+    pub(crate) fn renderer_frames_rendered(&mut self, id: usize) -> bool {
+        if id >= self.audio_renderers.len() {
+            return false;
+        }
+        let signaled = self.signal_renderer_frame(id);
+        self.play_renderer(id);
+        signaled
+    }
+
     fn play_renderer(&mut self, id: usize) {
-        let renderer = &mut self.audio_renderers[id].0;
+        let mut renderer = lock_renderer(&self.audio_renderers[id].0);
+        let renderer = &mut *renderer;
         let samples = renderer.take_output();
         if samples.is_empty() || renderer.output_channels == 0 {
             return;
@@ -6109,9 +6190,13 @@ impl Services {
             .filter(|out| out.started)
             .filter_map(|out| out.front_end)
             .chain(
+                // The audio thread keeps the renderers' deadlines itself
+                // (and wakes the workers): a scan asking here would wait
+                // for a frame being rendered.
                 self.audio_renderers
                     .iter()
-                    .filter_map(|(renderer, _)| renderer.next_deadline()),
+                    .filter(|_| !self.audio_thread)
+                    .filter_map(|(renderer, _)| lock_renderer(renderer).next_deadline()),
             )
             .min()
     }
@@ -6122,13 +6207,19 @@ impl Services {
         const SERVICE: &str = "aud:u:audio_renderer";
         let now = std::time::Instant::now();
         let command = call.request.command_id;
-        self.audio_renderers[id].0.advance(
+        lock_renderer(&self.audio_renderers[id].0).advance(
             now,
             Some(&GuestAudio(std::cell::RefCell::new(&mut *call.memory))),
         );
         self.play_renderer(id);
-        let renderer = &mut self.audio_renderers[id].0;
-        let parameters = renderer.parameters;
+        let (parameters, started, time_limit) = {
+            let renderer = lock_renderer(&self.audio_renderers[id].0);
+            (
+                renderer.parameters,
+                renderer.started,
+                renderer.rendering_time_limit,
+            )
+        };
         let word = |value: u32| value.to_le_bytes();
         match command {
             // GetSampleRate, GetSampleCount, GetMixBufferCount, GetState (0
@@ -6139,8 +6230,8 @@ impl Services {
                     0 => parameters.sample_rate,
                     1 => parameters.sample_count,
                     2 => parameters.mixes,
-                    3 => u32::from(!renderer.started),
-                    _ => renderer.rendering_time_limit,
+                    3 => u32::from(!started),
+                    _ => time_limit,
                 };
                 call.reply(0, None, AOC_INTERFACE_ID, &word(value))?;
             }
@@ -6171,8 +6262,7 @@ impl Services {
                 }
                 let mut bytes = vec![0u8; input_size as usize];
                 call.memory.read(input_address, &mut bytes)?;
-                let output = self.audio_renderers[id]
-                    .0
+                let output = lock_renderer(&self.audio_renderers[id].0)
                     .update(&bytes, output_size as usize)
                     .map_err(|message| call.unsupported(SERVICE, message))?;
                 call.memory.write(output_address, &output)?;
@@ -6181,7 +6271,7 @@ impl Services {
             // Start (5) / Stop (6).
             5 | 6 => {
                 call.shape(0, false, false)?;
-                self.audio_renderers[id].0.set_started(command == 5, now);
+                lock_renderer(&self.audio_renderers[id].0).set_started(command == 5, now);
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
             }
             // QuerySystemEvent (7): one copied event, signaled per frame.
@@ -6227,19 +6317,19 @@ impl Services {
             12 => {
                 call.shape(4, false, false)?;
                 let value = crate::bytes::le_u32(&call.request.arguments[..4]);
-                self.audio_renderers[id].0.voice_drop_parameter = value;
+                lock_renderer(&self.audio_renderers[id].0).voice_drop_parameter = value;
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
             }
             13 => {
                 call.shape(0, false, false)?;
-                let value = self.audio_renderers[id].0.voice_drop_parameter;
+                let value = lock_renderer(&self.audio_renderers[id].0).voice_drop_parameter;
                 call.reply(0, None, AOC_INTERFACE_ID, &value.to_le_bytes())?;
             }
             // SetRenderingTimeLimit (8): u32 percent.
             8 => {
                 call.shape(4, false, false)?;
                 let limit = crate::bytes::le_u32(&call.request.arguments[..4]);
-                self.audio_renderers[id].0.rendering_time_limit = limit;
+                lock_renderer(&self.audio_renderers[id].0).rendering_time_limit = limit;
                 call.reply(0, None, AOC_INTERFACE_ID, &[])?;
             }
             _ => {
@@ -9331,7 +9421,7 @@ impl Services {
             "refused_video_submissions":self.refused_video_submissions,
             "empty_frame_requests":self.empty_frame_requests,
             "library_applets":self.library_applets,
-            "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| renderer.report()).collect::<Vec<_>>(),
+            "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| lock_renderer(renderer).report()).collect::<Vec<_>>(),
             "terminate_result":self.terminate_result,
             "data_storage_reads":self.data_storage_reads,
             "data_storage_bytes_read":self.data_storage_bytes_read,
