@@ -72,6 +72,10 @@ pub struct Gpu {
     pub name: String,
 }
 
+/// How `Gpu::new`'s error begins when the device's driver is one Echora
+/// refuses: the run stops on it instead of going on without a GPU.
+pub const UNSUPPORTED_DRIVER: &str = "unsupported driver: ";
+
 fn vk_error(context: &str) -> impl Fn(vk::Result) -> String + '_ {
     move |error| format!("{context}: {error}")
 }
@@ -200,6 +204,29 @@ impl Gpu {
                         | vk::ShaderFloatControlsIndependence::ALL
                 ),
         );
+        // RADV before Mesa 26.1.4 releases a draw's task shaders before the
+        // cache flushes pending ahead of them ("radv: fix a synchronization
+        // issue with taskmesh and pending cache flushes"): the game's first
+        // 3D frames stall the GPU's compute ring until the kernel resets
+        // the GPU, and after a reset every later run stalls until a
+        // reboot. Nothing an application records avoids it, so such a
+        // driver is refused (ECHORA_ALLOW_OLD_RADV=1 runs on it anyway).
+        if properties12.driver_id == vk::DriverId::MESA_RADV
+            && std::env::var_os("ECHORA_ALLOW_OLD_RADV").is_none_or(|value| value != "1")
+        {
+            let info = properties12
+                .driver_info_as_c_str()
+                .ok()
+                .and_then(|info| info.to_str().ok())
+                .unwrap_or_default();
+            if radv_too_old(info) {
+                return Err(format!(
+                    "{UNSUPPORTED_DRIVER}the AMD Vulkan driver here is {info:?}; Echora needs RADV from \
+                     Mesa 26.1.4 or newer (older versions hang the GPU on the game's task shader draws). \
+                     Update Mesa, or point VK_DRIVER_FILES at a newer RADV's ICD file"
+                ));
+            }
+        }
         let shader_binary_version = (
             object_properties.shader_binary_uuid,
             object_properties.shader_binary_version,
@@ -780,4 +807,41 @@ pub fn stage_flags(stage: Stage) -> vk::ShaderStageFlags {
 fn bytemuck_words(words: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding and u8 has alignment 1.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 4) }
+}
+
+/// Whether a Mesa driver of this `driver_info` ("Mesa 25.2.8-1ubuntu1",
+/// "Mesa 26.3.0-devel (git-...)") is older than 26.1.4, the first RADV
+/// that orders task shaders after pending cache flushes. A version that
+/// cannot be read is not refused.
+fn radv_too_old(driver_info: &str) -> bool {
+    let version: Vec<u32> = driver_info
+        .trim_start_matches("Mesa ")
+        .split(|character: char| !character.is_ascii_digit())
+        .take(3)
+        .map_while(|part| part.parse().ok())
+        .collect();
+    match version[..] {
+        [major, minor, patch] => (major, minor, patch) < (26, 1, 4),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod driver_version_tests {
+    use super::radv_too_old;
+
+    #[test]
+    fn radv_before_the_taskmesh_flush_fix_is_too_old() {
+        assert!(radv_too_old("Mesa 25.2.8-1ubuntu1~24.04.1"));
+        assert!(radv_too_old("Mesa 25.2.8"));
+        assert!(radv_too_old("Mesa 26.0.5"));
+        assert!(radv_too_old("Mesa 26.1.3"));
+        assert!(!radv_too_old("Mesa 26.1.4"));
+        assert!(!radv_too_old("Mesa 26.2.7"));
+        assert!(!radv_too_old("Mesa 26.3.0-devel (git-0123abc)"));
+        assert!(!radv_too_old("Mesa 27.0.0"));
+        // Unreadable: not refused.
+        assert!(!radv_too_old(""));
+        assert!(!radv_too_old("Mesa main"));
+    }
 }

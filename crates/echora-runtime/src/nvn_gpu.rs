@@ -618,6 +618,15 @@ impl Nvn {
             match Backend::create() {
                 Ok(backend) => self.gpu = backend,
                 Err(error) => {
+                    // A driver known to hang the GPU ends the run: going
+                    // on without a picture would only hide it.
+                    if error.starts_with(echora_gpu::vulkan::UNSUPPORTED_DRIVER) {
+                        eprintln!("echora: {error}");
+                        if let Some(path) = super::debug_var_os("ECHORA_GPU_LOG") {
+                            let _ = std::fs::write(path, format!("{error}\n"));
+                        }
+                        std::process::exit(1);
+                    }
                     let message = format!("GPU backend disabled: {error}");
                     eprintln!("nvn: {message}");
                     if let Some(path) = super::debug_var_os("ECHORA_GPU_LOG") {
