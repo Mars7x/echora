@@ -173,6 +173,8 @@ last faults and gameplay.
 - Linux
 - Your own dump of the game (update 1.1.1), as a NUP file or a folder
 - A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
+- On AMD GPUs, the Mesa RADV driver 26.1.4 or newer (older versions hang the
+  GPU in 3D scenes, so Echora refuses to start on them)
 - Rust 1.88 or newer (CI builds with 1.99.1), `git`, a C compiler, NASM,
   `pkg-config` and these system libraries:
 
