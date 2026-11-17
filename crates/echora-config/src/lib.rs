@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// The exit code of a game run that stopped at start because the GPU's
+/// driver is one Echora refuses (RADV before Mesa 26.1.4, which hangs the
+/// GPU): `echora run` passes it on, and the launcher says what to do.
+pub const UNSUPPORTED_DRIVER_EXIT: u8 = 43;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{path}: {source}")]

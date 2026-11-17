@@ -664,11 +664,11 @@ impl Launcher {
         self.running = true;
         self.notify("Starting…", cx);
         cx.spawn(async move |this, cx| {
-            let succeeded = wait_for(child, cx).await;
+            let code = wait_for(child, cx).await;
             let _ = this.update(cx, |this, cx| {
                 this.running = false;
-                if !succeeded {
-                    this.notify("The game stopped. The run report has the details.", cx);
+                if let Some(message) = stop_message(code) {
+                    this.notify(message, cx);
                 }
                 cx.notify();
             });
@@ -807,17 +807,31 @@ impl Launcher {
 }
 
 /// Polls the game process without blocking the window.
-async fn wait_for(mut child: Child, cx: &mut gpui::AsyncApp) -> bool {
+/// The game's exit code once it has ended: `Some(0)` for a clean exit, none
+/// when it was killed or could not be waited for.
+async fn wait_for(mut child: Child, cx: &mut gpui::AsyncApp) -> Option<i32> {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return status.code(),
             Ok(None) => {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
+    }
+}
+
+/// What to tell the player about how the game ended (its exit `code`):
+/// nothing after a clean exit.
+fn stop_message(code: Option<i32>) -> Option<&'static str> {
+    match code {
+        Some(0) => None,
+        Some(code) if code == i32::from(echora_config::UNSUPPORTED_DRIVER_EXIT) => {
+            Some("This AMD graphics driver is too old for Echora. Update Mesa to 26.1.4 or newer.")
+        }
+        _ => Some("The game stopped. The run report has the details."),
     }
 }
 
@@ -2332,7 +2346,21 @@ impl Launcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{Game, game_environment, run_arguments, split_title, supported_build};
+    use super::{
+        Game, game_environment, run_arguments, split_title, stop_message, supported_build,
+    };
+
+    #[test]
+    fn a_refused_driver_gets_its_own_message() {
+        assert_eq!(stop_message(Some(0)), None);
+        let driver = stop_message(Some(i32::from(echora_config::UNSUPPORTED_DRIVER_EXIT)))
+            .expect("a message");
+        assert!(driver.contains("Mesa to 26.1.4"));
+        let other = stop_message(Some(2)).expect("a message");
+        assert!(other.contains("run report"));
+        // Killed by a signal: no code.
+        assert_eq!(stop_message(None), Some(other));
+    }
 
     fn game(build: Option<(&str, u32)>, version: &str) -> Game {
         Game {

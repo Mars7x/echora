@@ -625,7 +625,7 @@ impl Nvn {
                         if let Some(path) = super::debug_var_os("ECHORA_GPU_LOG") {
                             let _ = std::fs::write(path, format!("{error}\n"));
                         }
-                        std::process::exit(1);
+                        std::process::exit(i32::from(echora_config::UNSUPPORTED_DRIVER_EXIT));
                     }
                     let message = format!("GPU backend disabled: {error}");
                     eprintln!("nvn: {message}");

@@ -422,6 +422,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let status = command
                 .status()
                 .with_context(|| format!("start {}", runner.display()))?;
+            // A refused driver keeps its own code (the launcher names it).
+            if status.code() == Some(i32::from(echora_config::UNSUPPORTED_DRIVER_EXIT)) {
+                return Ok(ExitCode::from(echora_config::UNSUPPORTED_DRIVER_EXIT));
+            }
             if !status.success() {
                 return Ok(ExitCode::from(2));
             }
