@@ -335,6 +335,9 @@ pub struct Machine {
     parallel: bool,
     /// Workers parked without a thread, waiting for one to become runnable.
     parked_workers: usize,
+    /// Audio frames (or audio-out releases) the audio thread did, against
+    /// those left to guest threads' scans.
+    audio_thread_frames: u64,
     /// Parallel boundaries: count, microseconds waiting for the machine
     /// lock, microseconds holding it.
     lock_stats: [u64; 3],
@@ -457,6 +460,7 @@ impl Machine {
             preemptions: 0,
             parallel: false,
             parked_workers: 0,
+            audio_thread_frames: 0,
             lock_stats: [0; 3],
             boundary_kinds: vec![0; 0x84],
             boundary_held: vec![0; 0x84],
@@ -4706,7 +4710,7 @@ impl Machine {
             "steps":self.core.steps,
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
-            "parallel_lock":{"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
+            "parallel_lock":{"audio_thread_frames":self.audio_thread_frames,"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
             "thread_window_instructions":self.thread_instructions().into_iter().map(|(thread, count)| (thread.to_string(), count - self.profile_instructions.get(&thread).copied().unwrap_or(0))).collect::<BTreeMap<_, _>>(),
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
@@ -5019,14 +5023,20 @@ fn audio_thread(shared: &Shared) {
     // How long to sleep with nothing due: a renderer started meanwhile is
     // picked up within this.
     const IDLE: std::time::Duration = std::time::Duration::from_millis(2);
+    // The thread asks for the machine lock this long before a frame is due
+    // and renders it then, as of its due time: woken only at the deadline
+    // it lost every frame to a guest thread's scan (they reach the lock
+    // thousands of times a second; a sleeping thread wakes late). A frame
+    // is so rendered at most this much early.
+    const EARLY: std::time::Duration = std::time::Duration::from_micros(300);
     let mut deadline: Option<std::time::Instant> = None;
     while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
         let now = std::time::Instant::now();
         match deadline {
-            Some(at) if at <= now => {}
+            Some(at) if at <= now + EARLY => {}
             Some(at) => {
-                std::thread::sleep(at.saturating_duration_since(now).min(IDLE));
-                if at > std::time::Instant::now() {
+                std::thread::sleep(at.saturating_duration_since(now + EARLY).min(IDLE));
+                if at > std::time::Instant::now() + EARLY {
                     continue;
                 }
             }
@@ -5035,16 +5045,21 @@ fn audio_thread(shared: &Shared) {
         let signaled = {
             let mut machine = shared.lock_machine();
             let machine = &mut **machine;
-            let rendered = std::time::Instant::now();
-            let signaled = machine
+            let started = std::time::Instant::now();
+            let due = machine
                 .services
                 .next_audio_deadline()
-                .is_some_and(|at| at <= rendered)
-                && machine
+                .filter(|at| *at <= started + EARLY);
+            let signaled = due.is_some_and(|at| {
+                machine
                     .services
-                    .advance_audio(rendered, &mut machine.memory);
+                    .advance_audio(at.max(started), &mut machine.memory)
+            });
             deadline = machine.services.next_audio_deadline();
-            crate::timeline::span(0, "audio", rendered, std::time::Instant::now());
+            if due.is_some() {
+                machine.audio_thread_frames += 1;
+                crate::timeline::span(0, "audio", started, std::time::Instant::now());
+            }
             signaled
         };
         if signaled {
