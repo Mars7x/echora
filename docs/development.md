@@ -82,6 +82,7 @@ read.
 | `ECHORA_WALL_SECONDS=N` | End an idle run after N host seconds, so the report shows what every thread waits on. |
 | `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. |
 | `ECHORA_GPU=0` | Run without the GPU backend. |
+| `ECHORA_ALLOW_OLD_RADV=1` | Run on a Mesa RADV driver older than 26.1.4, which Echora otherwise refuses at start: those versions hang the GPU on the game's task shader draws, and after the kernel resets the GPU every later run hangs until a reboot. For debugging the driver only. |
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
 | `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
