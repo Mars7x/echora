@@ -58,6 +58,8 @@ pub(crate) struct TexturePool {
     /// What each written (binding, index) holds: a view's or sampler's
     /// raw handle.
     written: FastMap<(u32, u32), u64>,
+    /// The slots containing each image view, for retirement by handle.
+    view_slots: FastMap<u64, Vec<(u32, u32)>>,
     /// Last batch that bound this set. Its draws may access any descriptor
     /// in the pool, so replacing a descriptor here requires completion.
     last_use: u64,
@@ -104,10 +106,27 @@ impl TexturePool {
         // entries can only have been used by work that completed.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
         for &(array, index, handle) in changes {
-            if handle == 0 {
-                self.written.remove(&(array, index));
+            let slot = (array, index);
+            let previous = if handle == 0 {
+                self.written.remove(&slot)
             } else {
-                self.written.insert((array, index), handle);
+                self.written.insert(slot, handle)
+            };
+            if array == binding::SAMPLERS || previous == Some(handle) {
+                continue;
+            }
+            if let Some(previous) = previous
+                && let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    self.view_slots.entry(previous)
+            {
+                let slots = entry.get_mut();
+                slots.retain(|&held| held != slot);
+                if slots.is_empty() {
+                    entry.remove();
+                }
+            }
+            if handle != 0 {
+                self.view_slots.entry(handle).or_default().push(slot);
             }
         }
     }
@@ -252,6 +271,7 @@ impl Renderer {
             flags,
             integer: FastSet::default(),
             written: FastMap::default(),
+            view_slots: FastMap::default(),
             last_use: 0,
         })
     }
@@ -500,18 +520,19 @@ impl Renderer {
     pub(crate) fn forget_pool_views(&mut self, views: &[vk::ImageView]) {
         self.pool_cache = None;
         self.pool_entry_memo.clear();
-        let raw: FastSet<u64> = views.iter().map(|view| view.as_raw()).collect();
         for pool in self
             .texture_pool
             .iter_mut()
             .chain(self.spare_texture_pool.iter_mut())
         {
-            let stale: Vec<_> = pool
-                .written
+            let mut stale: Vec<_> = views
                 .iter()
-                .filter(|((array, _), handle)| *array != binding::SAMPLERS && raw.contains(handle))
-                .map(|(&(array, index), _)| (array, index, 0))
+                .filter_map(|view| pool.view_slots.get(&view.as_raw()))
+                .flatten()
+                .map(|&(array, index)| (array, index, 0))
                 .collect();
+            stale.sort_unstable();
+            stale.dedup();
             pool.write_entries(&self.gpu.device, &stale);
         }
     }
@@ -570,5 +591,46 @@ impl Renderer {
                     .destroy_descriptor_pool(pool.descriptor_pool, None)
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_a_view_clears_its_aliases_after_descriptor_rewrites() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        for key in [7, 8] {
+            renderer
+                .target(key, 4, 4, vk::Format::R8G8B8A8_UNORM)
+                .unwrap();
+        }
+        let entry = |texture, key| PoolEntry {
+            texture,
+            sampler: 1,
+            source: TextureSource::Target(key),
+            sampler_state: Sampler::default(),
+        };
+        renderer
+            .bind_pool(&vec![entry(1, 7), entry(2, 7), entry(3, 7)].into())
+            .unwrap();
+        renderer.bind_pool(&vec![entry(1, 8)].into()).unwrap();
+        let view = renderer.existing_target(7).unwrap().sampled_view;
+        let new = renderer.existing_target(8).unwrap().sampled_view;
+        renderer.flush().unwrap();
+        renderer.forget_pool_views(&[view, view]);
+
+        let written = &renderer.texture_pool.as_ref().unwrap().written;
+        assert_eq!(written[&(binding::SAMPLED_2D, 1)], new.as_raw());
+        assert!(!written.contains_key(&(binding::SAMPLED_2D, 2)));
+        assert!(!written.contains_key(&(binding::SAMPLED_2D, 3)));
+        assert!(written.contains_key(&(binding::SAMPLERS, 1)));
     }
 }
