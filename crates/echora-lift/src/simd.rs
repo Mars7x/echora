@@ -2695,6 +2695,25 @@ fn vec_fp_arith(
              out |= u128::from(raw) << (lane * {width}); }} \
              m.cpu.vectors[{rd}] = out;"
         );
+        let raw = format!(
+            "let mut out = 0u128; for lane in 0..{lanes} {{ \
+             let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
+             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out"
+        );
+        let raw = if width == 32 && lanes == 4 {
+            let second = if element.is_some() {
+                "u128::from(element)"
+            } else {
+                "v"
+            };
+            let by_element = element.is_some();
+            let accum = if fused { "d" } else { "0u128" };
+            format!(
+                "{p}::vector_fp_arithmetic_4s::<{by_element}>({p}::VecFpOp::{fp_op:?}, n, {second}, {accum}).unwrap_or_else(|| {{ {raw} }})"
+            )
+        } else {
+            format!("{{ {raw} }}")
+        };
         return format!(
             "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
              let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
@@ -2704,11 +2723,7 @@ fn vec_fp_arith(
              let mode = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
              && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
              let mut fast = mode && usable_all(n) && {second_usable}{d_usable}; \
-             let mut out = 0u128; let mut overflow = false; \
-             for lane in 0..{lanes} {{ \
-             let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
-             let raw = ({value}).to_bits(); \
-             out |= u128::from(raw) << (lane * {width}); }} \
+             let out = {raw}; let mut overflow = false; \
              if fast && !normal_all(out) {{ \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
@@ -4064,25 +4079,46 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
                 (String::new(), format!("({v} >> (lane * {width})) as {int}"))
             }
         };
-        let z = if fused {
+        let d = if fused {
             let (d, d_proof) = read(&mut values, &mut code, rd);
             if !covers(d_proof, lanes) {
                 checks.push(format!("usable_all({d})"));
             }
-            format!("let z = ({d} >> (lane * {width})) as {int}; ")
+            Some(d)
         } else {
-            String::new()
+            None
         };
+        let z = d.as_ref().map_or_else(String::new, |d| {
+            format!("let z = ({d} >> (lane * {width})) as {int}; ")
+        });
         let (value, exact) = arith_lane(fp_op, float);
         let operand_checks = if checks.is_empty() {
             String::new()
         } else {
             format!("good &= {}; ", checks.join(" && "))
         };
-        code.push_str(&format!(
-            "let o{index} = {{ {kit} {whole} {element_value}let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
+        let raw = format!(
+            "let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
              let x = ({n} >> (lane * {width})) as {int}; let y = {y}; {z}\
-             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} {operand_checks}\
+             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out"
+        );
+        let raw = if width == 32 && lanes == 4 {
+            let p = "echora_guest::simd";
+            let second = if element.is_some() {
+                "u128::from(element)"
+            } else {
+                &v
+            };
+            let accum = d.as_deref().unwrap_or("0u128");
+            let by_element = element.is_some();
+            format!(
+                "{p}::vector_fp_arithmetic_4s::<{by_element}>({p}::VecFpOp::{fp_op:?}, {n}, {second}, {accum}).unwrap_or_else(|| {{ {raw} }})"
+            )
+        } else {
+            format!("{{ {raw} }}")
+        };
+        code.push_str(&format!(
+            "let o{index} = {{ {kit} {whole} {element_value}let out = {raw}; {operand_checks}\
              if !normal_all(out) {{ for lane in 0..{lanes}u32 {{ \
              let x = ({n} >> (lane * {width})) as {int}; let y = {y}; {z}let raw = (out >> (lane * {width})) as {int}; \
              good &= normal(raw) | (zero(raw) & ({exact})); }} }} out }}; "

@@ -201,6 +201,55 @@ pub enum VecFpOp {
     RSqrtStep,
 }
 
+/// Computes a candidate 4S result in host registers. The caller checks the
+/// input and output lanes before committing the result to guest state.
+#[inline(always)]
+pub fn vector_fp_arithmetic_4s<const BY_ELEMENT: bool>(
+    op: VecFpOp,
+    n: u128,
+    m: u128,
+    d: u128,
+) -> Option<u128> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: the target has SSE2 (and FMA where required). The
+        // input and output types preserve all 128 bits in lane order.
+        unsafe {
+            let x = core::mem::transmute::<u128, __m128>(n);
+            let y = if BY_ELEMENT {
+                _mm_set1_ps(f32::from_bits(m as u32))
+            } else {
+                core::mem::transmute::<u128, __m128>(m)
+            };
+            let raw = match op {
+                VecFpOp::Add => _mm_add_ps(x, y),
+                VecFpOp::Sub => _mm_sub_ps(x, y),
+                VecFpOp::Mul => _mm_mul_ps(x, y),
+                VecFpOp::Div => _mm_div_ps(x, y),
+                #[cfg(target_feature = "fma")]
+                VecFpOp::MulAdd => _mm_fmadd_ps(x, y, core::mem::transmute::<u128, __m128>(d)),
+                #[cfg(target_feature = "fma")]
+                VecFpOp::MulSub => _mm_fnmadd_ps(x, y, core::mem::transmute::<u128, __m128>(d)),
+                #[cfg(target_feature = "fma")]
+                VecFpOp::RecipStep => _mm_fnmadd_ps(x, y, _mm_set1_ps(2.0)),
+                #[cfg(target_feature = "fma")]
+                VecFpOp::RSqrtStep => {
+                    _mm_mul_ps(_mm_fnmadd_ps(x, y, _mm_set1_ps(3.0)), _mm_set1_ps(0.5))
+                }
+                _ => return None,
+            };
+            let _ = d;
+            Some(core::mem::transmute::<__m128, u128>(raw))
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+    {
+        let _ = (op, n, m, d);
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum VecIntOp {
     Add,
