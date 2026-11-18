@@ -172,10 +172,11 @@ mod gpu;
 /// render state when it began (ECHORA_CAPTURE_FRAME).
 #[derive(Debug)]
 struct FrameCapture {
-    commands: Vec<(Option<u64>, Command)>,
+    commands: Vec<(Option<u64>, u64, Command)>,
     render: RenderState,
     queue_render: HashMap<u64, RenderState>,
     render_queue: Option<u64>,
+    oldest_descriptor_epoch: u64,
 }
 
 /// Queued work of one queue (see `Nvn::pending`).
@@ -185,6 +186,7 @@ enum QueueItem {
     List {
         commands: std::sync::Arc<Vec<Command>>,
         next: usize,
+        descriptor_epoch: u64,
     },
     /// A FenceSync: the sync signals once earlier work has run.
     Fence { sync: u64, args: Args },
@@ -193,10 +195,6 @@ enum QueueItem {
     /// A present (with a replay thread): the frame is shown once earlier
     /// work has run.
     Present { texture: u64 },
-    /// A texture descriptor registered again (with a replay thread): work
-    /// submitted before it reads the old one, as when the registration
-    /// finished the replay first, without waiting for that work to run.
-    Register(Box<Registration>),
 }
 
 /// A descriptor registration, with the sampler or texture view state
@@ -208,6 +206,14 @@ struct Registration {
     sampler: Option<echora_gpu::draw::Sampler>,
     entry: Args,
     view: Option<Option<Bag>>,
+}
+
+/// The registration replaced at `epoch`, for work submitted before it.
+#[derive(Debug)]
+struct PreviousDescriptor {
+    epoch: u64,
+    entry: Args,
+    view: Option<Bag>,
 }
 
 /// The ECHORA_* environment, read once: the draw path consulted debug
@@ -509,6 +515,11 @@ pub struct Nvn {
     /// Texture and image registrations by pool and descriptor index.
     #[serde(skip)]
     texture_descriptors: FastMap<u64, FastMap<u32, Args>>,
+    /// Older registrations still visible to submitted work and frame captures.
+    #[serde(skip)]
+    descriptor_history: FastMap<(u64, u32), Vec<PreviousDescriptor>>,
+    #[serde(skip)]
+    descriptor_epoch: u64,
     /// Sampler descriptors by pool and descriptor index.
     #[serde(skip)]
     sampler_states: HashMap<u64, HashMap<u32, echora_gpu::draw::Sampler>>,
@@ -787,6 +798,11 @@ pub struct RenderState {
     /// programs, state objects, pools, resources). Kept for the host
     /// renderer; nothing consumes it until draws are implemented.
     pub state: FastMap<&'static str, Command>,
+    descriptor_epoch: Option<u64>,
+    /// A queue released by a guest wait can see registrations published
+    /// while it was blocked.
+    descriptors_after_wait: u64,
+    blocked_on_wait: bool,
     /// The texture handle bound at each (NVN stage, slot), indexed for
     /// individual bindings and for gathering all handles from a stage.
     pub bound_textures: TextureBindings,
@@ -1077,10 +1093,11 @@ impl Nvn {
         self.replaying = true;
         self.bump_binding_serial("stat: binding serial by a restored capture");
         let result = (|| {
-            for (queue, command) in &capture.commands {
+            for (queue, epoch, command) in &capture.commands {
                 if let Some(queue) = *queue {
                     self.switch_render_queue(queue);
                 }
+                self.select_descriptors(*epoch);
                 self.execute(command, core)
                     .map_err(|trap| format!("{} failed: {trap:?}", command.name))?;
             }
@@ -2943,6 +2960,7 @@ impl Nvn {
                         .push_back(QueueItem::List {
                             commands: list,
                             next: 0,
+                            descriptor_epoch: self.descriptor_epoch,
                         });
                 }
                 self.pump_queues_handed_on(core)?;
@@ -3092,6 +3110,7 @@ impl Nvn {
                     "TexturePool" => {
                         self.texture_descriptors.remove(&this);
                         self.views.retain(|&(pool, _), _| pool != this);
+                        self.descriptor_history.retain(|&(pool, _), _| pool != this);
                         self.bump_binding_serial("stat: binding serial by texture pool finalized");
                     }
                     "SamplerPool" => {
@@ -3157,20 +3176,6 @@ impl Nvn {
                     entry,
                     view,
                 };
-                // A texture descriptor registered again while one queue's
-                // work is still to run: the replay applies it in order.
-                if sampler.is_none()
-                    && Self::replay_thread()
-                    && !self.replaying
-                    && self.descriptor_registered(this, u64::from(id))
-                    && let Some(queue) = self.single_pending_queue()
-                {
-                    self.pending
-                        .get_mut(&queue)
-                        .unwrap()
-                        .push_back(QueueItem::Register(Box::new(registration)));
-                    return Ok(true);
-                }
                 self.apply_registration(registration);
                 return Ok(true);
             }
@@ -4155,6 +4160,42 @@ impl Nvn {
         self.texture_descriptors.get(&pool)?.get(&id)
     }
 
+    fn previous_descriptor(&self, pool: u64, id: u32) -> Option<&PreviousDescriptor> {
+        let epoch = self.render.descriptor_epoch?;
+        if epoch == self.descriptor_epoch {
+            return None;
+        }
+        let changes = self.descriptor_history.get(&(pool, id))?;
+        changes.get(changes.partition_point(|change| change.epoch <= epoch))
+    }
+
+    fn render_texture_descriptor(&self, pool: u64, id: u32) -> Option<&Args> {
+        self.previous_descriptor(pool, id)
+            .map(|change| &change.entry)
+            .or_else(|| self.texture_descriptor(pool, id))
+    }
+
+    fn render_texture_view(&self, pool: u64, id: u32) -> Option<&Bag> {
+        match self.previous_descriptor(pool, id) {
+            Some(change) => change.view.as_ref(),
+            None => self.views.get(&(pool, id)),
+        }
+    }
+
+    fn select_descriptors(&mut self, epoch: u64) {
+        if self.render.descriptor_epoch != Some(epoch) {
+            self.render.descriptor_epoch = Some(epoch);
+            self.binding_memo.1.clear();
+            self.pool_inputs += 1;
+        }
+    }
+
+    fn resume_descriptor_visibility(&mut self) {
+        if std::mem::take(&mut self.render.blocked_on_wait) {
+            self.render.descriptors_after_wait = self.descriptor_epoch;
+        }
+    }
+
     /// Whether texture pool `pool`'s RegisterTexture or RegisterImage
     /// (`image`) of `texture` with view `view` at `id` would write the
     /// descriptor already there: the same texture, as it is now (storage
@@ -4194,20 +4235,72 @@ impl Nvn {
             .is_some_and(|bag| bag == registered)
     }
 
-    /// The one queue with work still to run, when exactly one has some.
-    fn single_pending_queue(&self) -> Option<u64> {
-        let mut queues = self.pending.iter().filter(|(_, work)| !work.is_empty());
-        let (queue, _) = queues.next()?;
-        queues.next().is_none().then_some(*queue)
+    fn oldest_descriptor_epoch(&self) -> Option<u64> {
+        let submitted = self.pending.values().filter_map(|work| {
+            work.iter().find_map(|item| match item {
+                QueueItem::List {
+                    descriptor_epoch, ..
+                } => Some(*descriptor_epoch),
+                _ => None,
+            })
+        });
+        let captured = self
+            .frame_capture
+            .as_ref()
+            .map(|capture| capture.oldest_descriptor_epoch);
+        submitted.chain(captured).min()
     }
 
-    /// Whether more than one queue has work still to run (a registration
-    /// cannot then be put in order behind it: `needs_replayed`).
+    /// How many queues have work still to run.
     pub fn pending_queues(&self) -> usize {
         self.pending
             .values()
             .filter(|work| !work.is_empty())
             .count()
+    }
+
+    fn replace_texture_descriptor(
+        &mut self,
+        pool: u64,
+        id: u32,
+        entry: Args,
+        view: Option<&Option<Bag>>,
+    ) {
+        let previous = self
+            .texture_descriptors
+            .entry(pool)
+            .or_default()
+            .insert(id, entry);
+        let Some(previous) = previous else {
+            return;
+        };
+        let current_view = self.views.get(&(pool, id));
+        if previous.x[..3] == entry.x[..3]
+            && previous.x[3] as u32 == entry.x[3] as u32
+            && view.is_none_or(|view| view.as_ref() == current_view)
+        {
+            return;
+        }
+        let oldest = self.oldest_descriptor_epoch();
+        self.descriptor_epoch += 1;
+        let Some(oldest) = oldest else {
+            self.descriptor_history.clear();
+            return;
+        };
+        let view = current_view.cloned();
+        self.descriptor_history.retain(|_, versions| {
+            let first_live = versions.partition_point(|version| version.epoch <= oldest);
+            versions.drain(..first_live);
+            !versions.is_empty()
+        });
+        self.descriptor_history
+            .entry((pool, id))
+            .or_default()
+            .push(PreviousDescriptor {
+                epoch: self.descriptor_epoch,
+                entry: previous,
+                view,
+            });
     }
 
     /// Make descriptor `registration.id` of its pool describe its object:
@@ -4239,6 +4332,8 @@ impl Nvn {
                 .entry(pool)
                 .or_default()
                 .insert(id, sampler);
+        } else if self.objects.contains_key(&pool) {
+            self.replace_texture_descriptor(pool, id, entry, view.as_ref());
         }
         match view {
             Some(Some(view)) => {
@@ -4248,12 +4343,6 @@ impl Nvn {
                 self.views.remove(&(pool, id));
             }
             None => {}
-        }
-        if sampler.is_none() && self.objects.contains_key(&pool) {
-            self.texture_descriptors
-                .entry(pool)
-                .or_default()
-                .insert(id, entry);
         }
     }
 
@@ -4482,7 +4571,11 @@ impl Nvn {
                 return Ok(progressed);
             };
             match item {
-                QueueItem::List { commands, next } => {
+                QueueItem::List {
+                    commands,
+                    next,
+                    descriptor_epoch,
+                } => {
                     if commands.get(*next).is_none() {
                         self.pending.get_mut(&queue).unwrap().pop_front();
                         continue;
@@ -4495,11 +4588,13 @@ impl Nvn {
                     {
                         replayed_list = Some(commands.clone());
                     }
+                    let descriptor_epoch = *descriptor_epoch;
                     let command = &replayed_list.as_ref().unwrap()[*next];
                     let rest = without_prefix(&command.name, "nvnCommandBuffer");
                     if rest == "WaitEvent" {
                         if !self.event_wait_holds(command, core)? {
                             if !force {
+                                self.render.blocked_on_wait = true;
                                 return Ok(progressed);
                             }
                             *self.forced_waits.entry("WaitEvent".into()).or_default() += 1;
@@ -4513,6 +4608,7 @@ impl Nvn {
                         {
                             *next += 1;
                         }
+                        self.resume_descriptor_visibility();
                         progressed = true;
                         continue;
                     }
@@ -4538,6 +4634,7 @@ impl Nvn {
                                         QueueItem::List {
                                             commands: list,
                                             next: 0,
+                                            descriptor_epoch,
                                         },
                                     );
                                 }
@@ -4546,6 +4643,9 @@ impl Nvn {
                         }
                         continue;
                     }
+                    self.select_descriptors(
+                        descriptor_epoch.max(self.render.descriptors_after_wait),
+                    );
                     self.execute(command, core)?;
                 }
                 QueueItem::Fence { sync, args } => {
@@ -4558,14 +4658,6 @@ impl Nvn {
                     let texture = *texture;
                     self.pending.get_mut(&queue).unwrap().pop_front();
                     self.present_frame(core, queue, texture)?;
-                    progressed = true;
-                }
-                QueueItem::Register(_) => {
-                    if let Some(QueueItem::Register(registration)) =
-                        self.pending.get_mut(&queue).unwrap().pop_front()
-                    {
-                        self.apply_registration(*registration);
-                    }
                     progressed = true;
                 }
                 QueueItem::WaitSync { sync } => {
@@ -4584,12 +4676,14 @@ impl Nvn {
                         });
                     }
                     if !signaled && !force {
+                        self.render.blocked_on_wait = true;
                         return Ok(progressed);
                     }
                     if !signaled {
                         *self.forced_waits.entry("WaitSync".into()).or_default() += 1;
                     }
                     self.pending.get_mut(&queue).unwrap().pop_front();
+                    self.resume_descriptor_visibility();
                     progressed = true;
                 }
             }
@@ -4669,15 +4763,23 @@ impl Nvn {
                     .any(|item| item.trim().parse::<u64>().ok() == Some(self.presented_frames))
             })
         {
+            let descriptor_epoch = self
+                .render
+                .descriptor_epoch
+                .unwrap_or(self.descriptor_epoch);
             let capture = self.frame_capture.get_or_insert_with(|| {
                 Box::new(FrameCapture {
                     commands: Vec::new(),
                     render: self.render.clone(),
                     queue_render: self.queue_render.clone(),
                     render_queue: self.render_queue,
+                    oldest_descriptor_epoch: descriptor_epoch,
                 })
             });
-            capture.commands.push((self.render_queue, command.clone()));
+            capture.oldest_descriptor_epoch = capture.oldest_descriptor_epoch.min(descriptor_epoch);
+            capture
+                .commands
+                .push((self.render_queue, descriptor_epoch, command.clone()));
         }
         // ECHORA_COMMAND_LOG=FROM-TO (debugging): each command executed
         // while preparing presents FROM to TO, with its first arguments.
@@ -8024,6 +8126,128 @@ mod tests {
     }
 
     #[test]
+    fn pending_queues_read_the_texture_and_view_from_their_submission() {
+        let mut nvn = Nvn::default();
+        let pool = 1;
+        let id = 10;
+        nvn.initialize(pool, "TexturePool", BTreeMap::new())
+            .unwrap();
+        let register = |nvn: &mut Nvn, texture: u64, format: Option<u64>| {
+            let view = format.map(|format| Bag {
+                kind: "TextureView".into(),
+                props: BTreeMap::from([(
+                    "Format".into(),
+                    Args {
+                        x: [format, 0, 0, 0],
+                        ..Args::default()
+                    },
+                )]),
+            });
+            nvn.apply_registration(Registration {
+                pool,
+                id,
+                sampler: None,
+                entry: Args {
+                    x: [texture, 0, 0, 0],
+                    ..Args::default()
+                },
+                view: Some(view),
+            });
+        };
+        let commands = std::sync::Arc::new(vec![Command {
+            name: "nvnCommandBufferSetTexturePool",
+            x: [0, pool, 0, 0, 0, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        }]);
+        let enqueue = |nvn: &mut Nvn, queue| {
+            nvn.pending
+                .entry(queue)
+                .or_default()
+                .push_back(QueueItem::List {
+                    commands: commands.clone(),
+                    next: 0,
+                    descriptor_epoch: nvn.descriptor_epoch,
+                });
+        };
+        let memory_pool = 7;
+        let event = 8;
+        let address = 0x10_0000;
+        let storage = |x| {
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x,
+                    ..Args::default()
+                },
+            )])
+        };
+        nvn.initialize(memory_pool, "MemoryPool", storage([address, 4096, 0, 0]))
+            .unwrap();
+        nvn.initialize(event, "Event", storage([memory_pool, 0, 0, 0]))
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(address, 4096, READ | WRITE, STATE_NORMAL, "descriptor wait")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+
+        register(&mut nvn, 100, None::<u64>);
+        enqueue(&mut nvn, 2);
+        enqueue(&mut nvn, 3);
+        let wait = Command {
+            name: "nvnCommandBufferWaitEvent",
+            x: [0, event, 0, 1, 0, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        let waiting = std::iter::once(wait)
+            .chain(commands.iter().cloned())
+            .collect();
+        nvn.pending
+            .entry(6)
+            .or_default()
+            .push_back(QueueItem::List {
+                commands: std::sync::Arc::new(waiting),
+                next: 0,
+                descriptor_epoch: nvn.descriptor_epoch,
+            });
+        assert!(!nvn.run_queue(6, &mut guest, false).unwrap());
+        register(&mut nvn, 100, Some(37));
+        enqueue(&mut nvn, 4);
+        register(&mut nvn, 200, Some(41));
+        enqueue(&mut nvn, 5);
+
+        let check = |nvn: &mut Nvn, guest: &mut Guest<'_>, queue, texture, format| {
+            assert!(nvn.run_queue(queue, guest, false).unwrap());
+            assert_eq!(
+                nvn.render_texture_descriptor(pool, id).unwrap().x[0],
+                texture
+            );
+            let selected = nvn
+                .render_texture_view(pool, id)
+                .map(|view| view.props["Format"].x[0]);
+            assert_eq!(selected, format);
+            assert_eq!(nvn.texture_descriptor(pool, id).unwrap().x[0], 200);
+        };
+        check(&mut nvn, &mut guest, 4, 100, Some(37));
+        check(&mut nvn, &mut guest, 2, 100, None);
+        check(&mut nvn, &mut guest, 3, 100, None);
+        check(&mut nvn, &mut guest, 5, 200, Some(41));
+        guest.memory.write_u32(address, 1).unwrap();
+        check(&mut nvn, &mut guest, 6, 200, Some(41));
+        register(&mut nvn, 300, None);
+        assert!(nvn.descriptor_history.is_empty());
+    }
+
+    #[test]
     fn resource_slots_track_sparse_single_plural_and_deferred_binds() {
         let mut memory = Memory::new(1 << 39);
         memory
@@ -8180,8 +8404,10 @@ mod tests {
             render_queue: Some(2),
             render: RenderState::default(),
             queue_render: HashMap::default(),
+            oldest_descriptor_epoch: 0,
             commands: vec![(
                 Some(2),
+                0,
                 Command {
                     name: "nvnCommandBufferSetScissor",
                     x: [0, 1, 2, 3, 4, 0, 0, 0],

@@ -2416,7 +2416,7 @@ impl Nvn {
     /// registered with a texture or image handle selects, if any.
     fn handle_view_levels(&self, handle: u64) -> Option<(u32, u32)> {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
-        let view = self.views.get(&(pool, (handle & 0xf_ffff) as u32))?;
+        let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
         let levels = view.props.get("Levels")?;
         Some((levels.x[0] as u32, levels.x[1] as u32))
     }
@@ -2426,7 +2426,7 @@ impl Nvn {
     /// views, as a PokeDinner capture shows them).
     fn handle_view_format(&self, handle: u64) -> Option<vk::Format> {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
-        let view = self.views.get(&(pool, (handle & 0xf_ffff) as u32))?;
+        let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
         vk_format(view.props.get("Format")?.x[0] as u32)
     }
 
@@ -2751,7 +2751,7 @@ impl Nvn {
     /// a handle sets, if any.
     fn handle_swizzle(&self, handle: u64) -> Option<[u64; 4]> {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
-        let view = self.views.get(&(pool, (handle & 0xf_ffff) as u32))?;
+        let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
         let swizzle = view.props.get("Swizzle")?;
         Some([swizzle.x[0], swizzle.x[1], swizzle.x[2], swizzle.x[3]])
     }
@@ -2785,7 +2785,7 @@ impl Nvn {
     /// registered with a handle selects, if any.
     fn handle_view_layers(&self, handle: u64) -> Option<(u32, u32)> {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
-        let view = self.views.get(&(pool, (handle & 0xf_ffff) as u32))?;
+        let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
         let layers = view.props.get("Layers")?;
         Some((layers.x[0] as u32, layers.x[1] as u32))
     }
@@ -3893,7 +3893,7 @@ impl Nvn {
             .ok_or("no texture pool is set")?
             .x[1];
         let id = (handle & 0xf_ffff) as u32;
-        let entry = match self.texture_descriptor(pool, id) {
+        let entry = match self.render_texture_descriptor(pool, id) {
             Some(entry) => entry,
             None => {
                 self.object(pool, "TexturePool")?;
