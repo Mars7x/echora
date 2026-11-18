@@ -982,10 +982,11 @@ impl Nvn {
         // Resolved bindings (`binding_memo`) change only with a texture's
         // bytes: one named, or one under the range. Descriptors are
         // registered, not read from the range.
-        if self
-            .code_pools
-            .iter()
-            .any(|(&start, &size)| start < range.end && range.start < start + size)
+        if self.stage_cache.get_mut().invalidate(&range)
+            || self
+                .code_pools
+                .iter()
+                .any(|(&start, &size)| start < range.end && range.start < start + size)
         {
             self.flush_epoch += 1;
         }

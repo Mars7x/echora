@@ -398,6 +398,43 @@ type TargetShape = (
 /// A stage's code window and its program key.
 type StageCode = (std::sync::Arc<Vec<u8>>, u64);
 
+#[derive(Debug, Default)]
+struct StageCodeCache {
+    entries: HashMap<u64, (u64, StageCode)>,
+    /// An envelope around the current guest ranges. Most pool flushes
+    /// miss it without walking any entries.
+    guest_span: Option<std::ops::Range<u64>>,
+}
+
+impl StageCodeCache {
+    fn insert(&mut self, gpu: u64, guest: u64, stage: StageCode) {
+        let end = guest + stage.0.len() as u64;
+        let span = self.guest_span.get_or_insert(guest..end);
+        span.start = span.start.min(guest);
+        span.end = span.end.max(end);
+        self.entries.insert(gpu, (guest, stage));
+    }
+
+    fn invalidate(&mut self, range: &std::ops::Range<u64>) -> bool {
+        if range.is_empty()
+            || self
+                .guest_span
+                .as_ref()
+                .is_none_or(|span| span.start >= range.end || range.start >= span.end)
+        {
+            return false;
+        }
+        let before = self.entries.len();
+        self.entries.retain(|_, (guest, (code, _))| {
+            *guest >= range.end || range.start >= *guest + code.len() as u64
+        });
+        if self.entries.is_empty() {
+            self.guest_span = None;
+        }
+        self.entries.len() != before
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Nvn {
     /// Guest addresses of replaced exports.
@@ -434,7 +471,7 @@ pub struct Nvn {
     pub(super) memory_trace_last: HashMap<u64, Vec<u8>>,
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
-    stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
+    stage_cache: std::cell::RefCell<StageCodeCache>,
     /// The CPU-visible ranges of live memory pools, rebuilt when a pool or
     /// virtual mapping changes.
     #[serde(skip)]
@@ -3660,7 +3697,10 @@ impl Nvn {
                     }
                 }
                 if kind == "MemoryPool" {
-                    let base = self.objects[&this].builder.get("Storage").map_or(0, |storage| storage.x[0]);
+                    let [base, size, _, _] = self.objects[&this]
+                        .builder
+                        .get("Storage")
+                        .map_or([0; 4], |storage| storage.x);
                     // ECHORA_UNPOOLED_LOG: finalized pools' GPU ranges.
                     if debug_var_os("ECHORA_UNPOOLED_LOG").is_some() {
                         let object = &self.objects[&this];
@@ -3720,6 +3760,9 @@ impl Nvn {
                         self.new_pools.extend(others);
                     }
                     self.code_pools.remove(&base);
+                    if base != 0 {
+                        self.stage_cache.get_mut().invalidate(&(base..base + size));
+                    }
                     self.flush_epoch += 1;
                     self.pool_epoch += 1;
                 }
@@ -6183,12 +6226,13 @@ impl Nvn {
     /// two gameplay programs run past 64 KiB; clipped to its memory pool
     /// and to readable memory) and its key: an
     /// FNV-1a hash of the program up to the end `sass::program_length` finds.
-    /// Windows are cached by address and reread only when their first 512
-    /// bytes (the header and first instructions) change.
+    /// Windows are cached by address. A pool flush or shader registration
+    /// can invalidate them, and the first 512 bytes are checked on lookup.
     fn stage_code(&self, core: &Guest, gpu: u64) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
         let (guest, remaining) = self.pool_for(gpu)?;
         let length = remaining.min(0x40000);
-        if let Some((code, key)) = self.stage_cache.borrow().get(&gpu)
+        if let Some((cached_guest, (code, key))) = self.stage_cache.borrow().entries.get(&gpu)
+            && *cached_guest == guest
             && code.len() as u64 == length
         {
             let mut prefix = [0; 512];
@@ -6207,7 +6251,7 @@ impl Nvn {
         let code = std::sync::Arc::new(code);
         self.stage_cache
             .borrow_mut()
-            .insert(gpu, (code.clone(), key));
+            .insert(gpu, guest, (code.clone(), key));
         Some((code, key))
     }
 
@@ -6819,6 +6863,13 @@ impl Nvn {
                 ],
                 v: [0; 2],
             });
+        }
+        let cache = self.stage_cache.get_mut();
+        for stage in &stages {
+            cache.entries.remove(&stage.x[0]);
+        }
+        if cache.entries.is_empty() {
+            cache.guest_span = None;
         }
         if let Some(directory) = debug_var_os("ECHORA_SHADER_DIR") {
             self.dump_shader_stages(core, &stages, std::path::Path::new(&directory))
@@ -8386,6 +8437,69 @@ mod tests {
         assert_eq!(nvn.render.storage_slots, [0, 0xc008, 0, 0, 0, 0, 0, 4]);
         assert_eq!(nvn.render.state["BindStorageBuffer/1/16"].x[3], 0x1300);
         assert_eq!(nvn.render.state["BindStorageBuffer/7/2"].x[3..5], [0, 0]);
+    }
+
+    #[test]
+    fn shader_code_flushes_and_registrations_refresh_bytes_past_the_prefix() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let base = 0x10_000;
+        let size = 0x2000;
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "shader pool")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let gpu = GPU_ADDRESS_BASE;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, size, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
+        nvn.initialize(2, "Program", BTreeMap::new()).unwrap();
+        guest
+            .memory
+            .write_u32(
+                base + 0x300,
+                (crate::sass::ALWAYS << 12) | crate::sass::opcode::EXIT,
+            )
+            .unwrap();
+        let (first, key) = nvn.stage_code(&guest, gpu).unwrap();
+
+        nvn.gpu_invalidate(0x5000..0x6000, None);
+        let (unaffected, _) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &unaffected));
+
+        let changed = base + 0x214;
+        guest.memory.write(changed, &[7]).unwrap();
+        let epoch = nvn.flush_epoch;
+        nvn.gpu_invalidate(changed..changed + 1, None);
+        assert_eq!(nvn.flush_epoch, epoch + 1);
+        let (flushed, flushed_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert_eq!(flushed[0x214], 7);
+        assert_ne!(key, flushed_key);
+
+        guest.memory.write(changed, &[12]).unwrap();
+        guest.memory.write_u64(base + 0x1000, gpu).unwrap();
+        nvn.set_program_shaders(&mut guest, 2, 1, base + 0x1000, 16)
+            .unwrap();
+        let (registered, registered_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert_eq!(registered[0x214], 12);
+        assert_ne!(flushed_key, registered_key);
     }
 
     #[test]
