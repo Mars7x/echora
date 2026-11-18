@@ -3099,27 +3099,23 @@ impl Nvn {
         } else {
             1
         };
-        (1..target.levels)
-            .map(|level| {
-                let offset = crate::nvn_format::block_linear_level_offset(
-                    info,
-                    target.width,
-                    target.height,
-                    depth,
-                    super::texture_layout_layers(
-                        &object.builder,
-                        info,
-                        [target.width, target.height, depth],
-                        target.shape.layers(),
-                        target.levels,
-                    ),
-                    level,
-                );
+        let dimensions = [target.width, target.height, depth];
+        let layout = super::texture_layout_layers(
+            &object.builder,
+            info,
+            dimensions,
+            target.shape.layers(),
+            target.levels,
+        );
+        crate::nvn_format::block_linear_mips(info, dimensions, layout, target.levels)
+            .enumerate()
+            .skip(1)
+            .map(|(level, mip)| {
                 let extent = (
                     (target.width >> level).max(1),
                     (target.height >> level).max(1),
                 );
-                (level, offset, extent)
+                (level as u32, mip.offset, extent)
             })
             .collect()
     }
@@ -3659,17 +3655,16 @@ impl Nvn {
             .try_reserve_exact(upload_bytes)
             .map_err(|err| format!("texture upload: {err}"))?;
         let mut levels = Vec::with_capacity(level_count as usize * layers as usize);
-        for level in 0..level_count {
+        let mips =
+            crate::nvn_format::block_linear_mips(info, [width, height, depth], layout, level_count);
+        for (level, mip) in (0..level_count).zip(mips) {
             let [level_width, level_height, level_depth] = extent_at(level);
             let (columns, rows) = (
                 level_width.div_ceil(info.block_width),
                 level_height.div_ceil(info.block_height),
             );
-            let level_offset = crate::nvn_format::block_linear_level_offset(
-                info, width, height, depth, layout, level,
-            );
-            let level_shape =
-                crate::nvn_format::level_block_shape(info, height, depth, layout, level);
+            let level_offset = mip.offset;
+            let level_shape = mip.shape;
             let row_bytes = columns as usize * block;
             let slice_bytes = row_bytes * rows as usize;
             let gather_layer = |layer: usize, data: &mut [u8]| {

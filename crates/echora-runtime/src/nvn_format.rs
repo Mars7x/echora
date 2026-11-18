@@ -436,12 +436,40 @@ fn levels_size(
     layers: impl Into<Layers>,
     levels: u32,
 ) -> (u64, BlockShape) {
-    let layers: Layers = layers.into();
-    let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
     let base = base_block_shape(format, height, depth, layers);
-    let mut layer_size = 0;
-    let mut depth_shift = base.z;
-    for level in 0..levels.max(1) {
+    let last = mips_with_base(format, [width, height, depth], base, levels.max(1))
+        .last()
+        .expect("there is at least one mip");
+    (last.offset + last.size, base)
+}
+
+/// A mip's byte offset within one layer, and its block shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockLinearMip {
+    pub offset: u64,
+    pub shape: BlockShape,
+    size: u64,
+}
+
+/// Block-linear mips in storage order within one layer.
+pub fn block_linear_mips(
+    format: FormatInfo,
+    extent: [u32; 3],
+    layers: impl Into<Layers>,
+    levels: u32,
+) -> impl Iterator<Item = BlockLinearMip> {
+    let base = base_block_shape(format, extent[1], extent[2], layers);
+    mips_with_base(format, extent, base, levels)
+}
+
+fn mips_with_base(
+    format: FormatInfo,
+    [width, height, depth]: [u32; 3],
+    base: BlockShape,
+    levels: u32,
+) -> impl Iterator<Item = BlockLinearMip> {
+    let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
+    (0..levels).scan((0, base.z), move |(layer_size, depth_shift), level| {
         let w = (width >> level).max(1);
         let h = (height >> level).max(1);
         let d = (depth >> level).max(1);
@@ -449,18 +477,27 @@ fn levels_size(
         let height_shift = fit_block(base.y, GOB_HEIGHT, rows);
         // Mip depth halves at most once per level. Carry the last level's
         // depth through this walk instead of starting at level zero again.
-        if level != 0 && depth_shift > 0 && u64::from(d) <= (1 << depth_shift) >> 1 {
-            depth_shift -= 1;
+        if level != 0 && *depth_shift > 0 && u64::from(d) <= (1 << *depth_shift) >> 1 {
+            *depth_shift -= 1;
         }
         let row_bytes = align(
             blocks(w, format.block_width) * u64::from(format.bytes_per_block),
             GOB_WIDTH,
         );
         let block_rows = GOB_HEIGHT << height_shift;
-        let block_depth = 1u64 << depth_shift;
-        layer_size += row_bytes * align(rows, block_rows) * align(u64::from(d), block_depth);
-    }
-    (layer_size, base)
+        let block_depth = 1u64 << *depth_shift;
+        let size = row_bytes * align(rows, block_rows) * align(u64::from(d), block_depth);
+        let offset = *layer_size;
+        *layer_size += size;
+        Some(BlockLinearMip {
+            offset,
+            shape: BlockShape {
+                y: height_shift,
+                z: *depth_shift,
+            },
+            size,
+        })
+    })
 }
 
 /// Byte offset of mip level `level` within a block-linear surface (levels
@@ -654,6 +691,37 @@ mod tests {
         );
         let two = block_linear_size(format, 1024, 2048, 1, 1, 2).0;
         assert_eq!(block_linear_level_offset(format, 1024, 2048, 1, 1, 2), two);
+    }
+
+    #[test]
+    fn advancing_mips_preserves_offsets_and_block_shapes() {
+        for format in [1, 37, 66, 123].into_iter().filter_map(info) {
+            for ([width, height, depth], layers) in [
+                ([1365, 1365, 1], Layers::from(90)),
+                ([65, 33, 17], Layers::from(1)),
+                (
+                    [135, 71, 10],
+                    Layers {
+                        count: 1,
+                        shape: Some(BlockShape { y: 2, z: 4 }),
+                    },
+                ),
+            ] {
+                let dimensions = [width, height, depth];
+                let walk = || block_linear_mips(format, dimensions, layers, 7);
+                for (level, mip) in (0..7).zip(walk()) {
+                    assert_eq!(walk().nth(level as usize), Some(mip));
+                    assert_eq!(
+                        mip.offset,
+                        block_linear_level_offset(format, width, height, depth, layers, level)
+                    );
+                    assert_eq!(
+                        mip.shape,
+                        level_block_shape(format, height, depth, layers, level)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
