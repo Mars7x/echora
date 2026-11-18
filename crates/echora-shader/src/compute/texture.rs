@@ -229,6 +229,7 @@ impl Emitter {
     /// unwritten entry: the access uses entry 0 and the results become
     /// zeros.
     fn pool_handle(&mut self, handle: u32) -> (u32, u32, u32) {
+        self.pool_trace_handle = self.vertex_trace_record.map(|_| handle);
         if let (Some(index), Some(inside), Some(sampler)) = (
             self.known(Known::PoolIndex(handle)),
             self.known(Known::PoolInside(handle)),
@@ -431,6 +432,7 @@ impl Emitter {
         }
         self.pool_inside = None;
         self.pool_integer = None;
+        self.pool_trace_handle = None;
         if texture.handle.is_none()
             && !texture.handle_value
             && usize::from(texture.bank) >= self.cbuf_used_sizes.len()
@@ -454,7 +456,8 @@ impl Emitter {
             }
             None => results,
         };
-        self.vertex_trace_texture(index, &results);
+        let handle = self.pool_trace_handle.take();
+        self.vertex_trace_texture(index, &results, handle);
         // The written components, in mask order.
         let components: Vec<u32> = (0..4)
             .filter(|n| texture.mask >> n & 1 != 0)

@@ -7695,7 +7695,7 @@ impl Nvn {
                                 .collect::<Vec<_>>()
                         );
                     }
-                    for texture in entry[8..8 + 6 * 16].chunks_exact(6) {
+                    for (index, texture) in entry[8..8 + 6 * 16].chunks_exact(6).enumerate() {
                         if texture[0] != 0 {
                             line += &format!(
                                 " | tex at {:#x} x{} {:08x} {:08x} {:08x} {:08x}",
@@ -7706,6 +7706,13 @@ impl Nvn {
                                 texture[4],
                                 texture[5]
                             );
+                            if entry[echora_shader_abi::VERTEX_TRACE_HANDLE_MASK] & (1 << index)
+                                != 0
+                            {
+                                let handle =
+                                    entry[echora_shader_abi::VERTEX_TRACE_HANDLE_WORD + index];
+                                line += &format!(" handle {handle:#010x}");
+                            }
                         }
                     }
                     eprintln!("{line}");

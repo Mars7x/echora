@@ -846,7 +846,7 @@ pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
                 .collect();
             line += &format!(" | out {out:?}");
         }
-        for texture in entry[8..8 + 6 * 16].as_chunks::<6>().0 {
+        for (index, texture) in entry[8..8 + 6 * 16].as_chunks::<6>().0.iter().enumerate() {
             if texture[0] != 0 {
                 line += &format!(
                     " | tex at {:#x} x{} {:08x} {:08x} {:08x} {:08x}",
@@ -857,6 +857,10 @@ pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
                     texture[4],
                     texture[5]
                 );
+                if entry[echora_shader_abi::VERTEX_TRACE_HANDLE_MASK] & (1 << index) != 0 {
+                    let handle = entry[echora_shader_abi::VERTEX_TRACE_HANDLE_WORD + index];
+                    line += &format!(" handle {handle:#010x}");
+                }
             }
         }
         lines.push(line);
@@ -9050,8 +9054,8 @@ mod tests {
     fn a_traced_fragment_program_s_record_prints_as_the_runtime_s_report() {
         use crate::header::{Header, Interpolation};
         use echora_shader_abi::{
-            FRAGMENT_TRACE_PIXEL_SPEC_ID, Stage, VERTEX_TRACE_HIGH_SPEC_ID,
-            VERTEX_TRACE_LOW_SPEC_ID,
+            FRAGMENT_TRACE_PIXEL_SPEC_ID, Stage, TEXTURE_POOL_SET, VERTEX_TRACE_HIGH_SPEC_ID,
+            VERTEX_TRACE_LOW_SPEC_ID, texture_pool,
         };
         // IPA R0, a[0x80]; IPA R1, a[0x84] (flat inputs given as words);
         // TEX.LZ R4, R0, R1 (2D, handle c[0x0][0x40]) xyzw; R0-R3 = R4-R7:
@@ -9080,6 +9084,19 @@ mod tests {
             (81, 3, 7),
             (87, 3, 1),
         ]);
+        let handle = 0x0030_0005;
+        let bindless = word(&[
+            (0, 12, 0x361),
+            (16, 8, 16),
+            (24, 8, 12),
+            (32, 8, 14),
+            (59, 1, 1),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
         let copy = |d: u128, a: u128| word(&[(0, 12, 0x202), (16, 8, d), (32, 8, a), (72, 4, 0xf)]);
         let program = [
             ipa(0, 0x80),
@@ -9089,6 +9106,10 @@ mod tests {
             copy(1, 5),
             copy(2, 6),
             copy(3, 7),
+            mov(12, 0.625f32.to_bits()),
+            mov(13, 0.375f32.to_bits()),
+            mov(14, handle),
+            bindless,
             EXIT,
         ];
         let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
@@ -9121,6 +9142,13 @@ mod tests {
             .binding;
         let buffer = 0x7e00_0000_0000u64;
         let texels: Vec<[u32; 4]> = (0..16u32).map(|n| [n, 2 * n, 3 * n, 0x3f80_0000]).collect();
+        let image = Image {
+            width: 4,
+            height: 4,
+            depth: 1,
+            layers: 1,
+            texels: texels.into(),
+        };
         let report = machine.simulate(&Inputs {
             workgroup_count: [1, 1, 1],
             builtins: HashMap::from([(
@@ -9131,16 +9159,9 @@ mod tests {
             )]),
             // Location 0 as the stage reads it: (0.625, 0.375) as words.
             locations: HashMap::from([(0, vec![0x3f20_0000, 0x3ec0_0000, 0, 0])]),
-            images: HashMap::from([(
-                (0, binding),
-                Image {
-                    width: 4,
-                    height: 4,
-                    depth: 1,
-                    layers: 1,
-                    texels: texels.into(),
-                },
-            )]),
+            images: HashMap::from([((0, binding), image.clone())]),
+            image_arrays: HashMap::from([((TEXTURE_POOL_SET, texture_pool::SAMPLED_2D, 5), image)]),
+            uniforms: HashMap::from([((TEXTURE_POOL_SET, texture_pool::FLAGS), vec![0; 24])]),
             memory: BTreeMap::from([(buffer, vec![0; 64 * 512])]),
             specialization: HashMap::from([
                 (VERTEX_TRACE_LOW_SPEC_ID, buffer as u32),
@@ -9154,7 +9175,10 @@ mod tests {
         // Texel (2, 1), number 6: 6, 12, 18 and 1.0; the TEX at 0x20.
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].ends_with(" | out [8e-45, 1.7e-44, 2.5e-44, 1.0] | tex at 0x20 x1 00000006 0000000c 00000012 3f800000"),
+            lines[0].ends_with(concat!(
+                " | out [8e-45, 1.7e-44, 2.5e-44, 1.0] | tex at 0x20 x1 00000006 0000000c 00000012 3f800000",
+                " | tex at 0xa0 x1 00000006 0000000c 00000012 3f800000 handle 0x00300005",
+            )),
             "{}",
             lines[0]
         );

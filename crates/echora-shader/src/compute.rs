@@ -626,6 +626,8 @@ struct Emitter {
     /// Whether the texture-pool handles the current texture instruction
     /// uses are within the pool (its results are zeros where not).
     pool_inside: Option<u32>,
+    /// Raw bindless handle of the texture instruction being traced.
+    pool_trace_handle: Option<u32>,
     /// For the current texture instruction's pool texture with a uint
     /// view: its views and whether the entry is integer.
     pool_integer: Option<texture::PoolViews>,
@@ -748,6 +750,7 @@ impl Emitter {
             pool_bindings: 0,
             pool_capacity: None,
             pool_inside: None,
+            pool_trace_handle: None,
             pool_integer: None,
             pool_flags: None,
             descriptor_aliases: Vec::new(),

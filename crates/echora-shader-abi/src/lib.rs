@@ -394,6 +394,10 @@ pub const VERTEX_TRACE_LOW_SPEC_ID: u32 = 27;
 /// The specialization constant id of `SpecMeaning::FragmentTracePixel`.
 pub const FRAGMENT_TRACE_PIXEL_SPEC_ID: u32 = 26;
 pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 28;
+/// First record word for the 16 raw bindless texture handles.
+pub const VERTEX_TRACE_HANDLE_WORD: usize = 108;
+/// Record word whose bit k marks a handle for texture trace entry k.
+pub const VERTEX_TRACE_HANDLE_MASK: usize = 124;
 /// The specialization constant ids of `SpecMeaning::LoopTraceLow` and
 /// `LoopTraceHigh`.
 pub const LOOP_TRACE_LOW_SPEC_ID: u32 = 29;

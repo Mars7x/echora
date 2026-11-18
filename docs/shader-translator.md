@@ -339,6 +339,8 @@ writes record n from invocation n of workgroup (0, 0, 0). Record words:
 | 2, 3 | vertex: VertexIndex and InstanceIndex (raw); mesh: LocalInvocationIndex and WorkgroupId.x |
 | 4..8 | the position as written (x, y, z, w float bits); mesh: output vertex n's, from the stage buffer |
 | 8 + 6k .. 14 + 6k | texture entry k (k < 16): the instruction's byte offset in the code (after the 128-byte program header) plus one (0: no entry), the times the invocation ran it, and the four result words of its last run (before the mask picks the written components; integer bits) |
+| 108..124 | Raw handle of the last sample for each bindless texture entry |
+| 124 | Bit k says entry k used a bindless handle |
 
 Entries are numbered by texture instruction (TEX, TLD, TLD4, TXD, TXQ,
 TMML) in the order the translation emits them, which is the same for

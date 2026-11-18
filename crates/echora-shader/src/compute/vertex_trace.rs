@@ -35,8 +35,8 @@
 //! the runtime zeroes the buffer before the draw it traces.
 
 use echora_shader_abi::{
-    FRAGMENT_TRACE_PIXEL_SPEC_ID, SpecConstant, SpecMeaning, VERTEX_TRACE_HIGH_SPEC_ID,
-    VERTEX_TRACE_LOW_SPEC_ID,
+    FRAGMENT_TRACE_PIXEL_SPEC_ID, SpecConstant, SpecMeaning, VERTEX_TRACE_HANDLE_MASK,
+    VERTEX_TRACE_HANDLE_WORD, VERTEX_TRACE_HIGH_SPEC_ID, VERTEX_TRACE_LOW_SPEC_ID,
 };
 
 use super::{Emitter, Stage};
@@ -181,7 +181,12 @@ impl Emitter {
     }
 
     /// A texture instruction at `index` produced `results`: its entry.
-    pub(super) fn vertex_trace_texture(&mut self, index: usize, results: &[u32]) {
+    pub(super) fn vertex_trace_texture(
+        &mut self,
+        index: usize,
+        results: &[u32],
+        handle: Option<u32>,
+    ) {
         let Some(record) = self.vertex_trace_record else {
             return;
         };
@@ -208,6 +213,12 @@ impl Emitter {
         self.trace_atomic(record, start, op::ATOMIC_EXCHANGE, offset);
         let one = self.constant(1);
         self.trace_atomic(record, start + 1, op::ATOMIC_I_ADD, one);
+        if let Some(handle) = handle {
+            let base = VERTEX_TRACE_HANDLE_WORD as u32;
+            self.trace_atomic(record, base + entry as u32, op::ATOMIC_EXCHANGE, handle);
+            let bit = self.constant(1 << entry);
+            self.trace_atomic(record, VERTEX_TRACE_HANDLE_MASK as u32, op::ATOMIC_OR, bit);
+        }
         let zero = self.constant(0);
         let mut nan = self.module.bool_constant(false);
         for n in 0..4 {
