@@ -235,6 +235,7 @@ pub mod decoration {
     pub const INVARIANT: u32 = 18;
     pub const NON_UNIFORM: u32 = 5300;
     pub const BUILT_IN: u32 = 11;
+    pub const FLAT: u32 = 14;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;

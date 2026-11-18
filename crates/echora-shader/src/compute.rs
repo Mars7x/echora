@@ -1536,6 +1536,12 @@ impl Emitter {
         let variable = self.module.global_variable(pointer, storage::INPUT);
         self.module
             .decorate(variable, decoration::BUILT_IN, &[builtin]);
+        if self.layout.stage == Stage::Fragment
+            && (builtin == BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID
+                || (BUILTIN_SUBGROUP_EQ_MASK..BUILTIN_SUBGROUP_EQ_MASK + 5).contains(&builtin))
+        {
+            self.module.decorate(variable, decoration::FLAT, &[]);
+        }
         self.builtins.insert(builtin, variable);
         self.interface.push(variable);
         variable
@@ -3398,6 +3404,27 @@ mod tests {
     }
 
     const EXIT: u128 = 0x94d | 7 << 12;
+
+    #[test]
+    fn fragment_subgroup_builtins_are_flat() {
+        let code = [
+            Op::S2r {
+                d: crate::decode::Reg(0),
+                special: 0,
+            },
+            Op::S2r {
+                d: crate::decode::Reg(1),
+                special: 0x38,
+            },
+        ]
+        .map(|op| Instruction { op, ..decode(EXIT) });
+        let layout = Layout {
+            stage: Stage::Fragment,
+            ..Layout::workgroup([1; 3])
+        };
+        let translated = translate(&code, &layout).unwrap();
+        assert!(validate(&translated.spirv).is_none());
+    }
 
     fn translated(words: &[u128]) -> Result<Translated, Unsupported> {
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
