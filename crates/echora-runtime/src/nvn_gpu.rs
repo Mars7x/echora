@@ -169,6 +169,7 @@ pub struct Backend {
     /// not contiguous): the pieces that are, by pool base, as (offset,
     /// length, file, offset in the file).
     shared_pieces: HashMap<u64, Vec<(u64, u64, i32, u64)>>,
+    shared_guest_index: std::cell::RefCell<GuestFileIndex>,
     /// Bumped whenever a pool is shared (or shared again): the page table
     /// is rebuilt after it changes.
     share_generation: usize,
@@ -195,7 +196,7 @@ impl std::fmt::Debug for Backend {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SharedRange {
     file: i32,
     start: u64,
@@ -205,6 +206,65 @@ struct SharedRange {
 impl SharedRange {
     fn overlaps(self, other: Self) -> bool {
         self.file == other.file && self.start < other.end && other.start < self.end
+    }
+}
+
+/// Imported guest spans indexed by address, in their original lookup
+/// order when several spans cover a request.
+#[derive(Default)]
+struct GuestFileIndex {
+    generation: usize,
+    spans: Vec<GuestFileSpan>,
+}
+
+struct GuestFileSpan {
+    guest: u64,
+    end: u64,
+    furthest_end: u64,
+    order: usize,
+    file: i32,
+    offset: u64,
+}
+
+impl GuestFileIndex {
+    fn new(generation: usize, mappings: impl Iterator<Item = (u64, u64, i32, u64)>) -> Self {
+        let mut spans: Vec<_> = mappings
+            .enumerate()
+            .filter_map(|(order, (guest, length, file, offset))| {
+                Some(GuestFileSpan {
+                    guest,
+                    end: guest.checked_add(length)?,
+                    furthest_end: 0,
+                    order,
+                    file,
+                    offset,
+                })
+            })
+            .collect();
+        spans.sort_unstable_by_key(|span| span.guest);
+        let mut furthest_end = 0;
+        for span in &mut spans {
+            furthest_end = furthest_end.max(span.end);
+            span.furthest_end = furthest_end;
+        }
+        Self { generation, spans }
+    }
+
+    fn range(&self, guest: u64, length: u64) -> Option<SharedRange> {
+        let end = guest.checked_add(length)?;
+        let after = self.spans.partition_point(|span| span.guest <= guest);
+        let span = self.spans[..after]
+            .iter()
+            .rev()
+            .take_while(|span| span.furthest_end >= end)
+            .filter(|span| span.end >= end)
+            .min_by_key(|span| span.order)?;
+        let start = span.offset.checked_add(guest - span.guest)?;
+        Some(SharedRange {
+            file: span.file,
+            start,
+            end: start.checked_add(length)?,
+        })
     }
 }
 
@@ -283,6 +343,7 @@ impl Backend {
             samples_reports: std::collections::HashSet::new(),
             shared_pools: HashMap::default(),
             shared_pieces: HashMap::default(),
+            shared_guest_index: Default::default(),
             share_generation: 0,
             target_index: HashMap::default(),
             target_levels: HashMap::default(),
@@ -5761,6 +5822,13 @@ impl Nvn {
             // would keep the old ones.
             if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
                 backend.renderer.release_file_range(offset, size);
+                backend.share_generation += 1;
+            }
+            if let Some(pieces) = backend.shared_pieces.remove(&base) {
+                for (_, size, _, offset) in pieces {
+                    backend.renderer.release_file_range(offset, size);
+                }
+                backend.share_generation += 1;
             }
         }
     }
@@ -7344,25 +7412,20 @@ impl Nvn {
     /// in-place span. Comparing file offsets covers aliases of those pages.
     fn shared_guest_range(&self, guest: u64, length: u64) -> Option<SharedRange> {
         let backend = self.gpu.as_ref()?;
-        let within = |start: u64, size: u64| start <= guest && guest + length <= start + size;
-        let (file, start) = backend
-            .shared_pools
-            .iter()
-            .find(|(base, (size, _, _))| within(**base, *size))
-            .map(|(base, &(_, file, offset))| (file, offset + (guest - base)))
-            .or_else(|| {
-                backend.shared_pieces.iter().find_map(|(base, pieces)| {
-                    pieces
-                        .iter()
-                        .find(|&&(at, size, ..)| within(base + at, size))
-                        .map(|&(at, _, file, offset)| (file, offset + (guest - base - at)))
-                })
-            })?;
-        Some(SharedRange {
-            file,
-            start,
-            end: start.checked_add(length)?,
-        })
+        let mut index = backend.shared_guest_index.borrow_mut();
+        if index.generation != backend.share_generation {
+            let whole = backend
+                .shared_pools
+                .iter()
+                .map(|(&base, &(length, file, offset))| (base, length, file, offset));
+            let pieces = backend.shared_pieces.iter().flat_map(|(&base, spans)| {
+                spans
+                    .iter()
+                    .map(move |&(at, length, file, offset)| (base + at, length, file, offset))
+            });
+            *index = GuestFileIndex::new(backend.share_generation, whole.chain(pieces));
+        }
+        index.range(guest, length)
     }
 
     /// Match the bound page table to the guest file before relying on
@@ -10712,10 +10775,63 @@ mod target_tests {
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{Backend, Nvn, Sampler, TextureSource, vk};
+    use super::{Backend, GuestFileIndex, Nvn, Sampler, SharedRange, TextureSource, vk};
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn shared_span_index_reuses_lookup_order_and_checks_the_whole_range() {
+        let index = GuestFileIndex::new(
+            1,
+            [
+                (0x1000, 0x400, 3, 0x8000),
+                (0x1100, 0x80, 4, 0xa000),
+                (0x1300, 0x400, 5, 0xc000),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            index.range(0x1120, 8),
+            Some(SharedRange {
+                file: 3,
+                start: 0x8120,
+                end: 0x8128
+            })
+        );
+        assert_eq!(
+            index.range(0x1380, 0x100),
+            Some(SharedRange {
+                file: 5,
+                start: 0xc080,
+                end: 0xc180
+            })
+        );
+        assert_eq!(index.range(0x13ff, 0x400), None);
+        assert_eq!(index.range(u64::MAX, 8), None);
+    }
+
+    #[test]
+    fn finalizing_a_pool_drops_all_of_its_shared_pieces() {
+        let Ok(Some(mut backend)) = Backend::create() else {
+            return;
+        };
+        backend.shared_pieces.insert(
+            0x1000,
+            vec![(0, 0x100, 3, 0x8000), (0x200, 0x100, 3, 0xa000)],
+        );
+        backend.share_generation += 1;
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        assert_eq!(nvn.shared_guest_range(0x1020, 8).unwrap().start, 0x8020);
+        assert_eq!(nvn.shared_guest_range(0x1200, 8).unwrap().start, 0xa000);
+        nvn.gpu_forget_pool(0x1000);
+        assert_eq!(nvn.shared_guest_range(0x1020, 8), None);
+        assert_eq!(nvn.shared_guest_range(0x1200, 8), None);
+    }
 
     #[test]
     fn small_texture_samples_cover_the_storage_without_its_neighbors() {
