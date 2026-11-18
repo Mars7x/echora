@@ -100,7 +100,7 @@ pub fn translate_with_needs(
                 ..mesh
             }),
             loop_trace: loop_trace(),
-            vertex_trace: vertex_trace(),
+            vertex_trace: options.vertex_trace.unwrap_or_else(vertex_trace),
             float64: options.float64,
             denorm_flush_32: options.denorm_flush_32,
             dual_source_blend: options.dual_source_blend,
@@ -297,6 +297,27 @@ pub fn program_code(program: &[u8]) -> Result<Vec<Instruction>, Unsupported> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_trace_instrumentation_can_be_selected_per_translation() {
+        let mut program = header(2, 5, &[576, 577, 578, 579]);
+        program.extend(bytes(&[NOP, EXIT]));
+        for trace in [false, true] {
+            let options = Options {
+                vertex_trace: Some(trace),
+                ..Options::default()
+            };
+            let translated =
+                translate_with_options(&program, &Parameters::default(), &options).unwrap();
+            assert_eq!(
+                translated.spec_constants.iter().any(|constant| {
+                    constant.meaning == echora_shader_abi::SpecMeaning::FragmentTracePixel
+                }),
+                trace
+            );
+            assert_eq!(spirv::tests::validate(&translated.spirv), None);
+        }
+    }
     use echora_shader_abi::PUSH_RESOLUTION_SCALE;
 
     const EXIT: u128 = 0x794d | 0x7000;

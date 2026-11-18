@@ -1357,6 +1357,15 @@ impl Nvn {
                 // recompiler drops stores at constant offsets.
                 local_memory_size: compute[4],
                 native_pointers,
+                // Instrument only these stage keys when a trace of every
+                // translated stage would be too expensive to reach the frame.
+                vertex_trace: std::env::var("ECHORA_VERTEX_TRACE_PROGRAMS")
+                    .ok()
+                    .map(|keys| {
+                        keys.split(',').any(|item| {
+                            u64::from_str_radix(item.trim().trim_start_matches("0x"), 16) == Ok(key)
+                        })
+                    }),
             };
             // ECHORA_SHADER_TRACE=FILE (debugging): each translation's
             // stage key and parameters, appended before it runs, so the
@@ -7625,6 +7634,10 @@ impl Nvn {
             && wanted
                 .split(',')
                 .any(|key| key == format!("{:016x}", keys.0) || key == format!("{:016x}", keys.1))
+            && super::debug_var("ECHORA_VERTEX_TRACE_REPORT_FROM")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|from| self.presented_frames >= from)
         {
             for index in 0..stages.len() {
                 let trace = (keys.0, keys.1, index);

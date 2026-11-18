@@ -144,6 +144,9 @@ pub struct Options {
     /// declared in a program whose non-`.FTZ` operations keep denormals
     /// through f64 (`float64`).
     pub denorm_flush_32: bool,
+    /// Override whether graphics stages record traces for this translation.
+    /// None follows the translator's ECHORA_VERTEX_TRACE setting.
+    pub vertex_trace: Option<bool>,
 }
 
 /// The task or mesh pipeline state a program is translated against, as the

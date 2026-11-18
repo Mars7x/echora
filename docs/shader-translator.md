@@ -322,6 +322,10 @@ while the address is 0).
 their first invocations computed in a buffer at the device address the
 specialization constants `VertexTraceLow` and `VertexTraceHigh` (ids 27
 and 28) give; nothing is written while the address is 0, the default.
+Launch the runtime with `ECHORA_VERTEX_TRACE_PROGRAMS=<key>[,...]` to trace
+only the listed hexadecimal stage keys. This overrides `ECHORA_VERTEX_TRACE`
+in the runtime. With `ECHORA_VERTEX_TRACE_REPORT` set, use
+`ECHORA_VERTEX_TRACE_REPORT_FROM=N` to print records starting at present N.
 The buffer is 64 records of 128 u32 words (32 KiB), zeroed by the
 runtime. A vertex program writes record `VertexIndex - BaseVertex` (the
 index the draw read; an index of 64 or more is not traced) from the

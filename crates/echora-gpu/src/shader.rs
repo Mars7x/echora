@@ -111,6 +111,7 @@ pub fn translate_rust(
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
+        vertex_trace: parameters.vertex_trace,
         ..Default::default()
     };
     let translated =
@@ -208,6 +209,8 @@ pub struct Parameters {
     /// (see `Descriptor::flags` bit 5), for a program whose NVN-tracked
     /// pointer words are not addresses.
     pub native_pointers: bool,
+    /// Enable or disable graphics instrumentation for this stage.
+    pub vertex_trace: Option<bool>,
 }
 
 #[repr(C)]
