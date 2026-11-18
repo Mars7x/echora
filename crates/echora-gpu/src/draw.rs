@@ -412,6 +412,8 @@ pub struct Sampler {
     pub address: [vk::SamplerAddressMode; 3],
     /// Level of detail clamp (minimum, maximum) and bias.
     pub lod: [f32; 3],
+    /// Requested anisotropy; 1 disables it. Clamped to the host limit at creation.
+    pub max_anisotropy: f32,
     /// Depth comparison (a shadow-map sampler): the reference is compared
     /// with the texel by this function, giving 0 or 1.
     pub compare: Option<vk::CompareOp>,
@@ -439,6 +441,7 @@ impl PartialEq for Sampler {
             self.base_level_only,
             self.address,
             self.lod.map(f32::to_bits),
+            self.max_anisotropy.to_bits(),
             self.compare,
             self.border,
             components(self.components),
@@ -451,6 +454,7 @@ impl PartialEq for Sampler {
             other.base_level_only,
             other.address,
             other.lod.map(f32::to_bits),
+            other.max_anisotropy.to_bits(),
             other.compare,
             other.border,
             components(other.components),
@@ -469,6 +473,7 @@ impl Default for Sampler {
             base_level_only: true,
             address: [vk::SamplerAddressMode::CLAMP_TO_EDGE; 3],
             lod: [0.0, vk::LOD_CLAMP_NONE, 0.0],
+            max_anisotropy: 1.0,
             compare: None,
             border: [0; 4],
             components: vk::ComponentMapping::default(),

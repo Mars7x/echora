@@ -497,6 +497,7 @@ type SamplerKey = (
     bool,
     [i32; 3],
     [u32; 3],
+    u32,
     Option<i32>,
     [u32; 4],
 );
@@ -2571,13 +2572,22 @@ impl Renderer {
         &mut self,
         sampler: &crate::draw::Sampler,
     ) -> Result<vk::Sampler, String> {
+        let anisotropy = sampler
+            .max_anisotropy
+            .max(1.0)
+            .min(self.gpu.max_sampler_anisotropy);
+        let lod_bias = sampler.lod[2].clamp(
+            -self.gpu.max_sampler_lod_bias,
+            self.gpu.max_sampler_lod_bias,
+        );
         let key: SamplerKey = (
             sampler.min_filter.as_raw(),
             sampler.mag_filter.as_raw(),
             sampler.mipmap.as_raw(),
             sampler.base_level_only,
             sampler.address.map(|mode| mode.as_raw()),
-            sampler.lod.map(f32::to_bits),
+            [sampler.lod[0], sampler.lod[1], lod_bias].map(f32::to_bits),
+            anisotropy.to_bits(),
             sampler.compare.map(|op| op.as_raw()),
             sampler.border,
         );
@@ -2597,7 +2607,9 @@ impl Renderer {
             } else {
                 sampler.lod[1].max(sampler.lod[0])
             })
-            .mip_lod_bias(sampler.lod[2])
+            .mip_lod_bias(lod_bias)
+            .anisotropy_enable(anisotropy > 1.0)
+            .max_anisotropy(anisotropy)
             .compare_enable(sampler.compare.is_some())
             .compare_op(sampler.compare.unwrap_or(vk::CompareOp::ALWAYS))
             .border_color(border_color(sampler.border));
@@ -6581,6 +6593,39 @@ fn block_compressed(format: vk::Format) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_cache_uses_effective_filtering_limits() {
+        use crate::draw::Sampler;
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let limit = renderer.gpu.max_sampler_anisotropy;
+        let requested = Sampler {
+            max_anisotropy: limit + 1.0,
+            ..Sampler::default()
+        };
+        let first = renderer.sampler(&requested).unwrap();
+        let clamped = Sampler {
+            max_anisotropy: limit,
+            ..requested
+        };
+        let count = renderer.samplers.len();
+        assert_eq!(renderer.sampler(&clamped).unwrap(), first);
+        assert_eq!(renderer.samplers.len(), count);
+
+        for sign in [-1.0, 1.0] {
+            let limit = renderer.gpu.max_sampler_lod_bias;
+            let mut requested = Sampler::default();
+            requested.lod[2] = sign * (limit + 1.0);
+            let first = renderer.sampler(&requested).unwrap();
+            requested.lod[2] = sign * limit;
+            let count = renderer.samplers.len();
+            assert_eq!(renderer.sampler(&requested).unwrap(), first);
+            assert_eq!(renderer.samplers.len(), count);
+        }
+    }
 
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.

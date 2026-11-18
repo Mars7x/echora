@@ -4053,6 +4053,12 @@ impl Nvn {
         // SetLodClamp(builder, float min, float max) and SetLodBias(builder,
         // float bias): the floats are the first vector registers.
         let float = |bits: u64| f32::from_bits(bits as u32);
+        if let Some(args) = props.get("MaxAnisotropy") {
+            let value = float(args.v[0]);
+            if value.is_finite() {
+                sampler.max_anisotropy = value.max(1.0);
+            }
+        }
         if let Some(args) = props.get("LodClamp") {
             let (min, max) = (float(args.v[0]), float(args.v[1]));
             if min.is_finite() && max.is_finite() {
@@ -11200,6 +11206,9 @@ mod pool_tests {
         };
         let pool = 0x1000;
         let builder = 0x2000;
+        let device = 0x3000;
+        let sampler = 0x4000;
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
         nvn.initialize(
             pool,
             "SamplerPool",
@@ -11222,34 +11231,104 @@ mod pool_tests {
                 states: Default::default(),
             },
         );
-        let mut call = |nvn: &mut Nvn, name: &str, args: [u64; 4]| {
+        let mut call = |nvn: &mut Nvn, name: &str, args: [u64; 4], v0: f32| {
             core.cpu.regs[..4].copy_from_slice(&args);
+            core.cpu.vectors[0] = u128::from(v0.to_bits());
             assert!(nvn.call(name, &mut core).unwrap());
         };
-        call(&mut nvn, "nvnSamplerBuilderSetDefaults", [builder, 0, 0, 0]);
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetDefaults",
+            [builder, 0, 0, 0],
+            0.0,
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetDevice",
+            [builder, device, 0, 0],
+            0.0,
+        );
         call(
             &mut nvn,
             "nvnSamplerBuilderSetMinMagFilter",
             [builder, 0, 0, 0],
+            0.0,
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetMaxAnisotropy",
+            [builder, 0, 0, 0],
+            2.5,
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerInitialize",
+            [sampler, builder, 0, 0],
+            0.0,
         );
         call(
             &mut nvn,
             "nvnSamplerPoolRegisterSamplerBuilder",
             [pool, 2, builder, 0],
+            0.0,
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
+        assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 2.5);
         call(
             &mut nvn,
             "nvnSamplerBuilderSetMinMagFilter",
             [builder, 1, 1, 0],
+            0.0,
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetMaxAnisotropy",
+            [builder, 0, 0, 0],
+            8.0,
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
+        assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 2.5);
         call(
             &mut nvn,
             "nvnSamplerPoolRegisterSamplerBuilder",
             [pool, 2, builder, 0],
+            0.0,
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::LINEAR);
+        assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 8.0);
+        call(
+            &mut nvn,
+            "nvnSamplerPoolRegisterSampler",
+            [pool, 3, sampler, 0],
+            0.0,
+        );
+        assert_eq!(nvn.handle_sampler(3 << 20).min_filter, vk::Filter::NEAREST);
+        assert_eq!(nvn.handle_sampler(3 << 20).max_anisotropy, 2.5);
+    }
+
+    #[test]
+    fn sampler_anisotropy_preserves_requests_and_normalizes_invalid_values() {
+        let defaults = Nvn::sampler_from_properties(&BTreeMap::new());
+        assert_eq!(defaults.max_anisotropy, 1.0);
+        for (requested, expected) in [
+            (4.0_f32, 4.0),
+            (16.0, 16.0),
+            (0.0, 1.0),
+            (-2.0, 1.0),
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+        ] {
+            let properties = BTreeMap::from([(
+                "MaxAnisotropy".into(),
+                Args {
+                    x: [0; 4],
+                    v: [u64::from(requested.to_bits()), 0],
+                },
+            )]);
+            let sampler = Nvn::sampler_from_properties(&properties);
+            assert_eq!(sampler.max_anisotropy, expected);
+            assert_eq!(sampler == defaults, expected == 1.0);
+        }
     }
 
     #[test]

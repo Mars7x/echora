@@ -28,6 +28,10 @@ pub struct Gpu {
     /// The depthBiasClamp feature is enabled (otherwise a polygon offset's
     /// clamp must be 0).
     pub depth_bias_clamp: bool,
+    /// Enabled sampler anisotropy limit, or 1 when unsupported.
+    pub max_sampler_anisotropy: f32,
+    /// Maximum absolute sampler LOD bias supported by the device.
+    pub max_sampler_lod_bias: f32,
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
     pub compute_subgroup_32: bool,
@@ -353,6 +357,7 @@ impl Gpu {
         }
 
         let features = vk::PhysicalDeviceFeatures::default()
+            .sampler_anisotropy(core.sampler_anisotropy != 0)
             .robust_buffer_access(core.robust_buffer_access != 0)
             .occlusion_query_precise(core.occlusion_query_precise != 0)
             .shader_int64(core.shader_int64 != 0)
@@ -549,6 +554,12 @@ impl Gpu {
             depth_clip_control,
             occlusion_query_precise: core.occlusion_query_precise != 0,
             depth_bias_clamp: core.depth_bias_clamp != 0,
+            max_sampler_anisotropy: if core.sampler_anisotropy != 0 {
+                properties.limits.max_sampler_anisotropy
+            } else {
+                1.0
+            },
+            max_sampler_lod_bias: properties.limits.max_sampler_lod_bias,
             compute_subgroup_32,
             buffer_device_address,
             texture_pool_layout,
