@@ -19,6 +19,12 @@ supported 1.1.1 dump had a median end-to-end time of 19.74 s before and
 report byte for byte. This measures discovery, which runs before emitting
 Rust and building the native translation.
 
+The register-liveness pass summarizes each basic block once and propagates
+register masks by block index. A comparison of both solvers on 3,779,116
+blocks discovered in the supported ExeFS, with host entries included, ran
+three times on the same 5800X3D. The median for liveness alone fell from
+29.25 s to 1.36 s, and every live-out mask matched in each comparison.
+
 ## Translated execution
 
 Measured on the benchmark kernels (`benches/kernels.rs`, x86-64, release),

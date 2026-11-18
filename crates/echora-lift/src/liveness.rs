@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::aarch64::Instruction;
 use crate::codegen::Translation;
-use crate::defuse::{Regs, effects};
+use crate::defuse::{Effects, Regs, effects};
 
 /// Counts of dead writes over a translation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -42,10 +42,9 @@ pub struct DeadWrites {
     pub dead_instructions: usize,
 }
 
-/// What `instruction` reads, with everything read where control leaves
+/// What the instruction reads, with everything read where control leaves
 /// the analysis (calls, SVCs, traps).
-fn reads(instruction: &Instruction) -> Regs {
-    let e = effects(instruction);
+fn reads(e: Effects) -> Regs {
     if e.calls || e.svc || e.traps {
         Regs::ALL
     } else {
@@ -53,12 +52,32 @@ fn reads(instruction: &Instruction) -> Regs {
     }
 }
 
+struct BlockEffects {
+    /// A single successor is stored twice. None makes every register live
+    /// when control leaves the analysis.
+    successors: Option<[usize; 2]>,
+    uses: Regs,
+    defines: Regs,
+}
+
+impl BlockEffects {
+    fn live_after(&self, live_in: &[Regs]) -> Regs {
+        match self.successors {
+            Some([first, second]) => live_in[first].union(live_in[second]),
+            None => Regs::ALL,
+        }
+    }
+}
+
 /// Registers and flags live at the end of each block (by block start).
 pub fn live_out(translation: &Translation) -> BTreeMap<u64, Regs> {
-    let starts: std::collections::BTreeSet<u64> =
-        translation.blocks.iter().map(|block| block.start).collect();
-    // Successor blocks, or None when control leaves what the analysis sees.
-    let successors: BTreeMap<u64, Option<Vec<u64>>> = translation
+    let starts: BTreeMap<u64, usize> = translation
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.start, index))
+        .collect();
+    let blocks: Vec<BlockEffects> = translation
         .blocks
         .iter()
         .map(|block| {
@@ -66,44 +85,59 @@ pub fn live_out(translation: &Translation) -> BTreeMap<u64, Regs> {
                 .instructions
                 .last()
                 .expect("blocks have an instruction");
-            let next = last.instruction.successors(last.pc);
-            let leaves = matches!(last.instruction, Instruction::BranchReg { .. })
-                || next.is_empty()
-                || next.iter().any(|pc| !starts.contains(pc));
-            (block.start, (!leaves).then_some(next))
+            let successors = if matches!(last.instruction, Instruction::BranchReg { .. }) {
+                None
+            } else {
+                match last.instruction.successors(last.pc).as_slice() {
+                    [] => None,
+                    [only] => starts.get(only).map(|&index| [index, index]),
+                    [first, second] => starts
+                        .get(first)
+                        .zip(starts.get(second))
+                        .map(|(&a, &b)| [a, b]),
+                    _ => unreachable!("an instruction has at most two direct successors"),
+                }
+            };
+            // The block needs registers read before a definition in it and
+            // successor inputs it does not define. Compute that transfer once.
+            let mut uses = Regs::NONE;
+            let mut defines = Regs::NONE;
+            for record in &block.instructions {
+                let effect = effects(&record.instruction);
+                uses = uses.union(reads(effect).difference(defines));
+                defines = defines.union(effect.writes);
+            }
+            BlockEffects {
+                successors,
+                uses,
+                defines,
+            }
         })
         .collect();
-    let mut live_in: BTreeMap<u64, Regs> = translation
-        .blocks
-        .iter()
-        .map(|block| (block.start, Regs::NONE))
-        .collect();
-    let mut out: BTreeMap<u64, Regs> = BTreeMap::new();
+    drop(starts);
+
+    let mut live_in = vec![Regs::NONE; blocks.len()];
     loop {
         let mut changed = false;
-        for block in translation.blocks.iter().rev() {
-            let after = match &successors[&block.start] {
-                None => Regs::ALL,
-                Some(next) => next
-                    .iter()
-                    .fold(Regs::NONE, |live, pc| live.union(live_in[pc])),
-            };
-            out.insert(block.start, after);
-            let mut live = after;
-            for record in block.instructions.iter().rev() {
-                live = live
-                    .difference(effects(&record.instruction).writes)
-                    .union(reads(&record.instruction));
-            }
-            if live != live_in[&block.start] {
-                live_in.insert(block.start, live);
+        for (index, block) in blocks.iter().enumerate().rev() {
+            let live = block
+                .uses
+                .union(block.live_after(&live_in).difference(block.defines));
+            if live != live_in[index] {
+                live_in[index] = live;
                 changed = true;
             }
         }
         if !changed {
-            return out;
+            break;
         }
     }
+    translation
+        .blocks
+        .iter()
+        .zip(blocks)
+        .map(|(block, effects)| (block.start, effects.live_after(&live_in)))
+        .collect()
 }
 
 /// The dead NZCV and register writes of `translation`.
@@ -141,7 +175,7 @@ pub fn dead_writes(translation: &Translation) -> DeadWrites {
             if all_dead && !side_effects && !e.writes.is_empty() {
                 counts.dead_instructions += 1;
             }
-            live = live.difference(e.writes).union(reads(&record.instruction));
+            live = live.difference(e.writes).union(reads(e));
         }
     }
     counts
