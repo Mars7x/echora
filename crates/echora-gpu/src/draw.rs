@@ -1275,21 +1275,27 @@ impl Renderer {
                 self.stat("stat: graphics texture pool binds", 1);
             }
             if let Some(constants) = &rescaling {
+                // Both stage ranges include this prefix.
                 device.cmd_push_constants(
                     commands,
                     program.pipeline_layout,
-                    program.push_stages,
+                    program.push_stages | program.abi_stages,
                     0,
                     constants,
                 );
             }
             if let Some(block) = &abi {
+                let start = if rescaling.is_some() {
+                    RESCALING_BYTES
+                } else {
+                    0
+                };
                 device.cmd_push_constants(
                     commands,
                     program.pipeline_layout,
                     program.abi_stages,
-                    0,
-                    block,
+                    start,
+                    &block[start as usize..],
                 );
             }
             if draw.mesh.is_none() {
@@ -1513,7 +1519,8 @@ pub(crate) mod tests {
         let module = naga::front::wgsl::parse_str(source).unwrap();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
+            naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY
+                | naga::valid::Capabilities::IMMEDIATES,
         )
         .validate(&module)
         .unwrap();
@@ -1555,17 +1562,24 @@ pub(crate) mod tests {
             return; // No device (CI).
         };
         let mut renderer = Renderer::new(gpu).unwrap();
+        renderer.set_resolution_scale(crate::renderer::Scale::new(2, 1).unwrap());
+        renderer.keep_unscaled(7).unwrap();
         let vertex = spirv(
-            "@vertex fn main(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-                return vec4<f32>(position, 0.0, 1.0);
+            "struct Rescaling { words: array<vec4<f32>, 2>, };
+            var<immediate> scaling: Rescaling;
+            @vertex fn main(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(position * scaling.words[1].z, 0.0, 1.0);
             }",
             naga::ShaderStage::Vertex,
         );
         let fragment = spirv(
             "@group(0) @binding(0) var<uniform> color: vec4<f32>;
             @group(0) @binding(3) var<uniform> tint: vec4<f32>;
+            struct Abi { words: array<vec4<u32>, 8>, };
+            var<immediate> abi: Abi;
             @fragment fn main() -> @location(0) vec4<f32> {
-                return vec4<f32>(color.r, tint.g, color.b, tint.a);
+                let blue = max(color.b, f32(abi.words[7].z) / 255.0);
+                return vec4<f32>(color.r, tint.g, blue, tint.a);
             }",
             naga::ShaderStage::Fragment,
         );
@@ -1589,7 +1603,9 @@ pub(crate) mod tests {
             ],
         );
         let has_pool = renderer.gpu.texture_pool_layout.is_some();
-        Arc::get_mut(&mut fragment).unwrap().texture_pool_bindings = u32::from(has_pool);
+        let fragment_data = Arc::get_mut(&mut fragment).unwrap();
+        fragment_data.texture_pool_bindings = u32::from(has_pool);
+        fragment_data.push_fields = echora_shader_abi::PUSH_PAGE_TABLE;
         let program = renderer
             .create_program(vec![translated(Stage::Vertex, vertex, vec![]), fragment])
             .unwrap();
@@ -1728,6 +1744,11 @@ pub(crate) mod tests {
         renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
+
+        draw.page_table.first_page = 255;
+        renderer.draw(&draw).unwrap();
+        let texels = renderer.read_target(7).unwrap();
+        assert_eq!(texels[0], [1.0, 1.0, 1.0, 1.0]);
         renderer.destroy_program(program).unwrap();
     }
 }
