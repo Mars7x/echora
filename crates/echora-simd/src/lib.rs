@@ -2524,6 +2524,72 @@ fn rounding_shift(value: i128, shift: i64) -> i128 {
     (value + (1i128 << (shift - 1))) >> shift
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn vector_shift_sse2(
+    op: VecShiftOp,
+    bits: u8,
+    n: u128,
+    d: u128,
+    shift: u8,
+    q: bool,
+) -> Option<u128> {
+    use core::arch::x86_64::*;
+    // SAFETY: u128 and packed integer vectors have the same bit representation.
+    let pack = |value| unsafe { core::mem::transmute::<u128, __m128i>(value) };
+    let counts = _mm_cvtsi32_si128(i32::from(shift));
+    let source = pack(n);
+    let result = match (op, bits) {
+        // A 16-bit shift also moves bits across the two bytes in each
+        // word. Keep only the destination bits that belong to each lane.
+        (VecShiftOp::Shl, 8) => {
+            let mask = u8::MAX.checked_shl(u32::from(shift)).unwrap_or(0);
+            _mm_and_si128(_mm_sll_epi16(source, counts), _mm_set1_epi8(mask as i8))
+        }
+        (VecShiftOp::Shl, 16) => _mm_sll_epi16(source, counts),
+        (VecShiftOp::Shl, 32) => _mm_sll_epi32(source, counts),
+        (VecShiftOp::Shl, 64) => _mm_sll_epi64(source, counts),
+        (VecShiftOp::Ushr | VecShiftOp::Usra, 8) => {
+            let mask = u8::MAX.checked_shr(u32::from(shift)).unwrap_or(0);
+            _mm_and_si128(_mm_srl_epi16(source, counts), _mm_set1_epi8(mask as i8))
+        }
+        (VecShiftOp::Ushr | VecShiftOp::Usra, 16) => _mm_srl_epi16(source, counts),
+        (VecShiftOp::Ushr | VecShiftOp::Usra, 32) => _mm_srl_epi32(source, counts),
+        (VecShiftOp::Ushr | VecShiftOp::Usra, 64) => _mm_srl_epi64(source, counts),
+        (VecShiftOp::Sshr | VecShiftOp::Ssra, 8) => {
+            let sign = _mm_cmpgt_epi8(_mm_setzero_si128(), source);
+            let lo = _mm_sra_epi16(_mm_unpacklo_epi8(source, sign), counts);
+            let hi = _mm_sra_epi16(_mm_unpackhi_epi8(source, sign), counts);
+            _mm_packs_epi16(lo, hi)
+        }
+        (VecShiftOp::Sshr | VecShiftOp::Ssra, 16) => _mm_sra_epi16(source, counts),
+        (VecShiftOp::Sshr | VecShiftOp::Ssra, 32) => _mm_sra_epi32(source, counts),
+        (VecShiftOp::Sshr | VecShiftOp::Ssra, 64) => {
+            // Replicate the sign of each high word over its 64-bit lane.
+            let sign = _mm_srai_epi32::<31>(_mm_shuffle_epi32::<0xf5>(source));
+            let zeros = _mm_cvtsi32_si128(i32::from(64 - shift.min(64)));
+            let high_bits = _mm_sll_epi64(sign, zeros);
+            _mm_or_si128(_mm_srl_epi64(source, counts), high_bits)
+        }
+        _ => return None,
+    };
+    let result = if matches!(op, VecShiftOp::Ssra | VecShiftOp::Usra) {
+        let accumulator = pack(d);
+        match bits {
+            8 => _mm_add_epi8(result, accumulator),
+            16 => _mm_add_epi16(result, accumulator),
+            32 => _mm_add_epi32(result, accumulator),
+            64 => _mm_add_epi64(result, accumulator),
+            _ => unreachable!(),
+        }
+    } else {
+        result
+    };
+    // SAFETY: same size and bit representation as the inputs.
+    let result = unsafe { core::mem::transmute::<__m128i, u128>(result) };
+    Some(if q { result } else { u128::from(result as u64) })
+}
+
 /// Shift by immediate on `bits`-wide lanes.
 #[allow(clippy::too_many_arguments)]
 pub fn vec_shift(
@@ -2536,8 +2602,16 @@ pub fn vec_shift(
     rn: u8,
     shift: u8,
 ) {
-    let bits = u32::from(bits);
     let (n, d) = (cpu.vectors[rn as usize], cpu.vectors[rd as usize]);
+    #[cfg(target_arch = "x86_64")]
+    if !scalar {
+        // SAFETY: SSE2 is part of baseline x86-64.
+        if let Some(result) = unsafe { vector_shift_sse2(op, bits, n, d, shift, q) } {
+            cpu.vectors[rd as usize] = result;
+            return;
+        }
+    }
+    let bits = u32::from(bits);
     let shift = i64::from(shift);
     if op == VecShiftOp::Shrn {
         // Source lanes are `bits` wide; results are bits/2 wide and fill the
@@ -4131,6 +4205,43 @@ mod vector_tests {
             let mut actual = [0; 16];
             memory.read(address, &mut actual).unwrap();
             assert_eq!(actual, bytes);
+        }
+    }
+
+    #[test]
+    fn packed_shifts_match_the_scalar_lanes_at_width_boundaries() {
+        let source = 0x80ff_017f_9070_10ff_7801_b703_80ff_017fu128;
+        let accumulator = 0x0203_04ff_a207_81ff_1f01_8703_80ff_017fu128;
+        for bits in [8, 16, 32, 64] {
+            for op in [
+                VecShiftOp::Shl,
+                VecShiftOp::Ushr,
+                VecShiftOp::Sshr,
+                VecShiftOp::Usra,
+                VecShiftOp::Ssra,
+            ] {
+                for shift in [0, 1, bits - 1, bits, bits + 1, u8::MAX] {
+                    for q in [false, true] {
+                        let mut cpu = Cpu {
+                            fpsr: FPSR_QC,
+                            ..Cpu::default()
+                        };
+                        cpu.vectors[..2].copy_from_slice(&[accumulator, source]);
+                        vec_shift(&mut cpu, op, bits, q, false, 0, 1, shift);
+                        let packed = cpu.vectors[0];
+                        let bits = u32::from(bits);
+                        let mut expected = 0;
+                        for lane in 0..lane_count(bits, q, false) {
+                            cpu.vectors[0] = u128::from(get_lane(accumulator, bits, lane));
+                            cpu.vectors[1] = u128::from(get_lane(source, bits, lane));
+                            vec_shift(&mut cpu, op, bits as u8, q, true, 0, 1, shift);
+                            set_lane(&mut expected, bits, lane, cpu.vectors[0] as u64);
+                        }
+                        assert_eq!(packed, expected, "{op:?} {bits} {shift} {q}");
+                        assert_eq!(cpu.fpsr, FPSR_QC);
+                    }
+                }
+            }
         }
     }
 }
