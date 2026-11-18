@@ -883,32 +883,15 @@ impl Nvn {
                 .collect();
             set_debug_overrides(Some(switches));
             eprintln!("replay {name} begins");
-            self.replaying = true;
-            self.render = capture.render.clone();
-            self.queue_render = capture.queue_render.clone();
-            self.render_queue = capture.render_queue;
-            self.bump_binding_serial("stat: binding serial by a restored capture");
-            let mut failed = None;
             let draws_before = self.gpu_draw_count();
             let started = std::time::Instant::now();
-            for (queue, command) in &capture.commands {
-                if let Some(queue) = *queue {
-                    self.switch_render_queue(queue);
-                }
-                if let Err(trap) = self.execute(command, core) {
-                    failed = Some(format!("{} failed: {trap:?}", command.name));
-                    break;
-                }
-            }
-            // The queued work runs now, as the replay thread would run it.
-            if failed.is_none()
-                && let Err(trap) = self.drain_queues(core)
-            {
-                failed = Some(format!("queued work failed: {trap:?}"));
-            }
+            let failed = self.replay_frame_commands(&capture, core).err();
             let replayed = started.elapsed();
-            let image = if self.gpu().is_some() {
-                self.gpu_submit()?;
+            let image = (|| {
+                let Some(backend) = self.gpu() else {
+                    return Ok(None);
+                };
+                backend.renderer.flush()?;
                 let finished = started.elapsed();
                 // The replay's times, for comparing builds on one frame:
                 // its commands, and those with the GPU's work finished.
@@ -922,16 +905,13 @@ impl Nvn {
                     ),
                 );
                 if debug_var_os("ECHORA_REPLAY_NO_IMAGE").is_some() {
-                    None
+                    Ok(None)
                 } else {
-                    self.gpu_read_back(texture)?
+                    self.gpu_read_back(texture)
                 }
-            } else {
-                None
-            };
-            self.replaying = false;
+            })();
             set_debug_overrides(None);
-            if let Some(image) = image {
+            if let Some(image) = image? {
                 let _ = std::fs::write(directory.join(format!("replay-{name}.png")), image.png());
             }
             eprintln!(
@@ -944,6 +924,43 @@ impl Nvn {
         }
         let _ = std::fs::remove_file(directory.join("ready"));
         Ok(())
+    }
+
+    fn replay_frame_commands(
+        &mut self,
+        capture: &FrameCapture,
+        core: &mut Guest,
+    ) -> Result<(), String> {
+        // The capture contains flattened commands executed before the
+        // present. Other live queue work belongs to the running game.
+        let pending = std::mem::take(&mut self.pending);
+        let budget = self.replay_budget.take();
+        let paused = self.replay_paused;
+        let render = std::mem::replace(&mut self.render, capture.render.clone());
+        let queue_render = std::mem::replace(&mut self.queue_render, capture.queue_render.clone());
+        let render_queue = std::mem::replace(&mut self.render_queue, capture.render_queue);
+        self.replaying = true;
+        self.bump_binding_serial("stat: binding serial by a restored capture");
+        let result = (|| {
+            for (queue, command) in &capture.commands {
+                if let Some(queue) = *queue {
+                    self.switch_render_queue(queue);
+                }
+                self.execute(command, core)
+                    .map_err(|trap| format!("{} failed: {trap:?}", command.name))?;
+            }
+            self.drain_queues(core)
+                .map_err(|trap| format!("queued work failed: {trap:?}"))
+        })();
+        self.replaying = false;
+        self.render = render;
+        self.queue_render = queue_render;
+        self.render_queue = render_queue;
+        self.pending = pending;
+        self.replay_budget = budget;
+        self.replay_paused = paused;
+        self.bump_binding_serial("stat: binding serial after a replay");
+        result
     }
 }
 
@@ -3350,7 +3367,7 @@ impl Nvn {
                 // shown when the replay reaches it; the caller goes on. The
                 // replay thread runs the work (woken after the call), not
                 // this call under the machine lock.
-                if Self::present_queued_mode() && !self.replaying && self.frame_capture.is_none() {
+                if Self::present_queued_mode() && !self.replaying {
                     self.pending
                         .entry(this)
                         .or_default()
@@ -7745,6 +7762,55 @@ mod tests {
         assert!(first.record(command, &mut guest).unwrap());
         assert_eq!(lock_shared(&replacement).commands.len(), 1);
         assert_eq!(lock_shared(&original).commands.len(), 2);
+    }
+
+    #[test]
+    fn replay_leaves_pending_live_work_and_render_state_in_place() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: 0,
+        };
+        let mut nvn = Nvn::default();
+        nvn.render_queue = Some(1);
+        nvn.render.colors = vec![3];
+        nvn.replay_budget = Some(7);
+        nvn.pending
+            .entry(1)
+            .or_default()
+            .push_back(QueueItem::Fence {
+                sync: 0x1000,
+                args: Args::default(),
+            });
+        let capture = FrameCapture {
+            render_queue: Some(2),
+            render: RenderState::default(),
+            queue_render: HashMap::default(),
+            commands: vec![(
+                Some(2),
+                Command {
+                    name: "nvnCommandBufferSetScissor",
+                    x: [0, 1, 2, 3, 4, 0, 0, 0],
+                    v: [0; 8],
+                    captured: Vec::new(),
+                    states: StateSnapshots::default(),
+                },
+            )],
+        };
+        for _ in 0..2 {
+            nvn.replay_frame_commands(&capture, &mut guest).unwrap();
+            assert_eq!(nvn.render_queue, Some(1));
+            assert_eq!(nvn.render.colors, [3]);
+            assert!(nvn.render.scissor.is_none());
+            assert_eq!(nvn.replay_budget, Some(7));
+            assert!(matches!(
+                nvn.pending[&1].front(),
+                Some(QueueItem::Fence { sync: 0x1000, .. })
+            ));
+            assert!(!read_shared(&nvn.registry).signaled.contains_key(&0x1000));
+        }
     }
 
     #[test]
