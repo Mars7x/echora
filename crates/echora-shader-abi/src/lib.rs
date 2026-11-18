@@ -292,18 +292,18 @@ impl PushConstants {
     /// The block as pushed (little-endian, the layout above).
     pub fn to_bytes(&self) -> [u8; PUSH_CONSTANTS_SIZE as usize] {
         let mut bytes = [0u8; PUSH_CONSTANTS_SIZE as usize];
-        let mut words = Vec::with_capacity(32);
-        words.extend_from_slice(&self.translator);
         let fetch = &self.vertex_fetch;
-        words.extend([
+        let table = &self.page_table;
+        let mut words = [0u32; PUSH_CONSTANTS_SIZE as usize / 4];
+        words[..20].copy_from_slice(&self.translator);
+        words[20..24].copy_from_slice(&[
             fetch.table as u32,
             (fetch.table >> 32) as u32,
             fetch.base_instance,
             fetch.attributes,
         ]);
-        words.extend(self.resolution_scale.map(f32::to_bits));
-        let table = &self.page_table;
-        words.extend([
+        words[24..28].copy_from_slice(&self.resolution_scale.map(f32::to_bits));
+        words[28..].copy_from_slice(&[
             table.address as u32,
             (table.address >> 32) as u32,
             table.first_page,
