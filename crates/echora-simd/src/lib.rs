@@ -1747,6 +1747,30 @@ pub fn vec_fp(
     );
     let bits = size_bits(size);
     let mut fp = Fp::new(cpu, size)?;
+    #[cfg(target_arch = "x86_64")]
+    if size == FpSize::S
+        && q
+        && !scalar
+        && matches!(
+            op,
+            VecFpOp::Add | VecFpOp::Sub | VecFpOp::AbsDiff | VecFpOp::Mul | VecFpOp::Div
+        )
+        && fp.cpu.fpsr & FPSR_IXC != 0
+    {
+        use core::arch::x86_64::__m128;
+
+        // SAFETY: SSE2 is part of x86-64, and every bit pattern is valid.
+        if let Some(result) = unsafe {
+            packed_fp_binary(
+                core::mem::transmute::<u128, __m128>(n),
+                core::mem::transmute::<u128, __m128>(m),
+                op,
+            )
+        } {
+            fp.cpu.vectors[rd as usize] = result;
+            return Ok(());
+        }
+    }
     if let Some(result) = fast_vector(&fp, op, q, scalar, n, d, |lane| get_lane(m, bits, lane)) {
         fp.cpu.vectors[rd as usize] = result;
         return Ok(());
@@ -1792,44 +1816,82 @@ unsafe fn packed_fp_pairwise(n: u128, m: u128, q: bool, op: VecFpOp) -> Option<u
     };
     let even = _mm_shuffle_ps::<0x88>(n, m);
     let odd = _mm_shuffle_ps::<0xdd>(n, m);
+    // SAFETY: the caller guarantees SSE2.
+    unsafe { packed_fp_binary(even, odd, op) }
+}
+
+/// Compute four single-precision lanes when no new guest status flag is needed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn packed_fp_binary(
+    n: core::arch::x86_64::__m128,
+    m: core::arch::x86_64::__m128,
+    op: VecFpOp,
+) -> Option<u128> {
+    use core::arch::x86_64::*;
+
+    let zero = _mm_setzero_si128();
     let magnitude = _mm_set1_epi32(i32::MAX);
     let least_normal = _mm_set1_epi32(0x007f_ffff);
     let infinity = _mm_set1_epi32(0x7f80_0000);
     let magnitude_of = |value| _mm_and_si128(_mm_castps_si128(value), magnitude);
-    let zero_or_normal = |value| {
-        _mm_or_si128(
-            _mm_cmpeq_epi32(value, zero),
-            _mm_and_si128(
-                _mm_cmpgt_epi32(value, least_normal),
-                _mm_cmplt_epi32(value, infinity),
-            ),
+    let normal = |value| {
+        _mm_and_si128(
+            _mm_cmpgt_epi32(value, least_normal),
+            _mm_cmplt_epi32(value, infinity),
         )
     };
+    let is_zero = |value| _mm_cmpeq_epi32(value, zero);
+    let zero_or_normal = |value| _mm_or_si128(is_zero(value), normal(value));
     let all = |mask| _mm_movemask_ps(_mm_castsi128_ps(mask)) == 0b1111;
-    let (even_abs, odd_abs) = (magnitude_of(even), magnitude_of(odd));
-    if !all(_mm_and_si128(
-        zero_or_normal(even_abs),
-        zero_or_normal(odd_abs),
-    )) {
+    let (abs_n, abs_m) = (magnitude_of(n), magnitude_of(m));
+    let usable_m = if op == VecFpOp::Div {
+        normal(abs_m)
+    } else {
+        zero_or_normal(abs_m)
+    };
+    if !all(_mm_and_si128(zero_or_normal(abs_n), usable_m)) {
         return None;
     }
     let result = match op {
-        VecFpOp::Add => {
-            let result = _mm_add_ps(even, odd);
-            // Adding normals or zeros can produce zero only by exact cancellation.
+        VecFpOp::Add | VecFpOp::Sub | VecFpOp::AbsDiff => {
+            let result = if op == VecFpOp::Add {
+                _mm_add_ps(n, m)
+            } else {
+                _mm_sub_ps(n, m)
+            };
+            // A zero from adding or subtracting normals or zeros is exact.
             if !all(zero_or_normal(magnitude_of(result))) {
+                return None;
+            }
+            if op == VecFpOp::AbsDiff {
+                _mm_and_ps(result, _mm_castsi128_ps(magnitude))
+            } else {
+                result
+            }
+        }
+        VecFpOp::Mul | VecFpOp::Div => {
+            let (result, exact_zero) = if op == VecFpOp::Mul {
+                (
+                    _mm_mul_ps(n, m),
+                    _mm_or_si128(is_zero(abs_n), is_zero(abs_m)),
+                )
+            } else {
+                (_mm_div_ps(n, m), is_zero(abs_n))
+            };
+            // A zero from nonzero operands can underflow and raise UFC.
+            if !all(_mm_or_si128(exact_zero, normal(magnitude_of(result)))) {
                 return None;
             }
             result
         }
         VecFpOp::Max | VecFpOp::MaxNum | VecFpOp::Min | VecFpOp::MinNum => {
             let (extreme, signed_zero) = if matches!(op, VecFpOp::Max | VecFpOp::MaxNum) {
-                (_mm_max_ps(even, odd), _mm_and_ps(even, odd))
+                (_mm_max_ps(n, m), _mm_and_ps(n, m))
             } else {
-                (_mm_min_ps(even, odd), _mm_or_ps(even, odd))
+                (_mm_min_ps(n, m), _mm_or_ps(n, m))
             };
-            let both_zero =
-                _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_or_si128(even_abs, odd_abs), zero));
+            let both_zero = _mm_castsi128_ps(is_zero(_mm_or_si128(abs_n, abs_m)));
             _mm_or_ps(
                 _mm_and_ps(both_zero, signed_zero),
                 _mm_andnot_ps(both_zero, extreme),
@@ -4966,8 +5028,21 @@ mod sticky_inexact_tests {
     /// and the exact path's flags (FPCR.FZ set, as games run).
     #[test]
     fn fast_vectors_match_the_exact_path() {
-        let values: [f32; 10] = [
-            1.0, -2.5, 3.0e38, 1.2e-38, 0.1, 7.0, -0.333, 1.0e-20, 0.0, -0.0,
+        let values = [
+            1.0,
+            -2.5,
+            3.0e38,
+            1.2e-38,
+            0.1,
+            7.0,
+            -0.333,
+            1.0e-20,
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            f32::from_bits(0x7f80_0001),
+            f32::NAN,
+            f32::INFINITY,
         ];
         let vector = |lanes: [f32; 4]| {
             lanes.iter().enumerate().fold(0u128, |acc, (lane, value)| {
@@ -4977,7 +5052,9 @@ mod sticky_inexact_tests {
         for op in [
             VecFpOp::Add,
             VecFpOp::Sub,
+            VecFpOp::AbsDiff,
             VecFpOp::Mul,
+            VecFpOp::Div,
             VecFpOp::MulAdd,
             VecFpOp::MulSub,
         ] {
