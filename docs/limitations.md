@@ -8,9 +8,9 @@ to be missing or incomplete.
 
 - The game gets past the New Game movie into its first 3D scene, which is
   drawn with its ground cover, plants, fireflies, mist, canopy and the Great
-  Deku Tree. Known faults there: the tree is darker than on the console, the
-  water is too red, and subtitles and the speaker's name are not drawn (their
-  text textures stay empty). No gameplay has been reached yet. Every
+  Deku Tree. The water is too red, and subtitles and the speaker's name
+  are not drawn (their text textures stay empty). No gameplay has been
+  reached yet. Every
   unimplemented operation still stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,

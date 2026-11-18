@@ -17,7 +17,7 @@ when the code for it does.
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie plays at the console's full 60 pictures per second (`ECHORA_MOVIE_RATE`) and the first 3D scene runs at about 14 frames per second (`ECHORA_PRESENT_RATE`), from about 28 and 2 before the waits between the CPU and GPU were removed. |
+| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie reaches 60 pictures per second (`ECHORA_MOVIE_RATE`). Recent runs measured about 20 frames per second (`ECHORA_PRESENT_RATE`) in the first 3D scene at 2560×1440 ([test hardware](limitations.md#performance)). |
 | 13. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 14. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 
@@ -27,8 +27,8 @@ when the code for it does.
    (the opening movie already does): reduce the cost of translated code on
    the guest threads that drive simulation and record draws, and reduce
    the time per draw on the Vulkan replay thread.
-2. Finish the first scene after the New Game movie: the tree's brightness,
-   the water's colour, and subtitles. Then carry on to gameplay.
+2. Correct the water's colour and restore subtitles in the first scene
+   after the New Game movie. Then carry on to gameplay.
 3. Sound: the remaining audio renderer effects (delay, biquad filter) and
    depop.
 4. Measure the remaining opt-in code generation changes against game
