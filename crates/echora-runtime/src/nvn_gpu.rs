@@ -1631,8 +1631,8 @@ impl Nvn {
             index => {
                 let Some(bind) = self
                     .render
-                    .state
-                    .get(bind_key("BindUniformBuffer", Some(5), (index - 3) as u64))
+                    .bound_uniforms
+                    .get(5, u64::from(index - 3))
                     .map(|bind| (bind.x[3], bind.x[4]))
                 else {
                     return Ok(None);
@@ -4343,11 +4343,7 @@ impl Nvn {
                 eprintln!("c1probe   root {table} {:?}", words(&bytes));
             }
             for slot in 0..4 {
-                if let Some(bind) =
-                    self.render
-                        .state
-                        .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
-                {
+                if let Some(bind) = self.render.bound_uniforms.get(5, slot) {
                     eprintln!("c1probe   ubo {slot} {:#x}+{:#x}", bind.x[3], bind.x[4]);
                 }
             }
@@ -4476,11 +4472,7 @@ impl Nvn {
             if entry + 12 > storage_base as usize {
                 break;
             }
-            if let Some(bind) =
-                self.render
-                    .state
-                    .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
-            {
+            if let Some(bind) = self.render.bound_uniforms.get(5, u64::from(slot)) {
                 c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
                 c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
             }
@@ -4688,7 +4680,7 @@ impl Nvn {
                 // Texel buffers (buffer textures) bind like textures.
                 kind @ (DescriptorKind::Texture | DescriptorKind::TextureBuffer) => {
                     let slot = slot(descriptor, kind).ok_or_else(|| unplaced(self, descriptor))?;
-                    let handle = self
+                    let &handle = self
                         .render
                         .bound_textures
                         .get(5, u64::from(slot))
@@ -4783,8 +4775,8 @@ impl Nvn {
                     let slot = descriptor.index - 3;
                     let bind = self
                         .render
-                        .state
-                        .get(bind_key("BindUniformBuffer", Some(5), slot as u64))
+                        .bound_uniforms
+                        .get(5, u64::from(slot))
                         .ok_or_else(|| format!("uniform buffer 5/{slot} is not bound"))?;
                     let used = u64::from(stage.cbuf_used_sizes[descriptor.index as usize]);
                     let size = bind.x[4].min(used.max(16)).min(64 << 10);
@@ -8054,17 +8046,15 @@ impl Nvn {
                         let slot = descriptor.index - 3;
                         let bind = self
                             .render
-                            .state
-                            .get(bind_key("BindUniformBuffer", Some(nvn as u64), slot as u64))
+                            .bound_uniforms
+                            .get(u64::from(nvn), u64::from(slot))
                             .ok_or_else(|| {
                                 // The slots that are bound, by stage, and
                                 // the program's stages (which bank it reads).
                                 let mut bound: Vec<&str> = self
                                     .render
-                                    .state
-                                    .keys()
-                                    .filter(|key| key.starts_with("BindUniformBuffer/"))
-                                    .copied()
+                                    .named_uniform_bindings()
+                                    .map(|(key, _)| key)
                                     .collect();
                                 bound.sort_unstable();
                                 format!(
@@ -8191,7 +8181,7 @@ impl Nvn {
                         if descriptor.cbuf_index == 2 && descriptor.cbuf_offset >= 0x20 =>
                     {
                         let slot = (descriptor.cbuf_offset - 0x20) / 8;
-                        let handle = self
+                        let &handle = self
                             .render
                             .bound_textures
                             .get(u64::from(nvn), u64::from(slot))
@@ -9344,9 +9334,7 @@ impl Nvn {
                 })
                 .chain(
                     self.render
-                        .state
-                        .iter()
-                        .filter(|(key, _)| key.starts_with("BindUniformBuffer/"))
+                        .named_uniform_bindings()
                         .map(|(key, bind)| format!("{key}:{:#x}+{:#x}", bind.x[3], bind.x[4])),
                 )
                 .collect()
@@ -10286,11 +10274,11 @@ impl PointerProbe<'_, '_> {
             0 | 2 => return None,
             1 => word.copy_from_slice(self.nvn.stage_constants(self.core, 5)?.get(at..at + 8)?),
             index => {
-                let bind = self.nvn.render.state.get(bind_key(
-                    "BindUniformBuffer",
-                    Some(5),
-                    (index - 3) as u64,
-                ))?;
+                let bind = self
+                    .nvn
+                    .render
+                    .bound_uniforms
+                    .get(5, u64::from(index - 3))?;
                 if u64::from(offset) + 8 > bind.x[4] {
                     return None;
                 }

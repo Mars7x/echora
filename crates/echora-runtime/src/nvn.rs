@@ -790,44 +790,68 @@ pub struct RenderState {
     /// The texture handle bound at each (NVN stage, slot), indexed for
     /// individual bindings and for gathering all handles from a stage.
     pub bound_textures: TextureBindings,
+    bound_uniforms: StageBindings<Command>,
     /// Slots set in each stage's 16-entry storage buffer table, including
     /// explicit bindings with a zero address or size.
     storage_slots: [u16; 8],
 }
 
-/// Texture handles by stage and slot, ordered by slot when binding a pool.
-#[derive(Clone, Debug, Default)]
-pub struct TextureBindings {
-    stages: [Vec<Option<u64>>; 8],
-    extended: BTreeMap<(u64, u64), u64>,
+/// Texture handles by stage and slot.
+pub type TextureBindings = StageBindings<u64>;
+
+/// Resource bindings indexed by stage and slot.
+#[derive(Clone, Debug)]
+pub struct StageBindings<T> {
+    stages: [Vec<Option<T>>; 8],
+    extended: BTreeMap<(u64, u64), T>,
 }
 
-impl TextureBindings {
+impl<T> Default for StageBindings<T> {
+    fn default() -> Self {
+        Self {
+            stages: Default::default(),
+            extended: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> StageBindings<T> {
     /// Match the range of cached command state keys.
     const SLOTS: u64 = 128;
 
-    fn insert(&mut self, (stage, slot): (u64, u64), handle: u64) -> Option<u64> {
+    fn insert(&mut self, (stage, slot): (u64, u64), value: T) -> Option<T> {
         if slot < Self::SLOTS && stage < self.stages.len() as u64 {
             let slots = &mut self.stages[stage as usize];
             let index = slot as usize;
             if index >= slots.len() {
-                slots.resize(index + 1, None);
+                slots.resize_with(index + 1, || None);
             }
-            return slots[index].replace(handle);
+            return slots[index].replace(value);
         }
-        self.extended.insert((stage, slot), handle)
+        self.extended.insert((stage, slot), value)
     }
 
-    fn get(&self, stage: u64, slot: u64) -> Option<u64> {
+    fn get(&self, stage: u64, slot: u64) -> Option<&T> {
         if slot < Self::SLOTS && stage < self.stages.len() as u64 {
-            return self.stages[stage as usize]
-                .get(slot as usize)
-                .copied()
-                .flatten();
+            return self.stages[stage as usize].get(slot as usize)?.as_ref();
         }
-        self.extended.get(&(stage, slot)).copied()
+        self.extended.get(&(stage, slot))
     }
 
+    fn iter(&self) -> impl Iterator<Item = ((u64, u64), &T)> {
+        self.stages
+            .iter()
+            .enumerate()
+            .flat_map(|(stage, slots)| {
+                slots.iter().enumerate().filter_map(move |(slot, value)| {
+                    Some(((stage as u64, slot as u64), value.as_ref()?))
+                })
+            })
+            .chain(self.extended.iter().map(|(&key, value)| (key, value)))
+    }
+}
+
+impl TextureBindings {
     fn handles(&self, stage: u64) -> impl Iterator<Item = u64> + '_ {
         usize::try_from(stage)
             .ok()
@@ -856,6 +880,23 @@ impl RenderState {
         if stage < self.storage_slots.len() as u64 && slot < u64::from(u16::BITS) {
             self.storage_slots[stage as usize] |= 1 << slot;
         }
+    }
+
+    fn named_uniform_bindings(&self) -> impl Iterator<Item = (&'static str, &Command)> {
+        self.bound_uniforms.iter().map(|((stage, slot), command)| {
+            (
+                gpu::bind_key("BindUniformBuffer", Some(stage), slot),
+                command,
+            )
+        })
+    }
+
+    fn named_bindings(&self) -> impl Iterator<Item = (&'static str, &Command)> {
+        self.state
+            .iter()
+            .filter(|(key, _)| key.contains('/'))
+            .map(|(&key, bind)| (key, bind))
+            .chain(self.named_uniform_bindings())
     }
 }
 
@@ -3623,12 +3664,11 @@ impl Nvn {
                                 .render
                                 .state
                                 .iter()
-                                .filter(|(key, bind)| {
-                                    (key.starts_with("BindStorageBuffer/")
-                                        || key.starts_with("BindUniformBuffer/"))
-                                        && range.contains(&bind.x[3])
-                                })
-                                .map(|(key, _)| *key)
+                                .filter(|(key, _)| key.starts_with("BindStorageBuffer/"))
+                                .map(|(&key, bind)| (key, bind))
+                                .chain(self.render.named_uniform_bindings())
+                                .filter(|(_, bind)| range.contains(&bind.x[3]))
+                                .map(|(key, _)| key)
                                 .collect();
                             stale.sort_unstable();
                             if !stale.is_empty() {
@@ -5369,9 +5409,15 @@ impl Nvn {
                         if single == "BindStorageBuffer" {
                             self.render.set_storage_slot(command.x[1], slot);
                         }
-                        self.render
-                            .state
-                            .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
+                        if single == "BindUniformBuffer" {
+                            self.render
+                                .bound_uniforms
+                                .insert((command.x[1], slot), bind);
+                        } else {
+                            self.render
+                                .state
+                                .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
+                        }
                     }
                     return Ok(());
                 }
@@ -5415,8 +5461,13 @@ impl Nvn {
                     // Per-slot bindings are kept per stage and slot; the
                     // others keep their latest command.
                     let key = match rest {
+                        "BindUniformBuffer" => {
+                            self.render
+                                .bound_uniforms
+                                .insert((command.x[1], command.x[2]), command.clone());
+                            return Ok(());
+                        }
                         "BindTexture"
-                        | "BindUniformBuffer"
                         | "BindStorageBuffer"
                         | "BindImage"
                         | "BindSeparateTexture"
@@ -6070,9 +6121,7 @@ impl Nvn {
             .collect();
         let binds: Vec<serde_json::Value> = self
             .render
-            .state
-            .iter()
-            .filter(|(key, _)| key.contains('/'))
+            .named_bindings()
             .map(|(key, bind)| serde_json::json!([key, bind.x[1..6]]))
             .collect();
         // Fixed-function state: each property's arguments.
@@ -6174,13 +6223,8 @@ impl Nvn {
                 }
             }
         }
-        let mut binds: Vec<(&&str, &Command)> = self
-            .render
-            .state
-            .iter()
-            .filter(|(key, _)| key.contains('/'))
-            .collect();
-        binds.sort_unstable_by_key(|(key, _)| **key);
+        let mut binds: Vec<(&str, &Command)> = self.render.named_bindings().collect();
+        binds.sort_unstable_by_key(|(key, _)| *key);
         for (key, bind) in binds {
             text += &format!("bind {key} x {:x?}\n", &bind.x[1..6]);
             // A uniform block's bytes as the draw reads them:
@@ -7971,7 +8015,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_slots_track_sparse_single_plural_and_deferred_binds() {
+    fn resource_slots_track_sparse_single_plural_and_deferred_binds() {
         let mut memory = Memory::new(1 << 39);
         memory
             .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
@@ -7983,6 +8027,8 @@ mod tests {
             counter: Some(0),
         };
         guest.memory.write_u64(0x10_0000, 9001).unwrap();
+        guest.memory.write_u64(0x10_0010, 0x2340).unwrap();
+        guest.memory.write_u64(0x10_0018, 0x100).unwrap();
         let mut nvn = Nvn::default();
         for (name, x, captured) in [
             (
@@ -8005,6 +8051,21 @@ mod tests {
                 [0, 1, 3, 0, 0, 0, 0, 0],
                 Vec::new(),
             ),
+            (
+                "nvnCommandBufferBindUniformBuffer",
+                [0, 1, 3, 0, 0, 0, 0, 0],
+                Vec::new(),
+            ),
+            (
+                "nvnCommandBufferBindUniformBuffers",
+                [0, 1, 127, 2, 0, 0, 0, 0],
+                vec![0x2000, 0x180, 0x2400, 0x200],
+            ),
+            (
+                "nvnCommandBufferBindUniformBuffersDeferred",
+                [0, 5, 1, 1, 0x10_0010, 0, 0, 0],
+                Vec::new(),
+            ),
         ] {
             nvn.execute_command(
                 &Command {
@@ -8020,10 +8081,22 @@ mod tests {
         }
         let bindings = &nvn.render.bound_textures;
         assert_eq!(bindings.get(1, 2), None);
-        assert_eq!(bindings.get(1, 3), Some(0));
-        assert_eq!(bindings.get(1, 128), Some(4003));
+        assert_eq!(bindings.get(1, 3), Some(&0));
+        assert_eq!(bindings.get(1, 128), Some(&4003));
         assert_eq!(bindings.handles(1).collect::<Vec<_>>(), [0, 4002, 4003]);
         assert_eq!(bindings.handles(7).collect::<Vec<_>>(), [9001]);
+        let uniforms = &nvn.render.bound_uniforms;
+        assert!(uniforms.get(1, 2).is_none());
+        assert_eq!(uniforms.get(1, 3).unwrap().x[3..5], [0, 0]);
+        assert_eq!(uniforms.get(1, 128).unwrap().x[3..5], [0x2400, 0x200]);
+        assert_eq!(uniforms.get(5, 1).unwrap().x[3..5], [0x2340, 0x100]);
+        let named: Vec<_> = nvn
+            .render
+            .named_uniform_bindings()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(named.contains(&"BindUniformBuffer/1/128"));
+        assert!(named.contains(&"BindUniformBuffer/5/1"));
     }
 
     #[test]
