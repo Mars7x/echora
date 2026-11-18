@@ -85,6 +85,7 @@ read.
 | `ECHORA_ALLOW_OLD_RADV=1` | Run on a Mesa RADV driver older than 26.1.4, which Echora otherwise refuses at start: those versions hang the GPU on the game's task shader draws, and after the kernel resets the GPU every later run hangs until a reboot. For debugging the driver only. |
 | `ECHORA_AUDIO_THREAD=0` | Mix the game's sound on the game's own threads under the machine lock, as before, instead of on a host thread of its own. For comparing the two. |
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
+| `ECHORA_PACK_DMA_SPANS=0` | Keep individual Linux DMA-BUF imports when rebuilding the GPU page table. Packing discontiguous ranges into fewer imports is enabled by default when the kernel and driver accept them. |
 | `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
 | `ECHORA_PAGE_TABLE=0` | Give translated programs an empty GPU page table, so their global memory reads return zeros (debugging). The page table is on by default. |
@@ -124,6 +125,11 @@ scene, alternating builds on the same boot. For the forest in the supported
 the present rate and divide `nvn.gpu_notes` timing totals by their draw
 count to check changes in CPU work per draw. Movie decoding is measured
 separately with `ECHORA_MOVIE_RATE`.
+
+On a Radeon RX 9070 XT with RADV 26.2.7, two runs in each mode averaged
+16.67 FPS with individual DMA-BUF imports and 16.95 FPS with packed imports.
+The number of shared buffers per submission fell from 846–849 to 97–99.
+Draw counts varied from 201,301 to 208,081 across the four runs.
 
 **Capturing**
 

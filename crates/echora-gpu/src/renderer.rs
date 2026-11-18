@@ -170,6 +170,8 @@ fn log_allocation(caller: &'static std::panic::Location<'static>, size: u64) {
 }
 /// The largest span `import_file` shares: udmabuf's default size limit.
 const MAX_SHARED_SPAN: u64 = 64 << 20;
+#[cfg(target_os = "linux")]
+const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
 /// Guest memory pinned by shared spans before the least recently used are
 /// dropped.
 const MAX_SHARED_BYTES: u64 = 1 << 30;
@@ -255,6 +257,36 @@ impl Submitter {
     }
 }
 
+/// Which backing file owns the offsets tracked by the page-table imports.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AddressedFile {
+    #[default]
+    Unset,
+    Single(i32),
+    Multiple,
+}
+
+/// Discontiguous byte ranges packed back-to-back in the same imported buffer.
+struct PackedSpans {
+    ranges: Vec<(u64, u64, u64)>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    address: u64,
+}
+
+impl PackedSpans {
+    fn offset(&self, start: u64, length: u64) -> Option<u64> {
+        let after = self.ranges.partition_point(|&(known, ..)| known <= start);
+        self.ranges[..after]
+            .iter()
+            .rev()
+            .take_while(|&&(known, ..)| known + MAX_SHARED_SPAN >= start)
+            .find_map(|&(known, size, offset)| {
+                (start + length <= known + size).then_some(offset + (start - known))
+            })
+    }
+}
+
 pub struct Renderer {
     /// The submission slot being recorded: its command buffer, fence,
     /// ring, descriptor pool and what they hold until it completes (the
@@ -337,6 +369,8 @@ pub struct Renderer {
     /// Page-table spans another joined (`address_span`): the table may
     /// still point into them until it is built whole.
     superseded: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
+    packed: Vec<PackedSpans>,
+    addressed_file: AddressedFile,
     /// A released range dropped a span that held more than it: other pools
     /// mapped through it are mapped again by a whole build.
     dropped_shared_span: bool,
@@ -770,6 +804,8 @@ impl Renderer {
             imported: FastMap::default(),
             addressed: Vec::new(),
             superseded: Vec::new(),
+            packed: Vec::new(),
+            addressed_file: AddressedFile::Unset,
             dropped_shared_span: false,
             page_table: None,
             import_refused: Default::default(),
@@ -2778,7 +2814,7 @@ impl Renderer {
         *self
             .stats
             .entry("stat: shared spans held at submissions")
-            .or_default() += (self.shared.len() + self.addressed.len()) as u64;
+            .or_default() += (self.shared.len() + self.addressed.len() + self.packed.len()) as u64;
         // ECHORA_SPAN_LOG (debugging): every 200th submission, how the
         // page table's spans lie in the file (sizes and the gaps between).
         if self.flushes.is_multiple_of(200) && std::env::var_os("ECHORA_SPAN_LOG").is_some() {
@@ -2801,7 +2837,8 @@ impl Renderer {
         *self
             .stats
             .entry("stat: page-table spans held at submissions")
-            .or_default() += (self.addressed.len() + self.superseded.len()) as u64;
+            .or_default() +=
+            (self.addressed.len() + self.superseded.len() + self.packed.len()) as u64;
         let start = std::time::Instant::now();
         let device = &self.gpu.device;
         // SAFETY: the buffer was begun.
@@ -3096,6 +3133,14 @@ impl Renderer {
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
         let key = (start, span);
+        if self.addressed_file == AddressedFile::Single(file)
+            && let Some((group, inside)) = self
+                .packed
+                .iter()
+                .find_map(|group| group.offset(start, span).map(|inside| (group, inside)))
+        {
+            return Ok(Some((group.buffer, inside + offset - start)));
+        }
         let after = self
             .addressed
             .partition_point(|(known, ..)| *known <= start);
@@ -3166,6 +3211,20 @@ impl Renderer {
         const PAGE: u64 = 4096;
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
+        if self.addressed_file == AddressedFile::Single(file)
+            && let Some(address) = self.packed.iter().find_map(|group| {
+                group
+                    .offset(start, span)
+                    .map(|inside| group.address + inside)
+            })
+        {
+            return Ok(Some(address + offset - start));
+        }
+        self.addressed_file = match self.addressed_file {
+            AddressedFile::Unset => AddressedFile::Single(file),
+            AddressedFile::Single(known) if known != file => AddressedFile::Multiple,
+            known => known,
+        };
         // Kept sorted by start; a span holding this one starts at most
         // MAX_SHARED_SPAN before it.
         let after = self
@@ -3239,6 +3298,77 @@ impl Renderer {
         Ok(Some(address + (offset - start)))
     }
 
+    /// Pack stable page-table imports for use when the caller rebuilds its
+    /// table. Unpacked spans keep their original addresses until that rebuild.
+    #[cfg(target_os = "linux")]
+    pub fn pack_addressed_spans(&mut self) -> Result<(), String> {
+        if self.addressed.len() < 64 {
+            return Ok(());
+        }
+        let AddressedFile::Single(file) = self.addressed_file else {
+            return Ok(());
+        };
+        // Avoid copying the old table's references just for packing. Run
+        // only when the old table is rebuilt for a separate reason.
+        let old = std::mem::take(&mut self.addressed);
+        self.addressed.reserve(old.len());
+        let mut start = 0;
+        while start < old.len() {
+            let mut length = 0;
+            let mut end = start;
+            let mut ranges = Vec::new();
+            for &(offset, size, ..) in old[start..].iter().take(128) {
+                if length + size > MAX_SHARED_SPAN {
+                    break;
+                }
+                ranges.push((offset, size, length));
+                length += size;
+                end += 1;
+            }
+            debug_assert!(end > start);
+            let packed = if ranges.len() >= 4 {
+                self.share_packed_spans(file, &ranges, length)
+            } else {
+                Ok(None)
+            };
+            let group = match packed {
+                Ok(Some((buffer, memory))) => {
+                    if let Some(address) = self.buffer_address(buffer) {
+                        Some(PackedSpans {
+                            ranges,
+                            buffer,
+                            memory,
+                            address,
+                        })
+                    } else {
+                        self.slot.retired_shared.push((buffer, memory));
+                        None
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    self.addressed.extend_from_slice(&old[start..]);
+                    return Err(error);
+                }
+            };
+            if let Some(group) = group {
+                self.stat("stat: individual imports packed", (end - start) as u64);
+                self.stat("stat: packed DMA imports", 1);
+                self.packed.push(group);
+                self.superseded.extend_from_slice(&old[start..end]);
+            } else {
+                self.addressed.extend_from_slice(&old[start..end]);
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn pack_addressed_spans(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// How many joined spans wait for the table to be built whole, the
     /// bytes they pin, and whether a released range dropped a span holding
     /// other pools too.
@@ -3260,13 +3390,34 @@ impl Renderer {
 
     /// Bytes of guest memory the page table's spans pin.
     pub fn addressed_bytes(&self) -> u64 {
-        self.addressed.iter().map(|(_, span, ..)| span).sum()
+        self.addressed.iter().map(|(_, span, ..)| span).sum::<u64>()
+            + self
+                .packed
+                .iter()
+                .flat_map(|group| &group.ranges)
+                .map(|&(_, span, _)| span)
+                .sum::<u64>()
     }
 
     /// Stop sharing file range `[offset, offset + length)`: its pages may be
     /// released (a udmabuf would keep the old ones).
     pub fn release_file_range(&mut self, offset: u64, length: u64) {
         let end = offset + length;
+        self.packed.retain(|group| {
+            let after = group.ranges.partition_point(|&(start, ..)| start < end);
+            if group.ranges[..after]
+                .iter()
+                .rev()
+                .take_while(|&&(start, ..)| start + MAX_SHARED_SPAN > offset)
+                .any(|&(start, size, _)| offset < start + size)
+            {
+                self.dropped_shared_span = true;
+                self.slot.retired_shared.push((group.buffer, group.memory));
+                false
+            } else {
+                true
+            }
+        });
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
             .into_iter()
             .partition(|(start, span, ..)| *start < end && offset < start + span);
@@ -3332,8 +3483,6 @@ impl Renderer {
             offset: u64,
             size: u64,
         }
-        const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
-        const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
         let mut create = Create {
             memfd: file as u32,
             flags: UDMABUF_FLAGS_CLOEXEC,
@@ -3345,7 +3494,7 @@ impl Renderer {
         let dma_buf = unsafe {
             libc::ioctl(
                 udmabuf.as_raw_fd(),
-                UDMABUF_CREATE as _,
+                libc::_IOW::<Create>(u32::from(b'u'), 0x42),
                 std::ptr::addr_of_mut!(create),
             )
         };
@@ -3361,6 +3510,83 @@ impl Renderer {
             }
             return Ok(None);
         }
+        self.import_shared_fd(&external, dma_buf, span)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn share_packed_spans(
+        &mut self,
+        file: i32,
+        ranges: &[(u64, u64, u64)],
+        span: u64,
+    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, String> {
+        use std::os::fd::AsRawFd;
+        let (Some(external), Some(Some(udmabuf))) =
+            (self.gpu.dma_buf_import.clone(), self.udmabuf.as_ref())
+        else {
+            return Ok(None);
+        };
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Item {
+            memfd: u32,
+            padding: u32,
+            offset: u64,
+            size: u64,
+        }
+
+        #[repr(C)]
+        struct ListHeader {
+            flags: u32,
+            count: u32,
+        }
+
+        #[repr(C)]
+        struct CreateList {
+            header: ListHeader,
+            items: [Item; 128],
+        }
+
+        let mut create = CreateList {
+            header: ListHeader {
+                flags: UDMABUF_FLAGS_CLOEXEC,
+                count: ranges.len() as u32,
+            },
+            items: [Item {
+                memfd: file as u32,
+                padding: 0,
+                offset: 0,
+                size: 0,
+            }; 128],
+        };
+        for (item, &(offset, size, _)) in create.items.iter_mut().zip(ranges) {
+            item.offset = offset;
+            item.size = size;
+        }
+        // SAFETY: the request includes count initialized items. The kernel
+        // copies them when making the new descriptor. The ioctl request
+        // encodes the fixed header size, excluding the trailing items.
+        let dma_buf = unsafe {
+            libc::ioctl(
+                udmabuf.as_raw_fd(),
+                libc::_IOW::<ListHeader>(u32::from(b'u'), 0x43),
+                &mut create,
+            )
+        };
+        if dma_buf < 0 {
+            self.stat("stat: packed DMA imports refused", 1);
+            return Ok(None);
+        }
+        self.import_shared_fd(&external, dma_buf, span)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_shared_fd(
+        &mut self,
+        external: &ash::khr::external_memory_fd::Device,
+        dma_buf: i32,
+        span: u64,
+    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, String> {
         let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
         let mut properties = vk::MemoryFdPropertiesKHR::default();
         // SAFETY: `dma_buf` is a dma-buf descriptor we own.
@@ -6197,7 +6423,13 @@ impl Drop for Renderer {
             .chain(
                 std::mem::take(&mut self.addressed)
                     .into_iter()
+                    .chain(std::mem::take(&mut self.superseded))
                     .map(|(_, _, buffer, memory, _)| (buffer, memory)),
+            )
+            .chain(
+                std::mem::take(&mut self.packed)
+                    .into_iter()
+                    .map(|group| (group.buffer, group.memory)),
             );
         let retired = std::mem::take(&mut self.slot.retired_shared)
             .into_iter()
@@ -6311,6 +6543,167 @@ mod tests {
         renderer.flush().unwrap();
         renderer.guest_barrier(0x12).unwrap();
         assert_eq!(renderer.hazard_barriers, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn packed_dma_spans_share_noncontiguous_file_pages() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let page = 4096;
+        let name = c"echora-packed-test";
+        // SAFETY: a valid name and flags. Ownership goes to File below.
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC)
+        };
+        assert!(fd >= 0);
+        let mut backing = unsafe { std::fs::File::from_raw_fd(fd) };
+        backing.set_len(9 * page).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+            0
+        );
+
+        let pages = [7, 1, 5, 3];
+        let ranges: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, &slot)| {
+                backing.seek(SeekFrom::Start(slot * page)).unwrap();
+                backing.write_all(&[slot as u8; 32]).unwrap();
+                (slot * page, page, index as u64 * page)
+            })
+            .collect();
+        let Some((single, single_memory)) = renderer
+            .share_span(backing.as_raw_fd(), page, page)
+            .unwrap()
+        else {
+            assert!(std::env::var_os("ECHORA_REQUIRE_PACKED_DMA").is_none());
+            return;
+        };
+        let (buffer, memory) = renderer
+            .share_packed_spans(backing.as_raw_fd(), &ranges, page * 4)
+            .unwrap()
+            .unwrap();
+        let output = renderer
+            .host_buffer(page * 4, vk::BufferUsageFlags::TRANSFER_DST)
+            .unwrap();
+        let commands = renderer.commands().unwrap();
+        let regions: Vec<_> = (0..4)
+            .map(|index| vk::BufferCopy {
+                src_offset: index * page,
+                dst_offset: index * page,
+                size: 32,
+            })
+            .collect();
+        // SAFETY: both buffers are live and the regions fit. Queue completion
+        // makes the writes visible to the coherent output mapping.
+        unsafe {
+            let device = &renderer.gpu.device;
+            device.cmd_copy_buffer(commands, buffer, output.buffer, &regions);
+            device.cmd_fill_buffer(commands, buffer, 64, 4, 0x1234_5678);
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+        renderer.flush().unwrap();
+        let mut updated = [0; 4];
+        use std::os::unix::fs::FileExt;
+        backing
+            .read_exact_at(&mut updated, pages[0] * page + 64)
+            .unwrap();
+        assert_eq!(updated, 0x1234_5678_u32.to_le_bytes());
+        let bytes = output.read_bytes((page * 4) as usize);
+        for (index, slot) in pages.into_iter().enumerate() {
+            assert_eq!(&bytes[index * page as usize..][..32], &[slot as u8; 32]);
+        }
+        // SAFETY: idle buffers. The Vulkan imports own their DMA descriptors.
+        unsafe {
+            for (buffer, memory) in [(buffer, memory), (single, single_memory)] {
+                renderer.gpu.device.destroy_buffer(buffer, None);
+                renderer.gpu.device.free_memory(memory, None);
+            }
+            output.destroy(&renderer.gpu.device);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compacted_dma_spans_preserve_buffer_offsets_and_retire_together() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let page = 4096;
+        let gap = 128 * 1024;
+        // SAFETY: a valid name and flags. Ownership goes to File below.
+        let fd = unsafe {
+            libc::memfd_create(
+                c"echora-addressed-test".as_ptr(),
+                libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        // SAFETY: successful memfd_create returned a newly owned fd.
+        let backing = unsafe { std::fs::File::from_raw_fd(fd) };
+        backing.set_len(64 * gap).unwrap();
+        // SAFETY: the memfd is live and allows seals.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+            0
+        );
+        let file = backing.as_raw_fd();
+        let Some(original) = renderer.address_span(file, 0, page).unwrap() else {
+            assert!(std::env::var_os("ECHORA_REQUIRE_PACKED_DMA").is_none());
+            return;
+        };
+        for index in 1..64 {
+            assert!(
+                renderer
+                    .address_span(file, index * gap, page)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        renderer.pack_addressed_spans().unwrap();
+        if renderer.packed.is_empty() {
+            assert!(std::env::var_os("ECHORA_REQUIRE_PACKED_DMA").is_none());
+            return;
+        }
+        assert_eq!(renderer.addressed.len(), 0);
+        assert_eq!(renderer.packed.len(), 1);
+        assert_eq!(renderer.superseded_spans().0, 64);
+        let base = renderer.packed[0].address;
+        let buffer = renderer.packed[0].buffer;
+        assert_ne!(base, original);
+        for index in 0..64 {
+            assert_eq!(
+                renderer.address_span(file, index * gap, page).unwrap(),
+                Some(base + index * page)
+            );
+            assert_eq!(
+                renderer.import_file(file, index * gap + 24, 64).unwrap(),
+                Some((buffer, index * page + 24))
+            );
+        }
+        renderer.take_superseded(64);
+        renderer.release_file_range(gap, page);
+        assert!(renderer.packed.is_empty());
+        assert!(renderer.superseded_spans().2);
     }
 
     #[test]

@@ -5703,7 +5703,7 @@ impl Nvn {
             signatures.iter().map(|(pool, _)| *pool).collect();
         // Spans joined into larger ones, or dropped with other pools' pages
         // in them, leave entries only a whole build replaces.
-        let (superseded, superseded_bytes, dropped) =
+        let (mut superseded, superseded_bytes, dropped) =
             self.gpu.as_ref().unwrap().renderer.superseded_spans();
         let whole = match &previous {
             None => Some("stat: page table built whole (first)"),
@@ -5715,7 +5715,12 @@ impl Nvn {
             Some(_) => None,
         };
         if let Some(reason) = whole {
-            self.gpu.as_mut().unwrap().stat(reason, 1);
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat(reason, 1);
+            if !super::debug_var_os("ECHORA_PACK_DMA_SPANS").is_some_and(|value| value == "0") {
+                backend.renderer.pack_addressed_spans()?;
+                superseded = backend.renderer.superseded_spans().0;
+            }
         }
         let previous = previous.filter(|_| whole.is_none());
         let mut built_pools = HashMap::default();
