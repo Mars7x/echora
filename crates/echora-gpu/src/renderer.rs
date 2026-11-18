@@ -2335,7 +2335,7 @@ impl Renderer {
             .image(target.image)
             .subresource_range(vk::ImageSubresourceRange {
                 level_count: target.levels,
-                layer_count: shape.layers(),
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
                 ..range(*format)
             });
         let after = vk::ImageMemoryBarrier {
