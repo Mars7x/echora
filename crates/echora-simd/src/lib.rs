@@ -2667,6 +2667,16 @@ pub fn vec_dot(cpu: &mut Cpu, signed: bool, q: bool, rd: u8, rn: u8, rm: u8) {
         cpu.vectors[rm as usize],
         cpu.vectors[rd as usize],
     );
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86-64 target baseline.
+    let result = unsafe { vec_dot_sse2(n, m, d, signed, q) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let result = vec_dot_scalar(n, m, d, signed, q);
+    cpu.vectors[rd as usize] = result;
+}
+
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn vec_dot_scalar(n: u128, m: u128, d: u128, signed: bool, q: bool) -> u128 {
     let byte = |v: u128, i: u32| -> i64 {
         let b = (v >> (8 * i)) as u8;
         if signed {
@@ -2683,7 +2693,40 @@ pub fn vec_dot(cpu: &mut Cpu, signed: bool, q: bool, rd: u8, rn: u8, rm: u8) {
         let value = (get_lane(d, 32, lane) as u32).wrapping_add(sum as u32);
         set_lane(&mut result, 32, lane, u64::from(value));
     }
-    cpu.vectors[rd as usize] = finish_vector(result, 32, q, false);
+    finish_vector(result, 32, q, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn vec_dot_sse2(n: u128, m: u128, d: u128, signed: bool, q: bool) -> u128 {
+    use core::arch::x86_64::*;
+    // SAFETY: packed integers and u128 admit the same bit patterns.
+    let packed = |value| unsafe { core::mem::transmute::<u128, __m128i>(value) };
+    let (n, m, d) = (packed(n), packed(m), packed(d));
+    let zero = _mm_setzero_si128();
+    let (n_high, m_high) = if signed {
+        (_mm_cmpgt_epi8(zero, n), _mm_cmpgt_epi8(zero, m))
+    } else {
+        (zero, zero)
+    };
+    // Widen bytes before multiplying, so even a pair of 255 * 255
+    // products fits without saturation. MADD returns one i32 per pair.
+    let lo = _mm_madd_epi16(_mm_unpacklo_epi8(n, n_high), _mm_unpacklo_epi8(m, m_high));
+    let hi = if q {
+        _mm_madd_epi16(_mm_unpackhi_epi8(n, n_high), _mm_unpackhi_epi8(m, m_high))
+    } else {
+        zero
+    };
+    // The shuffles only move bits. Adding adjacent pairs produces each
+    // four-byte dot product, then the guest's wrapping accumulation.
+    let lo = _mm_castsi128_ps(lo);
+    let hi = _mm_castsi128_ps(hi);
+    let even = _mm_castps_si128(_mm_shuffle_ps::<0x88>(lo, hi));
+    let odd = _mm_castps_si128(_mm_shuffle_ps::<0xdd>(lo, hi));
+    let result = _mm_add_epi32(_mm_add_epi32(even, odd), d);
+    // SAFETY: same size and bit representation as the inputs.
+    let result = unsafe { core::mem::transmute::<__m128i, u128>(result) };
+    if q { result } else { u128::from(result as u64) }
 }
 
 /// SADDLP/UADDLP (and SADALP/UADALP with `accumulate`): add adjacent pairs of
@@ -3582,6 +3625,33 @@ mod vector_tests {
             cpu.vectors[0],
             lanes32([1.0f32, 1.0, 1.5, 2.0].map(f32::to_bits))
         );
+    }
+
+    #[test]
+    fn vector_dot_preserves_signed_unsigned_and_wrapping_lanes() {
+        let mut cpu = Cpu::default();
+        let mut state = 0x7e23_78be_8f76_f87du64;
+        let mut bits = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state
+        };
+        let mut vector = || u128::from(bits()) << 64 | u128::from(bits());
+        for index in 0..8192 {
+            let n = if index == 0 { u128::MAX } else { vector() };
+            let m = if index == 0 { u128::MAX } else { vector() };
+            let d = if index == 0 { u128::MAX } else { vector() };
+            for signed in [false, true] {
+                for q in [false, true] {
+                    cpu.vectors[..3].copy_from_slice(&[n, m, d]);
+                    vec_dot(&mut cpu, signed, q, 2, 0, 1);
+                    assert_eq!(cpu.vectors[2], vec_dot_scalar(n, m, d, signed, q));
+                    vec_dot(&mut cpu, signed, q, 0, 0, 1);
+                    assert_eq!(cpu.vectors[0], vec_dot_scalar(n, m, n, signed, q));
+                }
+            }
+        }
     }
 
     #[test]
