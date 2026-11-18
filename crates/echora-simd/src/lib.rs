@@ -3331,9 +3331,11 @@ pub fn transfer_multiple(
     let lanes = per_register / esize;
     let total = u64::from(registers) * per_register;
     let register = |r: u64| ((u64::from(rt) + r) % 32) as usize;
-    let mut buffer = vec![0u8; total as usize];
+    // At most four 128-bit registers, read or written as one access.
+    let mut bytes = [0u8; 64];
+    let buffer = &mut bytes[..total as usize];
     if load {
-        memory.read(address, &mut buffer)?;
+        memory.read(address, buffer)?;
         let mut values = [0u128; 4];
         for r in 0..u64::from(registers) {
             for lane in 0..lanes {
@@ -3370,7 +3372,7 @@ pub fn transfer_multiple(
                     .copy_from_slice(&lane_value[..esize as usize]);
             }
         }
-        memory.write(address, &buffer)?;
+        memory.write(address, buffer)?;
     }
     Ok(total)
 }
@@ -3391,9 +3393,11 @@ pub fn transfer_single(
     let esize = usize::from(bits / 8);
     let total = usize::from(registers) * esize;
     let register = |r: usize| (usize::from(rt) + r) % 32;
-    let mut buffer = vec![0u8; total];
+    // At most one 64-bit lane from each of four registers.
+    let mut bytes = [0u8; 32];
+    let buffer = &mut bytes[..total];
     if load {
-        memory.read(address, &mut buffer)?;
+        memory.read(address, buffer)?;
         for r in 0..usize::from(registers) {
             let mut chunk = [0u8; 8];
             chunk[..esize].copy_from_slice(&buffer[r * esize..(r + 1) * esize]);
@@ -3409,7 +3413,7 @@ pub fn transfer_single(
             let lane = get_lane(cpu.vectors[register(r)], u32::from(bits), u32::from(index));
             buffer[r * esize..(r + 1) * esize].copy_from_slice(&lane.to_le_bytes()[..esize]);
         }
-        memory.write(address, &buffer)?;
+        memory.write(address, buffer)?;
     }
     Ok(total as u64)
 }
@@ -3427,8 +3431,9 @@ pub fn load_replicate(
 ) -> Result<u64, Trap> {
     let esize = usize::from(bits / 8);
     let total = usize::from(registers) * esize;
-    let mut buffer = vec![0u8; total];
-    memory.read(address, &mut buffer)?;
+    let mut bytes = [0u8; 32];
+    let buffer = &mut bytes[..total];
+    memory.read(address, buffer)?;
     for r in 0..usize::from(registers) {
         let mut chunk = [0u8; 8];
         chunk[..esize].copy_from_slice(&buffer[r * esize..(r + 1) * esize]);
