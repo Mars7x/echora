@@ -7048,7 +7048,7 @@ impl Nvn {
         let Ok(range) = super::debug_var("ECHORA_MEMORY_TRACE") else {
             return Ok(());
         };
-        let present = |name: &str, default: u64| {
+        let present = |name: &'static str, default: u64| {
             super::debug_var(name)
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())

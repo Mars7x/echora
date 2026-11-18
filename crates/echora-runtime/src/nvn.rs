@@ -256,50 +256,62 @@ fn set_debug_overrides(overrides: Option<HashMap<String, Option<String>>>) {
     DEBUG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// `std::env::var_os` for a ECHORA_* switch, from the snapshot (or a frame
-/// replay's switches).
-pub(crate) fn debug_var_os(name: &str) -> Option<&'static std::ffi::OsStr> {
-    // The draw path asks dozens of times per draw; names are literals, so
-    // the answer is cached by the name's address in a small open-addressed
-    // table (a few instructions instead of hashing the string into the
-    // environment snapshot, or walking every name asked so far).
-    type Slot = (usize, usize, Option<&'static std::ffi::OsStr>);
+/// Look up a static Echora switch name in the environment snapshot or a
+/// frame replay's overrides. Each worker caches misses as well as values.
+pub(crate) fn debug_var_os(name: &'static str) -> Option<&'static std::ffi::OsStr> {
+    use std::cell::Cell;
+    type Slot = Option<(&'static str, Option<&'static std::ffi::OsStr>)>;
     const SLOTS: usize = 1024;
-    thread_local! {
-        static CACHE: std::cell::RefCell<(u64, usize, Vec<Slot>)> =
-            const { std::cell::RefCell::new((0, 0, Vec::new())) };
+    struct Cache {
+        generation: Cell<u64>,
+        used: Cell<usize>,
+        slots: [Cell<Slot>; SLOTS],
     }
-    let key = (name.as_ptr() as usize, name.len());
+    thread_local! {
+        static CACHE: Cache = const { Cache {
+            generation: Cell::new(0),
+            used: Cell::new(0),
+            slots: [const { Cell::new(None) }; SLOTS],
+        } };
+    }
+    let address = name.as_ptr() as usize;
     let generation = DEBUG_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.0 != generation || cache.2.is_empty() {
-            *cache = (generation, 0, vec![(0, 0, None); SLOTS]);
-        }
-        // Literals are at least a byte apart; their lengths spread the rest.
-        let mut slot = (key.0 ^ key.0 >> 10 ^ key.1 << 5) % SLOTS;
-        // At most half full (below), so an empty slot ends every probe.
-        while cache.2[slot].0 != 0 {
-            if (cache.2[slot].0, cache.2[slot].1) == key {
-                return cache.2[slot].2;
+        if cache.generation.get() != generation {
+            for slot in &cache.slots {
+                slot.set(None);
             }
-            slot = (slot + 1) % SLOTS;
+            cache.generation.set(generation);
+            cache.used.set(0);
         }
-        let overridden = DEBUG_OVERRIDES
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(|overrides| overrides.get(name).copied());
-        let value = match overridden {
-            Some(value) => value,
-            None => debug_env().get(name).map(|value| value.as_os_str()),
-        };
-        if cache.1 < SLOTS / 2 {
-            cache.1 += 1;
-            cache.2[slot] = (key.0, key.1, value);
+        let mut index = (address ^ address >> 10 ^ name.len() << 5) % SLOTS;
+        while let Some((key, value)) = cache.slots[index].get() {
+            if std::ptr::eq(key, name) {
+                return value;
+            }
+            index = (index + 1) % SLOTS;
+        }
+        let value = lookup_debug_var(name);
+        let used = cache.used.get();
+        if used < SLOTS / 2 {
+            cache.slots[index].set(Some((name, value)));
+            cache.used.set(used + 1);
         }
         value
     })
+}
+
+#[cold]
+fn lookup_debug_var(name: &str) -> Option<&'static std::ffi::OsStr> {
+    let overridden = DEBUG_OVERRIDES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|overrides| overrides.get(name).copied());
+    match overridden {
+        Some(value) => value,
+        None => debug_env().get(name).map(|value| value.as_os_str()),
+    }
 }
 
 /// `std::env::var` for a ECHORA_* switch, from the snapshot.
@@ -310,7 +322,7 @@ pub(crate) fn mip_targets() -> bool {
     debug_var_os("ECHORA_GPU_NO_MIPS").is_none()
 }
 
-pub(crate) fn debug_var(name: &str) -> Result<String, std::env::VarError> {
+pub(crate) fn debug_var(name: &'static str) -> Result<String, std::env::VarError> {
     let value = debug_var_os(name).ok_or(std::env::VarError::NotPresent)?;
     value
         .to_str()
@@ -4781,7 +4793,7 @@ impl Nvn {
         // runs, with its arguments and captured words (what the GPU hands
         // the CPU, a meter's luminance, say).
         if debug_var_os("ECHORA_READBACK_LOG").is_some() {
-            let present = |name: &str, default: u64| {
+            let present = |name: &'static str, default: u64| {
                 debug_var(name)
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
@@ -7318,7 +7330,7 @@ impl Nvn {
         else {
             return;
         };
-        let present = |name: &str, default: u64| {
+        let present = |name: &'static str, default: u64| {
             debug_var(name)
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
