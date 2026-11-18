@@ -1771,6 +1771,76 @@ pub fn vec_fp(
     Ok(())
 }
 
+/// Pair adjacent single-precision lanes using the host's packed operations.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn packed_fp_pairwise(n: u128, m: u128, q: bool, op: VecFpOp) -> Option<u128> {
+    use core::arch::x86_64::*;
+
+    // SAFETY: packed single-precision vectors and u128 have the same bits.
+    let (n, m) = unsafe {
+        (
+            core::mem::transmute::<u128, __m128>(n),
+            core::mem::transmute::<u128, __m128>(m),
+        )
+    };
+    let zero = _mm_setzero_si128();
+    let (n, m) = if q {
+        (n, m)
+    } else {
+        (_mm_movelh_ps(n, m), _mm_castsi128_ps(zero))
+    };
+    let even = _mm_shuffle_ps::<0x88>(n, m);
+    let odd = _mm_shuffle_ps::<0xdd>(n, m);
+    let magnitude = _mm_set1_epi32(i32::MAX);
+    let least_normal = _mm_set1_epi32(0x007f_ffff);
+    let infinity = _mm_set1_epi32(0x7f80_0000);
+    let magnitude_of = |value| _mm_and_si128(_mm_castps_si128(value), magnitude);
+    let zero_or_normal = |value| {
+        _mm_or_si128(
+            _mm_cmpeq_epi32(value, zero),
+            _mm_and_si128(
+                _mm_cmpgt_epi32(value, least_normal),
+                _mm_cmplt_epi32(value, infinity),
+            ),
+        )
+    };
+    let all = |mask| _mm_movemask_ps(_mm_castsi128_ps(mask)) == 0b1111;
+    let (even_abs, odd_abs) = (magnitude_of(even), magnitude_of(odd));
+    if !all(_mm_and_si128(
+        zero_or_normal(even_abs),
+        zero_or_normal(odd_abs),
+    )) {
+        return None;
+    }
+    let result = match op {
+        VecFpOp::Add => {
+            let result = _mm_add_ps(even, odd);
+            // Adding normals or zeros can produce zero only by exact cancellation.
+            if !all(zero_or_normal(magnitude_of(result))) {
+                return None;
+            }
+            result
+        }
+        VecFpOp::Max | VecFpOp::MaxNum | VecFpOp::Min | VecFpOp::MinNum => {
+            let (extreme, signed_zero) = if matches!(op, VecFpOp::Max | VecFpOp::MaxNum) {
+                (_mm_max_ps(even, odd), _mm_and_ps(even, odd))
+            } else {
+                (_mm_min_ps(even, odd), _mm_or_ps(even, odd))
+            };
+            let both_zero =
+                _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_or_si128(even_abs, odd_abs), zero));
+            _mm_or_ps(
+                _mm_and_ps(both_zero, signed_zero),
+                _mm_andnot_ps(both_zero, extreme),
+            )
+        }
+        _ => return None,
+    };
+    // SAFETY: same size and representation as the inputs.
+    Some(unsafe { core::mem::transmute::<__m128, u128>(result) })
+}
+
 /// Pairwise FP operation. Vector: result lane i combines lanes 2i and 2i+1
 /// of the concatenation Vm:Vn (Vn supplies the low half). Scalar: the two
 /// lanes of Vn give one element.
@@ -1788,6 +1858,20 @@ pub fn vec_fp_pairwise(
     let (n, m) = (cpu.vectors[rn as usize], cpu.vectors[rm as usize]);
     let bits = size_bits(size);
     let mut fp = Fp::new(cpu, size)?;
+    #[cfg(target_arch = "x86_64")]
+    if size == FpSize::S
+        && !scalar
+        && match op {
+            VecFpOp::Add => fp.cpu.fpsr & FPSR_IXC != 0,
+            VecFpOp::Max | VecFpOp::MaxNum | VecFpOp::Min | VecFpOp::MinNum => true,
+            _ => false,
+        }
+        // SAFETY: SSE2 is part of x86-64.
+        && let Some(result) = unsafe { packed_fp_pairwise(n, m, q, op) }
+    {
+        fp.cpu.vectors[rd as usize] = result;
+        return Ok(());
+    }
     let mut result = 0u128;
     if scalar {
         let value = vec_fp_lane(&mut fp, op, get_lane(n, bits, 0), get_lane(n, bits, 1), 0);
@@ -4373,6 +4457,56 @@ mod fast_path_tests {
 #[cfg(test)]
 mod sticky_inexact_tests {
     use super::*;
+
+    #[test]
+    fn packed_pairwise_float_matches_full_scalar_state() {
+        let candidates: [[u32; 4]; 7] = [
+            [1.0f32.to_bits(), 2.0f32.to_bits(), 0, 0x8000_0000],
+            [0x8000_0000, 0x8000_0000, 0x0080_0001, 0x8080_0000],
+            [0x7f7f_ffff, 0x7f7f_ffff, 0x8000_0000, 0],
+            [0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000],
+            [0x7fc0_0001, 0x7fa0_0001, 0x0080_0000, 1],
+            [0x3f80_0000, 0x3380_0000, 0x40a0_0000, 0xc0a0_0000],
+            [0x8000_0000, 0, 0x3f80_0000, 0x3f80_0000],
+        ];
+        for n in candidates.map(from_lanes_u32) {
+            for m in candidates.map(from_lanes_u32) {
+                for (fpcr, fpsr) in [(0, 0), (0, FPSR_IXC), (FPCR_FZ | FPCR_DN, FPSR_IXC)] {
+                    for (q, count) in [(false, 1u32), (true, 2)] {
+                        for op in [
+                            VecFpOp::Add,
+                            VecFpOp::Max,
+                            VecFpOp::MaxNum,
+                            VecFpOp::Min,
+                            VecFpOp::MinNum,
+                        ] {
+                            let mut actual = Cpu {
+                                fpcr,
+                                fpsr,
+                                ..Cpu::default()
+                            };
+                            actual.vectors[1] = n;
+                            actual.vectors[2] = m;
+                            let mut expected = actual.clone();
+                            let mut fp = Fp::new(&mut expected, FpSize::S).unwrap();
+                            let mut result = 0;
+                            for (half, source) in [n, m].into_iter().enumerate() {
+                                for pair in 0..count {
+                                    let even = get_lane(source, 32, pair * 2);
+                                    let odd = get_lane(source, 32, pair * 2 + 1);
+                                    let value = vec_fp_lane(&mut fp, op, even, odd, 0);
+                                    set_lane(&mut result, 32, half as u32 * count + pair, value);
+                                }
+                            }
+                            expected.vectors[1] = result;
+                            vec_fp_pairwise(&mut actual, op, FpSize::S, q, false, 1, 1, 2).unwrap();
+                            assert_eq!(actual, expected, "{op:?} {q} {n:032x} {m:032x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The exact path raises FPSR.IXC for a rounded sum, difference,
     /// product or quotient and leaves it clear for an exact one; an
