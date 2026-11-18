@@ -260,6 +260,8 @@ pub struct Renderer {
     /// ring, descriptor pool and what they hold until it completes (the
     /// per-draw recording helpers work on it).
     slot: Slot,
+    /// Graphics state remains valid across render passes in one batch.
+    pub(crate) graphics: crate::draw::GraphicsState,
     pub gpu: Gpu,
     /// Held while the queue is used (submissions, presents).
     pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
@@ -729,6 +731,7 @@ impl Renderer {
             queue_lock,
             submitter,
             recording: false,
+            graphics: Default::default(),
             memory_types,
             targets: FastMap::default(),
             uploads: FastMap::default(),
@@ -878,6 +881,7 @@ impl Renderer {
             }
             .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
+            self.graphics.reset();
             if let Some(timer) = self.timer.as_mut() {
                 timer.begin(&self.gpu.device, self.slot.commands, self.slot.fence);
             }

@@ -88,7 +88,7 @@ impl VertexStream {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Blend {
     pub enable: bool,
     pub color: (vk::BlendFactor, vk::BlendFactor, vk::BlendOp),
@@ -146,6 +146,41 @@ pub struct Fixed {
     pub alpha_to_coverage: bool,
     /// The blend constant (SetBlendColor) the CONSTANT factors read.
     pub blend_constants: [f32; 4],
+}
+
+/// The graphics state written to the current Vulkan command buffer.
+#[derive(Default)]
+pub(crate) struct GraphicsState {
+    program: Option<vk::PipelineLayout>,
+    raster: Option<RasterState>,
+    blends: Vec<Blend>,
+}
+
+impl GraphicsState {
+    pub(crate) fn reset(&mut self) {
+        self.program = None;
+        self.raster = None;
+        self.blends.clear();
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct RasterState {
+    viewport: [u32; 6],
+    scissor: [i32; 4],
+    topology: vk::PrimitiveTopology,
+    primitive_restart: bool,
+    cull: vk::CullModeFlags,
+    front_face: vk::FrontFace,
+    polygon_mode: vk::PolygonMode,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: vk::CompareOp,
+    stencil: Option<[StencilFace; 2]>,
+    depth_minus_one_to_one: bool,
+    depth_bias: Option<([u32; 3], bool)>,
+    alpha_to_coverage: bool,
+    blend_constants: [u32; 4],
 }
 
 /// One face's stencil test and update.
@@ -938,28 +973,6 @@ impl Renderer {
         let objects = self.gpu.shader_objects()?.clone();
         let device = self.gpu.device.clone();
         let fixed = &draw.fixed;
-        let stage_bits: Vec<vk::ShaderStageFlags> = program
-            .stages
-            .iter()
-            .map(|stage| stage_flags(stage.stage))
-            .collect();
-        // Graphics stages the program does not use are bound to nothing:
-        // with the mesh feature on, the task and mesh stages too, and a mesh
-        // pipeline's vertex stage.
-        let mut unused = vec![
-            vk::ShaderStageFlags::VERTEX,
-            vk::ShaderStageFlags::TESSELLATION_CONTROL,
-            vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-            vk::ShaderStageFlags::GEOMETRY,
-        ];
-        if self.gpu.mesh_shader.is_some() {
-            unused.extend([
-                vk::ShaderStageFlags::TASK_EXT,
-                vk::ShaderStageFlags::MESH_EXT,
-            ]);
-        }
-        unused.retain(|stage| !stage_bits.contains(stage));
-        let null_shaders = vec![vk::ShaderEXT::null(); unused.len()];
         if draw.mesh.is_some() && self.gpu.mesh_shader.is_none() {
             return Err("the device has no task and mesh stages".into());
         }
@@ -990,23 +1003,6 @@ impl Renderer {
                     .offset(attribute.offset)
             })
             .collect();
-        let count = draw.colors.len().max(1);
-        let blends: Vec<Blend> = (0..count)
-            .map(|index| draw.blends.get(index).copied().unwrap_or_default())
-            .collect();
-        let enables: Vec<u32> = blends.iter().map(|blend| u32::from(blend.enable)).collect();
-        let equations: Vec<_> = blends
-            .iter()
-            .map(|blend| vk::ColorBlendEquationEXT {
-                src_color_blend_factor: blend.color.0,
-                dst_color_blend_factor: blend.color.1,
-                color_blend_op: blend.color.2,
-                src_alpha_blend_factor: blend.alpha.0,
-                dst_alpha_blend_factor: blend.alpha.1,
-                alpha_blend_op: blend.alpha.2,
-            })
-            .collect();
-        let masks: Vec<_> = blends.iter().map(|blend| blend.write_mask).collect();
         let [x, y, width, height, near, far] = fixed.viewport;
         // A negative height (Vulkan 1.1) flips Y; the caller decides.
         // Viewport and scissor are in guest texels; scaled targets have
@@ -1030,6 +1026,45 @@ impl Renderer {
                 width: area[2] as u32,
                 height: area[3] as u32,
             },
+        };
+        let raster = RasterState {
+            viewport: [
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                near,
+                far,
+            ]
+            .map(f32::to_bits),
+            scissor: area,
+            topology: fixed.topology,
+            primitive_restart: fixed.primitive_restart,
+            cull: fixed.cull,
+            front_face: fixed.front_face,
+            polygon_mode: fixed.polygon_mode,
+            depth_test: fixed.depth_test && draw.depth.is_some(),
+            depth_write: fixed.depth_write && draw.depth.is_some(),
+            depth_compare: fixed.depth_compare,
+            stencil: fixed.stencil.filter(|_| {
+                draw.depth
+                    .and_then(|key| self.existing_target(key))
+                    .is_some_and(|target| has_stencil(target.format))
+            }),
+            depth_minus_one_to_one: fixed.depth_minus_one_to_one,
+            depth_bias: fixed.depth_bias.map(|[constant, clamp, slope]| {
+                let clamp = if self.gpu.depth_bias_clamp {
+                    clamp
+                } else {
+                    0.0
+                };
+                (
+                    [constant, clamp, slope].map(f32::to_bits),
+                    fixed.depth_bias_d24,
+                )
+            }),
+            alpha_to_coverage: fixed.alpha_to_coverage,
+            blend_constants: fixed.blend_constants.map(f32::to_bits),
         };
         let rescaling = (!program.push_stages.is_empty()).then(|| {
             let scaled: Vec<bool> = program
@@ -1090,8 +1125,32 @@ impl Renderer {
         }
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
-            objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
-            objects.cmd_bind_shaders(commands, &unused, &null_shaders);
+            if self.graphics.program != Some(program.pipeline_layout) {
+                let stage_bits: Vec<_> = program
+                    .stages
+                    .iter()
+                    .map(|stage| stage_flags(stage.stage))
+                    .collect();
+                // Explicitly unbind graphics stages the program does not use.
+                let stages = [
+                    vk::ShaderStageFlags::VERTEX,
+                    vk::ShaderStageFlags::TESSELLATION_CONTROL,
+                    vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+                    vk::ShaderStageFlags::GEOMETRY,
+                    vk::ShaderStageFlags::TASK_EXT,
+                    vk::ShaderStageFlags::MESH_EXT,
+                ];
+                let enabled = if self.gpu.mesh_shader.is_some() { 6 } else { 4 };
+                let unused: Vec<_> = stages[..enabled]
+                    .iter()
+                    .copied()
+                    .filter(|stage| !stage_bits.contains(stage))
+                    .collect();
+                let null_shaders = [vk::ShaderEXT::null(); 6];
+                objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
+                objects.cmd_bind_shaders(commands, &unused, &null_shaders[..unused.len()]);
+                self.graphics.program = Some(program.pipeline_layout);
+            }
             device.cmd_bind_descriptor_sets(
                 commands,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1134,84 +1193,96 @@ impl Renderer {
             for (index, (buffer, offset)) in vertex_buffers.iter().enumerate() {
                 device.cmd_bind_vertex_buffers(commands, index as u32, &[*buffer], &[*offset]);
             }
-            objects.cmd_set_viewport_with_count(commands, &[viewport]);
-            objects.cmd_set_scissor_with_count(commands, &[scissor]);
-            objects.cmd_set_rasterizer_discard_enable(commands, false);
-            // Required with shader objects whenever depthClamp is enabled.
-            objects.cmd_set_depth_clamp_enable(commands, false);
-            objects.cmd_set_primitive_topology(commands, fixed.topology);
-            objects.cmd_set_primitive_restart_enable(commands, fixed.primitive_restart);
-            objects.cmd_set_cull_mode(commands, fixed.cull);
-            objects.cmd_set_front_face(commands, fixed.front_face);
-            if self.gpu.depth_clip_control {
-                objects
-                    .cmd_set_depth_clip_negative_one_to_one(commands, fixed.depth_minus_one_to_one);
+            if self.graphics.raster.is_none() {
+                objects.cmd_set_rasterizer_discard_enable(commands, false);
+                objects.cmd_set_depth_clamp_enable(commands, false);
+                objects.cmd_set_depth_bounds_test_enable(commands, false);
+                objects.cmd_set_rasterization_samples(commands, vk::SampleCountFlags::TYPE_1);
+                objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
             }
-            objects.cmd_set_polygon_mode(commands, fixed.polygon_mode);
-            objects.cmd_set_rasterization_samples(commands, vk::SampleCountFlags::TYPE_1);
-            objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
-            objects.cmd_set_alpha_to_coverage_enable(commands, fixed.alpha_to_coverage);
-            device.cmd_set_blend_constants(commands, &fixed.blend_constants);
-            objects.cmd_set_depth_bias_enable(commands, fixed.depth_bias.is_some());
-            if let Some([constant, clamp, slope]) = fixed.depth_bias {
-                let clamp = if self.gpu.depth_bias_clamp {
-                    clamp
-                } else {
-                    0.0
-                };
-                match self.gpu.depth_bias_control.as_ref() {
-                    Some(control) if fixed.depth_bias_d24 => {
-                        let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
-                            .depth_bias_representation(
-                                vk::DepthBiasRepresentationEXT::LEAST_REPRESENTABLE_VALUE_FORCE_UNORM,
-                            )
-                            .depth_bias_exact(true);
-                        let info = vk::DepthBiasInfoEXT::default()
-                            .depth_bias_constant_factor(constant)
-                            .depth_bias_clamp(clamp)
-                            .depth_bias_slope_factor(slope)
-                            .push_next(&mut representation);
-                        // Recording (the enclosing block's safety); the
-                        // extension is enabled and `info` outlives the call.
-                        (control.fp().cmd_set_depth_bias2_ext)(commands, &info);
-                    }
-                    _ => self
-                        .gpu
-                        .device
-                        .cmd_set_depth_bias(commands, constant, clamp, slope),
-                }
-            }
-            objects.cmd_set_depth_test_enable(commands, fixed.depth_test && draw.depth.is_some());
-            objects.cmd_set_depth_write_enable(commands, fixed.depth_write && draw.depth.is_some());
-            objects.cmd_set_depth_compare_op(commands, fixed.depth_compare);
-            objects.cmd_set_depth_bounds_test_enable(commands, false);
-            let stencil = fixed.stencil.filter(|_| {
-                draw.depth
-                    .and_then(|key| self.existing_target(key))
-                    .is_some_and(|target| has_stencil(target.format))
-            });
-            objects.cmd_set_stencil_test_enable(commands, stencil.is_some());
-            if let Some(faces) = stencil {
-                for (flags, face) in [
-                    (vk::StencilFaceFlags::FRONT, faces[0]),
-                    (vk::StencilFaceFlags::BACK, faces[1]),
-                ] {
-                    objects.cmd_set_stencil_op(
+            if self.graphics.raster.as_ref() != Some(&raster) {
+                objects.cmd_set_viewport_with_count(commands, &[viewport]);
+                objects.cmd_set_scissor_with_count(commands, &[scissor]);
+                objects.cmd_set_primitive_topology(commands, raster.topology);
+                objects.cmd_set_primitive_restart_enable(commands, raster.primitive_restart);
+                objects.cmd_set_cull_mode(commands, raster.cull);
+                objects.cmd_set_front_face(commands, raster.front_face);
+                if self.gpu.depth_clip_control {
+                    objects.cmd_set_depth_clip_negative_one_to_one(
                         commands,
-                        flags,
-                        face.fail,
-                        face.pass,
-                        face.depth_fail,
-                        face.compare,
+                        raster.depth_minus_one_to_one,
                     );
-                    device.cmd_set_stencil_compare_mask(commands, flags, face.compare_mask);
-                    device.cmd_set_stencil_write_mask(commands, flags, face.write_mask);
-                    device.cmd_set_stencil_reference(commands, flags, face.reference);
                 }
+                objects.cmd_set_polygon_mode(commands, raster.polygon_mode);
+                objects.cmd_set_alpha_to_coverage_enable(commands, raster.alpha_to_coverage);
+                device.cmd_set_blend_constants(commands, &fixed.blend_constants);
+                objects.cmd_set_depth_bias_enable(commands, raster.depth_bias.is_some());
+                if let Some((bias, force_unorm)) = raster.depth_bias {
+                    let [constant, clamp, slope] = bias.map(f32::from_bits);
+                    match self.gpu.depth_bias_control.as_ref() {
+                        Some(control) if force_unorm => {
+                            let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
+                                .depth_bias_representation(
+                                    vk::DepthBiasRepresentationEXT::LEAST_REPRESENTABLE_VALUE_FORCE_UNORM,
+                                )
+                                .depth_bias_exact(true);
+                            let info = vk::DepthBiasInfoEXT::default()
+                                .depth_bias_constant_factor(constant)
+                                .depth_bias_clamp(clamp)
+                                .depth_bias_slope_factor(slope)
+                                .push_next(&mut representation);
+                            (control.fp().cmd_set_depth_bias2_ext)(commands, &info);
+                        }
+                        _ => device.cmd_set_depth_bias(commands, constant, clamp, slope),
+                    }
+                }
+                objects.cmd_set_depth_test_enable(commands, raster.depth_test);
+                objects.cmd_set_depth_write_enable(commands, raster.depth_write);
+                objects.cmd_set_depth_compare_op(commands, raster.depth_compare);
+                objects.cmd_set_stencil_test_enable(commands, raster.stencil.is_some());
+                if let Some(faces) = raster.stencil {
+                    for (flags, face) in [
+                        (vk::StencilFaceFlags::FRONT, faces[0]),
+                        (vk::StencilFaceFlags::BACK, faces[1]),
+                    ] {
+                        objects.cmd_set_stencil_op(
+                            commands,
+                            flags,
+                            face.fail,
+                            face.pass,
+                            face.depth_fail,
+                            face.compare,
+                        );
+                        device.cmd_set_stencil_compare_mask(commands, flags, face.compare_mask);
+                        device.cmd_set_stencil_write_mask(commands, flags, face.write_mask);
+                        device.cmd_set_stencil_reference(commands, flags, face.reference);
+                    }
+                }
+                self.graphics.raster = Some(raster);
             }
-            objects.cmd_set_color_blend_enable(commands, 0, &enables);
-            objects.cmd_set_color_blend_equation(commands, 0, &equations);
-            objects.cmd_set_color_write_mask(commands, 0, &masks);
+            let blends = (0..draw.colors.len().max(1))
+                .map(|index| draw.blends.get(index).copied().unwrap_or_default());
+            if !self.graphics.blends.iter().copied().eq(blends.clone()) {
+                self.graphics.blends.clear();
+                self.graphics.blends.extend(blends);
+                let blends = &self.graphics.blends;
+                let enables: Vec<_> = blends.iter().map(|blend| u32::from(blend.enable)).collect();
+                let equations: Vec<_> = blends
+                    .iter()
+                    .map(|blend| vk::ColorBlendEquationEXT {
+                        src_color_blend_factor: blend.color.0,
+                        dst_color_blend_factor: blend.color.1,
+                        color_blend_op: blend.color.2,
+                        src_alpha_blend_factor: blend.alpha.0,
+                        dst_alpha_blend_factor: blend.alpha.1,
+                        alpha_blend_op: blend.alpha.2,
+                    })
+                    .collect();
+                let masks: Vec<_> = blends.iter().map(|blend| blend.write_mask).collect();
+                objects.cmd_set_color_blend_enable(commands, 0, &enables);
+                objects.cmd_set_color_blend_equation(commands, 0, &equations);
+                objects.cmd_set_color_write_mask(commands, 0, &masks);
+            }
             if let Some(groups) = draw.mesh {
                 let mesh = self.gpu.mesh_shader.as_ref().expect("checked above");
                 match groups {
@@ -1410,7 +1481,7 @@ pub(crate) mod tests {
         // A triangle covering the left half: (-1,-1), (0,-1)... in NDC.
         let positions: [f32; 8] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0];
         let color: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
-        let draw = Draw {
+        let mut draw = Draw {
             program: &program,
             colors: vec![7],
             color_levels: vec![0],
@@ -1473,11 +1544,23 @@ pub(crate) mod tests {
             vertex_fetch: Vec::new(),
         };
         renderer.draw(&draw).unwrap();
+        renderer.draw(&draw).unwrap();
+
+        draw.fixed.scissor = [0, 0, 1, 4];
+        draw.blends[0].write_mask = vk::ColorComponentFlags::R;
+        draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&1.0f32.to_le_bytes());
+        renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();
-        // Left half green, right half still clear.
-        assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
+        // The red-only write reaches the first column, retaining green.
+        assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
         assert_eq!(texels[4 + 1], [0.0, 1.0, 0.0, 1.0]);
         assert_eq!(texels[3], [0.0; 4]);
+
+        // This draw starts a new batch with the same raster and blend state.
+        draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&0.0f32.to_le_bytes());
+        renderer.draw(&draw).unwrap();
+        let texels = renderer.read_target(7).unwrap();
+        assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
         renderer.destroy_program(program).unwrap();
     }
 }
