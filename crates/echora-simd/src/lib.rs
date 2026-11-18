@@ -2788,6 +2788,16 @@ pub fn vec_narrow(
 /// TBL/TBX: byte lookup in the `regs` consecutive registers from Vn (wrapping
 /// at V31). Out-of-range indices give zero (TBL) or keep Vd's byte (TBX).
 pub fn vec_table(cpu: &mut Cpu, q: bool, extend: bool, rd: u8, rn: u8, regs: u8, rm: u8) {
+    #[cfg(target_arch = "x86_64")]
+    if regs <= 4 && std::is_x86_feature_detected!("ssse3") {
+        let indices = cpu.vectors[rm as usize];
+        let keep = extend.then(|| cpu.vectors[rd as usize]);
+        // SAFETY: the host supports the byte shuffle, and `regs` is bounded
+        // by the four table registers the instruction can name.
+        let result = unsafe { vec_table_ssse3(&cpu.vectors, rn, regs, indices, keep) };
+        cpu.vectors[rd as usize] = if q { result } else { u128::from(result as u64) };
+        return;
+    }
     let mut table = [0u8; 64];
     for r in 0..usize::from(regs) {
         let bytes = cpu.vectors[(usize::from(rn) + r) % 32].to_le_bytes();
@@ -2811,6 +2821,38 @@ pub fn vec_table(cpu: &mut Cpu, q: bool, extend: bool, rd: u8, rn: u8, regs: u8,
     } else {
         value & u128::from(u64::MAX)
     };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn vec_table_ssse3(
+    vectors: &[u128; 32],
+    first: u8,
+    regs: u8,
+    indices: u128,
+    keep: Option<u128>,
+) -> u128 {
+    use core::arch::x86_64::*;
+    // SAFETY: every bit pattern is valid, and the byte order matches Vn.
+    let packed = |value| unsafe { core::mem::transmute::<u128, __m128i>(value) };
+    let indices = packed(indices);
+    let groups = _mm_and_si128(indices, _mm_set1_epi8(-16));
+    let mut result = _mm_setzero_si128();
+    for table in 0..regs {
+        let register = (usize::from(first) + usize::from(table)) % vectors.len();
+        // PSHUFB selects by the low four bits. The high nibble selects
+        // which of the guest's table registers supplies each result byte.
+        let selected = _mm_cmpeq_epi8(groups, _mm_set1_epi8((table * 16) as i8));
+        let bytes = _mm_shuffle_epi8(packed(vectors[register]), indices);
+        result = _mm_or_si128(result, _mm_and_si128(selected, bytes));
+    }
+    if let Some(keep) = keep {
+        let limit = _mm_set1_epi8((regs * 16) as i8);
+        let outside = _mm_cmpeq_epi8(_mm_max_epu8(indices, limit), indices);
+        result = _mm_or_si128(result, _mm_and_si128(outside, packed(keep)));
+    }
+    // SAFETY: every pattern is valid as u128 in the same byte order.
+    unsafe { core::mem::transmute::<__m128i, u128>(result) }
 }
 
 const fn precision_format(precision: FpPrecision) -> Format {
@@ -3538,6 +3580,51 @@ mod vector_tests {
             cpu.vectors[0],
             lanes32([1.0f32, 1.0, 1.5, 2.0].map(f32::to_bits))
         );
+    }
+
+    #[test]
+    fn table_lookup_selects_every_byte_and_preserves_out_of_range_lanes() {
+        let mut cpu = Cpu::default();
+        let registers = std::array::from_fn(|register| {
+            u128::from_le_bytes(std::array::from_fn(|lane| (register * 13 + lane) as u8))
+        });
+        let first = 30;
+        let destination = 31;
+        let index_register = 1;
+        for regs in 1..=4 {
+            for extend in [false, true] {
+                for q in [false, true] {
+                    for base in (0..=255).step_by(16) {
+                        cpu.vectors = registers;
+                        let indices = std::array::from_fn(|lane| (base + lane) as u8);
+                        cpu.vectors[index_register] = u128::from_le_bytes(indices);
+                        let before = cpu.vectors;
+                        let expected = std::array::from_fn(|lane| {
+                            let index = usize::from(indices[lane]);
+                            if !q && lane >= 8 {
+                                0
+                            } else if index < usize::from(regs) * 16 {
+                                before[(first + index / 16) % 32].to_le_bytes()[index % 16]
+                            } else if extend {
+                                before[destination].to_le_bytes()[lane]
+                            } else {
+                                0
+                            }
+                        });
+                        vec_table(
+                            &mut cpu,
+                            q,
+                            extend,
+                            destination as u8,
+                            first as u8,
+                            regs,
+                            index_register as u8,
+                        );
+                        assert_eq!(cpu.vectors[destination], u128::from_le_bytes(expected));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
