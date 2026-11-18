@@ -5996,7 +5996,38 @@ pub fn emit_rust_split_to_regions<E>(
          /// Registers the window table used for direct calls between windows.\n\
          pub fn install() {{\n    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n}}\n\n\
          /// Runs translated code from `m.cpu.pc` until its window returns or traps.\n\
-         pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    match pc >> {SPLIT_WINDOW_BITS} {{\n"
+         pub fn dispatch(m: &mut Core) -> Result<(), Trap> {{\n    let pc = m.cpu.pc;\n    let window = pc >> {SPLIT_WINDOW_BITS};\n"
+    );
+    let first = windows.first().map_or(0, |(index, _)| *index);
+    let last = windows.last().map_or(first, |(index, _)| *index);
+    let span = last - first + 1;
+    // A dense slot costs half a sorted entry. Bound its memory by the
+    // size of WINDOWS on this host, even for large gaps between modules.
+    if let Ok(span) = usize::try_from(span)
+        && span <= windows.len().saturating_mul(2)
+    {
+        writeln!(
+            root,
+            r#"    static DENSE: std::sync::OnceLock<Vec<Option<WindowFn>>> = std::sync::OnceLock::new();
+    const FIRST: u64 = {first:#x};
+    let dense = DENSE.get_or_init(|| {{
+        let mut entries = vec![None; {span}];
+        for &(index, run) in WINDOWS {{
+            entries[(index - FIRST) as usize] = Some(run);
+        }}
+        entries
+    }});
+    let index = usize::try_from(window.wrapping_sub(FIRST)).unwrap_or(usize::MAX);
+    let run = dense.get(index).copied().flatten();"#
+        )
+        .unwrap();
+    } else {
+        root.push_str(
+            "    let run = WINDOWS.binary_search_by_key(&window, |&(index, _)| index)\n        .ok().map(|index| WINDOWS[index].1);\n",
+        );
+    }
+    root.push_str(
+        "    match run {\n        Some(run) => run(m),\n        None => Err(Trap::MissingBlock { pc }),\n    }\n}\n",
     );
     let plain_header = format!(
         "// Generated from user-provided executable bytes. Keep this file local.\n#[allow(unused_imports)]\nuse echora_guest::cpu;\nuse echora_guest::{{Core as Machine, Trap}};\n{AT_HELPER}"
@@ -6076,11 +6107,6 @@ pub fn emit_rust_split_to_regions<E>(
     };
     for (window, _) in &windows {
         let region = window >> shift;
-        writeln!(
-            root,
-            "        {window:#x} => gen_r_{region:x}::run_window_{window:x}(m),"
-        )
-        .unwrap();
         if regions_seen.last() != Some(&region) {
             regions_seen.push(region);
         }
@@ -6264,7 +6290,6 @@ pub fn emit_rust_split_to_regions<E>(
             })?;
         }
     }
-    root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
     for (window, _) in &windows {
@@ -6569,6 +6594,23 @@ mod tests {
             name: "synthetic".into(),
             base: 0x1000,
             bytes: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        }
+    }
+
+    #[test]
+    fn split_root_uses_an_index_only_when_the_windows_are_dense() {
+        let first = region(&[0xd65f_03c0]); // RET
+        for (base, dense) in [(0x1800, true), (0x1_0000_0000, false)] {
+            let second = CodeRegion {
+                base,
+                ..first.clone()
+            };
+            let translation = discover(&[first.clone(), second], &[first.base, base], 2).unwrap();
+            let (root, _) = emit_rust_split(&translation, 16);
+            assert_eq!(root.contains("DENSE.get_or_init"), dense);
+            assert_ne!(root.contains("WINDOWS.binary_search_by_key"), dense);
+            assert_eq!(root.matches("::run_window_").count(), 2);
+            assert!(root.contains("Err(Trap::MissingBlock { pc })"));
         }
     }
 
