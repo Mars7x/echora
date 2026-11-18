@@ -5668,27 +5668,21 @@ impl Worker {
         // A call made under the machine lock (present) finishes it here
         // first, a piece at a time with only this lock held, so the machine
         // lock is not held over the replay.
-        let machine_call = matches!(
-            nvn.entry(pc),
-            Some(crate::nvn::HostEntry::Proc(name)) if locked_nvn_call(&name)
-        );
+        let proc_name = |nvn: &crate::nvn::Nvn| match nvn.entry(pc) {
+            Some(crate::nvn::HostEntry::Proc(name)) => Some(name),
+            _ => None,
+        };
+        let name = proc_name(&nvn);
+        let machine_call = name.is_some_and(locked_nvn_call);
         // With a replay thread, only calls that need the work's results
         // (or change what it reads) finish it first; others go on.
         let thread = crate::nvn::Nvn::replay_thread();
         let settle = machine_call
-            || (thread
-                && matches!(
-                    nvn.entry(pc),
-                    Some(crate::nvn::HostEntry::Proc(name))
-                        if needs_replayed(&nvn, name, &self.core.cpu.regs)
-                ));
+            || (thread && name.is_some_and(|name| needs_replayed(&nvn, name, &self.core.cpu.regs)));
         // A queued present waits only for the previous present's work.
         let queued_present = machine_call
             && crate::nvn::Nvn::present_queued_mode()
-            && matches!(
-                nvn.entry(pc),
-                Some(crate::nvn::HostEntry::Proc(name)) if name == "nvnQueuePresentTexture"
-            );
+            && name == Some("nvnQueuePresentTexture");
         let waited = (thread && settle && nvn.replay_paused()).then(std::time::Instant::now);
         while crate::nvn::Nvn::replay_async()
             && nvn.replay_paused()
@@ -5713,24 +5707,22 @@ impl Worker {
             shared.hand_nvn_over();
             nvn = shared.lock_nvn();
         }
-        if let Some(waited) = waited {
-            if let Some(crate::nvn::HostEntry::Proc(name)) = nvn.entry(pc) {
-                nvn.note_replay_wait(&name, waited.elapsed());
-            }
+        // A thunk name is immutable once published. If it was missing,
+        // it may have been published while the lock was released.
+        let name = name.or_else(|| proc_name(&nvn));
+        if let Some((waited, name)) = waited.zip(name) {
+            nvn.note_replay_wait(name, waited.elapsed());
         }
         // A read of what programs stored through the page table, or a wait
         // on a fence: the GPU work it waits for finishes without the NVN
         // state held, so the replay goes on meanwhile.
-        let gpu_wait = match nvn.entry(pc) {
-            Some(crate::nvn::HostEntry::Proc(name)) if thread => match name {
-                "nvnMemoryPoolInvalidateMappedRange" => Some(None),
-                "nvnSyncWait" => Some(Some(self.core.cpu.regs[0])),
-                _ => None,
-            },
+        let gpu_wait = match name.filter(|_| thread) {
+            Some("nvnMemoryPoolInvalidateMappedRange") => Some(None),
+            Some("nvnSyncWait") => Some(Some(self.core.cpu.regs[0])),
             _ => None,
         };
-        let pre_wait = std::time::Instant::now();
         if let Some(sync) = gpu_wait {
+            let pre_wait = std::time::Instant::now();
             // The replay may record more while the lock is free: a few
             // rounds, so what the call itself waits for has finished.
             for _ in 0..3 {
@@ -5770,8 +5762,6 @@ impl Worker {
                     }
                 }
             }
-        }
-        if gpu_wait.is_some() {
             crate::timeline::span(
                 self.core.current_thread_id,
                 "gpu-wait-before-call",
@@ -5779,7 +5769,9 @@ impl Worker {
                 std::time::Instant::now(),
             );
         }
-        let mut made = self.held_nvn_call_locked(&mut nvn, pc);
+        let mut made = name
+            .filter(|name| !locked_nvn_call(name))
+            .is_some_and(|name| self.held_nvn_call_locked(&mut nvn, name));
         if thread && nvn.replay_paused() {
             shared.wake_replay();
         }
@@ -5809,15 +5801,12 @@ impl Worker {
             }
         }
         if thread {
-            let name = match nvn.entry(pc) {
-                Some(crate::nvn::HostEntry::Proc(name)) => name,
-                _ => "other".into(),
-            };
-            nvn.note_held(&name, locked.elapsed().saturating_sub(released + rewaited));
+            let name = name.unwrap_or("other");
+            nvn.note_held(name, locked.elapsed().saturating_sub(released + rewaited));
             if crate::timeline::on() {
                 let who = self.core.current_thread_id;
                 crate::timeline::span(who, "nvn-lock-wait", asked, locked);
-                crate::timeline::span(who, &name, locked, std::time::Instant::now());
+                crate::timeline::span(who, name, locked, std::time::Instant::now());
             }
         }
         drop(nvn);
@@ -5830,23 +5819,19 @@ impl Worker {
     }
 
     /// `held_nvn_call` with the NVN state locked.
-    fn held_nvn_call_locked(&mut self, nvn: &mut crate::nvn::Nvn, pc: u64) -> bool {
-        let Some(crate::nvn::HostEntry::Proc(name)) = nvn.entry(pc) else {
-            return false;
-        };
-        if locked_nvn_call(&name) {
-            return false;
-        }
+    fn held_nvn_call_locked(&mut self, nvn: &mut crate::nvn::Nvn, name: &'static str) -> bool {
         self.core.settle_block_trap();
         let counter = self.core.physical_counter_ticks();
-        let started = std::time::Instant::now();
+        let started = crate::nvn::debug_var_os("ECHORA_NVN_PROFILE")
+            .is_some()
+            .then(std::time::Instant::now);
         let outcome = {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
                 counter: Some(counter),
             };
-            nvn.call(&name, &mut guest)
+            nvn.call(name, &mut guest)
         };
         match outcome {
             Ok(true) => {
@@ -5857,7 +5842,7 @@ impl Worker {
                         nvn.calls.insert(name.to_string(), 1);
                     }
                 }
-                if crate::nvn::debug_var_os("ECHORA_NVN_PROFILE").is_some() {
+                if let Some(started) = started {
                     *nvn.call_microseconds.entry(name.to_string()).or_default() +=
                         started.elapsed().as_micros() as u64;
                 }
