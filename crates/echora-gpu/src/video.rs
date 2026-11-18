@@ -172,10 +172,12 @@ impl VideoDevice {
         }
         let extensions: Vec<_> = EXTENSIONS.iter().map(|name| name.as_ptr()).collect();
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
-            .push_next(&mut features13);
+            .push_next(&mut features13)
+            .push_next(&mut features12);
         // SAFETY: valid create info; the device is destroyed in Drop.
         let device = match unsafe { instance.create_device(physical, &info, None) } {
             Ok(device) => device,
@@ -243,25 +245,47 @@ impl VideoDevice {
         &self,
         queue: &Mutex<vk::Queue>,
         command: vk::CommandBuffer,
-        fence: vk::Fence,
+        sync: &mut VideoSync,
     ) -> Result<(), String> {
+        // Both queues access the decoded output. A fence waits on the host;
+        // the timeline makes writes and layout transitions visible to the
+        // next submit, including when it uses a different queue.
+        let at = |value| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(sync.timeline)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        };
+        let next = sync.value + 1;
+        let wait = [at(sync.value)];
+        let signal = [at(next)];
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
+        let submit = [vk::SubmitInfo2::default()
+            .command_buffer_infos(&commands)
+            .wait_semaphore_infos(&wait)
+            .signal_semaphore_infos(&signal)];
         let queue = queue.lock().unwrap_or_else(|poison| poison.into_inner());
         // SAFETY: the queue is held; the command buffer is recorded and the
         // fence unsignaled.
         unsafe {
             self.device
-                .reset_fences(&[fence])
+                .reset_fences(&[sync.fence])
                 .map_err(vk_error("vkResetFences"))?;
             self.device
-                .queue_submit2(*queue, &submit, fence)
+                .queue_submit2(*queue, &submit, sync.fence)
                 .map_err(vk_error("vkQueueSubmit2 (video)"))?;
         }
+        sync.value = next;
+        sync.pending = true;
         drop(queue);
         // SAFETY: the fence belongs to this device.
-        unsafe { self.device.wait_for_fences(&[fence], true, 5_000_000_000) }
-            .map_err(vk_error("vkWaitForFences (video)"))
+        unsafe {
+            self.device
+                .wait_for_fences(&[sync.fence], true, 5_000_000_000)
+        }
+        .map_err(vk_error("vkWaitForFences (video)"))?;
+        sync.pending = false;
+        Ok(())
     }
 }
 
@@ -430,8 +454,8 @@ pub struct Av1Frame<'a> {
     /// Every DPB slot `reference_name_slot_indices` names, with the
     /// reference information the parser keeps for it.
     pub references: &'a [(u32, StdVideoDecodeAV1ReferenceInfo)],
-    /// The slot this picture is decoded into, and its reference information
-    /// there. It becomes the picture later frames (and `read_nv12`) read.
+    /// The slot receiving the reconstructed picture and its reference
+    /// information. `read_nv12` returns the decode output for that slot.
     pub slot: u32,
     pub slot_info: StdVideoDecodeAV1ReferenceInfo,
 }
@@ -445,8 +469,8 @@ pub fn nv12_size(height: u32, pitch: u32) -> usize {
     pitch as usize * (height as usize + height.div_ceil(2) as usize)
 }
 
-/// An AV1 decode session: the DPB (an image per slot, that decoded
-/// pictures are also written to), the bitstream buffer and a
+/// An AV1 decode session: the DPB, optional separate output images,
+/// the bitstream buffer and a
 /// read-back buffer. Decoding is synchronous: each call waits for the GPU.
 pub struct Av1Decoder {
     video: Arc<VideoDevice>,
@@ -456,6 +480,9 @@ pub struct Av1Decoder {
     parameters: vk::VideoSessionParametersKHR,
     /// The DPB, one image per slot.
     pictures: Vec<DpbPicture>,
+    /// A separate decode output for each slot when the device requires
+    /// it. A later AV1 show-existing instruction can still read it back.
+    outputs: Vec<DpbPicture>,
     bitstream: Mapped,
     size_alignment: u64,
     readback: Mapped,
@@ -463,12 +490,20 @@ pub struct Av1Decoder {
     transfer_pool: vk::CommandPool,
     decode_command: vk::CommandBuffer,
     transfer_command: vk::CommandBuffer,
-    fence: vk::Fence,
+    sync: VideoSync,
     /// No picture was decoded yet: the DPB layers are uninitialized and the
     /// session needs a reset.
     fresh: bool,
     /// Each slot's picture size, once a picture is decoded into it.
     decoded: [Option<vk::Extent2D>; SLOTS as usize],
+}
+
+#[derive(Default)]
+struct VideoSync {
+    timeline: vk::Semaphore,
+    value: u64,
+    fence: vk::Fence,
+    pending: bool,
 }
 
 /// A host-visible buffer, persistently mapped.
@@ -585,9 +620,6 @@ impl Av1Decoder {
     /// A session for pictures up to `width` x `height`.
     pub fn new(video: Arc<VideoDevice>, width: u32, height: u32) -> Result<Self, String> {
         let capabilities = av1_capabilities(&video)?;
-        if !capabilities.coincide {
-            return Err("the device cannot decode into its DPB (DPB_AND_OUTPUT_COINCIDE)".into());
-        }
         if capabilities.max_dpb_slots < SLOTS || capabilities.max_active_references < 7 {
             return Err(format!(
                 "the device keeps {} DPB slots and {} references; AV1 needs {SLOTS} and 7",
@@ -606,17 +638,42 @@ impl Av1Decoder {
                 max.width, max.height
             ));
         }
-        let usage =
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
-        let format = *picture_formats(&video, usage)?
-            .first()
-            .ok_or("no picture format decodes AV1 into the DPB")?;
+        let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
+        let dst = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
+        let copy = vk::ImageUsageFlags::TRANSFER_SRC;
+        let choose = |usage, readback: bool| {
+            picture_formats(&video, usage).map(|formats| {
+                formats.into_iter().find(|format| {
+                    format.tiling != vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+                        && format.usage.contains(usage)
+                        && (!readback
+                            || (format.format == vk::Format::G8_B8R8_2PLANE_420_UNORM
+                                && format.usage.contains(copy)))
+                })
+            })
+        };
+        let combined = if capabilities.coincide {
+            choose(dpb | dst, true)?
+        } else {
+            None
+        };
+        let (format, output) = match combined {
+            Some(format) => ((format, dpb | dst | copy), None),
+            None if capabilities.distinct => {
+                let reference =
+                    choose(dpb, false)?.ok_or("no picture format for AV1 references")?;
+                let output = choose(dst, true)?.ok_or("no readable NV12 AV1 output format")?;
+                ((reference, dpb), Some((output, dst | copy)))
+            }
+            None => return Err("no readable NV12 format for AV1 output in the DPB".into()),
+        };
         let mut decoder = Self {
             extent,
             session: vk::VideoSessionKHR::null(),
             session_memory: Vec::new(),
             parameters: vk::VideoSessionParametersKHR::null(),
             pictures: Vec::new(),
+            outputs: Vec::new(),
             bitstream: Mapped::NONE,
             size_alignment: capabilities.bitstream_size_alignment.max(1),
             readback: Mapped::NONE,
@@ -624,12 +681,12 @@ impl Av1Decoder {
             transfer_pool: vk::CommandPool::null(),
             decode_command: vk::CommandBuffer::null(),
             transfer_command: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
+            sync: VideoSync::default(),
             fresh: true,
             decoded: [None; SLOTS as usize],
             video,
         };
-        decoder.create(format, &capabilities)?;
+        decoder.create(format, output, &capabilities)?;
         Ok(decoder)
     }
 
@@ -637,7 +694,8 @@ impl Av1Decoder {
     /// made if this fails part way).
     fn create(
         &mut self,
-        format: PictureFormat,
+        reference: (PictureFormat, vk::ImageUsageFlags),
+        output: Option<(PictureFormat, vk::ImageUsageFlags)>,
         capabilities: &Av1Capabilities,
     ) -> Result<(), String> {
         let video = self.video.clone();
@@ -647,9 +705,9 @@ impl Av1Decoder {
             let info = vk::VideoSessionCreateInfoKHR::default()
                 .queue_family_index(video.decode_family)
                 .video_profile(profile)
-                .picture_format(format.format)
+                .picture_format(output.map_or(reference.0.format, |(format, _)| format.format))
                 .max_coded_extent(self.extent)
-                .reference_picture_format(format.format)
+                .reference_picture_format(reference.0.format)
                 .max_dpb_slots(SLOTS)
                 .max_active_reference_pictures(7)
                 .std_header_version(&capabilities.std_header_version);
@@ -715,72 +773,12 @@ impl Av1Decoder {
         .result()
         .map_err(vk_error("vkBindVideoSessionMemoryKHR"))?;
 
-        // The DPB: an image per slot (separate reference images), also read
-        // back by the copy queue. One array image would do on paper, but
-        // RADV reads and writes a picture's chroma plane in array layers
-        // past the first at the wrong place.
         if !capabilities.separate_images {
             return Err("the device keeps DPB pictures only in one image".into());
         }
-        let families = [video.decode_family, video.transfer_family];
-        let concurrent = families[0] != families[1];
-        for _ in 0..SLOTS {
-            let mut picture = DpbPicture::NONE;
-            let created = with_profile(|profile| {
-                let profiles = [*profile];
-                let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-                let mut info = vk::ImageCreateInfo::default()
-                    .flags(format.create_flags)
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format.format)
-                    .extent(vk::Extent3D {
-                        width: self.extent.width,
-                        height: self.extent.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(format.tiling)
-                    .usage(
-                        vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                            | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-                            | vk::ImageUsageFlags::TRANSFER_SRC,
-                    )
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .push_next(&mut list);
-                if concurrent {
-                    info = info
-                        .sharing_mode(vk::SharingMode::CONCURRENT)
-                        .queue_family_indices(&families);
-                }
-                // SAFETY: valid create info; destroyed in Drop.
-                unsafe { device.create_image(&info, None) }
-            });
-            // Kept before anything can fail, so Drop releases it.
-            let image = created.map_err(vk_error("vkCreateImage (DPB)"))?;
-            picture.image = image;
-            self.pictures.push(picture);
-            let picture = self.pictures.last_mut().ok_or("no DPB picture")?;
-            // SAFETY: a live image.
-            let requirements = unsafe { device.get_image_memory_requirements(image) };
-            picture.memory = video.allocate_local(requirements)?;
-            // SAFETY: fresh memory of the size the image asks for.
-            unsafe { device.bind_image_memory(image, picture.memory, 0) }
-                .map_err(vk_error("vkBindImageMemory (DPB)"))?;
-            let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(
-                vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                    | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
-            );
-            let info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format.format)
-                .subresource_range(color_layers(0, 1))
-                .push_next(&mut view_usage);
-            // SAFETY: valid create info; destroyed in Drop.
-            picture.view = unsafe { device.create_image_view(&info, None) }
-                .map_err(vk_error("vkCreateImageView (DPB)"))?;
+        Self::create_pictures(&video, self.extent, reference, &mut self.pictures)?;
+        if let Some(output) = output {
+            Self::create_pictures(&video, self.extent, output, &mut self.outputs)?;
         }
 
         self.readback = Mapped::new(
@@ -816,9 +814,89 @@ impl Av1Decoder {
             *command = unsafe { device.allocate_command_buffers(&info) }
                 .map_err(vk_error("vkAllocateCommandBuffers (video)"))?[0];
         }
-        // SAFETY: valid create info; destroyed in Drop.
-        self.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(vk_error("vkCreateFence (video)"))?;
+        let mut timeline =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        // SAFETY: valid create info; both handles are destroyed in Drop.
+        unsafe {
+            self.sync.timeline = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                    None,
+                )
+                .map_err(vk_error("vkCreateSemaphore (video)"))?;
+            self.sync.fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(vk_error("vkCreateFence (video)"))?;
+        }
+        Ok(())
+    }
+
+    /// A separate image per slot. Images copied to the host are shared
+    /// with the transfer queue as well as the decode queue.
+    fn create_pictures(
+        video: &VideoDevice,
+        extent: vk::Extent2D,
+        (format, usage): (PictureFormat, vk::ImageUsageFlags),
+        pictures: &mut Vec<DpbPicture>,
+    ) -> Result<(), String> {
+        let device = &video.device;
+        let families = [video.decode_family, video.transfer_family];
+        let concurrent =
+            families[0] != families[1] && usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        for _ in 0..SLOTS {
+            let created = with_profile(|profile| {
+                let profiles = [*profile];
+                let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+                let mut info = vk::ImageCreateInfo::default()
+                    .flags(format.create_flags)
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format.format)
+                    .extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(format.tiling)
+                    .usage(usage)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .push_next(&mut list);
+                if concurrent {
+                    info = info
+                        .sharing_mode(vk::SharingMode::CONCURRENT)
+                        .queue_family_indices(&families);
+                }
+                // SAFETY: valid create info; destroyed in Drop.
+                unsafe { device.create_image(&info, None) }
+            });
+            // Kept before anything else can fail, so Drop releases it.
+            let image = created.map_err(vk_error("vkCreateImage (video picture)"))?;
+            pictures.push(DpbPicture {
+                image,
+                ..DpbPicture::NONE
+            });
+            let picture = pictures.last_mut().ok_or("no video picture")?;
+            // SAFETY: a live image.
+            let requirements = unsafe { device.get_image_memory_requirements(image) };
+            picture.memory = video.allocate_local(requirements)?;
+            // SAFETY: fresh memory of the size the image asks for.
+            unsafe { device.bind_image_memory(image, picture.memory, 0) }
+                .map_err(vk_error("vkBindImageMemory (video picture)"))?;
+            let video_usage = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
+            let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(usage & video_usage);
+            let info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format.format)
+                .subresource_range(color_layers(0, 1))
+                .push_next(&mut view_usage);
+            // SAFETY: valid create info; destroyed in Drop.
+            picture.view = unsafe { device.create_image_view(&info, None) }
+                .map_err(vk_error("vkCreateImageView (video picture)"))?;
+        }
         Ok(())
     }
 
@@ -826,6 +904,9 @@ impl Av1Decoder {
     /// the session parameters for the frames that follow. Pointers inside
     /// `header` need only be valid for the call.
     pub fn set_sequence(&mut self, header: &StdVideoAV1SequenceHeader) -> Result<(), String> {
+        if self.sync.pending {
+            return Err("previous video submission did not complete".into());
+        }
         let device = &self.video.device;
         let functions = self.video.video.fp();
         let mut av1 =
@@ -871,6 +952,9 @@ impl Av1Decoder {
 
     /// Decodes `frame` into its slot and waits for it.
     pub fn decode(&mut self, frame: &Av1Frame) -> Result<(), String> {
+        if self.sync.pending {
+            return Err("previous video submission did not complete".into());
+        }
         if self.parameters == vk::VideoSessionParametersKHR::null() {
             return Err("AV1 frame before a sequence header".into());
         }
@@ -945,6 +1029,9 @@ impl Av1Decoder {
             .map(|(slot, _, decoded)| self.picture_resource(*slot, *decoded))
             .collect();
         let target = self.picture_resource(frame.slot, extent);
+        let separate_output = self.outputs.get(frame.slot as usize);
+        let output =
+            separate_output.map_or(target, |output| target.image_view_binding(output.view));
         let mut slot_infos: Vec<_> = references
             .iter()
             .map(|(_, info, _)| {
@@ -993,7 +1080,7 @@ impl Av1Decoder {
         let decode = vk::VideoDecodeInfoKHR::default()
             .src_buffer(self.bitstream.buffer)
             .src_buffer_range(range)
-            .dst_picture_resource(target)
+            .dst_picture_resource(output)
             .setup_reference_slot(&setup)
             .reference_slots(&slots)
             .push_next(&mut picture);
@@ -1040,6 +1127,23 @@ impl Av1Decoder {
                     &vk::DependencyInfo::default().image_memory_barriers(&barrier),
                 );
             }
+            if let Some(output) =
+                separate_output.filter(|_| self.decoded[frame.slot as usize].is_none())
+            {
+                let barrier = [vk::ImageMemoryBarrier2::default()
+                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+                    .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::VIDEO_DECODE_DST_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(output.image)
+                    .subresource_range(color_layers(0, 1))];
+                device.cmd_pipeline_barrier2(
+                    command,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+                );
+            }
             (functions.cmd_begin_video_coding_khr)(command, &begin);
             if self.fresh {
                 let control = vk::VideoCodingControlInfoKHR::default()
@@ -1053,7 +1157,7 @@ impl Av1Decoder {
                 .map_err(vk_error("vkEndCommandBuffer (video)"))?;
         }
         self.video
-            .submit(&self.video.decode_queue, command, self.fence)?;
+            .submit(&self.video.decode_queue, command, &mut self.sync)?;
         self.fresh = false;
         self.decoded[frame.slot as usize] = Some(extent);
         Ok(())
@@ -1071,6 +1175,9 @@ impl Av1Decoder {
     /// Copies the picture in `slot` into `out` as NV12 with rows `pitch`
     /// bytes apart (`nv12_size(height, pitch)` bytes).
     pub fn read_nv12(&mut self, slot: u32, pitch: u32, out: &mut [u8]) -> Result<(), String> {
+        if self.sync.pending {
+            return Err("previous video submission did not complete".into());
+        }
         let extent = self
             .decoded
             .get(slot as usize)
@@ -1097,7 +1204,14 @@ impl Av1Decoder {
                 true,
             )?;
         }
-        let image = self.pictures[slot as usize].image;
+        let (image, layout) = if let Some(output) = self.outputs.get(slot as usize) {
+            (output.image, vk::ImageLayout::VIDEO_DECODE_DST_KHR)
+        } else {
+            (
+                self.pictures[slot as usize].image,
+                vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            )
+        };
         let layer = |aspect| {
             vk::ImageSubresourceLayers::default()
                 .aspect_mask(aspect)
@@ -1132,19 +1246,13 @@ impl Av1Decoder {
                 .image(image)
                 .subresource_range(color_layers(0, 1))
         };
-        // The decode that wrote the picture was waited for, so the copy
-        // needs only the layout changes around it.
-        let to_copy = [transition(
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )
-        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
-        let back = [transition(
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-        )
-        .src_stage_mask(vk::PipelineStageFlags2::COPY)];
+        // The semaphore wait orders the layout change after decoding.
+        let to_copy = [transition(layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+        let back = [transition(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, layout)
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)];
         let host = [vk::BufferMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -1187,7 +1295,7 @@ impl Av1Decoder {
                 .map_err(vk_error("vkEndCommandBuffer (video)"))?;
         }
         self.video
-            .submit(&self.video.transfer_queue, command, self.fence)?;
+            .submit(&self.video.transfer_queue, command, &mut self.sync)?;
         if !self.readback.coherent {
             let range = vk::MappedMemoryRange::default()
                 .memory(self.readback.memory)
@@ -1231,20 +1339,28 @@ impl Drop for Av1Decoder {
         let video = self.video.clone();
         let device = &video.device;
         let functions = video.video.fp();
+        if self.sync.pending {
+            // SAFETY: this fence still belongs to a submission. Keep its
+            // resources live after a timed-out decode or copy.
+            let _ = unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) };
+        }
         self.bitstream.destroy(&video);
         self.readback.destroy(&video);
         // SAFETY: every submission was waited for, so nothing below is in
         // use; null handles are skipped.
         unsafe {
-            if self.fence != vk::Fence::null() {
-                device.destroy_fence(self.fence, None);
+            if self.sync.fence != vk::Fence::null() {
+                device.destroy_fence(self.sync.fence, None);
+            }
+            if self.sync.timeline != vk::Semaphore::null() {
+                device.destroy_semaphore(self.sync.timeline, None);
             }
             for pool in [self.decode_pool, self.transfer_pool] {
                 if pool != vk::CommandPool::null() {
                     device.destroy_command_pool(pool, None);
                 }
             }
-            for picture in self.pictures.drain(..) {
+            for picture in self.pictures.drain(..).chain(self.outputs.drain(..)) {
                 if picture.view != vk::ImageView::null() {
                     device.destroy_image_view(picture.view, None);
                 }

@@ -122,16 +122,18 @@ Notes on values:
 - `VideoDevice` is a Vulkan device of its own with a decode queue and a
   copy queue, so movie decoding never shares a queue with the renderer.
   On RADV the decode family cannot copy.
-- The session is AV1 Main, 8-bit 4:2:0, without film grain. The DPB is
-  nine images, one per slot, which also hold the output pictures
-  (`DPB_AND_OUTPUT_COINCIDE`). An array image would be one allocation,
-  but RADV 25.2 misplaces the chroma plane of layers past the first.
+- The session is AV1 Main, 8-bit 4:2:0, without film grain. The DPB has
+  nine images, one per slot. Devices that support `DPB_AND_OUTPUT_COINCIDE`
+  can also use those images for decode output. With `DPB_AND_OUTPUT_DISTINCT`,
+  each slot has a separate NV12 output image, retained for AV1's
+  show-existing-frame operation.
 - `MovieDecoder` keeps the DPB slots by `PictureId`, maps the AV1 slots
   of `reference_name_slot_indices` to DPB slots, and reads shown pictures
   back as NV12 at the guest's pitch. It refuses film grain and superres,
   so the caller falls back to rav1d.
-- Submissions are decoded in order on a decoder thread; a picture is
-  waited for when its pixels are first read.
+- The decoder thread submits frames in order. A timeline semaphore orders
+  decode and copy submissions across queues. The thread waits on a fence
+  before reusing a command buffer or reading copied pixels on the CPU.
 - The game's movies decode this way by default; `ECHORA_VIDEO_DECODE=cpu`
   (or `rav1d`) decodes them with rav1d instead. If the device has no AV1
   decode, or a decode fails, that movie continues on rav1d, and the log
@@ -141,6 +143,11 @@ Notes on values:
   planes; `AV1_CHECK_HIDDEN=1` compares hidden frames too (rav1d's
   invisible-frame output). All 26 of the game's movies, 83,449 pictures,
   decode identically, at 2 to 4 ms per 1080p picture on an RX 9070 XT.
+  The separate-output path on the same GPU with RADV 26.2.7 matched rav1d
+  across 1,371 checked startup pictures, including hidden frames. In two
+  release comparisons of 240 pictures from the longer startup clip,
+  decoding and reading back a picture took 2.4 ms on the GPU versus
+  3.3 ms on the CPU.
 
 ## Tests
 

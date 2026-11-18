@@ -299,6 +299,42 @@ mod tests {
     }
 
     #[test]
+    fn native_decoder_matches_rav1d_on_an_inter_frame_stream() {
+        use echora_gpu::video::{SLOTS, VideoDevice, av1_capabilities, nv12_size};
+        use echora_gpu::video_av1::MovieDecoder;
+
+        let Ok(device) = VideoDevice::new() else {
+            return;
+        };
+        let capabilities = av1_capabilities(&device).unwrap();
+        if !capabilities.separate_images
+            || capabilities.max_dpb_slots < SLOTS
+            || capabilities.max_active_references < 7
+        {
+            return;
+        }
+        let mut native = MovieDecoder::new(device);
+        let mut cpu = Decoder::new().unwrap();
+        let ivf = include_bytes!("../../echora-av1/tests/vectors/av1-1-b8-06-mfmv.ivf");
+        let (_, frames) = echora_av1::ivf::parse_ivf(ivf).unwrap();
+        let mut compared = 0;
+        for frame in frames {
+            let gpu_pictures = native.decode(frame.data).unwrap();
+            let cpu_pictures = cpu.decode(frame.data).unwrap();
+            assert_eq!(gpu_pictures.len(), cpu_pictures.len());
+            for (gpu, cpu) in gpu_pictures.into_iter().zip(cpu_pictures) {
+                assert_eq!((gpu.width, gpu.height), (cpu.width, cpu.height));
+                let pitch = gpu.width.next_multiple_of(2);
+                let mut actual = vec![0; nv12_size(gpu.height, pitch)];
+                native.read_nv12(gpu, pitch, &mut actual).unwrap();
+                assert!(actual == cpu.nv12, "NV12 differs at picture {compared}");
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 4);
+    }
+
+    #[test]
     fn gray_converts_to_gray() {
         let picture = Picture {
             width: 2,

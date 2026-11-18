@@ -69,6 +69,7 @@ fn main() {
     let (mut compared, mut differing) = (0usize, 0usize);
     let started = std::time::Instant::now();
     let mut gpu_time = std::time::Duration::ZERO;
+    let mut cpu_time = std::time::Duration::ZERO;
     for (index, unit) in units.iter().enumerate() {
         if compared >= limit {
             break;
@@ -91,7 +92,10 @@ fn main() {
             gpu_pictures.push_back((picture.width, picture.height, out));
         }
         gpu_time += begun.elapsed();
-        match cpu.decode(unit) {
+        let begun = std::time::Instant::now();
+        let pictures = cpu.decode(unit);
+        cpu_time += begun.elapsed();
+        match pictures {
             Ok(pictures) => cpu_pictures.extend(pictures),
             Err(error) => {
                 println!("unit {index}: rav1d failed: {error}");
@@ -141,8 +145,9 @@ fn main() {
         }
     }
     println!(
-        "{compared} pictures compared, {differing} differ; GPU {:.1} ms per picture, total {:.1} s",
+        "{compared} pictures compared, {differing} differ; GPU {:.1} ms and CPU {:.1} ms per picture, total {:.1} s",
         gpu_time.as_secs_f64() * 1000.0 / compared.max(1) as f64,
+        cpu_time.as_secs_f64() * 1000.0 / compared.max(1) as f64,
         started.elapsed().as_secs_f64()
     );
     std::process::exit(i32::from(differing != 0 || compared == 0));
