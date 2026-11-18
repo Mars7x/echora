@@ -4905,17 +4905,13 @@ struct Shared<'a> {
     replay_failed: std::sync::Mutex<Option<Trap>>,
 }
 
-/// Attempts `Shared::lock_machine` makes before it sleeps on the lock,
-/// with `MACHINE_SPIN_PAUSES` spin hints between them: about 20 µs, longer
-/// than the lock is usually held (a few µs) and than a sleeping waiter
-/// takes to run again after its wake.
-const MACHINE_SPIN_TRIES: u32 = 256;
+/// A short spin lets workers catch nearby unlocks without keeping CPUs
+/// busy for longer holds.
+const MACHINE_SPIN_TRIES: u32 = 32;
 const MACHINE_SPIN_PAUSES: u32 = 8;
 
 impl<'a> Shared<'a> {
-    /// The machine lock, spinning briefly before sleeping on it: holds are
-    /// a few µs, and a waiter put to sleep took longer to run again than
-    /// the hold it waited for.
+    /// The machine lock, spinning briefly before blocking on it.
     fn lock_machine(&self) -> std::sync::MutexGuard<'_, &'a mut Machine> {
         for _ in 0..MACHINE_SPIN_TRIES {
             match self.machine.try_lock() {
