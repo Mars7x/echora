@@ -114,6 +114,17 @@ read.
 | `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |
 | `ECHORA_PC_SAMPLES_FROM=N` | Sample guest PCs only from presented frame N on. |
 
+For a before-and-after graphics measurement, use the same game data,
+driver, settings and warmed shader cache. Run each build through the same
+scene, alternating builds on the same boot. For the forest in the supported
+1.1.1 dump, automated input with `ECHORA_AUTO_PRESS=120` and
+`ECHORA_AUTO_KEYS=A,PLUS,A,PLUS,A,B,A` has reached the scene by present
+10,500. Use `ECHORA_PROFILE_FROM=10500`, `ECHORA_STOP_PRESENT=10700` and
+`ECHORA_PRESENT_RATE=100`, and confirm each run reached the scene. Compare
+the present rate and divide `nvn.gpu_notes` timing totals by their draw
+count to check changes in CPU work per draw. Movie decoding is measured
+separately with `ECHORA_MOVIE_RATE`.
+
 **Capturing**
 
 | Variable | Effect |

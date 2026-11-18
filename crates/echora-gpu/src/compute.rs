@@ -445,5 +445,6 @@ mod tests {
             results[&1],
             [0xaa, 0xaa, 0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12]
         );
+        renderer.destroy_program(program).unwrap();
     }
 }

@@ -4,7 +4,6 @@
 //! Everything a draw reads is copied into a host-visible ring at record time,
 //! so the guest may change its memory before the work is submitted.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use ash::vk;
@@ -741,18 +740,17 @@ impl Renderer {
         self.lap("stat: renderer ns reserve", &mut since);
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
-        let mut writes: Vec<(
-            u32,
-            vk::DescriptorType,
-            Option<vk::DescriptorBufferInfo>,
-            Option<vk::DescriptorImageInfo>,
-        )> = Vec::new();
-        let mut texel_views: HashMap<u32, vk::BufferView> = HashMap::new();
+        enum DescriptorSource {
+            Buffer(vk::DescriptorType, vk::DescriptorBufferInfo),
+            Image(vk::DescriptorImageInfo),
+            TexelBuffer(vk::BufferView),
+        }
+        let mut writes = Vec::with_capacity(descriptors.iter().sum::<u32>() as usize);
         let mut written = Vec::new();
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
-                match descriptor.kind() {
+                let source = match descriptor.kind() {
                     DescriptorKind::UniformBuffer => {
                         let (buffer, offset, length) = match (
                             draw.uniforms.get(&key),
@@ -776,16 +774,14 @@ impl Renderer {
                             }
                         };
                         let range = (length as u64).max(16).next_multiple_of(16);
-                        writes.push((
-                            descriptor.binding,
+                        DescriptorSource::Buffer(
                             vk::DescriptorType::UNIFORM_BUFFER,
-                            Some(vk::DescriptorBufferInfo {
+                            vk::DescriptorBufferInfo {
                                 buffer,
                                 offset,
                                 range,
-                            }),
-                            None,
-                        ));
+                            },
+                        )
                     }
                     DescriptorKind::StorageBuffer => {
                         let (buffer, offset, range) = if let Some(&(buffer, offset, length)) =
@@ -810,16 +806,14 @@ impl Renderer {
                                 (bytes.len() as u64).max(16).next_multiple_of(16),
                             )
                         };
-                        writes.push((
-                            descriptor.binding,
+                        DescriptorSource::Buffer(
                             vk::DescriptorType::STORAGE_BUFFER,
-                            Some(vk::DescriptorBufferInfo {
+                            vk::DescriptorBufferInfo {
                                 buffer,
                                 offset,
                                 range,
-                            }),
-                            None,
-                        ));
+                            },
+                        )
                     }
                     DescriptorKind::Texture => {
                         let Some((source, sampler)) = draw.textures.get(&key) else {
@@ -831,16 +825,11 @@ impl Renderer {
                         let view =
                             self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
                         let sampler = self.sampler(sampler)?;
-                        writes.push((
-                            descriptor.binding,
-                            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            None,
-                            Some(vk::DescriptorImageInfo {
-                                sampler,
-                                image_view: view,
-                                image_layout: vk::ImageLayout::GENERAL,
-                            }),
-                        ));
+                        DescriptorSource::Image(vk::DescriptorImageInfo {
+                            sampler,
+                            image_view: view,
+                            image_layout: vk::ImageLayout::GENERAL,
+                        })
                     }
                     DescriptorKind::TextureBuffer => {
                         let Some((source, _)) = draw.textures.get(&key) else {
@@ -849,46 +838,32 @@ impl Renderer {
                                 descriptor.binding
                             ));
                         };
-                        texel_views.insert(descriptor.binding, self.texel_buffer_view(source)?);
-                        writes.push((
-                            descriptor.binding,
-                            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-                            None,
-                            None,
-                        ));
+                        DescriptorSource::TexelBuffer(self.texel_buffer_view(source)?)
                     }
                     other => return Err(format!("{other:?} bindings are not modeled")),
-                }
+                };
+                writes.push((descriptor.binding, source));
             }
         }
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
         let set = self.descriptor_set(program.layout)?;
-        let texel_infos: Vec<[vk::BufferView; 1]> = writes
-            .iter()
-            .map(|write| [texel_views.get(&write.0).copied().unwrap_or_default()])
-            .collect();
-        let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = writes
-            .iter()
-            .map(|write| [write.2.unwrap_or_default()])
-            .collect();
-        let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = writes
-            .iter()
-            .map(|write| [write.3.unwrap_or_default()])
-            .collect();
+        // Each Vulkan write borrows only the source its descriptor type uses.
         let descriptor_writes: Vec<_> = writes
             .iter()
-            .enumerate()
-            .map(|(index, (binding, kind, buffer, _))| {
+            .map(|(binding, source)| {
                 let write = vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(*binding)
-                    .descriptor_type(*kind);
-                if *kind == vk::DescriptorType::UNIFORM_TEXEL_BUFFER {
-                    write.texel_buffer_view(&texel_infos[index])
-                } else if buffer.is_some() {
-                    write.buffer_info(&buffer_infos[index])
-                } else {
-                    write.image_info(&image_infos[index])
+                    .dst_binding(*binding);
+                match source {
+                    DescriptorSource::Buffer(kind, info) => write
+                        .descriptor_type(*kind)
+                        .buffer_info(std::slice::from_ref(info)),
+                    DescriptorSource::Image(info) => write
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(std::slice::from_ref(info)),
+                    DescriptorSource::TexelBuffer(view) => write
+                        .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                        .texel_buffer_view(std::slice::from_ref(view)),
                 }
             })
             .collect();

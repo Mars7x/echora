@@ -1595,18 +1595,19 @@ impl Renderer {
             Some((base, count)) if count > 0 => self.level_view_of(plain, base, count)?,
             _ => plain,
         };
-        let identity = |part: vk::ComponentSwizzle| part == vk::ComponentSwizzle::IDENTITY;
+        let identity = [components.r, components.g, components.b, components.a]
+            .into_iter()
+            .all(|part| part == vk::ComponentSwizzle::IDENTITY);
+        if identity && format.is_none() {
+            return Ok(plain);
+        }
         let Some(info) = self.view_infos.get(&plain).copied() else {
             return Ok(plain);
         };
         let format = format
             .filter(|format| srgb_twin(info.format) == Some(*format))
             .unwrap_or(info.format);
-        if format == info.format
-            && [components.r, components.g, components.b, components.a]
-                .into_iter()
-                .all(identity)
-        {
+        if identity && format == info.format {
             return Ok(plain);
         }
         let cache = (
