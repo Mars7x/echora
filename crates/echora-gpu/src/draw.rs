@@ -1085,6 +1085,9 @@ impl Renderer {
         };
         self.lap("stat: renderer ns geometry pass state", &mut since);
         self.time_item(true);
+        if pool.is_some() {
+            self.record_texture_pool_use();
+        }
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
@@ -1332,7 +1335,7 @@ pub(crate) mod tests {
         let module = naga::front::wgsl::parse_str(source).unwrap();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
         )
         .validate(&module)
         .unwrap();

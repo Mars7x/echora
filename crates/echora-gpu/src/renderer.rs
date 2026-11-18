@@ -359,7 +359,7 @@ pub struct Renderer {
     markers: FastMap<u64, (vk::Event, u64)>,
     free_events: Vec<vk::Event>,
     next_marker: u64,
-    completed_serial: u64,
+    pub(crate) completed_serial: u64,
     /// `completed_serial`, readable by other threads (a CPU wait answered
     /// without the NVN state lock).
     completed_shared: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -2482,10 +2482,6 @@ impl Renderer {
         if self.recording {
             self.submit_current()?;
             self.finish_current()?;
-        }
-        // No work reads the texture pool any more.
-        if let Some(pool) = self.texture_pool.as_mut() {
-            pool.in_use = false;
         }
         Ok(())
     }

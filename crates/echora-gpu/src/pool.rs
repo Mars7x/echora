@@ -8,13 +8,14 @@
 //! null descriptor (samplers as a default sampler), which a shader reading
 //! an entry nothing wrote gets.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ash::vk;
 use ash::vk::Handle;
 use echora_shader_abi::texture_pool as binding;
 
 use crate::draw::{ImageShape, Sampler, TextureSource};
+use crate::fast_map::{FastMap, FastSet};
 use crate::renderer::{HostBuffer, Renderer, integer_format};
 use crate::vulkan::{SAMPLER_POOL_CAPACITY, TEXTURE_POOL_CAPACITY};
 
@@ -46,20 +47,20 @@ pub(crate) struct TexturePool {
     /// the entry is integer (read through the uint arrays).
     flags: HostBuffer,
     /// Indices whose flag is set.
-    integer: HashSet<u32>,
+    integer: FastSet<u32>,
     /// What each written (binding, index) holds: a view's or sampler's
     /// raw handle.
-    written: HashMap<(u32, u32), u64>,
-    /// Recorded or submitted work since the last flush bound the set: an
-    /// entry it may read is then not rewritten before a flush.
-    pub(crate) in_use: bool,
+    written: FastMap<(u32, u32), u64>,
+    /// Last batch that bound this set. Its draws may access any descriptor
+    /// in the pool, so replacing a descriptor must wait for that batch.
+    last_use: u64,
 }
 
 /// The pool arrays a texture of `shape` is read through (the recompiler's
 /// texture types: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D, 5 cube, 6 cube
 /// array), with the binding of each; integer textures through the uint
 /// arrays only (sampling them as float is undefined).
-fn arrays(shape: ImageShape, integer: bool) -> Vec<(u32, u32)> {
+fn arrays(shape: ImageShape, integer: bool) -> impl Iterator<Item = (u32, u32)> {
     let types: &[u32] = match shape {
         ImageShape::D1 { .. } => &[0, 1],
         ImageShape::D2 { layers } if layers > 1 => &[3, 2],
@@ -67,22 +68,19 @@ fn arrays(shape: ImageShape, integer: bool) -> Vec<(u32, u32)> {
         ImageShape::D3 { .. } => &[4],
         ImageShape::Cube { .. } => &[5, 6, 3],
     };
-    types
-        .iter()
-        .filter_map(|&kind| {
-            let array = if integer {
-                match kind {
-                    2 => binding::UINT_2D,
-                    3 => binding::UINT_2D_ARRAY,
-                    4 => binding::UINT_3D,
-                    _ => return None,
-                }
-            } else {
-                binding::SAMPLED_1D + kind
-            };
-            Some((kind, array))
-        })
-        .collect()
+    types.iter().filter_map(move |&kind| {
+        let array = if integer {
+            match kind {
+                2 => binding::UINT_2D,
+                3 => binding::UINT_2D_ARRAY,
+                4 => binding::UINT_3D,
+                _ => return None,
+            }
+        } else {
+            binding::SAMPLED_1D + kind
+        };
+        Some((kind, array))
+    })
 }
 
 impl Renderer {
@@ -185,9 +183,9 @@ impl Renderer {
                 descriptor_pool,
                 set,
                 flags,
-                integer: HashSet::new(),
-                written: HashMap::new(),
-                in_use: false,
+                integer: FastSet::default(),
+                written: FastMap::default(),
+                last_use: 0,
             });
         }
         Ok(self.texture_pool.as_mut().unwrap())
@@ -218,9 +216,7 @@ impl Renderer {
             let targets = targets.clone();
             self.stat("stat: texture pool sets unchanged", 1);
             self.order_after_rendering(&targets)?;
-            let pool = self.texture_pool.as_mut().unwrap();
-            pool.in_use = true;
-            return Ok(pool.set);
+            return Ok(self.texture_pool.as_ref().unwrap().set);
         }
         // (binding, index, view or sampler) for every entry, resolved
         // before the set is touched (views can upload).
@@ -283,9 +279,9 @@ impl Renderer {
         let pool = self.texture_pool.as_ref().unwrap();
         let changed: Vec<(u32, u32, u64)> = wanted
             .into_iter()
+            .filter(|(array, index, handle)| pool.written.get(&(*array, *index)) != Some(handle))
             .collect::<HashSet<_>>()
             .into_iter()
-            .filter(|(array, index, handle)| pool.written.get(&(*array, *index)) != Some(handle))
             .collect();
         let flips: Vec<(u32, bool)> = kinds
             .into_iter()
@@ -295,7 +291,8 @@ impl Renderer {
             || changed
                 .iter()
                 .any(|(array, index, _)| pool.written.contains_key(&(*array, *index)));
-        if rewrites && pool.in_use {
+        let last_use = pool.last_use;
+        if rewrites && last_use > self.completed_serial {
             // ECHORA_POOL_REWRITE_LOG (debugging): the first rewrites of
             // entries work in flight may read, with what each entry asks.
             if std::env::var_os("ECHORA_POOL_REWRITE_LOG").is_some()
@@ -351,7 +348,7 @@ impl Renderer {
                 }
             }
             self.stat("stat: texture pool flushes for rewritten entries", 1);
-            self.flush()?;
+            self.wait_for(last_use)?;
         }
         // Targets read through the pool were maybe rendered just before.
         self.order_after_rendering(&targets)?;
@@ -407,9 +404,14 @@ impl Renderer {
         for (array, index, handle) in changed {
             pool.written.insert((array, index), handle);
         }
-        pool.in_use = true;
         self.pool_cache = Some((entries.clone(), self.target_changes, targets));
         Ok(set)
+    }
+
+    /// Called when recording a draw or dispatch that binds the pool.
+    pub(crate) fn record_texture_pool_use(&mut self) {
+        let serial = self.recorded_serial();
+        self.texture_pool.as_mut().unwrap().last_use = serial;
     }
 
     /// Entries holding any of `views` (an image about to be destroyed,
@@ -420,7 +422,7 @@ impl Renderer {
         let Some(pool) = self.texture_pool.as_mut() else {
             return;
         };
-        let raw: HashSet<u64> = views.iter().map(|view| view.as_raw()).collect();
+        let raw: FastSet<u64> = views.iter().map(|view| view.as_raw()).collect();
         let stale: Vec<(u32, u32)> = pool
             .written
             .iter()

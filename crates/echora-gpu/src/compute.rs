@@ -286,6 +286,9 @@ impl Renderer {
             crate::draw::rescaling_constants(&scaled, 1.0)
         });
         self.time_item(true);
+        if pool.is_some() {
+            self.record_texture_pool_use();
+        }
         // SAFETY: recording outside rendering; the program and set are live.
         unsafe {
             let device = &self.gpu.device;
@@ -445,6 +448,95 @@ mod tests {
             results[&1],
             [0xaa, 0xaa, 0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12]
         );
+        renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
+    fn texture_pool_rewrite_waits_for_the_batch_that_bound_it() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        for key in 1..=3 {
+            renderer
+                .target(key, 4, 4, vk::Format::R8G8B8A8_UNORM)
+                .unwrap();
+        }
+        for (key, red) in [(1, 0.0), (2, 1.0)] {
+            renderer
+                .clear_color(
+                    key,
+                    None,
+                    vk::ClearColorValue {
+                        float32: [red, 0.0, 0.0, 1.0],
+                    },
+                )
+                .unwrap();
+        }
+        renderer.flush().unwrap();
+
+        let code = spirv(
+            "enable wgpu_binding_array;
+             @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+             @group(1) @binding(3) var textures: binding_array<texture_2d<f32>, 8>;
+             @compute @workgroup_size(1) fn main() {
+                 output[0] = u32(textureLoad(textures[1], vec2<i32>(0, 0), 0).r);
+             }",
+            naga::ShaderStage::Compute,
+        );
+        let mut stage = translated(
+            Stage::Compute,
+            code,
+            vec![Descriptor {
+                kind: 1,
+                binding: 0,
+                count: 1,
+                flags: 1,
+                ..Default::default()
+            }],
+        );
+        std::sync::Arc::get_mut(&mut stage)
+            .unwrap()
+            .texture_pool_bindings = 1 << echora_shader_abi::texture_pool::SAMPLED_2D;
+        let program = renderer.create_program(vec![stage]).unwrap();
+        let dispatch = |key| Dispatch {
+            program: &program,
+            groups: [1, 1, 1],
+            uniforms: HashMap::new(),
+            storage: HashMap::from([(0, vec![0xff; 16])]),
+            storage_in_place: HashMap::new(),
+            textures: HashMap::new(),
+            images: HashMap::new(),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: vec![crate::pool::PoolEntry {
+                texture: 1,
+                sampler: 1,
+                source: TextureSource::Target(key),
+                sampler_state: Sampler::default(),
+            }]
+            .into(),
+        };
+        let first = renderer.dispatch_deferred(&dispatch(1)).unwrap()[0].1;
+        renderer.submit_frame().unwrap();
+        renderer
+            .clear_color(3, None, vk::ClearColorValue { float32: [0.0; 4] })
+            .unwrap();
+        let serial = renderer.recorded_serial();
+        let second = renderer.dispatch_deferred(&dispatch(2)).unwrap()[0].1;
+        assert_eq!(
+            renderer.recorded_serial(),
+            serial,
+            "unrelated work stayed recorded"
+        );
+        renderer.flush().unwrap();
+        let reads = renderer.take_reads(&[first, second]);
+        assert_eq!(reads[&first][..4], 0u32.to_le_bytes());
+        assert_eq!(reads[&second][..4], 1u32.to_le_bytes());
         renderer.destroy_program(program).unwrap();
     }
 }
