@@ -143,11 +143,9 @@ const GOB_HEIGHT: u64 = 8;
 const GOB_SIZE: u64 = GOB_WIDTH * GOB_HEIGHT;
 /// Shrink a block's GOB count (as log2 `shift`) while half of it still
 /// covers `extent` (rows of blocks for height, slices for depth).
-fn fit_block(mut shift: u32, unit: u64, extent: u64) -> u32 {
-    while shift > 0 && (unit << (shift - 1)) >= extent {
-        shift -= 1;
-    }
-    shift
+fn fit_block(shift: u32, unit: u64, extent: u64) -> u32 {
+    let extent_shift = u64::BITS - extent.saturating_sub(1).leading_zeros();
+    shift.min(extent_shift.saturating_sub(unit.trailing_zeros()))
 }
 
 fn align(value: u64, alignment: u64) -> u64 {
@@ -249,11 +247,10 @@ pub fn base_block_shape(
         return BlockShape { y: 0, z: 0 };
     }
     if depth > 1 {
-        let mut z = 4;
-        while z > 0 && u64::from(depth) <= (1 << z) >> 1 {
-            z -= 1;
-        }
-        return BlockShape { y: 0, z };
+        return BlockShape {
+            y: 0,
+            z: fit_block(4, 1, u64::from(depth)),
+        };
     }
     let scaled = rows + rows / 2;
     let y = match scaled {
@@ -329,19 +326,24 @@ fn levels_size(
     let blocks = |extent: u32, block: u32| u64::from(extent.max(1).div_ceil(block));
     let base = base_block_shape(format, height, depth, layers);
     let mut layer_size = 0;
+    let mut depth_shift = base.z;
     for level in 0..levels.max(1) {
         let w = (width >> level).max(1);
         let h = (height >> level).max(1);
         let d = (depth >> level).max(1);
         let rows = blocks(h, format.block_height);
-        let shape = level_block_shape(format, height, depth, layers, level);
-        let (level_height_shift, level_depth_shift) = (shape.y, shape.z);
+        let height_shift = fit_block(base.y, GOB_HEIGHT, rows);
+        // Mip depth halves at most once per level. Carry the last level's
+        // depth through this walk instead of starting at level zero again.
+        if level != 0 && depth_shift > 0 && u64::from(d) <= (1 << depth_shift) >> 1 {
+            depth_shift -= 1;
+        }
         let row_bytes = align(
             blocks(w, format.block_width) * u64::from(format.bytes_per_block),
             GOB_WIDTH,
         );
-        let block_rows = GOB_HEIGHT << level_height_shift;
-        let block_depth = 1u64 << level_depth_shift;
+        let block_rows = GOB_HEIGHT << height_shift;
+        let block_depth = 1u64 << depth_shift;
         layer_size += row_bytes * align(rows, block_rows) * align(u64::from(d), block_depth);
     }
     (layer_size, base)
