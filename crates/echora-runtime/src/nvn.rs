@@ -625,7 +625,10 @@ pub struct Nvn {
     replay_paused: bool,
     /// `program_memo` for mesh draws, by program handle in each graphics slot.
     #[serde(skip)]
-    mesh_program_memo: ((u64, u64), HashMap<[Option<u64>; 8], gpu::BoundMeshProgram>),
+    mesh_program_memo: (
+        (u64, u64),
+        HashMap<[Option<u64>; 8], std::sync::Arc<gpu::BoundProgram>>,
+    ),
     /// SHADER_CODE pools' guest storage (start, size).
     #[serde(skip)]
     code_pools: BTreeMap<u64, u64>,
@@ -671,7 +674,7 @@ pub struct Nvn {
     #[serde(skip)]
     program_memo: (
         (u64, u64),
-        HashMap<(u64, u64), (StateSnapshots, gpu::BoundProgram)>,
+        HashMap<(u64, u64), (StateSnapshots, std::sync::Arc<gpu::BoundProgram>)>,
     ),
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,
@@ -1186,6 +1189,7 @@ const CONTROL_MEMORY_PER_LIST: u64 = 16;
 /// First GPU virtual address handed to a memory pool, and pool alignment.
 const GPU_ADDRESS_BASE: u64 = 0x10_0000_0000;
 const GPU_ADDRESS_ALIGNMENT: u64 = 0x10000;
+const PROGRAM_STAGE_KEYS: [&str; 6] = ["Stage0", "Stage1", "Stage2", "Stage3", "Stage4", "Stage5"];
 
 /// Raw argument registers after the object pointer (X1..X4, V0..V1 low 64
 /// bits). Setters store them; matching getters return the first of each.
@@ -6014,9 +6018,12 @@ impl Nvn {
     fn stage_code(&self, core: &Guest, gpu: u64) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
         let (guest, remaining) = self.pool_for(gpu)?;
         let length = remaining.min(0x40000);
-        let prefix = read_prefix(core, guest, length.min(512));
-        if let Some((code, key)) = self.stage_cache.borrow().get(&gpu) {
-            if code.len() as u64 == length && code.starts_with(&prefix) {
+        if let Some((code, key)) = self.stage_cache.borrow().get(&gpu)
+            && code.len() as u64 == length
+        {
+            let mut prefix = [0; 512];
+            let readable = read_prefix_into(core, guest, &mut prefix[..length.min(512) as usize]);
+            if code.starts_with(&prefix[..readable]) {
                 return Some((code.clone(), *key));
             }
         }
@@ -6758,12 +6765,17 @@ impl Nvn {
 /// window crosses unmapped memory.
 fn read_prefix(core: &Guest, address: u64, length: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; length as usize];
+    let readable = read_prefix_into(core, address, &mut bytes);
+    bytes.truncate(readable);
+    bytes
+}
+
+fn read_prefix_into(core: &Guest, address: u64, bytes: &mut [u8]) -> usize {
     let mut readable = bytes.len();
     while readable > 0 && core.memory.read(address, &mut bytes[..readable]).is_err() {
         readable /= 2;
     }
-    bytes.truncate(readable);
-    bytes
+    readable
 }
 
 /// `layers` array layers of the texture `props` describe, with the block

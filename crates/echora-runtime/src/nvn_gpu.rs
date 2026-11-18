@@ -398,16 +398,17 @@ impl Backend {
 const TRACED_VARIANT: u64 = 0x7472_6163_6564_0000;
 
 /// Translated stages and binding counts shared by draws of the program.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct BoundProgram {
     keys: (u64, u64),
-    stages: Arc<[Arc<Translated>]>,
+    stages: Box<[Arc<Translated>]>,
+    entries: Box<[super::Args]>,
     uniforms: usize,
     textures: usize,
 }
 
 impl BoundProgram {
-    fn new(keys: (u64, u64), stages: Arc<[Arc<Translated>]>) -> Self {
+    fn new(keys: (u64, u64), stages: Box<[Arc<Translated>]>, entries: Box<[super::Args]>) -> Self {
         let mut uniforms = 0;
         let mut textures = 0;
         for descriptor in stages.iter().flat_map(|stage| &stage.descriptors) {
@@ -420,13 +421,13 @@ impl BoundProgram {
         Self {
             keys,
             stages,
+            entries,
             uniforms,
             textures,
         }
     }
 }
 
-pub(super) type BoundMeshProgram = (BoundProgram, Arc<[super::Args]>);
 /// Stage key, binding base, previous stage's stores, generic input types,
 /// compute workgroup size and shared memory, and the task/mesh state.
 type TranslationKey = (
@@ -1698,22 +1699,21 @@ impl Nvn {
             .objects
             .get(&program)
             .ok_or("bound program is not initialized")?;
-        let stages: Vec<super::Args> = (0..6)
-            .map_while(|index| program.state.get(&format!("Stage{index}")).copied())
-            .collect();
-        if stages.len() <= 1 {
-            return stages
-                .first()
-                .copied()
-                .ok_or_else(|| "bound program has no shaders".into());
-        }
+        let mut stages = super::PROGRAM_STAGE_KEYS
+            .iter()
+            .map_while(|key| program.state.get(*key).copied());
+        let first = stages.next().ok_or("bound program has no shaders")?;
+        let Some(second) = stages.next() else {
+            return Ok(first);
+        };
         let wanted = match bit {
             0 => 1,
             1 => 5,
             _ => return Err(format!("stage bit {bit} is not modeled")),
         };
-        stages
-            .iter()
+        [first, second]
+            .into_iter()
+            .chain(stages)
             .find(|stage| {
                 self.stage_code(core, stage.x[0]).is_some_and(|(code, _)| {
                     code.len() >= 4
@@ -1721,7 +1721,6 @@ impl Nvn {
                             == wanted
                 })
             })
-            .copied()
             .ok_or_else(|| format!("bound program has no stage of type {wanted}"))
     }
 
@@ -1746,7 +1745,7 @@ impl Nvn {
         types
     }
 
-    fn bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
+    fn bound_program(&mut self, core: &Guest) -> Result<Arc<BoundProgram>, String> {
         // The same programs as the last draw, within a present and with no
         // flush of guest memory since (program code is revalidated once a
         // present, as textures are): its stages again.
@@ -1773,7 +1772,7 @@ impl Nvn {
         {
             return Ok(bound.clone());
         }
-        let bound = self.resolve_bound_program(core)?;
+        let bound = Arc::new(self.resolve_bound_program(core)?);
         if let Some(key) = key {
             self.program_memo.1.insert(key, (attributes, bound.clone()));
         }
@@ -1781,16 +1780,16 @@ impl Nvn {
     }
 
     fn resolve_bound_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
-        let mut addresses = Vec::new();
-        for bit in [0u32, 1] {
+        let entry = |bit| {
             let bind = self
                 .render
                 .state
                 .get(super::program_key(bit))
                 .ok_or_else(|| format!("no program bound for stage {bit}"))?;
-            let stage = self.program_stage(core, bind.x[1], bit)?;
-            addresses.push(stage.x[0]);
-        }
+            self.program_stage(core, bind.x[1], bit)
+        };
+        let entries = [entry(0)?, entry(1)?];
+        let addresses = entries.map(|stage| stage.x[0]);
         let types = self
             .render
             .state
@@ -1836,7 +1835,11 @@ impl Nvn {
             self.stage_code(core, addresses[0]).unwrap().1,
             self.stage_code(core, addresses[1]).unwrap().1,
         );
-        Ok(BoundProgram::new(keys, Arc::from([vertex, fragment])))
+        Ok(BoundProgram::new(
+            keys,
+            Box::new([vertex, fragment]),
+            Box::new(entries),
+        ))
     }
 
     /// The task (if any), mesh and fragment stages of the programs bound for
@@ -1849,7 +1852,7 @@ impl Nvn {
     /// the vertex slot (its header names a vertex program), after one in the
     /// tessellation slot; a pass-through geometry program bound with it
     /// lists the per-primitive outputs.
-    fn bound_mesh_program(&mut self, core: &Guest) -> Result<BoundMeshProgram, String> {
+    fn bound_mesh_program(&mut self, core: &Guest) -> Result<Arc<BoundProgram>, String> {
         // As `bound_program`: the same binds within a present and with no
         // shader-code flush or program change since give the same stages.
         let binds = std::array::from_fn(|slot| {
@@ -1868,12 +1871,12 @@ impl Nvn {
         if let Some(found) = self.mesh_program_memo.1.get(&binds) {
             return Ok(found.clone());
         }
-        let found = self.resolve_bound_mesh_program(core)?;
+        let found = Arc::new(self.resolve_bound_mesh_program(core)?);
         self.mesh_program_memo.1.insert(binds, found.clone());
         Ok(found)
     }
 
-    fn resolve_bound_mesh_program(&mut self, core: &Guest) -> Result<BoundMeshProgram, String> {
+    fn resolve_bound_mesh_program(&mut self, core: &Guest) -> Result<BoundProgram, String> {
         // The graphics stages' programs: the COMPUTE bit's (5, NVN's
         // 0x20) is not one. A program bound for every bit (0xff, as the
         // game binds its tile classifier) stays in the compute slot while
@@ -2055,8 +2058,9 @@ impl Nvn {
             .stage_code(core, fragment.x[0])
             .map_or(0, |(_, key)| key);
         // Mesh programs never share a key with vertex programs' pipelines.
-        Ok((
-            BoundProgram::new((keys ^ 0x6d65_7368, fragment_key), translated.into()),
+        Ok(BoundProgram::new(
+            (keys ^ 0x6d65_7368, fragment_key),
+            translated.into(),
             entries.into(),
         ))
     }
@@ -7699,11 +7703,10 @@ impl Nvn {
         };
         let mut since = timing.then(std::time::Instant::now);
         let mesh_draw = command.name.contains("DrawMeshTasks");
-        let (program, mesh_entries) = if mesh_draw {
-            let (program, entries) = self.bound_mesh_program(core)?;
-            (program, Some(entries))
+        let program = if mesh_draw {
+            self.bound_mesh_program(core)?
         } else {
-            (self.bound_program(core)?, None)
+            self.bound_program(core)?
         };
         let keys = program.keys;
         let stages = &*program.stages;
@@ -8097,11 +8100,8 @@ impl Nvn {
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
-                        let mut bytes =
-                            match mesh_entries.as_ref().and_then(|entries| entries.get(index)) {
-                                Some(&entry) => self.stage_constants_of(core, entry),
-                                None => self.stage_constants(core, index as u32),
-                            }
+                        let mut bytes = self
+                            .stage_constants_of(core, program.entries[index])
                             .unwrap_or_default();
                         bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                         uniforms.insert((index, descriptor.binding), bytes);
