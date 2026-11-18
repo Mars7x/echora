@@ -2066,6 +2066,15 @@ impl Renderer {
             });
             if texture_type == 4 && flat {
                 let size = self.targets[key].width.clamp(2, 64);
+                let identity_key = u64::MAX - u64::from(size);
+                let shape = ImageShape::D3 { depth: size };
+                let format = vk::Format::R8G8B8A8_UNORM;
+                if let Some((0, target)) = self.uploads.get(&identity_key)
+                    && (target.width, target.height, target.shape, target.format)
+                        == (size, size, shape, format)
+                {
+                    return Ok(target.sampled_view);
+                }
                 let texels: Vec<u8> = (0..size * size * size)
                     .flat_map(|index| {
                         let channel = |value: u32| (value * 255 / (size - 1)) as u8;
@@ -2078,12 +2087,12 @@ impl Renderer {
                     })
                     .collect();
                 let identity = TextureSource::Upload {
-                    key: u64::MAX - u64::from(size),
+                    key: identity_key,
                     generation: 0,
                     width: size,
                     height: size,
-                    shape: ImageShape::D3 { depth: size },
-                    format: vk::Format::R8G8B8A8_UNORM,
+                    shape,
+                    format,
                     texels: std::sync::Arc::new(texels),
                     levels: vec![crate::draw::UploadRegion {
                         level: 0,
@@ -6842,6 +6851,45 @@ mod tests {
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (base_level, 1));
         }
+    }
+
+    #[test]
+    fn repeated_identity_volume_binds_keep_the_uploaded_texels() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        renderer.target(18, 8, 8, format).unwrap();
+        let source = TextureSource::Target(18);
+        let first = renderer.texture_view(&source, 4).unwrap();
+        assert_eq!(renderer.texture_view(&source, 4).unwrap(), first);
+
+        let upload = TextureSource::Upload {
+            key: u64::MAX - 8,
+            generation: 0,
+            width: 8,
+            height: 8,
+            shape: ImageShape::D3 { depth: 8 },
+            format,
+            texels: Default::default(),
+            levels: [UploadRegion {
+                level: 0,
+                layer: 0,
+                width: 8,
+                height: 8,
+                depth: 8,
+                offset: 0,
+            }]
+            .into(),
+        };
+        let TextureSource::Upload { texels, .. } = renderer.with_texels(&upload).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(&texels[..4], &[0, 0, 0, 255]);
+        assert_eq!(&texels[4 * 511..], &[255, 255, 255, 255]);
+        assert_eq!(&texels[4 * 163..4 * 164], &[109, 145, 72, 255]);
     }
 
     #[test]
