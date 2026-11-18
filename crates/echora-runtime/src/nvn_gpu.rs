@@ -706,6 +706,11 @@ impl Nvn {
 
     /// Size and Vulkan format of a texture used as a render target.
     fn target_shape(&self, texture: u64) -> Result<(u32, u32, vk::Format), String> {
+        if self.target_shapes.0 == self.texture_epoch
+            && let Some(&(width, height, format, ..)) = self.target_shapes.1.get(&texture)
+        {
+            return Ok((width, height, format));
+        }
         let (width, height) = self.texture_extent(texture)?;
         let object = self.object(texture, "Texture")?;
         let format = object
@@ -1615,12 +1620,8 @@ impl Nvn {
         let bind = |bit: u32| {
             self.render
                 .state
-                .get(if bit == 0 {
-                    "BindProgram@0"
-                } else {
-                    "BindProgram@1"
-                })
-                .map(|command| command.x)
+                .get(super::program_key(bit))
+                .map(|command| command.x[1])
         };
         let attributes = self
             .render
@@ -1718,14 +1719,15 @@ impl Nvn {
     fn bound_mesh_program(&mut self, core: &Guest) -> Result<BoundMeshProgram, String> {
         // As `bound_program`: the same binds within a present and with no
         // shader-code flush or program change since give the same stages.
-        let mut binds: Vec<(&'static str, [u64; 8])> = self
-            .render
-            .state
-            .iter()
-            .filter(|(key, _)| key.starts_with("BindProgram@"))
-            .map(|(key, bind)| (*key, bind.x))
-            .collect();
-        binds.sort_unstable();
+        let binds = std::array::from_fn(|slot| {
+            if slot == nvn_stage(Stage::Compute) as usize {
+                return None;
+            }
+            self.render
+                .state
+                .get(super::program_key(slot as u32))
+                .map(|bind| bind.x[1])
+        });
         let stamp = (self.presented_frames, self.flush_epoch);
         if self.mesh_program_memo.0 != stamp {
             self.mesh_program_memo = (stamp, HashMap::default());
@@ -2644,11 +2646,13 @@ impl Nvn {
     /// `mip_targets` allows).
     fn resolve_target(&self, texture: u64) -> Option<(u64, u32)> {
         let renderer = &self.gpu.as_ref()?.renderer;
-        let extent = self.texture_extent(texture).ok();
         // Its own format (or its sRGB twin): a texture object
         // reinterpreting the memory in another format (RGB9E5 over the HDR
         // scene's R11G11B10) is not the same target.
-        let format = self.target_shape(texture).ok().map(|(_, _, format)| format);
+        let (extent, format) = match self.target_shape(texture) {
+            Ok((width, height, format)) => (Some((width, height)), Some(format)),
+            Err(_) => (self.texture_extent(texture).ok(), None),
+        };
         let same_format = |target_format: vk::Format| {
             format.is_some_and(|format| {
                 target_format == format

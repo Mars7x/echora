@@ -622,16 +622,13 @@ pub struct Nvn {
     replay_budget: Option<u32>,
     #[serde(skip)]
     replay_paused: bool,
-    /// `program_memo` for mesh draws: by every BindProgram bit's arguments.
+    /// `program_memo` for mesh draws, by program handle in each graphics slot.
     #[serde(skip)]
-    mesh_program_memo: (
-        (u64, u64),
-        HashMap<Vec<(&'static str, [u64; 8])>, gpu::BoundMeshProgram>,
-    ),
+    mesh_program_memo: ((u64, u64), HashMap<[Option<u64>; 8], gpu::BoundMeshProgram>),
     /// SHADER_CODE pools' guest storage (start, size).
     #[serde(skip)]
     code_pools: BTreeMap<u64, u64>,
-    /// Bound programs draws resolved, by the two BindProgram arguments,
+    /// Bound programs draws resolved, by the two program handles,
     /// with the vertex attribute snapshot they were resolved with; valid
     /// for a (present, flush epoch) (see `bound_program`).
     /// The vertex input types of the last vertex attribute snapshot a draw
@@ -673,7 +670,7 @@ pub struct Nvn {
     #[serde(skip)]
     program_memo: (
         (u64, u64),
-        HashMap<([u64; 8], [u64; 8]), (StateSnapshots, gpu::BoundProgram)>,
+        HashMap<(u64, u64), (StateSnapshots, gpu::BoundProgram)>,
     ),
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,
