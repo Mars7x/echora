@@ -647,12 +647,11 @@ impl Slot {
 /// before it.
 pub(crate) const SLOTS: usize = 6;
 
-/// Draws and dispatches a submission holds by default (ECHORA_SUBMIT_ITEMS):
-/// small enough that the GPU starts a frame's work while the replay is still
-/// recording it (a whole forest frame in one submission left the GPU idle
-/// until the replay was done: 8.2 presents/s, 10.5 with 200), large enough
-/// that submissions (about a millisecond each) stay few.
-const SUBMIT_ITEMS: u32 = 200;
+/// Draws and dispatches a submission holds by default. Smaller batches let
+/// the GPU start a frame while the replay thread is still recording it.
+/// Two forest runs on a Radeon RX 9070 XT averaged 18.44 FPS at 100 items
+/// and 16.95 FPS at 200 with packed page-table imports.
+const SUBMIT_ITEMS: u32 = 100;
 
 /// Draws and dispatches one submission may hold (see `bound_submission`).
 const MAX_WORK_ITEMS: u32 = 1000;
@@ -4168,7 +4167,7 @@ impl Renderer {
     /// (headless runs once gathered 270 frames of work into one). Smaller
     /// submissions also let the GPU run a frame's work while the CPU still
     /// records the rest of it, instead of all of it after the present
-    /// (ECHORA_SUBMIT_ITEMS, default 128).
+    /// (`ECHORA_SUBMIT_ITEMS`, defaults to `SUBMIT_ITEMS`).
     pub(crate) fn bound_submission(&mut self) -> Result<(), String> {
         static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
