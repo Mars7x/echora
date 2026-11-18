@@ -1008,6 +1008,12 @@ interval by resampling: vector 265 to 304 Minstr/s (+14.7%, +13.4% to
 (+16.2%, +14.3% to +18.0%), fpairs 377 to 515 (+36.8%, +32.4% to +41.4%):
 none within noise.
 
+In a gameplay comparison on the Ryzen 7 5800X3D and RX 9070 XT, enabling
+`vector-float-runs` for the profiled regions changed 71 of 1,111 sources.
+Two runs per configuration averaged 16.19 FPS with the control and 16.13
+FPS with the option, measured over the same 200 forest presents. Each
+run played the full opening movie.
+
 ## Options on some regions only
 
 `ECHORA_LIFT_OPTIONS_REGIONS` (a comma-separated list of region ids as in
