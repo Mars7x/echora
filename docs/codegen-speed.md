@@ -42,6 +42,12 @@ emission. All 1,111 generated region sources matched byte for byte.
 
 ## Translated execution
 
+The NEON widening shifts use fixed lane widths, and integer reductions
+read the lanes directly from the register. On the Ryzen 7 5800X3D, the
+median widening-shift time fell from 23.15 ns to 5.62 ns and the median
+reduction time fell from 25.66 ns to 13.81 ns. Each instruction family
+matched the previous implementation on 32,768 inputs.
+
 Measured on the benchmark kernels (`benches/kernels.rs`, x86-64, release),
 with the generated machine code read from the bench binary. A typical
 integer loop (`ldst`: LDR, ADD, STR, SUBS, B.NE) cost about 53 host

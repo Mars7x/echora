@@ -2415,46 +2415,32 @@ pub fn int_to_fp_fixed(
 pub fn vec_across(cpu: &mut Cpu, op: VecAcrossOp, bits: u8, q: bool, rd: u8, rn: u8) {
     let bits = u32::from(bits);
     let n = cpu.vectors[rn as usize];
-    let lanes: Vec<u64> = (0..lane_count(bits, q, false))
-        .map(|lane| get_lane(n, bits, lane))
-        .collect();
+    let lanes = (0..lane_count(bits, q, false)).map(|lane| get_lane(n, bits, lane));
     let (value, out_bits) = match op {
-        VecAcrossOp::AddV => (lanes.iter().fold(0u64, |acc, x| acc.wrapping_add(*x)), bits),
-        VecAcrossOp::UMaxV => (
-            *lanes.iter().max().expect("a vector has at least one lane"),
-            bits,
-        ),
-        VecAcrossOp::UMinV => (
-            *lanes.iter().min().expect("a vector has at least one lane"),
-            bits,
-        ),
+        VecAcrossOp::AddV => (lanes.fold(0, u64::wrapping_add), bits),
+        VecAcrossOp::UMaxV => (lanes.max().expect("a vector has at least one lane"), bits),
+        VecAcrossOp::UMinV => (lanes.min().expect("a vector has at least one lane"), bits),
         VecAcrossOp::SMaxV => (
             lanes
-                .iter()
-                .map(|x| sign_extend_lane(*x, bits))
+                .map(|x| sign_extend_lane(x, bits))
                 .max()
                 .expect("a vector has at least one lane") as u64,
             bits,
         ),
         VecAcrossOp::SMinV => (
             lanes
-                .iter()
-                .map(|x| sign_extend_lane(*x, bits))
+                .map(|x| sign_extend_lane(x, bits))
                 .min()
                 .expect("a vector has at least one lane") as u64,
             bits,
         ),
         VecAcrossOp::SAddLV => (
             lanes
-                .iter()
-                .map(|x| sign_extend_lane(*x, bits))
-                .fold(0i64, |acc, x| acc.wrapping_add(x)) as u64,
+                .map(|x| sign_extend_lane(x, bits))
+                .fold(0, i64::wrapping_add) as u64,
             bits * 2,
         ),
-        VecAcrossOp::UAddLV => (
-            lanes.iter().fold(0u64, |acc, x| acc.wrapping_add(*x)),
-            bits * 2,
-        ),
+        VecAcrossOp::UAddLV => (lanes.fold(0, u64::wrapping_add), bits * 2),
     };
     cpu.vectors[rd as usize] = u128::from(value & lane_mask(out_bits));
 }
@@ -2556,21 +2542,32 @@ pub fn vec_shift_long(
     rn: u8,
     shift: u8,
 ) {
-    let bits = u32::from(bits);
     let n = cpu.vectors[rn as usize];
-    let wide = bits * 2;
-    let count = 64 / bits;
-    let mut result = 0u128;
-    for lane in 0..count {
-        let source = get_lane(n, bits, lane + if upper { count } else { 0 });
-        let extended = if signed {
-            sign_extend_lane(source, bits) as u64
-        } else {
-            source
-        };
-        set_lane(&mut result, wide, lane, extended << shift);
+    let source = if upper { (n >> 64) as u64 } else { n as u64 };
+    let mut result = [0; 16];
+    // Each lane width gives the compiler a fixed number of narrow loads
+    // and wide stores, with no variable masks on the packed result.
+    macro_rules! widen {
+        ($narrow:ty, $signed:ty, $wide:ty, $size:literal) => {{
+            let (lanes, _) = result.as_chunks_mut::<{ $size * 2 }>();
+            for (index, dest) in lanes.iter_mut().enumerate() {
+                let word = (source >> (index * $size * 8)) as $narrow;
+                let word = if signed {
+                    (word as $signed) as $wide
+                } else {
+                    <$wide>::from(word)
+                };
+                *dest = (word << shift).to_le_bytes();
+            }
+        }};
     }
-    cpu.vectors[rd as usize] = result;
+    match bits {
+        8 => widen!(u8, i8, u16, 1),
+        16 => widen!(u16, i16, u32, 2),
+        32 => widen!(u32, i32, u64, 4),
+        _ => unreachable!("widening shift lane size {bits}"),
+    }
+    cpu.vectors[rd as usize] = u128::from_le_bytes(result);
 }
 
 /// Widening three-operand operations on the lower or upper half (the "2"
