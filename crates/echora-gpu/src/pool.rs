@@ -219,9 +219,11 @@ impl Renderer {
                             && last.matches_binding(&entry.source, &entry.sampler_state)
                     }))
         {
-            let targets = targets.clone();
+            let pending = self.rendering_pending(targets);
             self.stat("stat: texture pool sets unchanged", 1);
-            self.order_after_rendering(&targets)?;
+            if pending {
+                self.memory_barrier()?;
+            }
             return Ok(self.texture_pool.as_ref().unwrap().set);
         }
         // (binding, index, view or sampler) for every entry, resolved
@@ -354,7 +356,12 @@ impl Renderer {
                 }
             }
             self.stat("stat: texture pool flushes for rewritten entries", 1);
+            let waiting = std::time::Instant::now();
             self.wait_for(last_use)?;
+            self.stat(
+                "stat: texture pool rewrite wait ns",
+                waiting.elapsed().as_nanos() as u64,
+            );
         }
         // Targets read through the pool were maybe rendered just before.
         self.order_after_rendering(&targets)?;
