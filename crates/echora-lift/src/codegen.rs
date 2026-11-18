@@ -10,6 +10,7 @@ use crate::aarch64::{
 use crate::simd::SimdOp;
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, ser::SerializeStruct};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
 
@@ -1631,13 +1632,17 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
 ];
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
-const FLAG_OPERATIONS: &[&str] = &[
-    "add_sub(",
-    "add_with_carry(",
-    "condition(",
-    "logical_flags(",
-    "conditional_compare(",
-    "conditional_compare_negative(",
+const FLAG_OPERATIONS: &[(&str, &str)] = &[
+    ("m.cpu.nzcv", "r.fl.nzcv"),
+    ("m.cpu.add_sub(", "r.fl.add_sub("),
+    ("m.cpu.add_with_carry(", "r.fl.add_with_carry("),
+    ("m.cpu.condition(", "r.fl.condition("),
+    ("m.cpu.logical_flags(", "r.fl.logical_flags("),
+    ("m.cpu.conditional_compare(", "r.fl.conditional_compare("),
+    (
+        "m.cpu.conditional_compare_negative(",
+        "r.fl.conditional_compare_negative(",
+    ),
 ];
 
 /// Helper calls that read or write NZCV in the `Core`.
@@ -1649,9 +1654,9 @@ const USES_FLAGS: &[&str] = &[
 
 /// Rewrite the generated `m.cpu.regs[n]` references in one pass. The
 /// intermediate `x[n]` spelling is also accepted by the window emitter.
-fn localize_registers(line: &str, used: &BTreeSet<u8>) -> String {
+fn localize_registers<'a>(line: &'a str, used: &BTreeSet<u8>) -> Cow<'a, str> {
     const CORE_REGS: &str = "m.cpu.regs";
-    let mut output = String::with_capacity(line.len());
+    let mut output = String::new();
     let mut copied = 0;
     for (open, _) in line.match_indices('[') {
         let prefix = &line[..open];
@@ -1668,19 +1673,28 @@ fn localize_registers(line: &str, used: &BTreeSet<u8>) -> String {
             }
             _ => None,
         };
-        if let Some((_, digits)) = register.filter(|(index, _)| used.contains(index)) {
-            output.push_str(&line[copied..start]);
+        let local = register.filter(|(index, _)| used.contains(index));
+        if !core && local.is_none() {
+            continue;
+        }
+        if copied == 0 {
+            output.reserve(line.len());
+        }
+        output.push_str(&line[copied..start]);
+        if let Some((_, digits)) = local {
             output.push_str("r.x");
             output.push_str(&tail[..digits]);
             copied = open + digits + 2;
-        } else if core {
-            output.push_str(&line[copied..start]);
+        } else {
             output.push_str("x[");
             copied = open + 1;
         }
     }
+    if copied == 0 {
+        return Cow::Borrowed(line);
+    }
     output.push_str(&line[copied..]);
-    output
+    Cow::Owned(output)
 }
 
 impl RegisterLocals {
@@ -1690,10 +1704,7 @@ impl RegisterLocals {
             written: BTreeSet::new(),
             sp_used: false,
             sp_written: false,
-            flags: cases.contains("m.cpu.nzcv")
-                || FLAG_OPERATIONS
-                    .iter()
-                    .any(|operation| cases.contains(&format!("m.cpu.{operation}"))),
+            flags: FLAG_OPERATIONS.iter().any(|(cpu, _)| cases.contains(cpu)),
             fpcr: (false, false),
             fpsr: (false, false),
         };
@@ -1868,12 +1879,18 @@ impl RegisterLocals {
         for line in cases.lines() {
             let mut line = localize_registers(line, &self.used);
             if fp_status {
-                for field in ["fpcr", "fpsr"] {
-                    line = line.replace(&format!("m.cpu.{field}"), &format!("r.{field}"));
+                for (cpu, local) in [("m.cpu.fpcr", "r.fpcr"), ("m.cpu.fpsr", "r.fpsr")] {
+                    if line.contains(cpu) {
+                        line = Cow::Owned(line.replace(cpu, local));
+                    }
                 }
-                line = wrap_cpu_helpers(&line, &store_fp, &reload_fp);
+                if line.contains("(&mut m.cpu") || line.contains("(&m.cpu") {
+                    line = Cow::Owned(wrap_cpu_helpers(&line, &store_fp, &reload_fp));
+                }
             }
-            let mut line = replace_sp(&line);
+            if line.contains("m.cpu.sp") {
+                line = Cow::Owned(replace_sp(&line));
+            }
             let before = depth;
             let code = without_strings(&line);
             depth = (depth + code.matches('{').count())
@@ -1884,10 +1901,10 @@ impl RegisterLocals {
             }
             let indent = line[..line.len() - line.trim_start().len()].to_owned();
             let kind = if self.flags {
-                line = line.replace("m.cpu.nzcv", "r.fl.nzcv");
-                for operation in FLAG_OPERATIONS {
-                    line =
-                        line.replace(&format!("m.cpu.{operation}"), &format!("r.fl.{operation}"));
+                for (cpu, local) in FLAG_OPERATIONS {
+                    if line.contains(cpu) {
+                        line = Cow::Owned(line.replace(cpu, local));
+                    }
                 }
                 USES_FLAGS
                     .iter()
@@ -1932,7 +1949,7 @@ impl RegisterLocals {
             let writes = local_writes(&line);
             pieces.push(Piece {
                 indent,
-                line,
+                line: line.into_owned(),
                 kind,
                 before,
                 after: depth,
@@ -2297,7 +2314,10 @@ fn sets_flags(call: &str) -> bool {
 }
 
 /// `line` without the contents of its string literals.
-fn without_strings(line: &str) -> String {
+fn without_strings(line: &str) -> Cow<'_, str> {
+    if !line.contains(['"', '\'']) {
+        return Cow::Borrowed(line);
+    }
     let mut code = String::with_capacity(line.len());
     let mut quoted = false;
     let mut escaped = false;
@@ -2318,7 +2338,7 @@ fn without_strings(line: &str) -> String {
             code.push(c);
         }
     }
-    code
+    Cow::Owned(code)
 }
 
 /// `text` without each `m.cpu.pc = X;` line that another `m.cpu.pc = `

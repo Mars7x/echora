@@ -25,6 +25,16 @@ blocks discovered in the supported ExeFS, with host entries included, ran
 three times on the same 5800X3D. The median for liveness alone fell from
 29.25 s to 1.36 s, and every live-out mask matched in each comparison.
 
+## Rust emission
+
+The register rewrite scans register references once per line and reuses
+the original text when the register, flag or stack rewrites make no
+change. A benchmark using 61,662 lines from hot translated windows
+took a median of 212 ms with the new rewrite and 733 ms with the previous
+rewrite, with identical text and annotations. A full lift of the same
+game and options emitted byte-identical Rust for all 1,111 regions. The
+two full lift runs took 181 s and 296 s, respectively.
+
 ## Translated execution
 
 Measured on the benchmark kernels (`benches/kernels.rs`, x86-64, release),
