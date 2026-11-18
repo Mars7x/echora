@@ -8059,12 +8059,15 @@ impl Nvn {
                 continue;
             }
             let nvn = nvn_stage(stage.stage);
-            for slot in 0..16u64 {
-                if let Some(bind) = self.render.state.get(bind_key(
-                    "BindStorageBuffer",
-                    Some(nvn as u64),
-                    slot as u64,
-                )) {
+            let mut slots = self.render.storage_slots[nvn as usize];
+            while slots != 0 {
+                let slot = u64::from(slots.trailing_zeros());
+                slots &= slots - 1;
+                if let Some(bind) =
+                    self.render
+                        .state
+                        .get(bind_key("BindStorageBuffer", Some(nvn as u64), slot))
+                {
                     let offset = u64::from(c0_storage_table(nvn)) + 16 * slot;
                     storage_entries.push((index, offset as u32, bind.x[3], bind.x[4]));
                 }

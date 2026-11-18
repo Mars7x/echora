@@ -775,6 +775,9 @@ pub struct RenderState {
     /// holds it under `BindTexture/{stage}/{slot}`: draws that read the
     /// texture pool list a stage's handles without scanning `state`.
     pub bound_textures: BTreeMap<(u64, u64), u64>,
+    /// Slots set in each stage's 16-entry storage buffer table, including
+    /// explicit bindings with a zero address or size.
+    storage_slots: [u16; 8],
 }
 
 impl RenderState {
@@ -785,6 +788,12 @@ impl RenderState {
             .get(key)
             .and_then(|bind| bind.states.first())
             .unwrap_or(&EMPTY)
+    }
+
+    fn set_storage_slot(&mut self, stage: u64, slot: u64) {
+        if stage < self.storage_slots.len() as u64 && slot < u64::from(u16::BITS) {
+            self.storage_slots[stage as usize] |= 1 << slot;
+        }
     }
 }
 
@@ -5270,6 +5279,9 @@ impl Nvn {
                         {
                             *self.stage_binds.entry(command.x[1]).or_default() += 1;
                         }
+                        if single == "BindStorageBuffer" {
+                            self.render.set_storage_slot(command.x[1], slot);
+                        }
                         self.render
                             .state
                             .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
@@ -5369,6 +5381,9 @@ impl Nvn {
                             != Some(command.x[3])
                     {
                         *self.stage_binds.entry(command.x[1]).or_default() += 1;
+                    }
+                    if rest == "BindStorageBuffer" {
+                        self.render.set_storage_slot(command.x[1], command.x[2]);
                     }
                     self.render.state.insert(key, command.clone());
                     return Ok(());
@@ -7793,6 +7808,54 @@ mod tests {
         assert!(first.record(command, &mut guest).unwrap());
         assert_eq!(lock_shared(&replacement).commands.len(), 1);
         assert_eq!(lock_shared(&original).commands.len(), 2);
+    }
+
+    #[test]
+    fn storage_slot_index_tracks_single_and_plural_binds() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        guest.memory.write(0x10_0000, &[0; 16]).unwrap();
+        let mut nvn = Nvn::default();
+        for (name, x, captured) in [
+            (
+                "nvnCommandBufferBindStorageBuffer",
+                [0, 1, 3, 0x1000, 0x100, 0, 0, 0],
+                Vec::new(),
+            ),
+            (
+                "nvnCommandBufferBindStorageBuffers",
+                [0, 1, 14, 3, 0, 0, 0, 0],
+                vec![0x1100, 0x100, 0x1200, 0x100, 0x1300, 0x100],
+            ),
+            (
+                "nvnCommandBufferBindStorageBuffersDeferred",
+                [0, 7, 2, 1, 0x10_0000, 0, 0, 0],
+                Vec::new(),
+            ),
+        ] {
+            nvn.execute_command(
+                &Command {
+                    name,
+                    x,
+                    v: [0; 8],
+                    captured,
+                    states: StateSnapshots::default(),
+                },
+                &mut guest,
+            )
+            .unwrap();
+        }
+        assert_eq!(nvn.render.storage_slots, [0, 0xc008, 0, 0, 0, 0, 0, 4]);
+        assert_eq!(nvn.render.state["BindStorageBuffer/1/16"].x[3], 0x1300);
+        assert_eq!(nvn.render.state["BindStorageBuffer/7/2"].x[3..5], [0, 0]);
     }
 
     #[test]
