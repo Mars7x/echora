@@ -10237,7 +10237,7 @@ mod pool_tests {
         let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: Some(0),
         };
         let handle = 19;
         nvn.render.bound_textures.insert((0, 0), handle);

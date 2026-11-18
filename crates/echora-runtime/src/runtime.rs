@@ -2867,6 +2867,7 @@ impl Machine {
                         held_failed: None,
                         lock_free_calls: 0,
                         recorded_calls: 0,
+                        nvn_thunks: Vec::new(),
                         nvn_lock_micros: [0; 2],
                         quiet_yields_until: None,
                         lock_free_yields: 0,
@@ -3082,7 +3083,7 @@ impl Machine {
         let mut guest = crate::nvn::Guest {
             cpu: &mut self.core.cpu,
             memory: crate::nvn::GuestMemory::Checked(&mut self.memory),
-            counter,
+            counter: Some(counter),
         };
         let profile = crate::nvn::debug_var_os("ECHORA_NVN_PROFILE")
             .is_some()
@@ -5074,6 +5075,8 @@ struct Worker {
     lock_free_calls: u64,
     /// Of those, calls recorded without the NVN state's lock.
     recorded_calls: u64,
+    /// Previously published thunk names. NVN assigns new indices by appending.
+    nvn_thunks: Vec<&'static str>,
     /// Their microseconds waiting for the NVN state's lock and holding it.
     nvn_lock_micros: [u64; 2],
     /// Until when a yield (SleepThread 0, -1 or -2) returns at once without
@@ -5127,7 +5130,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut core.memory),
-                counter,
+                counter: Some(counter),
             };
             let started = std::time::Instant::now();
             let result = nvn.resume_replay(&mut guest);
@@ -5576,32 +5579,37 @@ impl Worker {
         {
             return false;
         }
-        let name = {
+        let Some(index) = crate::nvn::thunk_index(pc) else {
+            return false;
+        };
+        if index >= self.nvn_thunks.len() {
             let thunks = shared
                 .thunks
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match crate::nvn::thunk_index(pc).and_then(|index| thunks.get(index).copied()) {
-                Some(name)
-                    if name.starts_with("nvnCommandBuffer") || crate::nvn::front_call(name) =>
-                {
-                    name
-                }
-                _ => return false,
-            }
+            self.nvn_thunks
+                .extend_from_slice(&thunks[self.nvn_thunks.len()..]);
+        }
+        let Some(&name) = self.nvn_thunks.get(index) else {
+            return false;
         };
+        let command = name.starts_with("nvnCommandBuffer");
+        if !command && !crate::nvn::front_call(name) {
+            return false;
+        }
         self.core.settle_block_trap();
-        let counter = self.core.physical_counter_ticks();
         let recorded = {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
-                counter,
+                // Recording and property calls only capture arguments.
+                // The command reports its timestamp when replay executes it.
+                counter: None,
             };
-            if name.starts_with("nvnCommandBuffer") {
-                shared.recorder.record(&name, &mut guest)
+            if command {
+                shared.recorder.record(name, &mut guest)
             } else {
-                shared.recorder.front(&name, &mut guest)
+                shared.recorder.front(name, &mut guest)
             }
         };
         match recorded {
@@ -5690,7 +5698,7 @@ impl Worker {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
-                counter,
+                counter: Some(counter),
             };
             if let Err(trap) = nvn.resume_replay(&mut guest) {
                 self.held_failed = Some(Some(trap));
@@ -5792,7 +5800,7 @@ impl Worker {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
-                counter,
+                counter: Some(counter),
             };
             if let Err(trap) = nvn.resume_replay(&mut guest) {
                 self.held_failed = Some(Some(trap));
@@ -5835,7 +5843,7 @@ impl Worker {
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
                 memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
-                counter,
+                counter: Some(counter),
             };
             nvn.call(&name, &mut guest)
         };

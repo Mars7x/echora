@@ -19,11 +19,19 @@ use echora_guest::memory::Memory;
 
 /// What an NVN call sees of the guest: the calling thread's registers, the
 /// full memory with its checked host-side accesses, and the system counter
-/// at the call.
+/// for calls that can execute work.
 pub struct Guest<'a> {
     pub cpu: &'a mut Cpu,
     pub memory: GuestMemory<'a>,
-    pub counter: u64,
+    pub counter: Option<u64>,
+}
+
+impl Guest<'_> {
+    fn counter(&self) -> Result<u64, Trap> {
+        self.counter.ok_or_else(|| Trap::InvalidState {
+            message: "NVN execution needs a guest counter sample".into(),
+        })
+    }
 }
 
 /// Guest memory as an NVN call reaches it: the machine's checked memory
@@ -2039,7 +2047,7 @@ impl Nvn {
                         "timestamp read {:#x} ticks {ticks} ns {nanoseconds} lr {:#x} now {} x19 {object:#x} {}",
                         x[1],
                         core.cpu.regs[30],
-                        core.counter,
+                        core.counter()?,
                         fields.join(" ")
                     );
                 }
@@ -5064,7 +5072,7 @@ impl Nvn {
                     self.gpu_note(format!("counter report of type {}", command.x[1]));
                 }
                 let to = self.gpu_to_guest(command.x[2], 16).map_err(stop)?;
-                let timestamp = core.counter;
+                let timestamp = core.counter()?;
                 // ECHORA_SAMPLES_PASSED_FORCE=N (debugging): every
                 // SAMPLES_PASSED report says N (which consumer reads them).
                 if command.x[1] & 0xffff_ffff == 1
@@ -7745,7 +7753,7 @@ mod tests {
         let mut guest = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: None,
         };
         let address = 0x10_0000;
         guest.cpu.regs[0] = address;
@@ -7776,7 +7784,7 @@ mod tests {
         let mut guest = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: Some(0),
         };
         let mut nvn = Nvn::default();
         nvn.render_queue = Some(1);
@@ -7828,7 +7836,7 @@ mod tests {
         let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: Some(0),
         };
         let mut nvn = Nvn::default();
         let (device_builder, device) = (0x10_0000, 0x10_1000);
@@ -7897,7 +7905,7 @@ mod tests {
         let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: Some(0),
         };
         let mut nvn = Nvn::default();
         let builder = 0x10_0000;
@@ -7932,7 +7940,7 @@ mod tests {
         let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: 0,
+            counter: Some(0),
         };
         // The CPU reference path: no GPU backend, so the images hold texels.
         let mut nvn = Nvn {
