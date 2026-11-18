@@ -35,6 +35,11 @@ rewrite, with identical text and annotations. A full lift of the same
 game and options emitted byte-identical Rust for all 1,111 regions. The
 two full lift runs took 181 s and 296 s, respectively.
 
+Region emission shares the translation analyses and writes completed
+regions in address order. With four logical CPUs available to the lift,
+emitting up to four regions at once took 85 s against 181 s for serial
+emission. All 1,111 generated region sources matched byte for byte.
+
 ## Translated execution
 
 Measured on the benchmark kernels (`benches/kernels.rs`, x86-64, release),

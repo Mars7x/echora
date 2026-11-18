@@ -13,6 +13,7 @@ use serde::{Serialize, ser::SerializeStruct};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
+use std::sync::Arc;
 
 /// Keep the host compiler's largest generated function bounded. Small
 /// translations retain the direct single-function form to avoid extra dispatch.
@@ -1166,7 +1167,7 @@ fn emit_call(output: &mut String, next: u64) {
 
 /// With `EmitOptions::deferred_charges`: whether the pending count may be
 /// nonzero where the block at `start` charges: a block that may defer its
-/// charge (`PENDING`) reaches it by a constant successor, or one in its
+/// charge reaches it by a constant successor, or one in its
 /// window leaves by a computed one (every block of the window then
 /// flushes), or it is emitted in a lifted function (which flushes every
 /// charge). Elsewhere the count is zero: a window starts at zero, every
@@ -1174,19 +1175,17 @@ fn emit_call(output: &mut String, next: u64) {
 /// charge.
 fn pending_may_be_set(start: u64) -> bool {
     IN_FUNCTION.get()
-        || PENDING.with_borrow(|pending| {
-            pending.as_ref().is_none_or(|(reached, windows)| {
-                reached.contains(&start) || windows.contains(&(start >> SPLIT_WINDOW_BITS))
-            })
+        || EMISSION_ANALYSES.with_borrow(|analysis| {
+            analysis
+                .as_deref()
+                .and_then(|analysis| analysis.pending.as_ref())
+                .is_none_or(|(reached, windows)| {
+                    reached.contains(&start) || windows.contains(&(start >> SPLIT_WINDOW_BITS))
+                })
         })
 }
 
 thread_local! {
-    /// With `EmitOptions::deferred_charges`: the blocks a block that may
-    /// defer reaches by a constant successor, and the windows one leaves
-    /// from by a computed successor (`pending_may_be_set`).
-    static PENDING: std::cell::RefCell<Option<(BTreeSet<u64>, BTreeSet<u64>)>> =
-        const { std::cell::RefCell::new(None) };
     /// Set while a lifted function is emitted.
     static IN_FUNCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::transitive_summaries` of the emission on this thread.
@@ -1426,27 +1425,6 @@ pub fn plt_report(translation: &Translation, region_bits: u32) -> PltReport {
     report
 }
 
-thread_local! {
-    /// The PLT stubs of the split emission running on this thread, unless
-    /// `EmitOptions::stub_windows` keeps every stub in its own window.
-    static PLT: std::cell::RefCell<Option<Plt>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Sets [`PLT`] for as long as it lives.
-struct PltStubs(Option<Plt>);
-
-impl PltStubs {
-    fn set(plt: Option<Plt>) -> Self {
-        Self(PLT.replace(plt))
-    }
-}
-
-impl Drop for PltStubs {
-    fn drop(&mut self) {
-        PLT.set(self.0.take());
-    }
-}
-
 /// A branch at `from` to the PLT stub at `target` (the branch has set the
 /// link register; for a call, `m.cpu.pc` is the stub): the stub runs here
 /// instead of in its window, as the same block (charged and with a host
@@ -1463,8 +1441,8 @@ fn emit_plt_stub(
     if !PLT_ON.get() {
         return None;
     }
-    PLT.with_borrow(|plt| {
-        let (stub, direct) = plt.as_ref()?.site(from, target, link)?;
+    EMISSION_ANALYSES.with_borrow(|analysis| {
+        let (stub, direct) = analysis.as_deref()?.plt.as_ref()?.site(from, target, link)?;
         if !link {
             writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
         }
@@ -3760,9 +3738,10 @@ fn emit_block_body(
                 "spin_hint",
                 "trace_hit",
             ];
-            let checked = RESUME.with_borrow(|resume| {
-                resume
-                    .as_ref()
+            let checked = EMISSION_ANALYSES.with_borrow(|analysis| {
+                analysis
+                    .as_deref()
+                    .and_then(|analysis| analysis.resume.as_ref())
                     .is_none_or(|resume| resume.contains(&block.start))
             });
             if (!resumable || !checked) && !observes.iter().any(|text| rest.contains(text)) {
@@ -4076,7 +4055,7 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
 /// with its index in the function table, and the region bits; with
 /// `EmitOptions::function_table`, calls go through the table.
 struct FunctionSet {
-    entries: std::rc::Rc<BTreeMap<u64, usize>>,
+    entries: Arc<BTreeMap<u64, usize>>,
     region_bits: u32,
     table: bool,
 }
@@ -4415,7 +4394,7 @@ impl Drop for TransitiveSummaries {
 }
 
 /// Effect summaries by function entry, shared between regions.
-type SummaryMap = std::rc::Rc<BTreeMap<u64, (Dirty, Dirty)>>;
+type SummaryMap = Arc<BTreeMap<u64, (Dirty, Dirty)>>;
 
 /// Restores [`SUMMARIES`] when it goes.
 struct Summaries(Option<SummaryMap>);
@@ -5291,13 +5270,6 @@ impl Drop for FloatRuns {
 }
 
 thread_local! {
-    /// With `EmitOptions::deferred_charges`: the blocks that keep their
-    /// charge's host boundary (`resume_blocks`: where execution can resume,
-    /// and every backward branch's target, so every loop still checks).
-    static RESUME: std::cell::RefCell<Option<BTreeSet<u64>>> = const { std::cell::RefCell::new(None) };
-}
-
-thread_local! {
     /// `EmitOptions::deferred_charges` of the emission running on this thread.
     static DEFERRED_CHARGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -5314,16 +5286,6 @@ impl DeferredCharges {
 impl Drop for DeferredCharges {
     fn drop(&mut self) {
         DEFERRED_CHARGES.set(self.0);
-    }
-}
-
-/// Clears the deferred charges' analyses (`RESUME`, `PENDING`) when it goes.
-struct DeferredAnalyses;
-
-impl Drop for DeferredAnalyses {
-    fn drop(&mut self) {
-        RESUME.set(None);
-        PENDING.set(None);
     }
 }
 
@@ -5571,25 +5533,6 @@ thread_local! {
     static UNTAGGED_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::split_ticks` of the emission running on this thread.
     static SPLIT_TICKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// With `EmitOptions::direct_calls`: the blocks with a dispatch arm and
-    /// the region size of the emission running on this thread.
-    static DIRECT_CALLS: std::cell::RefCell<Option<(BTreeSet<u64>, u32)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Sets [`DIRECT_CALLS`] for as long as it lives.
-struct DirectCalls(Option<(BTreeSet<u64>, u32)>);
-
-impl DirectCalls {
-    fn set(calls: Option<(BTreeSet<u64>, u32)>) -> Self {
-        Self(DIRECT_CALLS.replace(calls))
-    }
-}
-
-impl Drop for DirectCalls {
-    fn drop(&mut self) {
-        DIRECT_CALLS.set(self.0.take());
-    }
 }
 
 /// The window to call directly for a BL at `from` to `target`
@@ -5599,8 +5542,8 @@ fn direct_call_window(from: u64, target: u64) -> Option<u64> {
     if !DIRECT_ON.get() {
         return None;
     }
-    DIRECT_CALLS.with_borrow(|calls| {
-        let (entered, region_bits) = calls.as_ref()?;
+    EMISSION_ANALYSES.with_borrow(|analysis| {
+        let (entered, region_bits) = analysis.as_deref()?.direct_calls.as_ref()?;
         (entered.contains(&target) && target >> region_bits == from >> region_bits)
             .then_some(target >> SPLIT_WINDOW_BITS)
     })
@@ -5682,28 +5625,9 @@ impl Drop for FpStatusLocals {
 }
 
 thread_local! {
-    /// With `EmitOptions::fused_flags`: the registers and flags live at the
-    /// end of each block (by block start) of the emission on this thread.
-    static FUSED_FLAGS: std::cell::RefCell<Option<BTreeMap<u64, crate::defuse::Regs>>> =
-        const { std::cell::RefCell::new(None) };
     /// The block being emitted fuses the flag setter at this PC with the
     /// B.cond after it, which tests this condition.
     static FUSE: std::cell::Cell<Option<(u64, u8)>> = const { std::cell::Cell::new(None) };
-}
-
-/// Sets [`FUSED_FLAGS`] for as long as it lives.
-struct FusedFlags(Option<BTreeMap<u64, crate::defuse::Regs>>);
-
-impl FusedFlags {
-    fn set(live_out: Option<BTreeMap<u64, crate::defuse::Regs>>) -> Self {
-        Self(FUSED_FLAGS.replace(live_out))
-    }
-}
-
-impl Drop for FusedFlags {
-    fn drop(&mut self) {
-        FUSED_FLAGS.set(self.0.take());
-    }
 }
 
 /// The flag setter and condition `block` fuses, if any: its last two
@@ -5732,8 +5656,8 @@ fn fusion(block: &BasicBlock) -> Option<(u64, u8)> {
     if !FUSED_ON.get() {
         return None;
     }
-    FUSED_FLAGS.with_borrow(|live| {
-        let live = live.as_ref()?.get(&block.start)?;
+    EMISSION_ANALYSES.with_borrow(|analysis| {
+        let live = analysis.as_deref()?.live_out.as_ref()?.get(&block.start)?;
         (!live.nzcv).then_some((setter.pc, condition))
     })
 }
@@ -5911,7 +5835,7 @@ impl RegionSettings {
     fn set(
         options: EmitOptions,
         region_bits: u32,
-        functions: &std::rc::Rc<BTreeMap<u64, usize>>,
+        functions: &Arc<BTreeMap<u64, usize>>,
         summaries: &Option<SummaryMap>,
     ) -> Self {
         Self {
@@ -5968,6 +5892,35 @@ impl RegionSettings {
     }
 }
 
+/// Read-only results shared by the region emitters. A worker's region
+/// options stay in thread-local storage, independent of other regions.
+struct EmissionAnalyses {
+    pending: Option<(BTreeSet<u64>, BTreeSet<u64>)>,
+    resume: Option<BTreeSet<u64>>,
+    plt: Option<Plt>,
+    direct_calls: Option<(BTreeSet<u64>, u32)>,
+    live_out: Option<BTreeMap<u64, crate::defuse::Regs>>,
+}
+
+thread_local! {
+    static EMISSION_ANALYSES: std::cell::RefCell<Option<Arc<EmissionAnalyses>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct WorkerAnalyses(Option<Arc<EmissionAnalyses>>);
+
+impl WorkerAnalyses {
+    fn install(analyses: &Arc<EmissionAnalyses>) -> Self {
+        Self(EMISSION_ANALYSES.replace(Some(Arc::clone(analyses))))
+    }
+}
+
+impl Drop for WorkerAnalyses {
+    fn drop(&mut self) {
+        EMISSION_ANALYSES.set(self.0.take());
+    }
+}
+
 /// [`emit_rust_split_to_with`], with `listed` instead of `base` for the
 /// regions in `regions` (region indices, as in the crate names `gen-r-<x>`):
 /// options can be tried on some regions while the others keep `base`'s
@@ -5995,23 +5948,17 @@ pub fn emit_rust_split_to_regions<E>(
     };
     let used =
         |pick: fn(&EmitOptions) -> bool| pick(&base) || (!regions.is_empty() && pick(&listed));
-    // Analyses some region's emission needs, set once.
-    let _deferred = DeferredAnalyses;
-    if used(|o| o.deferred_charges && o.split_ticks) {
-        let resume = resume_blocks(translation);
-        PENDING.set(Some(pending_reach(
-            translation,
-            &resume,
-            &inlined_blocks(translation),
-        )));
-        RESUME.set(Some(resume));
-    }
-    let _plt = PltStubs::set(used(|o| !o.stub_windows).then(|| Plt::of(translation, region_bits)));
-    let _direct_calls = DirectCalls::set(
-        used(|o| o.direct_calls).then(|| (entered_blocks(translation), region_bits)),
-    );
-    let _fused_flags =
-        FusedFlags::set(used(|o| o.fused_flags).then(|| crate::liveness::live_out(translation)));
+    let inlined = inlined_blocks(translation);
+    let resume = used(|o| o.deferred_charges && o.split_ticks).then(|| resume_blocks(translation));
+    let analyses = Arc::new(EmissionAnalyses {
+        pending: resume
+            .as_ref()
+            .map(|resume| pending_reach(translation, resume, &inlined)),
+        resume,
+        plt: used(|o| !o.stub_windows).then(|| Plt::of(translation, region_bits)),
+        direct_calls: used(|o| o.direct_calls).then(|| (entered_blocks(translation), region_bits)),
+        live_out: used(|o| o.fused_flags).then(|| crate::liveness::live_out(translation)),
+    });
     let trees: BTreeMap<u64, crate::structure::WindowAnalysis> = if used(|o| o.structured) {
         // Every block execution can resume at is an entry of its tree, so
         // the tree is the window's only copy of its code.
@@ -6039,7 +5986,6 @@ pub fn emit_rust_split_to_regions<E>(
         }
     }
     let shift = region_bits - SPLIT_WINDOW_BITS;
-    let inlined = inlined_blocks(translation);
     let spin_heads: BTreeSet<u64> = crate::spin::find_spin_loops(&translation.blocks)
         .into_iter()
         .map(|spin| spin.head)
@@ -6070,8 +6016,6 @@ pub fn emit_rust_split_to_regions<E>(
         }
         header
     };
-    let finish_region = |_region: u64, source: String| unindent(&source);
-    let mut current: Option<(u64, String)> = None;
     // Lifted functions, emitted after their region's windows: only those of
     // regions whose options have them.
     let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
@@ -6082,7 +6026,7 @@ pub fn emit_rust_split_to_regions<E>(
     } else {
         BTreeMap::new()
     };
-    let function_indices: std::rc::Rc<BTreeMap<u64, usize>> = std::rc::Rc::new(
+    let function_indices: Arc<BTreeMap<u64, usize>> = Arc::new(
         lifted
             .keys()
             .enumerate()
@@ -6109,15 +6053,18 @@ pub fn emit_rust_split_to_regions<E>(
                 );
             }
         }
-        std::rc::Rc::new(summaries)
+        Arc::new(summaries)
     });
-    let mut settings: Option<RegionSettings> = None;
     let mut regions_seen: Vec<u64> = Vec::new();
-    let by_start: BTreeMap<u64, &BasicBlock> = translation
-        .blocks
-        .iter()
-        .map(|block| (block.start, block))
-        .collect();
+    let by_start: BTreeMap<u64, &BasicBlock> = if lifted.is_empty() {
+        BTreeMap::new()
+    } else {
+        translation
+            .blocks
+            .iter()
+            .map(|block| (block.start, block))
+            .collect()
+    };
     let region_functions = |region: u64, output: &mut String| {
         let first = region << region_bits;
         let last = first + ((1u64 << region_bits) - 1);
@@ -6127,7 +6074,7 @@ pub fn emit_rust_split_to_regions<E>(
             emit_function(output, entry, &blocks, &inlined, &spin_heads);
         }
     };
-    for (window, blocks) in &windows {
+    for (window, _) in &windows {
         let region = window >> shift;
         writeln!(
             root,
@@ -6137,103 +6084,97 @@ pub fn emit_rust_split_to_regions<E>(
         if regions_seen.last() != Some(&region) {
             regions_seen.push(region);
         }
-        if current.as_ref().map(|(index, _)| *index) != Some(region) {
-            if let Some((index, mut source)) = current.take() {
-                region_functions(index, &mut source);
-                sink(index, finish_region(index, source))?;
+    }
+    let emit = |region_windows: &[(u64, &[BasicBlock])]| {
+        let region = region_windows[0].0 >> shift;
+        let options = options_of(region);
+        let _analyses = WorkerAnalyses::install(&analyses);
+        let _settings = RegionSettings::set(options, region_bits, &function_indices, &summaries);
+        let mut source = header_of(options);
+        for (window, blocks) in region_windows {
+            let output = &mut source;
+            // A window lies within one page, and page permissions change only in
+            // SVCs, which leave the window: one execute check on entry covers
+            // every block run before it returns.
+            let mut cases = String::new();
+            let structured =
+                trees
+                    .get(window)
+                    .filter(|_| options.structured)
+                    .and_then(|analysis| {
+                        let tree = analysis.structure.as_ref()?;
+                        analysis.control_entries().next()?;
+                        Some((analysis, tree))
+                    });
+            if let Some((analysis, tree)) = structured {
+                // No boundary comes before a block that is not an entry, so
+                // execution never resumes there and the tree needs no other
+                // arms.
+                let entries: BTreeSet<u64> = analysis.control_entries().collect();
+                let skip: BTreeSet<u64> = blocks
+                    .iter()
+                    .map(|block| block.start)
+                    .filter(|start| !entries.contains(start))
+                    .collect();
+                emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads, &skip);
+            } else {
+                emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
             }
-            // The region's options: the previous region's settings go first,
-            // so each starts from the thread's own.
-            drop(settings.take());
-            settings = Some(RegionSettings::set(
-                options_of(region),
-                region_bits,
-                &function_indices,
-                &summaries,
-            ));
-            current = Some((region, header_of(options_of(region))));
-        }
-        let output = &mut current.as_mut().expect("region set above").1;
-        // A window lies within one page, and page permissions change only in
-        // SVCs, which leave the window: one execute check on entry covers
-        // every block run before it returns.
-        let mut cases = String::new();
-        let structured = trees
-            .get(window)
-            .filter(|_| options_of(region).structured)
-            .and_then(|analysis| {
-                let tree = analysis.structure.as_ref()?;
-                analysis.control_entries().next()?;
-                Some((analysis, tree))
-            });
-        if let Some((analysis, tree)) = structured {
-            // No boundary comes before a block that is not an entry, so
-            // execution never resumes there and the tree needs no other
-            // arms.
-            let entries: BTreeSet<u64> = analysis.control_entries().collect();
-            let skip: BTreeSet<u64> = blocks
-                .iter()
-                .map(|block| block.start)
-                .filter(|start| !entries.contains(start))
-                .collect();
-            emit_structured_cases(&mut cases, blocks, analysis, tree, &spin_heads, &skip);
-        } else {
-            emit_split_cases(&mut cases, blocks, &inlined, &spin_heads);
-        }
-        // Dense dispatch: each arm is the block's offset in the window in
-        // instructions; the matched value is the offset rotated right by
-        // two, so a misaligned PC or one outside the window (a huge value)
-        // matches no arm.
-        let dense = DENSE_DISPATCH.get() && structured.is_none();
-        let base = window << SPLIT_WINDOW_BITS;
-        if dense {
-            let mut indexed = String::with_capacity(cases.len());
-            for line in cases.split_inclusive('\n') {
-                let arm = line
-                    .strip_prefix("            0x")
-                    .and_then(|rest| rest.strip_suffix(" => {\n"))
-                    .and_then(|pc| u64::from_str_radix(pc, 16).ok())
-                    .filter(|pc| *pc >> SPLIT_WINDOW_BITS == *window);
-                match arm {
-                    Some(pc) => {
-                        writeln!(indexed, "            {} => {{", (pc - base) >> 2).unwrap();
+            // Dense dispatch: each arm is the block's offset in the window in
+            // instructions; the matched value is the offset rotated right by
+            // two, so a misaligned PC or one outside the window (a huge value)
+            // matches no arm.
+            let dense = DENSE_DISPATCH.get() && structured.is_none();
+            let base = window << SPLIT_WINDOW_BITS;
+            if dense {
+                let mut indexed = String::with_capacity(cases.len());
+                for line in cases.split_inclusive('\n') {
+                    let arm = line
+                        .strip_prefix("            0x")
+                        .and_then(|rest| rest.strip_suffix(" => {\n"))
+                        .and_then(|pc| u64::from_str_radix(pc, 16).ok())
+                        .filter(|pc| *pc >> SPLIT_WINDOW_BITS == *window);
+                    match arm {
+                        Some(pc) => {
+                            writeln!(indexed, "            {} => {{", (pc - base) >> 2).unwrap();
+                        }
+                        None => indexed.push_str(line),
                     }
-                    None => indexed.push_str(line),
                 }
-            }
-            cases = indexed;
-            writeln!(
+                cases = indexed;
+                writeln!(
                 cases,
                 "            _ if next_pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
             )
             .unwrap();
-            cases.push_str("            _ => return Err(Trap::MissingBlock { pc: next_pc }),\n");
-        } else {
-            writeln!(
-                cases,
-                "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
-            )
-            .unwrap();
-            // Every completed block passes the boundary check, so a loop that
-            // stays inside one window still yields to the host scheduler.
-            cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
-        }
-        let locals = RegisterLocals::of(&cases);
-        // Structured trees leave dead code after their `break`s.
-        let dead = if structured.is_some() {
-            ", unreachable_code"
-        } else {
-            ""
-        };
-        writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
-        output.push_str(&locals.load());
-        // The blocks run in a nested function so their early returns still
-        // pass the final store; it is always inlined, as a closure is not,
-        // so `r`'s fields stay host registers instead of stack slots
-        // reached through pointers. The PC is a local the blocks set;
-        // memory gets it after each block, where the boundary check and
-        // anything leaving the window see it.
-        output.push_str(
+                cases
+                    .push_str("            _ => return Err(Trap::MissingBlock { pc: next_pc }),\n");
+            } else {
+                writeln!(
+                    cases,
+                    "            pc if pc >> {SPLIT_WINDOW_BITS} != {window:#x} => return Ok(()),"
+                )
+                .unwrap();
+                // Every completed block passes the boundary check, so a loop that
+                // stays inside one window still yields to the host scheduler.
+                cases.push_str("            pc => return Err(Trap::MissingBlock { pc }),\n");
+            }
+            let locals = RegisterLocals::of(&cases);
+            // Structured trees leave dead code after their `break`s.
+            let dead = if structured.is_some() {
+                ", unreachable_code"
+            } else {
+                ""
+            };
+            writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+            output.push_str(&locals.load());
+            // The blocks run in a nested function so their early returns still
+            // pass the final store; it is always inlined, as a closure is not,
+            // so `r`'s fields stay host registers instead of stack slots
+            // reached through pointers. The PC is a local the blocks set;
+            // memory gets it after each block, where the boundary check and
+            // anything leaving the window see it.
+            output.push_str(
             if DEFERRED_CHARGES.get() {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, pending: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             } else if STEPS_LOCAL.get() {
@@ -6242,57 +6183,87 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
         );
-        let body = locals.rewrite(&cases);
-        let header = if dense {
-            format!(
-                "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
-            )
-        } else {
-            "    loop {\n        match next_pc {\n".to_owned()
-        };
-        if WINDOW_MEMORY.get() {
-            // Plain guest loads and stores through the window's copy of the
-            // access path (exclusive, atomic and wider accesses stay on
-            // `m.memory`).
-            output.push_str("    let wmem = m.memory.window_memory();\n");
-            output.push_str(&header);
-            output.push_str(
-                &body
-                    .replace("m.memory.load_u", "wmem.load_u")
-                    .replace("m.memory.store_u", "wmem.store_u"),
-            );
-        } else {
-            output.push_str(&header);
-            output.push_str(&body);
-        }
-        if STEPS_LOCAL.get() && !DEFERRED_CHARGES.get() {
-            // The local count goes back before anything after the window
-            // sees the steps. `Core::finish_block` reads no step count
-            // (host checks are the charges' since split ticks), so it needs
-            // no store of the local before it.
-            output.push_str(
+            let body = locals.rewrite(&cases);
+            let header = if dense {
+                format!(
+                    "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
+                )
+            } else {
+                "    loop {\n        match next_pc {\n".to_owned()
+            };
+            if WINDOW_MEMORY.get() {
+                // Plain guest loads and stores through the window's copy of the
+                // access path (exclusive, atomic and wider accesses stay on
+                // `m.memory`).
+                output.push_str("    let wmem = m.memory.window_memory();\n");
+                output.push_str(&header);
+                output.push_str(
+                    &body
+                        .replace("m.memory.load_u", "wmem.load_u")
+                        .replace("m.memory.store_u", "wmem.store_u"),
+                );
+            } else {
+                output.push_str(&header);
+                output.push_str(&body);
+            }
+            if STEPS_LOCAL.get() && !DEFERRED_CHARGES.get() {
+                // The local count goes back before anything after the window
+                // sees the steps. `Core::finish_block` reads no step count
+                // (host checks are the charges' since split ticks), so it needs
+                // no store of the local before it.
+                output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut st = m.steps;\nlet result = body(m, &mut r, &mut st);\nm.steps = st;\n",
             );
-        } else if DEFERRED_CHARGES.get() {
-            // The deferred blocks' instructions count before anything
-            // after the window (the host's trap settling and checks) sees
-            // the steps.
-            output.push_str(
+            } else if DEFERRED_CHARGES.get() {
+                // The deferred blocks' instructions count before anything
+                // after the window (the host's trap settling and checks) sees
+                // the steps.
+                output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
             );
-        } else {
-            output.push_str(
+            } else {
+                output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
             );
+            }
+            output.push_str(&locals.store());
+            output.push_str("    result\n}\n");
         }
-        output.push_str(&locals.store());
-        output.push_str("    result\n}\n");
+        region_functions(region, &mut source);
+        (region, unindent(&source))
+    };
+    let groups: Vec<_> = windows
+        .chunk_by(|a, b| a.0 >> shift == b.0 >> shift)
+        .collect();
+    let workers = if windows.len() < 256 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+    };
+    for batch in groups.chunks(workers) {
+        if let [one] = batch {
+            let (region, source) = emit(one);
+            sink(region, source)?;
+        } else {
+            std::thread::scope(|scope| {
+                let pending: Vec<_> = batch
+                    .iter()
+                    .map(|windows| scope.spawn(|| emit(windows)))
+                    .collect();
+                // Keep deterministic sink order and hold at most one batch
+                // of completed region sources at a time.
+                for worker in pending {
+                    let (region, source) = worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    sink(region, source)?;
+                }
+                Ok(())
+            })?;
+        }
     }
-    if let Some((index, mut source)) = current.take() {
-        region_functions(index, &mut source);
-        sink(index, finish_region(index, source))?;
-    }
-    drop(settings);
     root.push_str("        _ => Err(Trap::MissingBlock { pc }),\n    }\n}\n");
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
