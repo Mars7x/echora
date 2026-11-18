@@ -395,10 +395,10 @@ type StageCode = (std::sync::Arc<Vec<u8>>, u64);
 pub struct Nvn {
     /// Guest addresses of replaced exports.
     hooks: BTreeMap<u64, HostEntry>,
-    /// Thunk index -> entry-point name.
-    thunks: Vec<String>,
+    /// Thunk index -> interned entry-point name.
+    thunks: Vec<&'static str>,
     #[serde(skip)]
-    by_name: BTreeMap<String, u64>,
+    by_name: BTreeMap<&'static str, u64>,
     /// Calls per entry point that reached the host.
     pub calls: BTreeMap<String, u64>,
     /// ECHORA_NVN_PROFILE: host microseconds spent in each entry point.
@@ -1828,16 +1828,13 @@ impl Nvn {
         if let Some(entry) = self.hooks.get(&pc) {
             return Some(entry.clone());
         }
-        let offset = pc.checked_sub(THUNK_BASE)?;
-        if offset >= THUNK_SIZE || !offset.is_multiple_of(THUNK_STRIDE) {
-            return None;
-        }
         self.thunks
-            .get((offset / THUNK_STRIDE) as usize)
-            .map(|name| HostEntry::Proc(intern(name)))
+            .get(thunk_index(pc)?)
+            .copied()
+            .map(HostEntry::Proc)
     }
 
-    /// Whether `pc` is a host entry (no allocation, unlike `entry`).
+    /// Whether `pc` is a host entry.
     pub fn has_entry(&self, pc: u64) -> bool {
         self.hooks.contains_key(&pc) || self.thunk_name(pc).is_some()
     }
@@ -1853,7 +1850,7 @@ impl Nvn {
 
     /// The entry point name of each thunk, in thunk order (see `thunk_in`).
     pub fn thunk_names(&self) -> Vec<&'static str> {
-        self.thunks.iter().map(|name| intern(name)).collect()
+        self.thunks.clone()
     }
 
     /// How many entry point thunks exist (lookups add them).
@@ -1883,8 +1880,9 @@ impl Nvn {
                 message: "NVN thunk range exhausted".into(),
             });
         }
-        self.thunks.push(name.to_owned());
-        self.by_name.insert(name.to_owned(), address);
+        let name = intern(name);
+        self.thunks.push(name);
+        self.by_name.insert(name, address);
         Ok(address)
     }
 
