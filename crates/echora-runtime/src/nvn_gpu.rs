@@ -308,8 +308,36 @@ impl Backend {
 /// (ECHORA_VERTEX_TRACE_BASE).
 const TRACED_VARIANT: u64 = 0x7472_6163_6564_0000;
 
-/// Stage keys (vertex, fragment) and the stages' translations.
-pub(super) type BoundProgram = ((u64, u64), Vec<Arc<Translated>>);
+/// Translated stages and binding counts shared by draws of the program.
+#[derive(Clone, Debug)]
+pub(super) struct BoundProgram {
+    keys: (u64, u64),
+    stages: Arc<[Arc<Translated>]>,
+    uniforms: usize,
+    textures: usize,
+}
+
+impl BoundProgram {
+    fn new(keys: (u64, u64), stages: Arc<[Arc<Translated>]>) -> Self {
+        let mut uniforms = 0;
+        let mut textures = 0;
+        for descriptor in stages.iter().flat_map(|stage| &stage.descriptors) {
+            match descriptor.kind() {
+                DescriptorKind::UniformBuffer => uniforms += 1,
+                DescriptorKind::Texture | DescriptorKind::TextureBuffer => textures += 1,
+                _ => {}
+            }
+        }
+        Self {
+            keys,
+            stages,
+            uniforms,
+            textures,
+        }
+    }
+}
+
+pub(super) type BoundMeshProgram = (BoundProgram, Arc<[super::Args]>);
 /// Stage key, binding base, previous stage's stores, generic input types,
 /// compute workgroup size and shared memory, and the task/mesh state.
 type TranslationKey = (
@@ -1674,12 +1702,12 @@ impl Nvn {
             self.stage_code(core, addresses[0]).unwrap().1,
             self.stage_code(core, addresses[1]).unwrap().1,
         );
-        Ok((keys, vec![vertex, fragment]))
+        Ok(BoundProgram::new(keys, Arc::from([vertex, fragment])))
     }
 
     /// The task (if any), mesh and fragment stages of the programs bound for
-    /// a mesh draw: their keys, translations, NVN resource slots and stage
-    /// entries. A mesh program writes the stage buffer, and its control
+    /// a mesh draw: their keys, translations and stage entries. A mesh
+    /// program writes the stage buffer, and its control
     /// section gives its largest vertex and primitive counts at +0x60 (low
     /// and high half) and its threads at +0x58; a task program has nothing
     /// at +0x60, and its +0x58 is laid out as SET_MESH_INIT_SHADER (threads
@@ -1687,10 +1715,7 @@ impl Nvn {
     /// the vertex slot (its header names a vertex program), after one in the
     /// tessellation slot; a pass-through geometry program bound with it
     /// lists the per-primitive outputs.
-    fn bound_mesh_program(
-        &mut self,
-        core: &Guest,
-    ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
+    fn bound_mesh_program(&mut self, core: &Guest) -> Result<BoundMeshProgram, String> {
         // As `bound_program`: the same binds within a present and with no
         // shader-code flush or program change since give the same stages.
         let mut binds: Vec<(&'static str, [u64; 8])> = self
@@ -1713,10 +1738,7 @@ impl Nvn {
         Ok(found)
     }
 
-    fn resolve_bound_mesh_program(
-        &mut self,
-        core: &Guest,
-    ) -> Result<(BoundProgram, Vec<u32>, Vec<super::Args>), String> {
+    fn resolve_bound_mesh_program(&mut self, core: &Guest) -> Result<BoundMeshProgram, String> {
         // The graphics stages' programs: the COMPUTE bit's (5, NVN's
         // 0x20) is not one. A program bound for every bit (0xff, as the
         // game binds its tile classifier) stays in the compute slot while
@@ -1829,7 +1851,7 @@ impl Nvn {
                 base[2] + count(DescriptorKind::Image),
             ]
         };
-        let (mut translated, mut slots, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut translated, mut entries) = (Vec::new(), Vec::new());
         let mut base = [0u32; 3];
         let mut keys = 0u64;
         if let (Some(task), Some(init)) = (task, task_init) {
@@ -1853,7 +1875,6 @@ impl Nvn {
             base = advance(&stage, base);
             keys = self.stage_code(core, task.x[0]).map_or(0, |(_, key)| key);
             translated.push(stage);
-            slots.push(6);
             entries.push(task);
         }
         let parameters = MeshParameters {
@@ -1877,7 +1898,6 @@ impl Nvn {
         let stores = stage.stores;
         keys = keys.rotate_left(1) ^ self.stage_code(core, mesh.x[0]).map_or(0, |(_, key)| key);
         translated.push(stage);
-        slots.push(7);
         entries.push(mesh);
         let stage = self.translate_stage(
             core,
@@ -1895,16 +1915,14 @@ impl Nvn {
             ));
         }
         translated.push(stage);
-        slots.push(1);
         entries.push(fragment);
         let fragment_key = self
             .stage_code(core, fragment.x[0])
             .map_or(0, |(_, key)| key);
         // Mesh programs never share a key with vertex programs' pipelines.
         Ok((
-            ((keys ^ 0x6d65_7368, fragment_key), translated),
-            slots,
-            entries,
+            BoundProgram::new((keys ^ 0x6d65_7368, fragment_key), translated.into()),
+            entries.into(),
         ))
     }
 
@@ -7396,13 +7414,14 @@ impl Nvn {
         };
         let mut since = timing.then(std::time::Instant::now);
         let mesh_draw = command.name.contains("DrawMeshTasks");
-        let ((keys, stages), slots, mesh_entries) = if mesh_draw {
-            self.bound_mesh_program(core)?
+        let (program, mesh_entries) = if mesh_draw {
+            let (program, entries) = self.bound_mesh_program(core)?;
+            (program, Some(entries))
         } else {
-            let bound = self.bound_program(core)?;
-            let slots = bound.1.iter().map(|stage| nvn_stage(stage.stage)).collect();
-            (bound, slots, Vec::new())
+            (self.bound_program(core)?, None)
         };
+        let keys = program.keys;
+        let stages = &*program.stages;
         let mesh_groups = if mesh_draw {
             Some(self.mesh_groups(core, command)?)
         } else {
@@ -7537,7 +7556,7 @@ impl Nvn {
                 eprintln!("shader stats: draw {:016x}/{:016x}", keys.0, keys.1);
             }
             let program = backend.renderer.create_program_specialized(
-                stages.clone(),
+                stages.to_vec(),
                 if base_filter {
                     &untraced
                 } else {
@@ -7556,7 +7575,7 @@ impl Nvn {
             if base_filter && specialization.iter().any(|values| !values.is_empty()) {
                 let traced = backend
                     .renderer
-                    .create_program_specialized(stages.clone(), &specialization)?;
+                    .create_program_specialized(stages.to_vec(), &specialization)?;
                 backend
                     .programs
                     .insert((built.0, built.1 ^ TRACED_VARIANT), traced);
@@ -7694,22 +7713,12 @@ impl Nvn {
         // Bindings, through the inferred map.
         // Sized for the program's bindings: filled per draw, grown would
         // reallocate a few times each draw.
-        let count = |kinds: &[DescriptorKind]| {
-            stages
-                .iter()
-                .flat_map(|stage| &stage.descriptors)
-                .filter(|descriptor| kinds.contains(&descriptor.kind()))
-                .count()
-        };
-        let uniform_count = count(&[DescriptorKind::UniformBuffer]);
         let mut uniforms =
-            echora_gpu::FastMap::with_capacity_and_hasher(uniform_count, Default::default());
+            echora_gpu::FastMap::with_capacity_and_hasher(program.uniforms, Default::default());
         let mut guest_uniforms =
-            echora_gpu::FastMap::with_capacity_and_hasher(uniform_count, Default::default());
-        let mut textures = echora_gpu::FastMap::with_capacity_and_hasher(
-            count(&[DescriptorKind::Texture, DescriptorKind::TextureBuffer]),
-            Default::default(),
-        );
+            echora_gpu::FastMap::with_capacity_and_hasher(program.uniforms, Default::default());
+        let mut textures =
+            echora_gpu::FastMap::with_capacity_and_hasher(program.textures, Default::default());
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
@@ -7725,7 +7734,7 @@ impl Nvn {
         let mut memo_hits = 0u64;
         let mut binding_lap: Option<(usize, std::time::Instant)> = None;
         for (index, stage) in stages.iter().enumerate() {
-            let nvn = slots[index];
+            let nvn = nvn_stage(stage.stage);
             for descriptor in &stage.descriptors {
                 let now = timing.then(std::time::Instant::now);
                 if let (Some((kind, since)), Some(now)) = (binding_lap, now) {
@@ -7792,11 +7801,12 @@ impl Nvn {
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
-                        let mut bytes = match mesh_entries.get(index) {
-                            Some(&entry) => self.stage_constants_of(core, entry),
-                            None => self.stage_constants(core, index as u32),
-                        }
-                        .unwrap_or_default();
+                        let mut bytes =
+                            match mesh_entries.as_ref().and_then(|entries| entries.get(index)) {
+                                Some(&entry) => self.stage_constants_of(core, entry),
+                                None => self.stage_constants(core, index as u32),
+                            }
+                            .unwrap_or_default();
                         bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
@@ -8029,7 +8039,7 @@ impl Nvn {
             if stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE == 0 {
                 continue;
             }
-            let nvn = slots[index];
+            let nvn = nvn_stage(stage.stage);
             for slot in 0..16u64 {
                 if let Some(bind) = self.render.state.get(bind_key(
                     "BindStorageBuffer",
@@ -8088,9 +8098,9 @@ impl Nvn {
         // One stage's list is shared as it is (unchanged lists are then
         // known without comparing); several are joined.
         let mut lists = Vec::new();
-        for (index, stage) in stages.iter().enumerate() {
+        for stage in stages {
             if stage.texture_pool_bindings != 0 {
-                lists.push(self.pool_entries(core, slots[index])?);
+                lists.push(self.pool_entries(core, nvn_stage(stage.stage))?);
             }
         }
         let pool: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = match lists.len() {
@@ -8708,29 +8718,16 @@ impl Nvn {
             })
             .unwrap_or([0.0, 1.0]);
         // Fixed-function state from the record-time snapshots.
-        // (Shared, not copied: a draw read five of them.)
-        static NO_STATE: BTreeMap<String, super::Args> = BTreeMap::new();
-        let snapshot = |key: &str| -> StateSnapshots {
-            self.render
-                .state
-                .get(key)
-                .map(|bind| bind.states.clone())
-                .unwrap_or_default()
-        };
         let arg = |props: &BTreeMap<String, super::Args>, key: &str, index: usize| {
             props.get(key).map(|args| args.x[index])
         };
-        let polygon_states = snapshot("BindPolygonState");
-        let polygon = polygon_states.first().unwrap_or(&NO_STATE);
+        let polygon = self.render.properties("BindPolygonState");
         // The polygon state the draw binds (its address) and the props taken
         // for it, with their element's offset from that address (a nonzero
         // offset is another object's bag: the bound one has none).
-        let depth_states = snapshot("BindDepthStencilState");
-        let depth_state = depth_states.first().unwrap_or(&NO_STATE);
-        let color_states = snapshot("BindColorState");
-        let color_state = color_states.first().unwrap_or(&NO_STATE);
-        let mask_states = snapshot("BindChannelMaskState");
-        let mask_state = mask_states.first().unwrap_or(&NO_STATE);
+        let depth_state = self.render.properties("BindDepthStencilState");
+        let color_state = self.render.properties("BindColorState");
+        let mask_state = self.render.properties("BindChannelMaskState");
         // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
         // index equal to `index` starts a new primitive. Vulkan restarts
         // at the index type's all-ones value only, so matching indices are
@@ -8772,7 +8769,7 @@ impl Nvn {
             // ECHORA_GPU_NO_CULL=<fragment key>[,...] (debugging): those
             // programs' draws cull nothing (shows whether culling is what
             // drops a draw's triangles).
-            cull: match arg(&polygon, "CullFace", 0).unwrap_or(0) {
+            cull: match arg(polygon, "CullFace", 0).unwrap_or(0) {
                 _ if super::debug_var("ECHORA_GPU_NO_CULL").is_ok_and(|keys| {
                     keys.split(',')
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
@@ -8792,29 +8789,29 @@ impl Nvn {
             // the other way (tests the facing convention against the
             // picture).
             front_face: match (
-                arg(&polygon, "FrontFace", 0).unwrap_or(1),
+                arg(polygon, "FrontFace", 0).unwrap_or(1),
                 super::debug_var_os("ECHORA_GPU_INVERT_FACE").is_some(),
             ) {
                 (0, false) | (1.., true) => vk::FrontFace::CLOCKWISE,
                 _ => vk::FrontFace::COUNTER_CLOCKWISE,
             },
-            polygon_mode: match arg(&polygon, "PolygonMode", 0).unwrap_or(2) {
+            polygon_mode: match arg(polygon, "PolygonMode", 0).unwrap_or(2) {
                 0 => vk::PolygonMode::POINT,
                 1 => vk::PolygonMode::LINE,
                 _ => vk::PolygonMode::FILL,
             },
             // ECHORA_GPU_NODEPTH=<fragment key>[,...] (debugging): those
             // programs draw without the depth test.
-            depth_test: arg(&depth_state, "DepthTestEnable", 0).unwrap_or(0) != 0
+            depth_test: arg(depth_state, "DepthTestEnable", 0).unwrap_or(0) != 0
                 && !super::debug_var("ECHORA_GPU_NODEPTH").is_ok_and(|keys| {
                     keys.split(',')
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
                 }),
-            depth_write: arg(&depth_state, "DepthWriteEnable", 0).unwrap_or(0) != 0,
+            depth_write: arg(depth_state, "DepthWriteEnable", 0).unwrap_or(0) != 0,
             // ECHORA_GPU_EQUAL_AS_LEQUAL=<fragment key>[,...] (debugging):
             // those programs' EQUAL depth tests as LESS_OR_EQUAL (tells a
             // depth that differs by rounding from one never written).
-            depth_compare: match compare_op(arg(&depth_state, "DepthFunc", 0).unwrap_or(8)) {
+            depth_compare: match compare_op(arg(depth_state, "DepthFunc", 0).unwrap_or(8)) {
                 vk::CompareOp::EQUAL
                     if super::debug_var("ECHORA_GPU_EQUAL_AS_LEQUAL").is_ok_and(|keys| {
                         keys.split(',')
@@ -8855,20 +8852,18 @@ impl Nvn {
             // buffer's SetPolygonOffsetClamp(factor, units, clamp) (S0-S2):
             // ground decals drawn at the ground's depth rely on it, and
             // z-fought with the ground in alternating rows without it.
-            depth_bias: (arg(&polygon, "PolygonOffsetEnables", 0).unwrap_or(0) & 4 != 0)
+            depth_bias: (arg(polygon, "PolygonOffsetEnables", 0).unwrap_or(0) & 4 != 0)
                 .then(|| self.render.state.get("SetPolygonOffsetClamp"))
                 .flatten()
                 .map(|bind| {
                     let float = |index: usize| f32::from_bits(bind.v[index] as u32);
                     [float(1), float(2), float(0)]
                 }),
-            stencil: (arg(&depth_state, "StencilTestEnable", 0).unwrap_or(0) != 0)
-                .then(|| self.stencil_faces(&depth_state)),
+            stencil: (arg(depth_state, "StencilTestEnable", 0).unwrap_or(0) != 0)
+                .then(|| self.stencil_faces(depth_state)),
             // MultisampleState SetAlphaToCoverageEnable(state, enable).
             alpha_to_coverage: arg(
-                snapshot("BindMultisampleState")
-                    .first()
-                    .unwrap_or(&NO_STATE),
+                self.render.properties("BindMultisampleState"),
                 "AlphaToCoverageEnable",
                 0,
             )
@@ -8909,13 +8904,25 @@ impl Nvn {
         });
         let mut unknown_factors = Vec::new();
         let mut blends = [Blend::default(); MAX_COLOR_TARGETS];
-        for (target, blend) in blends[..bound].iter_mut().enumerate() {
+        macro_rules! target_state_keys {
+            ($($slot:literal),*) => {
+                [$([
+                    concat!("BlendEnable/", $slot),
+                    concat!("BindBlendState/", $slot),
+                    concat!("ChannelMask/", $slot),
+                ]),*]
+            };
+        }
+        const TARGET_STATE_KEYS: [[&str; 3]; MAX_COLOR_TARGETS] =
+            target_state_keys!(0, 1, 2, 3, 4, 5, 6, 7);
+        for (blend, [enable_key, state_key, mask_key]) in
+            blends[..bound].iter_mut().zip(TARGET_STATE_KEYS)
+        {
             // SetBlendEnable(state, index, enable): each index's latest.
-            if let Some(enable) = color_state.get(&format!("BlendEnable/{target}")) {
+            if let Some(enable) = color_state.get(enable_key) {
                 blend.enable = enable.x[1] != 0 && !no_blend;
             }
-            let blend_states = snapshot(&format!("BindBlendState/{target}"));
-            let blend_state = blend_states.first().unwrap_or(&NO_STATE);
+            let blend_state = self.render.properties(state_key);
             if let Some(func) = blend_state.get("BlendFunc") {
                 let factors = func.x.map(blend_factor);
                 if let [Some(src), Some(dst), Some(src_alpha), Some(dst_alpha)] = factors {
@@ -8931,7 +8938,7 @@ impl Nvn {
                 blend.color.2 = blend_op(equation.x[0]);
                 blend.alpha.2 = blend_op(equation.x[1]);
             }
-            if let Some(mask) = mask_state.get(&format!("ChannelMask/{target}")) {
+            if let Some(mask) = mask_state.get(mask_key) {
                 let mut flags = vk::ColorComponentFlags::empty();
                 // r, g, b in X2..X4; alpha (X5) recorded in v[1]. A
                 // G-buffer pass binds one texture as targets 2 and 4
@@ -8986,20 +8993,25 @@ impl Nvn {
             self.sequence_note(&line);
             self.gpu.as_mut().unwrap().note(line);
         }
-        // Each traced binding's texture, in binding order.
-        // The depth target's storage and extent, for the trace below.
-        let depth_storage = depth.map(|texture| {
+        // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: trace those
+        // programs' draws, with their fixed-function state.
+        let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
+            wanted.split(',').any(|item| {
+                item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
+            })
+        });
+        let trace_details = traced_program
+            || (self.gpu.as_ref().unwrap().traced < 40
+                && super::debug_var_os("ECHORA_GPU_LOG").is_some());
+        let depth_storage = depth.filter(|_| trace_details).map(|texture| {
             (
                 self.texture_storage(texture),
                 self.texture_extent(texture).ok(),
                 self.texture_storage(self.render.depth),
             )
         });
-        let traced_textures = if super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
-            wanted.split(',').any(|item| {
-                item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
-            })
-        }) {
+        // Each traced binding's texture, in binding order.
+        let traced_textures = if traced_program {
             let mut bound_textures: Vec<_> = textures.iter().collect();
             bound_textures.sort_by_key(|(key, _)| **key);
             bound_textures
@@ -9015,7 +9027,7 @@ impl Nvn {
         } else {
             String::new()
         };
-        let bound: Vec<String> = if super::debug_var_os("ECHORA_GPU_TRACE_PROGRAM").is_some() {
+        let bound: Vec<String> = if traced_program {
             self.render
                 .state
                 .iter()
@@ -9126,13 +9138,6 @@ impl Nvn {
             }
         }
         let backend = self.gpu.as_mut().unwrap();
-        // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: also trace those
-        // programs' draws, with their fixed-function state.
-        let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
-            wanted.split(',').any(|item| {
-                item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
-            })
-        });
         if traced_program {
             let line = format!(
                 "trace textures present {} {:016x}/{:016x} base {base_vertex} buffer {:#x} {traced_textures}",
@@ -9141,6 +9146,7 @@ impl Nvn {
             eprintln!("{line}");
             backend.note(line);
             // The colour state as snapshotted for this draw (blend enables).
+            let color_state = self.render.properties("BindColorState");
             eprintln!(
                 "trace color state {:016x}/{:016x} {color_state:?} blends {blends:?}",
                 keys.0, keys.1
@@ -9179,9 +9185,7 @@ impl Nvn {
             eprintln!("{line}");
             backend.note(line);
         }
-        if traced_program
-            || (backend.traced < 40 && super::debug_var_os("ECHORA_GPU_LOG").is_some())
-        {
+        if trace_details {
             backend.traced += 1;
             let floats = |bytes: &[u8], count: usize| -> Vec<f32> {
                 bytes
@@ -9211,6 +9215,7 @@ impl Nvn {
                 })
                 .collect();
             uniform_summary.sort();
+            let polygon = self.render.properties("BindPolygonState");
             let polygon_trace = format!(
                 "polygon bound {:#x?} props {polygon:?}",
                 self.render
@@ -9309,7 +9314,7 @@ impl Nvn {
                     all.insert(key, bytes);
                 }
             }
-            (stages.clone(), all, textures.clone(), page_table)
+            (stages.to_vec(), all, textures.clone(), page_table)
         });
         let vertex_fetch_dump = if stage_dump.is_some() {
             vertex_fetch.clone()

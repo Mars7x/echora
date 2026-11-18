@@ -626,7 +626,7 @@ pub struct Nvn {
     #[serde(skip)]
     mesh_program_memo: (
         (u64, u64),
-        HashMap<Vec<(&'static str, [u64; 8])>, (gpu::BoundProgram, Vec<u32>, Vec<Args>)>,
+        HashMap<Vec<(&'static str, [u64; 8])>, gpu::BoundMeshProgram>,
     ),
     /// SHADER_CODE pools' guest storage (start, size).
     #[serde(skip)]
@@ -776,6 +776,17 @@ pub struct RenderState {
     /// holds it under `BindTexture/{stage}/{slot}`: draws that read the
     /// texture pool list a stage's handles without scanning `state`.
     pub bound_textures: BTreeMap<(u64, u64), u64>,
+}
+
+impl RenderState {
+    /// Properties captured for the latest bind of this kind, or the defaults.
+    fn properties(&self, key: &str) -> &BTreeMap<String, Args> {
+        static EMPTY: BTreeMap<String, Args> = BTreeMap::new();
+        self.state
+            .get(key)
+            .and_then(|bind| bind.states.first())
+            .unwrap_or(&EMPTY)
+    }
 }
 
 /// Recorded commands that only change render state (SetRenderTargets,
