@@ -639,6 +639,13 @@ fn shader_word(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
+/// The translator sizes a bank through its last referenced word.
+fn set_shader_word(bytes: &mut [u8], offset: usize, word: u32) {
+    if let Some(destination) = bytes.get_mut(offset..offset + 4) {
+        destination.copy_from_slice(&word.to_le_bytes());
+    }
+}
+
 fn storage_contains(base: u64, size: u64, address: u64, length: u64) -> bool {
     address
         .checked_sub(base)
@@ -8339,11 +8346,9 @@ impl Nvn {
             };
             if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
                 let entry = offset as usize;
-                if bytes.len() < entry + 12 {
-                    bytes.resize((entry + 16).next_multiple_of(16), 0);
-                }
-                bytes[entry..entry + 8].copy_from_slice(&gpu.to_le_bytes());
-                bytes[entry + 8..entry + 12].copy_from_slice(&(size as u32).to_le_bytes());
+                set_shader_word(bytes, entry, gpu as u32);
+                set_shader_word(bytes, entry + 4, (gpu >> 32) as u32);
+                set_shader_word(bytes, entry + 8, size as u32);
             }
         }
         // The driver's other words in each stage's c0: the largest point
@@ -8364,10 +8369,7 @@ impl Nvn {
             };
             if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
                 for (offset, word) in [(0x610, 2047.0f32.to_bits()), (0x644, base_instance)] {
-                    if bytes.len() < offset + 4 {
-                        bytes.resize((offset + 4).next_multiple_of(16), 0);
-                    }
-                    bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+                    set_shader_word(bytes, offset, word);
                 }
             }
         }
