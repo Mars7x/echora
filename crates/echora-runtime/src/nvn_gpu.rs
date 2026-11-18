@@ -27,6 +27,14 @@ use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage
 
 use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, StateSnapshots};
 
+/// Reuse the allocation of the binding tables filled for each draw.
+#[derive(Debug, Default)]
+pub(super) struct DrawBindings {
+    uniforms: echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    guest_uniforms: echora_gpu::FastMap<(usize, u32), (u64, usize)>,
+    textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
+}
+
 /// A built page table (see `Nvn::page_table`).
 pub struct PageBuild {
     first: u64,
@@ -6810,12 +6818,12 @@ impl Nvn {
             ..Default::default()
         };
         write("push.bin".into(), &push.to_bytes())?;
-        for ((stage_index, binding), bytes) in &draw.uniforms {
+        for ((stage_index, binding), bytes) in draw.uniforms {
             if *stage_index == index {
                 write(format!("uniform-0-{binding}.bin"), bytes)?;
             }
         }
-        for ((stage_index, binding), &(guest, length)) in &draw.guest_uniforms {
+        for ((stage_index, binding), &(guest, length)) in draw.guest_uniforms {
             if *stage_index == index
                 && let Some(read) = draw.read_guest
             {
@@ -6824,7 +6832,7 @@ impl Nvn {
                 write(format!("uniform-0-{binding}.bin"), &bytes)?;
             }
         }
-        for ((stage_index, binding), (source, _)) in &draw.textures {
+        for ((stage_index, binding), (source, _)) in draw.textures {
             if *stage_index != index {
                 continue;
             }
@@ -7840,6 +7848,21 @@ impl Nvn {
 
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
+        let mut bindings = std::mem::take(&mut self.draw_bindings);
+        let result = self.gpu_draw_with_bindings(core, command, &mut bindings);
+        bindings.uniforms.clear();
+        bindings.guest_uniforms.clear();
+        bindings.textures.clear();
+        self.draw_bindings = bindings;
+        result
+    }
+
+    fn gpu_draw_with_bindings(
+        &mut self,
+        core: &mut Guest,
+        command: &Command,
+        bindings: &mut DrawBindings,
+    ) -> Result<(), String> {
         // Time spent in each phase (stats, microseconds), measured only
         // when GPU timing or the timeline is on: the clock reads were ~4%
         // of the replay thread's time.
@@ -8201,15 +8224,14 @@ impl Nvn {
                 .filter(|format| *format != 0)
                 .and_then(vk_format);
         }
-        // Bindings, through the inferred map.
-        // Sized for the program's bindings: filled per draw, grown would
-        // reallocate a few times each draw.
-        let mut uniforms =
-            echora_gpu::FastMap::with_capacity_and_hasher(program.uniforms, Default::default());
-        let mut guest_uniforms =
-            echora_gpu::FastMap::with_capacity_and_hasher(program.uniforms, Default::default());
-        let mut textures =
-            echora_gpu::FastMap::with_capacity_and_hasher(program.textures, Default::default());
+        let DrawBindings {
+            uniforms,
+            guest_uniforms,
+            textures,
+        } = bindings;
+        uniforms.reserve(program.uniforms);
+        guest_uniforms.reserve(program.uniforms);
+        textures.reserve(program.textures);
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
@@ -9767,7 +9789,7 @@ impl Nvn {
         .then(|| {
             // Every uniform buffer's bytes, the guest-read ones included.
             let mut all = uniforms.clone();
-            for (&key, &(guest, length)) in &guest_uniforms {
+            for (&key, &(guest, length)) in guest_uniforms.iter() {
                 let mut bytes = vec![0; length];
                 if core.memory.read(guest, &mut bytes).is_ok() {
                     all.insert(key, bytes);

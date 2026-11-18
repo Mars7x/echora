@@ -508,15 +508,15 @@ pub struct Draw<'a> {
     pub first_instance: u32,
     /// Bytes for each uniform buffer binding, by (stage index in the
     /// program, binding).
-    pub uniforms: crate::FastMap<(usize, u32), Vec<u8>>,
+    pub uniforms: &'a crate::FastMap<(usize, u32), Vec<u8>>,
     /// Uniform buffer bindings read from guest memory (address, length)
     /// straight into the upload ring as the draw is recorded, through
     /// `read_guest`, instead of copied into `uniforms` first.
-    pub guest_uniforms: crate::FastMap<(usize, u32), (u64, usize)>,
+    pub guest_uniforms: &'a crate::FastMap<(usize, u32), (u64, usize)>,
     /// Reads guest memory for `guest_uniforms` and guest vertex streams.
     pub read_guest: Option<&'a dyn Fn(u64, &mut [u8]) -> Result<(), String>>,
     /// Texture bindings by (stage index, binding).
-    pub textures: crate::FastMap<(usize, u32), (TextureSource, Sampler)>,
+    pub textures: &'a crate::FastMap<(usize, u32), (TextureSource, Sampler)>,
     /// Storage buffer contents by (stage index, binding). What a stage
     /// writes into them comes back (`Renderer::draw`).
     pub storage: crate::FastMap<(usize, u32), Vec<u8>>,
@@ -1654,13 +1654,25 @@ pub(crate) mod tests {
             .unwrap();
         // A triangle covering the left half: (-1,-1), (0,-1)... in NDC.
         let positions: [f32; 8] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0];
-        let color: [f32; 4] = [0.0; 4];
         let tint: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
         let red_only = [Blend {
             write_mask: vk::ColorComponentFlags::R,
             ..Blend::default()
         }];
         let blend = [Blend::default()];
+        let make_uniforms = |color: Option<[f32; 4]>| {
+            let bytes = |rgba: [f32; 4]| rgba.into_iter().flat_map(f32::to_le_bytes).collect();
+            let mut uniforms = crate::FastMap::from_iter([((1, 3), bytes(tint))]);
+            if let Some(color) = color {
+                uniforms.insert((1, 0), bytes(color));
+            }
+            uniforms
+        };
+        let black = make_uniforms(Some([0.0; 4]));
+        let red = make_uniforms(Some([1.0, 0.0, 0.0, 0.0]));
+        let blue = make_uniforms(Some([0.0, 0.0, 1.0, 0.0]));
+        let tint_only = make_uniforms(None);
+        let guest_uniform = crate::FastMap::from_iter([((1, 0), (0x1000, 4))]);
         let mut draw = Draw {
             program: &program,
             colors: &[7],
@@ -1690,19 +1702,10 @@ pub(crate) mod tests {
             base_vertex: 0,
             instances: 1,
             first_instance: 0,
-            uniforms: crate::FastMap::from_iter([
-                (
-                    (1, 0),
-                    color.iter().flat_map(|value| value.to_le_bytes()).collect(),
-                ),
-                (
-                    (1, 3),
-                    tint.iter().flat_map(|value| value.to_le_bytes()).collect(),
-                ),
-            ]),
-            guest_uniforms: crate::FastMap::default(),
+            uniforms: &black,
+            guest_uniforms: &crate::FastMap::default(),
             read_guest: None,
-            textures: crate::FastMap::default(),
+            textures: &crate::FastMap::default(),
             pool: Default::default(),
             storage: crate::FastMap::default(),
             storage_in_place: crate::FastMap::default(),
@@ -1734,7 +1737,7 @@ pub(crate) mod tests {
 
         draw.fixed.scissor = [0, 0, 1, 4];
         draw.blends = &red_only;
-        draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&1.0f32.to_le_bytes());
+        draw.uniforms = &red;
         renderer.draw(&draw).unwrap();
         let stats = renderer.take_stats();
         if !program.dynamic_uniforms.is_empty() {
@@ -1751,7 +1754,7 @@ pub(crate) mod tests {
         assert_eq!(texels[3], [0.0; 4]);
 
         // This draw starts a new batch with the same raster and blend state.
-        draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&0.0f32.to_le_bytes());
+        draw.uniforms = &black;
         renderer.draw(&draw).unwrap();
         let stats = renderer.take_stats();
         if !program.dynamic_uniforms.is_empty() {
@@ -1765,15 +1768,15 @@ pub(crate) mod tests {
         assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
 
         draw.blends = &blend;
-        draw.uniforms.get_mut(&(1, 0)).unwrap()[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+        draw.uniforms = &blue;
         renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [0.0, 1.0, 1.0, 1.0]);
 
         // Bind only the red word. The blue word from the previous upload
         // must be cleared before the shader reads the full vector.
-        draw.uniforms.remove(&(1, 0));
-        draw.guest_uniforms.insert((1, 0), (0x1000, 4));
+        draw.uniforms = &tint_only;
+        draw.guest_uniforms = &guest_uniform;
         let read_guest = |address, data: &mut [u8]| {
             assert_eq!(address, 0x1000);
             data.copy_from_slice(&1.0f32.to_le_bytes());

@@ -623,6 +623,8 @@ pub struct Nvn {
     /// list when its bindings still name the same resources.
     #[serde(skip)]
     pool_entry_cache: FastMap<u32, CachedPoolEntries>,
+    #[serde(skip)]
+    draw_bindings: gpu::DrawBindings,
     /// Bumped by every flush of guest memory over a SHADER_CODE pool
     /// (`gpu_invalidate`) and every change of a program object or its
     /// shaders.
