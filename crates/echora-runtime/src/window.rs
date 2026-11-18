@@ -199,6 +199,13 @@ fn window_size() -> (u32, u32) {
 }
 
 impl App {
+    fn publish_size(&self, size: winit::dpi::PhysicalSize<u32>) {
+        self.shared.size.store(
+            u64::from(size.width) << 32 | u64::from(size.height),
+            Ordering::Relaxed,
+        );
+    }
+
     fn publish(&self, window: &Window) -> Result<(), String> {
         let display = window
             .display_handle()
@@ -227,6 +234,7 @@ impl App {
             },
             _ => return Err("unsupported window system".into()),
         };
+        self.publish_size(window.inner_size());
         *self.shared.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
@@ -254,9 +262,13 @@ impl ApplicationHandler for App {
                 attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
             }
             WindowMode::ExclusiveFullscreen => {
-                let video = event_loop
-                    .primary_monitor()
-                    .and_then(|monitor| monitor.video_modes().next());
+                let video = event_loop.primary_monitor().and_then(|monitor| {
+                    let size = monitor.size();
+                    let refresh = monitor.refresh_rate_millihertz()?;
+                    monitor.video_modes().find(|video| {
+                        video.size() == size && video.refresh_rate_millihertz() == refresh
+                    })
+                });
                 attributes = attributes.with_fullscreen(Some(match video {
                     Some(video) => Fullscreen::Exclusive(video),
                     None => Fullscreen::Borderless(None),
@@ -288,12 +300,7 @@ impl ApplicationHandler for App {
                 // and destroying them under it crashed the run.
                 STOP_REQUESTED.store(true, Ordering::Relaxed);
             }
-            WindowEvent::Resized(size) => {
-                self.shared.size.store(
-                    u64::from(size.width) << 32 | u64::from(size.height),
-                    Ordering::Relaxed,
-                );
-            }
+            WindowEvent::Resized(size) => self.publish_size(size),
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
