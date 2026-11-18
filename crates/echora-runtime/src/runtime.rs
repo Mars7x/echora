@@ -5071,8 +5071,8 @@ struct Worker {
     lock_free_calls: u64,
     /// Of those, calls recorded without the NVN state's lock.
     recorded_calls: u64,
-    /// Previously published thunk names. NVN assigns new indices by appending.
-    nvn_thunks: Vec<&'static str>,
+    /// Previously published thunks and their recorder routes.
+    nvn_thunks: Vec<(&'static str, Option<crate::nvn::RecordedCall<'static>>)>,
     /// Their microseconds waiting for the NVN state's lock and holding it.
     nvn_lock_micros: [u64; 2],
     /// Until when a yield (SleepThread 0, -1 or -2) returns at once without
@@ -5606,16 +5606,15 @@ impl Worker {
                 .thunks
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.nvn_thunks
-                .extend_from_slice(&thunks[self.nvn_thunks.len()..]);
+            self.nvn_thunks.extend(
+                thunks[self.nvn_thunks.len()..]
+                    .iter()
+                    .map(|&name| (name, crate::nvn::RecordedCall::classify(name))),
+            );
         }
-        let Some(&name) = self.nvn_thunks.get(index) else {
+        let Some(&(name, Some(call))) = self.nvn_thunks.get(index) else {
             return false;
         };
-        let command = name.starts_with("nvnCommandBuffer");
-        if !command && !crate::nvn::front_call(name) {
-            return false;
-        }
         self.core.settle_block_trap();
         let recorded = {
             let mut guest = crate::nvn::Guest {
@@ -5625,11 +5624,7 @@ impl Worker {
                 // The command reports its timestamp when replay executes it.
                 counter: None,
             };
-            if command {
-                shared.recorder.record(name, &mut guest)
-            } else {
-                shared.recorder.front(name, &mut guest)
-            }
+            shared.recorder.call(name, call, &mut guest)
         };
         match recorded {
             Ok(true) => {

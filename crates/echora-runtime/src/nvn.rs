@@ -1493,9 +1493,41 @@ const REGISTRY_CALLS: &[&str] = &[
 /// Whether workers make NVN call `name` without the NVN state
 /// (`Recorder::front`).
 pub fn front_call(name: &str) -> bool {
-    name == "nvnSyncWait"
-        || REGISTRY_CALLS.contains(&name)
-        || split_name(name).is_some_and(|(kind, rest)| front_bag(kind, rest))
+    RecordedCall::front(name).is_some()
+}
+
+/// A thunk's route through the recorder. Workers classify names while
+/// copying newly published thunks.
+#[derive(Clone, Copy)]
+pub(crate) enum RecordedCall<'a> {
+    Command(Option<&'a str>),
+    SyncWait,
+    Registry,
+    Property { kind: &'static str, rest: &'a str },
+}
+
+impl<'a> RecordedCall<'a> {
+    pub(crate) fn classify(name: &'a str) -> Option<Self> {
+        Self::command(name).or_else(|| Self::front(name))
+    }
+
+    fn command(name: &'a str) -> Option<Self> {
+        let rest = name.strip_prefix("nvnCommandBuffer")?;
+        Some(Self::Command(
+            (!COMMAND_BUFFER_MANAGEMENT.contains(&rest)).then_some(rest),
+        ))
+    }
+
+    fn front(name: &'a str) -> Option<Self> {
+        if name == "nvnSyncWait" {
+            return Some(Self::SyncWait);
+        }
+        if REGISTRY_CALLS.contains(&name) {
+            return Some(Self::Registry);
+        }
+        let (kind, rest) = split_name(name)?;
+        front_bag(kind, rest).then_some(Self::Property { kind, rest })
+    }
 }
 
 /// A property-bag call workers make without the NVN state: any on a kind
@@ -1520,9 +1552,34 @@ const FRONT_KINDS: &[&str] = &[
 ];
 
 impl Recorder {
+    pub(crate) fn call(
+        &self,
+        name: &'static str,
+        call: RecordedCall<'static>,
+        core: &mut Guest,
+    ) -> Result<bool, Trap> {
+        match call {
+            RecordedCall::Command(Some(rest)) => self.record_known(name, rest, core),
+            RecordedCall::Command(None) => Ok(false),
+            _ => self.front_known(name, call, core),
+        }
+    }
+
     /// Make NVN call `name` when it is a property-bag call on a kind in
     /// `FRONT_KINDS`, as `Nvn::call` would: Ok(true) once made.
     pub fn front(&self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        let Some(call) = RecordedCall::front(name) else {
+            return Ok(false);
+        };
+        self.front_known(name, call, core)
+    }
+
+    fn front_known(
+        &self,
+        name: &str,
+        call: RecordedCall<'_>,
+        core: &mut Guest,
+    ) -> Result<bool, Trap> {
         if matches!(name, "nvnSyncWait" | "nvnEventGetValue")
             && read_shared(&self.registry).replay_pending
         {
@@ -1532,7 +1589,7 @@ impl Recorder {
         // (2) without the NVN state, so a thread polling one does not wait
         // for a whole queue replay to learn that; anything else is made
         // with the state.
-        if name == "nvnSyncWait" {
+        if matches!(call, RecordedCall::SyncWait) {
             let x = core.cpu.regs;
             let registry = read_shared(&self.registry);
             if x[1] == 0 && registry.unsignaled.contains(&x[0]) {
@@ -1558,16 +1615,13 @@ impl Recorder {
             }
             return Ok(false);
         }
-        if REGISTRY_CALLS.contains(&name) {
+        if matches!(call, RecordedCall::Registry) {
             call_watch(name, core);
             return registry_call(&self.registry, &self.bags, name, core);
         }
-        let Some((kind, rest)) = split_name(name) else {
+        let RecordedCall::Property { kind, rest } = call else {
             return Ok(false);
         };
-        if !front_bag(kind, rest) {
-            return Ok(false);
-        }
         call_watch(name, core);
         let x = core.cpu.regs;
         let this = x[0];
@@ -1585,12 +1639,13 @@ impl Recorder {
     /// buffer (X0) other than its management: Ok(true) once recorded,
     /// Ok(false) when it is not (the caller makes it with the NVN state).
     pub fn record(&self, name: &'static str, core: &mut Guest) -> Result<bool, Trap> {
-        let Some(rest) = name.strip_prefix("nvnCommandBuffer") else {
+        let Some(call) = RecordedCall::command(name) else {
             return Ok(false);
         };
-        if COMMAND_BUFFER_MANAGEMENT.contains(&rest) {
-            return Ok(false);
-        }
+        self.call(name, call, core)
+    }
+
+    fn record_known(&self, name: &'static str, rest: &str, core: &mut Guest) -> Result<bool, Trap> {
         let this = core.cpu.regs[0];
         // The command buffer this thread recorded into last, kept so most
         // commands skip the shared map's lock; a recording that ended
@@ -8060,6 +8115,38 @@ mod tests {
     use super::*;
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+    #[test]
+    fn recorder_thunks_keep_their_command_and_property_routes() {
+        for &name in REGISTRY_CALLS {
+            assert!(matches!(
+                RecordedCall::classify(name),
+                Some(RecordedCall::Registry)
+            ));
+        }
+        for management in COMMAND_BUFFER_MANAGEMENT {
+            assert!(matches!(
+                RecordedCall::classify(&format!("nvnCommandBuffer{management}")),
+                Some(RecordedCall::Command(None))
+            ));
+        }
+        assert!(matches!(
+            RecordedCall::classify("nvnCommandBufferDrawArrays"),
+            Some(RecordedCall::Command(Some("DrawArrays")))
+        ));
+        assert!(matches!(
+            RecordedCall::classify("nvnTextureBuilderSetWidth"),
+            Some(RecordedCall::Property {
+                kind: "TextureBuilder",
+                rest: "SetWidth"
+            })
+        ));
+        assert!(RecordedCall::classify("nvnTextureBuilderGetWidth").is_none());
+        assert!(matches!(
+            RecordedCall::classify("nvnSyncWait"),
+            Some(RecordedCall::SyncWait)
+        ));
+    }
 
     /// A state tag a thread has already seen is answered without the shared
     /// table, and still names the snapshot another thread finds there.
