@@ -1389,7 +1389,7 @@ impl Nvn {
         Ok(())
     }
 
-    /// The translation of the stage at GPU address `gpu`, cached.
+    /// The cached translation and code key of the stage at GPU address `gpu`.
     fn translate_stage(
         &mut self,
         core: &Guest,
@@ -1400,7 +1400,7 @@ impl Nvn {
         generic_input_types: [u8; 32],
         compute: [u32; 5],
         mesh: Option<MeshParameters>,
-    ) -> Result<Arc<Translated>, String> {
+    ) -> Result<(Arc<Translated>, u64), String> {
         let (code, key) = self
             .stage_code(core, gpu)
             .ok_or_else(|| format!("stage at {gpu:#x} is in no memory pool"))?;
@@ -1424,7 +1424,7 @@ impl Nvn {
             native_pointers,
         );
         if let Some(found) = self.gpu.as_ref().unwrap().translations.get(&cache_key) {
-            return found.clone();
+            return found.clone().map(|stage| (stage, key));
         }
         let resolution_scale = self
             .gpu
@@ -1590,7 +1590,7 @@ impl Nvn {
                 .insert(Arc::as_ptr(stage) as usize, (writes, local));
         }
         backend.translations.insert(cache_key, translated.clone());
-        translated
+        translated.map(|stage| (stage, key))
     }
 
     /// Stage keys and translations of the bound vertex and fragment programs.
@@ -1795,7 +1795,8 @@ impl Nvn {
             .state
             .get("BindVertexAttribState")
             .map_or([0; 32], |bind| generic_input_types(&bind.states));
-        let vertex = self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None)?;
+        let (vertex, vertex_key) =
+            self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None)?;
         let binding_base = vertex
             .descriptors
             .iter()
@@ -1816,7 +1817,7 @@ impl Nvn {
         ];
         // Fragment inputs the vertex stage does not write read as zero, so
         // the fragment stage is translated against the vertex stage's stores.
-        let fragment = self.translate_stage(
+        let (fragment, fragment_key) = self.translate_stage(
             core,
             addresses[1],
             base,
@@ -1831,12 +1832,8 @@ impl Nvn {
                 vertex.stage, fragment.stage
             ));
         }
-        let keys = (
-            self.stage_code(core, addresses[0]).unwrap().1,
-            self.stage_code(core, addresses[1]).unwrap().1,
-        );
         Ok(BoundProgram::new(
-            keys,
+            (vertex_key, fragment_key),
             Box::new([vertex, fragment]),
             Box::new(entries),
         ))
@@ -1998,7 +1995,7 @@ impl Nvn {
                 registers: [shader_a, shader_b, init],
                 primitive_header: None,
             };
-            let stage = self.translate_stage(
+            let (stage, key) = self.translate_stage(
                 core,
                 task.x[0],
                 base,
@@ -2011,7 +2008,7 @@ impl Nvn {
                 return Err(format!("the task program translated as {:?}", stage.stage));
             }
             base = advance(&stage, base);
-            keys = self.stage_code(core, task.x[0]).map_or(0, |(_, key)| key);
+            keys = key;
             translated.push(stage);
             entries.push(task);
         }
@@ -2020,7 +2017,7 @@ impl Nvn {
             registers: [shader_a, shader_b, init],
             primitive_header: geometry,
         };
-        let stage = self.translate_stage(
+        let (stage, key) = self.translate_stage(
             core,
             mesh.x[0],
             base,
@@ -2034,10 +2031,10 @@ impl Nvn {
         }
         base = advance(&stage, base);
         let stores = stage.stores;
-        keys = keys.rotate_left(1) ^ self.stage_code(core, mesh.x[0]).map_or(0, |(_, key)| key);
+        keys = keys.rotate_left(1) ^ key;
         translated.push(stage);
         entries.push(mesh);
-        let stage = self.translate_stage(
+        let (stage, fragment_key) = self.translate_stage(
             core,
             fragment.x[0],
             base,
@@ -2054,9 +2051,6 @@ impl Nvn {
         }
         translated.push(stage);
         entries.push(fragment);
-        let fragment_key = self
-            .stage_code(core, fragment.x[0])
-            .map_or(0, |(_, key)| key);
         // Mesh programs never share a key with vertex programs' pipelines.
         Ok(BoundProgram::new(
             (keys ^ 0x6d65_7368, fragment_key),
@@ -4298,7 +4292,7 @@ impl Nvn {
         if compute[..3].iter().any(|size| *size == 0 || *size > 1024) {
             return Err(format!("compute workgroup {:?}", &compute[..3]));
         }
-        let mut stage =
+        let (mut stage, mut code_key) =
             self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
         // Storage pointers the NVN tracking found outside c0 were constants,
         // not addresses (floats 1.0 and 10.0 in c1): such a program reads
@@ -4308,19 +4302,15 @@ impl Nvn {
             descriptor.kind() == DescriptorKind::StorageBuffer
                 && descriptor.cbuf_index != 0
                 && descriptor.flags & 32 == 0
-        }) {
-            let code_key = self.stage_code(core, address).map(|(_, key)| key);
-            if let Some(code_key) = code_key
-                && self.gpu.as_mut().unwrap().native_programs.insert(code_key)
-            {
-                stage =
-                    self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
-            }
+        }) && self.gpu.as_mut().unwrap().native_programs.insert(code_key)
+        {
+            (stage, code_key) =
+                self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
         }
         if stage.stage != Stage::Compute {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
-        let key = (self.stage_code(core, address).unwrap().1, u64::MAX);
+        let key = (code_key, u64::MAX);
         // ECHORA_GPU_C1_PROBE (debugging): for programs translated with raw
         // pointers, the words c1 could hold (the stage's constants, each
         // pushed root table, the first bound uniform buffers), every 300th
