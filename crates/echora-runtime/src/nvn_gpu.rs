@@ -100,6 +100,8 @@ pub struct Backend {
     /// Hashes of each upload's raw storage in STORAGE_CHUNK pieces, so a
     /// flush re-checks only the pieces it overlapped.
     storage_hashes: HashMap<u64, Vec<u64>>,
+    /// Merged storage of the cached uploads, rebuilt when the set changes.
+    cached_texture_ranges: Option<Vec<std::ops::Range<u64>>>,
     /// For uploads over DENSE_SAMPLE_ABOVE bytes: a hash of 4096 pieces
     /// spread over the storage, checked instead of every flushed byte.
     dense_samples: HashMap<u64, u64>,
@@ -325,6 +327,7 @@ impl Backend {
             texture_checked: HashMap::default(),
             dirty: HashMap::default(),
             storage_hashes: HashMap::default(),
+            cached_texture_ranges: None,
             dense_samples: HashMap::default(),
             copied_levels: HashMap::default(),
             shadows: HashMap::default(),
@@ -402,18 +405,29 @@ impl Backend {
                 .values()
                 .flat_map(|pool| pool.gpu_dirty.iter().cloned())
                 .collect();
-            ranges.sort_unstable_by_key(|range| range.start);
-            let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                match merged.last_mut() {
-                    Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                    _ => merged.push(range),
-                }
-            }
-            *index = (stamp, merged);
+            merge_ranges(&mut ranges);
+            *index = (stamp, ranges);
         }
-        let at = index.1.partition_point(|dirty| dirty.end <= range.start);
-        index.1.get(at).is_some_and(|dirty| dirty.start < range.end)
+        ranges_overlap(&index.1, range)
+    }
+
+    fn remove_texture_upload(&mut self, texture: u64) {
+        if self.textures.remove(&texture).is_some() {
+            self.cached_texture_ranges = None;
+        }
+    }
+
+    fn cached_textures_overlap(&mut self, range: &std::ops::Range<u64>) -> bool {
+        let ranges = self.cached_texture_ranges.get_or_insert_with(|| {
+            let mut ranges: Vec<_> = self
+                .textures
+                .values()
+                .map(|(_, _, range)| range.clone())
+                .collect();
+            merge_ranges(&mut ranges);
+            ranges
+        });
+        ranges_overlap(ranges, range)
     }
 
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
@@ -936,21 +950,29 @@ impl Nvn {
                     add_range(&mut pool.guest_dirty, start..end);
                 }
             }
+            // WriteTexels names the texture: its contents changed.
+            if let Some(texture) = texture {
+                backend.remove_texture_upload(texture);
+            }
             let mut touched = Vec::new();
-            backend.textures.retain(|key, (_, _, storage)| {
-                // WriteTexels names the texture: its contents changed.
-                if Some(*key) == texture {
-                    return false;
-                }
-                if storage.end > range.start && range.end > storage.start {
-                    touched.push((
-                        *key,
-                        range.start.max(storage.start) - storage.start
-                            ..range.end.min(storage.end) - storage.start,
-                    ));
-                }
-                true
-            });
+            if backend.cached_textures_overlap(&range) {
+                touched.extend(
+                    backend
+                        .textures
+                        .iter()
+                        .filter_map(|(&key, (_, _, storage))| {
+                            if storage.end > range.start && range.end > storage.start {
+                                Some((
+                                    key,
+                                    range.start.max(storage.start) - storage.start
+                                        ..range.end.min(storage.end) - storage.start,
+                                ))
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            }
             backend.stat("stat: textures invalidated", touched.len() as u64);
             if !touched.is_empty() {
                 self.bump_binding_serial("stat: binding serial by touched textures");
@@ -1060,7 +1082,7 @@ impl Nvn {
         let Some(backend) = self.gpu.as_mut() else {
             return;
         };
-        backend.textures.remove(&texture);
+        backend.remove_texture_upload(texture);
         backend.texture_checked.remove(&texture);
         backend.shadows.remove(&texture);
         backend.storage_hashes.remove(&texture);
@@ -1095,7 +1117,7 @@ impl Nvn {
             );
         }
         if let Some(backend) = self.gpu.as_mut() {
-            backend.textures.remove(&texture);
+            backend.remove_texture_upload(texture);
             backend.texture_checked.remove(&texture);
             let renderer = &mut backend.renderer;
             let retired = super::retired_texture(previous);
@@ -3281,7 +3303,7 @@ impl Nvn {
             if unchanged {
                 backend.stat("stat: texture uploads kept after flush", 1);
             } else {
-                backend.textures.remove(&texture);
+                backend.remove_texture_upload(texture);
             }
         }
         let frame = self.presented_frames;
@@ -3811,12 +3833,11 @@ impl Nvn {
             texels: Arc::new(texels),
             levels: levels.into(),
         };
-        self.gpu
-            .as_mut()
-            .unwrap()
+        let backend = self.gpu.as_mut().unwrap();
+        backend
             .textures
             .insert(texture, (sample, source.clone(), base..base + storage_size));
-        let backend = self.gpu.as_mut().unwrap();
+        backend.cached_texture_ranges = None;
         backend.storage_hashes.insert(texture, storage_hashes);
         if uncached && storage_size <= SHADOW_LIMIT {
             if backend.shadows.contains_key(&texture) {
@@ -10182,6 +10203,23 @@ fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str
     })
 }
 
+fn merge_ranges(ranges: &mut Vec<std::ops::Range<u64>>) {
+    ranges.sort_unstable_by_key(|range| range.start);
+    ranges.dedup_by(|next, previous| {
+        if next.start <= previous.end {
+            previous.end = previous.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn ranges_overlap(ranges: &[std::ops::Range<u64>], range: &std::ops::Range<u64>) -> bool {
+    let at = ranges.partition_point(|entry| entry.end <= range.start);
+    ranges.get(at).is_some_and(|entry| entry.start < range.end)
+}
+
 fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
     // The list is sorted and disjoint: the ranges touching `range` are one
     // run, found by binary search, and become one.
@@ -10779,6 +10817,39 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn texture_storage_index_preserves_flushes_and_named_invalidations() {
+        let Ok(Some(mut backend)) = Backend::create() else {
+            return;
+        };
+        backend
+            .textures
+            .insert(1, (0, TextureSource::Target(1), 0x1000..0x1080));
+        backend
+            .textures
+            .insert(2, (0, TextureSource::Target(2), 0x1080..0x1100));
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        nvn.gpu_invalidate(0x2000..0x2010, None);
+        assert!(nvn.gpu.as_ref().unwrap().dirty.is_empty());
+
+        nvn.gpu_invalidate(0x1040..0x10c0, None);
+        let dirtied = &nvn.gpu.as_ref().unwrap().dirty;
+        assert_eq!(dirtied[&1].len(), 1);
+        assert_eq!(dirtied[&1][0], 0x40..0x80);
+        assert_eq!(dirtied[&2].len(), 1);
+        assert_eq!(dirtied[&2][0], 0..0x40);
+
+        nvn.gpu_invalidate(0..0, Some(1));
+        let backend = nvn.gpu.as_mut().unwrap();
+        assert!(!backend.textures.contains_key(&1));
+        assert!(!backend.cached_textures_overlap(&(0x1000..0x1080)));
+        assert!(backend.cached_textures_overlap(&(0x1080..0x1081)));
+    }
 
     #[test]
     fn shared_span_index_reuses_lookup_order_and_checks_the_whole_range() {
