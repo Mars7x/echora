@@ -14,6 +14,78 @@
 //! emulators. The application writes pre-tiled packaged texture data into
 //! this storage, so sizes must match the hardware layout.
 
+/// Decode untiled ASTC into RGBA8. Large slices are divided at ASTC
+/// block rows, so each worker reads and writes independent byte ranges.
+pub(crate) fn decode_astc(
+    source: &[u8],
+    destination: &mut [u8],
+    width: u32,
+    height: u32,
+    depth: u32,
+    info: FormatInfo,
+) -> std::io::Result<()> {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let workers = *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+    });
+    decode_astc_with_workers(source, destination, [width, height, depth], info, workers)
+}
+
+fn decode_astc_with_workers(
+    source: &[u8],
+    destination: &mut [u8],
+    [width, height, depth]: [u32; 3],
+    info: FormatInfo,
+    workers: usize,
+) -> std::io::Result<()> {
+    let footprint = astc_decode::Footprint::new(info.block_width, info.block_height);
+    let row = width as usize * 4;
+    let block_row = width.div_ceil(info.block_width) as usize * 16;
+    let block_rows = height.div_ceil(info.block_height) as usize;
+    let input_slice = block_row * block_rows;
+    let output_slice = row * height as usize;
+    debug_assert_eq!(source.len(), input_slice * depth as usize);
+    debug_assert_eq!(destination.len(), output_slice * depth as usize);
+    let workers = workers.min(input_slice.div_ceil(256 << 10)).min(block_rows);
+    let decode = |input, output: &mut [u8], height| {
+        astc_decode::astc_decode(input, width, height, footprint, |x, y, color| {
+            let at = y as usize * row + x as usize * 4;
+            output[at..at + 4].copy_from_slice(&color);
+        })
+    };
+    for (input, output) in source
+        .chunks_exact(input_slice)
+        .zip(destination.chunks_exact_mut(output_slice))
+    {
+        if workers <= 1 {
+            decode(input, output, height)?;
+            continue;
+        }
+        let rows = block_rows.div_ceil(workers);
+        let texel_rows = rows * info.block_height as usize;
+        std::thread::scope(|scope| {
+            let mut jobs = Vec::with_capacity(workers - 1);
+            let mut bands = input
+                .chunks(rows * block_row)
+                .zip(output.chunks_mut(texel_rows * row))
+                .map(|(input, output)| {
+                    let height = (output.len() / row) as u32;
+                    (input, output, height)
+                });
+            // The calling thread decodes one band while the others run.
+            let (first_input, first_output, first_height) = bands.next().unwrap();
+            for (input, output, height) in bands {
+                jobs.push(scope.spawn(move || decode(input, output, height)));
+            }
+            decode(first_input, first_output, first_height)?;
+            jobs.into_iter().try_for_each(|job| job.join().unwrap())
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormatInfo {
     pub name: &'static str,
@@ -592,6 +664,29 @@ mod tests {
             block_linear_offset(r16, 1360, 1000, 1, 8, 0, 8, 0),
             2752 * 8
         );
+    }
+
+    #[test]
+    fn astc_bands_match_whole_slices_at_block_edges() {
+        let info = f("ASTC", 5, 4, 16);
+        let (width, height, depth) = (1027_u32, 795_u32, 2);
+        let count = width.div_ceil(5) * height.div_ceil(4) * depth;
+        let mut source = Vec::new();
+        for block in 0..count {
+            // Void-extent blocks carry a constant color. Vary it so a
+            // shifted band, slice or tail produces different output.
+            let color = block.to_le_bytes();
+            source.extend_from_slice(&[0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+            for channel in color {
+                source.extend_from_slice(&[channel, channel]);
+            }
+        }
+        let mut single = vec![0; (width * height * depth * 4) as usize];
+        let mut parallel = single.clone();
+        let extent = [width, height, depth];
+        decode_astc_with_workers(&source, &mut single, extent, info, 1).unwrap();
+        decode_astc_with_workers(&source, &mut parallel, extent, info, 4).unwrap();
+        assert_eq!(single, parallel);
     }
 
     #[test]

@@ -3355,27 +3355,24 @@ impl Nvn {
                         }
                     }
                 }
-                if astc {
-                    let texels_per_slice = level_width as usize * level_height as usize * 4;
-                    let mut rgba = vec![0u8; texels_per_slice * level_depth as usize];
-                    let footprint =
-                        astc_decode::Footprint::new(info.block_width, info.block_height);
-                    for z in 0..level_depth as usize {
-                        let slice = &mut rgba[z * texels_per_slice..][..texels_per_slice];
-                        astc_decode::astc_decode(
-                            &data[z * slice_bytes..][..slice_bytes],
-                            level_width,
-                            level_height,
-                            footprint,
-                            |x, y, texel| {
-                                let at = (y as usize * level_width as usize + x as usize) * 4;
-                                slice[at..at + 4].copy_from_slice(&texel);
-                            },
-                        )
-                        .map_err(|error| format!("ASTC decode: {error}"))?;
-                    }
-                    data = rgba;
-                }
+                let offset = texels.len();
+                let upload = if astc {
+                    let bytes =
+                        level_width as usize * level_height as usize * level_depth as usize * 4;
+                    texels.resize(offset + bytes, 0);
+                    crate::nvn_format::decode_astc(
+                        &data,
+                        &mut texels[offset..],
+                        level_width,
+                        level_height,
+                        level_depth,
+                        info,
+                    )
+                    .map_err(|error| format!("ASTC decode: {error}"))?;
+                    &texels[offset..]
+                } else {
+                    &data
+                };
                 // ECHORA_GPU_TEXTURE_DUMP=<dir> (debugging): the base level
                 // of large 4-byte 2D textures, as last uploaded.
                 if let Some(directory) = super::debug_var_os("ECHORA_GPU_TEXTURE_DUMP") {
@@ -3391,19 +3388,19 @@ impl Nvn {
                     {
                         let mut ppm =
                             format!("P6\n{level_width} {level_height}\n255\n").into_bytes();
-                        for texel in data.as_chunks::<4>().0 {
+                        for texel in upload.as_chunks::<4>().0 {
                             ppm.extend_from_slice(&texel[..3]);
                         }
                         let _ = std::fs::write(&path, ppm);
                         let mut pgm =
                             format!("P5\n{level_width} {level_height}\n255\n").into_bytes();
-                        pgm.extend(data.as_chunks::<4>().0.iter().map(|texel| texel[3]));
+                        pgm.extend(upload.as_chunks::<4>().0.iter().map(|texel| texel[3]));
                         let _ = std::fs::write(path.with_extension("alpha.pgm"), pgm);
                     }
                     // Compressed (16-byte block) textures: the untiled
                     // blocks, to compare with a reference capture.
                     if level == 0 && layer == 0 && block == 16 && level_width >= 512 {
-                        let _ = std::fs::write(path.with_extension("bin"), &data);
+                        let _ = std::fs::write(path.with_extension("bin"), upload);
                     }
                 }
                 levels.push(UploadRegion {
@@ -3412,9 +3409,11 @@ impl Nvn {
                     width: level_width,
                     height: level_height,
                     depth: level_depth,
-                    offset: texels.len() as u64,
+                    offset: offset as u64,
                 });
-                texels.extend_from_slice(&data);
+                if !astc {
+                    texels.extend_from_slice(&data);
+                }
             }
         }
         // Content-keyed: guest writes that change the texels upload again.
