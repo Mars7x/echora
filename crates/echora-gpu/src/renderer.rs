@@ -394,7 +394,7 @@ pub struct Renderer {
     /// Color clears limited by the scissor to part of the target.
     pub partial_clears: u64,
     pub flush_wait_microseconds: u64,
-    /// Images rendered to since the last memory barrier, and the
+    /// Images rendered to or cleared since the last memory barrier, and the
     /// attachments of the last rendering pass: a pass or transfer that
     /// reads one of them (or another pass that writes one) waits for
     /// those writes first.
@@ -4820,7 +4820,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Whether one of these images has attachment writes awaiting a barrier.
+    /// Whether one of these images has render or clear writes awaiting a barrier.
     pub(crate) fn rendering_pending(&self, images: &[vk::Image]) -> bool {
         images.iter().any(|image| self.written.contains(image))
     }
@@ -5152,9 +5152,7 @@ impl Renderer {
         rect: Option<[i32; 4]>,
         color: vk::ClearColorValue,
     ) -> Result<(), String> {
-        self.transition(key, vk::ImageLayout::GENERAL)?;
-        let commands = self.commands()?;
-        let target = &self.targets[&key];
+        let target = self.targets.get(&key).ok_or("no such target")?;
         if level >= target.levels || layer >= target.shape.layers() {
             return Err(format!(
                 "level {level} layer {layer} of a {}-level {}-layer target",
@@ -5173,6 +5171,10 @@ impl Renderer {
             return Ok(());
         }
         if [x, y, width, height] == whole {
+            self.transition(key, vk::ImageLayout::GENERAL)?;
+            self.order_target(key)?;
+            let commands = self.commands()?;
+            let target = &self.targets[&key];
             // SAFETY: recording; the image is in GENERAL layout.
             unsafe {
                 self.gpu.device.cmd_clear_color_image(
@@ -5187,6 +5189,10 @@ impl Renderer {
                     }],
                 )
             };
+            self.written.insert(target.image);
+            // The same attachments may be rebound next, but this write
+            // happened outside rendering and needs the usual dependency.
+            self.last_attachments.clear();
             return Ok(());
         }
         // A partial clear runs as an attachment clear in a render pass.
