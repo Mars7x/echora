@@ -3430,28 +3430,44 @@ pub fn transfer_single(
     index: u8,
     load: bool,
 ) -> Result<u64, Trap> {
-    let esize = usize::from(bits / 8);
-    let total = usize::from(registers) * esize;
+    let shift = u32::from(bits) * u32::from(index);
+    let registers = usize::from(registers);
+    match bits {
+        8 => transfer_lanes::<1>(cpu, memory, address, rt, registers, shift, load),
+        16 => transfer_lanes::<2>(cpu, memory, address, rt, registers, shift, load),
+        32 => transfer_lanes::<4>(cpu, memory, address, rt, registers, shift, load),
+        64 => transfer_lanes::<8>(cpu, memory, address, rt, registers, shift, load),
+        _ => unreachable!("invalid structure lane size {bits}"),
+    }
+}
+
+fn transfer_lanes<const BYTES: usize>(
+    cpu: &mut Cpu,
+    memory: &mut GuestView,
+    address: u64,
+    rt: u8,
+    registers: usize,
+    shift: u32,
+    load: bool,
+) -> Result<u64, Trap> {
+    let total = registers * BYTES;
     let register = |r: usize| (usize::from(rt) + r) % 32;
     // At most one 64-bit lane from each of four registers.
     let mut bytes = [0u8; 32];
     let buffer = &mut bytes[..total];
     if load {
         memory.read(address, buffer)?;
-        for r in 0..usize::from(registers) {
-            let mut chunk = [0u8; 8];
-            chunk[..esize].copy_from_slice(&buffer[r * esize..(r + 1) * esize]);
-            set_lane(
-                &mut cpu.vectors[register(r)],
-                u32::from(bits),
-                u32::from(index),
-                u64::from_le_bytes(chunk),
-            );
+        let mask = ((1u128 << (BYTES * 8)) - 1) << shift;
+        for (r, chunk) in buffer.as_chunks::<BYTES>().0.iter().enumerate() {
+            let mut lane = [0; 8];
+            lane[..BYTES].copy_from_slice(chunk);
+            let target = &mut cpu.vectors[register(r)];
+            *target = (*target & !mask) | (u128::from(u64::from_le_bytes(lane)) << shift);
         }
     } else {
-        for r in 0..usize::from(registers) {
-            let lane = get_lane(cpu.vectors[register(r)], u32::from(bits), u32::from(index));
-            buffer[r * esize..(r + 1) * esize].copy_from_slice(&lane.to_le_bytes()[..esize]);
+        for (r, chunk) in buffer.as_chunks_mut::<BYTES>().0.iter_mut().enumerate() {
+            let lane = (cpu.vectors[register(r)] >> shift) as u64;
+            chunk.copy_from_slice(&lane.to_le_bytes()[..BYTES]);
         }
         memory.write(address, buffer)?;
     }
@@ -4016,6 +4032,32 @@ mod vector_tests {
         let mut out = [0u8; 32];
         memory.read(0x1100, &mut out).unwrap();
         assert_eq!(out.as_slice(), words.as_slice());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn structure_lane_transfer_keeps_state_on_range_fault() {
+        let mut memory = Memory::new(0x20000);
+        memory
+            .map(0x1f000, 0x1000, READ | WRITE, STATE_NORMAL, "data")
+            .unwrap();
+        let address = 0x1fff0;
+        let bytes = [0x5a; 16];
+        memory.write(address, &bytes).unwrap();
+        let mut view = memory.view();
+        let mut cpu = Cpu::default();
+        cpu.vectors[31] = u128::MAX;
+        let original = cpu.vectors;
+        for load in [true, false] {
+            assert!(matches!(
+                transfer_single(&mut cpu, &mut view, address, 31, 4, 64, 1, load),
+                Err(Trap::MemoryFault { address: at, .. }) if at == address
+            ));
+            assert_eq!(cpu.vectors, original);
+            let mut actual = [0; 16];
+            memory.read(address, &mut actual).unwrap();
+            assert_eq!(actual, bytes);
+        }
     }
 }
 
