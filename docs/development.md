@@ -93,7 +93,8 @@ read.
 
 | Variable | Effect |
 |---|---|
-| `ECHORA_LIFT_OPTIONS=a,b` | Code generation options for `lift`: `inline-vector`, `structured`, `fused-flags` (a compare and its B.cond test the operands directly where NZCV is dead after them), `whole-vector-checks` (with `inline-vector`: inlined vector float operations check whole vectors before the exact per-lane test), `fp-status-locals` (FPCR and FPSR kept in window locals). All are off by default; [codegen speed](codegen-speed.md) recommends a set for the next full rebuild. |
+| `ECHORA_LIFT_OPTIONS=a,b` | Replace the CLI's default set for `lift`: `inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs`. Use `flat` to turn off the set. See [codegen speed](codegen-speed.md) for measured options. |
+| `ECHORA_LIFT_OPTIONS_REGIONS=regions` | Comma-separated region IDs (the hex suffix of `gen-r-<id>`) or a file listing them. Apply `ECHORA_LIFT_OPTIONS` on top of the defaults for those regions only. |
 | `ECHORA_SHADER_CACHE=dir` | Keep the driver's compiled shader binaries in this folder between runs, so later runs skip compiling them. `echora run` sets it to `shader-cache` in the translation folder. |
 | `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for the `survey` example in `echora-shader` and `shader-check` in `echora-gpu`. |
 | `ECHORA_SHADER_TRANSLATOR=plugin\|compare` | Use an installed shader plugin instead of Echora's own translator, or compare the two. `ECHORA_SHADER_PLUGIN=path` names the plugin; see [shader plugins](shader-plugin.md). |
@@ -108,6 +109,7 @@ read.
 | `ECHORA_PRESENT_RATE=N` | Every N presents, print the count and the rate over those N. |
 | `ECHORA_TIMELINE=file` | Write each thread's guest runs, lock waits, NVN calls and replay pieces as spans over a few presents (debugging). |
 | `ECHORA_GPU_TIME=1` | Every few seconds, print how long the GPU was busy, against wall time and against the time the CPU waited for it. |
+| `ECHORA_PROFILE_FROM=N` | Reset runtime and GPU statistics at present N to measure a specific part of a run. |
 | `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |
 | `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |
 | `ECHORA_PC_SAMPLES_FROM=N` | Sample guest PCs only from presented frame N on. |

@@ -51,10 +51,12 @@ to be missing or incomplete.
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its
   own (`ECHORA_REPLAY_INLINE=1` replays it on the submitting thread, as
-  before). In the first 3D scene that replay is now the limit: each draw
-  costs tens of microseconds to replay.
-- The faster code-generation options (`inline-vector`, `fused-flags`,
-  `whole-vector-checks`, `fp-status-locals`, `structured`) are off by default until they are checked in game.
+  before). The first 3D scene spends most of its frame time on a chain of
+  guest simulation and command recording. Vulkan replay also takes a
+  substantial share of CPU time and can delay guest synchronization.
+- The CLI enables the measured vector, floating-point and block
+  optimizations by default. Structured control flow and several newer
+  [code generation options](codegen-speed.md) are still experimental.
 
 ## Platforms
 

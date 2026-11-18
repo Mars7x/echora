@@ -8,7 +8,7 @@ when the code for it does.
 | 0. Reuse audit | The reuse matrix and architecture decision are written ([research](research.md)). | Done 2026-11-06. |
 | 1. Portable foundation | The workspace builds and its tests pass in CI on Linux and Windows. | Done 2026-11-06. |
 | 2. Content processing | The NUP is validated and inventoried, and its ExeFS cached, without manual extraction; NUP and folder input give the same result. | Done for the supported input. Overlaying update RomFS on a base is not needed yet. |
-| 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.3 million instructions) is translated and runs on Linux. |
+| 3. Compiler foundation | Synthetic programs are translated and run natively with verified results, and missing blocks are reported. | Done 2026-11-06. The whole game (17.6 million discovered instructions) is translated and runs on Linux. |
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with Echora's own Rust shader translator, and the internal render scale is applied; the resolution planner is not connected yet. |
 | 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler, and again on 2026-11-12 with Echora's own shader translator alone. |
@@ -24,17 +24,17 @@ when the code for it does.
 ## Next steps
 
 1. Speed, until the first scene runs at the console's 60 frames per second
-   (the opening movie already does): less work per draw when the game's commands are
-   replayed into Vulkan (the first scene's limit now), fewer uniform copies,
-   then the cost of the translated code.
+   (the opening movie already does): reduce the cost of translated code on
+   the guest threads that drive simulation and record draws, and reduce
+   the time per draw on the Vulkan replay thread.
 2. Finish the first scene after the New Game movie: the tree's brightness,
    the water's colour, and subtitles. Then carry on to gameplay.
 3. Sound: the remaining audio renderer effects (delay, biquad filter) and
    depop.
-4. Turn on the faster code generation in game builds once it is checked in
-   game: inline vector arithmetic with whole-vector checks, branches that
-   skip unused flags, and floating-point status kept in locals; then
-   structured control flow once it measures faster. They go in with the next full rebuild.
+4. Measure the remaining opt-in code generation changes against game
+   profiles. The default lift already uses inline vector arithmetic with
+   whole-vector checks, branches that skip unused flags, and floating-point
+   status kept in locals.
 5. Shorten the first build from about an hour: leaner generated code (about
    a third smaller in tests so far), full optimisation only for the hot code a
    profile finds, and more parallel compiler jobs.

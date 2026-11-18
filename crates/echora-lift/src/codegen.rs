@@ -9,7 +9,7 @@ use crate::aarch64::{
 };
 use crate::simd::SimdOp;
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Serialize, ser::SerializeStruct};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
 
@@ -29,12 +29,29 @@ pub struct CodeRegion {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct TranslatedInstruction {
     pub pc: u64,
     pub word: u32,
     pub instruction: Instruction,
-    pub disassembly: String,
+}
+
+impl TranslatedInstruction {
+    /// Format the instruction when a diagnostic needs it.
+    pub fn disassembly(&self) -> String {
+        aarch64::disassemble(self.word, self.pc)
+    }
+}
+
+impl Serialize for TranslatedInstruction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut record = serializer.serialize_struct("TranslatedInstruction", 4)?;
+        record.serialize_field("pc", &self.pc)?;
+        record.serialize_field("word", &self.word)?;
+        record.serialize_field("instruction", &self.instruction)?;
+        record.serialize_field("disassembly", &self.disassembly())?;
+        record.end()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,7 +111,7 @@ impl Translation {
             .map(|record| UnsupportedSite {
                 pc: record.pc,
                 word: record.word,
-                disassembly: record.disassembly.clone(),
+                disassembly: record.disassembly(),
             })
             .collect();
         TranslationReport {
@@ -235,27 +252,27 @@ pub fn discover_with_tables(
             break;
         }
         let instruction = aarch64::decode(word, pc);
-        let mut successors = instruction.successors(pc);
-        if is_plain_br(word) {
-            let targets = jump_table_targets(pc, &read_word, regions, data);
-            if !targets.is_empty() {
-                jump_tables.insert(pc, targets.len());
-                starts.extend(targets.iter().copied());
-                indirect_targets.extend(targets.iter().copied());
-            }
-            successors.extend(targets);
-        }
         if instruction.ends_block() {
+            let mut successors = instruction.successors(pc);
+            if is_plain_br(word) {
+                let targets = jump_table_targets(pc, &read_word, regions, data);
+                if !targets.is_empty() {
+                    jump_tables.insert(pc, targets.len());
+                    indirect_targets.extend(targets.iter().copied());
+                    successors.extend(targets);
+                }
+            }
             starts.extend(successors.iter().copied());
+            pending.extend(successors);
+        } else {
+            pending.push_back(pc.wrapping_add(4));
         }
-        pending.extend(successors);
         instructions.insert(
             pc,
             TranslatedInstruction {
                 pc,
                 word,
                 instruction,
-                disassembly: aarch64::disassemble(word, pc),
             },
         );
     }

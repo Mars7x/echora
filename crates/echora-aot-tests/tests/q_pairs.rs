@@ -15,7 +15,8 @@
 //! - Inside the address space but on memory not mapped (straddling the
 //!   data's end, or a page past it): the host faults, which ends the
 //!   process either way; each such run is a child process of this test,
-//!   whose fault message and signal must agree.
+//!   which must terminate with the same signal and report an inaccessible
+//!   address within the pair.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
@@ -151,9 +152,8 @@ fn pairs_past_the_address_space_trap_as_the_checked_calls_do() {
 }
 
 /// In a child process (`CHILD` set): runs one program with one lift from
-/// one base, which faults in the host and ends the process. Otherwise
-/// runs each such case in a child, both lifts, and compares their fault
-/// messages and signals.
+/// one base, which faults in the host and ends the process. The parent
+/// checks the fault address and termination signal for both lifts.
 #[test]
 fn pairs_on_unmapped_memory_end_the_process_alike() {
     use std::os::unix::process::ExitStatusExt;
@@ -186,6 +186,8 @@ fn pairs_on_unmapped_memory_end_the_process_alike() {
         }
         // A pair straddling the data's end, and one a page past it.
         for base in [DATA + DATA_SIZE - 16, DATA + DATA_SIZE + 0x1000] {
+            let start = base + 16 * u64::from(name.ends_with(" 1") && !name.ends_with("post 1"));
+            let inaccessible = start.max(DATA + DATA_SIZE)..start + 32;
             let outcome = |lift: &str| {
                 let output = std::process::Command::new(&exe)
                     .args([
@@ -197,22 +199,22 @@ fn pairs_on_unmapped_memory_end_the_process_alike() {
                     .env(CHILD, format!("{lift},{index},{base:x}"))
                     .output()
                     .unwrap();
-                let message = String::from_utf8_lossy(&output.stderr)
+                let fault = String::from_utf8_lossy(&output.stderr)
                     .lines()
-                    .find(|line| line.starts_with("guest memory fault"))
-                    .map(str::to_owned);
-                (
-                    output.status.signal(),
-                    message,
-                    String::from_utf8_lossy(&output.stdout).contains("no fault"),
-                )
+                    .find_map(|line| line.strip_prefix("guest memory fault at 0x"))
+                    .and_then(|address| u64::from_str_radix(address, 16).ok());
+                // Optimized host code can access either half first. Only
+                // an address in the inaccessible part of the pair is valid.
+                assert!(
+                    fault.is_some_and(|address| inaccessible.contains(&address)),
+                    "{lift}: {name} from {base:#x}: fault {fault:x?} outside {inaccessible:x?}"
+                );
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("no fault"));
+                output.status.signal()
             };
             let expected = outcome("reference");
             let actual = outcome("code");
-            assert!(
-                expected.0.is_some() && expected.1.is_some() && !expected.2,
-                "{name} from {base:#x}: {expected:?}"
-            );
+            assert!(expected.is_some(), "{name} from {base:#x} did not signal");
             assert_eq!(actual, expected, "{name} from {base:#x}");
             cases += 1;
         }

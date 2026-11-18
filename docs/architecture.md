@@ -58,9 +58,10 @@ input and audio are host crates of their own.
   DIR` translates dumped shader stages offline with the Rust translator and
   ranks what it refuses; `shader-check --compare` also compiles them on the
   host's driver. `translate-dump` and plain `shader-check` need a plugin.
-- **Generated code.** Five code-generation options can be turned on for a
-  lift with `ECHORA_LIFT_OPTIONS` (`inline-vector`, `fused-flags`,
-  `whole-vector-checks`, `fp-status-locals`, `structured`). All are off by default until they are checked in game.
+- **Generated code.** The CLI enables verified fast paths for floating point,
+  condition flags, guest memory access and block bookkeeping. A lift can
+  replace or augment those choices with the
+  [code generation switches](development.md#switches-for-test-runs).
 
 ## Front ends
 

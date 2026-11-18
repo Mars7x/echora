@@ -241,7 +241,8 @@ pub fn report(translation: &Translation, dispatches: &[Dispatch]) -> String {
             let _ = writeln!(
                 text,
                 "  {pc:#x}: {:08x}  {}",
-                record.word, record.disassembly
+                record.word,
+                record.disassembly()
             );
         }
     }

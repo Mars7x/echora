@@ -1,5 +1,26 @@
 # Speed of translated code: what costs, and the planned changes
 
+The sections below record experiments and the state of each option when
+measured. See [the development guide](development.md#switches-for-test-runs)
+for the CLI's current defaults.
+
+## Code discovery
+
+Discovery retains decoded instructions and formats disassembly only when it
+appears in a diagnostic. Straight-line instructions queue their next PC
+without allocating a successor list. Both changes apply to every guest
+program.
+
+On a Ryzen 7 5800X3D with Rust 1.99.1, three alternating release runs of
+`echora analyze --limit 20000000 --report report.json game.nup` on the
+supported 1.1.1 dump had a median end-to-end time of 19.74 s before and
+11.13 s after. Peak RSS fell from 6.05 to 3.21 GiB. Each run reported
+17,633,790 instructions in 3,778,014 blocks and produced the same JSON
+report byte for byte. This measures discovery, which runs before emitting
+Rust and building the native translation.
+
+## Translated execution
+
 Measured on the benchmark kernels (`benches/kernels.rs`, x86-64, release),
 with the generated machine code read from the bench binary. A typical
 integer loop (`ldst`: LDR, ADD, STR, SUBS, B.NE) cost about 53 host
@@ -971,7 +992,7 @@ with every other region holding functions, the table and transitive
 summaries and the rest without, so calls cross both ways, against the
 reference interpreter; the unlisted regions must name no function.
 
-## Recommended set for the next rebuild (measured 2026-11)
+## Measurements behind the initial default set (2026-11)
 
 **Turn on `inline-vector,fused-flags,whole-vector-checks,fp-status-locals`
 together; leave `structured` off.** `ECHORA_LIFT_OPTIONS` accepts all five
@@ -1035,7 +1056,7 @@ are the common case.
 The `window-memory` and block bookkeeping changes above need
 `echora-guest` and runtime work first. They are not in this set.
 
-## Order for the rebuild
+## Original rollout plan
 
 1. Land the `echora-guest` API and runtime changes with today's emission
    (the generated code still calls `tick_block_at` / `finish_block`, now

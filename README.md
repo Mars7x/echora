@@ -33,7 +33,7 @@ still well below full speed.
 What works today:
 
 - Echora reads and checks your NUP file or dump, and translates the whole
-  game, 17.3 million instructions, into native code. The first start takes
+  game, 17.6 million discovered instructions, into native code. The first start takes
   about an hour; after that it starts straight away.
 - The translated game runs. It boots through the system services, takes
   input, and gets through New Game and the opening movie into its first 3D

@@ -26,10 +26,10 @@ it every program, and `ECHORA_SHADER_TRANSLATOR=compare` compares the two.
 
 ## Ahead-of-time translation
 
-All of a game's programs ship in its RomFS (about 10,000 for the target
-game). The plan is to translate them all at the first start and fill the
-driver's pipeline cache, so nothing compiles during play. That makes three
-goals first-class, next to correctness:
+`echora shaders` inventories the GPU programs in RomFS and found 34,275
+unique stages in the supported game. The plan is to translate them at the
+first start and fill the driver's cache to avoid compilation during play.
+That makes three goals first-class, next to correctness:
 
 1. **No runtime state in a translation** wherever possible. Storage-image
    integer-ness, texture view types, render-target formats, vertex input
@@ -40,8 +40,8 @@ goals first-class, next to correctness:
 2. **Explicit, enumerable variants.** Where a variant cannot be avoided, the
    translation reports it, and the runtime records the variants it meets so
    the next start precompiles them too.
-3. **Throughput.** Translation is a pure function of the program and runs
-   in parallel per program: fast over ~10,000 programs.
+3. **Throughput.** Translation is a pure function of its inputs, so stages
+   can be prepared in parallel.
 
 ## Interface (agreed with the GPU side)
 
@@ -57,9 +57,8 @@ goals first-class, next to correctness:
   `Unsupported` names the first unhandled instruction or feature and its
   offset. `Translated` lists the specialization constants and push
   constants it reads.
-- `ECHORA_SHADER_TRANSLATOR` selects `plugin` (the default with a plugin),
-  `rust` (Rust where supported, the plugin otherwise; the default without
-  one) or `compare`.
+- `ECHORA_SHADER_TRANSLATOR` selects `rust` (the default, with fallback to
+  an installed plugin), `plugin` or `compare`.
 - **Page table**: 4 KiB pages (`PAGE_SHIFT` 12, the granularity of NVN
   memory pools, so no page spans two pools); a buffer of u64 device
   addresses (0 unmapped) for `[va_base, va_base + pages * 4 KiB)`; the
