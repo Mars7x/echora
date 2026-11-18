@@ -7603,10 +7603,13 @@ impl Image {
     pub fn png(&self) -> Vec<u8> {
         let mut raw = Vec::with_capacity(self.texels.len() * 3 + self.height as usize);
         for row in self.texels.chunks(self.width.max(1) as usize) {
-            raw.push(0); // filter: none
+            raw.push(1); // PNG Sub filter: subtract the same channel from the left pixel.
+            let mut previous = [0; 3];
             for texel in row {
-                for channel in &texel[..3] {
-                    raw.push((channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+                for (channel, left) in texel.iter().zip(&mut previous) {
+                    let value = (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    raw.push(value.wrapping_sub(*left));
+                    *left = value;
                 }
             }
         }
@@ -7617,34 +7620,18 @@ impl Image {
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         for (kind, data) in [
             (b"IHDR", header),
-            (b"IDAT", miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6)),
+            (b"IDAT", miniz_oxide::deflate::compress_to_vec_zlib(&raw, 1)),
             (b"IEND", Vec::new()),
         ] {
             png.extend_from_slice(&(data.len() as u32).to_be_bytes());
             let start = png.len();
             png.extend_from_slice(kind);
             png.extend_from_slice(&data);
-            let crc = crc32(&png[start..]);
+            let crc = crc32fast::hash(&png[start..]);
             png.extend_from_slice(&crc.to_be_bytes());
         }
         png
     }
-}
-
-/// CRC-32 (IEEE, as PNG chunks use).
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
 }
 
 /// Modeled nvnDeviceGetInteger properties. NVN is undocumented, so each value
@@ -7804,6 +7791,32 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn png_sub_filter_preserves_pixels_across_row_boundaries() {
+        let image = Image {
+            width: 2,
+            height: 2,
+            texels: vec![
+                [0.0, 1.0, 0.5, 1.0],
+                [1.0, 0.25, -1.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.5, 1.0, 0.0],
+            ],
+        };
+        let encoded = image.png();
+        let chunks = &encoded[8..];
+        let header_length = u32::from_be_bytes(chunks[..4].try_into().unwrap()) as usize;
+        let data_chunk = &chunks[12 + header_length..];
+        assert_eq!(&data_chunk[4..8], b"IDAT");
+        let length = u32::from_be_bytes(data_chunk[..4].try_into().unwrap()) as usize;
+        let decoded =
+            miniz_oxide::inflate::decompress_to_vec_zlib(&data_chunk[8..8 + length]).unwrap();
+        assert_eq!(
+            decoded,
+            [1, 0, 255, 128, 255, 65, 128, 1, 255, 0, 0, 1, 128, 255]
+        );
     }
 
     #[test]

@@ -1965,6 +1965,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astc-decode",
+ "crc32fast",
  "echora-audio",
  "echora-av1",
  "echora-config",
