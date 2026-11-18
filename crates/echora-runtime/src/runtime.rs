@@ -315,7 +315,7 @@ pub struct Machine {
     last_wake_check: u64,
     /// With several workers: the threads other workers are running now
     /// (never the thread of the core swapped into `core`).
-    running: std::collections::BTreeSet<u64>,
+    running: [Option<u64>; APPLICATION_CORE_COUNT],
     /// With several workers: the modelled core (0-2) of the worker whose
     /// core is swapped in. Threads are picked for it by affinity and
     /// priority (see `next_runnable_thread`).
@@ -1870,10 +1870,11 @@ impl Machine {
             })
         };
         let holding = |id: u64| -> bool {
-            self.thread_state(id) == Some(ThreadState::Runnable) && !self.running.contains(&id)
+            self.thread_state(id) == Some(ThreadState::Runnable)
+                && !self.running.contains(&Some(id))
         };
         for (id, scheduling) in self.runnable_threads() {
-            if exclude == Some(id) || self.running.contains(&id) {
+            if exclude == Some(id) || self.running.contains(&Some(id)) {
                 continue;
             }
             let held = held_at(id);
@@ -1976,7 +1977,7 @@ impl Machine {
         // waits for every one of them).
         let mut best = [u8::MAX; APPLICATION_CORE_COUNT];
         for (id, scheduling) in self.runnable_threads() {
-            if self.running.contains(&id) || id == self.core.current_thread_id {
+            if self.running.contains(&Some(id)) || id == self.core.current_thread_id {
                 continue;
             }
             let mask = scheduling.affinity_mask;
@@ -2603,11 +2604,11 @@ impl Machine {
         if self.parallel
             || (self.main_thread_state == ThreadState::Runnable
                 && self.layout.main_thread_id != current
-                && !self.running.contains(&self.layout.main_thread_id))
+                && !self.running.contains(&Some(self.layout.main_thread_id)))
             || self
                 .threads
                 .runnable_ids()
-                .any(|id| id != current && !self.running.contains(&id))
+                .any(|id| id != current && !self.running.contains(&Some(id)))
         {
             let slice = if self.parallel {
                 self.layout.parallel_slice
@@ -2817,7 +2818,7 @@ impl Machine {
         self.preempt_stops = cores.iter().map(|core| core.stop.clone()).collect();
         self.core_threads = vec![None; workers];
         self.core_threads[0] = Some(cores[0].current_thread_id);
-        self.running.insert(cores[0].current_thread_id);
+        self.running[0] = Some(cores[0].current_thread_id);
         self.parallel = true;
         let placeholder = self.nvn.entries_only();
         let recorder = self.nvn.recorder();
@@ -2906,7 +2907,7 @@ impl Machine {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.parallel = false;
-        self.running.clear();
+        self.running.fill(None);
         self.worker_core = None;
         self.core_threads.clear();
         self.preempt_flags.clear();
@@ -5403,12 +5404,12 @@ impl Worker {
                 } else {
                     machine.boundary(result)
                 };
-                machine.lock_stats[2] += held.elapsed().as_micros() as u64;
-                machine.thread_time.entry(thread).or_default()[2] +=
-                    held.elapsed().as_micros() as u64;
-                machine.boundary_held[kind] += held.elapsed().as_micros() as u64;
+                let finished = std::time::Instant::now();
+                let held_us = (finished - held).as_micros() as u64;
+                machine.lock_stats[2] += held_us;
+                machine.thread_time.entry(thread).or_default()[2] += held_us;
+                machine.boundary_held[kind] += held_us;
                 if crate::timeline::on() {
-                    let now = std::time::Instant::now();
                     crate::timeline::span(thread, "guest", ran, waited);
                     crate::timeline::span(thread, "machine-lock-wait", waited, held);
                     let name = if kind == 0x0b {
@@ -5416,7 +5417,7 @@ impl Worker {
                     } else {
                         boundary_kind_name(kind)
                     };
-                    crate::timeline::span(thread, &name, held, now);
+                    crate::timeline::span(thread, &name, held, finished);
                 }
                 match outcome {
                     Ok(()) => {
@@ -5486,7 +5487,7 @@ impl Worker {
                     }
                     Err(Trap::NoRunnableThreads { waiting_threads }) => {
                         let deadline = machine.next_wait_deadline();
-                        let everyone_parked = machine.running.is_empty();
+                        let everyone_parked = machine.running.iter().all(Option::is_none);
                         // Nothing for this core may still be something for
                         // another parked worker's core.
                         let others = machine.parked_workers_with_work() & !(1 << self.index);
@@ -5842,19 +5843,24 @@ impl Worker {
         std::mem::swap(&mut machine.core, &mut self.core);
         machine.worker_core = Some(self.index);
         if self.active {
-            machine.running.remove(&machine.core.current_thread_id);
+            machine.running[usize::from(self.index)] = None;
         }
     }
 
     fn swap_out(&mut self, machine: &mut Machine, active: bool) {
-        if active && !machine.running.insert(machine.core.current_thread_id) {
-            // Two workers running one guest thread from the same saved
-            // context corrupt it: report it where it happens.
-            eprintln!(
-                "worker {}: thread {} is already running on another worker (pc {:#x})",
-                self.index, machine.core.current_thread_id, machine.core.cpu.pc
-            );
-            machine.double_dispatches += 1;
+        if active {
+            let thread = Some(machine.core.current_thread_id);
+            if machine.running.contains(&thread) {
+                // Two workers running one guest thread from the same saved
+                // context corrupt it: report it where it happens.
+                eprintln!(
+                    "worker {}: thread {} is already running on another worker (pc {:#x})",
+                    self.index, machine.core.current_thread_id, machine.core.cpu.pc
+                );
+                machine.double_dispatches += 1;
+            } else {
+                machine.running[usize::from(self.index)] = thread;
+            }
         }
         if let Some(slot) = machine.core_threads.get_mut(usize::from(self.index)) {
             *slot = active.then_some(machine.core.current_thread_id);
