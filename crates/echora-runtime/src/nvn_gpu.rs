@@ -8896,6 +8896,22 @@ impl Nvn {
                 return Err(format!("{instances} instances from {first_instance}"));
             }
         }
+        // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
+        // index equal to `index` starts a new primitive. Vulkan restarts
+        // at the index type's all-ones value only, so matching indices are
+        // rewritten to it (8-bit indices were widened to 16 bits).
+        let restart = self
+            .render
+            .state
+            .get("SetPrimitiveRestart")
+            .filter(|command| command.x[1] & 0xff != 0)
+            .map(|command| command.x[2] as u32);
+        let strip = matches!(
+            topology,
+            vk::PrimitiveTopology::LINE_STRIP
+                | vk::PrimitiveTopology::TRIANGLE_STRIP
+                | vk::PrimitiveTopology::TRIANGLE_FAN
+        );
         let (mut indices, mut count, mut first, mut base_vertex) = match command.name {
             // DrawArrays(cmd, mode, first, count).
             "nvnCommandBufferDrawArrays" | "nvnCommandBufferDrawArraysInstanced" => {
@@ -8922,8 +8938,26 @@ impl Nvn {
                     2 => (4, Indices::U32),
                     other => return Err(format!("index type {other}")),
                 };
-                self.resolve_gpu(core, command.x[4], u64::from(count) * size)?;
-                let bytes = self.gpu_bytes(core, command.x[4], u64::from(count) * size)?;
+                let address = command.x[4];
+                let length = u64::from(count) * size;
+                self.resolve_gpu(core, address, length)?;
+                // Vertex pulling needs the indices only on the GPU. Upload
+                // them as-is when the CPU does not widen or rewrite them.
+                let rewrites_indices = size == 1 || quads || strip && restart.is_some();
+                let indices = if pulling && !rewrites_indices && count > 0 {
+                    let kind = if size == 2 {
+                        vk::IndexType::UINT16
+                    } else {
+                        vk::IndexType::UINT32
+                    };
+                    Indices::Guest {
+                        address: self.gpu_to_guest(address, length)?,
+                        bytes: length,
+                        kind,
+                    }
+                } else {
+                    wrap(self.gpu_bytes(core, address, length)?)
+                };
                 let base = if command.name.ends_with("BaseVertex")
                     || command.name.ends_with("Instanced")
                 {
@@ -8931,7 +8965,7 @@ impl Nvn {
                 } else {
                     0
                 };
-                (wrap(bytes), count, 0, base)
+                (indices, count, 0, base)
             }
             _ if mesh_draw => (Indices::None, 0, 0, 0),
             other => return Err(format!("{other} is not modeled on the GPU")),
@@ -8956,6 +8990,7 @@ impl Nvn {
                     .iter()
                     .map(|index| u32::from_le_bytes(*index))
                     .collect(),
+                Indices::Guest { .. } => unreachable!("quad indices are decoded on the CPU"),
             };
             let triangles: Vec<u8> = corners
                 .as_chunks::<4>()
@@ -8972,7 +9007,8 @@ impl Nvn {
             indices = Indices::U32(triangles);
         }
 
-        // One past the highest vertex the draw references.
+        // One past the highest vertex the draw references, for CPU-selected
+        // vertex stream ranges. Guest indices need no CPU-selected range.
         let vertex_end = match &indices {
             Indices::None => u64::from(first) + u64::from(count),
             Indices::U16(bytes) => bytes
@@ -8993,13 +9029,14 @@ impl Nvn {
                 .map_or(0, |max| {
                     (max as i64 + i64::from(base_vertex) + 1).max(0) as u64
                 }),
+            Indices::Guest { .. } => 0,
         };
         // The lowest vertex it references: meshes that share one large
         // vertex buffer read their own range only (the draw's first or base
         // vertex moves down by as much).
         let lowest_index = |indices: &Indices| -> Option<u64> {
             match indices {
-                Indices::None => None,
+                Indices::None | Indices::Guest { .. } => None,
                 Indices::U16(bytes) => bytes
                     .as_chunks::<2>()
                     .0
@@ -9325,22 +9362,6 @@ impl Nvn {
         let depth_state = self.render.properties("BindDepthStencilState");
         let color_state = self.render.properties("BindColorState");
         let mask_state = self.render.properties("BindChannelMaskState");
-        // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
-        // index equal to `index` starts a new primitive. Vulkan restarts
-        // at the index type's all-ones value only, so matching indices are
-        // rewritten to it (8-bit indices were widened to 16 bits).
-        let restart = self
-            .render
-            .state
-            .get("SetPrimitiveRestart")
-            .filter(|command| command.x[1] & 0xff != 0)
-            .map(|command| command.x[2] as u32);
-        let strip = matches!(
-            topology,
-            vk::PrimitiveTopology::LINE_STRIP
-                | vk::PrimitiveTopology::TRIANGLE_STRIP
-                | vk::PrimitiveTopology::TRIANGLE_FAN
-        );
         let primitive_restart = match (restart, &mut indices) {
             (Some(value), Indices::U16(bytes)) if strip => {
                 for index in bytes.as_chunks_mut::<2>().0 {
@@ -9818,28 +9839,55 @@ impl Nvn {
                     .get("BindPolygonState")
                     .map(|bind| bind.x[1])
             );
+            let index_sample = match &indices {
+                Indices::U16(bytes) => bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .take(16)
+                    .map(|index| u32::from(u16::from_le_bytes(*index)))
+                    .collect::<Vec<_>>(),
+                Indices::U32(bytes) => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .take(16)
+                    .map(|index| u32::from_le_bytes(*index))
+                    .collect(),
+                &Indices::Guest {
+                    address,
+                    bytes,
+                    kind,
+                } => {
+                    let width = if kind == vk::IndexType::UINT16 { 2 } else { 4 };
+                    let mut sample = [0u8; 64];
+                    let sample = &mut sample[..(bytes as usize).min(16 * width)];
+                    core.memory.read(address, sample).map_err(|trap| {
+                        format!("reading guest indices at {address:#x}: {trap:?}")
+                    })?;
+                    if width == 2 {
+                        sample
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|word| u32::from(u16::from_le_bytes(*word)))
+                            .collect()
+                    } else {
+                        sample
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|word| u32::from_le_bytes(*word))
+                            .collect()
+                    }
+                }
+                Indices::None => Vec::new(),
+            };
             let line = format!(
-                "trace draw {:016x}/{:016x} {polygon_trace} {:?} count {count} indices {:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
+                "trace draw {:016x}/{:016x} {polygon_trace} {:?} count {count} indices {index_sample:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",
                 keys.0,
                 keys.1,
                 topology,
-                match &indices {
-                    Indices::U16(bytes) => bytes
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .take(16)
-                        .map(|index| u32::from(u16::from_le_bytes(*index)))
-                        .collect::<Vec<_>>(),
-                    Indices::U32(bytes) => bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .take(16)
-                        .map(|index| u32::from_le_bytes(*index))
-                        .collect(),
-                    Indices::None => Vec::new(),
-                },
                 vertex_fetch
                     .iter()
                     .map(|entry| (

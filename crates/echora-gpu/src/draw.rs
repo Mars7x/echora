@@ -487,6 +487,12 @@ pub enum Indices {
     None,
     U16(Vec<u8>),
     U32(Vec<u8>),
+    /// Unmodified indices uploaded directly from guest memory.
+    Guest {
+        address: u64,
+        bytes: u64,
+        kind: vk::IndexType,
+    },
 }
 
 pub struct Draw<'a> {
@@ -892,6 +898,7 @@ impl Renderer {
         bytes += match &draw.indices {
             Indices::None => 0,
             Indices::U16(data) | Indices::U32(data) => data.len() as u64 + 16,
+            Indices::Guest { bytes, .. } => bytes + 16,
         };
         bytes += draw.vertex_fetch.len() as u64 * 32 + 256;
         if matches!(draw.mesh, Some(MeshGroups::Indirect { .. })) {
@@ -1055,6 +1062,17 @@ impl Renderer {
             Indices::None => None,
             Indices::U16(bytes) => Some((self.ring_upload(bytes, 16)?, vk::IndexType::UINT16)),
             Indices::U32(bytes) => Some((self.ring_upload(bytes, 16)?, vk::IndexType::UINT32)),
+            &Indices::Guest {
+                address,
+                bytes,
+                kind,
+            } => {
+                let read = draw.read_guest.ok_or("no reader for guest indices")?;
+                Some((
+                    self.ring_upload_with(bytes, 16, |ring| read(address, ring))?,
+                    kind,
+                ))
+            }
         };
 
         // Targets this draw samples were maybe rendered just before.
@@ -1839,6 +1857,41 @@ pub(crate) mod tests {
         assert!(renderer.draw(&draw).unwrap().is_empty());
         assert_eq!(renderer.recorded_serial(), serial);
         assert_eq!(renderer.read_target(7).unwrap(), texels);
+
+        draw.count = 4;
+        draw.uniforms = &blue;
+        let no_guest_uniforms = crate::FastMap::default();
+        draw.guest_uniforms = &no_guest_uniforms;
+        let read_indices = |address, bytes: &mut [u8]| {
+            let width = match address {
+                0x2000 => 2,
+                0x3000 => 4,
+                _ => panic!("unexpected guest index address {address:#x}"),
+            };
+            assert_eq!(bytes.len(), 4 * width);
+            for (source, destination) in (0u32..4).zip(bytes.chunks_exact_mut(width)) {
+                destination.copy_from_slice(&source.to_le_bytes()[..width]);
+            }
+            Ok(())
+        };
+        draw.read_guest = Some(&read_indices);
+        for (address, bytes, kind) in [
+            (0x2000, 8, vk::IndexType::UINT16),
+            (0x3000, 16, vk::IndexType::UINT32),
+        ] {
+            renderer
+                .clear_color(7, None, vk::ClearColorValue { float32: [0.0; 4] })
+                .unwrap();
+            draw.indices = Indices::Guest {
+                address,
+                bytes,
+                kind,
+            };
+            renderer.draw(&draw).unwrap();
+            let texels = renderer.read_target(7).unwrap();
+            assert_eq!(texels[0], [0.0, 1.0, 1.0, 1.0]);
+            assert_eq!(texels[3], [0.0; 4]);
+        }
 
         renderer.destroy_program(program).unwrap();
     }
