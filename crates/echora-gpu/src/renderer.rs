@@ -385,7 +385,6 @@ pub struct Renderer {
     /// ECHORA_LOOP_TRACE buffers (index, the program it counts), reported
     /// when a wait stalls or the device is lost (`report_loop_traces`).
     loop_trace_buffers: Vec<(usize, String)>,
-    pool: vk::CommandPool,
     recording: bool,
     /// No draws, dispatches or copies follow the last full barrier in the
     /// current command buffer.
@@ -568,6 +567,7 @@ type SamplerKey = (
 /// the reads deferred from its ring and the resources retired while it
 /// was recorded. The renderer's own fields hold the slot being recorded.
 struct Slot {
+    command_pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
     ring: HostBuffer,
@@ -618,6 +618,64 @@ struct OpenPass {
 }
 
 impl Slot {
+    fn new(device: &ash::Device, queue_family: u32) -> Result<Self, String> {
+        let mut slot = Self {
+            command_pool: vk::CommandPool::null(),
+            commands: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            ring: HostBuffer::empty(),
+            ring_used: 0,
+            descriptor_pool: vk::DescriptorPool::null(),
+            sets_used: 0,
+            descriptors_used: [0; 4],
+            pending_reads: Vec::new(),
+            retired_uploads: Vec::new(),
+            retired_texel_buffers: Vec::new(),
+            retired_shared: Vec::new(),
+            in_flight: false,
+            handed: 0,
+            serial: 0,
+            markers: Vec::new(),
+            open_pass: None,
+            condition_active: false,
+            condition_inside: false,
+        };
+        let created = (|| {
+            let pool = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family);
+            // SAFETY: the device and its queue family are live.
+            slot.command_pool = unsafe { device.create_command_pool(&pool, None) }
+                .map_err(vk_error("vkCreateCommandPool"))?;
+            let allocate = vk::CommandBufferAllocateInfo::default()
+                .command_pool(slot.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: the pool belongs to this slot and is unused.
+            slot.commands = unsafe { device.allocate_command_buffers(&allocate) }
+                .map_err(vk_error("vkAllocateCommandBuffers"))?[0];
+            // SAFETY: a valid create info on the live device.
+            slot.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(vk_error("vkCreateFence"))?;
+            slot.descriptor_pool = create_descriptor_pool(device)?;
+            Ok(())
+        })();
+        if let Err(error) = created {
+            slot.destroy_pools_and_fence(device);
+            return Err(error);
+        }
+        Ok(slot)
+    }
+
+    /// Destroy the slot after setup failed or the last submission finished.
+    fn destroy_pools_and_fence(&self, device: &ash::Device) {
+        // SAFETY: any created handles belong to the device and are idle.
+        // The destroy operations accept null handles from partial setup.
+        unsafe {
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_fence(self.fence, None);
+            device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+
     /// Whether `size` bytes at `alignment` fit this slot's ring.
     fn ring_fits(&self, size: u64, alignment: u64) -> bool {
         self.ring_used.next_multiple_of(alignment) + size <= RING_SIZE
@@ -806,61 +864,25 @@ impl Renderer {
                 Some(Submitter::new(&gpu, queue_lock.clone())?)
             };
         let device = &gpu.device;
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(gpu.queue_family)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: valid create infos on a live device; destroyed in Drop.
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .map_err(vk_error("vkCreateCommandPool"))?;
-        let allocate = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: as above.
-        let commands = unsafe { device.allocate_command_buffers(&allocate) }
-            .map_err(vk_error("vkAllocateCommandBuffers"))?[0];
-        // SAFETY: as above.
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(vk_error("vkCreateFence"))?;
+        let mut slots = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            match Slot::new(device, gpu.queue_family) {
+                Ok(slot) => slots.push(slot),
+                Err(error) => {
+                    for slot in slots {
+                        slot.destroy_pools_and_fence(device);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut fences = [vk::Fence::null(); SLOTS];
+        for (fence, slot) in fences.iter_mut().zip(&slots) {
+            *fence = slot.fence;
+        }
+        let slot = slots.remove(0);
+        let spares = slots;
         let memory_types = gpu.memory_properties();
-        let descriptor_pool = create_descriptor_pool(device)?;
-        let mut spares = Vec::with_capacity(SLOTS - 1);
-        for _ in 1..SLOTS {
-            let spare_allocate = vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            // SAFETY: valid create infos on a live device; destroyed in Drop.
-            let spare_commands = unsafe { device.allocate_command_buffers(&spare_allocate) }
-                .map_err(vk_error("vkAllocateCommandBuffers"))?[0];
-            // SAFETY: as above.
-            let spare_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-                .map_err(vk_error("vkCreateFence"))?;
-            spares.push(Slot {
-                commands: spare_commands,
-                fence: spare_fence,
-                ring: HostBuffer::empty(),
-                ring_used: 0,
-                descriptor_pool: create_descriptor_pool(device)?,
-                sets_used: 0,
-                descriptors_used: [0; 4],
-                pending_reads: Vec::new(),
-                retired_uploads: Vec::new(),
-                retired_texel_buffers: Vec::new(),
-                retired_shared: Vec::new(),
-                in_flight: false,
-                handed: 0,
-                serial: 0,
-                markers: Vec::new(),
-                open_pass: None,
-                condition_active: false,
-                condition_inside: false,
-            });
-        }
-        let mut fences = [fence; SLOTS];
-        for (slot, spare) in fences[1..].iter_mut().zip(&spares) {
-            *slot = spare.fence;
-        }
         // SAFETY: the physical device belongs to the live instance.
         let (period, valid_bits) = unsafe {
             let limits = gpu
@@ -890,7 +912,6 @@ impl Renderer {
             shader_cache: None,
             fatal: None,
             gpu,
-            pool,
             queue_lock,
             submitter,
             recording: false,
@@ -937,26 +958,7 @@ impl Renderer {
             last_attachments: Vec::new(),
             hazard_barriers: 0,
             spares,
-            slot: Slot {
-                commands,
-                fence,
-                ring: HostBuffer::empty(),
-                ring_used: 0,
-                descriptor_pool,
-                sets_used: 0,
-                descriptors_used: [0; 4],
-                pending_reads: Vec::new(),
-                retired_uploads: Vec::new(),
-                retired_texel_buffers: Vec::new(),
-                retired_shared: Vec::new(),
-                in_flight: false,
-                handed: 0,
-                serial: 0,
-                markers: Vec::new(),
-                open_pass: None,
-                condition_active: false,
-                condition_inside: false,
-            },
+            slot,
             markers: FastMap::default(),
             free_events: Vec::new(),
             next_marker: 1,
@@ -3108,8 +3110,8 @@ impl Renderer {
                 .reset_fences(&[self.slot.fence])
                 .map_err(vk_error("vkResetFences"))?;
             device
-                .reset_command_buffer(self.slot.commands, vk::CommandBufferResetFlags::empty())
-                .map_err(vk_error("vkResetCommandBuffer"))?;
+                .reset_command_pool(self.slot.command_pool, vk::CommandPoolResetFlags::empty())
+                .map_err(vk_error("vkResetCommandPool"))?;
             device
                 .reset_descriptor_pool(
                     self.slot.descriptor_pool,
@@ -6634,23 +6636,15 @@ impl Drop for Renderer {
             for (_, sampler) in std::mem::take(&mut self.samplers) {
                 self.gpu.device.destroy_sampler(sampler, None);
             }
-            self.gpu
-                .device
-                .destroy_descriptor_pool(self.slot.descriptor_pool, None);
-            for spare in &self.spares {
-                self.gpu
-                    .device
-                    .destroy_descriptor_pool(spare.descriptor_pool, None);
-                self.gpu.device.destroy_fence(spare.fence, None);
+            for slot in std::iter::once(&self.slot).chain(&self.spares) {
+                slot.destroy_pools_and_fence(&self.gpu.device);
             }
-            self.gpu.device.destroy_fence(self.slot.fence, None);
             for (_, (event, _)) in std::mem::take(&mut self.markers) {
                 self.gpu.device.destroy_event(event, None);
             }
             for event in std::mem::take(&mut self.free_events) {
                 self.gpu.device.destroy_event(event, None);
             }
-            self.gpu.device.destroy_command_pool(self.pool, None);
         }
     }
 }
