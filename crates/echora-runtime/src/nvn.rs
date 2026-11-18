@@ -1134,12 +1134,18 @@ impl Nvn {
 }
 
 impl Nvn {
-    /// The device's depth mode (nvnDeviceSetDepthMode): 0 NEAR_IS_MINUS_W,
-    /// 1 NEAR_IS_ZERO; NVN's default, 0, until the application sets one.
+    /// The replay queue's device depth mode (nvnDeviceSetDepthMode).
+    /// NVN defaults to 0 (NEAR_IS_MINUS_W) until the application sets one.
     pub(crate) fn depth_mode(&self) -> u64 {
-        self.objects
-            .values()
-            .find(|object| object.kind == "Device")
+        let device = self
+            .render_queue
+            .and_then(|queue| self.objects.get(&queue))
+            .filter(|object| object.kind == "Queue")
+            .and_then(|queue| queue.builder.get("Device"))
+            .and_then(|device| self.objects.get(&device.x[0]))
+            .filter(|object| object.kind == "Device");
+        device
+            .or_else(|| self.objects.values().find(|object| object.kind == "Device"))
             .and_then(|device| device.state.get("DepthMode"))
             .map_or(0, |args| args.x[0])
     }
@@ -8380,6 +8386,40 @@ mod tests {
         assert_eq!(nvn.render.storage_slots, [0, 0xc008, 0, 0, 0, 0, 0, 4]);
         assert_eq!(nvn.render.state["BindStorageBuffer/1/16"].x[3], 0x1300);
         assert_eq!(nvn.render.state["BindStorageBuffer/7/2"].x[3..5], [0, 0]);
+    }
+
+    #[test]
+    fn draw_depth_mode_follows_the_replay_queue_device() {
+        let mut nvn = Nvn::default();
+        for address in [0x1000, 0x2000] {
+            nvn.initialize(address, "Device", BTreeMap::new()).unwrap();
+        }
+        nvn.objects.get_mut(&0x2000).unwrap().state.insert(
+            "DepthMode".into(),
+            Args {
+                x: [1, 0, 0, 0],
+                ..Default::default()
+            },
+        );
+        for (queue, device) in [(0x3000, 0x1000), (0x4000, 0x2000)] {
+            nvn.initialize(
+                queue,
+                "Queue",
+                BTreeMap::from([(
+                    "Device".into(),
+                    Args {
+                        x: [device, 0, 0, 0],
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap();
+        }
+        assert_eq!(nvn.depth_mode(), 0);
+        nvn.switch_render_queue(0x4000);
+        assert_eq!(nvn.depth_mode(), 1);
+        nvn.switch_render_queue(0x3000);
+        assert_eq!(nvn.depth_mode(), 0);
     }
 
     #[test]
