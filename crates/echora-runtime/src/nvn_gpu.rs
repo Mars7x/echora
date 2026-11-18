@@ -25,7 +25,7 @@ use echora_gpu::present::Presenter;
 use echora_gpu::renderer::Renderer;
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
-use super::{Command, Guest, Image, Nvn, StateSnapshots};
+use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, StateSnapshots};
 
 /// A built page table (see `Nvn::page_table`).
 pub struct PageBuild {
@@ -8554,71 +8554,55 @@ impl Nvn {
             .iter()
             .rposition(|texture| *texture != 0)
             .map_or(0, |last| last + 1);
-        let colors: Vec<u64> = self.render.colors[..bound].to_vec();
-        // Each color target's mip level (`mip_targets`) and array
-        // layer, from its view.
-        let (color_levels, color_layers): (Vec<u32>, Vec<u32>) = self
-            .render
-            .colors
-            .iter()
-            .zip(self.render.color_levels.iter().chain(std::iter::repeat(&0)))
-            .take(bound)
-            .map(|(_, view)| {
-                let level = if !super::mip_targets() {
-                    0
-                } else {
-                    *view as u32
-                };
-                (level, (*view >> 32) as u32)
-            })
-            .unzip();
-        // The format each color view renders its target as (an sRGB view
-        // of a UNORM texture encodes).
-        let color_formats: Vec<Option<vk::Format>> = (0..bound)
-            .map(|index| {
-                self.render
-                    .color_formats
-                    .get(index)
-                    .copied()
-                    .filter(|format| *format != 0)
-                    .and_then(vk_format)
-            })
-            .collect();
-        // A color texture that is a mip level of another render target (by
-        // address) renders into that target's level.
-        let (colors, color_levels): (Vec<u64>, Vec<u32>) = colors
-            .iter()
-            .zip(color_levels)
-            .map(|(texture, level)| match self.resolve_target(*texture) {
-                Some((key, base)) if *texture != 0 && key != *texture => (key, base + level),
-                _ => (*texture, level),
-            })
-            .unzip();
-        // A block-compressed texture viewed in an integer format one block
-        // wide per texel (RGBA16UI over BC4) renders into its blocks.
-        let mut color_formats = color_formats;
-        let mut colors = colors;
-        let mut extent = None;
-        for (index, color) in colors.iter_mut().enumerate() {
-            let Some(view) = color_formats.get(index).copied().flatten() else {
-                continue;
+        let mut colors = [0; MAX_COLOR_TARGETS];
+        let mut color_levels = [0; MAX_COLOR_TARGETS];
+        let mut color_layers = [0; MAX_COLOR_TARGETS];
+        let mut color_formats = [None; MAX_COLOR_TARGETS];
+        let mips = super::mip_targets();
+        for index in 0..bound {
+            let texture = self.render.colors[index];
+            let view = self.render.color_levels.get(index).copied().unwrap_or(0);
+            color_layers[index] = (view >> 32) as u32;
+            let level = if mips { view as u32 } else { 0 };
+            let (target, base) = if texture == 0 {
+                (0, 0)
+            } else {
+                self.resolve_target(texture).unwrap_or((texture, 0))
             };
-            if *color == 0 {
-                continue;
-            }
-            if let Some((alias, size)) = self.block_alias_target(*color, view)? {
+            colors[index] = target;
+            color_levels[index] = base + level;
+            // An sRGB view encodes writes to a UNORM target. An integer
+            // view one block wide per texel renders into compressed blocks.
+            color_formats[index] = self
+                .render
+                .color_formats
+                .get(index)
+                .copied()
+                .filter(|format| *format != 0)
+                .and_then(vk_format);
+        }
+        let mut extent = None;
+        for (color, format) in colors[..bound].iter_mut().zip(&mut color_formats[..bound]) {
+            if *color != 0
+                && let Some(view) = *format
+                && let Some((alias, size)) = self.block_alias_target(*color, view)?
+            {
                 *color = alias;
-                color_formats[index] = None;
+                *format = None;
                 extent.get_or_insert(size);
             }
         }
-        let aliases: Vec<u64> = self.block_aliases.values().copied().collect();
-        for (index, texture) in colors
-            .iter()
-            .enumerate()
-            .filter(|(_, texture)| **texture != 0 && !aliases.contains(texture))
-        {
-            if self.depth_traced(*texture) {
+        let (colors, color_levels, color_layers, color_formats) = (
+            &colors[..bound],
+            &color_levels[..bound],
+            &color_layers[..bound],
+            &color_formats[..bound],
+        );
+        for (index, &texture) in colors.iter().enumerate() {
+            if texture == 0 || self.block_aliases.values().any(|&alias| alias == texture) {
+                continue;
+            }
+            if self.depth_traced(texture) {
                 eprintln!(
                     "depth trace present {} draw {:016x}/{:016x} renders {texture:x} as view format {:?} level {:?}",
                     self.presented_frames,
@@ -8628,7 +8612,7 @@ impl Nvn {
                     color_levels.get(index)
                 );
             }
-            extent.get_or_insert(self.ensure_render_target(*texture)?);
+            extent.get_or_insert(self.ensure_render_target(texture)?);
         }
         // A depth texture object over the storage of an existing depth
         // target is that target (the game builds a new object over the
@@ -8924,52 +8908,50 @@ impl Nvn {
                 .any(|item| item.trim() == format!("{:016x}", keys.1))
         });
         let mut unknown_factors = Vec::new();
-        let blends: Vec<Blend> = (0..colors.len())
-            .map(|target| {
-                let mut blend = Blend::default();
-                // SetBlendEnable(state, index, enable): each index's latest.
-                if let Some(enable) = color_state.get(&format!("BlendEnable/{target}")) {
-                    blend.enable = enable.x[1] != 0 && !no_blend;
+        let mut blends = [Blend::default(); MAX_COLOR_TARGETS];
+        for (target, blend) in blends[..bound].iter_mut().enumerate() {
+            // SetBlendEnable(state, index, enable): each index's latest.
+            if let Some(enable) = color_state.get(&format!("BlendEnable/{target}")) {
+                blend.enable = enable.x[1] != 0 && !no_blend;
+            }
+            let blend_states = snapshot(&format!("BindBlendState/{target}"));
+            let blend_state = blend_states.first().unwrap_or(&NO_STATE);
+            if let Some(func) = blend_state.get("BlendFunc") {
+                let factors = func.x.map(blend_factor);
+                if let [Some(src), Some(dst), Some(src_alpha), Some(dst_alpha)] = factors {
+                    blend.color.0 = src;
+                    blend.color.1 = dst;
+                    blend.alpha.0 = src_alpha;
+                    blend.alpha.1 = dst_alpha;
+                } else {
+                    unknown_factors.push(func.x);
                 }
-                let blend_states = snapshot(&format!("BindBlendState/{target}"));
-                let blend_state = blend_states.first().unwrap_or(&NO_STATE);
-                if let Some(func) = blend_state.get("BlendFunc") {
-                    let factors = func.x.map(blend_factor);
-                    if let [Some(src), Some(dst), Some(src_alpha), Some(dst_alpha)] = factors {
-                        blend.color.0 = src;
-                        blend.color.1 = dst;
-                        blend.alpha.0 = src_alpha;
-                        blend.alpha.1 = dst_alpha;
-                    } else {
-                        unknown_factors.push(func.x);
+            }
+            if let Some(equation) = blend_state.get("BlendEquation") {
+                blend.color.2 = blend_op(equation.x[0]);
+                blend.alpha.2 = blend_op(equation.x[1]);
+            }
+            if let Some(mask) = mask_state.get(&format!("ChannelMask/{target}")) {
+                let mut flags = vk::ColorComponentFlags::empty();
+                // r, g, b in X2..X4; alpha (X5) recorded in v[1]. A
+                // G-buffer pass binds one texture as targets 2 and 4
+                // and masks target 4 off: its alpha writes overwrote
+                // target 2's material alpha.
+                let alpha = mask.v[1];
+                for (enabled, flag) in [
+                    (mask.x[1], vk::ColorComponentFlags::R),
+                    (mask.x[2], vk::ColorComponentFlags::G),
+                    (mask.x[3], vk::ColorComponentFlags::B),
+                    (alpha, vk::ColorComponentFlags::A),
+                ] {
+                    if enabled & 0xff != 0 {
+                        flags |= flag;
                     }
                 }
-                if let Some(equation) = blend_state.get("BlendEquation") {
-                    blend.color.2 = blend_op(equation.x[0]);
-                    blend.alpha.2 = blend_op(equation.x[1]);
-                }
-                if let Some(mask) = mask_state.get(&format!("ChannelMask/{target}")) {
-                    let mut flags = vk::ColorComponentFlags::empty();
-                    // r, g, b in X2..X4; alpha (X5) recorded in v[1]. A
-                    // G-buffer pass binds one texture as targets 2 and 4
-                    // and masks target 4 off: its alpha writes overwrote
-                    // target 2's material alpha.
-                    let alpha = mask.v[1];
-                    for (enabled, flag) in [
-                        (mask.x[1], vk::ColorComponentFlags::R),
-                        (mask.x[2], vk::ColorComponentFlags::G),
-                        (mask.x[3], vk::ColorComponentFlags::B),
-                        (alpha, vk::ColorComponentFlags::A),
-                    ] {
-                        if enabled & 0xff != 0 {
-                            flags |= flag;
-                        }
-                    }
-                    blend.write_mask = flags;
-                }
-                blend
-            })
-            .collect();
+                blend.write_mask = flags;
+            }
+        }
+        let blends = &blends[..bound];
         // A target with factors NVN defines but the device path does not
         // map keeps the default (ONE, ZERO), never a guessed factor.
         for factors in unknown_factors {
@@ -9379,28 +9361,20 @@ impl Nvn {
             vertex_fetch,
             pool,
         };
-        let probe_target = draw.colors.iter().copied().find(|key| *key != 0);
-        let colors_written: Vec<u64> = draw
-            .colors
-            .iter()
-            .copied()
-            .filter(|key| *key != 0)
-            .collect();
-        for key in &colors_written {
-            *self.frame_target_draws.entry(*key).or_default() += 1;
+        let mut colors_written = [0; MAX_COLOR_TARGETS];
+        let mut color_places = [(0, 0); MAX_COLOR_TARGETS];
+        let mut written = 0;
+        for (index, &key) in draw.colors.iter().enumerate() {
+            if key == 0 {
+                continue;
+            }
+            *self.frame_target_draws.entry(key).or_default() += 1;
+            colors_written[written] = key;
+            color_places[written] = (draw.color_levels[index], draw.color_layers[index]);
+            written += 1;
         }
-        let color_places: Vec<(u32, u32)> = draw
-            .colors
-            .iter()
-            .enumerate()
-            .filter(|(_, key)| **key != 0)
-            .map(|(index, _)| {
-                (
-                    draw.color_levels.get(index).copied().unwrap_or(0),
-                    draw.color_layers.get(index).copied().unwrap_or(0),
-                )
-            })
-            .collect();
+        let colors_written = &colors_written[..written];
+        let probe_target = colors_written.first().copied();
         let (draw_count, draw_instances) = (draw.count, draw.instances);
         let probe_level = draw.color_levels.first().copied().unwrap_or(0);
         let setup_end = timing.then(std::time::Instant::now);
@@ -9626,13 +9600,13 @@ impl Nvn {
             );
         }
         if super::debug_var_os("ECHORA_DISPATCH_SOURCE_LOG").is_some() {
-            for key in &colors_written {
+            for key in colors_written {
                 let storage = self.texture_storage(*key).unwrap_or(0);
                 self.target_writers
                     .insert(*key, (keys.1, self.presented_frames, storage));
             }
         }
-        self.trace_targets(&colors_written, &color_places, &draw_label)?;
+        self.trace_targets(colors_written, &color_places[..written], &draw_label)?;
         // ECHORA_DEPTH_TRACE_TEXEL=<x>,<y> with ECHORA_DEPTH_TRACE (debugging):
         // after each draw into the traced depth memory, that texel's depth
         // when the draw changed it (which draw put a shadow caster there).

@@ -733,6 +733,8 @@ pub struct Image {
     pub texels: Vec<[f32; 4]>,
 }
 
+const MAX_COLOR_TARGETS: usize = 8;
+
 #[derive(Clone, Debug, Default)]
 pub struct RenderState {
     pub colors: Vec<u64>,
@@ -7394,7 +7396,7 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
     match command.name {
         "nvnCommandBufferSetRenderTargets" => {
             let count = command.x[1] as usize;
-            if count > 8 {
+            if count > MAX_COLOR_TARGETS {
                 return Err(Trap::InvalidState {
                     message: format!("{count} render targets"),
                 });

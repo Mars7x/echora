@@ -422,15 +422,15 @@ pub enum Indices {
 
 pub struct Draw<'a> {
     pub program: &'a Program,
-    pub colors: Vec<u64>,
+    pub colors: &'a [u64],
     /// The mip level each color target renders into.
-    pub color_levels: Vec<u32>,
+    pub color_levels: &'a [u32],
     /// The array layer (or cube face) each color target renders into.
-    pub color_layers: Vec<u32>,
+    pub color_layers: &'a [u32],
     /// The format each color target is rendered as, when its view names
     /// one (the target's sRGB or UNORM twin: an sRGB view encodes what is
     /// written).
-    pub color_formats: Vec<Option<vk::Format>>,
+    pub color_formats: &'a [Option<vk::Format>],
     pub depth: Option<u64>,
     /// The array layer the depth target renders into.
     pub depth_layer: u32,
@@ -460,7 +460,7 @@ pub struct Draw<'a> {
     /// `Renderer::import_file`): buffer, offset and length.
     pub storage_in_place: crate::FastMap<(usize, u32), (vk::Buffer, u64, u64)>,
     pub fixed: Fixed,
-    pub blends: Vec<Blend>,
+    pub blends: &'a [Blend],
     /// A task/mesh pipeline's workgroups (the program's first stages are
     /// task and mesh): drawn with vkCmdDrawMeshTasks*EXT, with no vertex
     /// input.
@@ -708,7 +708,7 @@ impl Renderer {
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
         let mut since = std::time::Instant::now();
-        let scale = self.attachment_scale(&draw.colors, draw.depth)?;
+        let scale = self.attachment_scale(draw.colors, draw.depth)?;
         self.bound_submission()?;
         self.lap("stat: renderer ns submission", &mut since);
         let program = draw.program;
@@ -960,10 +960,10 @@ impl Renderer {
         // then begins inside it (a pass change ends one begun there).
         self.prepare_condition()?;
         self.begin_rendering(
-            &draw.colors,
-            &draw.color_levels,
-            &draw.color_layers,
-            &draw.color_formats,
+            draw.colors,
+            draw.color_levels,
+            draw.color_layers,
+            draw.color_formats,
             draw.depth,
             draw.depth_layer,
             area,
@@ -1481,12 +1481,16 @@ pub(crate) mod tests {
         // A triangle covering the left half: (-1,-1), (0,-1)... in NDC.
         let positions: [f32; 8] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0];
         let color: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        let red_only = [Blend {
+            write_mask: vk::ColorComponentFlags::R,
+            ..Blend::default()
+        }];
         let mut draw = Draw {
             program: &program,
-            colors: vec![7],
-            color_levels: vec![0],
-            color_layers: vec![0],
-            color_formats: Vec::new(),
+            colors: &[7],
+            color_levels: &[0],
+            color_layers: &[0],
+            color_formats: &[],
             depth: None,
             depth_layer: 0,
             attributes: vec![VertexAttribute {
@@ -1538,7 +1542,7 @@ pub(crate) mod tests {
                 alpha_to_coverage: false,
                 blend_constants: [0.0; 4],
             },
-            blends: vec![Blend::default()],
+            blends: &[Blend::default()],
             mesh: None,
             page_table: Default::default(),
             vertex_fetch: Vec::new(),
@@ -1547,7 +1551,7 @@ pub(crate) mod tests {
         renderer.draw(&draw).unwrap();
 
         draw.fixed.scissor = [0, 0, 1, 4];
-        draw.blends[0].write_mask = vk::ColorComponentFlags::R;
+        draw.blends = &red_only;
         draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&1.0f32.to_le_bytes());
         renderer.draw(&draw).unwrap();
         let texels = renderer.read_target(7).unwrap();
