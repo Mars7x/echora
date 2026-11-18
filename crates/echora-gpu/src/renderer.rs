@@ -187,30 +187,96 @@ const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
 /// thread.
 struct Submitter {
     sender: Option<std::sync::mpsc::Sender<(vk::CommandBuffer, vk::Fence)>>,
-    /// The first submission error, returned by the next submission.
-    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    progress: std::sync::Arc<SubmissionProgress>,
     /// Nanoseconds the thread spent in vkQueueSubmit, for the statistics.
     submit_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Batches handed to the thread, and those whose vkQueueSubmit has
-    /// returned: a batch's fence and command buffer are the call's until
-    /// then, even once the fence has signalled.
+    /// Batches handed to the thread, in submission order.
     handed: u64,
-    submitted: std::sync::Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A batch's fence and command buffer belong to vkQueueSubmit until that call
+/// returns, even if the fence has already signaled.
+#[derive(Default)]
+struct SubmissionProgress {
+    returned: std::sync::atomic::AtomicU64,
+    failure: std::sync::Mutex<Option<String>>,
+    changed: std::sync::Condvar,
+}
+
+impl SubmissionProgress {
+    /// The submitter stopped, leaving the failed batch and any later ones
+    /// without a fence signal.
+    const FAILED: u64 = u64::MAX;
+
+    fn returned(&self, handed: u64) -> bool {
+        let returned = self.returned.load(std::sync::atomic::Ordering::Acquire);
+        returned != Self::FAILED && returned >= handed
+    }
+
+    fn failure(&self) -> Option<String> {
+        if self.returned.load(std::sync::atomic::Ordering::Acquire) != Self::FAILED {
+            return None;
+        }
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn finish(&self, result: Result<(), String>) -> bool {
+        use std::sync::atomic::Ordering::Release;
+
+        let succeeded = result.is_ok();
+        {
+            // Use the same mutex as the wait predicate so a notification
+            // cannot be lost between the check and parking.
+            let mut failure = self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match result {
+                Ok(()) => {
+                    self.returned.fetch_add(1, Release);
+                }
+                Err(error) => {
+                    *failure = Some(error);
+                    self.returned.store(Self::FAILED, Release);
+                }
+            }
+        }
+        self.changed.notify_all();
+        succeeded
+    }
+
+    fn wait(&self, handed: u64) -> Result<(), String> {
+        if self.returned(handed) {
+            return Ok(());
+        }
+        let failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failure = self
+            .changed
+            .wait_while(failure, |failure| {
+                failure.is_none() && !self.returned(handed)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failure.clone().map_or(Ok(()), Err)
+    }
 }
 
 impl Submitter {
     fn new(gpu: &Gpu, queue_lock: std::sync::Arc<std::sync::Mutex<()>>) -> Result<Self, String> {
         let (sender, receiver) = std::sync::mpsc::channel::<(vk::CommandBuffer, vk::Fence)>();
-        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let progress = std::sync::Arc::new(SubmissionProgress::default());
         let submit_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let submitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (device, queue) = (gpu.device.clone(), gpu.queue);
         let thread = std::thread::Builder::new()
             .name("echora-submit".into())
             .spawn({
-                let (error, submit_ns, submitted) =
-                    (error.clone(), submit_ns.clone(), submitted.clone());
+                let (progress, submit_ns) = (progress.clone(), submit_ns.clone());
                 move || {
                     for (commands, fence) in receiver {
                         let buffers = [commands];
@@ -223,16 +289,12 @@ impl Submitter {
                         // again until its fence signals; the queue is held.
                         let result = unsafe { device.queue_submit(queue, &submit, fence) };
                         drop(held);
-                        submitted.fetch_add(1, std::sync::atomic::Ordering::Release);
                         submit_ns.fetch_add(
                             start.elapsed().as_nanos() as u64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        if let Err(failure) = result.map_err(vk_error("vkQueueSubmit")) {
-                            error
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .get_or_insert(failure);
+                        if !progress.finish(result.map_err(vk_error("vkQueueSubmit"))) {
+                            break;
                         }
                     }
                 }
@@ -240,15 +302,14 @@ impl Submitter {
             .map_err(|error| format!("the submit thread: {error}"))?;
         Ok(Self {
             sender: Some(sender),
-            error,
+            progress,
             submit_ns,
             handed: 0,
-            submitted,
             thread: Some(thread),
         })
     }
 
-    /// Stop the thread once it has submitted everything handed to it.
+    /// Join the thread after it has drained the queue or hit a failure.
     fn stop(&mut self) {
         self.sender = None;
         if let Some(thread) = self.thread.take() {
@@ -2630,12 +2691,12 @@ impl Renderer {
         for index in 0..self.spares.len() {
             if self.spares[index].in_flight {
                 self.swap_with(index);
-                let finished = self.finish_current();
+                let finished = self.finish_current(false);
                 self.swap_with(index);
                 finished?;
             }
         }
-        self.finish_current()
+        self.finish_current(false)
     }
 
     /// The highest completed submission serial, shared (see `wait_for`).
@@ -2667,13 +2728,14 @@ impl Renderer {
         // Submitted: spare slots up to it can still be running (the
         // recorded one was waited for before it became current again).
         if self.slot.in_flight {
-            self.finish_current()?;
+            self.finish_current(false)?;
         }
         for index in 0..self.spares.len() {
             if self.spares[index].in_flight && self.spares[index].serial <= serial {
                 self.swap_with(index);
-                self.finish_current()?;
+                let finished = self.finish_current(false);
                 self.swap_with(index);
+                finished?;
             }
         }
         Ok(())
@@ -2751,17 +2813,21 @@ impl Renderer {
     /// Whether the submit thread's vkQueueSubmit of batch `handed` has
     /// returned (always, for batches submitted on this thread).
     fn submit_returned(&self, handed: u64) -> bool {
-        self.submitter.as_ref().is_none_or(|submitter| {
-            submitter
-                .submitted
-                .load(std::sync::atomic::Ordering::Acquire)
-                >= handed
-        })
+        self.submitter
+            .as_ref()
+            .is_none_or(|submitter| submitter.progress.returned(handed))
     }
 
     /// Note the submissions that have finished, without waiting: their
     /// slots are freed and `completed_handle` moves on.
     pub fn poll_completed(&mut self) -> Result<(), String> {
+        if let Some(error) = self
+            .submitter
+            .as_ref()
+            .and_then(|submitter| submitter.progress.failure())
+        {
+            return Err(error);
+        }
         let signaled = |renderer: &Self, slot: &Slot| {
             // SAFETY: the fence is live, and no vkQueueSubmit uses it now.
             renderer.submit_returned(slot.handed)
@@ -2770,12 +2836,13 @@ impl Renderer {
         for index in 0..self.spares.len() {
             if self.spares[index].in_flight && signaled(self, &self.spares[index]) {
                 self.swap_with(index);
-                self.finish_current()?;
+                let finished = self.finish_current(true);
                 self.swap_with(index);
+                finished?;
             }
         }
         if self.slot.in_flight && signaled(self, &self.slot) {
-            self.finish_current()?;
+            self.finish_current(true)?;
         }
         Ok(())
     }
@@ -2804,7 +2871,7 @@ impl Renderer {
         );
         self.swap_slot();
         // Its previous submission (if any) must finish before reuse.
-        let finished = self.finish_current();
+        let finished = self.finish_current(false);
         self.stat(
             "stat: flush ns waiting for the other slot",
             submitted.elapsed().as_nanos() as u64,
@@ -2936,12 +3003,7 @@ impl Renderer {
         unsafe { device.end_command_buffer(self.slot.commands) }
             .map_err(vk_error("vkEndCommandBuffer"))?;
         if let Some(submitter) = &mut self.submitter {
-            if let Some(error) = submitter
-                .error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
+            if let Some(error) = submitter.progress.failure() {
                 return Err(error);
             }
             submitter
@@ -2949,7 +3011,12 @@ impl Renderer {
                 .as_ref()
                 .ok_or("the submit thread has stopped")?
                 .send((self.slot.commands, self.slot.fence))
-                .map_err(|_| "the submit thread has stopped".to_string())?;
+                .map_err(|_| {
+                    submitter
+                        .progress
+                        .failure()
+                        .unwrap_or_else(|| "the submit thread has stopped".to_string())
+                })?;
             submitter.handed += 1;
             self.slot.handed = submitter.handed;
             *self
@@ -2985,63 +3052,53 @@ impl Renderer {
 
     /// Wait for the current slot's submission, then free what it retired,
     /// collect its deferred reads and make the slot ready to record.
-    fn finish_current(&mut self) -> Result<(), String> {
+    fn finish_current(&mut self, fence_signaled: bool) -> Result<(), String> {
         if !self.slot.in_flight {
             return Ok(());
         }
-        // A batch the submit thread failed to submit never signals.
-        if let Some(submitter) = &self.submitter
-            && let Some(error) = submitter
-                .error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        {
-            return Err(error);
-        }
         let wait_start = std::time::Instant::now();
         // A fence is the submit thread's while its vkQueueSubmit runs (the
-        // call holds it exclusively): waited on once that call returned.
-        while !self.submit_returned(self.slot.handed) {
-            std::thread::yield_now();
+        // call holds it exclusively). A failed submission never signals.
+        if let Some(submitter) = &self.submitter {
+            submitter.progress.wait(self.slot.handed)?;
         }
         let device = &self.gpu.device;
-        // SAFETY: the fence belongs to a submitted batch (or one handed to
-        // the submit thread: the wait covers its submission).
         // Under ECHORA_HANG_MARKERS a wait over 2 s reports where the GPU
         // stopped, then goes on waiting.
         // So does one with ECHORA_MESH_COUNT_LOG: the indirect mesh counts
         // read since the last report.
-        let mut limit = if self.hang.is_some()
-            || crate::mesh_count::logging()
-            || !self.loop_trace_buffers.is_empty()
-        {
-            2_000_000_000
-        } else {
-            u64::MAX
-        };
-        loop {
-            // SAFETY: the submit thread has released the fence and the
-            // queue signals it when it finishes this batch.
-            match unsafe { device.wait_for_fences(&[self.slot.fence], true, limit) } {
-                Ok(()) => break,
-                Err(vk::Result::TIMEOUT) if limit != u64::MAX => {
-                    if let Some(hang) = &self.hang {
-                        hang.report(self.slot.serial);
+        if !fence_signaled {
+            let mut limit = if self.hang.is_some()
+                || crate::mesh_count::logging()
+                || !self.loop_trace_buffers.is_empty()
+            {
+                2_000_000_000
+            } else {
+                u64::MAX
+            };
+            loop {
+                // SAFETY: the submit thread has released the fence and the
+                // queue signals it when it finishes this batch.
+                match unsafe { device.wait_for_fences(&[self.slot.fence], true, limit) } {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) if limit != u64::MAX => {
+                        if let Some(hang) = &self.hang {
+                            hang.report(self.slot.serial);
+                        }
+                        if let Some(mesh_count) = &self.mesh_count {
+                            mesh_count.report_pending("GPU stalled over 2 s");
+                        }
+                        self.report_loop_traces("GPU stalled over 2 s");
+                        limit = u64::MAX;
                     }
-                    if let Some(mesh_count) = &self.mesh_count {
-                        mesh_count.report_pending("GPU stalled over 2 s");
+                    Err(vk::Result::TIMEOUT) => {}
+                    Err(error) => {
+                        if let Some(mesh_count) = &self.mesh_count {
+                            mesh_count.report_pending("fence wait failed");
+                        }
+                        self.report_loop_traces("fence wait failed");
+                        return Err(vk_error("vkWaitForFences")(error));
                     }
-                    self.report_loop_traces("GPU stalled over 2 s");
-                    limit = u64::MAX;
-                }
-                Err(vk::Result::TIMEOUT) => {}
-                Err(error) => {
-                    if let Some(mesh_count) = &self.mesh_count {
-                        mesh_count.report_pending("fence wait failed");
-                    }
-                    self.report_loop_traces("fence wait failed");
-                    return Err(vk_error("vkWaitForFences")(error));
                 }
             }
         }
@@ -6473,9 +6530,18 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let flushed = self.flush();
         if let Some(mut submitter) = self.submitter.take() {
             submitter.stop();
+        }
+        if flushed.is_err() {
+            let _held = self
+                .queue_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: the submit thread has joined and earlier submissions
+            // may still own these resources after a submission failed.
+            let _ = unsafe { self.gpu.device.device_wait_idle() };
         }
         if let Some(occlusion) = self.occlusion.take() {
             occlusion.destroy(&self.gpu.device);
@@ -6538,13 +6604,19 @@ impl Drop for Renderer {
         for (_, (_, target)) in std::mem::take(&mut self.uploads) {
             self.destroy_target(target);
         }
-        for target in std::mem::take(&mut self.slot.retired_uploads) {
+        let mut retired_uploads = std::mem::take(&mut self.slot.retired_uploads);
+        let mut retired_texel_buffers = std::mem::take(&mut self.slot.retired_texel_buffers);
+        for spare in &mut self.spares {
+            retired_uploads.append(&mut spare.retired_uploads);
+            retired_texel_buffers.append(&mut spare.retired_texel_buffers);
+        }
+        for target in retired_uploads {
             self.destroy_target(target);
         }
         for (_, (_, buffer, view)) in std::mem::take(&mut self.texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
+        for (buffer, view) in retired_texel_buffers {
             self.destroy_texel_buffer(buffer, view);
         }
         let ring = std::mem::replace(&mut self.slot.ring, HostBuffer::empty());
@@ -6593,6 +6665,23 @@ fn block_compressed(format: vk::Format) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_submission_releases_waiters_for_queued_batches() {
+        let progress = SubmissionProgress::default();
+        assert!(progress.finish(Ok(())));
+        assert!(progress.returned(1));
+        assert!(!progress.returned(2));
+        std::thread::scope(|scope| {
+            let failed = scope.spawn(|| progress.wait(2));
+            let queued = scope.spawn(|| progress.wait(3));
+            assert!(!progress.finish(Err("submission failed".into())));
+            assert_eq!(failed.join().unwrap(), Err("submission failed".into()));
+            assert_eq!(queued.join().unwrap(), Err("submission failed".into()));
+        });
+        assert_eq!(progress.failure().as_deref(), Some("submission failed"));
+        assert!(!progress.returned(2));
+    }
 
     #[test]
     fn sampler_cache_uses_effective_filtering_limits() {
@@ -6653,6 +6742,27 @@ mod tests {
         let reads = renderer.take_reads(&[first, second]);
         assert_eq!(reads[&first], [0x11; 4]);
         assert_eq!(reads[&second], [0x22; 4]);
+    }
+
+    #[test]
+    fn polling_collects_reads_after_the_submitter_and_fence_finish() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer.resident_buffer(1, 4).unwrap();
+        renderer.fill_resident(1, 0, 4, 0x1234_5678).unwrap();
+        let token = renderer.read_resident(1, 0, 4).unwrap();
+        let serial = renderer.recorded_serial();
+        renderer.submit_frame().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while renderer.completed_serial() < serial {
+            renderer.poll_completed().unwrap();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let reads = renderer.take_reads(&[token]);
+        assert_eq!(reads[&token], 0x1234_5678_u32.to_le_bytes());
     }
 
     #[test]
