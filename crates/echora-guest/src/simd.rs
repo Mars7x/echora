@@ -39,6 +39,71 @@ pub const FPSR_IDC: u32 = 1 << 7;
 /// Cumulative saturation of the Advanced SIMD saturating instructions.
 pub const FPSR_QC: u32 = 1 << 27;
 
+/// Checks the low `LANES` lanes for IEEE normal values, also accepting both
+/// signs of zero when `ALLOW_ZERO` is set. Integer classification leaves
+/// subnormals and signaling NaNs untouched by the host's FP environment.
+/// `WIDTH` is 32 or 64, and `LANES` is the number of active lanes in 128 bits.
+#[inline(always)]
+pub fn vector_fp_lanes<const WIDTH: u32, const LANES: u32, const ALLOW_ZERO: bool>(
+    bits: u128,
+) -> bool {
+    const { assert!((WIDTH == 32 || WIDTH == 64) && LANES > 0 && LANES <= 128 / WIDTH) };
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if WIDTH == 32 && LANES > 1 {
+        use core::arch::x86_64::*;
+        // SAFETY: SSE2 is enabled, and all 128-bit patterns are valid as
+        // packed integers. On x86 the low bits are the low lanes in both types.
+        return unsafe {
+            let packed: __m128i = core::mem::transmute(bits);
+            let abs = _mm_and_si128(packed, _mm_set1_epi32(0x7fff_ffff));
+            let normal = _mm_and_si128(
+                _mm_cmpgt_epi32(abs, _mm_set1_epi32(0x007f_ffff)),
+                _mm_cmpgt_epi32(_mm_set1_epi32(0x7f80_0000), abs),
+            );
+            let valid = if ALLOW_ZERO {
+                _mm_or_si128(normal, _mm_cmpeq_epi32(abs, _mm_setzero_si128()))
+            } else {
+                normal
+            };
+            let live = (1 << LANES) - 1;
+            _mm_movemask_ps(_mm_castsi128_ps(valid)) & live == live
+        };
+    }
+    vector_fp_lanes_portable::<WIDTH, LANES, ALLOW_ZERO>(bits)
+}
+
+#[inline(always)]
+fn vector_fp_lanes_portable<const WIDTH: u32, const LANES: u32, const ALLOW_ZERO: bool>(
+    bits: u128,
+) -> bool {
+    let (exponent, mantissa, sign) = if WIDTH == 32 {
+        (
+            0x7f80_0000_7f80_0000_7f80_0000_7f80_0000,
+            0x007f_ffff_007f_ffff_007f_ffff_007f_ffff,
+            0x8000_0000_8000_0000_8000_0000_8000_0000,
+        )
+    } else {
+        (
+            0x7ff0_0000_0000_0000_7ff0_0000_0000_0000,
+            0x000f_ffff_ffff_ffff_000f_ffff_ffff_ffff,
+            0x8000_0000_0000_0000_8000_0000_0000_0000,
+        )
+    };
+    let live = u128::MAX >> (128 - WIDTH * LANES);
+    // Adding the largest unsigned value below the sign bit sets that bit
+    // exactly where the field is nonzero, with no carry into the next lane.
+    let nonzero = |field: u128| field.wrapping_add(!sign) & sign;
+    let e = bits & exponent;
+    let finite = nonzero(e ^ exponent);
+    let e_set = nonzero(e);
+    if ALLOW_ZERO {
+        let mantissa_set = nonzero(bits & mantissa);
+        ((!finite & sign) | (!e_set & mantissa_set)) & live == 0
+    } else {
+        !(finite & e_set) & sign & live == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum FpSize {
     S,
@@ -1322,4 +1387,82 @@ pub fn load_replicate(
     q: bool,
 ) -> Result<u64, Trap> {
     __echora_simd_load_replicate(cpu, memory, address, rt, registers, bits, q)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{vector_fp_lanes, vector_fp_lanes_portable};
+
+    #[test]
+    fn vector_fp_checks_respect_lane_boundaries_and_signed_zero() {
+        fn check<const WIDTH: u32, const LANES: u32>(vector: u128) {
+            let classes = (0..LANES).map(|lane| {
+                let bits = vector >> (lane * WIDTH);
+                if WIDTH == 32 {
+                    f32::from_bits(bits as u32).classify()
+                } else {
+                    f64::from_bits(bits as u64).classify()
+                }
+            });
+            use core::num::FpCategory::{Normal, Zero};
+            let normal = classes.clone().all(|class| class == Normal);
+            let usable = classes
+                .into_iter()
+                .all(|class| matches!(class, Normal | Zero));
+            assert_eq!(vector_fp_lanes::<WIDTH, LANES, false>(vector), normal);
+            assert_eq!(vector_fp_lanes::<WIDTH, LANES, true>(vector), usable);
+            assert_eq!(
+                vector_fp_lanes_portable::<WIDTH, LANES, false>(vector),
+                normal
+            );
+            assert_eq!(
+                vector_fp_lanes_portable::<WIDTH, LANES, true>(vector),
+                usable
+            );
+        }
+
+        const POSITIVE_F32: [u128; 8] = [
+            0,
+            1,
+            0x007f_ffff,
+            0x0080_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0x7f80_0001,
+            0x7fc0_0000,
+        ];
+        const POSITIVE_F64: [u128; 8] = [
+            0,
+            1,
+            0x000f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0x7ff8_0000_0000_0000,
+        ];
+        // Keep other lanes normal, so any incorrect classification of the
+        // chosen lane affects the result whenever that lane is active.
+        for sign in [0, 1] {
+            for lane in 0..4 {
+                let rest =
+                    0x3f80_0000_3f80_0000_3f80_0000_3f80_0000 & !(0xffff_ffff << (32 * lane));
+                for bits in POSITIVE_F32 {
+                    let vector = rest | (bits | (sign << 31)) << (32 * lane);
+                    check::<32, 1>(vector);
+                    check::<32, 2>(vector);
+                    check::<32, 4>(vector);
+                }
+            }
+            for lane in 0..2 {
+                let rest = 0x3ff0_0000_0000_0000_3ff0_0000_0000_0000
+                    & !(u128::from(u64::MAX) << (64 * lane));
+                for bits in POSITIVE_F64 {
+                    let vector = rest | (bits | (sign << 63)) << (64 * lane);
+                    check::<64, 1>(vector);
+                    check::<64, 2>(vector);
+                }
+            }
+        }
+    }
 }

@@ -180,6 +180,22 @@ alternating runs: `vector` 199/226/199 to 284/262/259 Minstr/s (best),
 `scalar` (no vector float operations) unchanged. Every aot suite passes
 with it; accepting every operand fails the FP semantics suite.
 
+On x86-64 with SSE2, generated code classifies packed f32 lanes using
+integer vector comparisons. These distinguish signed zeros, subnormals,
+finite normals, infinities and NaNs without consulting the host FP mode.
+The portable bit checks handle f64 and other targets. On a Ryzen 7
+5800X3D, four alternating runs pinned to one core and built with aligned
+functions, `target-cpu=native`, and `vector-float-runs` gave these medians
+in million guest instructions per second:
+
+| Kernel | Portable checks | Packed checks |
+|---|---:|---:|
+| `vector` | 417.8 | 573.1 |
+| `vnorm` | 555.9 | 662.4 |
+| `convert` | 523.3 | 588.9 |
+| `fpairs` | 704.9 | 705.0 |
+| `ldst` | 4387.6 | 4387.2 |
+
 On x86-64, `mul_add` (FMLA, FMADD) is a call to `compiler_builtins`'
 `fmaf`/`fma`, which dispatches again at run time: building the translation
 with `-C target-feature=+fma` inlines it (`scalar` +12-15%), but needs a

@@ -2557,47 +2557,11 @@ pub(crate) fn set_whole_vector_checks(on: bool) -> bool {
     WHOLE_VECTOR_CHECKS.replace(on)
 }
 
-/// Closures over a whole vector (lanes of `width` bits, those of `mask`):
-/// `usable_all` (every lane normal or zero) and `normal_all` (every lane
-/// normal). Each lane's exponent and mantissa fields are below its top bit,
-/// so adding all-ones below the top bit sets that bit exactly when the field
-/// is nonzero, without a carry into the next lane: one test per vector
-/// instead of one per lane.
-fn whole_vector_closures(width: u32, mask: &str) -> String {
-    let repeat = |lane: u64| -> String {
-        let mut value: u128 = 0;
-        for index in 0..128 / width {
-            value |= u128::from(lane) << (index * width);
-        }
-        format!("{value:#x}u128")
-    };
-    let (exponent, mantissa, low) = if width == 32 {
-        (
-            repeat(0x7f80_0000),
-            repeat(0x007f_ffff),
-            repeat(0x7fff_ffff),
-        )
-    } else {
-        (
-            repeat(0x7ff0_0000_0000_0000),
-            repeat(0x000f_ffff_ffff_ffff),
-            repeat(0x7fff_ffff_ffff_ffff),
-        )
-    };
-    let high = if width == 32 {
-        repeat(0x8000_0000)
-    } else {
-        repeat(0x8000_0000_0000_0000)
-    };
+/// Closures testing the low `lanes` floating-point lanes together.
+fn whole_vector_closures(width: u32, lanes: u32) -> String {
     format!(
-        "let lanes_mask: u128 = {mask}; \
-         let fields = |vector: u128| {{ let vector = vector & lanes_mask; let e = vector & {exponent}; \
-         ((e.wrapping_add({low})) & {high}, ((e ^ {exponent}).wrapping_add({low})) & {high}, \
-         ((vector & {mantissa}).wrapping_add({low})) & {high}) }}; \
-         let usable_all = |vector: u128| {{ let (e_set, not_all_ones, m_set) = fields(vector); \
-         (!not_all_ones & {high} & lanes_mask) | (!e_set & m_set) == 0 }}; \
-         let normal_all = |vector: u128| {{ let (e_set, not_all_ones, _) = fields(vector); \
-         (!(e_set & not_all_ones)) & {high} & lanes_mask == 0 }};"
+        "let usable_all = echora_guest::simd::vector_fp_lanes::<{width}, {lanes}, true>; \
+         let normal_all = echora_guest::simd::vector_fp_lanes::<{width}, {lanes}, false>;"
     )
 }
 
@@ -2699,12 +2663,7 @@ fn vec_fp_arith(
         String::new()
     };
     if WHOLE_VECTOR_CHECKS.get() {
-        let mask = if lanes * width == 128 {
-            "u128::MAX".to_owned()
-        } else {
-            format!("(1u128 << {}) - 1", lanes * width)
-        };
-        let closures = whole_vector_closures(width, &mask);
+        let closures = whole_vector_closures(width, lanes);
         let second_usable = match (element, fp_op == VecFpOp::Div) {
             (Some(_), _) => "usable(element)".to_owned(),
             (None, false) => "usable_all(v)".to_owned(),
@@ -4077,12 +4036,7 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
         // operand vector once (not lane by lane), skipped for an earlier
         // result of the run that covers the lanes; the result tested lane
         // by lane only when it is not all normal (a zero must be exact).
-        let mask = if lanes * width == 128 {
-            "u128::MAX".to_owned()
-        } else {
-            format!("(1u128 << {}) - 1", lanes * width)
-        };
-        let whole = whole_vector_closures(width, &mask);
+        let whole = whole_vector_closures(width, lanes);
         let mut checks = Vec::new();
         if !covers(n_proof, lanes) {
             checks.push(format!("usable_all({n})"));
