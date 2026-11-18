@@ -1831,6 +1831,64 @@ pub fn vec_fp_across(cpu: &mut Cpu, op: VecFpOp, rd: u8, rn: u8) -> Result<(), T
     Ok(())
 }
 
+/// Four fused single-precision lanes with one shared multiplier.
+/// The caller has checked the guest mode and sticky inexact flag.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn packed_fma_element(
+    multiplicand: u128,
+    element: u32,
+    accumulator: u128,
+    subtract: bool,
+) -> Option<u128> {
+    use core::arch::x86_64::*;
+
+    // SAFETY: u128 and packed integer vectors have the same bit representation.
+    let pack = |value| unsafe { core::mem::transmute::<u128, __m128i>(value) };
+    let magnitude = _mm_set1_epi32(i32::MAX);
+    let least_normal = _mm_set1_epi32(0x007f_ffff);
+    let infinity = _mm_set1_epi32(0x7f80_0000);
+    let zero = _mm_setzero_si128();
+    let normal = |value| {
+        _mm_and_si128(
+            _mm_cmpgt_epi32(value, least_normal),
+            _mm_cmplt_epi32(value, infinity),
+        )
+    };
+    let all = |mask| _mm_movemask_ps(_mm_castsi128_ps(mask)) == 0b1111;
+    let magnitude_of = |value| _mm_and_si128(value, magnitude);
+    let zero_or_normal = |value| _mm_or_si128(_mm_cmpeq_epi32(value, zero), normal(value));
+    let a = pack(multiplicand);
+    let b = _mm_set1_epi32(element as i32);
+    let d = pack(accumulator);
+    let (abs_a, abs_b, abs_d) = (magnitude_of(a), magnitude_of(b), magnitude_of(d));
+    if !all(_mm_and_si128(
+        _mm_and_si128(zero_or_normal(abs_a), zero_or_normal(abs_b)),
+        zero_or_normal(abs_d),
+    )) {
+        return None;
+    }
+    let (a, b, d) = (
+        _mm_castsi128_ps(a),
+        _mm_castsi128_ps(b),
+        _mm_castsi128_ps(d),
+    );
+    let result = if subtract {
+        _mm_fnmadd_ps(a, b, d)
+    } else {
+        _mm_fmadd_ps(a, b, d)
+    };
+    let result = _mm_castps_si128(result);
+    let abs_result = magnitude_of(result);
+    let zero_product = _mm_or_si128(_mm_cmpeq_epi32(abs_a, zero), _mm_cmpeq_epi32(abs_b, zero));
+    let exact_zero = _mm_and_si128(zero_product, _mm_cmpeq_epi32(abs_d, zero));
+    if !all(_mm_or_si128(normal(abs_result), exact_zero)) {
+        return None;
+    }
+    // SAFETY: same size and bit representation as the inputs.
+    Some(unsafe { core::mem::transmute::<__m128i, u128>(result) })
+}
+
 /// FP operation by element: every lane of Vn with lane `index` of Vm.
 #[allow(clippy::too_many_arguments)]
 pub fn vec_fp_element(
@@ -1848,6 +1906,22 @@ pub fn vec_fp_element(
     let element = get_lane(cpu.vectors[rm as usize], bits, u32::from(index));
     let (n, d) = (cpu.vectors[rn as usize], cpu.vectors[rd as usize]);
     let mut fp = Fp::new(cpu, size)?;
+    #[cfg(target_arch = "x86_64")]
+    if size == FpSize::S
+        && q
+        && !scalar
+        && matches!(op, VecFpOp::MulAdd | VecFpOp::MulSub)
+        && fp.cpu.fpsr & FPSR_IXC != 0
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: the host FMA feature was detected above.
+        if let Some(result) =
+            unsafe { packed_fma_element(n, element as u32, d, op == VecFpOp::MulSub) }
+        {
+            fp.cpu.vectors[rd as usize] = result;
+            return Ok(());
+        }
+    }
     if let Some(result) = fast_vector(&fp, op, q, scalar, n, d, |_| element) {
         fp.cpu.vectors[rd as usize] = result;
         return Ok(());
@@ -4534,6 +4608,55 @@ mod sticky_inexact_tests {
                         (exact, flags | FPSR_IXC),
                         "{op:?} {a} {b} {c} element"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_element_lanes_keep_exact_flags_with_exceptional_inputs() {
+        let samples = [
+            0,
+            0x8000_0000,
+            1,
+            0x0080_0000,
+            0x3f00_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0x7f80_0001,
+            0x7fc0_7331,
+        ];
+        let pack = |lanes: [u32; 4]| {
+            lanes
+                .into_iter()
+                .enumerate()
+                .fold(0, |value, (lane, bits)| {
+                    value | u128::from(bits) << (lane * 32)
+                })
+        };
+        for op in [VecFpOp::MulAdd, VecFpOp::MulSub] {
+            for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN] {
+                for (index, &a) in samples.iter().enumerate() {
+                    for &b in &samples {
+                        let n = pack([a, b, samples[(index + 3) % samples.len()], a]);
+                        let d = pack([b, 0xbf80_0000, 0x8000_0000, a]);
+                        let m = pack([0x7f80_0001, 0, b, 1]);
+                        let run = |fpsr| {
+                            let mut cpu = Cpu {
+                                fpcr,
+                                fpsr,
+                                ..Cpu::default()
+                            };
+                            cpu.vectors[..3].copy_from_slice(&[d, n, m]);
+                            vec_fp_element(&mut cpu, op, FpSize::S, true, false, 0, 1, 2, 2)
+                                .unwrap();
+                            (cpu.vectors[0], cpu.fpsr)
+                        };
+                        let (reference, flags) = run(0);
+                        assert_eq!(run(FPSR_IXC), (reference, flags | FPSR_IXC));
+                    }
                 }
             }
         }
