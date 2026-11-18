@@ -473,6 +473,8 @@ pub(crate) struct ZeroHandleReturn {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ZeroHandleWaits {
     waiting: BTreeMap<u64, WaitRecord>,
+    /// Address waiters by (address, thread), with their insertion order.
+    arbiter_orders: BTreeMap<(u64, u64), u64>,
     returns: BTreeMap<u64, ZeroHandleReturn>,
     next_condition_order: u64,
     /// Parked waits with a deadline, so the scheduler can skip timer
@@ -625,14 +627,9 @@ impl ZeroHandleWaits {
 
     /// Address-arbiter waiters on `address`: (thread, wait).
     pub(crate) fn arbiter_waiters(&self, address: u64) -> Vec<(u64, ArbiterWait)> {
-        self.waiting
-            .iter()
-            .filter_map(|(&id, record)| {
-                record
-                    .arbiter
-                    .filter(|wait| wait.address == address)
-                    .map(|wait| (id, wait))
-            })
+        self.arbiter_orders
+            .range((address, 0)..=(address, u64::MAX))
+            .map(|(&(_, id), &order)| (id, ArbiterWait { address, order }))
             .collect()
     }
 
@@ -734,15 +731,20 @@ impl ZeroHandleWaits {
 
     fn insert_waiting(&mut self, id: u64, record: WaitRecord) {
         self.timed += usize::from(record.deadline.is_some());
-        if let Some(old) = self.waiting.insert(id, record) {
-            self.timed -= usize::from(old.deadline.is_some());
+        if let Some(wait) = record.arbiter {
+            self.arbiter_orders.insert((wait.address, id), wait.order);
         }
+        let previous = self.waiting.insert(id, record);
+        debug_assert!(previous.is_none());
     }
 
-    fn remove_waiting(&mut self, id: u64) {
-        if let Some(old) = self.waiting.remove(&id) {
-            self.timed -= usize::from(old.deadline.is_some());
+    fn remove_waiting(&mut self, id: u64) -> Option<WaitRecord> {
+        let record = self.waiting.remove(&id)?;
+        self.timed -= usize::from(record.deadline.is_some());
+        if let Some(wait) = record.arbiter {
+            self.arbiter_orders.remove(&(wait.address, id));
         }
+        Some(record)
     }
 
     /// Whether any parked wait has a deadline (constant time).
@@ -751,6 +753,9 @@ impl ZeroHandleWaits {
     }
 
     pub(crate) fn earliest_deadline(&self) -> Option<std::time::Instant> {
+        if !self.has_deadline() {
+            return None;
+        }
         self.waiting
             .values()
             .filter_map(|record| record.deadline)
@@ -764,13 +769,12 @@ impl ZeroHandleWaits {
         result: u32,
         index: i32,
     ) -> Result<ZeroHandleReturn, Trap> {
-        let record = self
-            .waiting
-            .remove(&id)
-            .ok_or_else(|| invalid("wait completion requires a parked wait"))?;
         if self.returns.contains_key(&id) {
             return Err(invalid("wait completion cannot replace a pending return"));
         }
+        let record = self
+            .remove_waiting(id)
+            .ok_or_else(|| invalid("wait completion requires a parked wait"))?;
         let completed = ZeroHandleReturn {
             result,
             index,
@@ -1312,6 +1316,32 @@ mod zero_handle_tests {
         assert_eq!(state.cancel(u64::MAX).unwrap().timeout_ns, i64::MIN);
         assert_eq!(state.cancel(1).unwrap().timeout_ns, -1);
         assert_eq!(state.waiting_count(), 0);
+    }
+
+    #[test]
+    fn completing_address_waits_retires_their_index_and_deadline() {
+        let mut state = ZeroHandleWaits::default();
+        let deadline = std::time::Instant::now();
+        state.begin_arbiter(4, 1, Some(deadline), 0x1000).unwrap();
+        state.begin_arbiter(2, -1, None, 0x1000).unwrap();
+        state.begin_arbiter(1, -1, None, 0x2000).unwrap();
+        let waiters = state.arbiter_waiters(0x1000);
+        assert_eq!(
+            waiters.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [2, 4]
+        );
+        assert!(waiters[1].1.order < waiters[0].1.order);
+        assert!(state.has_deadline());
+        assert_eq!(state.earliest_deadline(), Some(deadline));
+
+        let completed = state.complete(4, 0xea01, -1).unwrap();
+        assert!(!completed.writes_index);
+        assert!(!state.has_deadline());
+        assert_eq!(state.earliest_deadline(), None);
+        assert_eq!(state.arbiter_waiters(0x1000), waiters[..1]);
+        assert_eq!(state.arbiter_waiters(0x2000)[0].0, 1);
+        state.complete(2, 0, 0).unwrap();
+        assert!(state.arbiter_waiters(0x1000).is_empty());
     }
 
     #[test]
