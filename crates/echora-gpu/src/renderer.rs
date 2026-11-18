@@ -2631,6 +2631,11 @@ impl Renderer {
         self.completed_shared.clone()
     }
 
+    /// The highest completed submission serial while holding the renderer.
+    pub fn completed_serial(&self) -> u64 {
+        self.completed_serial
+    }
+
     /// Serial of the submission that holds everything recorded so far:
     /// `wait_for` with it waits for that work and no later work.
     pub fn recorded_serial(&self) -> u64 {

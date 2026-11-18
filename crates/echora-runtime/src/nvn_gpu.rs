@@ -154,6 +154,9 @@ pub struct Backend {
     /// The renderer's marker at the last such signal (`Renderer::mark`):
     /// a wait for it ends when the GPU passes it, not when its batch ends.
     observable_marker: Option<u64>,
+    /// A later store can share the marker's submission without being
+    /// covered by the marker.
+    page_table_wrote_after_signal: bool,
     /// Work storing through the page table has run at some point: the
     /// resident pools' ranges a CPU read covers may hold its results.
     page_table_wrote: bool,
@@ -341,6 +344,7 @@ impl Backend {
             page_table_write_serial: 0,
             observable_serial: 0,
             observable_marker: None,
+            page_table_wrote_after_signal: false,
             page_table_wrote: false,
             resident: HashMap::default(),
             samples_reports: std::collections::HashSet::new(),
@@ -357,12 +361,10 @@ impl Backend {
     fn record_page_table_write(&mut self, serial: u64, bounded: Option<Vec<SharedRange>>) {
         self.page_table_writes = true;
         self.page_table_wrote = true;
+        self.page_table_wrote_after_signal = true;
         self.page_table_write_serial = serial;
         if let Some(ranges) = bounded {
-            let done = self
-                .renderer
-                .completed_handle()
-                .load(std::sync::atomic::Ordering::Acquire);
+            let done = self.renderer.completed_serial();
             self.shared_writes.retain(|(recorded, _)| *recorded > done);
             self.shared_writes
                 .extend(ranges.into_iter().map(|range| (serial, range)));
@@ -373,7 +375,10 @@ impl Backend {
     }
 
     fn wait_for_table_writes(&mut self, range: Option<SharedRange>) -> Result<(), String> {
-        if !self.page_table_writes {
+        if !self.page_table_writes
+            || self.renderer.completed_serial() >= self.page_table_write_serial
+        {
+            self.page_table_writes = false;
             return Ok(());
         }
         let serial = if let Some(range) = range {
@@ -388,7 +393,7 @@ impl Backend {
             self.page_table_write_serial
         };
         self.renderer.wait_for(serial)?;
-        if serial >= self.page_table_write_serial {
+        if self.renderer.completed_serial() >= self.page_table_write_serial {
             self.page_table_writes = false;
         }
         Ok(())
@@ -4124,11 +4129,7 @@ impl Nvn {
             .observable_marker
             .filter(|&marker| backend.renderer.marker_serial(marker) == Some(serial))
             .unwrap_or(0);
-        if serial
-            <= backend
-                .renderer
-                .completed_handle()
-                .load(std::sync::atomic::Ordering::Acquire)
+        if serial <= backend.renderer.completed_serial()
             || (marker != 0 && backend.renderer.marker_done(marker))
         {
             return Ok(None);
@@ -4155,12 +4156,9 @@ impl Nvn {
 
     /// The serial of the last finished submission.
     pub(super) fn gpu_completed_serial(&self) -> u64 {
-        self.gpu.as_ref().map_or(u64::MAX, |backend| {
-            backend
-                .renderer
-                .completed_handle()
-                .load(std::sync::atomic::Ordering::Acquire)
-        })
+        self.gpu
+            .as_ref()
+            .map_or(u64::MAX, |backend| backend.renderer.completed_serial())
     }
 
     /// Work recorded before submission `serial` ends at a fence or event
@@ -4180,6 +4178,7 @@ impl Nvn {
             }
         };
         backend.observable_marker = marker;
+        backend.page_table_wrote_after_signal = false;
         marker
     }
 
@@ -5666,10 +5665,7 @@ impl Nvn {
                         &format!(
                             "page-table-wait serial {waited_serial} recorded {} completed {}",
                             backend.renderer.recorded_serial(),
-                            backend
-                                .renderer
-                                .completed_handle()
-                                .load(std::sync::atomic::Ordering::Relaxed)
+                            backend.renderer.completed_serial()
                         ),
                         started,
                         started,
@@ -5683,10 +5679,14 @@ impl Nvn {
                 });
                 if backend.page_table_write_serial <= backend.observable_serial {
                     backend.stat("stat: GPU waits for page-table writes", 1);
-                    if !(marked && backend.page_table_write_serial == backend.observable_serial) {
+                    if marked && backend.page_table_write_serial == backend.observable_serial {
+                        backend.page_table_writes = backend.page_table_wrote_after_signal
+                            && backend.renderer.completed_serial()
+                                < backend.page_table_write_serial;
+                    } else {
                         backend.renderer.wait_for(backend.page_table_write_serial)?;
+                        backend.page_table_writes = false;
                     }
-                    backend.page_table_writes = false;
                 } else {
                     // Stores recorded after the last signal the guest saw
                     // are not waited for; the ones before it are.
@@ -10817,6 +10817,56 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn observable_marker_leaves_later_writes_in_the_same_submission_pending() {
+        let Ok(Some(mut backend)) = Backend::create() else {
+            return;
+        };
+        let base = 0x10_0000;
+        backend.renderer.resident_buffer(base, 4096).unwrap();
+        backend.renderer.upload_resident(base, 0, &[1; 16]).unwrap();
+        let serial = backend.renderer.recorded_serial();
+        backend.record_page_table_write(serial, None);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let marker = nvn.gpu_observable(serial).unwrap();
+        let backend = nvn.gpu.as_mut().unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 16, &[2; 16])
+            .unwrap();
+        assert_eq!(backend.renderer.recorded_serial(), serial);
+        backend.record_page_table_write(serial, None);
+        backend.renderer.submit_through(serial).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !nvn.gpu_marker_done(marker) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GPU marker did not complete"
+            );
+            std::thread::yield_now();
+        }
+
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        assert_eq!(nvn.gpu_read_wait_serial().unwrap(), None);
+        nvn.resolve_gpu_written(&mut guest, 0..0).unwrap();
+        let backend = nvn.gpu.as_mut().unwrap();
+        assert!(backend.renderer.completed_serial() < serial);
+        assert!(backend.page_table_writes);
+        backend.wait_for_table_writes(None).unwrap();
+        assert!(backend.renderer.completed_serial() >= serial);
+        assert!(!backend.page_table_writes);
+    }
 
     #[test]
     fn texture_storage_index_preserves_flushes_and_named_invalidations() {
