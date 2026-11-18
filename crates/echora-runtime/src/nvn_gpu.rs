@@ -25,7 +25,7 @@ use echora_gpu::present::Presenter;
 use echora_gpu::renderer::Renderer;
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
-use super::{Command, Guest, Image, Nvn};
+use super::{Command, Guest, Image, Nvn, StateSnapshots};
 
 /// A built page table (see `Nvn::page_table`).
 pub struct PageBuild {
@@ -1571,7 +1571,7 @@ impl Nvn {
             return [0; 32];
         };
         if let Some((known, types)) = &self.input_types_memo
-            && Arc::ptr_eq(known, &states)
+            && known.ptr_eq(&states)
         {
             return *types;
         }
@@ -1598,7 +1598,8 @@ impl Nvn {
             .render
             .state
             .get("BindVertexAttribState")
-            .map(|command| command.states.clone());
+            .map(|command| command.states.clone())
+            .unwrap_or_default();
         let stamp = (self.presented_frames, self.flush_epoch);
         if self.program_memo.0 != stamp {
             self.program_memo = (stamp, HashMap::default());
@@ -1606,11 +1607,7 @@ impl Nvn {
         let key = bind(0).zip(bind(1));
         if let Some(key) = key
             && let Some((memo_attributes, bound)) = self.program_memo.1.get(&key)
-            && match (&attributes, memo_attributes) {
-                (Some(now), Some(then)) => Arc::ptr_eq(now, then),
-                (None, None) => true,
-                _ => false,
-            }
+            && attributes.ptr_eq(memo_attributes)
         {
             return Ok(bound.clone());
         }
@@ -5437,12 +5434,12 @@ impl Nvn {
     /// string-keyed maps, looked up per attribute and stream per draw.
     fn parsed_vertex_state(
         &mut self,
-        attributes: &Arc<Vec<BTreeMap<String, super::Args>>>,
-        streams: &Arc<Vec<BTreeMap<String, super::Args>>>,
+        attributes: &StateSnapshots,
+        streams: &StateSnapshots,
     ) -> Arc<ParsedVertexState> {
         if let Some((known_attributes, known_streams, parsed)) = &self.vertex_state_memo
-            && Arc::ptr_eq(known_attributes, attributes)
-            && Arc::ptr_eq(known_streams, streams)
+            && known_attributes.ptr_eq(attributes)
+            && known_streams.ptr_eq(streams)
         {
             return parsed.clone();
         }
@@ -8695,7 +8692,7 @@ impl Nvn {
         // Fixed-function state from the record-time snapshots.
         // (Shared, not copied: a draw read five of them.)
         static NO_STATE: BTreeMap<String, super::Args> = BTreeMap::new();
-        let snapshot = |key: &str| -> Arc<Vec<BTreeMap<String, super::Args>>> {
+        let snapshot = |key: &str| -> StateSnapshots {
             self.render
                 .state
                 .get(key)

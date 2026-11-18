@@ -649,26 +649,20 @@ pub struct Nvn {
     #[serde(skip)]
     task_dump_present: Option<u64>,
     #[serde(skip)]
-    input_types_memo: Option<(std::sync::Arc<Vec<BTreeMap<String, Args>>>, [u8; 32])>,
+    input_types_memo: Option<(StateSnapshots, [u8; 32])>,
     /// The last vertex attribute and stream snapshots a draw read, with
     /// their props parsed (`parsed_vertex_state`), the snapshots kept
     /// alive so their addresses name them.
     #[serde(skip)]
     vertex_state_memo: Option<(
-        std::sync::Arc<Vec<BTreeMap<String, Args>>>,
-        std::sync::Arc<Vec<BTreeMap<String, Args>>>,
+        StateSnapshots,
+        StateSnapshots,
         std::sync::Arc<gpu::ParsedVertexState>,
     )>,
     #[serde(skip)]
     program_memo: (
         (u64, u64),
-        HashMap<
-            ([u64; 8], [u64; 8]),
-            (
-                Option<std::sync::Arc<Vec<BTreeMap<String, Args>>>>,
-                gpu::BoundProgram,
-            ),
-        >,
+        HashMap<([u64; 8], [u64; 8]), (StateSnapshots, gpu::BoundProgram)>,
     ),
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,
@@ -696,7 +690,36 @@ pub struct Command {
     /// Snapshots of the state structures a Bind*State command points to,
     /// taken at record time: the application may reuse that memory before
     /// the list executes. Shared: draws read them without copying.
-    pub states: std::sync::Arc<Vec<BTreeMap<String, Args>>>,
+    pub states: StateSnapshots,
+}
+
+/// Recorded fixed-function state, shared by commands binding the same
+/// snapshots. Commands with no state use one empty pointer value.
+#[derive(Clone, Debug, Default)]
+pub struct StateSnapshots(Option<std::sync::Arc<Vec<BTreeMap<String, Args>>>>);
+
+impl StateSnapshots {
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<Vec<BTreeMap<String, Args>>> for StateSnapshots {
+    fn from(states: Vec<BTreeMap<String, Args>>) -> Self {
+        Self((!states.is_empty()).then(|| std::sync::Arc::new(states)))
+    }
+}
+
+impl std::ops::Deref for StateSnapshots {
+    type Target = [BTreeMap<String, Args>];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
 }
 
 /// A host image: RGBA, one f32 per channel.
@@ -1132,8 +1155,8 @@ pub struct Recording {
 }
 
 /// Recordings by command buffer.
-type Recordings =
-    std::sync::Arc<std::sync::RwLock<BTreeMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>>;
+type RecordingMap = std::sync::RwLock<BTreeMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>;
+type Recordings = std::sync::Arc<RecordingMap>;
 
 fn read_shared<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
@@ -1341,32 +1364,48 @@ impl Recorder {
         // The command buffer this thread recorded into last, kept so most
         // commands skip the shared map's lock; a recording that ended
         // (EndRecording marks it) is looked up again.
+        struct CachedRecording {
+            owner: std::sync::Weak<RecordingMap>,
+            address: u64,
+            recording: std::sync::Arc<std::sync::Mutex<Recording>>,
+        }
         thread_local! {
-            static LAST: std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::Mutex<Recording>>)>> =
+            static LAST: std::cell::RefCell<Option<CachedRecording>> =
                 const { std::cell::RefCell::new(None) };
         }
-        let cached = LAST.with(|last| {
+        let mut record = |recording: &std::sync::Mutex<Recording>| -> Result<bool, Trap> {
+            let mut recording = lock_shared(recording);
+            if recording.ended {
+                return Ok(false);
+            }
+            record_command(name, rest, core, &self.bags, &mut recording, None)?;
+            Ok(true)
+        };
+        if LAST.with(|last| {
             last.borrow()
                 .as_ref()
-                .filter(|(buffer, _)| *buffer == this)
-                .map(|(_, recording)| recording.clone())
-        });
-        let recording = match cached {
-            Some(recording) if !lock_shared(&recording).ended => recording,
-            _ => {
-                let Some(recording) = read_shared(&self.recordings).get(&this).cloned() else {
-                    return Ok(false);
-                };
-                LAST.with(|last| *last.borrow_mut() = Some((this, recording.clone())));
-                recording
-            }
-        };
-        let mut recording = lock_shared(&recording);
-        if recording.ended {
-            return Ok(false);
+                .filter(|cached| {
+                    cached.address == this
+                        && cached.owner.as_ptr() == std::sync::Arc::as_ptr(&self.recordings)
+                })
+                .map_or(Ok(false), |cached| record(&cached.recording))
+        })? {
+            return Ok(true);
         }
-        record_command(name, rest, core, &self.bags, &mut recording, None)?;
-        Ok(true)
+        let Some(recording) = read_shared(&self.recordings).get(&this).cloned() else {
+            return Ok(false);
+        };
+        let recorded = record(&recording)?;
+        if recorded {
+            LAST.with(|last| {
+                *last.borrow_mut() = Some(CachedRecording {
+                    owner: std::sync::Arc::downgrade(&self.recordings),
+                    address: this,
+                    recording,
+                });
+            });
+        }
+        Ok(recorded)
     }
 }
 
@@ -5134,9 +5173,9 @@ impl Nvn {
                         for index in 0..(count * words) as u64 {
                             values.push(core.memory.read_u64(command.x[4] + index * 8)?);
                         }
-                        values
+                        std::borrow::Cow::Owned(values)
                     } else {
-                        command.captured.clone()
+                        std::borrow::Cow::Borrowed(command.captured.as_slice())
                     };
                     for (index, value) in values.chunks(words).take(count).enumerate() {
                         let slot = command.x[2] + index as u64;
@@ -6720,7 +6759,7 @@ const TAGGED_STATES: [&str; 6] = [
 /// The contents of tagged state structures by tag (the structure's first
 /// word: content-addressed, so equal states share one): the kind, and
 /// what a Bind of it snapshots (`snapshot_states`), made once per tag.
-type StateTags = FastMap<u32, (String, std::sync::Arc<Vec<BTreeMap<String, Args>>>)>;
+type StateTags = FastMap<u32, (String, StateSnapshots)>;
 static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
 
 /// After a setter changed a state structure at `address`: its contents'
@@ -6790,7 +6829,7 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
                         v: [0; 2],
                     },
                 );
-                (kind.into(), std::sync::Arc::new(vec![snapshot]))
+                (kind.into(), vec![snapshot].into())
             });
     }
     Some(tag)
@@ -6840,26 +6879,26 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
                 v: [0; 2],
             },
         );
-        command.states = std::sync::Arc::new(vec![props]);
+        command.states = vec![props].into();
         return;
     }
-    command.states = std::sync::Arc::new(
-        bags.kind_from(base, kind, count)
-            .into_iter()
-            .map(|(address, bag)| {
-                let mut props = bag.props;
-                // Element offset from the array start, as evidence of the layout.
-                props.insert(
-                    "@Offset".into(),
-                    Args {
-                        x: [address - base, 0, 0, 0],
-                        v: [0; 2],
-                    },
-                );
-                props
-            })
-            .collect(),
-    );
+    command.states = bags
+        .kind_from(base, kind, count)
+        .into_iter()
+        .map(|(address, bag)| {
+            let mut props = bag.props;
+            // Element offset from the array start, as evidence of the layout.
+            props.insert(
+                "@Offset".into(),
+                Args {
+                    x: [address - base, 0, 0, 0],
+                    v: [0; 2],
+                },
+            );
+            props
+        })
+        .collect::<Vec<_>>()
+        .into();
 }
 
 /// Record NVN call `name` (`nvnCommandBuffer` + `rest`) on a recording
@@ -7675,6 +7714,37 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn cached_recording_belongs_to_its_recorder_and_ends_with_its_buffer() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: 0,
+        };
+        let address = 0x10_0000;
+        guest.cpu.regs[0] = address;
+        let command = "nvnCommandBufferSetViewport";
+        let first = Nvn::default().recorder();
+        let second = Nvn::default().recorder();
+        let original = std::sync::Arc::<std::sync::Mutex<Recording>>::default();
+        write_shared(&first.recordings).insert(address, original.clone());
+        assert!(first.record(command, &mut guest).unwrap());
+        assert!(!second.record(command, &mut guest).unwrap());
+        assert!(first.record(command, &mut guest).unwrap());
+        let mut ended = lock_shared(&original);
+        assert_eq!(ended.commands.len(), 2);
+        ended.ended = true;
+        drop(ended);
+
+        let replacement = std::sync::Arc::<std::sync::Mutex<Recording>>::default();
+        write_shared(&first.recordings).insert(address, replacement.clone());
+        assert!(first.record(command, &mut guest).unwrap());
+        assert_eq!(lock_shared(&replacement).commands.len(), 1);
+        assert_eq!(lock_shared(&original).commands.len(), 2);
     }
 
     #[test]
