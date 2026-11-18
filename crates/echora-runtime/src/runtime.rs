@@ -4,7 +4,7 @@ use crate::memory::{
 };
 use crate::services::Services;
 use crate::synchronization::{MutexWaits, ThreadPriority, ZeroHandleWaits};
-use crate::threads::{ThreadCollection, ThreadCreate, ThreadState};
+use crate::threads::{Scheduling, ThreadCollection, ThreadCreate, ThreadState};
 pub use echora_guest::Core;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1790,11 +1790,26 @@ impl Machine {
         }
     }
 
+    fn runnable_threads(&self) -> impl Iterator<Item = (u64, Scheduling)> + '_ {
+        let main = (self.main_thread_state == ThreadState::Runnable).then_some((
+            self.layout.main_thread_id,
+            Scheduling {
+                affinity_mask: self.main_thread_affinity.1,
+                priority: self.main_thread_effective_priority,
+            },
+        ));
+        main.into_iter().chain(self.threads.runnable_threads())
+    }
+
     /// Each runnable thread this worker may run now (not `exclude`, not
     /// running elsewhere), with its home core here: `visit(id, home)` until
     /// it returns false. The worker, its cores and the holds are worked out
     /// once per call, not per thread.
-    fn for_each_schedulable(&self, exclude: Option<u64>, mut visit: impl FnMut(u64, u8) -> bool) {
+    fn for_each_schedulable(
+        &self,
+        exclude: Option<u64>,
+        mut visit: impl FnMut(u64, u8, u8) -> bool,
+    ) {
         // With several workers each runs a fixed set of the application
         // cores (see `worker_guest_cores`), as on Horizon: only threads
         // whose affinity mask names one of them. A thread pinned to one
@@ -1807,15 +1822,7 @@ impl Machine {
         // run on worker 1, all others on worker 0.
         let (any_core, _, one_core, split) = Self::scheduler_flags();
         let worker_cores = self.worker_core.map(|core| self.worker_guest_cores(core));
-        let mask_of = |id: u64| -> u64 {
-            if id == self.layout.main_thread_id {
-                Some(self.main_thread_affinity.1)
-            } else {
-                self.threads.affinity(id).map(|(_, mask)| mask)
-            }
-            .unwrap_or(u64::MAX)
-        };
-        let allowed = |id: u64| -> bool {
+        let allowed = |id: u64, mask: u64| -> bool {
             if *one_core {
                 return self.worker_core.is_none_or(|core| core == 0);
             }
@@ -1825,13 +1832,14 @@ impl Machine {
             let Some(cores) = worker_cores.filter(|_| !any_core) else {
                 return true;
             };
-            let mask = mask_of(id);
             mask & APPLICATION_CORES == 0 || mask & cores != 0
         };
         // A worker serving several guest cores runs each core's best
         // priority in turn (see `next_runnable_thread`); the diagnostics
         // above keep one group.
-        let cores = self.scheduled_guest_cores();
+        let cores = worker_cores
+            .filter(|_| !any_core && !one_core && split.is_none())
+            .unwrap_or(0);
         let folded = cores.count_ones() > 1;
         // A thread holding a core (dispatch disabled) runs only there, and
         // nothing else runs on a core held by a runnable holder.
@@ -1846,12 +1854,11 @@ impl Machine {
                 .map(|core| core as u8)
         };
         // As `guest_core_on_worker`, with this worker's cores worked out.
-        let home = |id: u64, held: Option<u8>| -> u8 {
+        let home = |mask: u64, held: Option<u8>| -> u8 {
             if !folded {
                 return 0;
             }
             held.unwrap_or_else(|| {
-                let mask = mask_of(id);
                 let usable = if mask & cores != 0 {
                     mask & cores
                 } else if mask & APPLICATION_CORES != 0 {
@@ -1865,9 +1872,7 @@ impl Machine {
         let holding = |id: u64| -> bool {
             self.thread_state(id) == Some(ThreadState::Runnable) && !self.running.contains(&id)
         };
-        let main =
-            (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
-        for id in main.into_iter().chain(self.threads.runnable_ids()) {
+        for (id, scheduling) in self.runnable_threads() {
             if exclude == Some(id) || self.running.contains(&id) {
                 continue;
             }
@@ -1875,17 +1880,17 @@ impl Machine {
             // A core's holder runs there even if its mask has moved on
             // since: it migrates once it ends a slice with dispatch enabled.
             let held_here = held.is_some_and(|held| cores & 1 << held != 0);
-            if !(allowed(id) || held_here) {
+            if !(allowed(id, scheduling.affinity_mask) || held_here) {
                 continue;
             }
-            let core = home(id, held);
+            let core = home(scheduling.affinity_mask, held);
             let hold_allows = !any_hold
                 || if held.is_some() {
                     held_here
                 } else {
                     !self.core_hold[usize::from(core)].is_some_and(|holder| holding(holder))
                 };
-            if hold_allows && !visit(id, core) {
+            if hold_allows && !visit(id, core, scheduling.priority) {
                 return;
             }
         }
@@ -1899,16 +1904,7 @@ impl Machine {
         // ECHORA_FLAT_PRIORITY (diagnostic): schedule as one worker does,
         // ignoring priority.
         let (_, flat_priority, _, _) = Self::scheduler_flags();
-        let priority = |id: u64| -> u8 {
-            if self.worker_core.is_none() || *flat_priority {
-                return 0;
-            }
-            if id == self.layout.main_thread_id {
-                self.main_thread_effective_priority
-            } else {
-                self.threads.priority(id).unwrap_or(u8::MAX)
-            }
-        };
+        let use_priority = self.worker_core.is_some() && !flat_priority;
         // A worker serving several guest cores runs each core's best
         // priority in turn, as Horizon's cores would side by side: with
         // strict priority across them a busy thread on one core would starve
@@ -1931,7 +1927,7 @@ impl Machine {
         // Within each core: priority, non-spinning first, then the first
         // thread after its previous thread, wrapping in ID order.
         let mut best = [None; APPLICATION_CORE_COUNT];
-        self.for_each_schedulable(exclude, |id, core| {
+        self.for_each_schedulable(exclude, |id, core, priority| {
             let index = usize::from(core);
             let previous = if core == start {
                 after
@@ -1942,7 +1938,8 @@ impl Machine {
                 .spin_backoff
                 .get(&id)
                 .is_some_and(|until| *until > self.core.steps);
-            let candidate = (priority(id), spinning, id <= previous, id);
+            let priority = if use_priority { priority } else { 0 };
+            let candidate = (priority, spinning, id <= previous, id);
             let slot = &mut best[index];
             *slot = Some(slot.map_or(candidate, |old| candidate.min(old)));
             true
@@ -1974,27 +1971,15 @@ impl Machine {
                 machine.threads.priority(id).unwrap_or(u8::MAX)
             }
         };
-        let mask = |machine: &Machine, id: u64| -> u64 {
-            if id == machine.layout.main_thread_id {
-                machine.main_thread_affinity.1
-            } else {
-                machine
-                    .threads
-                    .affinity(id)
-                    .map_or(u64::MAX, |(_, mask)| mask)
-            }
-        };
-        let main =
-            (self.main_thread_state == ThreadState::Runnable).then_some(self.layout.main_thread_id);
         // The best priority waiting for each application core, in one pass
         // over the threads no worker runs (a mask naming no application core
         // waits for every one of them).
         let mut best = [u8::MAX; APPLICATION_CORE_COUNT];
-        for id in main.into_iter().chain(self.threads.runnable_ids()) {
+        for (id, scheduling) in self.runnable_threads() {
             if self.running.contains(&id) || id == self.core.current_thread_id {
                 continue;
             }
-            let (waiting, mask) = (priority(self, id), mask(self, id));
+            let mask = scheduling.affinity_mask;
             let cores = if mask & APPLICATION_CORES == 0 {
                 APPLICATION_CORES
             } else {
@@ -2003,7 +1988,7 @@ impl Machine {
             let mut bits = cores;
             while bits != 0 {
                 let core = bits.trailing_zeros() as usize;
-                best[core] = best[core].min(waiting);
+                best[core] = best[core].min(scheduling.priority);
                 bits &= bits - 1;
             }
         }
@@ -2167,7 +2152,7 @@ impl Machine {
             let exclude = self.keeps_running.filter(|&id| id == current);
             // Whether next_runnable_thread would find one: any will do.
             let mut found = false;
-            self.for_each_schedulable(exclude, |_, _| {
+            self.for_each_schedulable(exclude, |_, _, _| {
                 found = true;
                 false
             });
@@ -2615,15 +2600,15 @@ impl Machine {
         // Any other runnable thread, backing off from a spin or not, gets the
         // processor back at slice ends.
         let current = self.core.current_thread_id;
-        let others = (self.main_thread_state == ThreadState::Runnable
-            && self.layout.main_thread_id != current
-            && !self.running.contains(&self.layout.main_thread_id))
+        if self.parallel
+            || (self.main_thread_state == ThreadState::Runnable
+                && self.layout.main_thread_id != current
+                && !self.running.contains(&self.layout.main_thread_id))
             || self
                 .threads
                 .runnable_ids()
-                .any(|id| id != current && !self.running.contains(&id));
-        // Other workers' stops and wakeups are seen at boundaries.
-        if others || self.parallel {
+                .any(|id| id != current && !self.running.contains(&id))
+        {
             let slice = if self.parallel {
                 self.layout.parallel_slice
             } else {

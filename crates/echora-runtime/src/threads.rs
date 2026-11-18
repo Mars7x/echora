@@ -74,14 +74,29 @@ struct InitializedThread {
     cpu: Cpu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Scheduling {
+    pub(crate) affinity_mask: u64,
+    pub(crate) priority: u8,
+}
+
+impl InitializedThread {
+    fn scheduling(&self) -> Scheduling {
+        Scheduling {
+            affinity_mask: self.affinity_mask,
+            priority: self.effective_priority,
+        }
+    }
+}
+
 pub(crate) struct ThreadCollection {
     main_thread_id: u64,
     next_id: Option<u64>,
     tls_anchor: Option<u64>,
     threads: BTreeMap<u64, InitializedThread>,
-    /// IDs of the Runnable threads, kept with every state change so the
-    /// scheduler does not scan every thread on each pick.
-    runnable: std::collections::BTreeSet<u64>,
+    /// Runnable threads' scheduling fields, in ID order. The scheduler
+    /// reads these together without looking up each full thread record.
+    runnable: BTreeMap<u64, Scheduling>,
 }
 
 /// The logical core a thread runs on: its ideal core, else one of its
@@ -193,12 +208,18 @@ impl ThreadCollection {
     }
 
     pub(crate) fn runnable_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        debug_assert!(self.runnable.iter().all(|id| {
-            self.threads
-                .get(id)
-                .is_some_and(|thread| thread.state == ThreadState::Runnable)
+        self.runnable.keys().copied()
+    }
+
+    pub(crate) fn runnable_threads(&self) -> impl Iterator<Item = (u64, Scheduling)> + '_ {
+        debug_assert!(self.runnable.iter().all(|(id, scheduling)| {
+            self.threads.get(id).is_some_and(|thread| {
+                thread.state == ThreadState::Runnable && thread.scheduling() == *scheduling
+            })
         }));
-        self.runnable.iter().copied()
+        self.runnable
+            .iter()
+            .map(|(&id, &scheduling)| (id, scheduling))
     }
 
     pub(crate) fn processor_id(&self, id: u64) -> Option<u8> {
@@ -249,6 +270,9 @@ impl ThreadCollection {
             ));
         }
         thread.effective_priority = priority;
+        if let Some(runnable) = self.runnable.get_mut(&id) {
+            runnable.priority = priority;
+        }
         Ok(())
     }
 
@@ -293,6 +317,9 @@ impl ThreadCollection {
         }
         thread.ideal_core = ideal_core;
         thread.affinity_mask = affinity_mask;
+        if let Some(runnable) = self.runnable.get_mut(&id) {
+            runnable.affinity_mask = affinity_mask;
+        }
         Ok(())
     }
 
@@ -319,7 +346,7 @@ impl ThreadCollection {
         }
         thread.logical_processor_id = Some(processor);
         thread.state = ThreadState::Runnable;
-        self.runnable.insert(id);
+        self.runnable.insert(id, thread.scheduling());
         Ok(())
     }
 
@@ -366,7 +393,7 @@ impl ThreadCollection {
             .ok_or_else(|| invalid("wait completion requires a waiting child"))?;
         thread.cpu.regs[0] = u64::from(result);
         thread.state = ThreadState::Runnable;
-        self.runnable.insert(id);
+        self.runnable.insert(id, thread.scheduling());
         Ok(())
     }
 
@@ -387,7 +414,7 @@ impl ThreadCollection {
         thread.cpu.regs[0] = u64::from(result);
         thread.cpu.regs[1] = u64::from(index as u32);
         thread.state = ThreadState::Runnable;
-        self.runnable.insert(id);
+        self.runnable.insert(id, thread.scheduling());
         Ok(())
     }
 
@@ -1638,6 +1665,36 @@ mod tests {
         assert_eq!(memory.query(0x11000).state, STATE_FREE);
         assert_eq!(read_page(&memory, TLS_ANCHOR), vec![0xa5; 0x1000]);
         assert_eq!(read_page(&memory, STACK_ALIAS), vec![0x6d; 0x1000]);
+    }
+
+    #[test]
+    fn runnable_entries_follow_affinity_priority_and_wait_transitions() {
+        let (mut memory, mut threads, mut services) = fixture();
+        let (id, _) = create_reserved(&mut threads, &mut memory, &mut services);
+        threads.start(id).unwrap();
+        let runnable = |threads: &ThreadCollection| threads.runnable_threads().collect::<Vec<_>>();
+        let entry = |affinity_mask, priority| {
+            (
+                id,
+                Scheduling {
+                    affinity_mask,
+                    priority,
+                },
+            )
+        };
+        assert_eq!(runnable(&threads), [entry(0x20, 28)]);
+
+        threads.set_affinity(id, 1, 0x02).unwrap();
+        threads.set_effective_priority(id, 7).unwrap();
+        assert_eq!(runnable(&threads), [entry(0x02, 7)]);
+        threads.block_wait(id, &Cpu::default()).unwrap();
+        assert!(runnable(&threads).is_empty());
+
+        threads.set_affinity(id, -1, 0x0c).unwrap();
+        threads.set_effective_priority(id, 14).unwrap();
+        assert!(runnable(&threads).is_empty());
+        threads.complete_synchronization_wait(id, 0, 0).unwrap();
+        assert_eq!(runnable(&threads), [entry(0x0c, 14)]);
     }
 
     #[test]
