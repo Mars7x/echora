@@ -814,6 +814,14 @@ impl Renderer {
     /// writes, its (stage index, binding) and the token of its contents
     /// after the next flush (`take_reads`).
     pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
+        let empty = match draw.mesh {
+            Some(MeshGroups::Direct(groups)) => groups.contains(&0),
+            Some(MeshGroups::Indirect { .. }) => false,
+            None => draw.count == 0 || draw.instances == 0,
+        };
+        if empty {
+            return Ok(Vec::new());
+        }
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
         static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1392,7 +1400,7 @@ impl Renderer {
                 device.cmd_draw_indexed(
                     commands,
                     draw.count,
-                    draw.instances.max(1),
+                    draw.instances,
                     draw.first,
                     draw.base_vertex,
                     draw.first_instance,
@@ -1401,7 +1409,7 @@ impl Renderer {
                 device.cmd_draw(
                     commands,
                     draw.count,
-                    draw.instances.max(1),
+                    draw.instances,
                     draw.first,
                     draw.first_instance,
                 );
@@ -1811,6 +1819,22 @@ pub(crate) mod tests {
 
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [1.0, 1.0, 1.0, 1.0]);
+
+        // An empty draw leaves both the image and the command buffer alone.
+        draw.uniforms = &black;
+        draw.instances = 0;
+        let serial = renderer.recorded_serial();
+        assert!(renderer.draw(&draw).unwrap().is_empty());
+        assert_eq!(renderer.recorded_serial(), serial);
+        draw.indices = Indices::U16(vec![0, 0, 1, 0, 2, 0, 3, 0]);
+        assert!(renderer.draw(&draw).unwrap().is_empty());
+        assert_eq!(renderer.recorded_serial(), serial);
+        draw.instances = 1;
+        draw.count = 0;
+        assert!(renderer.draw(&draw).unwrap().is_empty());
+        assert_eq!(renderer.recorded_serial(), serial);
+        assert_eq!(renderer.read_target(7).unwrap(), texels);
+
         renderer.destroy_program(program).unwrap();
     }
 }

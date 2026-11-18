@@ -7933,6 +7933,22 @@ impl Nvn {
 
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
+        let x = &command.x;
+        let empty = match command.name {
+            "nvnCommandBufferDrawArrays"
+            | "nvnCommandBufferDrawElements"
+            | "nvnCommandBufferDrawElementsBaseVertex" => x[3] as u32 == 0,
+            "nvnCommandBufferDrawArraysInstanced" => x[3] as u32 == 0 || x[5] as u32 == 0,
+            "nvnCommandBufferDrawElementsInstanced" => x[3] as u32 == 0 || x[7] as u32 == 0,
+            "nvnCommandBufferDrawMeshTasks" => x[2] as u32 == 0,
+            _ => false,
+        };
+        if empty {
+            if let Some(backend) = &mut self.gpu {
+                backend.stat("stat: empty draws", 1);
+            }
+            return Ok(());
+        }
         let mut bindings = std::mem::take(&mut self.draw_bindings);
         let result = self.gpu_draw_with_bindings(core, command, &mut bindings);
         bindings.uniforms.clear();
@@ -7973,7 +7989,11 @@ impl Nvn {
         let keys = program.keys;
         let stages = &*program.stages;
         let mesh_groups = if mesh_draw {
-            Some(self.mesh_groups(core, command)?)
+            let groups = self.mesh_groups(core, command)?;
+            if matches!(groups, MeshGroups::Direct(groups) if groups.contains(&0)) {
+                return Ok(());
+            }
+            Some(groups)
         } else {
             None
         };
@@ -8912,7 +8932,7 @@ impl Nvn {
         };
         // A draw this large can only come from misread state; it would hold
         // the GPU for seconds (the kernel resets it past 10 s).
-        if u64::from(count) * u64::from(instances.max(1)) > 1 << 24 {
+        if u64::from(count) * u64::from(instances) > 1 << 24 {
             return Err(format!("{count} vertices x {instances} instances"));
         }
         if quads {
@@ -8938,6 +8958,9 @@ impl Nvn {
                 .flat_map(|[a, b, c, d]| [*a, *b, *c, *a, *c, *d])
                 .flat_map(u32::to_le_bytes)
                 .collect();
+            if triangles.is_empty() {
+                return Ok(());
+            }
             count = (triangles.len() / 4) as u32;
             first = 0;
             indices = Indices::U32(triangles);
@@ -11023,6 +11046,38 @@ mod pool_tests {
         backend.wait_for_table_writes(None).unwrap();
         assert!(backend.renderer.completed_serial() >= serial);
         assert!(!backend.page_table_writes);
+    }
+
+    #[test]
+    fn empty_draws_do_not_resolve_program_or_buffer_bindings() {
+        let mut nvn = Nvn::default();
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        for (name, count_arg) in [
+            ("nvnCommandBufferDrawArrays", 3),
+            ("nvnCommandBufferDrawElements", 3),
+            ("nvnCommandBufferDrawElementsBaseVertex", 3),
+            ("nvnCommandBufferDrawArraysInstanced", 5),
+            ("nvnCommandBufferDrawElementsInstanced", 7),
+            ("nvnCommandBufferDrawMeshTasks", 2),
+        ] {
+            let mut command = Command {
+                name,
+                x: [1; 8],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            };
+            command.x[count_arg] = 0;
+            nvn.gpu_draw(&mut guest, &command).unwrap();
+            command.x[count_arg] = 1;
+            assert!(nvn.gpu_draw(&mut guest, &command).is_err());
+        }
     }
 
     #[test]
