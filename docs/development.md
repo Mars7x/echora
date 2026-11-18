@@ -86,6 +86,7 @@ read.
 | `ECHORA_AUDIO_THREAD=0` | Mix the game's sound on the game's own threads under the machine lock, as before, instead of on a host thread of its own. For comparing the two. |
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
 | `ECHORA_PACK_DMA_SPANS=0` | Keep individual Linux DMA-BUF imports when rebuilding the GPU page table. Packing discontiguous ranges into fewer imports is enabled by default when the kernel and driver accept them. |
+| `ECHORA_DYNAMIC_UNIFORMS=0` | Use ordinary uniform descriptors for graphics. By default, graphics programs within the Vulkan device's dynamic uniform limit can reuse a descriptor set while changing uniform offsets. |
 | `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
 | `ECHORA_PAGE_TABLE=0` | Give translated programs an empty GPU page table, so their global memory reads return zeros (debugging). The page table is on by default. |

@@ -68,6 +68,8 @@ pub struct Gpu {
     pub texture_pool_layout: Option<vk::DescriptorSetLayout>,
     /// Descriptor indexing budget for two versions of the texture pool.
     pub(crate) spare_texture_pool: bool,
+    pub(crate) dynamic_uniform_limit: u32,
+
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
     pub shader_binary_version: ([u8; 16], u32),
@@ -550,6 +552,7 @@ impl Gpu {
             compute_subgroup_32,
             buffer_device_address,
             texture_pool_layout,
+            dynamic_uniform_limit: properties.limits.max_descriptor_set_uniform_buffers_dynamic,
             spare_texture_pool: properties12.max_update_after_bind_descriptors_in_all_pools
                 >= 2 * (TEXTURE_POOL_CAPACITY * (echora_shader_abi::texture_pool::COUNT - 2)
                     + SAMPLER_POOL_CAPACITY
@@ -600,10 +603,21 @@ impl Gpu {
         &self,
         descriptors: &[(Descriptor, vk::ShaderStageFlags)],
     ) -> Result<vk::DescriptorSetLayout, String> {
+        self.descriptor_layout(descriptors, false)
+    }
+
+    pub(crate) fn descriptor_layout(
+        &self,
+        descriptors: &[(Descriptor, vk::ShaderStageFlags)],
+        dynamic_uniforms: bool,
+    ) -> Result<vk::DescriptorSetLayout, String> {
         let bindings: Vec<_> = descriptors
             .iter()
             .map(|(descriptor, stages)| {
                 let kind = match descriptor.kind() {
+                    DescriptorKind::UniformBuffer if dynamic_uniforms => {
+                        vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    }
                     DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
                     DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
                     DescriptorKind::TextureBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,

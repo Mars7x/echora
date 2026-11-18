@@ -635,6 +635,10 @@ fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, St
             descriptor_count: MAX_SETS * 8,
         },
         vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+            descriptor_count: MAX_SETS * 8,
+        },
+        vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             descriptor_count: MAX_SETS * 16,
         },
@@ -944,7 +948,6 @@ impl Renderer {
             }
             .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
-            self.graphics.reset();
             if let Some(timer) = self.timer.as_mut() {
                 timer.begin(&self.gpu.device, self.slot.commands, self.slot.fence);
             }
@@ -2763,6 +2766,7 @@ impl Renderer {
             }
         }
         self.recording = false;
+        self.graphics.reset();
         self.flushes += 1;
         self.slot.serial = self.flushes;
         self.work_items = 0;

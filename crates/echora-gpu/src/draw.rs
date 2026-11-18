@@ -32,6 +32,7 @@ pub struct Program {
     /// A stage reads the texture pool: set 1 is the renderer's pool set
     /// (`Renderer::bind_pool`).
     pub(crate) pool: bool,
+    dynamic_uniforms: Vec<u32>,
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -154,6 +155,8 @@ pub(crate) struct GraphicsState {
     program: Option<vk::PipelineLayout>,
     raster: Option<RasterState>,
     blends: Vec<Blend>,
+    // Valid for the current command buffer and program. Submitting resets it.
+    dynamic_set: Option<DynamicSet>,
 }
 
 impl GraphicsState {
@@ -161,6 +164,51 @@ impl GraphicsState {
         self.program = None;
         self.raster = None;
         self.blends.clear();
+        self.dynamic_set = None;
+    }
+}
+
+struct DynamicSet {
+    set: vk::DescriptorSet,
+    bindings: Vec<(u32, DescriptorSource)>,
+}
+
+enum DescriptorSource {
+    Buffer(vk::DescriptorType, vk::DescriptorBufferInfo),
+    Image(vk::DescriptorImageInfo),
+    TexelBuffer(vk::BufferView),
+}
+
+impl DescriptorSource {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Buffer(a_kind, a), Self::Buffer(b_kind, b)) => {
+                (a_kind, a.buffer, a.offset, a.range) == (b_kind, b.buffer, b.offset, b.range)
+            }
+            (Self::Image(a), Self::Image(b)) => {
+                (a.sampler, a.image_view, a.image_layout)
+                    == (b.sampler, b.image_view, b.image_layout)
+            }
+            (Self::TexelBuffer(a), Self::TexelBuffer(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn write(&self, set: vk::DescriptorSet, binding: u32) -> vk::WriteDescriptorSet<'_> {
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(binding);
+        match self {
+            Self::Buffer(kind, info) => write
+                .descriptor_type(*kind)
+                .buffer_info(std::slice::from_ref(info)),
+            Self::Image(info) => write
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(info)),
+            Self::TexelBuffer(view) => write
+                .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                .texel_buffer_view(std::slice::from_ref(view)),
+        }
     }
 }
 
@@ -510,7 +558,24 @@ impl Renderer {
                 descriptors.push((*descriptor, stage_flags(stage.stage)));
             }
         }
-        let layout = self.gpu.descriptor_set_layout_for(&descriptors)?;
+        let mut dynamic_uniforms = Vec::new();
+        if stages
+            .iter()
+            .all(|stage| stage.stage != echora_shader_abi::Stage::Compute)
+            && !std::env::var_os("ECHORA_DYNAMIC_UNIFORMS").is_some_and(|value| value == "0")
+        {
+            dynamic_uniforms.extend(descriptors.iter().filter_map(|(descriptor, _)| {
+                (descriptor.kind() == DescriptorKind::UniformBuffer).then_some(descriptor.binding)
+            }));
+            if dynamic_uniforms.len() <= self.gpu.dynamic_uniform_limit as usize {
+                dynamic_uniforms.sort_unstable();
+            } else {
+                dynamic_uniforms.clear();
+            }
+        }
+        let layout = self
+            .gpu
+            .descriptor_layout(&descriptors, !dynamic_uniforms.is_empty())?;
         let pool = stages.iter().any(|stage| stage.texture_pool_bindings != 0);
         let mut layouts = vec![layout];
         if pool {
@@ -668,7 +733,14 @@ impl Renderer {
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
             &infos,
-            &format!("{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}"),
+            &format!(
+                "{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}{}",
+                if dynamic_uniforms.is_empty() {
+                    ""
+                } else {
+                    " dynamic uniforms"
+                },
+            ),
         )?;
         Ok(Program {
             stages,
@@ -679,6 +751,7 @@ impl Renderer {
             texture_bits,
             abi_stages,
             pool,
+            dynamic_uniforms,
         })
     }
 
@@ -775,13 +848,9 @@ impl Renderer {
         self.lap("stat: renderer ns reserve", &mut since);
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
-        enum DescriptorSource {
-            Buffer(vk::DescriptorType, vk::DescriptorBufferInfo),
-            Image(vk::DescriptorImageInfo),
-            TexelBuffer(vk::BufferView),
-        }
         let mut writes = Vec::with_capacity(descriptors.iter().sum::<u32>() as usize);
         let mut written = Vec::new();
+        let mut dynamic_offsets = vec![0; program.dynamic_uniforms.len()];
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
@@ -809,14 +878,26 @@ impl Renderer {
                             }
                         };
                         let range = (length as u64).max(16).next_multiple_of(16);
-                        DescriptorSource::Buffer(
-                            vk::DescriptorType::UNIFORM_BUFFER,
-                            vk::DescriptorBufferInfo {
-                                buffer,
-                                offset,
-                                range,
-                            },
-                        )
+                        let mut info = vk::DescriptorBufferInfo {
+                            buffer,
+                            offset,
+                            range,
+                        };
+                        if dynamic_offsets.is_empty() {
+                            DescriptorSource::Buffer(vk::DescriptorType::UNIFORM_BUFFER, info)
+                        } else {
+                            // Vulkan consumes dynamic offsets in binding order.
+                            let slot = program
+                                .dynamic_uniforms
+                                .binary_search(&descriptor.binding)
+                                .expect("program layout includes this uniform binding");
+                            dynamic_offsets[slot] = offset as u32;
+                            info.offset = 0;
+                            DescriptorSource::Buffer(
+                                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                                info,
+                            )
+                        }
                     }
                     DescriptorKind::StorageBuffer => {
                         let (buffer, offset, range) = if let Some(&(buffer, offset, length)) =
@@ -881,32 +962,34 @@ impl Renderer {
             }
         }
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
-        let set = self.descriptor_set(program.layout)?;
-        // Each Vulkan write borrows only the source its descriptor type uses.
-        let descriptor_writes: Vec<_> = writes
-            .iter()
-            .map(|(binding, source)| {
-                let write = vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(*binding);
-                match source {
-                    DescriptorSource::Buffer(kind, info) => write
-                        .descriptor_type(*kind)
-                        .buffer_info(std::slice::from_ref(info)),
-                    DescriptorSource::Image(info) => write
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(std::slice::from_ref(info)),
-                    DescriptorSource::TexelBuffer(view) => write
-                        .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
-                        .texel_buffer_view(std::slice::from_ref(view)),
-                }
+        let matching = if !dynamic_offsets.is_empty()
+            && self.graphics.program == Some(program.pipeline_layout)
+        {
+            self.graphics.dynamic_set.as_ref().filter(|previous| {
+                previous.bindings.len() == writes.len()
+                    && previous.bindings.iter().zip(&writes).all(
+                        |((old_binding, old), (binding, source))| {
+                            binding == old_binding && source.same_as(old)
+                        },
+                    )
             })
-            .collect();
-        // SAFETY: the set and resources are live.
-        unsafe {
-            self.gpu
-                .device
-                .update_descriptor_sets(&descriptor_writes, &[])
+        } else {
+            None
+        };
+        let reused = matching.is_some();
+        let set = if let Some(previous) = matching {
+            let set = previous.set;
+            self.stat("stat: dynamic graphics descriptor sets reused", 1);
+            set
+        } else {
+            let set = self.descriptor_set(program.layout)?;
+            let updates: Vec<_> = writes
+                .iter()
+                .map(|(binding, source)| source.write(set, *binding))
+                .collect();
+            // SAFETY: the allocated set and its resources are live.
+            unsafe { self.gpu.device.update_descriptor_sets(&updates, &[]) };
+            set
         };
         self.lap("stat: renderer ns descriptor set", &mut since);
         // Vertex streams and indices.
@@ -1150,6 +1233,7 @@ impl Renderer {
                 objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
                 objects.cmd_bind_shaders(commands, &unused, &null_shaders[..unused.len()]);
                 self.graphics.program = Some(program.pipeline_layout);
+                self.graphics.dynamic_set = None;
             }
             device.cmd_bind_descriptor_sets(
                 commands,
@@ -1157,8 +1241,14 @@ impl Renderer {
                 program.pipeline_layout,
                 0,
                 &[set],
-                &[],
+                &dynamic_offsets,
             );
+            if !reused && !dynamic_offsets.is_empty() {
+                self.graphics.dynamic_set = Some(DynamicSet {
+                    set,
+                    bindings: writes,
+                });
+            }
             if let Some(pool) = pool {
                 device.cmd_bind_descriptor_sets(
                     commands,
@@ -1456,7 +1546,10 @@ pub(crate) mod tests {
         );
         let fragment = spirv(
             "@group(0) @binding(0) var<uniform> color: vec4<f32>;
-            @fragment fn main() -> @location(0) vec4<f32> { return color; }",
+            @group(0) @binding(3) var<uniform> tint: vec4<f32>;
+            @fragment fn main() -> @location(0) vec4<f32> {
+                return vec4<f32>(color.r, tint.g, color.b, tint.a);
+            }",
             naga::ShaderStage::Fragment,
         );
         let uniform = Descriptor {
@@ -1469,7 +1562,18 @@ pub(crate) mod tests {
         let program = renderer
             .create_program(vec![
                 translated(Stage::Vertex, vertex, vec![]),
-                translated(Stage::Fragment, fragment, vec![uniform]),
+                translated(
+                    Stage::Fragment,
+                    fragment,
+                    vec![
+                        Descriptor {
+                            binding: 3,
+                            index: 4,
+                            ..uniform
+                        },
+                        uniform,
+                    ],
+                ),
             ])
             .unwrap();
         renderer
@@ -1480,7 +1584,8 @@ pub(crate) mod tests {
             .unwrap();
         // A triangle covering the left half: (-1,-1), (0,-1)... in NDC.
         let positions: [f32; 8] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0];
-        let color: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        let color: [f32; 4] = [0.0; 4];
+        let tint: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
         let red_only = [Blend {
             write_mask: vk::ColorComponentFlags::R,
             ..Blend::default()
@@ -1514,10 +1619,16 @@ pub(crate) mod tests {
             base_vertex: 0,
             instances: 1,
             first_instance: 0,
-            uniforms: crate::FastMap::from_iter([(
-                (1, 0),
-                color.iter().flat_map(|value| value.to_le_bytes()).collect(),
-            )]),
+            uniforms: crate::FastMap::from_iter([
+                (
+                    (1, 0),
+                    color.iter().flat_map(|value| value.to_le_bytes()).collect(),
+                ),
+                (
+                    (1, 3),
+                    tint.iter().flat_map(|value| value.to_le_bytes()).collect(),
+                ),
+            ]),
             guest_uniforms: crate::FastMap::default(),
             read_guest: None,
             textures: crate::FastMap::default(),
@@ -1554,6 +1665,12 @@ pub(crate) mod tests {
         draw.blends = &red_only;
         draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&1.0f32.to_le_bytes());
         renderer.draw(&draw).unwrap();
+        if !program.dynamic_uniforms.is_empty() {
+            assert_eq!(
+                renderer.take_stats()["stat: dynamic graphics descriptor sets reused"],
+                2
+            );
+        }
         let texels = renderer.read_target(7).unwrap();
         // The red-only write reaches the first column, retaining green.
         assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
@@ -1563,6 +1680,13 @@ pub(crate) mod tests {
         // This draw starts a new batch with the same raster and blend state.
         draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&0.0f32.to_le_bytes());
         renderer.draw(&draw).unwrap();
+        if !program.dynamic_uniforms.is_empty() {
+            assert!(
+                !renderer
+                    .take_stats()
+                    .contains_key("stat: dynamic graphics descriptor sets reused")
+            );
+        }
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
         renderer.destroy_program(program).unwrap();
