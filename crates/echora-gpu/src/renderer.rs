@@ -3637,8 +3637,9 @@ impl Renderer {
             // as block-linear rows of one width lie alike in memory.
             let flat = |shape: ImageShape| matches!(shape, ImageShape::D2 { layers: 1 });
             if (old.width, old.format) == (width, format) && flat(old.shape) && flat(shape) {
-                self.create_target_keeping(key, &old, height, levels)?;
+                let result = self.create_target_keeping(key, &old, height, levels);
                 self.slot.retired_uploads.push(old);
+                result?;
                 return Ok(&self.targets[&key]);
             }
             self.slot.retired_uploads.push(old);
@@ -3670,8 +3671,8 @@ impl Renderer {
         Ok(&self.targets[&key])
     }
 
-    /// Create target `key` `height` rows high in place of `old` (same
-    /// width and format), copying the rows both have.
+    /// Replace a flat target at the same width and format, preserving
+    /// the overlapping rows of each retained mip level.
     fn create_target_keeping(
         &mut self,
         key: u64,
@@ -3681,29 +3682,52 @@ impl Renderer {
     ) -> Result<(), String> {
         let shape = ImageShape::D2 { layers: 1 };
         let target = self.create_target(old.width, height, shape, old.format, levels, old.scale)?;
+        let compressed = bc_block_bytes(old.format).is_some();
+        let retained = if old.layout == vk::ImageLayout::UNDEFINED {
+            0
+        } else {
+            old.levels.min(levels)
+        };
+        let regions: Vec<_> = (0..retained)
+            .filter_map(|mip_level| {
+                let (width, old_height) = old.extent(mip_level);
+                let (_, new_height) = target.extent(mip_level);
+                let mut height = old_height.min(new_height);
+                // A partial compressed block must end at both image edges.
+                if compressed && old_height != new_height {
+                    height -= height % 4;
+                }
+                let layers = vk::ImageSubresourceLayers {
+                    aspect_mask: aspect(old.format),
+                    mip_level,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                (height > 0).then_some(vk::ImageCopy {
+                    src_subresource: layers,
+                    dst_subresource: layers,
+                    extent: vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    },
+                    ..Default::default()
+                })
+            })
+            .collect();
         self.targets_created += 1;
         self.register_views(&target);
         self.target_changes += 1;
         self.changed_targets.push(key);
         self.targets.insert(key, target);
+        if levels > 1 && retained < levels && !compressed {
+            self.zero_target_levels(key, retained)?;
+        }
+        if regions.is_empty() {
+            return Ok(());
+        }
         self.transition(key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
-        let layers = vk::ImageSubresourceLayers {
-            aspect_mask: range(old.format).aspect_mask,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let region = vk::ImageCopy {
-            src_subresource: layers,
-            dst_subresource: layers,
-            extent: vk::Extent3D {
-                width: old.extent(0).0,
-                height: old.extent(0).1.min(old.scale.apply(height)),
-                depth: 1,
-            },
-            ..Default::default()
-        };
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -3730,7 +3754,7 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 image,
                 vk::ImageLayout::GENERAL,
-                &[region],
+                &regions,
             );
             *self
                 .stats
@@ -3753,11 +3777,16 @@ impl Renderer {
     /// undefined contents, and levels the application samples before
     /// writing (a bloom chain's) would show garbage.
     fn zero_target(&mut self, key: u64) -> Result<(), String> {
+        self.zero_target_levels(key, 0)
+    }
+
+    fn zero_target_levels(&mut self, key: u64, first_level: u32) -> Result<(), String> {
         self.transition(key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
         let target = &self.targets[&key];
         let subresource = vk::ImageSubresourceRange {
-            level_count: target.levels,
+            base_mip_level: first_level,
+            level_count: target.levels - first_level,
             layer_count: target.shape.layers(),
             ..range(target.format)
         };
@@ -6201,6 +6230,40 @@ mod tests {
     fn clip_limits_to_bounds() {
         assert_eq!(clip([-5, 2, 20, 4], [0, 0, 10, 10]), [0, 2, 10, 4]);
         assert_eq!(clip([12, 0, 4, 4], [0, 0, 10, 10])[2], -2);
+    }
+
+    #[test]
+    fn resizing_a_target_keeps_all_overlapping_mip_levels() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        renderer.target_with_levels(1, 16, 8, format, 2).unwrap();
+        renderer
+            .clear_color_level(1, 0, 0, None, vk::ClearColorValue { float32: red })
+            .unwrap();
+        renderer
+            .clear_color_level(1, 1, 0, None, vk::ClearColorValue { float32: green })
+            .unwrap();
+
+        renderer.target_with_levels(1, 16, 16, format, 3).unwrap();
+        let base = renderer.read_target_level(1, 0).unwrap();
+        assert_eq!(&base[..16 * 8], &[red; 16 * 8]);
+        let mip = renderer.read_target_level(1, 1).unwrap();
+        assert_eq!(&mip[..8 * 4], &[green; 8 * 4]);
+        assert_eq!(
+            renderer.read_target_level(1, 2).unwrap(),
+            vec![[0.0; 4]; 16]
+        );
+
+        renderer.target_with_levels(1, 16, 4, format, 2).unwrap();
+        assert_eq!(renderer.read_target_level(1, 0).unwrap(), vec![red; 16 * 4]);
+        assert_eq!(
+            renderer.read_target_level(1, 1).unwrap(),
+            vec![green; 8 * 2]
+        );
     }
 
     #[test]
