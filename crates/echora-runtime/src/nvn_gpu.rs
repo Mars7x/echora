@@ -2471,12 +2471,7 @@ impl Nvn {
             }
         }
         let stage = u64::from(nvn);
-        let mut handles: Vec<u64> = self
-            .render
-            .bound_textures
-            .range((stage, 0)..=(stage, u64::MAX))
-            .map(|(_, &handle)| handle)
-            .collect();
+        let mut handles: Vec<u64> = self.render.bound_textures.handles(stage).collect();
         handles.extend_from_slice(additional);
         handles.sort_unstable();
         handles.dedup();
@@ -4676,10 +4671,11 @@ impl Nvn {
                     let slot = slot(descriptor, kind).ok_or_else(|| unplaced(self, descriptor))?;
                     let handle = self
                         .render
-                        .state
-                        .get(bind_key("BindTexture", Some(5), slot as u64))
-                        .ok_or_else(|| format!("texture 5/{slot} is not bound: {}", layout(self)))?
-                        .x[3];
+                        .bound_textures
+                        .get(5, u64::from(slot))
+                        .ok_or_else(|| {
+                            format!("texture 5/{slot} is not bound: {}", layout(self))
+                        })?;
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
                     let texture = self.handle_texture(handle)?;
                     let started = std::time::Instant::now();
@@ -8195,10 +8191,9 @@ impl Nvn {
                         let slot = (descriptor.cbuf_offset - 0x20) / 8;
                         let handle = self
                             .render
-                            .state
-                            .get(bind_key("BindTexture", Some(nvn as u64), slot as u64))
-                            .ok_or_else(|| format!("texture {nvn}/{slot} is not bound"))?
-                            .x[3];
+                            .bound_textures
+                            .get(u64::from(nvn), u64::from(slot))
+                            .ok_or_else(|| format!("texture {nvn}/{slot} is not bound"))?;
                         // Valid within a present (textures are revalidated
                         // once per present); registrations evict their ids.
                         let stamp = (

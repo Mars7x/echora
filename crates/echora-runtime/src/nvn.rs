@@ -776,13 +776,59 @@ pub struct RenderState {
     /// programs, state objects, pools, resources). Kept for the host
     /// renderer; nothing consumes it until draws are implemented.
     pub state: FastMap<&'static str, Command>,
-    /// The texture handle bound at each (NVN stage, slot), as `state`
-    /// holds it under `BindTexture/{stage}/{slot}`: draws that read the
-    /// texture pool list a stage's handles without scanning `state`.
-    pub bound_textures: BTreeMap<(u64, u64), u64>,
+    /// The texture handle bound at each (NVN stage, slot), indexed for
+    /// individual bindings and for gathering all handles from a stage.
+    pub bound_textures: TextureBindings,
     /// Slots set in each stage's 16-entry storage buffer table, including
     /// explicit bindings with a zero address or size.
     storage_slots: [u16; 8],
+}
+
+/// Texture handles by stage and slot, ordered by slot when binding a pool.
+#[derive(Clone, Debug, Default)]
+pub struct TextureBindings {
+    stages: [Vec<Option<u64>>; 8],
+    extended: BTreeMap<(u64, u64), u64>,
+}
+
+impl TextureBindings {
+    /// Match the range of cached command state keys.
+    const SLOTS: u64 = 128;
+
+    fn insert(&mut self, (stage, slot): (u64, u64), handle: u64) -> Option<u64> {
+        if slot < Self::SLOTS && stage < self.stages.len() as u64 {
+            let slots = &mut self.stages[stage as usize];
+            let index = slot as usize;
+            if index >= slots.len() {
+                slots.resize(index + 1, None);
+            }
+            return slots[index].replace(handle);
+        }
+        self.extended.insert((stage, slot), handle)
+    }
+
+    fn get(&self, stage: u64, slot: u64) -> Option<u64> {
+        if slot < Self::SLOTS && stage < self.stages.len() as u64 {
+            return self.stages[stage as usize]
+                .get(slot as usize)
+                .copied()
+                .flatten();
+        }
+        self.extended.get(&(stage, slot)).copied()
+    }
+
+    fn handles(&self, stage: u64) -> impl Iterator<Item = u64> + '_ {
+        usize::try_from(stage)
+            .ok()
+            .and_then(|stage| self.stages.get(stage))
+            .into_iter()
+            .flat_map(|slots| slots.iter().copied().flatten())
+            .chain(
+                self.extended
+                    .range((stage, 0)..=(stage, u64::MAX))
+                    .map(|(_, &handle)| handle),
+            )
+    }
 }
 
 impl RenderState {
@@ -7898,6 +7944,62 @@ mod tests {
         assert!(first.record(command, &mut guest).unwrap());
         assert_eq!(lock_shared(&replacement).commands.len(), 1);
         assert_eq!(lock_shared(&original).commands.len(), 2);
+    }
+
+    #[test]
+    fn texture_slots_track_sparse_single_plural_and_deferred_binds() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        guest.memory.write_u64(0x10_0000, 9001).unwrap();
+        let mut nvn = Nvn::default();
+        for (name, x, captured) in [
+            (
+                "nvnCommandBufferBindTexture",
+                [0, 1, 3, 4001, 0, 0, 0, 0],
+                Vec::new(),
+            ),
+            (
+                "nvnCommandBufferBindTextures",
+                [0, 1, 127, 2, 0, 0, 0, 0],
+                vec![4002, 4003],
+            ),
+            (
+                "nvnCommandBufferBindTexturesDeferred",
+                [0, 7, 3, 1, 0x10_0000, 0, 0, 0],
+                Vec::new(),
+            ),
+            (
+                "nvnCommandBufferBindTexture",
+                [0, 1, 3, 0, 0, 0, 0, 0],
+                Vec::new(),
+            ),
+        ] {
+            nvn.execute_command(
+                &Command {
+                    name,
+                    x,
+                    v: [0; 8],
+                    captured,
+                    states: StateSnapshots::default(),
+                },
+                &mut guest,
+            )
+            .unwrap();
+        }
+        let bindings = &nvn.render.bound_textures;
+        assert_eq!(bindings.get(1, 2), None);
+        assert_eq!(bindings.get(1, 3), Some(0));
+        assert_eq!(bindings.get(1, 128), Some(4003));
+        assert_eq!(bindings.handles(1).collect::<Vec<_>>(), [0, 4002, 4003]);
+        assert_eq!(bindings.handles(7).collect::<Vec<_>>(), [9001]);
     }
 
     #[test]
