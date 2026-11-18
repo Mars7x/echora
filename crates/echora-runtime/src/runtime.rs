@@ -2711,14 +2711,15 @@ impl Machine {
             return self.run_parallel(&dispatch);
         }
         let _watch = crate::fault::watch(&self.core);
+        self.core.rearm();
         loop {
-            // Limits the host set since the last entry take effect.
-            self.core.rearm();
+            rearm_lowered_dispatch_limit(&self.core);
             let result = dispatch(&mut self.core);
             if result.is_ok() {
                 continue;
             }
             self.boundary(result)?;
+            self.core.rearm();
         }
     }
 
@@ -5339,9 +5340,9 @@ impl Worker {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
+                self.core.rearm();
                 let result = loop {
-                    // Limits the host set since the last entry take effect.
-                    self.core.rearm();
+                    rearm_lowered_dispatch_limit(&self.core);
                     crate::host_profile::set_guest_thread(self.core.current_thread_id);
                     match dispatch(&mut self.core) {
                         Ok(()) => {}
@@ -5925,6 +5926,19 @@ impl Worker {
     }
 }
 
+/// Retain a valid block limit across window exits and fast host calls.
+/// A lower limit must take effect at once. An old, lower limit naturally
+/// takes the exact checks early and updates itself. The scheduler also
+/// clears the limit when a different worker requests a preemption.
+fn rearm_lowered_dispatch_limit(core: &Core) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if core.stop.load(Relaxed) > core.max_steps.min(core.host_check_at)
+        || (core.parallel && core.preempt.load(Relaxed))
+    {
+        core.rearm();
+    }
+}
+
 #[allow(clippy::unwrap_used)]
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
@@ -6013,6 +6027,37 @@ mod tests {
         m.core.cpu.fpcr = 0x00400000;
         m.core.cpu.fpsr = 1;
         m
+    }
+
+    #[test]
+    fn generated_dispatch_keeps_an_unchanged_limit_and_honors_a_lowered_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        for workers in [1, 2] {
+            let mut machine = thread_machine();
+            machine.layout.workers = workers;
+            machine
+                .memory
+                .map(0x1000, PAGE_SIZE, READ | EXECUTE, STATE_CODE, "guest code")
+                .unwrap();
+            let visits = AtomicUsize::new(0);
+            let result = machine.run_generated(|core| match visits.fetch_add(1, Relaxed) {
+                0 => {
+                    core.host_check_at = u64::MAX;
+                    core.max_steps = 50;
+                    core.tick_block_at(core.cpu.pc, 1)
+                }
+                1 => {
+                    assert_eq!(core.stop.load(Relaxed), 50);
+                    core.max_steps = core.steps;
+                    Ok(())
+                }
+                2 => core.tick_block_at(core.cpu.pc, 1),
+                _ => panic!("dispatch ran after the lowered budget"),
+            });
+            assert!(matches!(result, Err(Trap::Budget { steps: 1, .. })));
+            assert_eq!(visits.load(Relaxed), 3);
+        }
     }
 
     fn create_thread_args(m: &mut Machine, priority: u64, core: u64) {
