@@ -73,9 +73,8 @@ impl MeshCount {
         let log_address = renderer
             .buffer_address(log.buffer)
             .ok_or("bounded mesh counts need buffer device addresses")?;
-        // Three words a probe (the program writes x, y and z).
-        let probes = renderer.host_buffer_with(u64::from(PROBES) * 12, usage, true)?;
-        probes.write(0, &vec![0xff; PROBES as usize * 12]);
+        let probes = renderer.host_buffer_with(u64::from(PROBES) * 4, usage, true)?;
+        probes.write(0, &vec![0xff; PROBES as usize * 4]);
         let probes_address = renderer
             .buffer_address(probes.buffer)
             .ok_or("bounded mesh counts need buffer device addresses")?;
@@ -187,16 +186,14 @@ impl MeshCount {
         if self.probed > 0 {
             let words: Vec<String> = self
                 .probes
-                .read_bytes(self.probed as usize * 12)
-                .as_chunks::<12>()
+                .read_bytes(self.probed as usize * 4)
+                .as_chunks::<4>()
                 .0
                 .iter()
-                .map(
-                    |probe| match u32::from_le_bytes(probe[..4].try_into().unwrap()) {
-                        u32::MAX => "not run".to_string(),
-                        word => format!("{word:#x}"),
-                    },
-                )
+                .map(|probe| match u32::from_le_bytes(*probe) {
+                    u32::MAX => "not run".to_string(),
+                    word => format!("{word:#x}"),
+                })
                 .collect();
             eprintln!("gpu: probed words as the GPU read them ({why}): {words:?}");
         }
@@ -217,9 +214,9 @@ impl MeshCount {
 
 impl Renderer {
     /// Record, outside a rendering pass and any render condition, the move
-    /// of group counts (a mesh draw's x with y and z set to 1, or a
-    /// dispatch's x, y and z) at `source` (its buffer
-    /// and offset) into `target`, each bounded by TASK_WORKGROUPS (also
+    /// of group counts at `source` (its buffer and offset) into `target`.
+    /// A mesh draw updates x and the caller initializes y and z to 1. A
+    /// dispatch updates all three axes. Each is bounded by TASK_WORKGROUPS (also
     /// the minimum maxComputeWorkGroupCount), ordered after earlier writes
     /// and before the indirect draw or dispatch that reads them. False
     /// when the device cannot address the buffers (the caller copies the
@@ -284,7 +281,7 @@ impl Renderer {
             if mesh_count.probed >= PROBES {
                 break;
             }
-            let slot = mesh_count.probes_address + u64::from(mesh_count.probed) * 12;
+            let slot = mesh_count.probes_address + u64::from(mesh_count.probed) * 4;
             mesh_count.probed += 1;
             self.record_bound_program(address, slot, IndirectCounts::Mesh, u32::MAX, 0, false)?;
         }
@@ -485,7 +482,7 @@ fn bound_program(kind: IndirectCounts) -> Vec<u32> {
             );
         }
     }
-    for (offset, value) in offsets.into_iter().zip(values) {
+    for (offset, value) in offsets.into_iter().zip(values).take(kind.axes()) {
         let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offset]);
         let target_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target_at]);
         main.emit(op::STORE, &[target_at, value, 2, 4]);
@@ -525,9 +522,13 @@ mod tests {
         let bytes = |words: &[u32]| -> Vec<u8> {
             words.iter().flat_map(|word| word.to_le_bytes()).collect()
         };
+        let initial_target = match kind {
+            IndirectCounts::Mesh => [0xdead_beef, 1, 1],
+            IndirectCounts::Dispatch => [0xdead_beef; 3],
+        };
         let memory = [
             (SOURCE, bytes(&source[..kind.axes()])),
-            (TARGET, bytes(&[0xdead_beef; 3])),
+            (TARGET, bytes(&initial_target)),
             (LOG, bytes(&[0xdead_beef])),
         ]
         .into_iter()
@@ -581,7 +582,10 @@ mod tests {
             .host_buffer_with(4, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
             .unwrap();
         source.write(0, &73u32.to_le_bytes());
-        let target = renderer.ring_upload(&[0; 12], 4).unwrap();
+        let initial = [0u32, 1, 1].map(u32::to_le);
+        let target = renderer
+            .ring_upload(crate::draw::words_as_bytes(&initial), 4)
+            .unwrap();
         assert!(
             renderer
                 .bounded_indirect((source.buffer, 0), target, IndirectCounts::Mesh)
