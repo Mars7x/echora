@@ -2608,23 +2608,22 @@ impl Renderer {
         Ok(created)
     }
 
-    /// Submit what is recorded and wait for it.
     /// Submit what was recorded and wait until all submitted work has
     /// completed: deferred reads are then available and retired resources
     /// are freed.
     pub fn flush(&mut self) -> Result<(), String> {
+        if self.recording {
+            self.submit_current()?;
+        }
         for index in 0..self.spares.len() {
             if self.spares[index].in_flight {
                 self.swap_with(index);
-                self.finish_current()?;
+                let finished = self.finish_current();
                 self.swap_with(index);
+                finished?;
             }
         }
-        if self.recording {
-            self.submit_current()?;
-            self.finish_current()?;
-        }
-        Ok(())
+        self.finish_current()
     }
 
     /// The highest completed submission serial, shared (see `wait_for`).
@@ -2996,7 +2995,7 @@ impl Renderer {
         // stopped, then goes on waiting.
         // So does one with ECHORA_MESH_COUNT_LOG: the indirect mesh counts
         // read since the last report.
-        let limit = if self.hang.is_some()
+        let mut limit = if self.hang.is_some()
             || crate::mesh_count::logging()
             || !self.loop_trace_buffers.is_empty()
         {
@@ -3004,32 +3003,33 @@ impl Renderer {
         } else {
             u64::MAX
         };
-        let mut reported = false;
-        // SAFETY: as below.
-        while let Err(vk::Result::TIMEOUT) =
-            unsafe { device.wait_for_fences(&[self.slot.fence], true, limit) }
-        {
-            if !reported {
-                reported = true;
-                if let Some(hang) = &self.hang {
-                    hang.report(self.slot.serial);
+        loop {
+            // SAFETY: the submit thread has released the fence and the
+            // queue signals it when it finishes this batch.
+            match unsafe { device.wait_for_fences(&[self.slot.fence], true, limit) } {
+                Ok(()) => break,
+                Err(vk::Result::TIMEOUT) if limit != u64::MAX => {
+                    if let Some(hang) = &self.hang {
+                        hang.report(self.slot.serial);
+                    }
+                    if let Some(mesh_count) = &self.mesh_count {
+                        mesh_count.report_pending("GPU stalled over 2 s");
+                    }
+                    self.report_loop_traces("GPU stalled over 2 s");
+                    limit = u64::MAX;
                 }
-                if let Some(mesh_count) = &self.mesh_count {
-                    mesh_count.report_pending("GPU stalled over 2 s");
-                }
-                self.report_loop_traces("GPU stalled over 2 s");
-            }
-        }
-        unsafe {
-            device
-                .wait_for_fences(&[self.slot.fence], true, u64::MAX)
-                .map_err(|error| {
+                Err(vk::Result::TIMEOUT) => {}
+                Err(error) => {
                     if let Some(mesh_count) = &self.mesh_count {
                         mesh_count.report_pending("fence wait failed");
                     }
                     self.report_loop_traces("fence wait failed");
-                    vk_error("vkWaitForFences")(error)
-                })?;
+                    return Err(vk_error("vkWaitForFences")(error));
+                }
+            }
+        }
+        // SAFETY: the fence has signaled and this slot is no longer in use.
+        unsafe {
             device
                 .reset_fences(&[self.slot.fence])
                 .map_err(vk_error("vkResetFences"))?;
@@ -6580,6 +6580,29 @@ mod tests {
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.
         Gpu::new().ok().map(|gpu| Renderer::new(gpu).unwrap())
+    }
+
+    #[test]
+    fn flush_collects_reads_from_queued_and_recorded_work() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer.resident_buffer(1, 4).unwrap();
+        renderer.fill_resident(1, 0, 4, 0x1111_1111).unwrap();
+        let first = renderer.read_resident(1, 0, 4).unwrap();
+        renderer.submit_frame().unwrap();
+        renderer.fill_resident(1, 0, 4, 0x2222_2222).unwrap();
+        let second = renderer.read_resident(1, 0, 4).unwrap();
+        let serial = renderer.recorded_serial();
+        assert!(renderer.reads_pending());
+
+        renderer.flush().unwrap();
+
+        assert_eq!(renderer.completed_serial, serial);
+        assert!(!renderer.reads_pending());
+        let reads = renderer.take_reads(&[first, second]);
+        assert_eq!(reads[&first], [0x11; 4]);
+        assert_eq!(reads[&second], [0x22; 4]);
     }
 
     #[test]
