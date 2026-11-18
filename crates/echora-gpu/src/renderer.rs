@@ -294,6 +294,9 @@ pub struct Renderer {
     loop_trace_buffers: Vec<(usize, String)>,
     pool: vk::CommandPool,
     recording: bool,
+    /// No draws, dispatches or copies follow the last full barrier in the
+    /// current command buffer.
+    full_barrier_recorded: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     targets: FastMap<u64, Target>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
@@ -753,6 +756,7 @@ impl Renderer {
             queue_lock,
             submitter,
             recording: false,
+            full_barrier_recorded: false,
             graphics: Default::default(),
             memory_types,
             targets: FastMap::default(),
@@ -892,6 +896,7 @@ impl Renderer {
 
     /// The command buffer, for recording inside the open rendering pass.
     pub(crate) fn recording_commands(&mut self) -> Result<vk::CommandBuffer, String> {
+        self.full_barrier_recorded = false;
         if !self.recording {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -4865,6 +4870,12 @@ impl Renderer {
     /// A full memory barrier; everything written before is visible after.
     #[track_caller]
     pub(crate) fn memory_barrier(&mut self) -> Result<(), String> {
+        if self.recording && self.full_barrier_recorded {
+            // The previous barrier already orders all earlier work before
+            // later work.
+            self.stat("stat: redundant full barriers", 1);
+            return Ok(());
+        }
         let commands = self.commands()?;
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -4885,6 +4896,7 @@ impl Renderer {
                 &[],
             )
         };
+        self.full_barrier_recorded = true;
         self.written.clear();
         self.hazard_barriers += 1;
         Ok(())
@@ -6261,6 +6273,38 @@ mod tests {
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.
         Gpu::new().ok().map(|gpu| Renderer::new(gpu).unwrap())
+    }
+
+    #[test]
+    fn consecutive_full_barriers_share_one_dependency() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer.guest_barrier(0x11).unwrap();
+        renderer.guest_barrier(0x12).unwrap();
+        assert_eq!(renderer.hazard_barriers, 1);
+
+        renderer
+            .target(1, 8, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        renderer
+            .clear_color(
+                1,
+                None,
+                vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .unwrap();
+        renderer.guest_barrier(0x11).unwrap();
+        assert_eq!(renderer.hazard_barriers, 2);
+        assert_eq!(renderer.read_target(1).unwrap()[0], [1.0, 0.0, 0.0, 1.0]);
+
+        renderer.guest_barrier(0x12).unwrap();
+        assert_eq!(renderer.hazard_barriers, 3);
+        renderer.flush().unwrap();
+        renderer.guest_barrier(0x12).unwrap();
+        assert_eq!(renderer.hazard_barriers, 4);
     }
 
     #[test]
