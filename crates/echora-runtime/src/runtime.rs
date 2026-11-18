@@ -1912,74 +1912,49 @@ impl Machine {
         // the next core with work after `after`'s. With one core per worker
         // (W=6) every thread shares the worker's core and this is strict
         // priority as before.
-        // (id, home core, priority, backing off from a spin)
-        let mut candidates: Vec<(u64, u8, u8, bool)> = Vec::new();
+        let cores = self.scheduled_guest_cores();
+        let start = match self.worker_core {
+            Some(worker) if cores.count_ones() > 1 => self
+                .core_hold
+                .iter()
+                .position(|hold| *hold == Some(after))
+                .map_or_else(
+                    || self.guest_core_on_worker(after, worker),
+                    |held| held as u8,
+                ),
+            _ => 0,
+        };
+        // Within each core: priority, non-spinning first, then the first
+        // thread after its previous thread, wrapping in ID order.
+        const CORE_SLOTS: usize = (u64::BITS - APPLICATION_CORES.leading_zeros()) as usize;
+        let mut best = [None; CORE_SLOTS];
         self.for_each_schedulable(exclude, &mut |id, core| {
+            let index = usize::from(core);
+            let previous = if core == start {
+                after
+            } else {
+                self.core_last_thread[index]
+            };
             let spinning = self
                 .spin_backoff
                 .get(&id)
                 .is_some_and(|until| *until > self.core.steps);
-            candidates.push((id, core, priority(id), spinning));
+            let candidate = (priority(id), spinning, id <= previous, id);
+            let slot = &mut best[index];
+            *slot = Some(slot.map_or(candidate, |old| candidate.min(old)));
             true
         });
-        if candidates.is_empty() {
-            return None;
-        }
-        let cores = self.scheduled_guest_cores();
-        let home = |id: u64| -> u8 {
-            match self.worker_core {
-                Some(core) if cores.count_ones() > 1 => self
-                    .core_hold
-                    .iter()
-                    .position(|hold| *hold == Some(id))
-                    .map_or_else(|| self.guest_core_on_worker(id, core), |held| held as u8),
-                _ => 0,
-            }
-        };
-        let mut best = [u8::MAX; 64];
-        for &(_, core, priority, _) in &candidates {
-            let slot = &mut best[usize::from(core) % 64];
-            *slot = (*slot).min(priority);
-        }
-        // Cores in turn after `after`'s, ending with its own.
-        let start = home(after);
-        let turn = |core: u8| (u32::from(core) + 63 - u32::from(start)) % 64;
-        let pick = |skip_spinning: bool| {
-            let mut first: Option<u32> = None;
-            let mut next: Option<(u32, u64)> = None;
-            let mut wrapped: Option<(u32, u64)> = None;
-            for &(id, core, priority, spinning) in &candidates {
-                if priority != best[usize::from(core) % 64] || skip_spinning && spinning {
-                    continue;
-                }
-                let turn = turn(core);
-                // Equal priorities on a core take turns: after `after` on
-                // its own core (the last turn), after the thread a core
-                // last ran on the others.
-                let key = (turn, id);
-                let previous = if turn == 63 {
-                    after
-                } else {
-                    self.core_last_thread[usize::from(core) % 64]
-                };
-                // The first core in turn decides; within it, the next id
-                // after `previous`, else (wrapping) the lowest.
-                let slot = if id > previous {
-                    &mut next
-                } else {
-                    &mut wrapped
-                };
-                *slot = Some(slot.map_or(key, |old| old.min(key)));
-                first = Some(first.map_or(turn, |old: u32| old.min(turn)));
-            }
-            let first = first?;
-            [next, wrapped]
-                .into_iter()
-                .flatten()
-                .find(|&(turn, _)| turn == first)
-                .map(|(_, id)| id)
-        };
-        pick(true).or_else(|| pick(false))
+        // Across cores: prefer a non-spinning candidate anywhere, then
+        // rotate through cores after `after`'s, ending with its own.
+        best.into_iter()
+            .enumerate()
+            .filter_map(|(core, entry)| {
+                let (_, spinning, _, id) = entry?;
+                let turn = (core + 63 - usize::from(start)) % 64;
+                Some((spinning, turn, id))
+            })
+            .min()
+            .map(|(_, _, id)| id)
     }
 
     /// Horizon preemption across workers: a runnable thread no worker runs
