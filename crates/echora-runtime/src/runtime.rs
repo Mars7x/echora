@@ -162,6 +162,7 @@ const KERNEL_VIRTUAL_ADDRESS_END: u64 = 0xffff_ffff_ffe0_0000;
 const MUTEX_WAIT_MASK: u32 = 0x4000_0000;
 /// The Switch 2's six application cores (affinity mask bits 0-5).
 const APPLICATION_CORES: u64 = 0x3f;
+const APPLICATION_CORE_COUNT: usize = APPLICATION_CORES.count_ones() as usize;
 /// Thread-local region fields after the IPC message buffer.
 const TLS_DISABLE_COUNT: u64 = 0x100;
 const TLS_INTERRUPT_FLAG: u64 = 0x102;
@@ -295,12 +296,12 @@ pub struct Machine {
     /// The thread each guest core last ran, by guest core, with several
     /// cores folded onto a worker: equal priorities on a core take turns
     /// after it (see `next_runnable_thread`).
-    core_last_thread: [u64; 64],
+    core_last_thread: [u64; APPLICATION_CORE_COUNT],
     /// By guest core folded onto a worker: the thread with dispatch
     /// disabled (TLS DisableCount) that gave the worker to another core's
     /// turn. It keeps its core: nothing else runs there, and it resumes on
     /// no other, until it ends a slice with dispatch enabled.
-    core_hold: [Option<u64>; 64],
+    core_hold: [Option<u64>; APPLICATION_CORE_COUNT],
     /// The thread the worker holding the machine goes on running after a
     /// boundary (set by `request_preemptions`, cleared when the worker
     /// idles): `parked_workers_with_work` wakes no one for it.
@@ -445,8 +446,8 @@ impl Machine {
             host_call_continue: None,
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
-            core_last_thread: [0; 64],
-            core_hold: [None; 64],
+            core_last_thread: [0; APPLICATION_CORE_COUNT],
+            core_hold: [None; APPLICATION_CORE_COUNT],
             keeps_running: None,
             signal_to_address_without_waiters: 0,
             wait_for_address_immediate_returns: 0,
@@ -1793,7 +1794,7 @@ impl Machine {
     /// running elsewhere), with its home core here: `visit(id, home)` until
     /// it returns false. The worker, its cores and the holds are worked out
     /// once per call, not per thread.
-    fn for_each_schedulable(&self, exclude: Option<u64>, visit: &mut dyn FnMut(u64, u8) -> bool) {
+    fn for_each_schedulable(&self, exclude: Option<u64>, mut visit: impl FnMut(u64, u8) -> bool) {
         // With several workers each runs a fixed set of the application
         // cores (see `worker_guest_cores`), as on Horizon: only threads
         // whose affinity mask names one of them. A thread pinned to one
@@ -1839,7 +1840,10 @@ impl Machine {
             if !any_hold {
                 return None;
             }
-            (0..64u8).find(|&core| self.core_hold[usize::from(core)] == Some(id))
+            self.core_hold
+                .iter()
+                .position(|holder| *holder == Some(id))
+                .map(|core| core as u8)
         };
         // As `guest_core_on_worker`, with this worker's cores worked out.
         let home = |id: u64, held: Option<u8>| -> u8 {
@@ -1879,7 +1883,7 @@ impl Machine {
                 || if held.is_some() {
                     held_here
                 } else {
-                    !self.core_hold[usize::from(core) % 64].is_some_and(|holder| holding(holder))
+                    !self.core_hold[usize::from(core)].is_some_and(|holder| holding(holder))
                 };
             if hold_allows && !visit(id, core) {
                 return;
@@ -1926,9 +1930,8 @@ impl Machine {
         };
         // Within each core: priority, non-spinning first, then the first
         // thread after its previous thread, wrapping in ID order.
-        const CORE_SLOTS: usize = (u64::BITS - APPLICATION_CORES.leading_zeros()) as usize;
-        let mut best = [None; CORE_SLOTS];
-        self.for_each_schedulable(exclude, &mut |id, core| {
+        let mut best = [None; APPLICATION_CORE_COUNT];
+        self.for_each_schedulable(exclude, |id, core| {
             let index = usize::from(core);
             let previous = if core == start {
                 after
@@ -1986,7 +1989,7 @@ impl Machine {
         // The best priority waiting for each application core, in one pass
         // over the threads no worker runs (a mask naming no application core
         // waits for every one of them).
-        let mut best = [u8::MAX; 64];
+        let mut best = [u8::MAX; APPLICATION_CORE_COUNT];
         for id in main.into_iter().chain(self.threads.runnable_ids()) {
             if self.running.contains(&id) || id == self.core.current_thread_id {
                 continue;
@@ -2047,7 +2050,7 @@ impl Machine {
             // is disabled leaves the thread here, on the core it ran on).
             let core = self.guest_core_on_worker(current, worker);
             if cores & 1 << core != 0 {
-                self.core_last_thread[usize::from(core) % 64] = current;
+                self.core_last_thread[usize::from(core)] = current;
             }
         }
     }
@@ -2066,12 +2069,14 @@ impl Machine {
         // else (its mask has moved to another worker's cores since it was
         // dispatched) the core of this worker it last ran on.
         let cores = self.worker_guest_cores(worker);
-        let home = usize::from(self.guest_core_on_worker(current, worker)) % 64;
-        let Some(core) = (0..64)
-            .find(|&core| self.core_hold[core] == Some(current))
-            .or_else(|| (cores & 1 << home != 0).then_some(home))
+        let home = usize::from(self.guest_core_on_worker(current, worker));
+        let Some(core) = self
+            .core_hold
+            .iter()
+            .position(|holder| *holder == Some(current))
+            .or_else(|| (home < APPLICATION_CORE_COUNT && cores & 1 << home != 0).then_some(home))
             .or_else(|| {
-                (0..64)
+                (0..APPLICATION_CORE_COUNT)
                     .find(|&core| cores & 1 << core != 0 && self.core_last_thread[core] == current)
             })
         else {
@@ -2100,20 +2105,25 @@ impl Machine {
     /// The application cores worker `worker` runs: core `c` belongs to
     /// worker `c % workers`, so each core has exactly one worker.
     fn worker_guest_cores(&self, worker: u8) -> u64 {
-        let workers = self.core_threads.len().max(1) as u64;
         // ECHORA_CORE_MAP=W0,W1,... (diagnostic): core c belongs to the
         // c-th listed worker instead.
-        let map: Option<Vec<u64>> = crate::nvn::debug_var_os("ECHORA_CORE_MAP").map(|map| {
-            map.to_string_lossy()
+        if let Some(map) = crate::nvn::debug_var_os("ECHORA_CORE_MAP") {
+            let map: Vec<u64> = map
+                .to_string_lossy()
                 .split(',')
                 .filter_map(|item| item.trim().parse().ok())
-                .collect()
-        });
-        (0..u64::from(APPLICATION_CORES.count_ones()))
-            .filter(|&core| match &map {
-                Some(map) => map.get(core as usize).copied().unwrap_or(0) == u64::from(worker),
-                None => core % workers == u64::from(worker),
-            })
+                .collect();
+            return (0..APPLICATION_CORE_COUNT)
+                .filter(|&core| map.get(core).copied().unwrap_or(0) == u64::from(worker))
+                .fold(0, |mask, core| mask | 1 << core);
+        }
+        let worker = usize::from(worker);
+        let workers = self.core_threads.len().max(1);
+        if worker >= workers {
+            return 0;
+        }
+        (worker..APPLICATION_CORE_COUNT)
+            .step_by(workers)
             .fold(0, |mask, core| mask | 1 << core)
     }
 
@@ -2157,7 +2167,7 @@ impl Machine {
             let exclude = self.keeps_running.filter(|&id| id == current);
             // Whether next_runnable_thread would find one: any will do.
             let mut found = false;
-            self.for_each_schedulable(exclude, &mut |_, _| {
+            self.for_each_schedulable(exclude, |_, _| {
                 found = true;
                 false
             });
@@ -2799,10 +2809,7 @@ impl Machine {
         // Start ECHORA_STOP_SECONDS's clock with the workers.
         stop_seconds_passed();
         // One worker per application core.
-        let workers = self
-            .layout
-            .workers
-            .min(APPLICATION_CORES.count_ones() as usize);
+        let workers = self.layout.workers.min(APPLICATION_CORE_COUNT);
         let global = self.core.steps;
         let idle = |machine: &Machine| {
             let mut core = Core::new(machine.memory.view());
