@@ -67,6 +67,7 @@ pub const fn width_mask(bits: u8) -> u64 {
     }
 }
 
+#[inline(always)]
 pub const fn sign_extend(value: u64, bits: u8) -> u64 {
     assert!(bits > 0 && bits <= 64);
     if bits == 64 {
@@ -92,6 +93,7 @@ pub fn shift(value: u64, kind: u8, amount: u8, bits: u8) -> u64 {
 }
 
 /// UXTB/UXTH/UXTW/UXTX/SXTB/SXTH/SXTW/SXTX, followed by an optional LSL.
+#[inline(always)]
 pub fn extend(value: u64, option: u8, amount: u8) -> u64 {
     assert!(option < 8 && amount < 64);
     let bits = 8_u8 << (option & 3);
