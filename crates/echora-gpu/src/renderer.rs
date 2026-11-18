@@ -347,9 +347,9 @@ pub struct Renderer {
     /// Draws and dispatches recorded since the last submission.
     work_items: u32,
     samplers: FastMap<SamplerKey, vk::Sampler>,
-    /// Views of another type than an image's own (a 2D-array view of a 2D
-    /// image, ...), by image and view type.
-    extra_views: FastMap<(vk::Image, i32), vk::ImageView>,
+    /// Additional views retired with their image, with their range, format,
+    /// and usage used to identify them.
+    extra_views: FastMap<(vk::Image, ExtraView), vk::ImageView>,
     /// Host memory imported as storage buffers (VK_EXT_external_memory_host),
     /// by page-aligned host address and length.
     imported: FastMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
@@ -453,6 +453,41 @@ pub struct Renderer {
     /// Where linked shader objects' driver binaries are kept between runs
     /// (see `crate::shader_cache`), if anywhere.
     pub(crate) shader_cache: Option<std::path::PathBuf>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum ExtraView {
+    Sampled(vk::ImageViewType),
+    SampledRange {
+        view_type: vk::ImageViewType,
+        base_level: u32,
+        level_count: u32,
+        base_layer: u32,
+        layer_count: u32,
+    },
+    RelativeLevels {
+        source: vk::ImageView,
+        base: u32,
+        count: u32,
+    },
+    Swizzled {
+        source: vk::ImageView,
+        format: vk::Format,
+        components: [vk::ComponentSwizzle; 4],
+    },
+    Level(u32),
+    StorageLevel {
+        format: vk::Format,
+        level: u32,
+    },
+    Layer {
+        level: u32,
+        layer: u32,
+    },
+    AttachmentLevel {
+        format: vk::Format,
+        level: u32,
+    },
 }
 
 type SamplerKey = (
@@ -1685,14 +1720,14 @@ impl Renderer {
         texture_type: u32,
         sampler: &crate::draw::Sampler,
     ) -> Result<vk::ImageView, String> {
-        use ash::vk::Handle;
         let (components, format) = (sampler.components, sampler.format);
         let plain = self.texture_view(source, texture_type)?;
         let plain = match sampler.view_levels {
             Some((base, count)) if count > 0 => self.level_view_of(plain, base, count)?,
             _ => plain,
         };
-        let identity = [components.r, components.g, components.b, components.a]
+        let swizzle = [components.r, components.g, components.b, components.a];
+        let identity = swizzle
             .into_iter()
             .all(|part| part == vk::ComponentSwizzle::IDENTITY);
         if identity && format.is_none() {
@@ -1709,12 +1744,11 @@ impl Renderer {
         }
         let cache = (
             info.image,
-            i32::MIN
-                + (plain.as_raw() as i32 & 0xffff) * 8192
-                + i32::from(format != info.format) * 4096
-                + [components.r, components.g, components.b, components.a]
-                    .iter()
-                    .fold(0, |key, part| key * 8 + part.as_raw()),
+            ExtraView::Swizzled {
+                source: plain,
+                format,
+                components: swizzle,
+            },
         );
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
@@ -1755,8 +1789,14 @@ impl Renderer {
         if base == 0 && count == levels {
             return Ok(view);
         }
-        let packed = base | count << 5 | (info.view_type.as_raw() as u32) << 10;
-        let cache = (info.image, -(1 << 29) - packed as i32);
+        let cache = (
+            info.image,
+            ExtraView::RelativeLevels {
+                source: view,
+                base,
+                count,
+            },
+        );
         if let Some(existing) = self.extra_views.get(&cache) {
             return Ok(*existing);
         }
@@ -1982,12 +2022,16 @@ impl Renderer {
             }
             self.transition(key, vk::ImageLayout::GENERAL)?;
             let target = &self.targets[&key];
-            let packed = base_level
-                | level_count << 5
-                | base_layer << 10
-                | layer_count << 17
-                | (view_type.as_raw() as u32) << 25;
-            let cache = (target.image, -(1 << 30) - packed as i32);
+            let cache = (
+                target.image,
+                ExtraView::SampledRange {
+                    view_type,
+                    base_level,
+                    level_count,
+                    base_layer,
+                    layer_count,
+                },
+            );
             if let Some(view) = self.extra_views.get(&cache) {
                 return Ok(*view);
             }
@@ -2102,7 +2146,8 @@ impl Renderer {
         if wanted == own_view_type(target.shape) {
             return Ok(target.sampled_view);
         }
-        if let Some(view) = self.extra_views.get(&(target.image, wanted.as_raw())) {
+        let cache = (target.image, ExtraView::Sampled(wanted));
+        if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
         let layers = target.shape.layers();
@@ -2139,11 +2184,10 @@ impl Renderer {
                 layer_count,
                 ..subresource
             });
-        let image = target.image;
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert((image, wanted.as_raw()), view);
+        self.extra_views.insert(cache, view);
         self.view_infos.insert(view, ViewInfo::of(&info));
         Ok(view)
     }
@@ -4706,8 +4750,7 @@ impl Renderer {
         if level >= target.levels {
             return Err(format!("level {level} of a {}-level target", target.levels));
         }
-        // Keyed apart from level_view's (i32::MAX - level) entries.
-        let cache = (target.image, i32::MIN + format.as_raw() * 32 + level as i32);
+        let cache = (target.image, ExtraView::StorageLevel { format, level });
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
@@ -4738,7 +4781,7 @@ impl Renderer {
         if level >= target.levels {
             return Err(format!("level {level} of a {}-level target", target.levels));
         }
-        let cache = (target.image, i32::MAX - level as i32);
+        let cache = (target.image, ExtraView::Level(level));
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
@@ -4781,7 +4824,7 @@ impl Renderer {
                 target.levels
             ));
         }
-        let cache = (target.image, i32::MIN + 1 + (layer << 5 | level) as i32);
+        let cache = (target.image, ExtraView::Layer { level, layer });
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
@@ -4821,12 +4864,7 @@ impl Renderer {
         {
             return self.attachment_view(key, level, layer);
         }
-        // Keyed apart from the other views' entries (level_view's near
-        // i32::MAX, the attachments' and twins' near i32::MIN).
-        let cache = (
-            target.image,
-            (1 << 28) + format.as_raw() * 32 + level as i32,
-        );
+        let cache = (target.image, ExtraView::AttachmentLevel { format, level });
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
@@ -6775,6 +6813,36 @@ mod tests {
     fn clip_limits_to_bounds() {
         assert_eq!(clip([-5, 2, 20, 4], [0, 0, 10, 10]), [0, 2, 10, 4]);
         assert_eq!(clip([12, 0, 4, 4], [0, 0, 10, 10])[2], -2);
+    }
+
+    #[test]
+    fn relative_mip_views_keep_their_source_ranges() {
+        use crate::draw::{Sampler, TextureSource};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer
+            .target_with_levels(7, 8, 8, vk::Format::R8G8B8A8_UNORM, 4)
+            .unwrap();
+        let sampler = Sampler {
+            view_levels: Some((0, 1)),
+            ..Default::default()
+        };
+        for base_level in [1, 2, 1] {
+            let source = TextureSource::TargetView {
+                key: 7,
+                base_level,
+                level_count: 2,
+                base_layer: 0,
+                layer_count: 1,
+            };
+            let view = renderer
+                .texture_view_swizzled(&source, 2, &sampler)
+                .unwrap();
+            let range = renderer.view_infos[&view].range;
+            assert_eq!((range.base_mip_level, range.level_count), (base_level, 1));
+        }
     }
 
     #[test]
