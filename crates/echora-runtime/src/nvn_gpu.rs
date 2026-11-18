@@ -9850,6 +9850,17 @@ pub(super) fn texture_sample(
 ) -> u64 {
     let mut sample = u64::from(format) << 48 ^ u64::from(width) << 24 ^ u64::from(height);
     sample ^= u64::from(depth_or_layers) << 40;
+    // At this size the evenly spaced samples cover the entire texture.
+    // Read it once, without hashing overlapping chunks or touching bytes
+    // beyond the texture when it occupies less than one sample.
+    const FULL_SAMPLE: usize = echora_shader_abi::PAGE_SIZE as usize;
+    if storage_size <= FULL_SAMPLE as u64 {
+        let mut bytes = [0; FULL_SAMPLE];
+        let bytes = &mut bytes[..storage_size as usize];
+        if core.memory.read(base, bytes).is_ok() {
+            return (sample ^ hash_bytes(bytes)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
     // The chunks are gathered first, so their reads (cache misses across a
     // large texture) overlap, then hashed in four independent lanes.
     let mut chunks = [[0u8; 64]; 256];
@@ -10328,6 +10339,28 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn small_texture_samples_cover_the_storage_without_its_neighbors() {
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let base = 0x10000;
+        memory
+            .map(base, 1 << 12, READ | WRITE, STATE_NORMAL, "test texture")
+            .unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let snapshot = |core: &Guest| super::texture_sample(core, base, 4, 37, [1, 1, 1]);
+        let initial = snapshot(&core);
+        core.memory.write(base + 4, &[1]).unwrap();
+        assert_eq!(snapshot(&core), initial);
+        core.memory.write(base + 3, &[1]).unwrap();
+        assert_ne!(snapshot(&core), initial);
+    }
 
     #[test]
     fn sampler_registration_captures_the_builder_properties() {
