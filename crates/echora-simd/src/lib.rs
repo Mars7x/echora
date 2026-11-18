@@ -3485,19 +3485,20 @@ pub fn vec_permute(cpu: &mut Cpu, op: VecPermuteOp, bits: u8, q: bool, rd: u8, r
 
 /// EXT: bytes `index`.. of the concatenation Vm:Vn (Vn in the low part).
 pub fn vec_ext(cpu: &mut Cpu, q: bool, rd: u8, rn: u8, rm: u8, index: u8) {
-    let width = if q { 16 } else { 8 };
-    let n = cpu.vectors[rn as usize].to_le_bytes();
-    let m = cpu.vectors[rm as usize].to_le_bytes();
-    let mut bytes = [0u8; 16];
-    for (position, byte) in bytes.iter_mut().take(width).enumerate() {
-        let source = usize::from(index) + position;
-        *byte = if source < width {
-            n[source]
+    let n = cpu.vectors[rn as usize];
+    let m = cpu.vectors[rm as usize];
+    assert!(index <= 16);
+    let shift = u32::from(index) * 8;
+    cpu.vectors[rd as usize] = if q {
+        n.unbounded_shr(shift) | m.unbounded_shl(128 - shift)
+    } else {
+        let window = if shift < 64 {
+            (u128::from(n as u64) | (m << 64)) >> shift
         } else {
-            m[source - width]
+            m >> (shift - 64)
         };
-    }
-    cpu.vectors[rd as usize] = u128::from_le_bytes(bytes);
+        u128::from(window as u64)
+    };
 }
 
 /// LD1-LD4/ST1-ST4 (multiple structures). `structure` is the interleave
@@ -4143,6 +4144,27 @@ mod vector_tests {
         assert_eq!(cpu.vectors[0], lanes32([1, 2, 0x1fff_ffff, 0]));
         vec_shift(&mut cpu, VecShiftOp::Sshr, 32, true, false, 0, 1, 3);
         assert_eq!(cpu.vectors[0], lanes32([1, 2, u32::MAX, 0]));
+    }
+
+    #[test]
+    fn extract_covers_each_byte_offset_and_destination_alias() {
+        let mut cpu = Cpu::default();
+        let n = std::array::from_fn::<_, 16, _>(|index| index as u8);
+        let m = std::array::from_fn::<_, 16, _>(|index| 16 + index as u8);
+        for q in [false, true] {
+            let width = if q { 16 } else { 8 };
+            let source = [&n[..width], &m].concat();
+            for index in 0..=16 {
+                let mut expected = [0; 16];
+                expected[..width].copy_from_slice(&source[index..index + width]);
+                for rd in [0, 1, 2] {
+                    cpu.vectors[1] = u128::from_le_bytes(n);
+                    cpu.vectors[2] = u128::from_le_bytes(m);
+                    vec_ext(&mut cpu, q, rd, 1, 2, index as u8);
+                    assert_eq!(cpu.vectors[usize::from(rd)], u128::from_le_bytes(expected));
+                }
+            }
+        }
     }
 
     #[test]
