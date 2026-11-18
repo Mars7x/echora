@@ -46,6 +46,7 @@ pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
     translations: HashMap<TranslationKey, Result<Arc<Translated>, String>>,
+    compute_jumps: HashMap<u64, Option<ComputeJumps>>,
     /// Bindless lookups by translation identity. The translation cache
     /// keeps each addressed translation alive.
     handle_reads: HashMap<usize, Arc<shader::handle_reads::HandleReads>>,
@@ -76,6 +77,8 @@ pub struct Backend {
     vertex_trace_addresses: Vec<u64>,
     /// Linked programs by (vertex key, fragment key).
     programs: HashMap<(u64, u64), Program>,
+    /// Compute programs by translation identity and specialization bits.
+    compute_programs: HashMap<(usize, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
     pub notes: BTreeMap<String, u64>,
     /// "stat: " counters by their static name (`stat`; merged into the
@@ -317,6 +320,7 @@ impl Backend {
             max_extent: renderer.max_image_extent(),
             renderer,
             translations: HashMap::default(),
+            compute_jumps: HashMap::default(),
             handle_reads: HashMap::default(),
             global_writes: HashMap::default(),
             unbounded_write_serial: 0,
@@ -328,6 +332,7 @@ impl Backend {
             vertex_traces: HashMap::default(),
             vertex_trace_addresses: Vec::new(),
             programs: HashMap::default(),
+            compute_programs: HashMap::default(),
             notes: BTreeMap::new(),
             stats: Default::default(),
             traced: 0,
@@ -517,7 +522,7 @@ impl BoundProgram {
 }
 
 /// Stage key, binding base, previous stage's stores, generic input types,
-/// compute workgroup size and shared memory, and the task/mesh state.
+/// compute and mesh state, native pointers, and proved compute jump targets.
 type TranslationKey = (
     u64,
     [u32; 3],
@@ -526,7 +531,42 @@ type TranslationKey = (
     [u32; 5],
     Option<MeshParameters>,
     bool,
+    Option<Arc<shader::JumpTargets>>,
 );
+
+struct ComputeJumps {
+    tables: shader::JumpTables,
+    last: Option<(Vec<Box<[u8]>>, Option<Arc<shader::JumpTargets>>)>,
+}
+
+impl ComputeJumps {
+    fn from_program(program: &[u8]) -> Option<Self> {
+        Some(Self {
+            tables: shader::JumpTables::from_compute_program(program)?,
+            last: None,
+        })
+    }
+
+    fn resolve(&mut self, constants: &[u8]) -> Option<Arc<shader::JumpTargets>> {
+        if let Some((saved, targets)) = &self.last
+            && self
+                .tables
+                .table_bytes(constants)
+                .zip(saved)
+                .all(|(current, saved)| current == Some(saved.as_ref()))
+        {
+            return targets.clone();
+        }
+        let bytes = self
+            .tables
+            .table_bytes(constants)
+            .map(|table| table.map(Box::from))
+            .collect::<Option<Vec<_>>>()?;
+        let targets = self.tables.resolve(constants).map(Arc::new);
+        self.last = Some((bytes, targets.clone()));
+        targets
+    }
+}
 
 /// Shader::AttributeType of each vertex attribute's format: integer formats
 /// must reach integer shader inputs.
@@ -1500,6 +1540,7 @@ impl Nvn {
         generic_input_types: [u8; 32],
         compute: [u32; 5],
         mesh: Option<MeshParameters>,
+        compute_constants: Option<&[u8]>,
     ) -> Result<(Arc<Translated>, u64), String> {
         let (code, key) = self
             .stage_code(core, gpu)
@@ -1513,7 +1554,17 @@ impl Nvn {
                 let _ = std::fs::write(path, code.as_slice());
             }
         }
-        let native_pointers = self.gpu.as_ref().unwrap().native_programs.contains(&key);
+        let backend = self.gpu.as_mut().unwrap();
+        let native_pointers = backend.native_programs.contains(&key);
+        let jump_targets = compute_constants.and_then(|constants| {
+            backend
+                .compute_jumps
+                .entry(key)
+                .or_insert_with(|| ComputeJumps::from_program(&code))
+                .as_mut()?
+                .resolve(constants)
+        });
+        let constants_for_translation = jump_targets.as_ref().and(compute_constants);
         let cache_key = (
             key,
             base,
@@ -1522,8 +1573,9 @@ impl Nvn {
             compute,
             mesh,
             native_pointers,
+            jump_targets,
         );
-        if let Some(found) = self.gpu.as_ref().unwrap().translations.get(&cache_key) {
+        if let Some(found) = backend.translations.get(&cache_key) {
             return found.clone().map(|stage| (stage, key));
         }
         let resolution_scale = self
@@ -1589,7 +1641,15 @@ impl Nvn {
             // pointers); graphics stages bind every candidate.
             let plugin = |nvn: &Self| {
                 if compute[0] != 0 {
-                    shader::translate(&code, parameters, &mut PointerProbe { nvn, core })
+                    shader::translate(
+                        &code,
+                        parameters,
+                        &mut PointerProbe {
+                            nvn,
+                            core,
+                            c1: compute_constants.unwrap_or_default(),
+                        },
+                    )
                 } else {
                     shader::translate(&code, parameters, &mut shader::NoEnvironment)
                 }
@@ -1611,7 +1671,13 @@ impl Nvn {
             // A program reading the texture pool (set 1) needs a device
             // that holds it; elsewhere such programs stay with the plugin.
             let rust = (translator != shader::Translator::Plugin)
-                .then(|| shader::translate_rust(&code, &parameters))
+                .then(|| {
+                    shader::translate_rust_with_compute_constants(
+                        &code,
+                        &parameters,
+                        constants_for_translation,
+                    )
+                })
                 .map(|result| {
                     result.and_then(|translated| {
                         if translated.texture_pool_bindings == 0 || pool_ready {
@@ -1693,17 +1759,6 @@ impl Nvn {
         translated.map(|stage| (stage, key))
     }
 
-    /// Stage keys and translations of the bound vertex and fragment programs.
-    /// Constant buffer 1 of the stage bound at NVN stage `bit`: the
-    /// shader's own constant data, which the compiler places in its code
-    /// block (NVN2 control section: size at +0x3c, offset in the code at
-    /// +0x40; from the reference implementation's GLSLC notes).
-    fn stage_constants(&self, core: &Guest, bit: u32) -> Option<Vec<u8>> {
-        let bind = self.render.state.get(super::program_key(bit))?;
-        let stage = self.program_stage(core, bind.x[1], bit).ok()?;
-        self.stage_constants_of(core, stage)
-    }
-
     /// The memory a raw storage pointer candidate of a compute program
     /// names (`Descriptor::flags` bit 5): the eight bytes at its place in
     /// c0 (`c0`, as filled), the stage's constants (c1) or bound uniform
@@ -1715,6 +1770,7 @@ impl Nvn {
         core: &mut Guest,
         descriptor: &shader::Descriptor,
         c0: &[u8],
+        c1: &[u8],
     ) -> Result<Option<(u64, u64)>, String> {
         let at = descriptor.cbuf_offset as usize;
         let mut word = [0u8; 8];
@@ -1723,8 +1779,8 @@ impl Nvn {
                 Some(bytes) => word.copy_from_slice(bytes),
                 None => return Ok(None),
             },
-            1 => match self.stage_constants(core, 5) {
-                Some(bytes) if bytes.len() >= at + 8 => word.copy_from_slice(&bytes[at..at + 8]),
+            1 => match c1.get(at..at + 8) {
+                Some(bytes) => word.copy_from_slice(bytes),
                 _ => return Ok(None),
             },
             2 => return Ok(None),
@@ -1896,7 +1952,7 @@ impl Nvn {
             .get("BindVertexAttribState")
             .map_or([0; 32], |bind| generic_input_types(&bind.states));
         let (vertex, vertex_key) =
-            self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None)?;
+            self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None, None)?;
         let binding_base = vertex
             .descriptors
             .iter()
@@ -1924,6 +1980,7 @@ impl Nvn {
             Some(vertex.stores),
             [0; 32],
             [0; 5],
+            None,
             None,
         )?;
         if vertex.stage != Stage::Vertex || fragment.stage != Stage::Fragment {
@@ -2103,6 +2160,7 @@ impl Nvn {
                 [0; 32],
                 [0; 5],
                 Some(parameters),
+                None,
             )?;
             if stage.stage != Stage::Task {
                 return Err(format!("the task program translated as {:?}", stage.stage));
@@ -2125,6 +2183,7 @@ impl Nvn {
             [0; 32],
             [0; 5],
             Some(parameters),
+            None,
         )?;
         if stage.stage != Stage::Mesh {
             return Err(format!("the mesh program translated as {:?}", stage.stage));
@@ -2141,6 +2200,7 @@ impl Nvn {
             Some(stores),
             [0; 32],
             [0; 5],
+            None,
             None,
         )?;
         if stage.stage != Stage::Fragment {
@@ -4468,8 +4528,19 @@ impl Nvn {
         if compute[..3].iter().any(|size| *size == 0 || *size > 1024) {
             return Err(format!("compute workgroup {:?}", &compute[..3]));
         }
-        let (mut stage, mut code_key) =
-            self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
+        // The jump proof and the shader bind see the same snapshot of
+        // bank 1. Only the bytes read by the table shape the translation.
+        let constants = self.stage_constants_of(core, *stage_args);
+        let (mut stage, mut code_key) = self.translate_stage(
+            core,
+            address,
+            [0; 3],
+            None,
+            [0; 32],
+            compute,
+            None,
+            constants.as_deref(),
+        )?;
         // Storage pointers the NVN tracking found outside c0 were constants,
         // not addresses (floats 1.0 and 10.0 in c1): such a program reads
         // its pointers as raw arguments instead, picking among every
@@ -4480,20 +4551,32 @@ impl Nvn {
                 && descriptor.flags & 32 == 0
         }) && self.gpu.as_mut().unwrap().native_programs.insert(code_key)
         {
-            (stage, code_key) =
-                self.translate_stage(core, address, [0; 3], None, [0; 32], compute, None)?;
+            (stage, code_key) = self.translate_stage(
+                core,
+                address,
+                [0; 3],
+                None,
+                [0; 32],
+                compute,
+                None,
+                constants.as_deref(),
+            )?;
         }
         if stage.stage != Stage::Compute {
             return Err(format!("bound compute stage is {:?}", stage.stage));
         }
-        let key = (code_key, u64::MAX);
         // ECHORA_GPU_C1_PROBE (debugging): for programs translated with raw
         // pointers, the words c1 could hold (the stage's constants, each
         // pushed root table, the first bound uniform buffers), every 300th
         // present.
         if super::debug_var_os("ECHORA_GPU_C1_PROBE").is_some()
             && self.presented_frames.is_multiple_of(300)
-            && self.gpu.as_ref().unwrap().native_programs.contains(&key.0)
+            && self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .native_programs
+                .contains(&code_key)
         {
             let words = |bytes: &[u8]| -> Vec<String> {
                 bytes
@@ -4504,12 +4587,12 @@ impl Nvn {
                     .map(|word| format!("{:#x}", u64::from_le_bytes(*word)))
                     .collect()
             };
-            let constants = self.stage_constants(core, 5).unwrap_or_default();
+            let constants = constants.as_deref().unwrap_or_default();
             eprintln!(
                 "c1probe present {} {:016x} constants {:?}",
                 self.presented_frames,
-                key.0,
-                words(&constants)
+                code_key,
+                words(constants)
             );
             for (table, root) in self.render.roots[1].iter().enumerate().take(4) {
                 let bytes: Vec<u8> = root[..8]
@@ -4529,7 +4612,7 @@ impl Nvn {
         if super::debug_var("ECHORA_GPU_SKIP_DISPATCH").is_ok_and(|skipped| {
             skipped
                 .split(',')
-                .any(|skip| skip == format!("{:016x}", key.0))
+                .any(|skip| skip == format!("{:016x}", code_key))
         }) {
             return Ok(());
         }
@@ -4550,7 +4633,7 @@ impl Nvn {
                 .collect();
             format!(
                 "program {:#x} uses [{}], bound [{}]",
-                key.0,
+                code_key,
                 descriptors.join(" "),
                 bound.join(" ")
             )
@@ -4693,7 +4776,12 @@ impl Nvn {
                         // A raw pointer candidate (the program picks among
                         // them by address): one that maps nowhere binds
                         // zeros it never selects.
-                        _ if native => match self.native_pointer(core, descriptor, &c0)? {
+                        _ if native => match self.native_pointer(
+                            core,
+                            descriptor,
+                            &c0,
+                            constants.as_deref().unwrap_or_default(),
+                        )? {
                             Some(found) => found,
                             None => {
                                 storage.insert(descriptor.binding, vec![0; 16]);
@@ -4760,7 +4848,7 @@ impl Nvn {
                     {
                         eprintln!(
                             "storage write present {} dispatch {:016x} binding {} gpu {gpu:#x}+{size:#x}",
-                            self.presented_frames, key.0, descriptor.binding
+                            self.presented_frames, code_key, descriptor.binding
                         );
                     }
                     if descriptor.cbuf_index == 0 && !native {
@@ -4773,13 +4861,13 @@ impl Nvn {
                     // storage buffer that program binds, its flags and the
                     // path it takes, at every 300th present.
                     let probing = super::debug_var("ECHORA_GPU_STORAGE_PROBE")
-                        .is_ok_and(|probe| probe == format!("{:016x}", key.0))
+                        .is_ok_and(|probe| probe == format!("{:016x}", code_key))
                         && self.presented_frames.is_multiple_of(300);
                     if probing {
                         eprintln!(
                             "probe present {} {:016x} binding {} c{}+{:#x} gpu {gpu:#x} size {size:#x} flags {:#x}",
                             self.presented_frames,
-                            key.0,
+                            code_key,
                             descriptor.binding,
                             descriptor.cbuf_index,
                             descriptor.cbuf_offset,
@@ -4965,7 +5053,7 @@ impl Nvn {
                 DescriptorKind::UniformBuffer if descriptor.index == 1 => {
                     // Only the constants themselves: reads past them return
                     // zeros (robust buffer access).
-                    let mut bytes = self.stage_constants(core, 5).unwrap_or_default();
+                    let mut bytes = constants.clone().unwrap_or_default();
                     bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                     uniforms.insert(descriptor.binding, bytes);
                 }
@@ -4993,7 +5081,7 @@ impl Nvn {
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let line = format!(
                 "flow dispatch {:016x} reads {} writes {} storage {} flags {:?}",
-                key.0,
+                code_key,
                 self.describe_sources(textures.values().map(|(source, _)| source)),
                 self.describe_targets(images.values().map(|(key, _)| *key)),
                 storage.len(),
@@ -5022,7 +5110,7 @@ impl Nvn {
                     .collect();
                 let line = format!(
                     "flow dispatch {:016x} uniform {binding} [{}]",
-                    key.0,
+                    code_key,
                     words.join(" ")
                 );
                 self.sequence_note(&line);
@@ -5035,7 +5123,7 @@ impl Nvn {
         if let Ok(wanted) = super::debug_var("ECHORA_DISPATCH_SOURCE_LOG") {
             if wanted
                 .split(',')
-                .any(|item| item.trim() == format!("{:016x}", key.0))
+                .any(|item| item.trim() == format!("{:016x}", code_key))
             {
                 let mut bound: Vec<_> = textures.iter().collect();
                 bound.sort_by_key(|(binding, _)| **binding);
@@ -5062,7 +5150,7 @@ impl Nvn {
                 eprintln!(
                     "dispatch sources present {} {:016x}: reads {} writes {}",
                     self.presented_frames,
-                    key.0,
+                    code_key,
                     reads.join(", "),
                     self.describe_targets(image_keys.iter().copied())
                 );
@@ -5070,7 +5158,7 @@ impl Nvn {
             for target in &image_keys {
                 let storage = self.texture_storage(*target).unwrap_or(0);
                 self.target_writers
-                    .insert(*target, (key.0, self.presented_frames, storage));
+                    .insert(*target, (code_key, self.presented_frames, storage));
             }
         }
         let images_written = image_keys.clone();
@@ -5118,7 +5206,7 @@ impl Nvn {
             super::debug_var_os("ECHORA_DUMP_DIR"),
         ) && wanted
             .split(',')
-            .any(|item| item.trim() == format!("{:016x}", key.0))
+            .any(|item| item.trim() == format!("{:016x}", code_key))
             && super::debug_var("ECHORA_DUMP_DISPATCH_FROM")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -5130,7 +5218,7 @@ impl Nvn {
             while directory
                 .join(format!(
                     "uniforms-{:016x}-{}-{index}-0.bin",
-                    key.0, self.presented_frames
+                    code_key, self.presented_frames
                 ))
                 .exists()
             {
@@ -5140,7 +5228,7 @@ impl Nvn {
                 let _ = std::fs::write(
                     directory.join(format!(
                         "uniforms-{:016x}-{}-{index}-{binding}.bin",
-                        key.0, self.presented_frames
+                        code_key, self.presented_frames
                     )),
                     bytes,
                 );
@@ -5149,7 +5237,7 @@ impl Nvn {
             let _ = std::fs::write(
                 directory.join(format!(
                     "uniforms-{:016x}-{}-{index}-0.bin",
-                    key.0, self.presented_frames
+                    code_key, self.presented_frames
                 )),
                 uniforms.get(&0).map_or(&[][..], |bytes| &bytes[..]),
             );
@@ -5170,7 +5258,7 @@ impl Nvn {
         };
         // The program, specialized for what is bound: an IntegerFormat
         // constant is 1 when its binding's image or texture is integer. Each
-        // combination is its own program (key.1 holds the values as bits).
+        // combination has its own program for this exact translation.
         let backend = self.gpu.as_mut().unwrap();
         let mut specialization = Vec::new();
         for constant in &stage.spec_constants {
@@ -5181,14 +5269,14 @@ impl Nvn {
                 // ECHORA_LOOP_TRACE: the program's counter buffer, 64 KiB.
                 meaning @ (echora_shader_abi::SpecMeaning::LoopTraceLow
                 | echora_shader_abi::SpecMeaning::LoopTraceHigh) => {
-                    let address = match backend.loop_traces.get(&key.0) {
+                    let address = match backend.loop_traces.get(&code_key) {
                         Some(&(_, address, _)) => address,
                         None => {
                             let (index, address) = backend.renderer.debug_buffer(64 << 10)?;
                             backend
                                 .renderer
-                                .mark_loop_trace(index, format!("dispatch {:016x}", key.0));
-                            backend.loop_traces.insert(key.0, (index, address, 0));
+                                .mark_loop_trace(index, format!("dispatch {:016x}", code_key));
+                            backend.loop_traces.insert(code_key, (index, address, 0));
                             address
                         }
                     };
@@ -5219,32 +5307,28 @@ impl Nvn {
         if specialization.len() > 32 {
             return Err(format!("{} spec constants", specialization.len()));
         }
-        let key = if specialization.is_empty() {
-            key
-        } else {
-            let bits = specialization
-                .iter()
-                .enumerate()
-                .fold(0u64, |bits, (index, (_, value))| {
-                    bits | u64::from(*value != 0) << index
-                });
-            (key.0, 1 << 63 | bits)
-        };
-        if !backend.programs.contains_key(&key) {
+        let specialization_bits = specialization
+            .iter()
+            .enumerate()
+            .fold(0u64, |bits, (index, (_, value))| {
+                bits | u64::from(*value != 0) << index
+            });
+        let program_key = (Arc::as_ptr(&stage) as usize, specialization_bits);
+        if !backend.compute_programs.contains_key(&program_key) {
             // ECHORA_SHADER_STATS (debugging): which program compiles next,
             // for the driver's statistics (RADV_DEBUG=shaderstats) that follow.
             if super::debug_var_os("ECHORA_SHADER_STATS").is_some() {
-                eprintln!("shader stats: dispatch {:016x}", key.0);
+                eprintln!("shader stats: dispatch {:016x}", code_key);
             }
             let program = backend
                 .renderer
                 .create_program_specialized(vec![stage.clone()], &[specialization])?;
-            backend.programs.insert(key, program);
+            backend.compute_programs.insert(program_key, program);
         }
         // Every 60 presents, a traced program's loops that ran: for loop k,
         // total iterations, the most one invocation made, invocations the
         // budget stopped, and the header's guest offset.
-        if let Some(&(index, address, reported)) = backend.loop_traces.get(&key.0)
+        if let Some(&(index, address, reported)) = backend.loop_traces.get(&code_key)
             && self.presented_frames >= reported + 60
         {
             let words: Vec<u32> = backend
@@ -5258,7 +5342,7 @@ impl Nvn {
                     eprintln!(
                         "loop trace present {} program {:016x} loop {loop_index} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
                         self.presented_frames,
-                        key.0,
+                        code_key,
                         entry[3].wrapping_sub(1),
                         entry[0],
                         entry[1],
@@ -5268,11 +5352,11 @@ impl Nvn {
             }
             backend
                 .loop_traces
-                .insert(key.0, (index, address, self.presented_frames));
+                .insert(code_key, (index, address, self.presented_frames));
         }
         // The GPU page table, for programs that read global memory through
         // it.
-        let page_table = if self.gpu.as_ref().unwrap().programs[&key]
+        let page_table = if self.gpu.as_ref().unwrap().compute_programs[&program_key]
             .stages
             .iter()
             .any(|stage| stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0)
@@ -5284,7 +5368,7 @@ impl Nvn {
         // Only a program that stores through the table makes later CPU
         // reads wait (one that only reads it, the translator says, does not).
         let writes_page_table = page_table.address != 0
-            && self.gpu.as_ref().unwrap().programs[&key]
+            && self.gpu.as_ref().unwrap().compute_programs[&program_key]
                 .stages
                 .iter()
                 .any(|stage| {
@@ -5323,26 +5407,26 @@ impl Nvn {
             let wanted = keys
                 .to_string_lossy()
                 .split(',')
-                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(key.0));
+                .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(code_key));
             // ECHORA_DUMP_DISPATCH_FROM=N: from present N on (a temporal
             // pass's live frame, not its first run).
             let from = super::debug_var("ECHORA_DUMP_DISPATCH_FROM")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
-            if wanted && self.presented_frames >= from && self.dumped_dispatches.insert(key.0) {
+            if wanted && self.presented_frames >= from && self.dumped_dispatches.insert(code_key) {
                 let groups = [command.x[1], command.x[2], command.x[3]].map(|count| count as u32);
                 if let Err(error) = self.dump_dispatch(
                     core,
-                    key.0,
+                    code_key,
                     &stage,
                     groups,
                     &uniforms,
                     &storage_ranges,
                     page_table,
                 ) {
-                    eprintln!("dispatch dump {:016x}: {error}", key.0);
-                    self.gpu_note(format!("dispatch dump {:016x}: {error}", key.0));
+                    eprintln!("dispatch dump {:016x}: {error}", code_key);
+                    self.gpu_note(format!("dispatch dump {:016x}: {error}", code_key));
                 }
                 let read: Vec<(u32, TextureSource)> =
                     textures
@@ -5354,12 +5438,12 @@ impl Nvn {
                         .collect();
                 eprintln!(
                     "dispatch dump {:016x}: {} textures and images to read",
-                    key.0,
+                    code_key,
                     read.len()
                 );
-                if let Err(error) = self.dump_images(key.0, &read) {
-                    eprintln!("dispatch dump {:016x} images: {error}", key.0);
-                    self.gpu_note(format!("dispatch dump {:016x} images: {error}", key.0));
+                if let Err(error) = self.dump_images(code_key, &read) {
+                    eprintln!("dispatch dump {:016x} images: {error}", code_key);
+                    self.gpu_note(format!("dispatch dump {:016x} images: {error}", code_key));
                 }
             }
             // ECHORA_DUMP_ONLY: listed programs are dumped, never run.
@@ -5381,7 +5465,7 @@ impl Nvn {
         };
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
-            program: &backend.programs[&key],
+            program: &backend.compute_programs[&program_key],
             groups,
             uniforms,
             storage,
@@ -5403,7 +5487,7 @@ impl Nvn {
             let label = format!(
                 "present {} dispatch {:016x} groups {} reads [{}] writes {:x?}",
                 self.presented_frames,
-                key.0,
+                code_key,
                 match dispatch.indirect {
                     Some(_) => format!("indirect at {:#x}", command.x[1]),
                     None => format!("{:?}", dispatch.groups),
@@ -5428,7 +5512,7 @@ impl Nvn {
         if super::debug_var_os("ECHORA_TARGET_TRACE").is_some()
             || super::debug_var_os("ECHORA_MEMORY_TRACE").is_some()
         {
-            let label = format!("dispatch {:016x}", key.0);
+            let label = format!("dispatch {:016x}", code_key);
             self.trace_targets(&images_written, &[], &label)?;
             if let Err(error) = self.trace_memory(core, &label) {
                 eprintln!("memory trace: {error}");
@@ -5455,7 +5539,7 @@ impl Nvn {
                 *token,
                 guest..guest + length,
                 binding,
-                key.0,
+                code_key,
                 base,
             ));
         }
@@ -10459,6 +10543,7 @@ mod range_tests {
 struct PointerProbe<'a, 'g> {
     nvn: &'a Nvn,
     core: &'a Guest<'g>,
+    c1: &'a [u8],
 }
 
 impl PointerProbe<'_, '_> {
@@ -10468,7 +10553,7 @@ impl PointerProbe<'_, '_> {
         let mut word = [0u8; 8];
         match index {
             0 | 2 => return None,
-            1 => word.copy_from_slice(self.nvn.stage_constants(self.core, 5)?.get(at..at + 8)?),
+            1 => word.copy_from_slice(self.c1.get(at..at + 8)?),
             index => {
                 let bind = self
                     .nvn

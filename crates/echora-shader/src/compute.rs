@@ -22,6 +22,7 @@ use echora_shader_abi::{ABI_VERSION, Descriptor, Stage, Translated, Unsupported}
 use crate::decode::{
     Combine, FloatCompare, FloatModes, Instruction, IntCompare, Op, Operand, Pred, Src,
 };
+use crate::jump_tables::JumpTargets;
 use crate::spirv::{
     self, Function, Module, Type, capability, decoration, execution, glsl, op, storage,
 };
@@ -96,7 +97,7 @@ fn unsupported(index: usize, reason: impl Into<String>) -> Unsupported {
     }
 }
 
-fn relative_target(index: usize, offset: i64, length: usize) -> Option<usize> {
+pub(crate) fn relative_target(index: usize, offset: i64, length: usize) -> Option<usize> {
     let next = i64::try_from(index + 1).ok()?;
     let bytes = next.checked_mul(16)?.checked_add(offset)?;
     if bytes < 0 || bytes % 16 != 0 {
@@ -108,7 +109,17 @@ fn relative_target(index: usize, offset: i64, length: usize) -> Option<usize> {
 
 /// Splits `code` into blocks.
 fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
+    blocks_for_targets(code, None)
+}
+
+fn blocks_for_targets(
+    code: &[Instruction],
+    targets: Option<&JumpTargets>,
+) -> Result<Vec<Block>, Unsupported> {
     let mut leaders = BTreeSet::from([0]);
+    if let Some(targets) = targets {
+        leaders.extend(targets.0.values().flatten().copied());
+    }
     for (index, instruction) in code.iter().enumerate() {
         match instruction.op {
             Op::Bra { offset, mode, .. } => {
@@ -237,7 +248,10 @@ pub fn translate_with_needs(
     code: &[Instruction],
     layout: &Layout,
 ) -> Result<(Translated, Needs), Unsupported> {
-    let emitter = emit(code, layout)?;
+    Ok(finish_with_needs(emit(code, layout)?))
+}
+
+fn finish_with_needs(emitter: Emitter) -> (Translated, Needs) {
     let needs = Needs {
         capabilities: emitter.module.capability_sites().to_vec(),
         store: emitter.module.store_site(),
@@ -245,7 +259,7 @@ pub fn translate_with_needs(
         txq_fallbacks: emitter.txq_fallbacks.clone(),
         dnz: emitter.dnz_counts,
     };
-    Ok((emitter.finish(), needs))
+    (emitter.finish(), needs)
 }
 
 /// A translation, the variables of its general registers and those of its
@@ -273,21 +287,33 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
         && !guest_lines()
         && let Some(inlined) = local_calls::inline_leaf(code)
         && let Ok(blocks) = blocks(&inlined)
-        && let Some(graph) = structure::Graph::new(&blocks)
+        && let Some(graph) = structure::Graph::new(&blocks, None)
         && let Ok(emitter) = emit_blocks(&inlined, layout, &blocks, Some(&graph))
     {
         return Ok(emitter);
     }
     let blocks = blocks(code)?;
-    let graph = structure::Graph::new(&blocks);
+    let graph = structure::Graph::new(&blocks, None);
     emit_blocks(code, layout, &blocks, graph.as_ref())
+}
+
+pub(crate) fn translate_with_jump_targets(
+    code: &[Instruction],
+    layout: &Layout,
+    targets: &JumpTargets,
+) -> Option<(Translated, Needs)> {
+    let blocks = blocks_for_targets(code, Some(targets)).ok()?;
+    let graph = structure::Graph::new(&blocks, Some(targets))?;
+    Some(finish_with_needs(
+        emit_blocks(code, layout, &blocks, Some(&graph)).ok()?,
+    ))
 }
 
 fn emit_blocks(
     code: &[Instruction],
     layout: &Layout,
     blocks: &[Block],
-    graph: Option<&structure::Graph>,
+    graph: Option<&structure::Graph<'_>>,
 ) -> Result<Emitter, Unsupported> {
     let mut emitter = Emitter::new(layout);
     emitter.hmma_pairs = matrix::pairs(code, blocks);
@@ -338,6 +364,8 @@ mod fetch;
 mod half;
 mod image;
 mod io;
+#[cfg(test)]
+mod jump_tests;
 mod local_calls;
 pub(crate) mod matrix;
 mod memory;

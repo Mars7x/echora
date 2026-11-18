@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 use echora_shader_abi::Unsupported;
 
 use super::{Block, Emitter, End, Guard, loop_budget};
-use crate::decode::{Instruction, Op};
+use crate::decode::{Instruction, Op, Src};
+use crate::jump_tables::JumpTargets;
 use crate::spirv::{self, op};
 
 /// A structured statement.
@@ -35,6 +36,11 @@ enum Statement {
         condition: Guard,
         then: Box<Statement>,
         otherwise: Box<Statement>,
+    },
+    Switch {
+        selector: Src,
+        instruction: usize,
+        arms: Vec<(u32, Statement)>,
     },
     /// Construct `id`, run once; an exit from it continues after it.
     Block {
@@ -56,7 +62,8 @@ enum Statement {
 }
 
 /// The graph of a program's blocks.
-pub(super) struct Graph {
+pub(super) struct Graph<'a> {
+    targets: Option<&'a JumpTargets>,
     /// Reverse postorder numbers (`usize::MAX`: unreachable).
     rpo: Vec<usize>,
     loop_header: Vec<bool>,
@@ -72,10 +79,10 @@ enum Frame {
     BlockFollowedBy(usize, usize),
 }
 
-impl Graph {
+impl<'a> Graph<'a> {
     /// The graph, or `None` for an irreducible one or one with computed
     /// branches.
-    pub(super) fn new(blocks: &[Block]) -> Option<Self> {
+    pub(super) fn new(blocks: &[Block], targets: Option<&'a JumpTargets>) -> Option<Self> {
         let index_of: BTreeMap<usize, usize> = blocks
             .iter()
             .enumerate()
@@ -104,7 +111,19 @@ impl Graph {
                         next.into_iter().collect()
                     }
                 }
-                End::Indirect { .. } => return None,
+                End::Indirect { condition, .. } => {
+                    let known = targets?.0.get(&block.body_end)?;
+                    let mut edges = known
+                        .iter()
+                        .map(|target| index_of.get(target).copied())
+                        .collect::<Option<Vec<_>>>()?;
+                    if !condition.always() {
+                        edges.extend(next);
+                    }
+                    edges.sort_unstable();
+                    edges.dedup();
+                    edges
+                }
             };
         }
         // Reverse postorder from the entry.
@@ -199,6 +218,7 @@ impl Graph {
             children[idom[node]].push(node);
         }
         Some(Self {
+            targets,
             rpo,
             loop_header,
             merge,
@@ -209,7 +229,7 @@ impl Graph {
 
 /// Translates a graph into statements.
 struct Builder<'a> {
-    graph: &'a Graph,
+    graph: &'a Graph<'a>,
     blocks: &'a [Block],
     index_of: BTreeMap<usize, usize>,
     context: Vec<Frame>,
@@ -312,7 +332,34 @@ impl Builder<'_> {
                     }
                 }
             }
-            End::Indirect { .. } => Statement::Return(None),
+            End::Indirect { target, condition } => {
+                let instruction = self.blocks[x].body_end;
+                let targets =
+                    &self.graph.targets.expect("proved indirect branches").0[&instruction];
+                let arms = targets
+                    .iter()
+                    .map(|&target| {
+                        (
+                            target as u32 * 16,
+                            self.branch(x, Some(self.index_of[&target])),
+                        )
+                    })
+                    .collect();
+                let selected = Statement::Switch {
+                    selector: target,
+                    instruction,
+                    arms,
+                };
+                if condition.always() {
+                    selected
+                } else {
+                    Statement::If {
+                        condition,
+                        then: Box::new(selected),
+                        otherwise: Box::new(self.branch(x, next)),
+                    }
+                }
+            }
         }
     }
 }
@@ -357,7 +404,7 @@ impl Emitter {
         &mut self,
         code: &[Instruction],
         blocks: &[Block],
-        graph: &Graph,
+        graph: &Graph<'_>,
     ) -> Result<(), Unsupported> {
         let mut builder = Builder {
             graph,
@@ -524,6 +571,34 @@ impl Emitter {
                 self.dominators.pop();
                 done?;
                 // Both arms leave: the merge is never reached.
+                self.function.label(merge);
+                self.function.emit(op::UNREACHABLE, &[]);
+            }
+            Statement::Switch {
+                selector,
+                instruction,
+                arms,
+            } => {
+                let value = self.source(*instruction, *selector)?;
+                let (default, merge) = (self.module.id(), self.module.id());
+                let labels: Vec<_> = arms.iter().map(|_| self.module.id()).collect();
+                let mut operands = vec![value, default];
+                for (&label, (literal, _)) in labels.iter().zip(arms) {
+                    operands.extend([*literal, label]);
+                }
+                self.function
+                    .emit(op::SELECTION_MERGE, &[merge, spirv::NONE]);
+                self.function.emit(op::SWITCH, &operands);
+                self.dominators.push(self.function.block());
+                for (&label, (_, arm)) in labels.iter().zip(arms) {
+                    self.function.label(label);
+                    self.statement(code, blocks, arm, state)?;
+                }
+                // The dispatch's bound constant bytes only give the proved
+                // destinations. The switch must still have a default label.
+                self.function.label(default);
+                self.leave();
+                self.dominators.pop();
                 self.function.label(merge);
                 self.function.emit(op::UNREACHABLE, &[]);
             }

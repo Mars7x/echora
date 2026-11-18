@@ -10,6 +10,7 @@ pub mod compute;
 pub mod decode;
 pub mod handle_reads;
 pub mod header;
+pub mod jump_tables;
 pub mod requirements;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
@@ -61,6 +62,27 @@ pub fn translate_with_needs(
     program: &[u8],
     parameters: &Parameters,
     options: &Options,
+) -> Result<(Translated, compute::Needs), Unsupported> {
+    translate_with_constants(program, parameters, options, None)
+}
+
+/// Translate computed jumps against the same constant bank the caller will
+/// bind to every dispatch using this translation.
+pub fn translate_with_compute_constants(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+    constants: &[u8],
+) -> Result<Translated, Unsupported> {
+    translate_with_constants(program, parameters, options, Some(constants))
+        .map(|(translated, _)| translated)
+}
+
+fn translate_with_constants(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+    constants: Option<&[u8]>,
 ) -> Result<(Translated, compute::Needs), Unsupported> {
     let mesh = match parameters.stage_slot {
         None => None,
@@ -145,6 +167,13 @@ pub fn translate_with_needs(
         denorm_flush_32: options.denorm_flush_32,
         dual_source_blend: false,
     };
+    if let Some(constants) = constants
+        && let Some(tables) = jump_tables::JumpTables::analyze(&code)
+        && let Some(targets) = tables.resolve(constants)
+        && let Some(translation) = compute::translate_with_jump_targets(&code, &layout, &targets)
+    {
+        return Ok(translation);
+    }
     compute::translate_with_needs(&code, &layout)
 }
 

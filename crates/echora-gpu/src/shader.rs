@@ -6,6 +6,7 @@
 use std::ffi::c_void;
 
 pub use echora_shader::handle_reads;
+pub use echora_shader::jump_tables::{JumpTables, JumpTargets};
 pub use echora_shader_abi::{
     ABI_VERSION, Descriptor, DescriptorKind, MeshParameters, PUSH_TRANSLATOR, Stage, Translated,
 };
@@ -110,13 +111,26 @@ pub fn translate_rust(
     program: &[u8],
     parameters: &Parameters,
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
+    translate_rust_with_compute_constants(program, parameters, None)
+}
+
+pub fn translate_rust_with_compute_constants(
+    program: &[u8],
+    parameters: &Parameters,
+    constants: Option<&[u8]>,
+) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
         vertex_trace: parameters.vertex_trace,
         ..Default::default()
     };
-    let translated =
-        echora_shader::translate_with_options(program, &abi_parameters(parameters), &options)?;
+    let parameters = abi_parameters(parameters);
+    let translated = match constants {
+        Some(bytes) => {
+            echora_shader::translate_with_compute_constants(program, &parameters, &options, bytes)
+        }
+        None => echora_shader::translate_with_options(program, &parameters, &options),
+    }?;
     if translated.abi_version != ABI_VERSION {
         return Err(echora_shader_abi::Unsupported {
             reason: format!(
