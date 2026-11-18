@@ -3543,14 +3543,40 @@ impl Nvn {
                 None => out.fill(0),
             }
         };
-        let mut texels = Vec::new();
-        let mut levels = Vec::new();
-        for level in 0..level_count {
-            let (level_width, level_height, level_depth) = (
+        let extent_at = |level: u32| {
+            [
                 (width >> level).max(1),
                 (height >> level).max(1),
                 (depth >> level).max(1),
-            );
+            ]
+        };
+        let layer_bytes = |[w, h, d]: [u32; 3]| {
+            let (columns, rows, block_bytes) = if astc {
+                (w, h, 4)
+            } else {
+                (
+                    w.div_ceil(info.block_width),
+                    h.div_ceil(info.block_height),
+                    block,
+                )
+            };
+            (columns as usize)
+                .checked_mul(rows as usize)?
+                .checked_mul(d as usize)?
+                .checked_mul(block_bytes)
+        };
+        let upload_bytes = (0..level_count)
+            .try_fold(0usize, |total, level| {
+                total.checked_add(layer_bytes(extent_at(level))?.checked_mul(layers as usize)?)
+            })
+            .ok_or("texture upload size overflow")?;
+        let mut texels = Vec::new();
+        texels
+            .try_reserve_exact(upload_bytes)
+            .map_err(|err| format!("texture upload: {err}"))?;
+        let mut levels = Vec::with_capacity(level_count as usize * layers as usize);
+        for level in 0..level_count {
+            let [level_width, level_height, level_depth] = extent_at(level);
             let (columns, rows) = (
                 level_width.div_ceil(info.block_width),
                 level_height.div_ceil(info.block_height),
@@ -3561,121 +3587,110 @@ impl Nvn {
             let level_shape =
                 crate::nvn_format::level_block_shape(info, height, depth, layout, level);
             let row_bytes = columns as usize * block;
-            for layer in 0..layers {
-                let layer_base = u64::from(layer) * layer_stride + level_offset;
-                let slice_bytes = row_bytes * rows as usize;
-                let mut data = vec![0u8; slice_bytes * level_depth as usize];
+            let slice_bytes = row_bytes * rows as usize;
+            let gather_layer = |layer: usize, data: &mut [u8]| {
+                let layer_base = layer as u64 * layer_stride + level_offset;
                 if let Some(rows) = copied.as_ref().filter(|rows| rows.len() == data.len()) {
                     data.copy_from_slice(rows);
-                } else {
-                    for z in 0..level_depth {
-                        for row in 0..rows {
-                            let line = &mut data
-                                [z as usize * slice_bytes + row as usize * row_bytes..]
-                                [..row_bytes];
-                            if stride != 0 {
-                                copy_block(line, u64::from(row) * stride);
-                                continue;
+                    return;
+                }
+                for z in 0..level_depth {
+                    for row in 0..rows {
+                        let from = z as usize * slice_bytes + row as usize * row_bytes;
+                        let line = &mut data[from..from + row_bytes];
+                        if stride != 0 {
+                            copy_block(line, u64::from(row) * stride);
+                            continue;
+                        }
+                        // Blocks dividing 16 bytes: the row's 16-byte runs.
+                        if 16 % block == 0 {
+                            for (start, offset) in crate::nvn_format::block_linear_row_runs(
+                                info,
+                                level_width,
+                                level_height,
+                                level_shape,
+                                row,
+                                z,
+                            ) {
+                                let start = start as usize;
+                                let end = (start + 16).min(row_bytes);
+                                copy_block(&mut line[start..end], layer_base + offset);
                             }
-                            // Blocks dividing 16 bytes: the row's 16-byte runs.
-                            if 16 % block == 0 {
-                                for (start, offset) in crate::nvn_format::block_linear_row_runs(
-                                    info,
-                                    level_width,
-                                    level_height,
-                                    level_shape,
-                                    row,
-                                    z,
-                                ) {
-                                    let start = start as usize;
-                                    let end = (start + 16).min(row_bytes);
-                                    copy_block(&mut line[start..end], layer_base + offset);
-                                }
-                                continue;
-                            }
-                            // A run of blocks at consecutive addresses at a time.
-                            let mut column = 0;
-                            while column < columns {
-                                let run = crate::nvn_format::block_linear_run(info, column)
-                                    .min(columns - column);
-                                let offset = crate::nvn_format::block_linear_offset_in(
-                                    info,
-                                    level_width,
-                                    level_height,
-                                    level_shape,
-                                    column,
-                                    row,
-                                    z,
-                                );
-                                copy_block(
-                                    &mut line[column as usize * block..][..run as usize * block],
-                                    layer_base + offset,
-                                );
-                                column += run;
-                            }
+                            continue;
+                        }
+                        // Copy complete blocks at consecutive storage addresses.
+                        let mut column = 0;
+                        while column < columns {
+                            let run = crate::nvn_format::block_linear_run(info, column)
+                                .min(columns - column);
+                            let offset = crate::nvn_format::block_linear_offset_in(
+                                info,
+                                level_width,
+                                level_height,
+                                level_shape,
+                                column,
+                                row,
+                                z,
+                            );
+                            copy_block(
+                                &mut line[column as usize * block..][..run as usize * block],
+                                layer_base + offset,
+                            );
+                            column += run;
                         }
                     }
                 }
-                let offset = texels.len();
-                let upload = if astc {
-                    let bytes =
-                        level_width as usize * level_height as usize * level_depth as usize * 4;
-                    texels.resize(offset + bytes, 0);
-                    crate::nvn_format::decode_astc(
-                        &data,
-                        &mut texels[offset..],
-                        level_width,
-                        level_height,
-                        level_depth,
-                        info,
-                    )
-                    .map_err(|error| format!("ASTC decode: {error}"))?;
-                    &texels[offset..]
-                } else {
-                    &data
-                };
-                // ECHORA_GPU_TEXTURE_DUMP=<dir> (debugging): the base level
-                // of large 4-byte 2D textures, as last uploaded.
-                if let Some(directory) = super::debug_var_os("ECHORA_GPU_TEXTURE_DUMP") {
-                    let path = std::path::Path::new(&directory).join(format!(
-                        "tex-{base:x}-{level_width}x{level_height}-{}.ppm",
-                        info.name
-                    ));
-                    if level == 0
-                        && layer == 0
-                        && block == 4
-                        && level_depth == 1
-                        && level_width >= 512
-                    {
-                        let mut ppm =
-                            format!("P6\n{level_width} {level_height}\n255\n").into_bytes();
-                        for texel in upload.as_chunks::<4>().0 {
-                            ppm.extend_from_slice(&texel[..3]);
-                        }
-                        let _ = std::fs::write(&path, ppm);
-                        let mut pgm =
-                            format!("P5\n{level_width} {level_height}\n255\n").into_bytes();
-                        pgm.extend(upload.as_chunks::<4>().0.iter().map(|texel| texel[3]));
-                        let _ = std::fs::write(path.with_extension("alpha.pgm"), pgm);
-                    }
-                    // Compressed (16-byte block) textures: the untiled
-                    // blocks, to compare with a reference capture.
-                    if level == 0 && layer == 0 && block == 16 && level_width >= 512 {
-                        let _ = std::fs::write(path.with_extension("bin"), upload);
-                    }
-                }
-                levels.push(UploadRegion {
-                    level,
-                    layer,
-                    width: level_width,
-                    height: level_height,
-                    depth: level_depth,
-                    offset: offset as u64,
-                });
-                if !astc {
-                    texels.extend_from_slice(&data);
+            };
+            let offset = texels.len();
+            let length = layer_bytes([level_width, level_height, level_depth])
+                .expect("the size of each mip was checked");
+            texels.resize(offset + length * layers as usize, 0);
+            let output = &mut texels[offset..];
+            if astc {
+                crate::nvn_format::decode_astc_layers(
+                    output,
+                    [level_width, level_height, level_depth],
+                    info,
+                    gather_layer,
+                )
+                .map_err(|error| format!("ASTC decode: {error}"))?;
+            } else {
+                for (layer, slice) in output.chunks_exact_mut(length).enumerate() {
+                    gather_layer(layer, slice);
                 }
             }
+            let upload = &output[..length];
+            // ECHORA_GPU_TEXTURE_DUMP=<dir> (debugging): the base level
+            // of large 4-byte 2D textures, as last uploaded.
+            if let Some(directory) = super::debug_var_os("ECHORA_GPU_TEXTURE_DUMP") {
+                let path = std::path::Path::new(&directory).join(format!(
+                    "tex-{base:x}-{level_width}x{level_height}-{}.ppm",
+                    info.name
+                ));
+                if level == 0 && block == 4 && level_depth == 1 && level_width >= 512 {
+                    let mut ppm = format!("P6\n{level_width} {level_height}\n255\n").into_bytes();
+                    for texel in upload.as_chunks::<4>().0 {
+                        ppm.extend_from_slice(&texel[..3]);
+                    }
+                    let _ = std::fs::write(&path, ppm);
+                    let mut pgm = format!("P5\n{level_width} {level_height}\n255\n").into_bytes();
+                    pgm.extend(upload.as_chunks::<4>().0.iter().map(|texel| texel[3]));
+                    let _ = std::fs::write(path.with_extension("alpha.pgm"), pgm);
+                }
+                // Compressed (16-byte block) textures: the untiled
+                // blocks, to compare with a reference capture.
+                if level == 0 && block == 16 && level_width >= 512 {
+                    let _ = std::fs::write(path.with_extension("bin"), upload);
+                }
+            }
+            levels.extend((0..layers).map(|layer| UploadRegion {
+                level,
+                layer,
+                width: level_width,
+                height: level_height,
+                depth: level_depth,
+                offset: (offset + layer as usize * length) as u64,
+            }));
         }
         // Content-keyed: guest writes that change the texels upload again.
         let generation = hash_bytes(&texels);

@@ -14,15 +14,13 @@
 //! emulators. The application writes pre-tiled packaged texture data into
 //! this storage, so sizes must match the hardware layout.
 
-/// Decode untiled ASTC into RGBA8. Large slices are divided at ASTC
-/// block rows, so each worker reads and writes independent byte ranges.
-pub(crate) fn decode_astc(
-    source: &[u8],
+/// Decode an ASTC mip's layers into consecutive RGBA8 images. Packed
+/// blocks are gathered from guest layout when each worker needs them.
+pub(crate) fn decode_astc_layers(
     destination: &mut [u8],
-    width: u32,
-    height: u32,
-    depth: u32,
+    extent: [u32; 3],
     info: FormatInfo,
+    gather: impl Fn(usize, &mut [u8]) + Sync,
 ) -> std::io::Result<()> {
     static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
@@ -30,9 +28,53 @@ pub(crate) fn decode_astc(
             .map_or(1, usize::from)
             .min(8)
     });
-    decode_astc_with_workers(source, destination, [width, height, depth], info, workers)
+    decode_astc_layers_with_workers(destination, extent, info, workers, gather)
 }
 
+fn decode_astc_layers_with_workers(
+    destination: &mut [u8],
+    extent: [u32; 3],
+    info: FormatInfo,
+    workers: usize,
+    gather: impl Fn(usize, &mut [u8]) + Sync,
+) -> std::io::Result<()> {
+    let [width, height, depth] = extent;
+    let packed = width.div_ceil(info.block_width) as usize
+        * height.div_ceil(info.block_height) as usize
+        * depth as usize
+        * 16;
+    let rgba = width as usize * height as usize * depth as usize * 4;
+    let layers = destination.len() / rgba;
+    debug_assert_eq!(layers * rgba, destination.len());
+    let decode = |first, output: &mut [u8], row_workers| {
+        // Each worker reuses the temporary packed buffer across layers.
+        let mut blocks = vec![0; packed];
+        for (index, layer) in output.chunks_exact_mut(rgba).enumerate() {
+            gather(first + index, &mut blocks);
+            decode_astc_with_workers(&blocks, layer, extent, info, row_workers)?;
+        }
+        Ok(())
+    };
+    let layer_workers = workers
+        .min(layers)
+        .min((packed * layers).div_ceil(256 << 10));
+    if layer_workers <= 1 {
+        return decode(0, destination, workers);
+    }
+    let group = layers.div_ceil(layer_workers);
+    std::thread::scope(|scope| {
+        let mut chunks = destination.chunks_mut(group * rgba);
+        let first = chunks.next().unwrap();
+        let jobs: Vec<_> = chunks
+            .enumerate()
+            .map(|(index, chunk)| scope.spawn(move || decode((index + 1) * group, chunk, 1)))
+            .collect();
+        decode(0, first, 1)?;
+        jobs.into_iter().try_for_each(|job| job.join().unwrap())
+    })
+}
+
+/// Large individual slices still split into independent ASTC block rows.
 fn decode_astc_with_workers(
     source: &[u8],
     destination: &mut [u8],
@@ -687,6 +729,31 @@ mod tests {
         decode_astc_with_workers(&source, &mut single, extent, info, 1).unwrap();
         decode_astc_with_workers(&source, &mut parallel, extent, info, 4).unwrap();
         assert_eq!(single, parallel);
+    }
+
+    #[test]
+    fn astc_array_workers_preserve_layer_order_at_partial_blocks() {
+        let info = f("ASTC", 5, 4, 16);
+        let extent = [321, 241, 1];
+        let layer_bytes = extent[0] as usize * extent[1] as usize * 4;
+        let layers = 12;
+        let gather = |layer: usize, out: &mut [u8]| {
+            for (index, block) in out.chunks_exact_mut(16).enumerate() {
+                block[..8].copy_from_slice(&[0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+                let color = [layer as u8, index as u8, (index >> 8) as u8, 255];
+                for (word, channel) in block[8..].chunks_exact_mut(2).zip(color) {
+                    word.fill(channel);
+                }
+            }
+        };
+        let mut serial = vec![0; layers * layer_bytes];
+        let mut parallel = serial.clone();
+        decode_astc_layers_with_workers(&mut serial, extent, info, 1, gather).unwrap();
+        decode_astc_layers_with_workers(&mut parallel, extent, info, 4, gather).unwrap();
+        assert_eq!(parallel, serial);
+        for (layer, bytes) in parallel.chunks_exact(layer_bytes).enumerate() {
+            assert_eq!(&bytes[..4], &[layer as u8, 0, 0, 255]);
+        }
     }
 
     #[test]
