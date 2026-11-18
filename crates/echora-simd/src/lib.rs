@@ -3685,22 +3685,50 @@ fn transfer_lanes<const BYTES: usize>(
 ) -> Result<u64, Trap> {
     let total = registers * BYTES;
     let register = |r: usize| (usize::from(rt) + r) % 32;
+    // A lane is aligned to its width and therefore lies in one 64-bit half.
+    let upper = shift & 64 != 0;
+    let shift = shift & 63;
+    let load_lane = |target: &mut u128, chunk: &[u8; BYTES]| {
+        let mut lane_bytes = [0; 8];
+        lane_bytes[..BYTES].copy_from_slice(chunk);
+        let mask = (u64::MAX >> (64 - BYTES * 8)) << shift;
+        let lane = u64::from_le_bytes(lane_bytes) << shift;
+        let mut low = *target as u64;
+        let mut high = (*target >> 64) as u64;
+        let half = if upper { &mut high } else { &mut low };
+        *half = (*half & !mask) | lane;
+        *target = u128::from(low) | (u128::from(high) << 64);
+    };
+    let store_lane = |source: u128| {
+        let half = if upper {
+            (source >> 64) as u64
+        } else {
+            source as u64
+        };
+        (half >> shift).to_le_bytes()
+    };
+    if registers == 1 {
+        let target = &mut cpu.vectors[register(0)];
+        if load {
+            let mut bytes = [0; BYTES];
+            memory.read(address, &mut bytes)?;
+            load_lane(target, &bytes);
+        } else {
+            memory.write(address, &store_lane(*target)[..BYTES])?;
+        }
+        return Ok(BYTES as u64);
+    }
     // At most one 64-bit lane from each of four registers.
     let mut bytes = [0u8; 32];
     let buffer = &mut bytes[..total];
     if load {
         memory.read(address, buffer)?;
-        let mask = ((1u128 << (BYTES * 8)) - 1) << shift;
         for (r, chunk) in buffer.as_chunks::<BYTES>().0.iter().enumerate() {
-            let mut lane = [0; 8];
-            lane[..BYTES].copy_from_slice(chunk);
-            let target = &mut cpu.vectors[register(r)];
-            *target = (*target & !mask) | (u128::from(u64::from_le_bytes(lane)) << shift);
+            load_lane(&mut cpu.vectors[register(r)], chunk);
         }
     } else {
         for (r, chunk) in buffer.as_chunks_mut::<BYTES>().0.iter_mut().enumerate() {
-            let lane = (cpu.vectors[register(r)] >> shift) as u64;
-            chunk.copy_from_slice(&lane.to_le_bytes()[..BYTES]);
+            chunk.copy_from_slice(&store_lane(cpu.vectors[register(r)])[..BYTES]);
         }
         memory.write(address, buffer)?;
     }
@@ -4286,6 +4314,58 @@ mod vector_tests {
         let mut out = [0u8; 32];
         memory.read(0x1100, &mut out).unwrap();
         assert_eq!(out.as_slice(), words.as_slice());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn structure_lane_transfer_preserves_the_other_lanes() {
+        let mut memory = Memory::new(0x20000);
+        memory
+            .map(0x1000, 0x2000, READ | WRITE, STATE_NORMAL, "data")
+            .unwrap();
+        let address = 0x1ff9;
+        let bytes: [u8; 32] = std::array::from_fn(|index| 0x80 | index as u8);
+        let mut view = memory.view();
+        for bits in [8, 16, 32, 64] {
+            let width = usize::from(bits / 8);
+            for index in 0..128 / bits {
+                for registers in 1..=4 {
+                    let mut cpu = Cpu {
+                        vectors: [0xf0de_bc9a_7856_3412_1234_5678_9abc_def0; 32],
+                        ..Cpu::default()
+                    };
+                    let mut expected = cpu.vectors;
+                    for r in 0..usize::from(registers) {
+                        let mut lane = [0; 8];
+                        lane[..width].copy_from_slice(&bytes[r * width..(r + 1) * width]);
+                        set_lane(
+                            &mut expected[(31 + r) % 32],
+                            u32::from(bits),
+                            u32::from(index),
+                            u64::from_le_bytes(lane),
+                        );
+                    }
+                    view.write(address, &bytes).unwrap();
+                    let size = transfer_single(
+                        &mut cpu, &mut view, address, 31, registers, bits, index, true,
+                    )
+                    .unwrap();
+                    assert_eq!(cpu.vectors, expected);
+                    view.write(address, &[0; 32]).unwrap();
+                    assert_eq!(
+                        transfer_single(
+                            &mut cpu, &mut view, address, 31, registers, bits, index, false,
+                        )
+                        .unwrap(),
+                        size
+                    );
+                    let mut stored = [0; 32];
+                    view.read(address, &mut stored).unwrap();
+                    assert_eq!(stored[..size as usize], bytes[..size as usize]);
+                    assert!(stored[size as usize..].iter().all(|&byte| byte == 0));
+                }
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", windows))]
