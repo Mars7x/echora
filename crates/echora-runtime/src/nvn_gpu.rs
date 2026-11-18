@@ -951,10 +951,7 @@ impl Nvn {
     ) -> Result<(), String> {
         // A texture object over one level of another target clears that
         // target's level, as draws into it render there.
-        let (texture, level) = match self.resolve_target(texture) {
-            Some((key, base)) if key != texture => (key, base + level),
-            _ => (texture, level),
-        };
+        let (texture, level) = self.resolve_color_target(texture, level)?;
         let started = std::time::Instant::now();
         self.ensure_render_target(texture)?;
         let ensured = std::time::Instant::now();
@@ -2841,6 +2838,10 @@ impl Nvn {
     /// texture object per level, as bloom chains use; levels above 0 as
     /// `mip_targets` allows).
     fn resolve_target(&self, texture: u64) -> Option<(u64, u32)> {
+        self.resolve_target_with_levels(texture, self.texture_levels(texture))
+    }
+
+    fn resolve_target_with_levels(&self, texture: u64, levels: u32) -> Option<(u64, u32)> {
         let renderer = &self.gpu.as_ref()?.renderer;
         // Its own format (or its sRGB twin): a texture object
         // reinterpreting the memory in another format (RGB9E5 over the HDR
@@ -2862,6 +2863,7 @@ impl Nvn {
         if renderer.existing_target(texture).is_some_and(|target| {
             (format.is_none() || same_format(target.format))
                 && extent.is_none_or(|extent| (target.width, target.height) == extent)
+                && target.levels >= levels
         }) {
             return Some((texture, 0));
         }
@@ -2877,7 +2879,9 @@ impl Nvn {
             let backend = self.gpu.as_ref()?;
             for &key in backend.target_index.get(&base).into_iter().flatten() {
                 if renderer.existing_target(key).is_some_and(|target| {
-                    (target.width, target.height) == extent && same_format(target.format)
+                    (target.width, target.height) == extent
+                        && same_format(target.format)
+                        && target.levels >= levels
                 }) {
                     return Some((key, 0));
                 }
@@ -2886,11 +2890,11 @@ impl Nvn {
                 .target_levels
                 .get(&base)?
                 .iter()
-                .find(|(key, _, level_extent)| {
+                .find(|(key, level, level_extent)| {
                     *level_extent == extent
-                        && renderer
-                            .existing_target(*key)
-                            .is_some_and(|target| same_format(target.format))
+                        && renderer.existing_target(*key).is_some_and(|target| {
+                            same_format(target.format) && target.levels - level >= levels
+                        })
                 })
                 .map(|&(key, level, _)| (key, level));
         }
@@ -2905,20 +2909,90 @@ impl Nvn {
             let Some(target_base) = self.texture_storage(key) else {
                 continue;
             };
-            if target_base == base && (target.width, target.height) == extent {
+            if target_base == base
+                && (target.width, target.height) == extent
+                && target.levels >= levels
+            {
                 return Some((key, 0));
             }
             if mip_match.is_some() || target.levels == 1 || base <= target_base {
                 continue;
             }
             for (level, offset, level_extent) in self.target_level_offsets(key, target) {
-                if target_base + offset == base && level_extent == extent {
+                if target_base + offset == base
+                    && level_extent == extent
+                    && target.levels - level >= levels
+                {
                     mip_match = Some((key, level));
                     break;
                 }
             }
         }
         mip_match
+    }
+
+    /// A renderable view of a compatible image covering the texture's
+    /// mip chain. When extending a same-layout image, keep the levels
+    /// already written through its shorter alias.
+    fn resolve_color_target(&mut self, texture: u64, level: u32) -> Result<(u64, u32), String> {
+        let levels = self.texture_levels(texture);
+        if let Some((key, base)) = self.resolve_target_with_levels(texture, levels) {
+            return Ok((key, base + level));
+        }
+        if levels > 1
+            && self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .existing_target(texture)
+                .is_none()
+            && let Some((alias, 0)) = self.resolve_target_with_levels(texture, 1)
+            && self.flat_alias_layout_matches(texture, alias)
+        {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .move_target(alias, texture)?;
+            self.ensure_render_target(texture)?;
+        }
+        Ok((texture, level))
+    }
+
+    /// The layouts that the renderer can extend in place: a single flat
+    /// surface with the same format, storage, stride and level-0 tiling.
+    fn flat_alias_layout_matches(&self, texture: u64, alias: u64) -> bool {
+        let Some(identity) = self.texture_identity(texture) else {
+            return false;
+        };
+        let Some(info) = crate::nvn_format::info(identity.1 as u32) else {
+            return false;
+        };
+        let shape = ImageShape::D2 { layers: 1 };
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        let Some(target) = renderer.existing_target(alias) else {
+            return false;
+        };
+        if target.shape != shape
+            || self.render_shape(texture) != shape
+            || self.texture_identity(alias) != Some(identity)
+            || Some(target.format) != vk_format(identity.1 as u32)
+        {
+            return false;
+        }
+        let layout = |key| -> Option<_> {
+            let props = &self.objects.get(&key)?.builder;
+            let value = |name| props.get(name).map_or(0, |args| args.x[0]);
+            let dims = [target.width, target.height, 1];
+            let layers =
+                super::texture_layout_layers(props, info, dims, 1, self.texture_levels(key));
+            let block = crate::nvn_format::base_block_shape(info, target.height, 1, layers);
+            Some((value("Stride"), value("Samples").max(1), block))
+        };
+        layout(texture)
+            .zip(layout(alias))
+            .is_some_and(|(a, b)| a == b)
     }
 
     /// Each level above 0 of render target `key`: its offset from the
@@ -7998,6 +8072,44 @@ impl Nvn {
             return Ok(());
         }
         let keys_for_note = [keys.0, keys.1];
+        // Resolve color aliases before gathering sampled texture bindings.
+        // Each color keeps its NVN target index as its attachment location
+        // (a fragment program writes target n's registers to location n);
+        // an unbound target between bound ones is a gap (0), trailing ones
+        // are dropped.
+        let bound = self
+            .render
+            .colors
+            .iter()
+            .rposition(|texture| *texture != 0)
+            .map_or(0, |last| last + 1);
+        let mut colors = [0; MAX_COLOR_TARGETS];
+        let mut color_levels = [0; MAX_COLOR_TARGETS];
+        let mut color_layers = [0; MAX_COLOR_TARGETS];
+        let mut color_formats = [None; MAX_COLOR_TARGETS];
+        let mips = super::mip_targets();
+        for index in 0..bound {
+            let texture = self.render.colors[index];
+            let view = self.render.color_levels.get(index).copied().unwrap_or(0);
+            color_layers[index] = (view >> 32) as u32;
+            let level = if mips { view as u32 } else { 0 };
+            let (target, attachment_level) = if texture == 0 {
+                (0, 0)
+            } else {
+                self.resolve_color_target(texture, level)?
+            };
+            colors[index] = target;
+            color_levels[index] = attachment_level;
+            // An sRGB view encodes writes to a UNORM target. An integer
+            // view one block wide per texel renders into compressed blocks.
+            color_formats[index] = self
+                .render
+                .color_formats
+                .get(index)
+                .copied()
+                .filter(|format| *format != 0)
+                .and_then(vk_format);
+        }
         // Bindings, through the inferred map.
         // Sized for the program's bindings: filled per draw, grown would
         // reallocate a few times each draw.
@@ -8849,44 +8961,6 @@ impl Nvn {
             .as_mut()
             .unwrap()
             .stat("stat: draw geometry bytes", geometry_bytes as u64);
-        // Targets: the bound colors and depth, created at their sizes.
-        // Each color keeps its NVN target index as its attachment location
-        // (a fragment program writes target n's registers to location n);
-        // an unbound target between bound ones is a gap (0), trailing ones
-        // are dropped.
-        let bound = self
-            .render
-            .colors
-            .iter()
-            .rposition(|texture| *texture != 0)
-            .map_or(0, |last| last + 1);
-        let mut colors = [0; MAX_COLOR_TARGETS];
-        let mut color_levels = [0; MAX_COLOR_TARGETS];
-        let mut color_layers = [0; MAX_COLOR_TARGETS];
-        let mut color_formats = [None; MAX_COLOR_TARGETS];
-        let mips = super::mip_targets();
-        for index in 0..bound {
-            let texture = self.render.colors[index];
-            let view = self.render.color_levels.get(index).copied().unwrap_or(0);
-            color_layers[index] = (view >> 32) as u32;
-            let level = if mips { view as u32 } else { 0 };
-            let (target, base) = if texture == 0 {
-                (0, 0)
-            } else {
-                self.resolve_target(texture).unwrap_or((texture, 0))
-            };
-            colors[index] = target;
-            color_levels[index] = base + level;
-            // An sRGB view encodes writes to a UNORM target. An integer
-            // view one block wide per texel renders into compressed blocks.
-            color_formats[index] = self
-                .render
-                .color_formats
-                .get(index)
-                .copied()
-                .filter(|format| *format != 0)
-                .and_then(vk_format);
-        }
         let mut extent = None;
         for (color, format) in colors[..bound].iter_mut().zip(&mut color_formats[..bound]) {
             if *color != 0
@@ -10595,6 +10669,39 @@ mod target_tests {
         assert_eq!(nvn.resolve_target(4), Some((3, 0)));
         nvn.refresh_target_index();
         assert_eq!(nvn.resolve_target(4), Some((3, 0)));
+
+        // Two compatible images of the same extent and storage are
+        // present. Only one covers the bound texture's full mip chain.
+        for (key, levels) in [(6, 1), (7, 3), (8, 3)] {
+            nvn.initialize(key, "Texture", texture(16, levels, 0x4000, 37))
+                .unwrap();
+        }
+        nvn.ensure_render_target(6).unwrap();
+        nvn.ensure_render_target(7).unwrap();
+        for indexed in [false, true] {
+            if indexed {
+                nvn.refresh_target_index();
+            }
+            assert_eq!(nvn.resolve_color_target(8, 2).unwrap(), (7, 2));
+        }
+
+        // When only a shallow image covers the storage, extending it
+        // keeps pixels already written at level 0.
+        nvn.initialize(9, "Texture", texture(16, 1, 0x8000, 37))
+            .unwrap();
+        nvn.initialize(10, "Texture", texture(16, 3, 0x8000, 37))
+            .unwrap();
+        let red = [1.0f32, 0.0, 0.0, 1.0];
+        let blue = [0.0f32, 0.0, 1.0, 1.0];
+        nvn.gpu_clear_color(9, 0, 0, red.map(f32::to_bits), None)
+            .unwrap();
+        nvn.refresh_target_index();
+        nvn.gpu_clear_color(10, 2, 0, blue.map(f32::to_bits), None)
+            .unwrap();
+        assert_eq!(nvn.resolve_target(9), Some((10, 0)));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(renderer.read_target_level(10, 0).unwrap(), [red; 256]);
+        assert_eq!(renderer.read_target_level(10, 2).unwrap(), [blue; 16]);
     }
 }
 
