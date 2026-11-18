@@ -10492,13 +10492,34 @@ pub(super) fn texture_sample(
             return (sample ^ hash_bytes(bytes)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         }
     }
+    match &core.memory {
+        super::GuestMemory::Checked(memory) => {
+            sample_chunks(sample, base, storage_size, |address, bytes| {
+                memory.read(address, bytes).is_ok()
+            })
+        }
+        super::GuestMemory::View(view) => {
+            sample_chunks(sample, base, storage_size, |address, bytes| {
+                view.read(address, bytes).is_ok()
+            })
+        }
+    }
+}
+
+fn sample_chunks(
+    sample: u64,
+    base: u64,
+    storage_size: u64,
+    read_chunk: impl Fn(u64, &mut [u8; 64]) -> bool,
+) -> u64 {
     // The chunks are gathered first, so their reads (cache misses across a
     // large texture) overlap, then hashed in four independent lanes.
     let mut chunks = [[0u8; 64]; 256];
     let mut read = [false; 256];
+    let span = storage_size.saturating_sub(64);
     for (index, (chunk, read)) in chunks.iter_mut().zip(&mut read).enumerate() {
-        let offset = (storage_size.saturating_sub(64)) * index as u64 / 255;
-        *read = core.memory.read(base + offset, chunk).is_ok();
+        let offset = span * index as u64 / 255;
+        *read = read_chunk(base + offset, chunk);
     }
     let mut lanes = [
         sample,
