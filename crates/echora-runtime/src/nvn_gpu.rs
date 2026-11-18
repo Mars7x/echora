@@ -3591,30 +3591,18 @@ impl Nvn {
     /// MIRROR_CLAMP_TO_BORDER, CLAMP_TO_BORDER, MIRRORED_REPEAT,
     /// CLAMP_TO_EDGE.
     fn handle_sampler(&self, handle: u64) -> Sampler {
-        let mut sampler = Sampler::default();
-        let Some(pool) = self
-            .render
+        let id = (handle >> 20 & 0xfff) as u32;
+        self.render
             .state
             .get("SetSamplerPool")
-            .map(|bind| bind.x[1])
-        else {
-            return sampler;
-        };
-        let id = handle >> 20 & 0xfff;
-        let Some(entry) = self
-            .object(pool, "SamplerPool")
-            .ok()
-            .and_then(|pool| pool.state.get(&format!("Descriptor{id}")))
-        else {
-            return sampler;
-        };
-        let props = match self.object(entry.x[0], "Sampler") {
-            Ok(object) => object.builder.clone(),
-            Err(_) => match self.bag(entry.x[0], "SamplerBuilder") {
-                Ok(props) => props,
-                Err(_) => return sampler,
-            },
-        };
+            .and_then(|bind| self.sampler_states.get(&bind.x[1]))
+            .and_then(|pool| pool.get(&id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn sampler_from_properties(props: &BTreeMap<String, super::Args>) -> Sampler {
+        let mut sampler = Sampler::default();
         let filter = |value: u64| match value {
             0 | 2 | 4 => vk::Filter::NEAREST,
             _ => vk::Filter::LINEAR,
@@ -10322,9 +10310,74 @@ mod target_tests {
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{Backend, Nvn, Sampler, TextureSource};
-    use crate::nvn::{Guest, GuestMemory};
+    use super::{Backend, Nvn, Sampler, TextureSource, vk};
+    use crate::nvn::{Args, Command, Guest, GuestMemory};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn sampler_registration_captures_the_builder_properties() {
+        let mut nvn = Nvn::default();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let pool = 0x1000;
+        let builder = 0x2000;
+        nvn.initialize(
+            pool,
+            "SamplerPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [0, 0, 16, 0],
+                    v: [0; 2],
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.render.state.insert(
+            "SetSamplerPool",
+            Command {
+                name: "nvnCommandBufferSetSamplerPool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        let mut call = |nvn: &mut Nvn, name: &str, args: [u64; 4]| {
+            core.cpu.regs[..4].copy_from_slice(&args);
+            assert!(nvn.call(name, &mut core).unwrap());
+        };
+        call(&mut nvn, "nvnSamplerBuilderSetDefaults", [builder, 0, 0, 0]);
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetMinMagFilter",
+            [builder, 0, 0, 0],
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerPoolRegisterSamplerBuilder",
+            [pool, 2, builder, 0],
+        );
+        assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetMinMagFilter",
+            [builder, 1, 1, 0],
+        );
+        assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
+        call(
+            &mut nvn,
+            "nvnSamplerPoolRegisterSamplerBuilder",
+            [pool, 2, builder, 0],
+        );
+        assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::LINEAR);
+    }
 
     #[test]
     fn pool_list_is_reused_only_while_bindings_stay_current() {

@@ -199,14 +199,13 @@ enum QueueItem {
     Register(Box<Registration>),
 }
 
-/// A descriptor registration, as `apply_registration` makes it: the pool,
-/// the id, sampler or texture, the descriptor and (textures) the view's
-/// properties when registered (`None`: no view).
+/// A descriptor registration, with the sampler or texture view state
+/// captured when it was registered.
 #[derive(Debug)]
 struct Registration {
     pool: u64,
     id: u32,
-    sampler: bool,
+    sampler: Option<echora_gpu::draw::Sampler>,
     entry: Args,
     view: Option<Option<Bag>>,
 }
@@ -511,6 +510,9 @@ pub struct Nvn {
     /// Texture views registered with texture pool descriptors, by (pool, id).
     #[serde(skip)]
     views: BTreeMap<(u64, u32), Bag>,
+    /// Sampler descriptors by pool and descriptor index.
+    #[serde(skip)]
+    sampler_states: HashMap<u64, HashMap<u32, echora_gpu::draw::Sampler>>,
     /// Render state the host executor tracks between submitted lists.
     #[serde(skip)]
     render: RenderState,
@@ -2973,6 +2975,10 @@ impl Nvn {
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
+                if kind == "SamplerPool" {
+                    self.sampler_states.remove(&this);
+                    self.bump_binding_serial("stat: binding serial by sampler pool finalized");
+                }
                 return Ok(true);
             }
             // nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const
@@ -2992,25 +2998,25 @@ impl Nvn {
                 if id >= count {
                     return Err(invalid(format!("descriptor {id} outside a pool of {count}")));
                 }
-                let sampler = rest.starts_with("RegisterSampler");
                 let mut entry = Args::default();
-                let view = match rest {
+                let (sampler, view) = match rest {
                     "RegisterSamplerBuilder" => {
-                        self.bag(x[2], "SamplerBuilder").map_err(invalid)?;
-                        None
+                        let props = self.bag(x[2], "SamplerBuilder").map_err(invalid)?;
+                        (Some(Self::sampler_from_properties(&props)), None)
                     }
                     "RegisterSampler" => {
-                        self.object(x[2], "Sampler").map_err(invalid)?;
-                        None
+                        let object = self.object(x[2], "Sampler").map_err(invalid)?;
+                        (Some(Self::sampler_from_properties(&object.builder)), None)
                     }
                     _ => {
                         self.object(x[2], "Texture").map_err(invalid)?;
-                        if x[3] != 0 {
+                        let view = if x[3] != 0 {
                             self.bag(x[3], "TextureView").map_err(invalid)?;
-                            Some(Some(read_shared(self.bags.at(x[3]))[&x[3]].clone()))
+                            Some(read_shared(self.bags.at(x[3]))[&x[3]].clone())
                         } else {
-                            Some(None)
-                        }
+                            None
+                        };
+                        (None, Some(view))
                     }
                 };
                 entry.x[0] = x[2];
@@ -3032,7 +3038,7 @@ impl Nvn {
                 };
                 // A texture descriptor registered again while one queue's
                 // work is still to run: the replay applies it in order.
-                if !sampler
+                if sampler.is_none()
                     && Self::replay_thread()
                     && !self.replaying
                     && self.descriptor_registered(this, u64::from(id))
@@ -4083,7 +4089,7 @@ impl Nvn {
             view,
         } = registration;
         let keep = |handle: &u64, _: &mut ResolvedBinding| {
-            let named = if sampler {
+            let named = if sampler.is_some() {
                 handle >> 20 & 0xfff
             } else {
                 handle & 0xf_ffff
@@ -4095,6 +4101,12 @@ impl Nvn {
             memo.retain(keep);
         }
         self.pool_inputs += 1;
+        if let Some(sampler) = sampler {
+            self.sampler_states
+                .entry(pool)
+                .or_default()
+                .insert(id, sampler);
+        }
         match view {
             Some(Some(view)) => {
                 self.views.insert((pool, id), view);
