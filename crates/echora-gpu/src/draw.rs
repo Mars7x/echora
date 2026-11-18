@@ -18,6 +18,8 @@ pub struct Program {
     pub(crate) layout: vk::DescriptorSetLayout,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) shaders: Vec<vk::ShaderEXT>,
+    shader_stages: Vec<vk::ShaderStageFlags>,
+    unused_graphics_stages: Vec<vk::ShaderStageFlags>,
     /// With resolution scaling: the stages given the rescaling push
     /// constants, and each texture binding's (stage index, binding) by its
     /// scaling bit (the recompiler numbers texture descriptors in binding
@@ -157,6 +159,7 @@ pub(crate) struct GraphicsState {
     blends: Vec<Blend>,
     // Valid for the current command buffer and program. Submitting resets it.
     dynamic_set: Option<DynamicSet>,
+    pool_set: Option<vk::DescriptorSet>,
 }
 
 impl GraphicsState {
@@ -165,6 +168,7 @@ impl GraphicsState {
         self.raster = None;
         self.blends.clear();
         self.dynamic_set = None;
+        self.pool_set = None;
     }
 }
 
@@ -742,11 +746,31 @@ impl Renderer {
                 },
             ),
         )?;
+        let shader_stages: Vec<_> = stages
+            .iter()
+            .map(|stage| stage_flags(stage.stage))
+            .collect();
+        let graphics_stages = [
+            vk::ShaderStageFlags::VERTEX,
+            vk::ShaderStageFlags::TESSELLATION_CONTROL,
+            vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+            vk::ShaderStageFlags::GEOMETRY,
+            vk::ShaderStageFlags::TASK_EXT,
+            vk::ShaderStageFlags::MESH_EXT,
+        ];
+        let enabled = if self.gpu.mesh_shader.is_some() { 6 } else { 4 };
+        let unused_graphics_stages = graphics_stages[..enabled]
+            .iter()
+            .copied()
+            .filter(|stage| !shader_stages.contains(stage))
+            .collect();
         Ok(Program {
             stages,
             layout,
             pipeline_layout,
             shaders,
+            shader_stages,
+            unused_graphics_stages,
             push_stages,
             texture_bits,
             abi_stages,
@@ -1209,31 +1233,14 @@ impl Renderer {
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             if self.graphics.program != Some(program.pipeline_layout) {
-                let stage_bits: Vec<_> = program
-                    .stages
-                    .iter()
-                    .map(|stage| stage_flags(stage.stage))
-                    .collect();
                 // Explicitly unbind graphics stages the program does not use.
-                let stages = [
-                    vk::ShaderStageFlags::VERTEX,
-                    vk::ShaderStageFlags::TESSELLATION_CONTROL,
-                    vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-                    vk::ShaderStageFlags::GEOMETRY,
-                    vk::ShaderStageFlags::TASK_EXT,
-                    vk::ShaderStageFlags::MESH_EXT,
-                ];
-                let enabled = if self.gpu.mesh_shader.is_some() { 6 } else { 4 };
-                let unused: Vec<_> = stages[..enabled]
-                    .iter()
-                    .copied()
-                    .filter(|stage| !stage_bits.contains(stage))
-                    .collect();
                 let null_shaders = [vk::ShaderEXT::null(); 6];
-                objects.cmd_bind_shaders(commands, &stage_bits, &program.shaders);
-                objects.cmd_bind_shaders(commands, &unused, &null_shaders[..unused.len()]);
+                objects.cmd_bind_shaders(commands, &program.shader_stages, &program.shaders);
+                let unused = &program.unused_graphics_stages;
+                objects.cmd_bind_shaders(commands, unused, &null_shaders[..unused.len()]);
                 self.graphics.program = Some(program.pipeline_layout);
                 self.graphics.dynamic_set = None;
+                self.graphics.pool_set = None;
             }
             device.cmd_bind_descriptor_sets(
                 commands,
@@ -1249,7 +1256,9 @@ impl Renderer {
                     bindings: writes,
                 });
             }
-            if let Some(pool) = pool {
+            if let Some(pool) = pool
+                && self.graphics.pool_set != Some(pool)
+            {
                 device.cmd_bind_descriptor_sets(
                     commands,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -1258,6 +1267,8 @@ impl Renderer {
                     &[pool],
                     &[],
                 );
+                self.graphics.pool_set = Some(pool);
+                self.stat("stat: graphics texture pool binds", 1);
             }
             if let Some(constants) = &rescaling {
                 device.cmd_push_constants(
@@ -1561,22 +1572,22 @@ pub(crate) mod tests {
             index: 3,
             ..Default::default()
         };
+        let mut fragment = translated(
+            Stage::Fragment,
+            fragment,
+            vec![
+                Descriptor {
+                    binding: 3,
+                    index: 4,
+                    ..uniform
+                },
+                uniform,
+            ],
+        );
+        let has_pool = renderer.gpu.texture_pool_layout.is_some();
+        Arc::get_mut(&mut fragment).unwrap().texture_pool_bindings = u32::from(has_pool);
         let program = renderer
-            .create_program(vec![
-                translated(Stage::Vertex, vertex, vec![]),
-                translated(
-                    Stage::Fragment,
-                    fragment,
-                    vec![
-                        Descriptor {
-                            binding: 3,
-                            index: 4,
-                            ..uniform
-                        },
-                        uniform,
-                    ],
-                ),
-            ])
+            .create_program(vec![translated(Stage::Vertex, vertex, vec![]), fragment])
             .unwrap();
         renderer
             .target(7, 4, 4, vk::Format::R8G8B8A8_UNORM)
@@ -1668,11 +1679,12 @@ pub(crate) mod tests {
         draw.blends = &red_only;
         draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&1.0f32.to_le_bytes());
         renderer.draw(&draw).unwrap();
+        let stats = renderer.take_stats();
         if !program.dynamic_uniforms.is_empty() {
-            assert_eq!(
-                renderer.take_stats()["stat: dynamic graphics descriptor sets reused"],
-                2
-            );
+            assert_eq!(stats["stat: dynamic graphics descriptor sets reused"], 2);
+        }
+        if has_pool {
+            assert_eq!(stats["stat: graphics texture pool binds"], 1);
         }
         let texels = renderer.read_target(7).unwrap();
         // The red-only write reaches the first column, retaining green.
@@ -1683,12 +1695,12 @@ pub(crate) mod tests {
         // This draw starts a new batch with the same raster and blend state.
         draw.uniforms.get_mut(&(1, 0)).unwrap()[..4].copy_from_slice(&0.0f32.to_le_bytes());
         renderer.draw(&draw).unwrap();
+        let stats = renderer.take_stats();
         if !program.dynamic_uniforms.is_empty() {
-            assert!(
-                !renderer
-                    .take_stats()
-                    .contains_key("stat: dynamic graphics descriptor sets reused")
-            );
+            assert!(!stats.contains_key("stat: dynamic graphics descriptor sets reused"));
+        }
+        if has_pool {
+            assert_eq!(stats["stat: graphics texture pool binds"], 1);
         }
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
