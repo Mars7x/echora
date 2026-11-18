@@ -361,6 +361,16 @@ pub(crate) type ResolvedBinding = (
     u64,
 );
 
+type PoolListStamp = ((u64, u64, u64, u64), u64, u64, u64);
+
+#[derive(Debug)]
+struct CachedPoolEntries {
+    stamp: PoolListStamp,
+    entries: std::sync::Arc<[echora_gpu::pool::PoolEntry]>,
+    /// The resolved handles, in the same order as `entries`.
+    handles: Vec<u64>,
+}
+
 /// A render target's width, height, format, mip levels and shape.
 type TargetShape = (
     u32,
@@ -589,17 +599,10 @@ pub struct Nvn {
     /// Texture binds that changed a stage's bound handle, by NVN stage.
     #[serde(skip)]
     stage_binds: FastMap<u64, u64>,
-    /// Each NVN stage's texture pool entries, kept while their memo stamp,
-    /// GPU write generation and `pool_inputs` hold: draws share one list,
-    /// which the renderer knows unchanged without comparing.
+    /// Each NVN stage's resolved texture pool entries. Draws share the
+    /// list when its bindings still name the same resources.
     #[serde(skip)]
-    pool_entry_cache: FastMap<
-        u32,
-        (
-            ((u64, u64, u64, u64), u64, u64, u64),
-            std::sync::Arc<[echora_gpu::pool::PoolEntry]>,
-        ),
-    >,
+    pool_entry_cache: FastMap<u32, CachedPoolEntries>,
     /// Bumped by every flush of guest memory over a SHADER_CODE pool
     /// (`gpu_invalidate`) and every change of a program object or its
     /// shaders.

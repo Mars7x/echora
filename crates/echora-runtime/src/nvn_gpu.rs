@@ -2191,6 +2191,23 @@ impl Nvn {
         vk_format(view.props.get("Format")?.x[0] as u32)
     }
 
+    fn pool_list_stamp(&self, stage: u32) -> super::PoolListStamp {
+        (
+            (
+                self.texture_epoch,
+                self.gpu.as_ref().unwrap().renderer.target_changes,
+                self.binding_serial,
+                self.presented_frames,
+            ),
+            self.gpu_writes_now(),
+            self.pool_inputs,
+            self.stage_binds
+                .get(&u64::from(stage))
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
     /// Texture pool entries for a program stage that reads the pool: the
     /// textures bound to NVN stage `nvn`. Bound handles are what such
     /// programs index (they sit in c2 from 0x20, 8 bytes per slot); a
@@ -2203,44 +2220,59 @@ impl Nvn {
     ) -> Result<std::sync::Arc<[echora_gpu::pool::PoolEntry]>, String> {
         // (The renderer's counts from pool writes reach the statistics
         // with the page table's at each present.)
-        let key = (
-            (
-                self.texture_epoch,
-                self.gpu.as_ref().unwrap().renderer.target_changes,
-                self.binding_serial,
-                self.presented_frames,
-            ),
-            self.gpu_writes_now(),
-            self.pool_inputs,
-            self.stage_binds.get(&u64::from(nvn)).copied().unwrap_or(0),
-        );
-        if let Some((cached, list)) = self.pool_entry_cache.get(&nvn)
-            && *cached == key
+        let key = self.pool_list_stamp(nvn);
+        if let Some(cached) = self.pool_entry_cache.get(&nvn)
+            && cached.stamp == key
         {
-            let list = list.clone();
+            let list = cached.entries.clone();
             self.gpu
                 .as_mut()
                 .unwrap()
                 .stat("stat: pool entry lists reused", 1);
             return Ok(list);
         }
-        if let Some((cached, _)) = self.pool_entry_cache.get(&nvn) {
+        // Keep the same shared array when a GPU write changed the generation
+        // but all its bindings still resolve to the same source and sampler.
+        self.evict_bindings();
+        let key = self.pool_list_stamp(nvn);
+        if let Some(mut cached) = self.pool_entry_cache.remove(&nvn) {
+            let previous = cached.stamp;
+            if (previous.0, previous.2, previous.3) == (key.0, key.2, key.3)
+                && cached
+                    .handles
+                    .iter()
+                    .zip(cached.entries.iter())
+                    .all(|(&handle, entry)| {
+                        self.with_memoized_binding(handle, |binding| {
+                            entry.matches_binding(&binding.0, &binding.1)
+                        }) == Some(true)
+                    })
+            {
+                cached.stamp = key;
+                let list = cached.entries.clone();
+                self.pool_entry_cache.insert(nvn, cached);
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: pool entry lists reused", 1);
+                return Ok(list);
+            }
             let backend = self.gpu.as_mut().unwrap();
             for (changed, name) in [
                 (
-                    cached.0 != key.0,
+                    previous.0 != key.0,
                     "stat: pool entry lists remade: memo stamp",
                 ),
                 (
-                    cached.1 != key.1,
+                    previous.1 != key.1,
                     "stat: pool entry lists remade: GPU writes",
                 ),
                 (
-                    cached.2 != key.2,
+                    previous.2 != key.2,
                     "stat: pool entry lists remade: registrations or queue",
                 ),
                 (
-                    cached.3 != key.3,
+                    previous.3 != key.3,
                     "stat: pool entry lists remade: stage binds",
                 ),
             ] {
@@ -2269,13 +2301,14 @@ impl Nvn {
             // they touch (`evict_bindings`).
             0,
         );
-        self.evict_bindings();
         if self.binding_memo.0 != stamp {
             self.binding_memo = (stamp, Default::default());
         }
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(handles.len());
+        let mut resolved_handles = Vec::with_capacity(handles.len());
         for handle in handles {
             if let Some((source, sampler_state)) = self.memoized_binding(handle) {
+                resolved_handles.push(handle);
                 entries.push(echora_gpu::pool::PoolEntry {
                     texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                     sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -2317,6 +2350,7 @@ impl Nvn {
                     texture,
                 ),
             );
+            resolved_handles.push(handle);
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
                 sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
@@ -2326,18 +2360,14 @@ impl Nvn {
         }
         let list: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = entries.into();
         // Resolving may have moved the memo stamp: kept under the key now.
-        let key = (
-            (
-                self.texture_epoch,
-                self.gpu.as_ref().unwrap().renderer.target_changes,
-                self.binding_serial,
-                self.presented_frames,
-            ),
-            self.gpu_writes_now(),
-            self.pool_inputs,
-            self.stage_binds.get(&u64::from(nvn)).copied().unwrap_or(0),
+        self.pool_entry_cache.insert(
+            nvn,
+            super::CachedPoolEntries {
+                stamp: self.pool_list_stamp(nvn),
+                entries: list.clone(),
+                handles: resolved_handles,
+            },
         );
-        self.pool_entry_cache.insert(nvn, (key, list.clone()));
         Ok(list)
     }
 
@@ -5060,21 +5090,28 @@ impl Nvn {
         &mut self,
         handle: u64,
     ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
+        self.with_memoized_binding(handle, |entry| (entry.0.clone(), entry.1))
+    }
+
+    fn with_memoized_binding<T>(
+        &mut self,
+        handle: u64,
+        read: impl FnOnce(&super::ResolvedBinding) -> T,
+    ) -> Option<T> {
         let now = self.gpu_writes_now();
         let frame = self.presented_frames;
         let entry = self.binding_memo.1.get(&handle)?;
         // The common case: checked at this present and GPU-write generation.
         if entry.4 == frame && entry.3 == now {
-            return Some((entry.0.clone(), entry.1));
+            return Some(read(entry));
         }
-        let (source, _, _, _, present, _) = entry;
         // From an earlier present: a render target's binding holds while
         // the target set is unchanged (the stamp) and no blocks drawn since
         // wait to be copied into it (`texture_source` brings those in); an
         // upload is checked against guest memory once per present, so it
         // is resolved again.
-        if *present != frame {
-            let current = match source {
+        if entry.4 != frame {
+            let current = match &entry.0 {
                 echora_gpu::draw::TextureSource::Target(key)
                 | echora_gpu::draw::TextureSource::TargetView { key, .. } => {
                     !self.block_aliases.contains_key(key)
@@ -5084,22 +5121,19 @@ impl Nvn {
             if !current {
                 return None;
             }
-            self.binding_memo.1.get_mut(&handle).unwrap().4 = frame;
-            return self.memoized_binding(handle);
         }
-        let (source, sampler, storage, checked, _, _) = self.binding_memo.1.get(&handle)?;
-        if *checked != now {
-            if storage
+        if entry.3 != now
+            && entry
+                .2
                 .as_ref()
                 .is_some_and(|storage| self.gpu_writes_pending(storage))
-            {
-                return None;
-            }
-            let binding = (source.clone(), *sampler);
-            self.binding_memo.1.get_mut(&handle).unwrap().3 = now;
-            return Some(binding);
+        {
+            return None;
         }
-        Some((source.clone(), *sampler))
+        let entry = self.binding_memo.1.get_mut(&handle)?;
+        entry.3 = now;
+        entry.4 = frame;
+        Some(read(entry))
     }
 
     /// Drop the memoized bindings that targets made, remade or moved since
@@ -10205,5 +10239,60 @@ mod bind_key_tests {
             bind_key(kind, Some(2), 5),
             bind_key("BindUniformBuffer", Some(2), 5)
         ));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{Backend, Nvn, Sampler, TextureSource};
+    use crate::nvn::{Guest, GuestMemory};
+    use std::sync::Arc;
+
+    #[test]
+    fn pool_list_is_reused_only_while_bindings_stay_current() {
+        let Ok(Some(backend)) = Backend::create() else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: 0,
+        };
+        let handle = 19;
+        nvn.render.bound_textures.insert((0, 0), handle);
+        nvn.binding_memo.1.insert(
+            handle,
+            (
+                TextureSource::Target(7),
+                Sampler::default(),
+                Some(4096..8192),
+                0,
+                0,
+                7,
+            ),
+        );
+
+        let original = nvn.pool_entries(&mut core, 0).unwrap();
+        assert_eq!(original.len(), 1);
+        let backend = nvn.gpu.as_mut().unwrap();
+        backend.in_place_writes.push(8192..8196);
+        backend.gpu_writes += 1;
+        let unchanged = nvn.pool_entries(&mut core, 0).unwrap();
+        assert!(Arc::ptr_eq(&original, &unchanged));
+
+        let backend = nvn.gpu.as_mut().unwrap();
+        backend.in_place_writes.push(4096..4100);
+        backend.gpu_writes += 1;
+        let changed = nvn.pool_entries(&mut core, 0).unwrap();
+        // There is no registered handle to rebuild this fixture's stale
+        // binding. It must be resolved anew and disappear from the list.
+        assert!(changed.is_empty());
     }
 }

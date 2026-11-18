@@ -30,6 +30,13 @@ pub struct PoolEntry {
     pub sampler_state: Sampler,
 }
 
+impl PoolEntry {
+    /// Whether the handle still names this texture revision and sampler.
+    pub fn matches_binding(&self, source: &TextureSource, sampler: &Sampler) -> bool {
+        self.sampler_state == *sampler && self.source.same_as(source)
+    }
+}
+
 /// A pool entry of an upload as `bind_pool` resolved it: the entry, its
 /// (binding, index, sampler or view) descriptors and its integer flag.
 /// Valid while no view it names is destroyed (`forget_pool_views`).
@@ -209,8 +216,7 @@ impl Renderer {
                 || last.len() == entries.len()
                     && last.iter().zip(entries.iter()).all(|(last, entry)| {
                         (last.texture, last.sampler) == (entry.texture, entry.sampler)
-                            && last.sampler_state == entry.sampler_state
-                            && last.source.same_as(&entry.source)
+                            && last.matches_binding(&entry.source, &entry.sampler_state)
                     }))
         {
             let targets = targets.clone();
