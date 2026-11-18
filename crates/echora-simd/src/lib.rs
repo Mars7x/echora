@@ -2344,6 +2344,14 @@ pub fn vec_unary(cpu: &mut Cpu, op: VecUnaryOp, bits: u8, q: bool, scalar: bool,
     cpu.vectors[rd as usize] = finish_vector(result, bits, q, scalar);
 }
 
+/// Powers of two for fixed-point conversions are normal and exact in f64
+/// for every fractional-bit count the helper accepts.
+fn fixed_point_scale(fbits: u8, inverse: bool) -> f64 {
+    let fbits = u64::from(fbits);
+    let exponent = if inverse { 1023 - fbits } else { 1023 + fbits };
+    f64::from_bits(exponent << 52)
+}
+
 fn fp_to_integer_lane(
     fp: &mut Fp<'_>,
     value: u64,
@@ -2357,7 +2365,7 @@ fn fp_to_integer_lane(
         fp.raise(FPSR_IOC);
         return 0;
     }
-    let scaled = fp.to_f64(input) * 2f64.powi(i32::from(fbits));
+    let scaled = fp.to_f64(input) * fixed_point_scale(fbits, false);
     let x = round(scaled, rounding);
     let (min, max) = match (signed, bits) {
         (true, 32) => (f64::from(i32::MIN), f64::from(i32::MAX)),
@@ -2383,7 +2391,7 @@ fn fp_to_integer_lane(
 
 fn integer_to_fp_lane(value: u64, size: FpSize, signed: bool, fbits: u8) -> u64 {
     let bits = size_bits(size);
-    let scale = 2f64.powi(-i32::from(fbits));
+    let scale = fixed_point_scale(fbits, true);
     match size {
         FpSize::S => {
             // Convert through f64 only when exact; otherwise use the direct
@@ -2420,6 +2428,34 @@ fn integer_to_fp_lane(value: u64, size: FpSize, signed: bool, fbits: u8) -> u64 
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn packed_i32_to_fp(n: u128, signed: bool, fbits: u8) -> u128 {
+    use core::arch::x86_64::*;
+
+    // SAFETY: the integer vector has the same 128 bits as the guest register.
+    let n = unsafe { core::mem::transmute::<u128, __m128i>(n) };
+    let value = if signed {
+        _mm_cvtepi32_ps(n)
+    } else {
+        // Splitting at 16 bits makes both conversions and the multiply
+        // exact. Only the addition rounds the unsigned value.
+        let high = _mm_cvtepi32_ps(_mm_srli_epi32::<16>(n));
+        let low = _mm_cvtepi32_ps(_mm_and_si128(n, _mm_set1_epi32(0xffff)));
+        _mm_add_ps(_mm_mul_ps(high, _mm_set1_ps(65536.0)), low)
+    };
+    // The caller keeps the smallest nonzero result normal. Scaling by
+    // a power of two after conversion therefore preserves the rounding.
+    let result = if fbits == 0 {
+        value
+    } else {
+        let scale = f32::from_bits((127 - u32::from(fbits)) << 23);
+        _mm_mul_ps(value, _mm_set1_ps(scale))
+    };
+    // SAFETY: the packed result and the guest register have the same bits.
+    unsafe { core::mem::transmute::<__m128, u128>(result) }
+}
+
 /// Lanewise FP unary operation; `fbits` applies to the fixed-point converts.
 #[allow(clippy::too_many_arguments)]
 pub fn vec_fp_unary(
@@ -2435,6 +2471,16 @@ pub fn vec_fp_unary(
     let bits = size_bits(size);
     let n = cpu.vectors[rn as usize];
     let mut fp = Fp::new(cpu, size)?;
+    #[cfg(target_arch = "x86_64")]
+    if size == FpSize::S
+        && fbits <= 126
+        && matches!(op, VecFpUnaryOp::FromSigned | VecFpUnaryOp::FromUnsigned)
+    {
+        // SAFETY: SSE2 is part of x86-64.
+        let result = unsafe { packed_i32_to_fp(n, op == VecFpUnaryOp::FromSigned, fbits) };
+        fp.cpu.vectors[rd as usize] = finish_vector(result, bits, q, scalar);
+        return Ok(());
+    }
     let format = fp.format;
     let mut result = 0u128;
     for lane in 0..lane_count(bits, q, scalar) {
@@ -2517,7 +2563,7 @@ pub fn fp_to_fixed(
         fp.raise(FPSR_IOC);
         0
     } else {
-        let x = (fp.to_f64(input) * 2f64.powi(i32::from(fbits))).trunc();
+        let x = (fp.to_f64(input) * fixed_point_scale(fbits, false)).trunc();
         let (min, max) = match (signed, gp_bits) {
             (true, 32) => (f64::from(i32::MIN), f64::from(i32::MAX)),
             (true, _) => (i64::MIN as f64, 9_223_372_036_854_775_808.0),
@@ -2561,7 +2607,7 @@ pub fn int_to_fp_fixed(
         (false, 32) => f64::from(value as u32),
         (false, _) => value as f64,
     };
-    let scaled = wide * 2f64.powi(-i32::from(fbits));
+    let scaled = wide * fixed_point_scale(fbits, true);
     let bits = match size {
         FpSize::S => u64::from((scaled as f32).to_bits()),
         FpSize::D => scaled.to_bits(),
@@ -3811,6 +3857,32 @@ mod vector_tests {
         // Scalar form: one element from the two low lanes of Vn.
         vec_fp_pairwise(&mut cpu, VecFpOp::Add, FpSize::S, false, true, 0, 1, 0).unwrap();
         assert_eq!(cpu.vectors[0], u128::from(3.0f32.to_bits()));
+    }
+
+    #[test]
+    fn fixed_point_vector_conversions_round_once_and_clear_unused_lanes() {
+        let values = [1, 0x0100_0001, 0x8000_0000, u32::MAX];
+        for (op, signed) in [
+            (VecFpUnaryOp::FromSigned, true),
+            (VecFpUnaryOp::FromUnsigned, false),
+        ] {
+            for fbits in 0..=u8::MAX {
+                for (q, scalar) in [(true, false), (false, false), (false, true)] {
+                    let mut cpu = Cpu {
+                        fpcr: FPCR_FZ | FPCR_DN,
+                        fpsr: FPSR_IXC,
+                        ..Cpu::default()
+                    };
+                    cpu.vectors[1] = lanes32(values);
+                    vec_fp_unary(&mut cpu, op, FpSize::S, q, scalar, 1, 1, fbits).unwrap();
+                    let expected = lanes32(values.map(|lane| {
+                        integer_to_fp_lane(u64::from(lane), FpSize::S, signed, fbits) as u32
+                    }));
+                    assert_eq!(cpu.vectors[1], finish_vector(expected, 32, q, scalar));
+                    assert_eq!(cpu.fpsr, FPSR_IXC);
+                }
+            }
+        }
     }
 
     #[test]
