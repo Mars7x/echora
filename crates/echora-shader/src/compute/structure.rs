@@ -56,7 +56,7 @@ enum Statement {
 }
 
 /// The graph of a program's blocks.
-struct Graph {
+pub(super) struct Graph {
     /// Reverse postorder numbers (`usize::MAX`: unreachable).
     rpo: Vec<usize>,
     loop_header: Vec<bool>,
@@ -75,7 +75,7 @@ enum Frame {
 impl Graph {
     /// The graph, or `None` for an irreducible one or one with computed
     /// branches.
-    fn new(blocks: &[Block]) -> Option<Self> {
+    pub(super) fn new(blocks: &[Block]) -> Option<Self> {
         let index_of: BTreeMap<usize, usize> = blocks
             .iter()
             .enumerate()
@@ -352,18 +352,15 @@ fn continue_code(id: usize) -> u32 {
 }
 
 impl Emitter {
-    /// The structured translation of `blocks`, or `false` (nothing
-    /// emitted) when their graph needs the dispatch loop.
+    /// The structured translation of `blocks` using their reducible graph.
     pub(super) fn structured(
         &mut self,
         code: &[Instruction],
         blocks: &[Block],
-    ) -> Result<bool, Unsupported> {
-        let Some(graph) = Graph::new(blocks) else {
-            return Ok(false);
-        };
+        graph: &Graph,
+    ) -> Result<(), Unsupported> {
         let mut builder = Builder {
-            graph: &graph,
+            graph,
             blocks,
             index_of: blocks
                 .iter()
@@ -404,8 +401,7 @@ impl Emitter {
             trace,
             loops: 0,
         };
-        self.statement(code, blocks, &root, &mut state)?;
-        Ok(true)
+        self.statement(code, blocks, &root, &mut state)
     }
 
     fn statement(

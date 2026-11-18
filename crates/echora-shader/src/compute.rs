@@ -96,6 +96,16 @@ fn unsupported(index: usize, reason: impl Into<String>) -> Unsupported {
     }
 }
 
+fn relative_target(index: usize, offset: i64, length: usize) -> Option<usize> {
+    let next = i64::try_from(index + 1).ok()?;
+    let bytes = next.checked_mul(16)?.checked_add(offset)?;
+    if bytes < 0 || bytes % 16 != 0 {
+        return None;
+    }
+    let target = usize::try_from(bytes / 16).ok()?;
+    (target < length).then_some(target)
+}
+
 /// Splits `code` into blocks.
 fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
     let mut leaders = BTreeSet::from([0]);
@@ -105,12 +115,7 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
                 if mode != 0 {
                     return Err(unsupported(index, "branch with a convergence mode"));
                 }
-                let target = i64::try_from(index + 1)
-                    .ok()
-                    .and_then(|next| next.checked_mul(16)?.checked_add(offset))
-                    .filter(|target| *target >= 0 && target % 16 == 0)
-                    .map(|target| (target / 16) as usize)
-                    .filter(|target| *target < code.len())
+                let target = relative_target(index, offset, code.len())
                     .ok_or_else(|| unsupported(index, "branch outside the program"))?;
                 leaders.insert(target);
                 leaders.insert(index + 1);
@@ -119,12 +124,7 @@ fn blocks(code: &[Instruction]) -> Result<Vec<Block>, Unsupported> {
                 leaders.insert(index + 1);
             }
             Op::Call { offset } => {
-                let target = i64::try_from(index + 1)
-                    .ok()
-                    .and_then(|next| next.checked_mul(16)?.checked_add(offset))
-                    .filter(|target| *target >= 0 && target % 16 == 0)
-                    .map(|target| (target / 16) as usize)
-                    .filter(|target| *target < code.len())
+                let target = relative_target(index, offset, code.len())
                     .ok_or_else(|| unsupported(index, "call outside the program"))?;
                 leaders.insert(target);
                 leaders.insert(index + 1);
@@ -267,13 +267,34 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
     if code.is_empty() {
         return Err(unsupported(0, "empty program"));
     }
+    // Trace modes report byte offsets from the guest code.
+    if layout.stage == Stage::Compute
+        && !layout.loop_trace
+        && !guest_lines()
+        && let Some(inlined) = local_calls::inline_leaf(code)
+        && let Ok(blocks) = blocks(&inlined)
+        && let Some(graph) = structure::Graph::new(&blocks)
+        && let Ok(emitter) = emit_blocks(&inlined, layout, &blocks, Some(&graph))
+    {
+        return Ok(emitter);
+    }
     let blocks = blocks(code)?;
+    let graph = structure::Graph::new(&blocks);
+    emit_blocks(code, layout, &blocks, graph.as_ref())
+}
+
+fn emit_blocks(
+    code: &[Instruction],
+    layout: &Layout,
+    blocks: &[Block],
+    graph: Option<&structure::Graph>,
+) -> Result<Emitter, Unsupported> {
     let mut emitter = Emitter::new(layout);
-    emitter.hmma_pairs = matrix::pairs(code, &blocks);
+    emitter.hmma_pairs = matrix::pairs(code, blocks);
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     emitter.texture_views = texture_views(code, &emitter.handle_words);
-    emitter.memory.cached = memory::cached_accesses(code, &blocks);
+    emitter.memory.cached = memory::cached_accesses(code, blocks);
     // `.FTZ` `.DNZ` multiplies may rely on a declared 32-bit flush, unless
     // an operation keeps denormals through f64 (`denormal`).
     emitter.flush32 = layout.denorm_flush_32
@@ -282,8 +303,10 @@ fn emit(code: &[Instruction], layout: &Layout) -> Result<Emitter, Unsupported> {
             .any(|instruction| keeps_denormals(layout, instruction.op));
     // Structured control flow where the graph allows, else the dispatch
     // loop.
-    if !emitter.structured(code, &blocks)? {
-        emitter.program(code, &blocks)?;
+    if let Some(graph) = graph {
+        emitter.structured(code, blocks, graph)?;
+    } else {
+        emitter.program(code, blocks)?;
     }
     emitter.mesh_end()?;
     if emitter.declares_flush32 {
@@ -315,6 +338,7 @@ mod fetch;
 mod half;
 mod image;
 mod io;
+mod local_calls;
 pub(crate) mod matrix;
 mod memory;
 mod mesh;
