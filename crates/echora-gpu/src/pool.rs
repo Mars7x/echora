@@ -1,6 +1,6 @@
-//! The texture pool (`echora_shader_abi::TEXTURE_POOL_SET`): one descriptor
-//! set, shared by every program that reads it, whose arrays hold the guest
-//! texture and sampler pool entries bindless handles name.
+//! The texture pool (`echora_shader_abi::TEXTURE_POOL_SET`): descriptor
+//! arrays holding the guest texture and sampler entries that bindless
+//! handles name. Each draw or dispatch binds the current version.
 //!
 //! Entries are written as draws and dispatches name them (`PoolEntry`),
 //! not all at once: a guest pool holds every texture the game registered,
@@ -59,8 +59,58 @@ pub(crate) struct TexturePool {
     /// raw handle.
     written: FastMap<(u32, u32), u64>,
     /// Last batch that bound this set. Its draws may access any descriptor
-    /// in the pool, so replacing a descriptor must wait for that batch.
+    /// in the pool, so replacing a descriptor here requires completion.
     last_use: u64,
+}
+
+impl TexturePool {
+    /// Write the changed sampled views or samplers. A zero view clears
+    /// a descriptor whose image was discarded.
+    fn write_entries(&mut self, device: &ash::Device, changes: &[(u32, u32, u64)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let infos: Vec<[vk::DescriptorImageInfo; 1]> = changes
+            .iter()
+            .map(|&(array, _, handle)| {
+                [if array == binding::SAMPLERS {
+                    vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(handle))
+                } else if handle != 0 {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(vk::ImageView::from_raw(handle))
+                        .image_layout(vk::ImageLayout::GENERAL)
+                } else {
+                    vk::DescriptorImageInfo::default()
+                }]
+            })
+            .collect();
+        let writes: Vec<_> = changes
+            .iter()
+            .zip(&infos)
+            .map(|(&(array, index, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.set)
+                    .dst_binding(array)
+                    .dst_array_element(index)
+                    .descriptor_type(if array == binding::SAMPLERS {
+                        vk::DescriptorType::SAMPLER
+                    } else {
+                        vk::DescriptorType::SAMPLED_IMAGE
+                    })
+                    .image_info(info)
+            })
+            .collect();
+        // SAFETY: the set and its new descriptors are live. Replaced
+        // entries can only have been used by work that completed.
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        for &(array, index, handle) in changes {
+            if handle == 0 {
+                self.written.remove(&(array, index));
+            } else {
+                self.written.insert((array, index), handle);
+            }
+        }
+    }
 }
 
 /// The pool arrays a texture of `shape` is read through (the recompiler's
@@ -91,121 +141,172 @@ fn arrays(shape: ImageShape, integer: bool) -> impl Iterator<Item = (u32, u32)> 
 }
 
 impl Renderer {
-    /// The pool set, created on first use with every entry null.
-    fn texture_pool(&mut self) -> Result<&mut TexturePool, String> {
-        if self.texture_pool.is_none() {
-            let layout = self
-                .gpu
-                .texture_pool_layout
-                .ok_or("the device cannot hold the texture pool")?;
-            let sizes = [
-                vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::SAMPLER,
-                    descriptor_count: SAMPLER_POOL_CAPACITY,
-                },
-                vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::SAMPLED_IMAGE,
-                    descriptor_count: TEXTURE_POOL_CAPACITY * 10,
-                },
-                vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: TEXTURE_POOL_CAPACITY * 2,
-                },
-                vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-                    descriptor_count: TEXTURE_POOL_CAPACITY,
-                },
-                vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 1,
-                },
-            ];
-            let info = vk::DescriptorPoolCreateInfo::default()
-                .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
-                .max_sets(1)
-                .pool_sizes(&sizes);
-            let device = &self.gpu.device;
-            // SAFETY: valid create info; destroyed with the renderer.
-            let descriptor_pool = unsafe { device.create_descriptor_pool(&info, None) }
-                .map_err(|error| format!("vkCreateDescriptorPool (texture pool): {error}"))?;
-            let layouts = [layout];
-            let allocate = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(&layouts);
-            // SAFETY: the pool and layout are live.
-            let set = match unsafe { device.allocate_descriptor_sets(&allocate) } {
-                Ok(sets) => sets[0],
-                Err(error) => {
-                    // SAFETY: nothing was allocated from it.
-                    unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
-                    return Err(format!("vkAllocateDescriptorSets (texture pool): {error}"));
-                }
-            };
-            let flags_size = u64::from(TEXTURE_POOL_CAPACITY) * 4;
-            let flags = self.host_buffer(flags_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            flags.write(0, &vec![0; flags_size as usize]);
-            let flags_info = [vk::DescriptorBufferInfo {
-                buffer: flags.buffer,
-                offset: 0,
-                range: flags_size,
-            }];
-            let sampler = self.sampler(&Sampler::default())?;
-            let samplers = vec![
-                vk::DescriptorImageInfo {
-                    sampler,
-                    ..Default::default()
+    /// A new pool set, with every entry null or the default sampler.
+    fn create_texture_pool(&mut self) -> Result<TexturePool, String> {
+        let layout = self
+            .gpu
+            .texture_pool_layout
+            .ok_or("the device cannot hold the texture pool")?;
+        let sampler = self.sampler(&Sampler::default())?;
+        let sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: SAMPLER_POOL_CAPACITY,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: TEXTURE_POOL_CAPACITY * 10,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: TEXTURE_POOL_CAPACITY * 2,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                descriptor_count: TEXTURE_POOL_CAPACITY,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1,
+            },
+        ];
+        let info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
+            .max_sets(1)
+            .pool_sizes(&sizes);
+        let device = &self.gpu.device;
+        // SAFETY: valid create info; destroyed with the renderer.
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&info, None) }
+            .map_err(|error| format!("vkCreateDescriptorPool (texture pool): {error}"))?;
+        let layouts = [layout];
+        let allocate = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool and layout are live.
+        let set = match unsafe { device.allocate_descriptor_sets(&allocate) } {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                // SAFETY: nothing was allocated from it.
+                unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
+                return Err(format!("vkAllocateDescriptorSets (texture pool): {error}"));
+            }
+        };
+        let flags_size = u64::from(TEXTURE_POOL_CAPACITY) * 4;
+        let flags = match self.host_buffer(flags_size, vk::BufferUsageFlags::STORAGE_BUFFER) {
+            Ok(flags) => flags,
+            Err(error) => {
+                // SAFETY: the pool's set has never been used.
+                unsafe {
+                    self.gpu
+                        .device
+                        .destroy_descriptor_pool(descriptor_pool, None)
                 };
-                SAMPLER_POOL_CAPACITY as usize
-            ];
-            let images = vec![vk::DescriptorImageInfo::default(); TEXTURE_POOL_CAPACITY as usize];
-            let buffers = vec![vk::BufferView::null(); TEXTURE_POOL_CAPACITY as usize];
-            let writes: Vec<_> = (0..binding::COUNT)
-                .map(|array| {
-                    let write = vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(array);
-                    match array {
-                        binding::SAMPLERS => write
-                            .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .image_info(&samplers),
-                        binding::SAMPLED_BUFFER => write
-                            .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
-                            .texel_buffer_view(&buffers),
-                        binding::STORAGE_2D | binding::STORAGE_3D => write
-                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                            .image_info(&images),
-                        binding::FLAGS => write
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .buffer_info(&flags_info),
-                        _ => write
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .image_info(&images),
-                    }
-                })
-                .collect();
-            // SAFETY: the set is live and unused; null descriptors are
-            // enabled with the layout (`Gpu::new`).
-            unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
-            self.texture_pool = Some(TexturePool {
-                descriptor_pool,
-                set,
-                flags,
-                integer: FastSet::default(),
-                written: FastMap::default(),
-                last_use: 0,
-            });
-        }
-        Ok(self.texture_pool.as_mut().unwrap())
+                return Err(error);
+            }
+        };
+        flags.write(0, &vec![0; flags_size as usize]);
+        let flags_info = [vk::DescriptorBufferInfo {
+            buffer: flags.buffer,
+            offset: 0,
+            range: flags_size,
+        }];
+        let samplers = vec![
+            vk::DescriptorImageInfo {
+                sampler,
+                ..Default::default()
+            };
+            SAMPLER_POOL_CAPACITY as usize
+        ];
+        let images = vec![vk::DescriptorImageInfo::default(); TEXTURE_POOL_CAPACITY as usize];
+        let buffers = vec![vk::BufferView::null(); TEXTURE_POOL_CAPACITY as usize];
+        let writes: Vec<_> = (0..binding::COUNT)
+            .map(|array| {
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(array);
+                match array {
+                    binding::SAMPLERS => write
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&samplers),
+                    binding::SAMPLED_BUFFER => write
+                        .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                        .texel_buffer_view(&buffers),
+                    binding::STORAGE_2D | binding::STORAGE_3D => write
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&images),
+                    binding::FLAGS => write
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&flags_info),
+                    _ => write
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&images),
+                }
+            })
+            .collect();
+        // SAFETY: the set is live and unused; null descriptors are
+        // enabled with the layout (`Gpu::new`).
+        unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
+        Ok(TexturePool {
+            descriptor_pool,
+            set,
+            flags,
+            integer: FastSet::default(),
+            written: FastMap::default(),
+            last_use: 0,
+        })
     }
 
-    /// Write `entries` into the pool set and return it, for a program
-    /// that reads the pool (bound as set 1). An entry that changes while
-    /// recorded or submitted work may read it is written after a flush.
+    /// Copy current bindings into an idle spare and use it for the next
+    /// draw, so current work keeps the descriptors it already bound.
+    fn rotate_texture_pool(&mut self) -> bool {
+        if !self.tried_spare_texture_pool && self.gpu.spare_texture_pool {
+            self.tried_spare_texture_pool = true;
+            self.spare_texture_pool = self.create_texture_pool().ok();
+        }
+        let Some(spare) = self.spare_texture_pool.as_mut() else {
+            return false;
+        };
+        if spare.last_use > self.completed_serial {
+            return false;
+        }
+        let active = self.texture_pool.as_ref().unwrap();
+        let mut changes = Vec::new();
+        for (&(array, index), &handle) in &active.written {
+            if spare.written.get(&(array, index)) != Some(&handle) {
+                changes.push((array, index, handle));
+            }
+        }
+        for &(array, index) in spare.written.keys() {
+            if !active.written.contains_key(&(array, index)) {
+                changes.push((array, index, 0));
+            }
+        }
+        spare.write_entries(&self.gpu.device, &changes);
+        for &index in active.integer.difference(&spare.integer) {
+            spare.flags.write(index as usize * 4, &1u32.to_le_bytes());
+        }
+        for &index in spare.integer.difference(&active.integer) {
+            spare.flags.write(index as usize * 4, &0u32.to_le_bytes());
+        }
+        spare.integer.clone_from(&active.integer);
+        std::mem::swap(&mut self.texture_pool, &mut self.spare_texture_pool);
+        self.stat("stat: texture pool rotations", 1);
+        self.stat(
+            "stat: texture pool descriptors synchronized",
+            changes.len() as u64,
+        );
+        true
+    }
+
+    /// Write `entries` and return the texture pool's current set. Keep
+    /// old descriptor contents live for work that already bound them.
     pub(crate) fn bind_pool(
         &mut self,
         entries: &std::sync::Arc<[PoolEntry]>,
     ) -> Result<vk::DescriptorSet, String> {
-        self.texture_pool()?;
+        if self.texture_pool.is_none() {
+            self.texture_pool = Some(self.create_texture_pool()?);
+        }
         // The same entries as the last call, with no target made again
         // since (a view of one would change): the set already holds them.
         if let Some((last, changes, targets)) = &self.pool_cache
@@ -309,6 +410,11 @@ impl Renderer {
                     .get("stat: texture pool flushes for rewritten entries")
                     .copied()
                     .unwrap_or(0)
+                    + self
+                        .stats
+                        .get("stat: texture pool rotations")
+                        .copied()
+                        .unwrap_or(0)
                     < 300
             {
                 for (array, index, handle) in &changed {
@@ -355,13 +461,15 @@ impl Renderer {
                     eprintln!("pool rewrite flag index {index}: integer -> {integer}");
                 }
             }
-            self.stat("stat: texture pool flushes for rewritten entries", 1);
-            let waiting = std::time::Instant::now();
-            self.wait_for(last_use)?;
-            self.stat(
-                "stat: texture pool rewrite wait ns",
-                waiting.elapsed().as_nanos() as u64,
-            );
+            if !self.rotate_texture_pool() {
+                self.stat("stat: texture pool flushes for rewritten entries", 1);
+                let waiting = std::time::Instant::now();
+                self.wait_for(last_use)?;
+                self.stat(
+                    "stat: texture pool rewrite wait ns",
+                    waiting.elapsed().as_nanos() as u64,
+                );
+            }
         }
         // Targets read through the pool were maybe rendered just before.
         self.order_after_rendering(&targets)?;
@@ -376,47 +484,7 @@ impl Renderer {
                 pool.integer.remove(&index);
             }
         }
-        let infos: Vec<[vk::DescriptorImageInfo; 1]> = changed
-            .iter()
-            .map(|&(array, _, handle)| {
-                [if array == binding::SAMPLERS {
-                    vk::DescriptorImageInfo {
-                        sampler: vk::Sampler::from_raw(handle),
-                        ..Default::default()
-                    }
-                } else {
-                    vk::DescriptorImageInfo {
-                        image_view: vk::ImageView::from_raw(handle),
-                        image_layout: vk::ImageLayout::GENERAL,
-                        ..Default::default()
-                    }
-                }]
-            })
-            .collect();
-        let writes: Vec<_> = changed
-            .iter()
-            .zip(&infos)
-            .map(|(&(array, index, _), info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(array)
-                    .dst_array_element(index)
-                    .descriptor_type(if array == binding::SAMPLERS {
-                        vk::DescriptorType::SAMPLER
-                    } else {
-                        vk::DescriptorType::SAMPLED_IMAGE
-                    })
-                    .image_info(info)
-            })
-            .collect();
-        if !writes.is_empty() {
-            // SAFETY: the set and the views and samplers are live; work
-            // that may read a rewritten entry has completed (above).
-            unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
-        }
-        for (array, index, handle) in changed {
-            pool.written.insert((array, index), handle);
-        }
+        pool.write_entries(&self.gpu.device, &changed);
         self.pool_cache = Some((entries.clone(), self.target_changes, targets));
         Ok(set)
     }
@@ -432,35 +500,19 @@ impl Renderer {
     pub(crate) fn forget_pool_views(&mut self, views: &[vk::ImageView]) {
         self.pool_cache = None;
         self.pool_entry_memo.clear();
-        let Some(pool) = self.texture_pool.as_mut() else {
-            return;
-        };
         let raw: FastSet<u64> = views.iter().map(|view| view.as_raw()).collect();
-        let stale: Vec<(u32, u32)> = pool
-            .written
-            .iter()
-            .filter(|(_, handle)| raw.contains(handle))
-            .map(|(key, _)| *key)
-            .collect();
-        if stale.is_empty() {
-            return;
-        }
-        let null = [vk::DescriptorImageInfo::default()];
-        let writes: Vec<_> = stale
-            .iter()
-            .map(|&(array, index)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(pool.set)
-                    .dst_binding(array)
-                    .dst_array_element(index)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&null)
-            })
-            .collect();
-        // SAFETY: the set is live; null descriptors are enabled.
-        unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
-        for key in stale {
-            pool.written.remove(&key);
+        for pool in self
+            .texture_pool
+            .iter_mut()
+            .chain(self.spare_texture_pool.iter_mut())
+        {
+            let stale: Vec<_> = pool
+                .written
+                .iter()
+                .filter(|((array, _), handle)| *array != binding::SAMPLERS && raw.contains(handle))
+                .map(|(&(array, index), _)| (array, index, 0))
+                .collect();
+            pool.write_entries(&self.gpu.device, &stale);
         }
     }
 
@@ -506,7 +558,10 @@ impl Renderer {
     }
 
     pub(crate) fn destroy_texture_pool(&mut self) {
-        if let Some(pool) = self.texture_pool.take() {
+        for pool in [self.texture_pool.take(), self.spare_texture_pool.take()]
+            .into_iter()
+            .flatten()
+        {
             pool.flags.destroy(&self.gpu.device);
             // SAFETY: all work has completed.
             unsafe {

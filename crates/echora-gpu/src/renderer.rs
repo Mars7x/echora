@@ -268,6 +268,8 @@ pub struct Renderer {
     submitter: Option<Submitter>,
     /// The texture pool's set (`crate::pool`), once a program reads it.
     pub(crate) texture_pool: Option<crate::pool::TexturePool>,
+    pub(crate) spare_texture_pool: Option<crate::pool::TexturePool>,
+    pub(crate) tried_spare_texture_pool: bool,
     /// The texture pool entries last bound, the target changes then, and
     /// the targets they read (`bind_pool`).
     pub(crate) pool_cache: Option<(
@@ -735,6 +737,8 @@ impl Renderer {
         let timer = crate::timing::GpuTimer::from_env(device, period, valid_bits, fences);
         let mut renderer = Self {
             texture_pool: None,
+            spare_texture_pool: None,
+            tried_spare_texture_pool: false,
             pool_cache: None,
             pool_entry_memo: FastMap::default(),
             stats: FastMap::default(),

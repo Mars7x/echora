@@ -452,14 +452,21 @@ mod tests {
     }
 
     #[test]
-    fn texture_pool_rewrite_waits_for_the_batch_that_bound_it() {
+    fn texture_pool_rewrite_preserves_bindings_for_pending_work() {
+        for use_spare in [false, true] {
+            check_texture_pool_rewrite(use_spare);
+        }
+    }
+
+    fn check_texture_pool_rewrite(use_spare: bool) {
         let Ok(gpu) = Gpu::new() else {
             return;
         };
-        if gpu.texture_pool_layout.is_none() {
+        if gpu.texture_pool_layout.is_none() || (use_spare && !gpu.spare_texture_pool) {
             return;
         }
         let mut renderer = Renderer::new(gpu).unwrap();
+        renderer.tried_spare_texture_pool = !use_spare;
         for key in 1..=3 {
             renderer
                 .target(key, 4, 4, vk::Format::R8G8B8A8_UNORM)
@@ -522,7 +529,11 @@ mod tests {
             .into(),
         };
         let first = renderer.dispatch_deferred(&dispatch(1)).unwrap()[0].1;
-        renderer.submit_frame().unwrap();
+        if !use_spare {
+            // Without a second set, the rewrite must wait for only the
+            // submission using the first set and leave newer work recorded.
+            renderer.submit_frame().unwrap();
+        }
         renderer
             .clear_color(3, None, vk::ClearColorValue { float32: [0.0; 4] })
             .unwrap();
@@ -531,7 +542,14 @@ mod tests {
         assert_eq!(
             renderer.recorded_serial(),
             serial,
-            "unrelated work stayed recorded"
+            "work stayed recorded through the descriptor rewrite"
+        );
+        let stats = renderer.take_stats();
+        let count = |name| stats.get(name).copied().unwrap_or(0);
+        assert_eq!(count("stat: texture pool rotations"), u64::from(use_spare));
+        assert_eq!(
+            count("stat: texture pool flushes for rewritten entries"),
+            u64::from(!use_spare)
         );
         renderer.flush().unwrap();
         let reads = renderer.take_reads(&[first, second]);

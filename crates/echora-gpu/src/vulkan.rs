@@ -66,6 +66,8 @@ pub struct Gpu {
     /// needs (with null descriptors, which entries start as): set 1 of
     /// every program that reads the pool.
     pub texture_pool_layout: Option<vk::DescriptorSetLayout>,
+    /// Descriptor indexing budget for two versions of the texture pool.
+    pub(crate) spare_texture_pool: bool,
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
     pub shader_binary_version: ([u8; 16], u32),
@@ -548,6 +550,10 @@ impl Gpu {
             compute_subgroup_32,
             buffer_device_address,
             texture_pool_layout,
+            spare_texture_pool: properties12.max_update_after_bind_descriptors_in_all_pools
+                >= 2 * (TEXTURE_POOL_CAPACITY * (echora_shader_abi::texture_pool::COUNT - 2)
+                    + SAMPLER_POOL_CAPACITY
+                    + 1),
             cooperative_matrix,
             host_import,
             dma_buf_import,
