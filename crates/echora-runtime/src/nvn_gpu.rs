@@ -3539,12 +3539,14 @@ impl Nvn {
             .get("SetTexturePool")
             .ok_or("no texture pool is set")?
             .x[1];
-        let id = handle & 0xf_ffff;
-        let entry = self
-            .object(pool, "TexturePool")?
-            .state
-            .get(&format!("Descriptor{id}"))
-            .ok_or_else(|| format!("texture {id} is not registered"))?;
+        let id = (handle & 0xf_ffff) as u32;
+        let entry = match self.texture_descriptor(pool, id) {
+            Some(entry) => entry,
+            None => {
+                self.object(pool, "TexturePool")?;
+                return Err(format!("texture {id} is not registered"));
+            }
+        };
         // The structure was reused for other storage or in another format
         // since registration: the descriptor still names the texture it
         // held then.

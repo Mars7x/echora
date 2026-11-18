@@ -510,6 +510,9 @@ pub struct Nvn {
     /// Texture views registered with texture pool descriptors, by (pool, id).
     #[serde(skip)]
     views: BTreeMap<(u64, u32), Bag>,
+    /// Texture and image registrations by pool and descriptor index.
+    #[serde(skip)]
+    texture_descriptors: FastMap<u64, FastMap<u32, Args>>,
     /// Sampler descriptors by pool and descriptor index.
     #[serde(skip)]
     sampler_states: HashMap<u64, HashMap<u32, echora_gpu::draw::Sampler>>,
@@ -2984,9 +2987,17 @@ impl Nvn {
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
-                if kind == "SamplerPool" {
-                    self.sampler_states.remove(&this);
-                    self.bump_binding_serial("stat: binding serial by sampler pool finalized");
+                match kind {
+                    "TexturePool" => {
+                        self.texture_descriptors.remove(&this);
+                        self.views.retain(|&(pool, _), _| pool != this);
+                        self.bump_binding_serial("stat: binding serial by texture pool finalized");
+                    }
+                    "SamplerPool" => {
+                        self.sampler_states.remove(&this);
+                        self.bump_binding_serial("stat: binding serial by sampler pool finalized");
+                    }
+                    _ => {}
                 }
                 return Ok(true);
             }
@@ -4025,9 +4036,23 @@ impl Nvn {
     /// registered at `id` (a registration there replaces one queued work may
     /// name).
     pub fn descriptor_registered(&self, pool: u64, id: u64) -> bool {
-        self.objects
-            .get(&pool)
-            .is_none_or(|pool| pool.state.contains_key(&format!("Descriptor{id}")))
+        let Some(object) = self.objects.get(&pool) else {
+            return true;
+        };
+        let Ok(id) = u32::try_from(id) else {
+            return false;
+        };
+        if object.kind == "SamplerPool" {
+            self.sampler_states
+                .get(&pool)
+                .is_some_and(|entries| entries.contains_key(&id))
+        } else {
+            self.texture_descriptor(pool, id).is_some()
+        }
+    }
+
+    fn texture_descriptor(&self, pool: u64, id: u32) -> Option<&Args> {
+        self.texture_descriptors.get(&pool)?.get(&id)
     }
 
     /// Whether texture pool `pool`'s RegisterTexture or RegisterImage
@@ -4043,10 +4068,9 @@ impl Nvn {
         view: u64,
         image: bool,
     ) -> bool {
-        let Some(entry) = self
-            .objects
-            .get(&pool)
-            .and_then(|pool| pool.state.get(&format!("Descriptor{id}")))
+        let Some(entry) = u32::try_from(id)
+            .ok()
+            .and_then(|id| self.texture_descriptor(pool, id))
         else {
             return false;
         };
@@ -4125,8 +4149,11 @@ impl Nvn {
             }
             None => {}
         }
-        if let Some(pool) = self.objects.get_mut(&pool) {
-            pool.state.insert(format!("Descriptor{id}"), entry);
+        if sampler.is_none() && self.objects.contains_key(&pool) {
+            self.texture_descriptors
+                .entry(pool)
+                .or_default()
+                .insert(id, entry);
         }
     }
 
@@ -7777,6 +7804,54 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn descriptor_indices_are_scoped_to_their_pool() {
+        let mut nvn = Nvn::default();
+        nvn.initialize(1, "TexturePool", BTreeMap::new()).unwrap();
+        nvn.initialize(2, "TexturePool", BTreeMap::new()).unwrap();
+        nvn.initialize(3, "SamplerPool", BTreeMap::new()).unwrap();
+        let id = 2074;
+        let entry = Args {
+            x: [99, 1, 0, 0],
+            v: [0; 2],
+        };
+        assert!(!nvn.descriptor_registered(1, u64::from(id)));
+        nvn.apply_registration(Registration {
+            pool: 1,
+            id,
+            sampler: None,
+            entry,
+            view: Some(None),
+        });
+        assert!(nvn.descriptor_registered(1, u64::from(id)));
+        assert!(!nvn.descriptor_registered(2, u64::from(id)));
+        assert!(!nvn.descriptor_registered(3, u64::from(id)));
+        assert!(nvn.registration_unchanged(1, u64::from(id), 99, 0, true));
+        assert!(!nvn.registration_unchanged(1, u64::from(id), 99, 0, false));
+
+        nvn.apply_registration(Registration {
+            pool: 3,
+            id,
+            sampler: Some(Default::default()),
+            entry: Args::default(),
+            view: None,
+        });
+        assert!(nvn.descriptor_registered(3, u64::from(id)));
+        assert!(nvn.texture_descriptor(3, id).is_none());
+
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        call(&mut nvn, &mut guest, "nvnTexturePoolFinalize", &[1]);
+        nvn.initialize(1, "TexturePool", BTreeMap::new()).unwrap();
+        assert!(!nvn.descriptor_registered(1, u64::from(id)));
+        assert!(!nvn.registration_unchanged(1, u64::from(id), 99, 0, true));
     }
 
     #[test]
