@@ -3058,23 +3058,6 @@ impl Nvn {
             layers,
             levels_set,
         );
-        // Shapes a texture's own layout gives that the extent alone would
-        // not: noted by shape, so a report shows which textures they are.
-        let mut layout_note = None;
-        if let Some(shape) = layout.shape {
-            let derived = crate::nvn_format::base_block_shape(info, height, depth, layers);
-            if shape != derived {
-                layout_note = Some(format!(
-                    "layout shape {shape:?} instead of {derived:?}: {} {width}x{height}x{depth} layers {layers} levels {levels_set} target {:?} packaged {:016x}",
-                    info.name,
-                    get("Target"),
-                    object
-                        .builder
-                        .get("PackagedTextureLayout")
-                        .map_or(0, |value| value.x[1])
-                ));
-            }
-        }
         let storage_size = if stride != 0 {
             stride * u64::from(height.div_ceil(info.block_height))
         } else {
@@ -3469,6 +3452,19 @@ impl Nvn {
                 }
             }
         }
+        // Compare the packaged and derived layouts when an upload is made.
+        let layout_note = layout.shape.and_then(|shape| {
+            let derived = crate::nvn_format::base_block_shape(info, height, depth, layers);
+            (shape != derived).then(|| {
+                let builder = &self.objects[&texture].builder;
+                format!(
+                    "layout shape {shape:?} instead of {derived:?}: {} {width}x{height}x{depth} layers {layers} levels {levels_set} target {:?} packaged {:016x}",
+                    info.name,
+                    builder.get("Target").map(|value| value.x[0] as u32),
+                    builder.get("PackagedTextureLayout").map_or(0, |value| value.x[1])
+                )
+            })
+        });
         let source = TextureSource::Upload {
             key: texture,
             generation,
@@ -4190,13 +4186,13 @@ impl Nvn {
         }
         // For skipped dispatches: the program's bindings and the compute
         // slots bound, from which the driver constant layout is inferred.
-        let layout = {
+        let layout = |nvn: &Self| {
             let descriptors: Vec<String> = stage
                 .descriptors
                 .iter()
                 .map(|d| format!("{:?}@c{}+{:#x}", d.kind(), d.cbuf_index, d.cbuf_offset))
                 .collect();
-            let bound: Vec<&str> = self
+            let bound: Vec<&str> = nvn
                 .render
                 .state
                 .keys()
@@ -4254,13 +4250,14 @@ impl Nvn {
                 _ => None,
             }
         };
-        let unplaced = |descriptor: &shader::Descriptor| {
+        let unplaced = |nvn: &Self, descriptor: &shader::Descriptor| {
             format!(
-                "{:?} binding at c{}+{:#x} in compute (control 0xb0.. {:02x?}): {layout}",
+                "{:?} binding at c{}+{:#x} in compute (control 0xb0.. {:02x?}): {}",
                 descriptor.kind(),
                 descriptor.cbuf_index,
                 descriptor.cbuf_offset,
-                header
+                header,
+                layout(nvn),
             )
         };
         let mut c0 = vec![0u8; (table_end as usize).max(0x100)];
@@ -4368,7 +4365,10 @@ impl Nvn {
                                 .state
                                 .get(bind_key("BindStorageBuffer", Some(5), slot as u64))
                                 .ok_or_else(|| {
-                                    format!("storage buffer 5/{slot} is not bound: {layout}")
+                                    format!(
+                                        "storage buffer 5/{slot} is not bound: {}",
+                                        layout(self)
+                                    )
                                 })?;
                             (bind.x[3], bind.x[4])
                         }
@@ -4379,7 +4379,7 @@ impl Nvn {
                             let pointer = constant_pointer(descriptor, &c0);
                             let (gpu, size) = pointer
                                 .filter(|&(gpu, size)| gpu != 0 && size != 0)
-                                .ok_or_else(|| unplaced(descriptor))?;
+                                .ok_or_else(|| unplaced(self, descriptor))?;
                             self.gpu.as_mut().unwrap().note(format!(
                                 "compute storage through c{}+{:#x}",
                                 descriptor.cbuf_index, descriptor.cbuf_offset
@@ -4510,12 +4510,12 @@ impl Nvn {
                 }
                 // Texel buffers (buffer textures) bind like textures.
                 kind @ (DescriptorKind::Texture | DescriptorKind::TextureBuffer) => {
-                    let slot = slot(descriptor, kind).ok_or_else(|| unplaced(descriptor))?;
+                    let slot = slot(descriptor, kind).ok_or_else(|| unplaced(self, descriptor))?;
                     let handle = self
                         .render
                         .state
                         .get(bind_key("BindTexture", Some(5), slot as u64))
-                        .ok_or_else(|| format!("texture 5/{slot} is not bound: {layout}"))?
+                        .ok_or_else(|| format!("texture 5/{slot} is not bound: {}", layout(self)))?
                         .x[3];
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
                     let texture = self.handle_texture(handle)?;
@@ -4545,12 +4545,12 @@ impl Nvn {
                 // later draws sample what it wrote.
                 DescriptorKind::Image => {
                     let slot = slot(descriptor, DescriptorKind::Image)
-                        .ok_or_else(|| unplaced(descriptor))?;
+                        .ok_or_else(|| unplaced(self, descriptor))?;
                     let handle = self
                         .render
                         .state
                         .get(bind_key("BindImage", Some(5), slot as u64))
-                        .ok_or_else(|| format!("image 5/{slot} is not bound: {layout}"))?
+                        .ok_or_else(|| format!("image 5/{slot} is not bound: {}", layout(self)))?
                         .x[3];
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
                     let texture = self.handle_texture(handle)?;
@@ -4631,7 +4631,7 @@ impl Nvn {
                     ));
                     uniforms.insert(descriptor.binding, vec![0; used as usize]);
                 }
-                _ => return Err(unplaced(descriptor)),
+                _ => return Err(unplaced(self, descriptor)),
             }
         }
         self.initialize_new_targets(core);
@@ -5054,9 +5054,14 @@ impl Nvn {
             "stat: dispatch renderer microseconds",
             started.elapsed().as_micros() as u64,
         );
-        self.trace_targets(&images_written, &[], &format!("dispatch {:016x}", key.0))?;
-        if let Err(error) = self.trace_memory(core, &format!("dispatch {:016x}", key.0)) {
-            eprintln!("memory trace: {error}");
+        if super::debug_var_os("ECHORA_TARGET_TRACE").is_some()
+            || super::debug_var_os("ECHORA_MEMORY_TRACE").is_some()
+        {
+            let label = format!("dispatch {:016x}", key.0);
+            self.trace_targets(&images_written, &[], &label)?;
+            if let Err(error) = self.trace_memory(core, &label) {
+                eprintln!("memory trace: {error}");
+            }
         }
         let backend = self.gpu.as_mut().unwrap();
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
