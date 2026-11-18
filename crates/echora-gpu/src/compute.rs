@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use ash::vk;
 
 use crate::draw::{Program, Sampler, TextureSource};
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, descriptor_buffer_range};
 use crate::shader::DescriptorKind;
 
 pub struct Dispatch<'a> {
@@ -84,14 +84,14 @@ impl Renderer {
                 DescriptorKind::Image => descriptors[3] += 1,
                 DescriptorKind::StorageBuffer => {
                     if !dispatch.storage_in_place.contains_key(&binding) {
-                        let length = dispatch.storage.get(&binding).map_or(16, Vec::len) as u64;
-                        bytes += length.max(16) + 256;
+                        let length = dispatch.storage.get(&binding).map_or(16, Vec::len);
+                        bytes += descriptor_buffer_range(length) + 256;
                     }
                     descriptors[2] += 1;
                 }
                 _ => {
-                    let length = dispatch.uniforms.get(&binding).map_or(16, Vec::len) as u64;
-                    bytes += length.max(16) + 256;
+                    let length = dispatch.uniforms.get(&binding).map_or(16, Vec::len);
+                    bytes += descriptor_buffer_range(length) + 256;
                     descriptors[0] += 1;
                 }
             }
@@ -189,8 +189,7 @@ impl Renderer {
                 other => return Err(format!("{other:?} bindings are not modeled in compute")),
             };
             let bytes = bytes.unwrap_or(&[0; 16]);
-            let (buffer, offset) = self.ring_upload(bytes, 256)?;
-            let range = (bytes.len() as u64).max(16).next_multiple_of(16);
+            let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
             // Only buffers the shader writes come back (flags bit 0).
             if kind == vk::DescriptorType::STORAGE_BUFFER && descriptor.flags & 1 != 0 {
                 storage.push((binding, offset, bytes.len()));
@@ -403,7 +402,7 @@ mod tests {
             "struct Words { data: array<u32> }
             @group(0) @binding(0) var<uniform> value: vec4<u32>;
             @group(0) @binding(1) var<storage, read_write> words: Words;
-            @compute @workgroup_size(1) fn main() { words.data[1] = value.x; }",
+            @compute @workgroup_size(1) fn main() { words.data[1] = value.x + value.y; }",
             naga::ShaderStage::Compute,
         );
         let uniform = Descriptor {
@@ -430,7 +429,8 @@ mod tests {
             .unwrap();
         let mut value = vec![0u8; 16];
         value[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        let dispatch = Dispatch {
+        value[4] = 1;
+        let mut dispatch = Dispatch {
             program: &program,
             groups: [1, 1, 1],
             uniforms: HashMap::from([(0, value)]),
@@ -443,6 +443,13 @@ mod tests {
             page_table: Default::default(),
             pool: Default::default(),
         };
+        let results = renderer.dispatch(&dispatch).unwrap();
+        assert_eq!(
+            results[&1],
+            [0xaa, 0xaa, 0xaa, 0xaa, 0x79, 0x56, 0x34, 0x12]
+        );
+        // The previous dispatch left value.y in this ring slot.
+        dispatch.uniforms.get_mut(&0).unwrap().truncate(4);
         let results = renderer.dispatch(&dispatch).unwrap();
         assert_eq!(
             results[&1],

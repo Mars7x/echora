@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::renderer::{Renderer, has_stencil};
+use crate::renderer::{Renderer, descriptor_buffer_range, has_stencil};
 use crate::shader::{Descriptor, DescriptorKind, Translated};
 use crate::vulkan::stage_flags;
 
@@ -819,8 +819,8 @@ impl Renderer {
                     }
                     DescriptorKind::StorageBuffer => {
                         if !draw.storage_in_place.contains_key(&key) {
-                            let length = draw.storage.get(&key).map_or(16, Vec::len) as u64;
-                            bytes += length.max(16) + 256;
+                            let length = draw.storage.get(&key).map_or(16, Vec::len);
+                            bytes += descriptor_buffer_range(length) + 256;
                         }
                         descriptors[2] += 1;
                     }
@@ -828,8 +828,8 @@ impl Renderer {
                         let length = match draw.uniforms.get(&key) {
                             Some(bytes) => bytes.len(),
                             None => draw.guest_uniforms.get(&key).map_or(16, |read| read.1),
-                        } as u64;
-                        bytes += length.max(16) + 256;
+                        };
+                        bytes += descriptor_buffer_range(length) + 256;
                         descriptors[0] += 1;
                     }
                 }
@@ -861,28 +861,27 @@ impl Renderer {
                 let key = (stage_index, descriptor.binding);
                 let source = match descriptor.kind() {
                     DescriptorKind::UniformBuffer => {
-                        let (buffer, offset, length) = match (
+                        let (buffer, offset, range) = match (
                             draw.uniforms.get(&key),
                             draw.guest_uniforms.get(&key),
                             draw.read_guest,
                         ) {
-                            (Some(bytes), ..) => {
-                                let (buffer, offset) = self.ring_upload(bytes, 256)?;
-                                (buffer, offset, bytes.len())
-                            }
+                            (Some(bytes), ..) => self.ring_upload_padded(bytes)?,
                             (None, Some(&(guest, length)), Some(read)) => {
+                                let range = descriptor_buffer_range(length);
                                 let (buffer, offset) =
-                                    self.ring_upload_with(length as u64, 256, |ring| {
-                                        read(guest, ring)
+                                    self.ring_upload_with(range, 256, |ring| {
+                                        let (data, padding) = ring.split_at_mut(length);
+                                        if !data.is_empty() {
+                                            read(guest, data)?;
+                                        }
+                                        padding.fill(0);
+                                        Ok(())
                                     })?;
-                                (buffer, offset, length)
+                                (buffer, offset, range)
                             }
-                            _ => {
-                                let (buffer, offset) = self.ring_upload(&[0; 16], 256)?;
-                                (buffer, offset, 16)
-                            }
+                            _ => self.ring_upload_padded(&[])?,
                         };
-                        let range = (length as u64).max(16).next_multiple_of(16);
                         let mut info = vk::DescriptorBufferInfo {
                             buffer,
                             offset,
@@ -915,17 +914,13 @@ impl Renderer {
                                 .get(&key)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[0; 16]);
-                            let (buffer, offset) = self.ring_upload(bytes, 256)?;
+                            let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
                             // Only buffers the stage writes come back
                             // (flags bit 0).
                             if descriptor.flags & 1 != 0 {
                                 written.push((key, offset, bytes.len()));
                             }
-                            (
-                                buffer,
-                                offset,
-                                (bytes.len() as u64).max(16).next_multiple_of(16),
-                            )
+                            (buffer, offset, range)
                         };
                         DescriptorSource::Buffer(
                             vk::DescriptorType::STORAGE_BUFFER,
@@ -1597,6 +1592,7 @@ pub(crate) mod tests {
             write_mask: vk::ColorComponentFlags::R,
             ..Blend::default()
         }];
+        let blend = [Blend::default()];
         let mut draw = Draw {
             program: &program,
             colors: &[7],
@@ -1660,7 +1656,7 @@ pub(crate) mod tests {
                 alpha_to_coverage: false,
                 blend_constants: [0.0; 4],
             },
-            blends: &[Blend::default()],
+            blends: &blend,
             mesh: None,
             page_table: Default::default(),
             vertex_fetch: Vec::new(),
@@ -1696,6 +1692,26 @@ pub(crate) mod tests {
         }
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
+
+        draw.blends = &blend;
+        draw.uniforms.get_mut(&(1, 0)).unwrap()[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+        renderer.draw(&draw).unwrap();
+        let texels = renderer.read_target(7).unwrap();
+        assert_eq!(texels[0], [0.0, 1.0, 1.0, 1.0]);
+
+        // Bind only the red word. The blue word from the previous upload
+        // must be cleared before the shader reads the full vector.
+        draw.uniforms.remove(&(1, 0));
+        draw.guest_uniforms.insert((1, 0), (0x1000, 4));
+        let read_guest = |address, data: &mut [u8]| {
+            assert_eq!(address, 0x1000);
+            data.copy_from_slice(&1.0f32.to_le_bytes());
+            Ok(())
+        };
+        draw.read_guest = Some(&read_guest);
+        renderer.draw(&draw).unwrap();
+        let texels = renderer.read_target(7).unwrap();
+        assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
         renderer.destroy_program(program).unwrap();
     }
 }

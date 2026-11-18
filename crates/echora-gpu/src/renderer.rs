@@ -661,6 +661,10 @@ const RING_SIZE: u64 = 64 << 20;
 /// Descriptor sets per flush.
 const MAX_SETS: u32 = 4096;
 
+pub(crate) fn descriptor_buffer_range(length: usize) -> u64 {
+    (length as u64).max(16).next_multiple_of(16)
+}
+
 /// A descriptor pool for one submission's sets.
 fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, String> {
     let sizes = [
@@ -1622,6 +1626,25 @@ impl Renderer {
         self.slot
             .upload_with(size, alignment, fill)?
             .ok_or_else(|| format!("{size} bytes do not fit an empty ring"))
+    }
+
+    /// Upload a descriptor's bytes and initialize the rest of its range.
+    pub(crate) fn ring_upload_padded(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(vk::Buffer, u64, u64), String> {
+        let range = descriptor_buffer_range(bytes.len());
+        let (buffer, offset) = if range == bytes.len() as u64 {
+            self.ring_upload(bytes, 256)?
+        } else {
+            self.ring_upload_with(range, 256, |ring| {
+                let (data, padding) = ring.split_at_mut(bytes.len());
+                data.copy_from_slice(bytes);
+                padding.fill(0);
+                Ok(())
+            })?
+        };
+        Ok((buffer, offset, range))
     }
 
     /// Make room, before recording one draw or dispatch, for `bytes` of
