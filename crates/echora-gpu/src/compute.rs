@@ -248,7 +248,11 @@ impl Renderer {
         let indirect = match dispatch.indirect {
             Some(source) => {
                 let (ring, at) = self.ring_upload(&[0; 12], 16)?;
-                if self.bounded_indirect(source, (ring, at), 3)? {
+                if self.bounded_indirect(
+                    source,
+                    (ring, at),
+                    crate::mesh_count::IndirectCounts::Dispatch,
+                )? {
                     Some((ring, at))
                 } else {
                     self.stat("stat: dispatch counts read unbounded", 1);

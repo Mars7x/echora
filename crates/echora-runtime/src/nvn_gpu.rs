@@ -2153,8 +2153,8 @@ impl Nvn {
 
     /// A mesh draw's workgroups: DrawMeshTasks(cmd, first, count) draws
     /// `count` groups (from 0 only), DrawMeshTasksIndirect(cmd, address)
-    /// reads three u32 group counts at that GPU address (from the device
-    /// buffer of a resident pool when the GPU may have written them).
+    /// reads one u32 group count at that GPU address, from the device
+    /// buffer when the GPU may have written it.
     fn mesh_groups(&mut self, core: &mut Guest, command: &Command) -> Result<MeshGroups, String> {
         match command.name {
             "nvnCommandBufferDrawMeshTasks" => {
@@ -2171,33 +2171,29 @@ impl Nvn {
                 Ok(MeshGroups::Direct([count.min(bound), 1, 1]))
             }
             "nvnCommandBufferDrawMeshTasksIndirect" => {
+                let length = 4;
                 let address = command.x[1];
-                let guest = self.gpu_to_guest(address, 12)?;
+                let guest = self.gpu_to_guest(address, length)?;
+                let read_count = |core: &Guest<'_>| {
+                    core.memory
+                        .read_u32(guest)
+                        .map_err(|trap| format!("reading GPU {address:#x}: {trap:?}"))
+                };
                 // ECHORA_MESH_LOG (debugging): each indirect mesh draw's
                 // group counts as the GPU wrote them (waits for the GPU).
                 if super::debug_var_os("ECHORA_MESH_LOG").is_some() {
-                    self.resolve_gpu_written(core, guest..guest + 12)?;
-                    let bytes = self.gpu_bytes(core, address, 12)?;
-                    let words: Vec<u32> = bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|word| u32::from_le_bytes(*word))
-                        .collect();
+                    self.resolve_gpu_written(core, guest..guest + length)?;
+                    let groups = [read_count(core)?, 1, 1];
                     eprintln!(
-                        "mesh indirect present {} at {address:#x}: groups {words:?}",
+                        "mesh indirect present {} at {address:#x}: groups {groups:?}",
                         self.presented_frames
                     );
                 }
                 self.diagnostic_probe(core)?;
-                if let Some((buffer, offset)) = self.indirect_arguments(core, guest)? {
+                if let Some((buffer, offset)) = self.indirect_arguments(core, guest, length)? {
                     return Ok(MeshGroups::Indirect { buffer, offset });
                 }
-                let bytes = self.gpu_bytes(core, address, 12)?;
-                let word = |index: usize| {
-                    u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
-                };
-                Ok(MeshGroups::Direct([word(0), word(1), word(2)]))
+                Ok(MeshGroups::Direct([read_count(core)?, 1, 1]))
             }
             other => Err(format!("{other} is not modeled on the GPU")),
         }
@@ -5163,7 +5159,7 @@ impl Nvn {
             let guest = self.gpu_to_guest(command.x[1], 12)?;
             self.resolve_copies(core, Some(guest..guest + 12))?;
             Some(
-                self.indirect_arguments(core, guest)?
+                self.indirect_arguments(core, guest, 12)?
                     .ok_or("indirect dispatch arguments are in no memory pool")?,
             )
         } else {
@@ -7525,7 +7521,7 @@ impl Nvn {
             .import_file(range.file, range.start, length)
     }
 
-    /// Where the GPU reads the 12 bytes of indirect arguments at guest
+    /// Where the GPU reads `length` bytes of indirect arguments at guest
     /// `guest` from: the pool's GPU copy when a GPU write through a binding
     /// made it newer there, otherwise guest memory itself, shared in place,
     /// for a CPU-visible pool (what the CPU wrote, and what programs stored
@@ -7536,8 +7532,9 @@ impl Nvn {
         &mut self,
         core: &mut Guest,
         guest: u64,
+        length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
-        let range = guest..guest + 12;
+        let range = guest..guest + length;
         let copy_newer = self.gpu.as_ref().unwrap().resident.values().any(|pool| {
             pool.contains(guest)
                 && pool
@@ -7546,7 +7543,7 @@ impl Nvn {
                     .any(|dirty| dirty.start < range.end && range.start < dirty.end)
         });
         if !copy_newer {
-            if let Some(shared) = self.shared_binding(guest, 12)? {
+            if let Some(shared) = self.shared_binding(guest, length)? {
                 self.gpu
                     .as_mut()
                     .unwrap()
@@ -7554,7 +7551,7 @@ impl Nvn {
                 return Ok(Some(shared));
             }
         }
-        self.resident_pool_binding(core, guest, 12)
+        self.resident_pool_binding(core, guest, length)
     }
 
     /// The device buffer and offset for `length` storage bytes at guest
@@ -10817,6 +10814,63 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn mesh_indirect_accepts_a_count_at_the_end_of_a_pool() {
+        let Ok(Some(backend)) = Backend::create() else {
+            return;
+        };
+        let pool = 1;
+        let base = 0x10_0000;
+        let address = 0x20_0000;
+        let size = 4096;
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [base, size, 0, 0],
+                    ..Args::default()
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.objects.get_mut(&pool).unwrap().state.insert(
+            "GpuAddress".into(),
+            Args {
+                x: [address, 0, 0, 0],
+                ..Args::default()
+            },
+        );
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "mesh count")
+            .unwrap();
+        memory.write(base + size - 4, &73u32.to_le_bytes()).unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut command = Command {
+            name: "nvnCommandBufferDrawMeshTasksIndirect",
+            x: [0; 8],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: Default::default(),
+        };
+        command.x[1] = address + size - 4;
+        let groups = nvn.mesh_groups(&mut guest, &command).unwrap();
+        assert!(matches!(groups, super::MeshGroups::Indirect { .. }));
+    }
 
     #[test]
     fn observable_marker_leaves_later_writes_in_the_same_submission_pending() {

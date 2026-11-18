@@ -1050,11 +1050,15 @@ impl Renderer {
         // whose y and z are 1, before the rendering pass.
         let mesh_arguments = match draw.mesh {
             Some(MeshGroups::Indirect { buffer, offset }) => {
-                let words: Vec<u8> = [0u32, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
-                let (ring, at) = self.ring_upload(&words, 16)?;
+                let words = [0u32, 1, 1].map(u32::to_le);
+                let (ring, at) = self.ring_upload(words_as_bytes(&words), 16)?;
                 // Bounded by the device's limit on the GPU (`mesh_count`);
                 // copied as it is where buffers have no addresses.
-                if !self.bounded_indirect((buffer, offset), (ring, at), 1)? {
+                if !self.bounded_indirect(
+                    (buffer, offset),
+                    (ring, at),
+                    crate::mesh_count::IndirectCounts::Mesh,
+                )? {
                     self.stat("stat: mesh counts copied unbounded", 1);
                     self.copy_mesh_count((buffer, offset), (ring, at))?;
                 }

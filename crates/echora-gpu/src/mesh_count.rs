@@ -5,10 +5,8 @@
 //! three, and a count above maxTaskWorkGroupCount is not a valid one: the
 //! count is moved into the draw's argument slot by a one-invocation compute
 //! program that bounds it by VK_EXT_mesh_shader's minimum limit (65535),
-//! and the count as read is kept in a log for ECHORA_MESH_COUNT_LOG. The
-//! game's task programs leave at once past their 4096th workgroup, so a
-//! larger count draws nothing more; an unbounded one of billions ran the GPU
-//! past the kernel's job limit.
+//! and the original count is retained for ECHORA_MESH_COUNT_LOG and
+//! device-loss diagnostics.
 
 use ash::vk;
 use echora_shader::spirv::{self, Function, Module, Type};
@@ -23,6 +21,22 @@ const LOGGED: u32 = 65536;
 
 /// Words ECHORA_DIAG_PROBE reads through the GPU's view (`probe_device_words`).
 const PROBES: u32 = 64;
+const PUSH_BYTES: usize = 32;
+
+#[derive(Clone, Copy)]
+pub(crate) enum IndirectCounts {
+    Mesh,
+    Dispatch,
+}
+
+impl IndirectCounts {
+    fn axes(self) -> usize {
+        match self {
+            Self::Mesh => 1,
+            Self::Dispatch => 3,
+        }
+    }
+}
 
 /// A bound from a diagnostic variable (tighter than the device limit, so a
 /// diagnostic run cannot flood the GPU through wrong counts), else `limit`.
@@ -34,7 +48,7 @@ fn diagnostic_bound(name: &str, limit: u32) -> u32 {
 }
 
 pub(crate) struct MeshCount {
-    pipeline: vk::Pipeline,
+    pipelines: [vk::Pipeline; 2],
     layout: vk::PipelineLayout,
     /// Each draw's count as read (u32), by draw number modulo LOGGED.
     log: HostBuffer,
@@ -67,13 +81,49 @@ impl MeshCount {
             .ok_or("bounded mesh counts need buffer device addresses")?;
         let range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(40);
+            .size(PUSH_BYTES as u32);
         let ranges = [range];
         let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
         // SAFETY: a valid device and create info; destroyed in `destroy`.
         let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
             .map_err(vk_error("vkCreatePipelineLayout"))?;
-        let words = bound_program();
+        let mut pipelines = [vk::Pipeline::null(); 2];
+        for kind in [IndirectCounts::Mesh, IndirectCounts::Dispatch] {
+            match Self::create_pipeline(device, layout, kind) {
+                Ok(pipeline) => pipelines[kind as usize] = pipeline,
+                Err(error) => {
+                    // SAFETY: neither pipeline has been used.
+                    unsafe {
+                        for pipeline in pipelines {
+                            device.destroy_pipeline(pipeline, None);
+                        }
+                        device.destroy_pipeline_layout(layout, None);
+                    }
+                    log.destroy(device);
+                    probes.destroy(device);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self {
+            pipelines,
+            layout,
+            log,
+            log_address,
+            next: 0,
+            reported: 0,
+            probes,
+            probes_address,
+            probed: 0,
+        })
+    }
+
+    fn create_pipeline(
+        device: &ash::Device,
+        layout: vk::PipelineLayout,
+        kind: IndirectCounts,
+    ) -> Result<vk::Pipeline, String> {
+        let words = bound_program(kind);
         let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
         // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
         let module = unsafe { device.create_shader_module(&module_info, None) }
@@ -91,19 +141,7 @@ impl MeshCount {
         };
         // SAFETY: the pipeline (made or not) no longer needs the module.
         unsafe { device.destroy_shader_module(module, None) };
-        let pipeline =
-            pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0];
-        Ok(Self {
-            pipeline,
-            layout,
-            log,
-            log_address,
-            next: 0,
-            reported: 0,
-            probes,
-            probes_address,
-            probed: 0,
-        })
+        Ok(pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0])
     }
 
     /// The counts read since the last report: each past the bound, then
@@ -167,7 +205,9 @@ impl MeshCount {
     pub(crate) fn destroy(self, device: &ash::Device) {
         // SAFETY: the renderer is idle when it is destroyed.
         unsafe {
-            device.destroy_pipeline(self.pipeline, None);
+            for pipeline in self.pipelines {
+                device.destroy_pipeline(pipeline, None);
+            }
             device.destroy_pipeline_layout(self.layout, None);
         }
         self.log.destroy(device);
@@ -177,8 +217,8 @@ impl MeshCount {
 
 impl Renderer {
     /// Record, outside a rendering pass and any render condition, the move
-    /// of `words` group counts (1: an NVN mesh draw's one, the target's y
-    /// and z set to 1; 3: a dispatch's x, y and z) at `source` (its buffer
+    /// of group counts (a mesh draw's x with y and z set to 1, or a
+    /// dispatch's x, y and z) at `source` (its buffer
     /// and offset) into `target`, each bounded by TASK_WORKGROUPS (also
     /// the minimum maxComputeWorkGroupCount), ordered after earlier writes
     /// and before the indirect draw or dispatch that reads them. False
@@ -188,7 +228,7 @@ impl Renderer {
         &mut self,
         source: (vk::Buffer, u64),
         target: (vk::Buffer, u64),
-        words: u32,
+        kind: IndirectCounts,
     ) -> Result<bool, String> {
         let (Some(source_address), Some(target_address)) =
             (self.buffer_address(source.0), self.buffer_address(target.0))
@@ -209,22 +249,21 @@ impl Renderer {
                 diagnostic_bound("ECHORA_DIAG_DISPATCH_GROUPS", u32::MAX),
             )
         });
-        let (bound, product) = if words == 1 {
-            (task_bound, 0)
-        } else {
-            (
+        let (bound, product) = match kind {
+            IndirectCounts::Mesh => (task_bound, 0),
+            IndirectCounts::Dispatch => (
                 axis_bound,
                 if product_bound == u32::MAX {
                     0
                 } else {
                     product_bound
                 },
-            )
+            ),
         };
         self.record_bound_program(
             source_address + source.1,
             target_address + target.1,
-            words,
+            kind,
             bound,
             product,
             true,
@@ -247,7 +286,7 @@ impl Renderer {
             }
             let slot = mesh_count.probes_address + u64::from(mesh_count.probed) * 12;
             mesh_count.probed += 1;
-            self.record_bound_program(address, slot, 1, u32::MAX, 0, false)?;
+            self.record_bound_program(address, slot, IndirectCounts::Mesh, u32::MAX, 0, false)?;
         }
         Ok(())
     }
@@ -259,7 +298,7 @@ impl Renderer {
         &mut self,
         source: u64,
         target: u64,
-        words: u32,
+        kind: IndirectCounts,
         bound: u32,
         product: u32,
         logged: bool,
@@ -275,15 +314,13 @@ impl Renderer {
         } else {
             target
         };
-        let push: Vec<u8> = [source, target, log]
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .chain(bound.to_le_bytes())
-            .chain(words.to_le_bytes())
-            .chain(product.to_le_bytes())
-            .chain([0; 4])
-            .collect();
-        let (pipeline, layout) = (mesh_count.pipeline, mesh_count.layout);
+        let mut push = [0; PUSH_BYTES];
+        push[..8].copy_from_slice(&source.to_le_bytes());
+        push[8..16].copy_from_slice(&target.to_le_bytes());
+        push[16..24].copy_from_slice(&log.to_le_bytes());
+        push[24..28].copy_from_slice(&bound.to_le_bytes());
+        push[28..32].copy_from_slice(&product.to_le_bytes());
+        let (pipeline, layout) = (mesh_count.pipelines[kind as usize], mesh_count.layout);
         // The count an earlier pass wrote is read by the program.
         let written = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
@@ -348,11 +385,10 @@ pub(crate) fn logging() -> bool {
     *ON.get_or_init(|| std::env::var_os("ECHORA_MESH_COUNT_LOG").is_some())
 }
 
-/// One invocation: for each of the 3 words, `target[i] = i < words ?
-/// min(source[i], bound) : 1`, and `*log` the largest source word used
-/// (u32). The push constants hold the source, target and log addresses
-/// (u64), then the bound and the word count.
-fn bound_program() -> Vec<u32> {
+/// Read the guest record's one or three axes, clamp them, and log the
+/// highest raw axis. A mesh record contains only X. The host record uses
+/// one for Y and Z without reading them from the source.
+fn bound_program(kind: IndirectCounts) -> Vec<u32> {
     use spirv::{capability, decoration, execution, glsl, op, storage};
     let mut module = Module::new();
     module.capability(capability::SHADER);
@@ -365,10 +401,10 @@ fn bound_program() -> Vec<u32> {
     let u32_type = module.u32();
     let u64_type = module.u64();
     let block = module.ty(Type::Struct {
-        members: vec![u64_type, u64_type, u64_type, u32_type, u32_type, u32_type],
+        members: vec![u64_type, u64_type, u64_type, u32_type, u32_type],
     });
     module.decorate(block, decoration::BLOCK, &[]);
-    for (member, offset) in [0, 8, 16, 24, 28, 32].into_iter().enumerate() {
+    for (member, offset) in [0, 8, 16, 24, 28].into_iter().enumerate() {
         module.member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
     }
     let push_pointer = module.pointer(storage::PUSH_CONSTANT, block);
@@ -380,9 +416,7 @@ fn bound_program() -> Vec<u32> {
         result: void,
         parameters: Vec::new(),
     });
-    let members: Vec<u32> = (0..6)
-        .map(|value| module.constant(u32_type, value))
-        .collect();
+    let members = [0, 1, 2, 3, 4].map(|value| module.constant(u32_type, value));
     let one = module.constant(u32_type, 1);
     let zero = module.constant(u32_type, 0);
     let mut main = Function::new(&mut module, void, function_type);
@@ -394,63 +428,67 @@ fn bound_program() -> Vec<u32> {
     let target = field(&mut main, &mut module, 1, push_u64, u64_type);
     let log = field(&mut main, &mut module, 2, push_u64, u64_type);
     let bound = field(&mut main, &mut module, 3, push_u32, u32_type);
-    let words = field(&mut main, &mut module, 4, push_u32, u32_type);
-    let product = field(&mut main, &mut module, 5, push_u32, u32_type);
-    let offsets: Vec<u32> = (0..3u64)
-        .map(|index| module.constant64(u64_type, index * 4))
-        .collect();
+    let offsets = [0, 4, 8].map(|offset| module.constant64(u64_type, offset));
     let mut largest = zero;
-    let mut values = Vec::new();
-    for index in 0..3usize {
-        let source_at = main.value(&mut module, op::I_ADD, u64_type, &[source, offsets[index]]);
+    let mut values = [one; 3];
+    for (index, (value, offset)) in values.iter_mut().zip(offsets).take(kind.axes()).enumerate() {
+        let source_at = main.value(&mut module, op::I_ADD, u64_type, &[source, offset]);
         // Memory operand Aligned (2), 4.
         let source_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[source_at]);
         let count = main.value(&mut module, op::LOAD, u32_type, &[source_at, 2, 4]);
-        let used = main.value(
-            &mut module,
-            op::U_LESS_THAN,
-            bool_type,
-            &[members[index], words],
-        );
-        let bounded = main.value(
+        *value = main.value(
             &mut module,
             op::EXT_INST,
             u32_type,
             &[glsl_set, glsl::U_MIN, count, bound],
         );
-        values.push(main.value(&mut module, op::SELECT, u32_type, &[used, bounded, one]));
-        let raw = main.value(&mut module, op::SELECT, u32_type, &[used, count, zero]);
-        largest = main.value(
+        largest = if index == 0 {
+            count
+        } else {
+            main.value(
+                &mut module,
+                op::EXT_INST,
+                u32_type,
+                &[glsl_set, glsl::U_MAX, largest, count],
+            )
+        };
+    }
+    if matches!(kind, IndirectCounts::Dispatch) {
+        // Each dispatch axis is at most TASK_WORKGROUPS. Their product
+        // fits 64 bits and can exceed 32 bits.
+        let product = field(&mut main, &mut module, 4, push_u32, u32_type);
+        let [x, y, z] =
+            values.map(|axis| main.value(&mut module, op::U_CONVERT, u64_type, &[axis]));
+        let xy = main.value(&mut module, op::I_MUL, u64_type, &[x, y]);
+        let xyz = main.value(&mut module, op::I_MUL, u64_type, &[xy, z]);
+        let wide_product = main.value(&mut module, op::U_CONVERT, u64_type, &[product]);
+        let capped = main.value(&mut module, op::I_NOT_EQUAL, bool_type, &[product, zero]);
+        let over = main.value(
+            &mut module,
+            op::U_GREATER_THAN,
+            bool_type,
+            &[xyz, wide_product],
+        );
+        let limit = main.value(&mut module, op::LOGICAL_AND, bool_type, &[capped, over]);
+        let x_capped = main.value(
             &mut module,
             op::EXT_INST,
             u32_type,
-            &[glsl_set, glsl::U_MAX, largest, raw],
+            &[glsl_set, glsl::U_MIN, values[0], product],
         );
+        for (value, replacement) in values.iter_mut().zip([x_capped, one, one]) {
+            *value = main.value(
+                &mut module,
+                op::SELECT,
+                u32_type,
+                &[limit, replacement, *value],
+            );
+        }
     }
-    // A product bound (nonzero): past it, x alone (bounded by it) and y, z 1.
-    let xy = main.value(&mut module, op::I_MUL, u32_type, &[values[0], values[1]]);
-    let xyz = main.value(&mut module, op::I_MUL, u32_type, &[xy, values[2]]);
-    let capped = main.value(&mut module, op::I_NOT_EQUAL, bool_type, &[product, zero]);
-    let over = main.value(&mut module, op::U_GREATER_THAN, bool_type, &[xyz, product]);
-    let limit = main.value(&mut module, op::LOGICAL_AND, bool_type, &[capped, over]);
-    let x_capped = main.value(
-        &mut module,
-        op::EXT_INST,
-        u32_type,
-        &[glsl_set, glsl::U_MIN, values[0], product],
-    );
-    values[0] = main.value(
-        &mut module,
-        op::SELECT,
-        u32_type,
-        &[limit, x_capped, values[0]],
-    );
-    values[1] = main.value(&mut module, op::SELECT, u32_type, &[limit, one, values[1]]);
-    values[2] = main.value(&mut module, op::SELECT, u32_type, &[limit, one, values[2]]);
-    for index in 0..3usize {
-        let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offsets[index]]);
+    for (offset, value) in offsets.into_iter().zip(values) {
+        let target_at = main.value(&mut module, op::I_ADD, u64_type, &[target, offset]);
         let target_at = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[target_at]);
-        main.emit(op::STORE, &[target_at, values[index], 2, 4]);
+        main.emit(op::STORE, &[target_at, value, 2, 4]);
     }
     let log = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[log]);
     main.emit(op::STORE, &[log, largest, 2, 4]);
@@ -464,6 +502,8 @@ fn bound_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::IndirectCounts;
+
     /// The bound program run once in the simulator: the three target words
     /// and the logged word, for `source` words, a per-word `bound`, the
     /// number of `words` used and a `product` bound (0: none).
@@ -472,26 +512,27 @@ mod tests {
         const SOURCE: u64 = 0x1000;
         const TARGET: u64 = 0x2000;
         const LOG: u64 = 0x3000;
+        let kind = if words == 1 {
+            IndirectCounts::Mesh
+        } else {
+            IndirectCounts::Dispatch
+        };
         let push: Vec<u8> = [SOURCE, TARGET, LOG]
             .iter()
             .flat_map(|address| address.to_le_bytes())
-            .chain(
-                [bound, words, product]
-                    .iter()
-                    .flat_map(|word| word.to_le_bytes()),
-            )
+            .chain([bound, product].iter().flat_map(|word| word.to_le_bytes()))
             .collect();
         let bytes = |words: &[u32]| -> Vec<u8> {
             words.iter().flat_map(|word| word.to_le_bytes()).collect()
         };
         let memory = [
-            (SOURCE, bytes(&source)),
+            (SOURCE, bytes(&source[..kind.axes()])),
             (TARGET, bytes(&[0xdead_beef; 3])),
             (LOG, bytes(&[0xdead_beef])),
         ]
         .into_iter()
         .collect();
-        let report = Machine::new(&super::bound_program()).simulate(&Inputs {
+        let report = Machine::new(&super::bound_program(kind)).simulate(&Inputs {
             workgroup_count: [1, 1, 1],
             push,
             memory,
@@ -511,7 +552,7 @@ mod tests {
     #[test]
     fn a_mesh_count_is_bounded_and_its_other_groups_are_one() {
         // One word used: the count as it is below the bound, the bound
-        // above it; y and z are 1 whatever follows the count in memory.
+        // above it; y and z are 1 even with only four source bytes mapped.
         assert_eq!(bounded([5, 77, 88], 65535, 1, 0), ([5, 1, 1], 5));
         assert_eq!(bounded([0, 77, 88], 65535, 1, 0), ([0, 1, 1], 0));
         assert_eq!(bounded([65535, 0, 0], 65535, 1, 0), ([65535, 1, 1], 65535));
@@ -525,6 +566,35 @@ mod tests {
             bounded([0x1234_5678, 0, 0], u32::MAX, 1, 0),
             ([0x1234_5678, 1, 1], 0x1234_5678)
         );
+    }
+
+    #[test]
+    fn a_four_byte_mesh_record_expands_to_vulkan_indirect_arguments() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address {
+            return;
+        }
+        let mut renderer = super::Renderer::new(gpu).unwrap();
+        let source = renderer
+            .host_buffer_with(4, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
+            .unwrap();
+        source.write(0, &73u32.to_le_bytes());
+        let target = renderer.ring_upload(&[0; 12], 4).unwrap();
+        assert!(
+            renderer
+                .bounded_indirect((source.buffer, 0), target, IndirectCounts::Mesh)
+                .unwrap()
+        );
+        let token = renderer.defer_ring_read(target.1, 12);
+        renderer.flush().unwrap();
+        let expected: Vec<_> = [73u32, 1, 1]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert_eq!(renderer.take_reads(&[token])[&token], expected);
+        source.destroy(renderer.device());
     }
 
     #[test]
@@ -544,6 +614,10 @@ mod tests {
             ([64, 1, 1], u32::MAX)
         );
         assert_eq!(bounded([1000, 1, 1], 64, 3, 16), ([16, 1, 1], 1000));
+        assert_eq!(
+            bounded([4096, 4096, 256], 65535, 3, 32768),
+            ([4096, 1, 1], 4096)
+        );
         // No group count is ever more than the product bound.
         for source in [
             [64, 64, 64],
@@ -561,23 +635,25 @@ mod tests {
     }
 
     #[test]
-    fn the_bound_program_is_valid_spirv() {
-        let words = super::bound_program();
-        let path =
-            std::env::temp_dir().join(format!("echora-mesh-count-{}.spv", std::process::id()));
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-        std::fs::write(&path, bytes).unwrap();
-        let output = std::process::Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.3"])
-            .arg(&path)
-            .output();
-        let _ = std::fs::remove_file(&path);
-        if let Ok(output) = output {
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    fn the_bound_programs_are_valid_spirv() {
+        for kind in [IndirectCounts::Mesh, IndirectCounts::Dispatch] {
+            let words = super::bound_program(kind);
+            let path =
+                std::env::temp_dir().join(format!("echora-mesh-count-{}.spv", std::process::id()));
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).unwrap();
+            let output = std::process::Command::new("spirv-val")
+                .args(["--target-env", "vulkan1.3"])
+                .arg(&path)
+                .output();
+            let _ = std::fs::remove_file(&path);
+            if let Ok(output) = output {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
     }
 }
