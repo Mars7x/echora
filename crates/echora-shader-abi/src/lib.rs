@@ -482,6 +482,7 @@ pub const VERTEX_ATTRIBUTES: usize = 32;
 
 impl VertexAttribute {
     /// The entry as the table stores it.
+    #[inline]
     pub fn to_bytes(&self) -> [u8; 32] {
         let words = [
             self.address as u32,

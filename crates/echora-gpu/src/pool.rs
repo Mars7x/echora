@@ -340,7 +340,7 @@ impl Renderer {
                             && last.matches_binding(&entry.source, &entry.sampler_state)
                     }))
         {
-            let pending = self.rendering_pending(targets);
+            let pending = self.rendering_pending(targets.iter().copied());
             self.stat("stat: texture pool sets unchanged", 1);
             if pending {
                 self.memory_barrier()?;

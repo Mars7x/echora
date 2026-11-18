@@ -5192,8 +5192,10 @@ impl Renderer {
     }
 
     /// Whether one of these images has render or clear writes awaiting a barrier.
-    pub(crate) fn rendering_pending(&self, images: &[vk::Image]) -> bool {
-        images.iter().any(|image| self.written.contains(image))
+    pub(crate) fn rendering_pending(&self, images: impl IntoIterator<Item = vk::Image>) -> bool {
+        images
+            .into_iter()
+            .any(|image| self.written.contains(&image))
     }
 
     /// Make earlier rendering visible before work that reads (or writes)
@@ -5202,7 +5204,7 @@ impl Renderer {
     /// nothing else orders a pass's attachment writes before a later
     /// sample, copy or read back of the same image (stale tiles otherwise).
     pub(crate) fn order_after_rendering(&mut self, images: &[vk::Image]) -> Result<(), String> {
-        if !self.rendering_pending(images) {
+        if !self.rendering_pending(images.iter().copied()) {
             return Ok(());
         }
         self.memory_barrier()

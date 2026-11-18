@@ -900,7 +900,8 @@ impl Renderer {
             Indices::U16(data) | Indices::U32(data) => data.len() as u64 + 16,
             Indices::Guest { bytes, .. } => bytes + 16,
         };
-        bytes += draw.vertex_fetch.len() as u64 * 32 + 256;
+        let vertex_fetch_bytes = draw.vertex_fetch.len() as u64 * 32;
+        bytes += vertex_fetch_bytes + 256;
         if matches!(draw.mesh, Some(MeshGroups::Indirect { .. })) {
             bytes += 32;
         }
@@ -1076,7 +1077,7 @@ impl Renderer {
         };
 
         // Targets this draw samples were maybe rendered just before.
-        let sampled: Vec<vk::Image> = draw
+        let sampled = draw
             .textures
             .values()
             .filter_map(|(source, _)| match source {
@@ -1084,9 +1085,10 @@ impl Renderer {
                     self.existing_target(*key).map(|target| target.image)
                 }
                 TextureSource::Upload { .. } => None,
-            })
-            .collect();
-        self.order_after_rendering(&sampled)?;
+            });
+        if self.rendering_pending(sampled) {
+            self.memory_barrier()?;
+        }
         // An indirect mesh draw's record holds one group count (NVN mesh
         // draws are one-dimensional: DrawMeshTasks(first, count)), not
         // Vulkan's three: the count is copied, on the GPU, into a ring slot
@@ -1215,12 +1217,17 @@ impl Renderer {
                 ..Default::default()
             };
             if !draw.vertex_fetch.is_empty() {
-                let bytes: Vec<u8> = draw
-                    .vertex_fetch
-                    .iter()
-                    .flat_map(echora_shader_abi::VertexAttribute::to_bytes)
-                    .collect();
-                let (buffer, offset) = self.ring_upload(&bytes, 256)?;
+                let (buffer, offset) = self.ring_upload_with(vertex_fetch_bytes, 256, |ring| {
+                    for (entry, attribute) in ring
+                        .as_chunks_mut::<32>()
+                        .0
+                        .iter_mut()
+                        .zip(&draw.vertex_fetch)
+                    {
+                        *entry = attribute.to_bytes();
+                    }
+                    Ok(())
+                })?;
                 fetch.table = self
                     .buffer_address(buffer)
                     .ok_or("vertex pulling needs buffer device addresses")?
