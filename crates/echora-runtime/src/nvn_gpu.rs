@@ -330,6 +330,31 @@ impl Backend {
         Ok(())
     }
 
+    /// Whether a resident GPU copy holds bytes newer than guest memory
+    /// anywhere in this range.
+    fn resident_writes_pending(&self, range: &std::ops::Range<u64>) -> bool {
+        let mut index = self.dirty_index.borrow_mut();
+        let stamp = self.dirty_removals;
+        if index.0 != stamp {
+            let mut ranges: Vec<std::ops::Range<u64>> = self
+                .resident
+                .values()
+                .flat_map(|pool| pool.gpu_dirty.iter().cloned())
+                .collect();
+            ranges.sort_unstable_by_key(|range| range.start);
+            let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                match merged.last_mut() {
+                    Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                    _ => merged.push(range),
+                }
+            }
+            *index = (stamp, merged);
+        }
+        let at = index.1.partition_point(|dirty| dirty.end <= range.start);
+        index.1.get(at).is_some_and(|dirty| dirty.start < range.end)
+    }
+
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
     /// the run report; nothing is logged.
     pub(super) fn stat(&mut self, name: &'static str, amount: u64) {
@@ -5423,26 +5448,7 @@ impl Nvn {
         {
             return true;
         }
-        let mut index = backend.dirty_index.borrow_mut();
-        let stamp = backend.dirty_removals;
-        if index.0 != stamp {
-            let mut ranges: Vec<std::ops::Range<u64>> = backend
-                .resident
-                .values()
-                .flat_map(|pool| pool.gpu_dirty.iter().cloned())
-                .collect();
-            ranges.sort_unstable_by_key(|range| range.start);
-            let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                match merged.last_mut() {
-                    Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                    _ => merged.push(range),
-                }
-            }
-            *index = (stamp, merged);
-        }
-        let at = index.1.partition_point(|dirty| dirty.end <= range.start);
-        index.1.get(at).is_some_and(overlaps)
+        backend.resident_writes_pending(range)
     }
 
     pub(super) fn resolve_storage(
@@ -5576,6 +5582,12 @@ impl Nvn {
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
         };
+        if range
+            .as_ref()
+            .is_some_and(|range| !backend.resident_writes_pending(range))
+        {
+            return Ok(());
+        }
         let mut wanted = Vec::new();
         for pool in backend.resident.values() {
             for dirty in &pool.gpu_dirty {
@@ -10697,6 +10709,56 @@ mod pool_tests {
             [pool, 2, builder, 0],
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::LINEAR);
+    }
+
+    #[test]
+    fn resident_readback_only_copies_overlapping_dirty_bytes() {
+        let Ok(Some(mut backend)) = Backend::create() else {
+            return;
+        };
+        let base = 0x10_0000;
+        backend.renderer.resident_buffer(base, 4096).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 8, &[0x42; 16])
+            .unwrap();
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size: 4096,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: std::iter::once(base + 8..base + 24).collect(),
+            },
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 4096, READ | WRITE, STATE_NORMAL, "resident test")
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.resolve_resident(&mut core, Some(base..base + 8))
+            .unwrap();
+        assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 0);
+        nvn.resolve_resident(&mut core, Some(base + 12..base + 16))
+            .unwrap();
+        assert_eq!(core.memory.read_u32(base + 12).unwrap(), 0x4242_4242);
+        assert_eq!(core.memory.read_u32(base + 16).unwrap(), 0);
+        let backend = nvn.gpu.as_ref().unwrap();
+        assert!(!backend.resident_writes_pending(&(base + 12..base + 16)));
+        assert!(backend.resident_writes_pending(&(base + 16..base + 24)));
     }
 
     #[test]
