@@ -1647,6 +1647,42 @@ const USES_FLAGS: &[&str] = &[
     "simd::fp_select(",
 ];
 
+/// Rewrite the generated `m.cpu.regs[n]` references in one pass. The
+/// intermediate `x[n]` spelling is also accepted by the window emitter.
+fn localize_registers(line: &str, used: &BTreeSet<u8>) -> String {
+    const CORE_REGS: &str = "m.cpu.regs";
+    let mut output = String::with_capacity(line.len());
+    let mut copied = 0;
+    for (open, _) in line.match_indices('[') {
+        let prefix = &line[..open];
+        let core = prefix.ends_with(CORE_REGS);
+        if !core && !prefix.ends_with('x') {
+            continue;
+        }
+        let start = open - if core { CORE_REGS.len() } else { 1 };
+        let tail = &line[open + 1..];
+        let register = match tail.as_bytes() {
+            [units @ b'0'..=b'9', b']', ..] => Some((units - b'0', 1)),
+            [tens @ b'1'..=b'9', units @ b'0'..=b'9', b']', ..] => {
+                Some(((tens - b'0') * 10 + (units - b'0'), 2))
+            }
+            _ => None,
+        };
+        if let Some((_, digits)) = register.filter(|(index, _)| used.contains(index)) {
+            output.push_str(&line[copied..start]);
+            output.push_str("r.x");
+            output.push_str(&tail[..digits]);
+            copied = open + digits + 2;
+        } else if core {
+            output.push_str(&line[copied..start]);
+            output.push_str("x[");
+            copied = open + 1;
+        }
+    }
+    output.push_str(&line[copied..]);
+    output
+}
+
 impl RegisterLocals {
     fn of(cases: &str) -> Self {
         let mut locals = Self {
@@ -1830,15 +1866,12 @@ impl RegisterLocals {
         let mut depth = 0usize;
         let mut tracked = true;
         for line in cases.lines() {
-            let mut line = line.replace("m.cpu.regs[", "x[");
+            let mut line = localize_registers(line, &self.used);
             if fp_status {
                 for field in ["fpcr", "fpsr"] {
                     line = line.replace(&format!("m.cpu.{field}"), &format!("r.{field}"));
                 }
                 line = wrap_cpu_helpers(&line, &store_fp, &reload_fp);
-            }
-            for index in &self.used {
-                line = line.replace(&format!("x[{index}]"), &format!("r.x{index}"));
             }
             let mut line = replace_sp(&line);
             let before = depth;
@@ -6468,6 +6501,14 @@ pub fn emit_rust(translation: &Translation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localize_registers_matches_whole_register_indices() {
+        let used = BTreeSet::from([1, 10, 27]);
+        let input = "m.cpu.regs[1] = m.cpu.regs[10] + x[27] + m.cpu.regs[11] + r.x2 + x[01];";
+        let expected = "r.x1 = r.x10 + r.x27 + x[11] + r.x2 + x[01];";
+        assert_eq!(localize_registers(input, &used), expected);
+    }
 
     /// Expected text written with the Cpu::read_reg/write_reg helper calls,
     /// in the form the generator emits after resolving them statically.
