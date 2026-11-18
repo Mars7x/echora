@@ -780,7 +780,12 @@ impl Renderer {
     pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
-        let mut since = std::time::Instant::now();
+        static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let profile = *PROFILE.get_or_init(|| {
+            std::env::var_os("ECHORA_GPU_TIME").is_some_and(|mode| mode != "0")
+                || std::env::var_os("ECHORA_TIMELINE").is_some()
+        });
+        let mut since = profile.then(std::time::Instant::now);
         let scale = self.attachment_scale(draw.colors, draw.depth)?;
         self.bound_submission()?;
         self.lap("stat: renderer ns submission", &mut since);
@@ -1422,10 +1427,12 @@ impl Renderer {
 impl Renderer {
     /// Count the time since `since` under `name` and restart it (the
     /// draw's phases, in the statistics).
-    fn lap(&mut self, name: &'static str, since: &mut std::time::Instant) {
-        let now = std::time::Instant::now();
-        self.stat(name, (now - *since).as_nanos() as u64);
-        *since = now;
+    fn lap(&mut self, name: &'static str, since: &mut Option<std::time::Instant>) {
+        if let Some(since) = since {
+            let now = std::time::Instant::now();
+            self.stat(name, (now - *since).as_nanos() as u64);
+            *since = now;
+        }
     }
 }
 
