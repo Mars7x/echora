@@ -237,6 +237,10 @@ type DebugOverrides = HashMap<String, Option<&'static std::ffi::OsStr>>;
 static DEBUG_OVERRIDES: std::sync::RwLock<Option<DebugOverrides>> = std::sync::RwLock::new(None);
 static DEBUG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) fn debug_generation() -> u64 {
+    DEBUG_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Replace the replay switches (`None` for none). The values are leaked:
 /// replays set a few dozen short strings.
 fn set_debug_overrides(overrides: Option<HashMap<String, Option<String>>>) {
@@ -275,7 +279,7 @@ pub(crate) fn debug_var_os(name: &'static str) -> Option<&'static std::ffi::OsSt
         } };
     }
     let address = name.as_ptr() as usize;
-    let generation = DEBUG_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+    let generation = debug_generation();
     CACHE.with(|cache| {
         if cache.generation.get() != generation {
             for slot in &cache.slots {

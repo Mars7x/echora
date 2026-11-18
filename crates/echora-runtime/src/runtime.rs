@@ -1993,6 +1993,9 @@ impl Machine {
                 bits &= bits - 1;
             }
         }
+        if best == [u8::MAX; APPLICATION_CORE_COUNT] {
+            return;
+        }
         for core in 0..self.core_threads.len() {
             // This worker's own core was just scheduled.
             if self.worker_core == Some(core as u8) {
@@ -2859,6 +2862,7 @@ impl Machine {
                         active: index == 0,
                         index: index as u8,
                         held_failed: None,
+                        nvn_call_path: None,
                         lock_free_calls: 0,
                         recorded_calls: 0,
                         nvn_thunks: Vec::new(),
@@ -5061,6 +5065,8 @@ struct Worker {
     /// A held call failed: its error to report, or none for a call the
     /// held path cannot make (it is then made under the lock).
     held_failed: Option<Option<Trap>>,
+    /// Recording policy and the replay debug-switch generation it came from.
+    nvn_call_path: Option<(u64, NvnCallPath)>,
     /// Held calls since this worker last took the machine lock.
     lock_free_calls: u64,
     /// Of those, calls recorded without the NVN state's lock.
@@ -5078,6 +5084,31 @@ struct Worker {
     lock_free_yields: u64,
     /// Of those, in a row since the last yield or sleep under the lock.
     quiet_run: u32,
+}
+
+#[derive(Clone, Copy)]
+enum NvnCallPath {
+    Record,
+    NvnLock,
+    MachineLock,
+}
+
+impl NvnCallPath {
+    #[cold]
+    fn from_switches() -> Self {
+        use crate::nvn::debug_var_os;
+
+        // LOCKED_SUBMIT is the older name for LOCKED_NVN.
+        if debug_var_os("ECHORA_LOCKED_NVN").is_some()
+            || debug_var_os("ECHORA_LOCKED_SUBMIT").is_some()
+        {
+            Self::MachineLock
+        } else if debug_var_os("ECHORA_GPU_FLOW").is_some() {
+            Self::NvnLock
+        } else {
+            Self::Record
+        }
+    }
 }
 
 /// NVN entry points that stay under the machine lock: present publishes
@@ -5313,14 +5344,12 @@ impl Worker {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
                 self.core.rearm();
+                crate::host_profile::set_guest_thread(thread);
                 let result = loop {
                     rearm_lowered_dispatch_limit(&self.core);
-                    crate::host_profile::set_guest_thread(self.core.current_thread_id);
                     match dispatch(&mut self.core) {
                         Ok(()) => {}
-                        Err(Trap::MissingBlock { pc })
-                            if self.recorded_nvn_call(shared, pc)
-                                || self.held_nvn_call(shared, pc) => {}
+                        Err(Trap::MissingBlock { pc }) if self.try_nvn_call(shared, pc) => {}
                         Err(Trap::SupervisorCall { number: 0x0b }) if self.quiet_yield() => {}
                         result => break result,
                     }
@@ -5537,6 +5566,30 @@ impl Worker {
         }
     }
 
+    /// Try the worker's NVN paths before taking the machine lock.
+    fn try_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
+        if self.held_failed.is_some() {
+            return false;
+        }
+        let generation = crate::nvn::debug_generation();
+        let path = match self.nvn_call_path {
+            Some((cached, path)) if cached == generation => path,
+            _ => {
+                let path = NvnCallPath::from_switches();
+                self.nvn_call_path = Some((generation, path));
+                path
+            }
+        };
+        match path {
+            NvnCallPath::Record => {
+                self.recorded_nvn_call(shared, pc)
+                    || (self.held_failed.is_none() && self.held_nvn_call(shared, pc))
+            }
+            NvnCallPath::NvnLock => self.held_nvn_call(shared, pc),
+            NvnCallPath::MachineLock => false,
+        }
+    }
+
     /// Record NVN call `pc` on a recording command buffer without any lock
     /// but that buffer's own (see `nvn::Recorder`): the game records command
     /// buffers on several cores at once, and through the NVN state's lock
@@ -5545,13 +5598,6 @@ impl Worker {
     /// such call (it is then made with the NVN state) or recording failed
     /// (reported at the next boundary, `held_failed`).
     fn recorded_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
-        if self.held_failed.is_some()
-            || crate::nvn::debug_var_os("ECHORA_LOCKED_NVN").is_some()
-            || crate::nvn::debug_var_os("ECHORA_LOCKED_SUBMIT").is_some()
-            || crate::nvn::debug_var_os("ECHORA_GPU_FLOW").is_some()
-        {
-            return false;
-        }
         let Some(index) = crate::nvn::thunk_index(pc) else {
             return false;
         };
@@ -5609,15 +5655,8 @@ impl Worker {
     /// worker's (an NVN call never blocks it). False when `pc` is not such
     /// a call or the call failed: the boundary then takes the machine lock,
     /// where a failed call's error is reported, or a call this path cannot
-    /// make is made (`held_failed`). ECHORA_LOCKED_NVN (or its older name
-    /// ECHORA_LOCKED_SUBMIT; diagnostic) makes every call under the lock.
+    /// make is made (`held_failed`).
     fn held_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
-        if self.held_failed.is_some()
-            || crate::nvn::debug_var_os("ECHORA_LOCKED_NVN").is_some()
-            || crate::nvn::debug_var_os("ECHORA_LOCKED_SUBMIT").is_some()
-        {
-            return false;
-        }
         if let Some(trap) = shared
             .replay_failed
             .lock()
