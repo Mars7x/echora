@@ -429,16 +429,10 @@ pub struct Nvn {
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<HashMap<u64, StageCode>>,
-    /// GPU ranges as (pool object, pool GPU address, range GPU address,
-    /// size, guest address, furthest end so far): a pool's storage, or one
-    /// mapping of a virtual pool, sorted by range GPU address. Rebuilt when
-    /// a lookup misses (see `pool_for`).
+    /// The CPU-visible ranges of live memory pools, rebuilt when a pool or
+    /// virtual mapping changes.
     #[serde(skip)]
-    pool_ranges: std::cell::RefCell<Vec<[u64; 6]>>,
-    /// `object_generation` when `pool_ranges` was built: while it holds,
-    /// every range's pool is live at its address and is not checked again.
-    #[serde(skip)]
-    pool_ranges_generation: std::cell::Cell<Option<u64>>,
+    pool_ranges: std::cell::RefCell<PoolRanges>,
     /// Bumped whenever an object is created or removed, or a virtual pool
     /// is remapped: what `texture_storage` answers can change only then.
     #[serde(skip)]
@@ -735,6 +729,20 @@ impl std::ops::Deref for StateSnapshots {
     fn deref(&self) -> &Self::Target {
         self.0.as_deref().map_or(&[], Vec::as_slice)
     }
+}
+
+#[derive(Debug, Default)]
+struct PoolRanges {
+    epoch: Option<u64>,
+    entries: Vec<PoolRange>,
+}
+
+#[derive(Debug)]
+struct PoolRange {
+    gpu: u64,
+    size: u64,
+    guest: u64,
+    furthest_end: u64,
 }
 
 /// A host image: RGBA, one f32 per channel.
@@ -2334,6 +2342,9 @@ impl Nvn {
                     let request = [word(0)?, word(8)?, word(0x10)?, word(0x18)?];
                     mappings.push(request);
                 }
+                // Each request changes the set of translations immediately.
+                self.pool_ranges.get_mut().epoch = None;
+                self.object_generation += 1;
                 for [physical, physical_offset, offset, size] in mappings {
                     if size == 0 || offset.checked_add(size).is_none_or(|end| end > pool_size) {
                         return Err(invalid(format!(
@@ -2383,9 +2394,6 @@ impl Nvn {
                         );
                     }
                 }
-                self.pool_ranges.borrow_mut().clear();
-                self.pool_ranges_generation.set(None);
-                self.object_generation += 1;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -6434,46 +6442,49 @@ impl Nvn {
     }
 
     /// The guest address of GPU address `address` and the bytes left in its
-    /// memory pool. Pool ranges are cached, sorted by their GPU start with
-    /// the furthest end of the ranges up to each one beside it, so a lookup
-    /// is a binary search and a short walk back; a range whose pool object
-    /// is gone, or a miss, rebuilds the cache from the live pools.
+    /// memory pool. Sorted ranges and their running maximum end allow a
+    /// binary search even when ranges overlap.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let current = self.pool_ranges_generation.get() == Some(self.object_generation);
-        let find = |ranges: &[[u64; 6]], current: bool| {
-            let after = ranges.partition_point(|range| range[2] <= address);
-            ranges[..after]
-                .iter()
-                .rev()
-                .take_while(|range| address < range[5])
-                .find_map(|&[key, pool_gpu, gpu, size, memory, _]| {
-                    let offset = address.checked_sub(gpu).filter(|offset| *offset < size)?;
-                    let live = current
-                        || self.objects.get(&key).is_some_and(|pool| {
-                            pool.kind == "MemoryPool"
-                                && pool.state.get("GpuAddress").map(|args| args.x[0])
-                                    == Some(pool_gpu)
-                        });
-                    live.then_some((memory + offset, size - offset))
-                })
-        };
-        if let Some(found) = find(&self.pool_ranges.borrow(), current) {
-            return Some(found);
+        let mut index = self.pool_ranges.borrow_mut();
+        if index.epoch != Some(self.pool_epoch) {
+            self.index_pool_ranges(&mut index.entries);
+            index.epoch = Some(self.pool_epoch);
         }
-        let mut ranges: Vec<[u64; 6]> = Vec::new();
-        for (key, pool) in &self.objects {
-            if pool.kind != "MemoryPool" {
-                continue;
-            }
+        let ranges = &index.entries;
+        let after = ranges.partition_point(|range| range.gpu <= address);
+        ranges[..after]
+            .iter()
+            .rev()
+            .take_while(|range| address < range.furthest_end)
+            .find_map(|range| {
+                let offset = address - range.gpu;
+                (offset < range.size).then(|| (range.guest + offset, range.size - offset))
+            })
+    }
+
+    fn index_pool_ranges(&self, ranges: &mut Vec<PoolRange>) {
+        ranges.clear();
+        let mut add = |gpu, size, guest| {
+            ranges.push(PoolRange {
+                gpu,
+                size,
+                guest,
+                furthest_end: 0,
+            });
+        };
+        for pool in self
+            .objects
+            .values()
+            .filter(|pool| pool.kind == "MemoryPool")
+        {
             let Some(gpu) = pool.state.get("GpuAddress").map(|args| args.x[0]) else {
                 continue;
             };
             let storage = &pool.builder["Storage"];
             if storage.x[0] != 0 {
-                ranges.push([*key, gpu, gpu, storage.x[1], storage.x[0], 0]);
+                add(gpu, storage.x[1], storage.x[0]);
                 continue;
             }
-            // A virtual pool: each mapping reaches into a physical pool.
             for (name, mapping) in &pool.state {
                 let Some(offset) = name
                     .strip_prefix(VIRTUAL_MAPPING)
@@ -6485,25 +6496,26 @@ impl Nvn {
                 let Some(storage) = self
                     .objects
                     .get(&physical)
-                    .filter(|object| object.kind == "MemoryPool")
-                    .map(|object| object.builder["Storage"].x[0])
+                    .filter(|pool| pool.kind == "MemoryPool")
+                    .map(|pool| pool.builder["Storage"])
+                    .filter(|storage| {
+                        storage.x[0] != 0
+                            && physical_offset
+                                .checked_add(size)
+                                .is_some_and(|end| end <= storage.x[1])
+                    })
                 else {
                     continue;
                 };
-                ranges.push([*key, gpu, gpu + offset, size, storage + physical_offset, 0]);
+                add(gpu + offset, size, storage.x[0] + physical_offset);
             }
         }
-        ranges.sort_by_key(|range| range[2]);
+        ranges.sort_by_key(|range| range.gpu);
         let mut end = 0;
-        for range in &mut ranges {
-            end = end.max(range[2].saturating_add(range[3]));
-            range[5] = end;
+        for range in ranges {
+            end = end.max(range.gpu.saturating_add(range.size));
+            range.furthest_end = end;
         }
-        let found = find(&ranges, true);
-        *self.pool_ranges.borrow_mut() = ranges;
-        self.pool_ranges_generation
-            .set(Some(self.object_generation));
-        found
     }
 
     fn texture_extent(&self, texture: u64) -> Result<(u32, u32), String> {
@@ -8162,6 +8174,8 @@ mod tests {
         assert_eq!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10), Ok(0x10_9010));
         assert!(nvn.gpu_to_guest(virtual_gpu + 0x3ff0, 0x20).is_err());
         assert!(nvn.gpu_to_guest(virtual_gpu, 4).is_err());
+        call(&mut nvn, &mut core, "nvnMemoryPoolFinalize", &[0x10_3000]);
+        assert!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10).is_err());
         // A null physical pool unmaps the range.
         core.memory.write(request, &0u64.to_le_bytes()).unwrap();
         assert_eq!(
