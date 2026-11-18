@@ -1843,129 +1843,98 @@ impl Renderer {
         texture_type: u32,
     ) -> Result<vk::ImageView, String> {
         use crate::draw::{ImageShape, TextureSource};
-        // Released texels come back from the image when this view needs
-        // another image made from them (the aliases below).
-        let filled;
-        let source = match source {
-            TextureSource::Upload {
-                texels,
-                format,
-                shape,
-                ..
-            } if texels.is_empty()
-                && !block_compressed(*format)
-                && match shape {
-                    ImageShape::D2 { layers } => {
-                        matches!(texture_type, 0 | 1) || (texture_type == 4 && *layers == 1)
-                    }
-                    ImageShape::D3 { .. } => matches!(texture_type, 2 | 3),
-                    _ => false,
-                } =>
-            {
-                filled = self.with_texels(source)?;
-                &filled
-            }
-            _ => source,
-        };
-        // A 2D upload read by a 1D binding (the shader's texture
-        // instruction is 1D): Vulkan has no 1D view of a 2D image, so its
-        // first row is uploaded again as a 1D image under its own cache
-        // key, which is what a 1D read of the 2D texture returns (row 0;
-        // inferred, NVN 1D textures are not told apart from 2D ones of
-        // height 1 so far). Each region's copy reads one row from the same
-        // texels. Block-compressed formats have no 1D images.
+        // Incompatible image dimensions need separate uploads: a row of
+        // a 2D image as 1D, a flat image as one 3D slice, or the slices of
+        // level 0 of a volume as 2D array layers.
         if let TextureSource::Upload {
             key,
+            generation,
+            width,
+            height,
+            shape,
             format,
-            shape: ImageShape::D2 { layers },
-            ..
-        } = source
-        {
-            if matches!(texture_type, 0 | 1) && !block_compressed(*format) {
-                let mut one_dimensional = source.clone();
-                if let TextureSource::Upload {
-                    key: alias,
-                    height,
-                    shape,
-                    levels,
-                    ..
-                } = &mut one_dimensional
-                {
-                    *alias = key ^ 1 << 63;
-                    *height = 1;
-                    *shape = ImageShape::D1 { layers: *layers };
-                    *levels = levels
-                        .iter()
-                        .map(|region| crate::draw::UploadRegion {
-                            height: 1,
-                            ..*region
-                        })
-                        .collect();
-                }
-                return self.texture_view(&one_dimensional, texture_type);
-            }
-            // Likewise a 3D binding (a colour lookup table slot the
-            // application fills with an ordinary texture, inferred): a 3D
-            // image one slice deep holds the same texels.
-            if texture_type == 4 && *layers == 1 && !block_compressed(*format) {
-                let mut volume = source.clone();
-                if let TextureSource::Upload {
-                    key: alias, shape, ..
-                } = &mut volume
-                {
-                    *alias = key ^ 1 << 62;
-                    *shape = ImageShape::D3 { depth: 1 };
-                }
-                return self.texture_view(&volume, texture_type);
-            }
-        }
-        // A 3D upload read by a 2D or 2D-array binding (the instruction
-        // decides the type): Vulkan samples no 2D view of a 3D image, so
-        // level 0 is uploaded again as a 2D array whose layers are its
-        // depth slices, under its own cache key. Each slice's copy reads
-        // from the same texels.
-        if let TextureSource::Upload {
-            key,
-            format,
-            shape: ImageShape::D3 { depth },
-            texels,
             levels,
             ..
         } = source
-            && matches!(texture_type, 2 | 3)
             && !block_compressed(*format)
-            && *depth > 0
         {
-            let mut layered = source.clone();
-            let base = levels.iter().find(|region| region.level == 0).copied();
-            if let (
-                TextureSource::Upload {
-                    key: alias,
-                    shape,
-                    levels: slices,
-                    ..
-                },
-                Some(base),
-            ) = (&mut layered, base)
-            {
-                let end = levels
+            let alias = match *shape {
+                ImageShape::D2 { layers } if matches!(texture_type, 0 | 1) => {
+                    Some((key ^ 1 << 63, 1, ImageShape::D1 { layers }))
+                }
+                ImageShape::D2 { layers: 1 } if texture_type == 4 => {
+                    Some((key ^ 1 << 62, *height, ImageShape::D3 { depth: 1 }))
+                }
+                ImageShape::D3 { depth } if depth > 0 && matches!(texture_type, 2 | 3) => levels
                     .iter()
-                    .map(|region| region.offset)
-                    .filter(|&offset| offset > base.offset)
-                    .min()
-                    .unwrap_or(texels.len() as u64);
-                let slice = (end - base.offset) / u64::from(*depth);
-                *alias = key ^ 1 << 61;
-                *shape = ImageShape::D2 { layers: *depth };
-                *slices = (0..*depth)
-                    .map(|layer| crate::draw::UploadRegion {
-                        layer,
-                        depth: 1,
-                        offset: base.offset + u64::from(layer) * slice,
-                        ..base
-                    })
-                    .collect();
-                return self.texture_view(&layered, texture_type);
+                    .any(|region| region.level == 0)
+                    .then_some((key ^ 1 << 61, *height, ImageShape::D2 { layers: depth })),
+                _ => None,
+            };
+            if let Some((alias, alias_height, alias_shape)) = alias {
+                let current = self.uploads.get(&alias).is_some_and(|(uploaded, target)| {
+                    uploaded == generation
+                        && (target.width, target.height, target.format, target.shape)
+                            == (*width, alias_height, *format, alias_shape)
+                });
+                // The alias already holds this generation. The source's
+                // texels may have been released after its own upload.
+                let mut source = if current {
+                    source.clone()
+                } else {
+                    self.with_texels(source)?
+                };
+                let TextureSource::Upload {
+                    key,
+                    height,
+                    shape,
+                    texels,
+                    levels,
+                    ..
+                } = &mut source
+                else {
+                    unreachable!("with_texels preserves an upload source");
+                };
+                *key = alias;
+                *height = alias_height;
+                *shape = alias_shape;
+                if !current {
+                    match alias_shape {
+                        ImageShape::D1 { .. } => {
+                            *levels = levels
+                                .iter()
+                                .map(|region| crate::draw::UploadRegion {
+                                    height: 1,
+                                    ..*region
+                                })
+                                .collect();
+                        }
+                        ImageShape::D2 { layers } => {
+                            let base = levels
+                                .iter()
+                                .find(|region| region.level == 0)
+                                .copied()
+                                .expect("the volume has level 0");
+                            let end = levels
+                                .iter()
+                                .map(|region| region.offset)
+                                .filter(|&offset| offset > base.offset)
+                                .min()
+                                .unwrap_or(texels.len() as u64);
+                            let slice = (end - base.offset) / u64::from(layers);
+                            *levels = (0..layers)
+                                .map(|layer| crate::draw::UploadRegion {
+                                    layer,
+                                    depth: 1,
+                                    offset: base.offset + u64::from(layer) * slice,
+                                    ..base
+                                })
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+                return self.texture_view(&source, texture_type);
             }
         }
         // A view of some mip levels and/or array layers (cube faces) of a
@@ -6890,6 +6859,53 @@ mod tests {
         assert_eq!(&texels[..4], &[0, 0, 0, 255]);
         assert_eq!(&texels[4 * 511..], &[255, 255, 255, 255]);
         assert_eq!(&texels[4 * 163..4 * 164], &[109, 145, 72, 255]);
+    }
+
+    #[test]
+    fn a_cached_upload_alias_needs_no_readback_of_the_original() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        for (key, shape, depth, original_type, alias_type) in [
+            (20, ImageShape::D2 { layers: 1 }, 1, 2, 0),
+            (21, ImageShape::D2 { layers: 1 }, 1, 2, 4),
+            (22, ImageShape::D3 { depth: 4 }, 4, 4, 3),
+        ] {
+            let mut source = TextureSource::Upload {
+                key,
+                generation: 1,
+                width: 4,
+                height: 4,
+                shape,
+                format: vk::Format::R8G8B8A8_UNORM,
+                texels: std::sync::Arc::new(vec![0x3a; 64 * depth as usize]),
+                levels: [UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 4,
+                    height: 4,
+                    depth,
+                    offset: 0,
+                }]
+                .into(),
+            };
+            renderer.texture_view(&source, original_type).unwrap();
+            let alias = renderer.texture_view(&source, alias_type).unwrap();
+            renderer.flush().unwrap();
+            let TextureSource::Upload { texels, .. } = &mut source else {
+                unreachable!();
+            };
+            *texels = Default::default();
+            let submissions = renderer.flushes;
+            assert_eq!(renderer.texture_view(&source, alias_type).unwrap(), alias);
+            assert_eq!(renderer.flushes, submissions);
+            if let TextureSource::Upload { generation, .. } = &mut source {
+                *generation += 1;
+            }
+            assert!(renderer.texture_view(&source, alias_type).is_err());
+        }
     }
 
     #[test]
