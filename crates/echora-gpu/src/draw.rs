@@ -62,7 +62,7 @@ pub(crate) fn rescaling_constants(scaled_textures: &[bool], down_factor: f32) ->
     bytes
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexAttribute {
     pub location: u32,
     pub stream: u32,
@@ -160,6 +160,7 @@ pub(crate) struct GraphicsState {
     // Valid for the current command buffer and program. Submitting resets it.
     dynamic_set: Option<DynamicSet>,
     pool_set: Option<vk::DescriptorSet>,
+    vertex_input: Option<VertexInput>,
 }
 
 impl GraphicsState {
@@ -167,9 +168,20 @@ impl GraphicsState {
         self.program = None;
         self.raster = None;
         self.blends.clear();
+        self.reset_program_bindings();
+    }
+
+    fn reset_program_bindings(&mut self) {
         self.dynamic_set = None;
         self.pool_set = None;
+        self.vertex_input = None;
     }
+}
+
+#[derive(Default)]
+struct VertexInput {
+    attributes: Vec<VertexAttribute>,
+    streams: Vec<(u32, u32)>,
 }
 
 struct DynamicSet {
@@ -1087,33 +1099,6 @@ impl Renderer {
         if draw.mesh.is_some() && self.gpu.mesh_shader.is_none() {
             return Err("the device has no task and mesh stages".into());
         }
-        let bindings: Vec<_> = vertex_buffers
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let stream = &draw.streams[index];
-                vk::VertexInputBindingDescription2EXT::default()
-                    .binding(index as u32)
-                    .stride(stream.stride)
-                    .input_rate(if stream.divisor == 0 {
-                        vk::VertexInputRate::VERTEX
-                    } else {
-                        vk::VertexInputRate::INSTANCE
-                    })
-                    .divisor(stream.divisor.max(1))
-            })
-            .collect();
-        let attributes: Vec<_> = draw
-            .attributes
-            .iter()
-            .map(|attribute| {
-                vk::VertexInputAttributeDescription2EXT::default()
-                    .location(attribute.location)
-                    .binding(attribute.stream)
-                    .format(attribute.format)
-                    .offset(attribute.offset)
-            })
-            .collect();
         let [x, y, width, height, near, far] = fixed.viewport;
         // A negative height (Vulkan 1.1) flips Y; the caller decides.
         // Viewport and scissor are in guest texels; scaled targets have
@@ -1243,8 +1228,7 @@ impl Renderer {
                 let unused = &program.unused_graphics_stages;
                 objects.cmd_bind_shaders(commands, unused, &null_shaders[..unused.len()]);
                 self.graphics.program = Some(program.pipeline_layout);
-                self.graphics.dynamic_set = None;
-                self.graphics.pool_set = None;
+                self.graphics.reset_program_bindings();
             }
             device.cmd_bind_descriptor_sets(
                 commands,
@@ -1299,7 +1283,7 @@ impl Renderer {
                 );
             }
             if draw.mesh.is_none() {
-                objects.cmd_set_vertex_input(commands, &bindings, &attributes);
+                self.set_vertex_input(commands, &objects, draw);
             }
             for (index, (buffer, offset)) in vertex_buffers.iter().enumerate() {
                 device.cmd_bind_vertex_buffers(commands, index as u32, &[*buffer], &[*offset]);
@@ -1441,6 +1425,59 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn set_vertex_input(
+        &mut self,
+        commands: vk::CommandBuffer,
+        objects: &ash::ext::shader_object::Device,
+        draw: &Draw<'_>,
+    ) {
+        let streams = draw
+            .streams
+            .iter()
+            .map(|stream| (stream.stride, stream.divisor));
+        if self.graphics.vertex_input.as_ref().is_some_and(|last| {
+            last.attributes == draw.attributes && last.streams.iter().copied().eq(streams.clone())
+        }) {
+            return;
+        }
+        let bindings: Vec<_> = streams
+            .clone()
+            .enumerate()
+            .map(|(index, (stride, divisor))| {
+                vk::VertexInputBindingDescription2EXT::default()
+                    .binding(index as u32)
+                    .stride(stride)
+                    .input_rate(if divisor == 0 {
+                        vk::VertexInputRate::VERTEX
+                    } else {
+                        vk::VertexInputRate::INSTANCE
+                    })
+                    .divisor(divisor.max(1))
+            })
+            .collect();
+        let attributes: Vec<_> = draw
+            .attributes
+            .iter()
+            .map(|attribute| {
+                vk::VertexInputAttributeDescription2EXT::default()
+                    .location(attribute.location)
+                    .binding(attribute.stream)
+                    .format(attribute.format)
+                    .offset(attribute.offset)
+            })
+            .collect();
+        // SAFETY: commands is recording with live vertex bindings.
+        unsafe { objects.cmd_set_vertex_input(commands, &bindings, &attributes) };
+        let last = self
+            .graphics
+            .vertex_input
+            .get_or_insert_with(VertexInput::default);
+        last.attributes.clone_from(&draw.attributes);
+        last.streams.clear();
+        last.streams.extend(streams);
+        self.stat("stat: graphics vertex input sets", 1);
+    }
+
     /// Count the time since `since` under `name` and restart it (the
     /// draw's phases, in the statistics).
     fn lap(&mut self, name: &'static str, since: &mut Option<std::time::Instant>) {
@@ -1706,6 +1743,7 @@ pub(crate) mod tests {
         if has_pool {
             assert_eq!(stats["stat: graphics texture pool binds"], 1);
         }
+        assert_eq!(stats["stat: graphics vertex input sets"], 1);
         let texels = renderer.read_target(7).unwrap();
         // The red-only write reaches the first column, retaining green.
         assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
@@ -1722,6 +1760,7 @@ pub(crate) mod tests {
         if has_pool {
             assert_eq!(stats["stat: graphics texture pool binds"], 1);
         }
+        assert_eq!(stats["stat: graphics vertex input sets"], 1);
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [0.0, 1.0, 0.0, 1.0]);
 
@@ -1745,8 +1784,28 @@ pub(crate) mod tests {
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [1.0, 1.0, 0.0, 1.0]);
 
-        draw.page_table.first_page = 255;
+        renderer.take_stats();
         renderer.draw(&draw).unwrap();
+        draw.page_table.first_page = 255;
+        let stream = &mut draw.streams[0];
+        stream.data = stream
+            .data
+            .chunks_exact(8)
+            .flat_map(|position| position.iter().copied().chain([0; 8]))
+            .collect();
+        stream.stride = 16;
+        renderer.draw(&draw).unwrap();
+        renderer.draw(&draw).unwrap();
+        let stats = renderer.take_stats();
+        assert_eq!(stats["stat: graphics vertex input sets"], 2);
+
+        let serial = renderer.recorded_serial();
+        renderer.guest_barrier(0x12).unwrap();
+        renderer.draw(&draw).unwrap();
+        assert_eq!(renderer.recorded_serial(), serial);
+        let stats = renderer.take_stats();
+        assert!(!stats.contains_key("stat: graphics vertex input sets"));
+
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [1.0, 1.0, 1.0, 1.0]);
         renderer.destroy_program(program).unwrap();
