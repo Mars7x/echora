@@ -8,6 +8,7 @@
 
 pub mod compute;
 pub mod decode;
+pub mod handle_reads;
 pub mod header;
 pub mod requirements;
 #[cfg(any(test, feature = "sim"))]

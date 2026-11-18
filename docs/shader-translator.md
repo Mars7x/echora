@@ -113,6 +113,19 @@ array or 3D pool texture may be integer: bit 0 of its word in the
 flags buffer (binding 14, one u32 per texture index) says so at run
 time, and the read (fetch, sample or gather, not a depth comparison or
 a per-tap gather) then goes through its uint view (bindings 11-13).
+
+The runtime also prepares descriptors for handles a shader reads from
+uniform inputs. It analyzes a straight-line prefix, follows the integer
+address calculation, and reads global words from the stage's bound
+storage buffers. Invocation-dependent values and unsupported control
+flow leave descriptor preparation to the explicit texture bindings.
+For compute shaders with provable global write bounds, it waits only
+for submissions that can modify those handle bytes. The active page
+table must map both ranges to verified shared file offsets, so aliases
+of the same guest memory are ordered together. The runtime waits for all
+earlier page-table writes when it cannot establish those bounds or
+verify the memory mapping.
+
 Texel buffers and storage images through the pool (bindings 8-10) are
 not used yet: the decoder knows no buffer textures or bindless surfaces. TEX.B (0x361) has the handle among its values,
 after the coordinates (all coordinates in Ra unless packed, bit 60, with

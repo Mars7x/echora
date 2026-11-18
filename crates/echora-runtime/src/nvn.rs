@@ -376,6 +376,8 @@ struct CachedPoolEntries {
     entries: std::sync::Arc<[echora_gpu::pool::PoolEntry]>,
     /// The resolved handles, in the same order as `entries`.
     handles: Vec<u64>,
+    /// Handles read from shader inputs beyond the stage's texture binds.
+    additional: Vec<u64>,
 }
 
 /// A render target's width, height, format, mip levels and shape.

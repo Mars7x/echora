@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 
+pub use echora_shader::handle_reads;
 pub use echora_shader_abi::{
     ABI_VERSION, Descriptor, DescriptorKind, MeshParameters, PUSH_TRANSLATOR, Stage, Translated,
 };

@@ -169,6 +169,26 @@ pub struct Texture {
     pub half: bool,
 }
 
+impl Texture {
+    /// Destination registers in the order that the selected words are written.
+    pub(crate) fn output_registers(self) -> impl Iterator<Item = Reg> {
+        let selected = (self.mask & 15).count_ones() as u8;
+        let words = if self.half {
+            selected.div_ceil(2)
+        } else {
+            selected
+        };
+        let first = if self.half { 1 } else { 2 };
+        (0..words).map(move |index| {
+            if self.d2 == Reg::ZERO || index < first {
+                Reg(self.d.0.saturating_add(index))
+            } else {
+                Reg(self.d2.0.saturating_add(index - first))
+            }
+        })
+    }
+}
+
 /// A source of a half-precision pair operation: the pair (`swizzle` 0),
 /// a 32-bit float converted to both halves (1), or its low (2) or high (3)
 /// half in both; then absolute value and negation.

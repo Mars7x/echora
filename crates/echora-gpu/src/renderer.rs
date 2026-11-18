@@ -1249,6 +1249,33 @@ impl Renderer {
             .map_or(&[], |(_, entries)| entries.as_slice())
     }
 
+    /// Whether a device address covers these exact bytes of the shared
+    /// guest file. Previous imports remain valid until the table replaces
+    /// their device addresses.
+    pub fn shares_device_range(&self, file: i32, offset: u64, length: u64, device: u64) -> bool {
+        if self.addressed_file != AddressedFile::Single(file) {
+            return false;
+        }
+        let after = self
+            .addressed
+            .partition_point(|&(start, ..)| start <= offset);
+        self.addressed[..after]
+            .iter()
+            .rev()
+            .take_while(|&&(start, ..)| start + MAX_SHARED_SPAN >= offset)
+            .chain(&self.superseded)
+            .any(|&(start, size, _, _, address)| {
+                offset
+                    .checked_sub(start)
+                    .is_some_and(|inside| inside + length <= size && address + inside == device)
+            })
+            || self.packed.iter().any(|group| {
+                group
+                    .offset(offset, length)
+                    .is_some_and(|inside| group.address + inside == device)
+            })
+    }
+
     /// Record a copy of `bytes` into resident buffer `key` at `at` (before
     /// work that reads it, after work that used it). Uploads larger than
     /// the ring go in pieces.
@@ -6694,6 +6721,7 @@ mod tests {
         let base = renderer.packed[0].address;
         let buffer = renderer.packed[0].buffer;
         assert_ne!(base, original);
+        assert!(renderer.shares_device_range(file, 24, 64, original + 24));
         for index in 0..64 {
             assert_eq!(
                 renderer.address_span(file, index * gap, page).unwrap(),
@@ -6703,8 +6731,17 @@ mod tests {
                 renderer.import_file(file, index * gap + 24, 64).unwrap(),
                 Some((buffer, index * page + 24))
             );
+            assert!(renderer.shares_device_range(
+                file,
+                index * gap + 24,
+                64,
+                base + index * page + 24,
+            ));
         }
+        assert!(!renderer.shares_device_range(file, gap + 24, 64, base + 24));
+        assert!(!renderer.shares_device_range(file, gap + page - 32, 64, base + 2 * page - 32));
         renderer.take_superseded(64);
+        assert!(!renderer.shares_device_range(file, 24, 64, original + 24));
         renderer.release_file_range(gap, page);
         assert!(renderer.packed.is_empty());
         assert!(renderer.superseded_spans().2);

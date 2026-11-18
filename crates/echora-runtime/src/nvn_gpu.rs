@@ -38,6 +38,13 @@ pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
     translations: HashMap<TranslationKey, Result<Arc<Translated>, String>>,
+    /// Bindless lookups by translation identity. The translation cache
+    /// keeps each addressed translation alive.
+    handle_reads: HashMap<usize, Arc<shader::handle_reads::HandleReads>>,
+    global_writes: HashMap<usize, (shader::handle_reads::GlobalWrites, [u32; 3])>,
+    /// Last unbounded store and bounded shared ranges still used by batches.
+    unbounded_write_serial: u64,
+    shared_writes: Vec<(u64, SharedRange)>,
     /// Compute stage keys translated with raw storage pointers
     /// (`Parameters::native_pointers`).
     native_programs: std::collections::HashSet<u64>,
@@ -188,6 +195,19 @@ impl std::fmt::Debug for Backend {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SharedRange {
+    file: i32,
+    start: u64,
+    end: u64,
+}
+
+impl SharedRange {
+    fn overlaps(self, other: Self) -> bool {
+        self.file == other.file && self.start < other.end && other.start < self.end
+    }
+}
+
 impl Backend {
     /// A backend when ECHORA_GPU is set, the recompiler is linked and a
     /// device with shader objects exists.
@@ -224,6 +244,10 @@ impl Backend {
             max_extent: renderer.max_image_extent(),
             renderer,
             translations: HashMap::default(),
+            handle_reads: HashMap::default(),
+            global_writes: HashMap::default(),
+            unbounded_write_serial: 0,
+            shared_writes: Vec::new(),
             native_programs: Default::default(),
             page_table: None,
             page_build: None,
@@ -264,6 +288,46 @@ impl Backend {
             target_levels: HashMap::default(),
             target_index_stamp: None,
         }))
+    }
+
+    fn record_page_table_write(&mut self, serial: u64, bounded: Option<Vec<SharedRange>>) {
+        self.page_table_writes = true;
+        self.page_table_wrote = true;
+        self.page_table_write_serial = serial;
+        if let Some(ranges) = bounded {
+            let done = self
+                .renderer
+                .completed_handle()
+                .load(std::sync::atomic::Ordering::Acquire);
+            self.shared_writes.retain(|(recorded, _)| *recorded > done);
+            self.shared_writes
+                .extend(ranges.into_iter().map(|range| (serial, range)));
+        } else {
+            self.unbounded_write_serial = serial;
+            self.shared_writes.clear();
+        }
+    }
+
+    fn wait_for_table_writes(&mut self, range: Option<SharedRange>) -> Result<(), String> {
+        if !self.page_table_writes {
+            return Ok(());
+        }
+        let serial = if let Some(range) = range {
+            self.shared_writes
+                .iter()
+                .filter(|&(_, written)| range.overlaps(*written))
+                .map(|&(serial, _)| serial)
+                .max()
+                .unwrap_or(0)
+                .max(self.unbounded_write_serial)
+        } else {
+            self.page_table_write_serial
+        };
+        self.renderer.wait_for(serial)?;
+        if serial >= self.page_table_write_serial {
+            self.page_table_writes = false;
+        }
+        Ok(())
     }
 
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
@@ -541,6 +605,19 @@ fn c0_storage_table(nvn: u32) -> u32 {
         7 => 0x770,
         _ => 0x510,
     }
+}
+
+fn shader_word(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn storage_contains(base: u64, size: u64, address: u64, length: u64) -> bool {
+    address
+        .checked_sub(base)
+        .and_then(|offset| offset.checked_add(length))
+        .is_some_and(|end| end <= size)
 }
 
 /// Draw primitive modes, GL numbering (inferred: DrawElementsBaseVertex
@@ -1340,6 +1417,7 @@ impl Nvn {
             .texture_pool_layout
             .is_some();
         let mut notes: Vec<String> = Vec::new();
+        let mut builtin = false;
         let translated = {
             let parameters = Parameters {
                 binding_base: base[0],
@@ -1422,6 +1500,7 @@ impl Nvn {
                 });
             let result = match (translator, rust) {
                 (shader::Translator::Rust, Some(Ok(translated))) => {
+                    builtin = true;
                     notes.push("stat: rust translator programs".into());
                     Ok(translated)
                 }
@@ -1463,6 +1542,26 @@ impl Nvn {
             && !shader::available()
         {
             backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
+        }
+        if let Ok(stage) = &translated
+            && stage.texture_pool_bindings != 0
+            && let Some(reads) = shader::handle_reads::HandleReads::from_program(&code)
+        {
+            backend
+                .handle_reads
+                .insert(Arc::as_ptr(stage) as usize, Arc::new(reads));
+        }
+        if builtin
+            && let Ok(stage) = &translated
+            && stage.stage == Stage::Compute
+            && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
+            && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
+            && let Some(writes) = shader::handle_reads::GlobalWrites::from_program(&code)
+        {
+            let local = [compute[0], compute[1], compute[2]].map(|size| size.max(1));
+            backend
+                .global_writes
+                .insert(Arc::as_ptr(stage) as usize, (writes, local));
         }
         backend.translations.insert(cache_key, translated.clone());
         translated
@@ -2237,21 +2336,81 @@ impl Nvn {
         )
     }
 
+    /// Resolve a shader's draw-uniform handles against the same constant
+    /// and storage buffers that are about to be passed to the GPU.
+    fn shader_pool_handles(
+        &mut self,
+        core: &mut Guest,
+        stage: &Arc<Translated>,
+        mut constant: impl FnMut(&Guest, u8, usize) -> Option<u32>,
+        bound_storage: impl Fn(u64, u64) -> bool,
+    ) -> Vec<u64> {
+        let Some(reads) = self
+            .gpu
+            .as_ref()
+            .and_then(|backend| backend.handle_reads.get(&(Arc::as_ptr(stage) as usize)))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let mut handles = Vec::new();
+        reads.evaluate(
+            |input| match input {
+                shader::handle_reads::Input::Constant { bank, offset } => {
+                    constant(core, bank, usize::from(offset))
+                }
+                shader::handle_reads::Input::GlobalWord {
+                    address,
+                    word,
+                    words,
+                } => {
+                    let length = 4 * u64::from(words);
+                    if !address.is_multiple_of(length) || !bound_storage(address, length) {
+                        return None;
+                    }
+                    let guest = self.gpu_to_guest(address, length).ok()?;
+                    let shared = self.shared_table_range(address, guest, length);
+                    // A consuming draw sees earlier GPU writes even when
+                    // the guest CPU has yet to see a fence.
+                    self.gpu.as_mut()?.wait_for_table_writes(shared).ok()?;
+                    let range = guest..guest.checked_add(length)?;
+                    if shared.is_some() {
+                        self.resolve_storage(core, Some(range)).ok()?;
+                    } else {
+                        self.resolve_gpu_written(core, range).ok()?;
+                    }
+                    core.memory.read_u32(guest + 4 * u64::from(word)).ok()
+                }
+            },
+            |handle| {
+                if handle & echora_shader_abi::TEXTURE_INDEX_MASK
+                    < echora_shader_abi::TEXTURE_POOL_CAPACITY
+                {
+                    handles.push(u64::from(handle));
+                }
+            },
+        );
+        handles.sort_unstable();
+        handles.dedup();
+        handles
+    }
+
     /// Texture pool entries for a program stage that reads the pool: the
-    /// textures bound to NVN stage `nvn`. Bound handles are what such
-    /// programs index (they sit in c2 from 0x20, 8 bytes per slot); a
-    /// handle formed elsewhere reads a null entry unless a bound one names
-    /// it. Handles that do not resolve are left out.
+    /// textures bound to NVN stage `nvn` (c2 from 0x20, 8 bytes per slot),
+    /// plus handles read from the stage's other inputs. Handles that do
+    /// not resolve are left out.
     fn pool_entries(
         &mut self,
         core: &mut Guest,
         nvn: u32,
+        additional: &[u64],
     ) -> Result<std::sync::Arc<[echora_gpu::pool::PoolEntry]>, String> {
         // (The renderer's counts from pool writes reach the statistics
         // with the page table's at each present.)
         let key = self.pool_list_stamp(nvn);
         if let Some(cached) = self.pool_entry_cache.get(&nvn)
             && cached.stamp == key
+            && cached.additional == additional
         {
             let list = cached.entries.clone();
             self.gpu
@@ -2266,7 +2425,8 @@ impl Nvn {
         let key = self.pool_list_stamp(nvn);
         if let Some(mut cached) = self.pool_entry_cache.remove(&nvn) {
             let previous = cached.stamp;
-            if (previous.0, previous.2, previous.3) == (key.0, key.2, key.3)
+            if cached.additional == additional
+                && (previous.0, previous.2, previous.3) == (key.0, key.2, key.3)
                 && cached
                     .handles
                     .iter()
@@ -2317,6 +2477,7 @@ impl Nvn {
             .range((stage, 0)..=(stage, u64::MAX))
             .map(|(_, &handle)| handle)
             .collect();
+        handles.extend_from_slice(additional);
         handles.sort_unstable();
         handles.dedup();
         // Resolved handles are kept for the present as the draw path's
@@ -2395,6 +2556,7 @@ impl Nvn {
                 stamp: self.pool_list_stamp(nvn),
                 entries: list.clone(),
                 handles: resolved_handles,
+                additional: additional.to_vec(),
             },
         );
         Ok(list)
@@ -4938,22 +5100,36 @@ impl Nvn {
         };
         // Only a program that stores through the table makes later CPU
         // reads wait (one that only reads it, the translator says, does not).
-        if page_table.address != 0
+        let writes_page_table = page_table.address != 0
             && self.gpu.as_ref().unwrap().programs[&key]
                 .stages
                 .iter()
                 .any(|stage| {
                     stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
                         && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
-                })
-        {
-            let backend = self.gpu.as_mut().unwrap();
-            backend.page_table_writes = true;
-            backend.page_table_wrote = true;
-            backend.page_table_write_serial = backend.renderer.recorded_serial();
-        }
+                });
         let pool = if stage.texture_pool_bindings != 0 {
-            self.pool_entries(core, 5)?
+            let additional = self.shader_pool_handles(
+                core,
+                &stage,
+                |_, bank, offset| {
+                    let descriptor = stage.descriptors.iter().find(|descriptor| {
+                        descriptor.kind() == DescriptorKind::UniformBuffer
+                            && descriptor.index == u32::from(bank)
+                    })?;
+                    shader_word(uniforms.get(&descriptor.binding)?, offset)
+                },
+                |address, length| {
+                    c0[storage_base as usize..texture_base as usize]
+                        .chunks_exact(16)
+                        .any(|entry| {
+                            let base = u64::from_le_bytes(entry[..8].try_into().unwrap());
+                            let size = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+                            storage_contains(base, u64::from(size), address, length)
+                        })
+                },
+            );
+            self.pool_entries(core, 5, &additional)?
         } else {
             Default::default()
         };
@@ -5008,14 +5184,22 @@ impl Nvn {
                 return Ok(());
             }
         }
+        let groups = [command.x[1], command.x[2], command.x[3]].map(|count| count as u32);
+        let bounded = if writes_page_table && indirect.is_none() {
+            self.compute_shared_writes(&stage, groups, |bank, offset| {
+                let descriptor = stage.descriptors.iter().find(|descriptor| {
+                    descriptor.kind() == DescriptorKind::UniformBuffer
+                        && descriptor.index == u32::from(bank)
+                })?;
+                shader_word(uniforms.get(&descriptor.binding)?, usize::from(offset))
+            })
+        } else {
+            None
+        };
         let backend = self.gpu.as_mut().unwrap();
         let dispatch = echora_gpu::compute::Dispatch {
             program: &backend.programs[&key],
-            groups: [
-                command.x[1] as u32,
-                command.x[2] as u32,
-                command.x[3] as u32,
-            ],
+            groups,
             uniforms,
             storage,
             storage_in_place,
@@ -5051,6 +5235,9 @@ impl Nvn {
             .dispatch_deferred(&dispatch)?
             .into_iter()
             .collect();
+        if writes_page_table {
+            backend.record_page_table_write(backend.renderer.recorded_serial(), bounded);
+        }
         backend.stat(
             "stat: dispatch renderer microseconds",
             started.elapsed().as_micros() as u64,
@@ -7063,18 +7250,12 @@ impl Nvn {
         }
     }
 
-    /// The buffer and offset that share `length` guest bytes at `guest` with
-    /// the GPU in place, when they lie in a shared memory pool, or in one
-    /// piece of a pool shared in pieces, and the span imports; None
-    /// otherwise (the caller copies).
-    fn shared_binding(
-        &mut self,
-        guest: u64,
-        length: u64,
-    ) -> Result<Option<(vk::Buffer, u64)>, String> {
-        let backend = self.gpu.as_mut().unwrap();
+    /// The file bytes that back a guest range represented by one known
+    /// in-place span. Comparing file offsets covers aliases of those pages.
+    fn shared_guest_range(&self, guest: u64, length: u64) -> Option<SharedRange> {
+        let backend = self.gpu.as_ref()?;
         let within = |start: u64, size: u64| start <= guest && guest + length <= start + size;
-        let found = backend
+        let (file, start) = backend
             .shared_pools
             .iter()
             .find(|(base, (size, _, _))| within(**base, *size))
@@ -7086,11 +7267,88 @@ impl Nvn {
                         .find(|&&(at, size, ..)| within(base + at, size))
                         .map(|&(at, _, file, offset)| (file, offset + (guest - base - at)))
                 })
-            });
-        let Some((file, offset)) = found else {
+            })?;
+        Some(SharedRange {
+            file,
+            start,
+            end: start.checked_add(length)?,
+        })
+    }
+
+    /// Match the bound page table to the guest file before relying on
+    /// shared memory. The same guest range can also have a separate
+    /// device-local buffer whose writes must be copied back.
+    fn shared_table_range(&self, gpu: u64, guest: u64, length: u64) -> Option<SharedRange> {
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        let backend = self.gpu.as_ref()?;
+        let (key, table) = backend.page_table?;
+        if key != (backend.share_generation, self.pool_epoch) {
+            return None;
+        }
+        let shared = self.shared_guest_range(guest, length)?;
+        let entries = backend.renderer.page_table_entries();
+        let mut done = 0;
+        while done < length {
+            let address = gpu.checked_add(done)?;
+            let page = (address >> PAGE_SHIFT).checked_sub(u64::from(table.first_page))?;
+            let inside = address & (PAGE_SIZE - 1);
+            let device = *entries.get(usize::try_from(page).ok()?)?;
+            let bytes = (length - done).min(PAGE_SIZE - inside);
+            if device == 0
+                || !backend.renderer.shares_device_range(
+                    shared.file,
+                    shared.start + done,
+                    bytes,
+                    device + inside,
+                )
+            {
+                return None;
+            }
+            done += bytes;
+        }
+        Some(shared)
+    }
+
+    /// Compute writes whose byte ranges lie entirely in known shared
+    /// storage. Unbounded, indirect and resident writes remain global.
+    fn compute_shared_writes(
+        &self,
+        stage: &Arc<Translated>,
+        groups: [u32; 3],
+        constant: impl FnMut(u8, u16) -> Option<u32>,
+    ) -> Option<Vec<SharedRange>> {
+        let (plan, local) = self
+            .gpu
+            .as_ref()?
+            .global_writes
+            .get(&(Arc::as_ptr(stage) as usize))?;
+        plan.intervals(groups, *local, constant)?
+            .into_iter()
+            .map(|range| {
+                let length = range.end - range.start;
+                let guest = self.gpu_to_guest(range.start, length).ok()?;
+                self.shared_table_range(range.start, guest, length)
+            })
+            .collect()
+    }
+
+    /// The buffer and offset that share `length` guest bytes at `guest` with
+    /// the GPU in place, when they lie in a shared memory pool, or in one
+    /// piece of a pool shared in pieces, and the span imports; None
+    /// otherwise (the caller copies).
+    fn shared_binding(
+        &mut self,
+        guest: u64,
+        length: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        let Some(range) = self.shared_guest_range(guest, length) else {
             return Ok(None);
         };
-        backend.renderer.import_file(file, offset, length)
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .import_file(range.file, range.start, length)
     }
 
     /// Where the GPU reads the 12 bytes of indirect arguments at guest
@@ -8131,9 +8389,31 @@ impl Nvn {
         // One stage's list is shared as it is (unchanged lists are then
         // known without comparing); several are joined.
         let mut lists = Vec::new();
-        for stage in stages {
+        for (index, stage) in stages.iter().enumerate() {
             if stage.texture_pool_bindings != 0 {
-                lists.push(self.pool_entries(core, nvn_stage(stage.stage))?);
+                let additional = self.shader_pool_handles(
+                    core,
+                    stage,
+                    |core, bank, offset| {
+                        let descriptor = stage.descriptors.iter().find(|descriptor| {
+                            descriptor.kind() == DescriptorKind::UniformBuffer
+                                && descriptor.index == u32::from(bank)
+                        })?;
+                        let key = (index, descriptor.binding);
+                        if let Some(bytes) = uniforms.get(&key) {
+                            return shader_word(bytes, offset);
+                        }
+                        let &(guest, length) = guest_uniforms.get(&key)?;
+                        (offset + 4 <= length).then_some(())?;
+                        core.memory.read_u32(guest + offset as u64).ok()
+                    },
+                    |address, length| {
+                        storage_entries.iter().any(|&(owner, _, base, size)| {
+                            owner == index && storage_contains(base, size, address, length)
+                        })
+                    },
+                );
+                lists.push(self.pool_entries(core, nvn_stage(stage.stage), &additional)?);
             }
         }
         let pool: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = match lists.len() {
@@ -8555,17 +8835,11 @@ impl Nvn {
         // Stages store through the table (a vertex program writing texels
         // back for the CPU): later CPU reads of those ranges wait for them.
         // Stages that only read through it (the translator says) do not.
-        if page_table.address != 0
+        let writes_page_table = page_table.address != 0
             && stages.iter().any(|stage| {
                 stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
                     && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
-            })
-        {
-            let backend = self.gpu.as_mut().unwrap();
-            backend.page_table_writes = true;
-            backend.page_table_wrote = true;
-            backend.page_table_write_serial = backend.renderer.recorded_serial();
-        }
+            });
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams.iter().map(VertexStream::len).sum::<usize>();
         if geometry_bytes > 1 << 20 && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -9447,6 +9721,7 @@ impl Nvn {
                 base,
             ));
         }
+        let table_write_serial = writes_page_table.then(|| backend.renderer.recorded_serial());
         if storage_results > 0 {
             // (Not `stat`: the draw still borrows the programs.)
             *backend
@@ -9528,6 +9803,9 @@ impl Nvn {
             if let Err(error) = result {
                 eprintln!("draw dump {:016x}: {error}", keys.1);
             }
+        }
+        if let Some(serial) = table_write_serial {
+            backend.record_page_table_write(serial, None);
         }
         if let Some((key, directory)) = snap.filter(|snap| Some(snap.0) == probe_target) {
             let sequence = self.sequence;
@@ -10457,18 +10735,31 @@ mod pool_tests {
             ),
         );
 
-        let original = nvn.pool_entries(&mut core, 0).unwrap();
+        let original = nvn.pool_entries(&mut core, 0, &[]).unwrap();
         assert_eq!(original.len(), 1);
         let backend = nvn.gpu.as_mut().unwrap();
         backend.in_place_writes.push(8192..8196);
         backend.gpu_writes += 1;
-        let unchanged = nvn.pool_entries(&mut core, 0).unwrap();
+        let unchanged = nvn.pool_entries(&mut core, 0, &[]).unwrap();
         assert!(Arc::ptr_eq(&original, &unchanged));
+
+        let dynamic = 20;
+        nvn.binding_memo.1.insert(
+            dynamic,
+            (TextureSource::Target(8), Sampler::default(), None, 1, 0, 8),
+        );
+        let including_dynamic = nvn.pool_entries(&mut core, 0, &[dynamic]).unwrap();
+        assert_eq!(including_dynamic.len(), 2);
+        assert_eq!(including_dynamic[1].texture, dynamic as u32);
+        let same = nvn.pool_entries(&mut core, 0, &[dynamic]).unwrap();
+        assert!(Arc::ptr_eq(&including_dynamic, &same));
+        let static_only = nvn.pool_entries(&mut core, 0, &[]).unwrap();
+        assert_eq!(static_only.len(), 1);
 
         let backend = nvn.gpu.as_mut().unwrap();
         backend.in_place_writes.push(4096..4100);
         backend.gpu_writes += 1;
-        let changed = nvn.pool_entries(&mut core, 0).unwrap();
+        let changed = nvn.pool_entries(&mut core, 0, &[]).unwrap();
         // There is no registered handle to rebuild this fixture's stale
         // binding. It must be resolved anew and disappear from the list.
         assert!(changed.is_empty());
