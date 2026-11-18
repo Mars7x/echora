@@ -2699,32 +2699,39 @@ impl Nvn {
                 .target_levels
                 .get(&base)?
                 .iter()
-                .find(|(_, _, level_extent)| *level_extent == extent)
+                .find(|(key, _, level_extent)| {
+                    *level_extent == extent
+                        && renderer
+                            .existing_target(*key)
+                            .is_some_and(|target| same_format(target.format))
+                })
                 .map(|&(key, level, _)| (key, level));
         }
+        let mut mip_match = None;
         for key in renderer.target_keys() {
-            let Some(target) = renderer.existing_target(key) else {
+            let Some(target) = renderer
+                .existing_target(key)
+                .filter(|target| same_format(target.format))
+            else {
                 continue;
             };
             let Some(target_base) = self.texture_storage(key) else {
                 continue;
             };
-            if target_base == base
-                && (target.width, target.height) == extent
-                && same_format(target.format)
-            {
+            if target_base == base && (target.width, target.height) == extent {
                 return Some((key, 0));
             }
-            if !mips || target.levels == 1 || base <= target_base {
+            if mip_match.is_some() || target.levels == 1 || base <= target_base {
                 continue;
             }
             for (level, offset, level_extent) in self.target_level_offsets(key, target) {
                 if target_base + offset == base && level_extent == extent {
-                    return Some((key, level));
+                    mip_match = Some((key, level));
+                    break;
                 }
             }
         }
-        None
+        mip_match
     }
 
     /// Each level above 0 of render target `key`: its offset from the
@@ -10235,6 +10242,74 @@ mod bind_key_tests {
             bind_key(kind, Some(2), 5),
             bind_key("BindUniformBuffer", Some(2), 5)
         ));
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::{Backend, Nvn};
+    use crate::nvn::Args;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn mip_storage_aliases_require_compatible_formats() {
+        let Ok(Some(backend)) = Backend::create() else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        let pool = 1;
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([0x10000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        let texture = |size, levels, offset, format| {
+            BTreeMap::from([
+                ("Width".into(), scalar(size)),
+                ("Height".into(), scalar(size)),
+                ("Levels".into(), scalar(levels)),
+                ("Format".into(), scalar(format)),
+                ("Storage".into(), args([pool, offset, 0, 0])),
+            ])
+        };
+        let parent = 2;
+        nvn.initialize(parent, "Texture", texture(16, 2, 0, 37))
+            .unwrap();
+        nvn.ensure_render_target(parent).unwrap();
+        let target = nvn
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .existing_target(parent)
+            .unwrap();
+        let (_, offset, _) = nvn.target_level_offsets(parent, target)[0];
+        nvn.initialize(3, "Texture", texture(8, 1, offset, 37))
+            .unwrap();
+        nvn.initialize(4, "Texture", texture(8, 1, offset, 56))
+            .unwrap();
+        nvn.initialize(5, "Texture", texture(8, 1, offset, 10))
+            .unwrap();
+
+        for indexed in [false, true] {
+            if indexed {
+                nvn.refresh_target_index();
+            }
+            assert_eq!(nvn.resolve_target(3), Some((parent, 1)));
+            assert_eq!(nvn.resolve_target(4), Some((parent, 1)));
+            assert_eq!(nvn.resolve_target(5), None);
+        }
+        nvn.ensure_render_target(3).unwrap();
+        assert_eq!(nvn.resolve_target(4), Some((3, 0)));
+        nvn.refresh_target_index();
+        assert_eq!(nvn.resolve_target(4), Some((3, 0)));
     }
 }
 
