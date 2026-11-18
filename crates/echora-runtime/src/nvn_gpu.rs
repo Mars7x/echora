@@ -10226,17 +10226,7 @@ pub(super) fn texture_sample(
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = bytes.len() as u64 ^ 0x9e37_79b9_7f4a_7c15;
-    let (words, tail) = bytes.as_chunks::<8>();
-    for word in words {
-        hash = (hash ^ u64::from_le_bytes(*word))
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(29);
-    }
-    for byte in tail {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
-    }
-    hash
+    twox_hash::XxHash3_64::oneshot(bytes)
 }
 
 /// The sRGB encoding of a linear value in [0, 1].
