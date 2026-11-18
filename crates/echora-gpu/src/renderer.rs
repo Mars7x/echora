@@ -452,15 +452,33 @@ struct Slot {
     serial: u64,
     /// Markers its commands set (`mark`), freed once it completes.
     markers: Vec<u64>,
-    /// The rendering pass left open after a draw (color views, depth view,
-    /// render area): the next draw into the same attachments continues it
-    /// instead of storing and loading them again. Any other recording
-    /// (`commands`) ends it.
-    open_pass: Option<(Vec<vk::ImageView>, Option<vk::ImageView>, [i32; 4])>,
+    /// The rendering pass left open after a draw. `commands` ends it.
+    open_pass: Option<OpenPass>,
     /// The wanted condition (`Renderer::condition`) is active in this
     /// slot's command buffer, and began inside its open rendering pass.
     condition_active: bool,
     condition_inside: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ColorAttachment {
+    target: u64,
+    level: u32,
+    layer: u32,
+    format: Option<vk::Format>,
+}
+
+struct OpenPass {
+    /// Bindings of the last draw that used this pass. A target can be
+    /// replaced under the same key while the pass is open.
+    target_changes: u64,
+    colors: Vec<Option<ColorAttachment>>,
+    depth: Option<(u64, u32)>,
+    /// The requested area only matters when there are no attachments.
+    requested_area: Option<[i32; 4]>,
+    views: Vec<vk::ImageView>,
+    depth_view: Option<vk::ImageView>,
+    area: [i32; 4],
 }
 
 impl Slot {
@@ -5257,16 +5275,43 @@ impl Renderer {
         area: [i32; 4],
     ) -> Result<(), String> {
         let level = |index: usize| levels.get(index).copied().unwrap_or(0);
+        let layer = |index: usize| layers.get(index).copied().unwrap_or(0);
+        let format = |index: usize| formats.get(index).copied().flatten();
+        let color_bindings = colors.iter().enumerate().map(|(index, &target)| {
+            (target != 0).then(|| ColorAttachment {
+                target,
+                level: level(index),
+                layer: layer(index),
+                format: format(index),
+            })
+        });
+        let depth_binding = depth.map(|key| (key, depth_layer));
+        if self.slot.open_pass.as_ref().is_some_and(|pass| {
+            pass.target_changes == self.target_changes
+                && pass.depth == depth_binding
+                && pass
+                    .requested_area
+                    .is_none_or(|requested| requested == area)
+                && pass.colors.len() == colors.len()
+                && pass.colors.iter().copied().eq(color_bindings.clone())
+        }) {
+            return Ok(());
+        }
         let mut views = Vec::with_capacity(colors.len());
-        for (index, key) in colors.iter().enumerate() {
-            if *key == 0 {
+        for binding in color_bindings.clone() {
+            let Some(ColorAttachment {
+                target,
+                level,
+                layer,
+                format,
+            }) = binding
+            else {
                 views.push(vk::ImageView::null());
                 continue;
-            }
-            let layer = layers.get(index).copied().unwrap_or(0);
-            let view = match formats.get(index).copied().flatten() {
-                Some(format) => self.attachment_view_as(*key, level(index), layer, format)?,
-                None => self.attachment_view(*key, level(index), layer)?,
+            };
+            let view = match format {
+                Some(format) => self.attachment_view_as(target, level, layer, format)?,
+                None => self.attachment_view(target, level, layer)?,
             };
             views.push(view);
         }
@@ -5292,19 +5337,18 @@ impl Renderer {
             });
         // A pass with no attachments renders over `area` (the draw's
         // scissor): only its vertex stage's stores have effect.
-        let whole = if smallest_width == i32::MAX {
-            area
-        } else {
-            [0, 0, smallest_width, smallest_height]
-        };
-        if self
-            .slot
-            .open_pass
-            .as_ref()
-            .is_some_and(|(open, open_depth, open_area)| {
-                *open == views && *open_depth == depth_view && *open_area == whole
-            })
+        let requested_area = (smallest_width == i32::MAX).then_some(area);
+        let whole = requested_area.unwrap_or([0, 0, smallest_width, smallest_height]);
+        if let Some(pass) = &mut self.slot.open_pass
+            && pass.views == views
+            && pass.depth_view == depth_view
+            && pass.area == whole
         {
+            pass.target_changes = self.target_changes;
+            pass.colors.clear();
+            pass.colors.extend(color_bindings);
+            pass.depth = depth_binding;
+            pass.requested_area = requested_area;
             return Ok(());
         }
         self.end_pass();
@@ -5370,7 +5414,15 @@ impl Renderer {
         if counting {
             self.occlusion_pass_begun(commands);
         }
-        self.slot.open_pass = Some((views, depth_view, whole));
+        self.slot.open_pass = Some(OpenPass {
+            target_changes: self.target_changes,
+            colors: color_bindings.collect(),
+            depth: depth_binding,
+            requested_area,
+            views,
+            depth_view,
+            area: whole,
+        });
         Ok(())
     }
 
@@ -6230,6 +6282,31 @@ mod tests {
     fn clip_limits_to_bounds() {
         assert_eq!(clip([-5, 2, 20, 4], [0, 0, 10, 10]), [0, 2, 10, 4]);
         assert_eq!(clip([12, 0, 4, 4], [0, 0, 10, 10])[2], -2);
+    }
+
+    #[test]
+    fn open_pass_tracks_the_image_under_each_target_key() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        renderer.target(1, 4, 4, format).unwrap();
+        renderer
+            .begin_rendering(&[1], &[], &[], &[], None, 0, [0, 0, 2, 2])
+            .unwrap();
+        renderer.target(3, 4, 4, format).unwrap();
+        renderer
+            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, 0, [2, 2, 2, 2])
+            .unwrap();
+        assert_eq!(renderer.stats["stat: render passes begun"], 1);
+
+        renderer.move_target(1, 2).unwrap();
+        renderer.target(1, 4, 4, format).unwrap();
+        renderer
+            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, 0, [2, 2, 2, 2])
+            .unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(renderer.stats["stat: render passes begun"], 2);
     }
 
     #[test]
