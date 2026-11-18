@@ -415,6 +415,9 @@ impl Backend {
     /// Whether a resident GPU copy holds bytes newer than guest memory
     /// anywhere in this range.
     fn resident_writes_pending(&self, range: &std::ops::Range<u64>) -> bool {
+        if self.resident.is_empty() {
+            return false;
+        }
         let mut index = self.dirty_index.borrow_mut();
         let stamp = self.dirty_removals;
         if index.0 != stamp {
@@ -5553,25 +5556,6 @@ impl Nvn {
         Ok(())
     }
 
-    /// `resolve_storage` for `size` bytes at GPU address `address` (memory
-    /// a draw or dispatch is about to read).
-    #[track_caller]
-    fn resolve_gpu(&mut self, core: &mut Guest, address: u64, size: u64) -> Result<(), String> {
-        if self
-            .gpu
-            .as_ref()
-            .is_none_or(|backend| backend.pending_storage.is_empty())
-        {
-            return Ok(());
-        }
-        let guest = self.gpu_to_guest(address, size)?;
-        self.resolve_storage(core, Some(guest..guest + size))
-    }
-
-    /// Store finished dispatch results to guest memory: all of them
-    /// (`None`), or, when any overlaps `range`, all of them (results come
-    /// back in dispatch order, so an earlier one never lands on a later).
-    #[track_caller]
     /// The current GPU write generation (`gpu_writes`).
     fn gpu_writes_now(&self) -> u64 {
         self.gpu.as_ref().map_or(0, |backend| backend.gpu_writes)
@@ -5702,6 +5686,20 @@ impl Nvn {
             return true;
         }
         backend.resident_writes_pending(range)
+    }
+
+    /// Make a mapped draw input current before the CPU reads it or copies
+    /// it into the upload ring.
+    fn resolve_draw_input(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        if size == 0 {
+            return Ok(());
+        }
+        self.resolve_storage(core, Some(guest..guest + size))
     }
 
     pub(super) fn resolve_storage(
@@ -8410,7 +8408,6 @@ impl Nvn {
                         let used = u64::from(stage.cbuf_used_sizes[descriptor.index as usize]);
                         let size = bind.x[4].min(used.max(16)).min(64 << 10);
                         let address = bind.x[3];
-                        self.resolve_gpu(core, address, size)?;
                         // Read into the upload ring as the draw is recorded
                         // (nothing writes the range before then: what the
                         // GPU left there was just stored).
@@ -8419,6 +8416,7 @@ impl Nvn {
                         if let Some(started) = started {
                             uniform_time += started.elapsed();
                         }
+                        self.resolve_draw_input(core, guest, size)?;
                         uniform_bytes += size;
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
@@ -8940,7 +8938,8 @@ impl Nvn {
                 };
                 let address = command.x[4];
                 let length = u64::from(count) * size;
-                self.resolve_gpu(core, address, length)?;
+                let guest = self.gpu_to_guest(address, length)?;
+                self.resolve_draw_input(core, guest, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
                 let rewrites_indices = size == 1 || quads || strip && restart.is_some();
@@ -8951,12 +8950,16 @@ impl Nvn {
                         vk::IndexType::UINT32
                     };
                     Indices::Guest {
-                        address: self.gpu_to_guest(address, length)?,
+                        address: guest,
                         bytes: length,
                         kind,
                     }
                 } else {
-                    wrap(self.gpu_bytes(core, address, length)?)
+                    let mut bytes = vec![0; length as usize];
+                    core.memory
+                        .read(guest, &mut bytes)
+                        .map_err(|trap| format!("reading GPU {address:#x}: {trap:?}"))?;
+                    wrap(bytes)
                 };
                 let base = if command.name.ends_with("BaseVertex")
                     || command.name.ends_with("Instanced")
@@ -9107,9 +9110,10 @@ impl Nvn {
                         (vertex_end * stride).min(bind.x[3])
                     };
                     let (address, size) = (bind.x[2] + skip, reach.saturating_sub(skip));
-                    self.resolve_gpu(core, address, size)?;
+                    let guest = self.gpu_to_guest(address, size)?;
+                    self.resolve_draw_input(core, guest, size)?;
                     // Read into the ring when recorded, not copied here.
-                    Some((self.gpu_to_guest(address, size)?, size as usize))
+                    Some((guest, size as usize))
                 }
                 _ => None,
             };
@@ -11401,7 +11405,7 @@ mod pool_tests {
     }
 
     #[test]
-    fn resident_readback_only_copies_overlapping_dirty_bytes() {
+    fn draw_input_reads_only_overlapping_resident_bytes() {
         let Ok(Some(mut backend)) = Backend::create() else {
             return;
         };
@@ -11438,11 +11442,11 @@ mod pool_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: Some(0),
         };
-        nvn.resolve_resident(&mut core, Some(base..base + 8))
-            .unwrap();
+        assert!(nvn.gpu.as_ref().unwrap().pending_storage.is_empty());
+        nvn.resolve_draw_input(&mut core, base, 8).unwrap();
+        nvn.resolve_draw_input(&mut core, base + 12, 0).unwrap();
         assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 0);
-        nvn.resolve_resident(&mut core, Some(base + 12..base + 16))
-            .unwrap();
+        nvn.resolve_draw_input(&mut core, base + 12, 4).unwrap();
         assert_eq!(core.memory.read_u32(base + 12).unwrap(), 0x4242_4242);
         assert_eq!(core.memory.read_u32(base + 16).unwrap(), 0);
         let backend = nvn.gpu.as_ref().unwrap();
