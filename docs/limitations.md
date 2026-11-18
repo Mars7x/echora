@@ -44,16 +44,17 @@ to be missing or incomplete.
 
 ## Performance
 
-- The first 3D scene runs below full speed. The console runs the game at 60
-  frames per second; here the opening movie reaches that, but the first 3D
-  scene runs at about 14 frames per second.
+- The console runs the game at 60 frames per second. The opening movie
+  reaches that speed in Echora. Recent full-opening runs on a Ryzen 7
+  5800X3D and Radeon RX 9070 XT averaged about 20 FPS over 600 forest
+  frames at 2560×1440. The camera and draw workload can vary between runs.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its
   own (`ECHORA_REPLAY_INLINE=1` replays it on the submitting thread, as
-  before). The first 3D scene spends most of its frame time on a chain of
-  guest simulation and command recording. Vulkan replay also takes a
-  substantial share of CPU time and can delay guest synchronization.
+  before). In a 600-frame forest profile, the Vulkan batches occupied
+  about a third of wall time. CPU work includes guest simulation, command
+  recording, and preparing texture bindings for replay.
 - The CLI enables the measured vector, floating-point and block
   optimizations by default. Structured control flow and several newer
   [code generation options](codegen-speed.md) are still experimental.
