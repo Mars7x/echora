@@ -4453,6 +4453,7 @@ impl Nvn {
 
     fn run_queue_work(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
         let mut progressed = false;
+        let mut replayed_list: Option<std::sync::Arc<Vec<Command>>> = None;
         loop {
             // A replay in pieces (`replay_budget`) stops here when its piece
             // is done; `resume_replay` goes on from this item.
@@ -4486,29 +4487,37 @@ impl Nvn {
                         self.pending.get_mut(&queue).unwrap().pop_front();
                         continue;
                     }
-                    let commands = commands.clone();
-                    let index = *next;
-                    let command = &commands[index];
-                    let rest = without_prefix(&command.name, "nvnCommandBuffer");
-                    if rest == "WaitEvent" && !self.event_wait_holds(command, core)? {
-                        if !force {
-                            return Ok(progressed);
-                        }
-                        *self.forced_waits.entry("WaitEvent".into()).or_default() += 1;
-                        *self
-                            .skipped_work
-                            .entry("WaitEvent unsatisfied".into())
-                            .or_default() += 1;
-                    }
-                    if let QueueItem::List { next, .. } =
-                        self.pending.get_mut(&queue).unwrap().front_mut().unwrap()
+                    // Keep a single reference while replaying this list,
+                    // including across calls that mutate NVN state.
+                    if replayed_list
+                        .as_ref()
+                        .is_none_or(|held| !std::sync::Arc::ptr_eq(held, commands))
                     {
-                        *next += 1;
+                        replayed_list = Some(commands.clone());
                     }
-                    progressed = true;
+                    let command = &replayed_list.as_ref().unwrap()[*next];
+                    let rest = without_prefix(&command.name, "nvnCommandBuffer");
                     if rest == "WaitEvent" {
+                        if !self.event_wait_holds(command, core)? {
+                            if !force {
+                                return Ok(progressed);
+                            }
+                            *self.forced_waits.entry("WaitEvent".into()).or_default() += 1;
+                            *self
+                                .skipped_work
+                                .entry("WaitEvent unsatisfied".into())
+                                .or_default() += 1;
+                        }
+                        if let QueueItem::List { next, .. } =
+                            self.pending.get_mut(&queue).unwrap().front_mut().unwrap()
+                        {
+                            *next += 1;
+                        }
+                        progressed = true;
                         continue;
                     }
+                    *next += 1;
+                    progressed = true;
                     if matches!(rest, "CallCommands" | "CopyCommands") {
                         // The called lists run next, in order, ahead of
                         // the rest of this one (their waits block too).
