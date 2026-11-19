@@ -8496,11 +8496,48 @@ mod tests {
             let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
             let (translated, registers, _) =
                 translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
-            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            let machine = Machine::new(&translated.spirv);
+            let report = machine.simulate(&Inputs {
                 workgroup_count: [1, 1, 1],
                 ..Inputs::default()
             });
-            // No value Vulkan leaves undefined reaches the result.
+            // Log2, reciprocal and roots receive defined operands even
+            // for inputs whose guest result comes from a separate case.
+            let extended = match function {
+                3 => Some(glsl::LOG2),
+                5 => Some(glsl::INVERSE_SQRT),
+                8 => Some(glsl::SQRT),
+                _ => None,
+            };
+            if function == 4 || extended.is_some() {
+                let operand = machine
+                    .body
+                    .iter()
+                    .find_map(|instruction| match instruction.operands.as_slice() {
+                        [_, _, _, divisor] if function == 4 && instruction.opcode == op::F_DIV => {
+                            Some(*divisor)
+                        }
+                        [_, _, _, opcode, input]
+                            if instruction.opcode == op::EXT_INST && Some(*opcode) == extended =>
+                        {
+                            Some(*input)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    machine.body.iter().any(|instruction| {
+                        instruction.opcode == op::SELECT
+                            && instruction.operands[1] == operand
+                            && instruction.operands[3..].iter().any(|value| {
+                                machine.constants.get(value).is_some_and(|bits| {
+                                    bits.as_slice() == [u64::from(1.0_f32.to_bits())]
+                                })
+                            })
+                    }),
+                    "MUFU {function} of {x}: unguarded host operand"
+                );
+            }
             assert!(
                 !report.undefined[0].contains(&registers[&1]),
                 "MUFU {function} of {x}: an undefined result"

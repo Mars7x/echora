@@ -2476,11 +2476,10 @@ impl Emitter {
                     let signed_zero = self.value(op::BITCAST, self.f32, &[signed_zero]);
                     self.value(op::SELECT, self.f32, &[tiny, signed_zero, x])
                 };
-                // The edges the hardware gives where GLSL.std.450 and OpFDiv
-                // leave the result undefined or loose (IEEE's limits;
-                // LOG2, RSQ and SQRT of a negative NaN): `special(e, cases,
-                // value)` picks the first case that holds.
+                // Handle the guest's edge cases explicitly and keep the
+                // host operations inside their defined input domains.
                 let zero = self.float_constant(0.0);
+                let one = self.float_constant(1.0);
                 let bits = self.value(op::BITCAST, self.u32, &[x]);
                 let sign_mask = self.constant(0x8000_0000);
                 let sign = self.value(op::BITWISE_AND, self.u32, &[bits, sign_mask]);
@@ -2504,6 +2503,12 @@ impl Emitter {
                         })
                 };
                 let is_nan = self.value(op::IS_NAN, self.bool, &[x]);
+                let positive_finite_input = |e: &mut Self| {
+                    let positive = e.value(op::F_ORD_GREATER_THAN, e.bool, &[x, zero]);
+                    let finite = e.value(op::F_ORD_LESS_THAN, e.bool, &[x, positive_infinity]);
+                    let valid = e.value(op::LOGICAL_AND, e.bool, &[positive, finite]);
+                    e.value(op::SELECT, e.f32, &[valid, x, one])
+                };
                 let value = match function {
                     // SIN and COS take turns, reduced exactly to [-0.5, 0.5]
                     // (GLSL's precision holds in [-pi, pi]); Inf gives NaN.
@@ -2520,7 +2525,8 @@ impl Emitter {
                     2 => self.glsl(self.f32, glsl::EXP2, &[x]),
                     // LG2(±0) is -Inf, of a negative NaN, of +Inf +Inf.
                     3 => {
-                        let log = self.glsl(self.f32, glsl::LOG2, &[x]);
+                        let input = positive_finite_input(self);
+                        let log = self.glsl(self.f32, glsl::LOG2, &[input]);
                         let minus_infinity = self.float_constant(f32::NEG_INFINITY);
                         pick(
                             self,
@@ -2536,19 +2542,20 @@ impl Emitter {
                     // a denormal, which MUFU flushes (OpFDiv's precision
                     // holds for |x| in [2^-126, 2^126]).
                     4 => {
-                        let one = self.float_constant(1.0);
-                        let quotient = self.value(op::F_DIV, self.f32, &[one, x]);
                         let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
                         let largest = self.float_constant(2f32.powi(126));
                         let huge =
                             self.value(op::F_ORD_GREATER_THAN, self.bool, &[magnitude, largest]);
+                        let input = pick(self, &[(is_nan, one), (is_zero, one), (huge, one)], x);
+                        let quotient = self.value(op::F_DIV, self.f32, &[one, input]);
                         let infinity = signed(self, f32::INFINITY);
                         let signed_zero = signed(self, 0.0);
                         pick(self, &[(is_zero, infinity), (huge, signed_zero)], quotient)
                     }
                     // RSQ(±0) is ±Inf, of +Inf +0, of a negative NaN.
                     5 => {
-                        let root = self.glsl(self.f32, glsl::INVERSE_SQRT, &[x]);
+                        let input = positive_finite_input(self);
+                        let root = self.glsl(self.f32, glsl::INVERSE_SQRT, &[input]);
                         let infinity = signed(self, f32::INFINITY);
                         pick(
                             self,
@@ -2562,7 +2569,8 @@ impl Emitter {
                     }
                     // SQRT(±0) is ±0, of +Inf +Inf, of a negative NaN.
                     8 => {
-                        let root = self.glsl(self.f32, glsl::SQRT, &[x]);
+                        let input = positive_finite_input(self);
+                        let root = self.glsl(self.f32, glsl::SQRT, &[input]);
                         pick(
                             self,
                             &[
