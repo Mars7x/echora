@@ -1370,38 +1370,42 @@ impl Renderer {
             return Ok(echora_shader_abi::PageTable::default());
         }
         let bytes = (entries.len().max(1) * 8) as u64;
-        let current = self
-            .page_table
-            .as_ref()
-            .is_some_and(|(_, written)| written.as_slice() == entries);
-        // Entries that only fill unmapped pages (a pool made since) are
-        // written in place: no program recorded before could reach those
-        // pages, so work still reading the table sees the same answers.
-        let added = !current
-            && self.page_table.as_ref().is_some_and(|(_, written)| {
-                written.len() == entries.len()
-                    && written
-                        .chunks(512)
-                        .zip(entries.chunks(512))
-                        .all(|(old, new)| {
-                            old == new
-                                || old
-                                    .iter()
-                                    .zip(new)
-                                    .all(|(old, new)| old == new || *old == 0)
-                        })
-            });
-        if added {
-            let (buffer, written) = self.page_table.as_mut().unwrap();
-            for (index, (old, new)) in written.chunks_mut(512).zip(entries.chunks(512)).enumerate()
-            {
-                if old != new {
-                    buffer.write_page_addresses(index * 512 * 8, new);
-                    old.copy_from_slice(new);
-                }
+        // Preserve the table in place when its only changes fill unmapped
+        // pages. Keep the changed chunks so this comparison only runs once.
+        const CHUNK: usize = 512;
+        let additions = self.page_table.as_ref().and_then(|(_, written)| {
+            if written.len() != entries.len() {
+                return None;
             }
-            self.stat("stat: page tables extended in place", 1);
-        } else if !current {
+            let mut changed = Vec::new();
+            for (index, (old, new)) in written.chunks(CHUNK).zip(entries.chunks(CHUNK)).enumerate()
+            {
+                if old == new {
+                    continue;
+                }
+                if old
+                    .iter()
+                    .zip(new)
+                    .any(|(old, new)| old != new && *old != 0)
+                {
+                    return None;
+                }
+                changed.push(index);
+            }
+            Some(changed)
+        });
+        if let Some(changed) = additions {
+            if !changed.is_empty() {
+                let (buffer, written) = self.page_table.as_mut().unwrap();
+                for index in changed {
+                    let start = index * CHUNK;
+                    let end = (start + CHUNK).min(entries.len());
+                    buffer.write_page_addresses(start * 8, &entries[start..end]);
+                    written[start..end].copy_from_slice(&entries[start..end]);
+                }
+                self.stat("stat: page tables extended in place", 1);
+            }
+        } else {
             // Finish allocating before retiring the currently published table.
             let buffer = if self
                 .free_page_tables
@@ -7527,35 +7531,50 @@ mod tests {
         assert!(created);
         let resident = renderer.resident_address(7).unwrap();
         assert_ne!(resident, 0);
-        let table = renderer
-            .set_page_table(0x100, &[resident, 0, resident + 4096])
-            .unwrap();
+        let mut entries = vec![0; 1025];
+        entries[0] = resident;
+        entries[2] = resident + 4096;
+        let table = renderer.set_page_table(0x100, &entries).unwrap();
         assert_ne!(table.address, 0);
-        assert_eq!((table.first_page, table.page_count), (0x100, 3));
-        // The same entries: the same table, not rewritten.
-        let again = renderer
-            .set_page_table(0x100, &[resident, 0, resident + 4096])
-            .unwrap();
+        assert_eq!((table.first_page, table.page_count), (0x100, 1025));
+
+        let again = renderer.set_page_table(0x100, &entries).unwrap();
         assert_eq!(again, table);
 
-        let extended = renderer
-            .set_page_table(0x100, &[resident, resident + 4096, resident + 4096])
-            .unwrap();
+        entries[1] = resident + 4096;
+        entries[1024] = resident;
+        let extended = renderer.set_page_table(0x100, &entries).unwrap();
         assert_eq!(extended, table);
+        assert_eq!(renderer.page_table_entries(), entries);
+        let expected: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        assert_eq!(
+            renderer
+                .page_table
+                .as_ref()
+                .unwrap()
+                .0
+                .read_bytes(expected.len()),
+            expected
+        );
 
         renderer.commands().unwrap();
-        let replaced = renderer
-            .set_page_table(0x100, &[0, resident, resident + 4096])
-            .unwrap();
+        entries[0] = 0;
+        entries[1] = resident;
+        let replaced = renderer.set_page_table(0x100, &entries).unwrap();
         assert_ne!(replaced.address, table.address);
         assert!(renderer.free_page_tables.is_empty());
         assert_eq!(renderer.slot.retired_page_tables.len(), 1);
 
         renderer.flush().unwrap();
-        let entries = [resident + 4096, 0, resident];
+        entries[0] = resident + 4096;
+        entries[1] = 0;
+        entries[2] = resident;
         let reused = renderer.set_page_table(0x200, &entries).unwrap();
         assert_eq!(reused.address, table.address);
-        assert_eq!((reused.first_page, reused.page_count), (0x200, 3));
+        assert_eq!((reused.first_page, reused.page_count), (0x200, 1025));
         assert_eq!(renderer.page_table_entries(), entries);
         let expected: Vec<_> = entries
             .iter()
