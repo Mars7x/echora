@@ -163,33 +163,31 @@ pub fn decode_adpcm(
     if count == 0 {
         return 0;
     }
-    let in_frame = position % SAMPLES_PER_FRAME;
-    let mut nibble = (position / SAMPLES_PER_FRAME) * NIBBLES_PER_FRAME + in_frame;
-    if in_frame != 0 {
-        nibble += 2;
-    }
-    // The bytes the samples' nibbles and the frame headers on the way span.
-    let first_byte = nibble / 2;
-    let mut end_nibble = nibble;
-    for _ in 0..count {
-        if end_nibble % NIBBLES_PER_FRAME == 0 {
-            end_nibble += 2;
-        }
-        end_nibble += 1;
-    }
-    let mut bytes = vec![0u8; (end_nibble.div_ceil(2) - first_byte) as usize];
-    if !source.read(buffer + u64::from(first_byte), &mut bytes) {
+    // A boundary refers to the next frame's header when it is aligned,
+    // or a sample nibble after the current header otherwise.
+    let nibble_at = |sample: u32| {
+        let frame = u64::from(sample / SAMPLES_PER_FRAME);
+        let sample = u64::from(sample % SAMPLES_PER_FRAME);
+        frame * u64::from(NIBBLES_PER_FRAME) + if sample == 0 { 0 } else { sample + 2 }
+    };
+    let first_byte = nibble_at(position) / 2;
+    let end_byte = nibble_at(position + count).div_ceil(2);
+    let mut bytes = vec![0u8; (end_byte - first_byte) as usize];
+    if !buffer
+        .checked_add(first_byte)
+        .is_some_and(|address| source.read(address, &mut bytes))
+    {
         return 0;
     }
     let mut header = context.header as u8;
     let (mut yn0, mut yn1) = (i32::from(context.yn0), i32::from(context.yn1));
     let mut read = 0usize;
     let mut left = count;
+    let mut in_frame = position % SAMPLES_PER_FRAME;
     while left > 0 {
-        if nibble % NIBBLES_PER_FRAME == 0 {
+        if in_frame == 0 {
             header = bytes[read];
             read += 1;
-            nibble += 2;
         }
         let index = usize::from(header >> 4) & 7;
         let scale = u32::from(header & 0xf);
@@ -197,27 +195,30 @@ pub fn decode_adpcm(
             i32::from(coefficients[index * 2]),
             i32::from(coefficients[index * 2 + 1]),
         );
-        let byte = bytes[read];
-        let raw = if nibble & 1 != 0 {
-            read += 1;
-            byte & 0xf
-        } else {
-            byte >> 4
-        };
-        // Sign-extend the nibble.
-        let code = (i32::from(raw) << 28) >> 28;
-        let xn = code.wrapping_shl(scale);
-        let sample = (xn.wrapping_shl(11))
-            .wrapping_add(0x400)
-            .wrapping_add(coeff0.wrapping_mul(yn0))
-            .wrapping_add(coeff1.wrapping_mul(yn1))
-            >> 11;
-        let sample = sample.clamp(-0x8000, 0x7fff);
-        yn1 = yn0;
-        yn0 = sample;
-        out.push(sample as i16);
-        nibble += 1;
-        left -= 1;
+        let frame_samples = left.min(SAMPLES_PER_FRAME - in_frame);
+        for sample in in_frame..in_frame + frame_samples {
+            let byte = bytes[read];
+            let raw = if sample & 1 != 0 {
+                read += 1;
+                byte & 0xf
+            } else {
+                byte >> 4
+            };
+            // Sign-extend the nibble.
+            let code = (i32::from(raw) << 28) >> 28;
+            let xn = code.wrapping_shl(scale);
+            let sample = (xn.wrapping_shl(11))
+                .wrapping_add(0x400)
+                .wrapping_add(coeff0.wrapping_mul(yn0))
+                .wrapping_add(coeff1.wrapping_mul(yn1))
+                >> 11;
+            let sample = sample.clamp(-0x8000, 0x7fff);
+            yn1 = yn0;
+            yn0 = sample;
+            out.push(sample as i16);
+        }
+        left -= frame_samples;
+        in_frame = 0;
     }
     *context = AdpcmContext {
         header: u16::from(header),
@@ -462,6 +463,53 @@ mod tests {
             2
         );
         assert_eq!(&out[4..], [4, 4]);
+    }
+
+    #[test]
+    fn adpcm_partial_reads_preserve_cross_frame_predictors() {
+        let source = Bytes(vec![
+            0x01, 0x12, 0xf0, 0x23, 0x89, 0x50, 0x07, 0x42, 0x10, 0x7f, 0x80, 0x01, 0x06, 0xfe,
+            0x91, 0x50,
+        ]);
+        let mut coefficients = [0i16; 16];
+        coefficients[0] = 0x800;
+        coefficients[2] = 0x400;
+        let mut continuous = AdpcmContext::default();
+        let mut chunks = AdpcmContext::default();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        assert_eq!(
+            decode_adpcm(
+                &source,
+                0x1000,
+                &coefficients,
+                &mut continuous,
+                0,
+                28,
+                0,
+                28,
+                &mut expected,
+            ),
+            28
+        );
+        for (offset, count) in [(0, 1), (1, 12), (13, 3), (16, 11), (27, 1)] {
+            assert_eq!(
+                decode_adpcm(
+                    &source,
+                    0x1000,
+                    &coefficients,
+                    &mut chunks,
+                    0,
+                    28,
+                    offset,
+                    count,
+                    &mut actual,
+                ),
+                count
+            );
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(chunks, continuous);
     }
 
     #[test]
