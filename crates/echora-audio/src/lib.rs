@@ -1,7 +1,7 @@
 //! Host audio output: the interleaved signed 16-bit PCM that the guest's
 //! audio-out buffers carry, played on the default output device through
-//! CPAL (ALSA on Linux, which reaches PipeWire and PulseAudio; WASAPI on
-//! Windows). Opt-in with `ECHORA_AUDIO=1`.
+//! PipeWire on Linux and CPAL on other platforms. Opt-in with
+//! `ECHORA_AUDIO=1`.
 //!
 //! A dedicated thread owns the stream (CPAL streams are not `Send` on every
 //! platform) and moves submitted samples into a bounded queue that the
@@ -14,7 +14,10 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
+#[cfg(not(target_os = "linux"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(target_os = "linux")]
+mod pipewire;
 
 /// Start a host stream of interleaved PCM16 at `sample_rate` with
 /// `channels` channels, or `None` when host audio is off or no device can
@@ -32,7 +35,11 @@ pub fn open_device(sample_rate: u32, channels: u32) -> Option<Sender<Vec<u8>>> {
         .name("echora-audio".into())
         .spawn(move || {
             let queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-            let stream = match build_stream(sample_rate, channels, queue.clone()) {
+            #[cfg(target_os = "linux")]
+            let stream = pipewire::Playback::start(sample_rate, channels, queue.clone());
+            #[cfg(not(target_os = "linux"))]
+            let stream = build_stream(sample_rate, channels, queue.clone());
+            let stream = match stream {
                 Ok(stream) => stream,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -92,6 +99,7 @@ fn pull<T: Copy>(
     remaining.fill(silence);
 }
 
+#[cfg(not(target_os = "linux"))]
 fn build_stream(
     sample_rate: u32,
     channels: u32,

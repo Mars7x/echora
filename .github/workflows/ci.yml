@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all --check

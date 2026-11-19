@@ -175,7 +175,7 @@ last faults and gameplay.
 
 ### Requirements
 
-- Linux
+- Linux with PipeWire for host audio
 - Your own dump of the game (update 1.1.1), as a NUP file or a folder
 - A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
 - On AMD GPUs, the Mesa RADV driver 26.1.4 or newer (older versions hang the
@@ -185,9 +185,9 @@ last faults and gameplay.
 
 ```sh
 # Ubuntu
-sudo apt install build-essential nasm pkg-config libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev
+sudo apt install build-essential nasm pkg-config libclang-dev libpipewire-0.3-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev
 # Fedora
-sudo dnf install gcc nasm pkgconf-pkg-config alsa-lib-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
+sudo dnf install gcc nasm pkgconf-pkg-config clang-devel pipewire-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
 ```
 
 The C compiler is for libzstd and the system libraries' bindings, and NASM
