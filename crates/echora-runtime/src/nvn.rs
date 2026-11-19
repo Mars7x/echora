@@ -6856,11 +6856,8 @@ impl Nvn {
                 furthest_end: 0,
             });
         };
-        for pool in self
-            .objects
-            .values()
-            .filter(|pool| pool.kind == "MemoryPool")
-        {
+        for address in &self.memory_pools {
+            let pool = &self.objects[address];
             let Some(gpu) = pool.state.get("GpuAddress").map(|args| args.x[0]) else {
                 continue;
             };
