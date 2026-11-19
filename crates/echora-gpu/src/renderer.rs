@@ -2870,6 +2870,11 @@ impl Renderer {
             return Ok(None);
         }
         let commands = self.commands()?;
+        // A report before the marker belongs to the work it signals.
+        // Resolve it outside conditional rendering, before making writes
+        // visible to the host.
+        self.end_condition();
+        self.occlusion_resolve(commands);
         let event = match self.free_events.pop() {
             Some(event) => event,
             // SAFETY: a valid create info on a live device.
@@ -7908,6 +7913,29 @@ mod tests {
         assert!(
             ordered,
             "a new rendering pass must wait for the prior store"
+        );
+    }
+
+    #[test]
+    fn marker_includes_pending_counter_reports() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let (buffer, _) = renderer.resident_buffer(1, 16).unwrap();
+        renderer.fill_resident(1, 0, 16, 0).unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.samples_report(buffer, 0, 0x1234).unwrap();
+        let reports_pending =
+            |renderer: &Renderer| renderer.occlusion.as_ref().unwrap().pending_at(buffer, 0);
+        assert!(reports_pending(&renderer));
+        let marker = renderer.mark().unwrap().unwrap();
+        assert!(!reports_pending(&renderer));
+        let token = renderer.read_resident(1, 0, 16).unwrap();
+        renderer.flush().unwrap();
+        assert!(renderer.marker_done(marker));
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            [0_u64, 0x1234].map(u64::to_le_bytes).concat()
         );
     }
 
