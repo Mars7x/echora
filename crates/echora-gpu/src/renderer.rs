@@ -4460,14 +4460,21 @@ impl Renderer {
     }
 
     pub fn target_keys(&self) -> Vec<u64> {
-        let mut keys: Vec<u64> = self
-            .targets
-            .keys()
-            .copied()
-            .filter(|key| *key < STAGING_KEYS)
-            .collect();
-        keys.sort_unstable();
+        let mut keys = Vec::new();
+        self.collect_target_keys(&mut keys);
         keys
+    }
+
+    /// Collect guest render-target keys in address order, reusing the buffer.
+    pub fn collect_target_keys(&self, keys: &mut Vec<u64>) {
+        keys.clear();
+        keys.extend(
+            self.targets
+                .keys()
+                .copied()
+                .filter(|key| *key < STAGING_KEYS),
+        );
+        keys.sort_unstable();
     }
 
     /// The largest 1D/2D image extent the device supports.

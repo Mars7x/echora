@@ -2521,6 +2521,7 @@ impl Nvn {
                 // Each request changes the set of translations immediately.
                 self.pool_ranges.get_mut().epoch = None;
                 self.storage_memo.get_mut().clear();
+                self.invalidate_target_index(None);
                 for [physical, physical_offset, offset, size] in mappings {
                     if size == 0 || offset.checked_add(size).is_none_or(|end| end > pool_size) {
                         return Err(invalid(format!(
@@ -6962,10 +6963,14 @@ impl Nvn {
     fn object_changed(&mut self, address: u64, kind: &str) {
         match kind {
             "Program" => self.flush_epoch += 1,
-            "MemoryPool" => self.storage_memo.get_mut().clear(),
+            "MemoryPool" => {
+                self.storage_memo.get_mut().clear();
+                self.invalidate_target_index(None);
+            }
             "Texture" => {
                 self.storage_memo.get_mut().remove(&address);
                 self.size_memo.get_mut().remove(&address);
+                self.invalidate_target_index(Some(address));
             }
             _ => {}
         }

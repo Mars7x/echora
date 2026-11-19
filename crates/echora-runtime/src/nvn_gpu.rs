@@ -205,7 +205,8 @@ pub struct Backend {
     /// targets in `target_keys` order and levels ascending (a texture over one of
     /// their levels resolves to them). Built with `target_index`.
     target_levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
-    target_index_stamp: Option<(u64, u64)>,
+    target_index_stamp: Option<u64>,
+    target_keys: Vec<u64>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -392,6 +393,7 @@ impl Backend {
             target_index: HashMap::default(),
             target_levels: HashMap::default(),
             target_index_stamp: None,
+            target_keys: Vec::new(),
         }))
     }
 
@@ -2961,9 +2963,17 @@ impl Nvn {
     /// Whether `target_index` describes the current targets and storage.
     fn target_index_current(&self) -> bool {
         self.gpu.as_ref().is_some_and(|backend| {
-            backend.target_index_stamp
-                == Some((backend.renderer.target_changes, self.texture_epoch))
+            backend.target_index_stamp == Some(backend.renderer.target_changes)
         })
+    }
+
+    /// A texture changed, or a pool changed where textures map.
+    pub(super) fn invalidate_target_index(&mut self, texture: Option<u64>) {
+        if let Some(backend) = self.gpu.as_mut()
+            && texture.is_none_or(|key| backend.renderer.existing_target(key).is_some())
+        {
+            backend.target_index_stamp = None;
+        }
     }
 
     /// Rebuild `target_index` if targets or texture storage changed.
@@ -2971,13 +2981,18 @@ impl Nvn {
         if self.target_index_current() {
             return;
         }
-        let Some(backend) = self.gpu.as_ref() else {
+        let Some(backend) = self.gpu.as_mut() else {
             return;
         };
         let started = std::time::Instant::now();
-        let mut index: HashMap<u64, Vec<u64>> = HashMap::default();
-        let mut levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>> = HashMap::default();
-        for key in backend.renderer.target_keys() {
+        let mut index = std::mem::take(&mut backend.target_index);
+        let mut levels = std::mem::take(&mut backend.target_levels);
+        let mut keys = std::mem::take(&mut backend.target_keys);
+        index.values_mut().for_each(Vec::clear);
+        levels.values_mut().for_each(Vec::clear);
+        backend.renderer.collect_target_keys(&mut keys);
+        let backend = self.gpu.as_ref().unwrap();
+        for &key in &keys {
             let base = self.texture_storage(key);
             if let Some(base) = base {
                 index.entry(base).or_default().push(key);
@@ -2996,9 +3011,12 @@ impl Nvn {
             }
         }
         let backend = self.gpu.as_mut().unwrap();
+        index.retain(|_, targets| !targets.is_empty());
+        levels.retain(|_, targets| !targets.is_empty());
         backend.target_index = index;
         backend.target_levels = levels;
-        backend.target_index_stamp = Some((backend.renderer.target_changes, self.texture_epoch));
+        backend.target_keys = keys;
+        backend.target_index_stamp = Some(backend.renderer.target_changes);
         backend.stat("stat: target index rebuilds", 1);
         backend.stat(
             "stat: target index rebuild us",
@@ -11325,6 +11343,54 @@ mod pool_tests {
             command.x[count_arg] = 1;
             assert!(nvn.gpu_draw(&mut guest, &command).is_err());
         }
+    }
+
+    #[test]
+    fn target_index_updates_when_backing_storage_changes() {
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            0x1000,
+            "MemoryPool",
+            BTreeMap::from([("Storage".to_owned(), args([0x10_0000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        let props = BTreeMap::from([
+            ("Storage".to_owned(), args([0x1000, 0x2000, 0, 0])),
+            ("Width".to_owned(), args([16, 0, 0, 0])),
+            ("Height".to_owned(), args([16, 0, 0, 0])),
+            ("Format".to_owned(), args([37, 0, 0, 0])),
+        ]);
+        nvn.initialize(0x2000, "Texture", props.clone()).unwrap();
+        nvn.ensure_render_target(0x2000).unwrap();
+        nvn.refresh_target_index();
+        assert_eq!(nvn.gpu.as_ref().unwrap().target_index[&0x10_2000], [0x2000]);
+        nvn.initialize(0x3000, "Texture", props).unwrap();
+        assert!(nvn.target_index_current());
+
+        nvn.objects.remove(&0x1000);
+        nvn.object_changed(0x1000, "MemoryPool");
+        assert!(!nvn.target_index_current());
+        nvn.refresh_target_index();
+        assert!(nvn.gpu.as_ref().unwrap().target_index.is_empty());
+        nvn.initialize(
+            0x1000,
+            "MemoryPool",
+            BTreeMap::from([("Storage".to_owned(), args([0x20_0000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.refresh_target_index();
+        assert_eq!(nvn.gpu.as_ref().unwrap().target_index[&0x20_2000], [0x2000]);
     }
 
     #[test]
