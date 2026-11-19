@@ -4515,6 +4515,63 @@ impl Renderer {
         .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
     }
 
+    /// Whether this ASTC upload can use the renderer's sampled image layout.
+    pub fn supports_astc_upload(
+        &self,
+        format: vk::Format,
+        shape: crate::draw::ImageShape,
+        width: u32,
+        height: u32,
+        levels: u32,
+    ) -> bool {
+        use crate::draw::ImageShape;
+        let Some(twin) = self
+            .gpu
+            .texture_compression_astc_ldr
+            .then(|| astc_srgb_twin(format))
+            .flatten()
+        else {
+            return false;
+        };
+        let flags = match shape {
+            ImageShape::D2 { .. } => vk::ImageCreateFlags::MUTABLE_FORMAT,
+            ImageShape::Cube { .. } => {
+                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::CUBE_COMPATIBLE
+            }
+            _ => return false,
+        };
+        let views = [format, twin];
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&views);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .flags(flags)
+            .push_next(&mut format_list);
+        let mut properties = vk::ImageFormatProperties2::default();
+        // SAFETY: the instance and physical device are live.
+        let supported = unsafe {
+            self.gpu
+                .instance
+                .get_physical_device_image_format_properties2(
+                    self.gpu.physical,
+                    &info,
+                    &mut properties,
+                )
+        };
+        let limits = properties.image_format_properties;
+        supported.is_ok()
+            && width <= limits.max_extent.width
+            && height <= limits.max_extent.height
+            && levels <= limits.max_mip_levels
+            && shape.layers() <= limits.max_array_layers
+    }
+
     /// The resolution scale a new target `key` of this extent gets: the
     /// renderer's for 2D targets larger than a few texels (tiny ones hold
     /// values such as exposure, not images).
@@ -7440,10 +7497,14 @@ const SRGB_PAIRS: [(vk::Format, vk::Format); 6] = [
 
 /// Whether `format` is one of the sRGB-encoded twins.
 fn is_srgb(format: vk::Format) -> bool {
-    SRGB_PAIRS.iter().any(|&(_, srgb)| srgb == format)
+    astc_ldr_format_index(format).is_some_and(|index| index % 2 == 1)
+        || SRGB_PAIRS.iter().any(|&(_, srgb)| srgb == format)
 }
 
 pub fn srgb_twin(format: vk::Format) -> Option<vk::Format> {
+    if let Some(twin) = astc_srgb_twin(format) {
+        return Some(twin);
+    }
     SRGB_PAIRS.iter().find_map(|&(unorm, srgb)| {
         if format == unorm {
             Some(srgb)
@@ -7453,6 +7514,18 @@ pub fn srgb_twin(format: vk::Format) -> Option<vk::Format> {
             None
         }
     })
+}
+
+fn astc_srgb_twin(format: vk::Format) -> Option<vk::Format> {
+    astc_ldr_format_index(format)
+        .map(|index| vk::Format::from_raw(vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw() + (index ^ 1)))
+}
+
+fn astc_ldr_format_index(format: vk::Format) -> Option<i32> {
+    // Vulkan assigns consecutive UNORM/sRGB pairs to the ASTC LDR formats.
+    (vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw()..=vk::Format::ASTC_12X12_SRGB_BLOCK.as_raw())
+        .contains(&format.as_raw())
+        .then(|| format.as_raw() - vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw())
 }
 
 /// The float format of the same texel size for a 32-bit integer format.

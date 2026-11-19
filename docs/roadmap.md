@@ -38,11 +38,11 @@ when the code for it does.
 5. Shorten the first build from about an hour: leaner generated code (about
    a third smaller in tests so far), full optimisation only for the hot code a
    profile finds, and more parallel compiler jobs.
-6. Keep compressed textures compressed on the GPU. The game's ASTC textures
-   are unpacked to plain RGBA8 because PC GPUs mostly can't sample ASTC, which
-   uses four to eight times the video memory (one 90-layer array after the
-   opening movie becomes 852 MiB). Re-encoding them as BC7, cached on disk like
-   the shader binaries, would bring that close to the console's footprint.
+6. Reduce the memory used by ASTC textures on GPUs that need to decode them.
+   Echora uploads compressed blocks when Vulkan supports the texture. The CPU
+   fallback expands them to RGBA8, such as one 90-layer array after the
+   opening movie that grows to 852 MiB. Re-encoding them as BC7, cached on disk
+   like the shader binaries, would bring that close to the console's footprint.
 7. Translate and compile every shader before the game starts, so nothing
    stutters while it runs. `echora shaders` already lists all 34,275 unique
    shader stages the game ships.

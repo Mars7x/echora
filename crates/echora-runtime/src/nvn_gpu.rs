@@ -6,9 +6,9 @@
 //! Fixed-function state comes from record-time snapshots with NVN enum
 //! values inferred from GL order (see compare_op, blend_factor, blend_op);
 //! samplers keep only their filters and wrap modes;
-//! textures upload every mip level of their first layer (ASTC decoded on
-//! the CPU); the driver constant buffers 0..2 read as
-//! zeros.
+//! textures upload their mip levels and layers. ASTC is decoded on the CPU
+//! if compressed uploads are unavailable. Driver constant buffers 0..2
+//! read as zeros.
 
 use std::collections::BTreeMap;
 /// Maps here are keyed by addresses and names looked up on every call: the
@@ -698,6 +698,19 @@ pub fn vk_format(format: u32) -> Option<vk::Format> {
         "BGRA8_SRGB" => F::B8G8R8A8_SRGB,
         _ => return None,
     })
+}
+
+fn astc_vk_format(format: u32) -> Option<vk::Format> {
+    // NVN lists the same block footprints as Vulkan, first UNORM and then
+    // sRGB. Vulkan interleaves the two variants.
+    let (block, srgb) = match format {
+        121..=134 => (format - 121, 0),
+        135..=148 => (format - 135, 1),
+        _ => return None,
+    };
+    Some(vk::Format::from_raw(
+        vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw() + (block * 2 + srgb) as i32,
+    ))
 }
 
 /// How a vertex program pulling its inputs decodes an NVN vertex format
@@ -2524,7 +2537,8 @@ impl Nvn {
     fn handle_view_format(&self, handle: u64) -> Option<vk::Format> {
         let pool = self.render.state.get("SetTexturePool")?.x[1];
         let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
-        vk_format(view.props.get("Format")?.x[0] as u32)
+        let format = view.props.get("Format")?.x[0] as u32;
+        vk_format(format).or_else(|| astc_vk_format(format))
     }
 
     fn pool_list_stamp(&self, stage: u32) -> super::PoolListStamp {
@@ -3411,7 +3425,7 @@ impl Nvn {
             crate::nvn_format::info(format).ok_or_else(|| format!("texture format {format}"))?;
         let (width, height) = (get("Width").unwrap_or(1), get("Height").unwrap_or(1));
         let astc = info.name.starts_with("ASTC");
-        let vk_format = match vk_format(format) {
+        let mut vk_format = match vk_format(format) {
             Some(vk_format) => vk_format,
             // ASTC has no host format on most desktop GPUs: decoded below.
             None if info.name == "ASTC" => vk::Format::R8G8B8A8_UNORM,
@@ -3599,6 +3613,19 @@ impl Nvn {
             let levels = get("Levels").unwrap_or(1).clamp(1, 16);
             levels.min(32 - width.max(height).max(depth).leading_zeros())
         };
+        let compressed_astc = astc_vk_format(format).filter(|&format| {
+            self.gpu.as_ref().unwrap().renderer.supports_astc_upload(
+                format,
+                shape,
+                width,
+                height,
+                level_count,
+            )
+        });
+        let decode_astc = astc && compressed_astc.is_none();
+        if let Some(format) = compressed_astc {
+            vk_format = format;
+        }
         // The rows of the last whole-level copy into the texture, when the
         // storage still samples as the copy left it: they are level 0
         // untiled, so neither the storage read nor untiling is needed.
@@ -3723,7 +3750,7 @@ impl Nvn {
             ]
         };
         let layer_bytes = |[w, h, d]: [u32; 3]| {
-            let (columns, rows, block_bytes) = if astc {
+            let (columns, rows, block_bytes) = if decode_astc {
                 (w, h, 4)
             } else {
                 (
@@ -3817,7 +3844,7 @@ impl Nvn {
                 .expect("the size of each mip was checked");
             texels.resize(offset + length * layers as usize, 0);
             let output = &mut texels[offset..];
-            if astc {
+            if decode_astc {
                 crate::nvn_format::decode_astc_layers(
                     output,
                     [level_width, level_height, level_depth],
@@ -3922,6 +3949,10 @@ impl Nvn {
             levels: levels.into(),
         };
         let backend = self.gpu.as_mut().unwrap();
+        if compressed_astc.is_some() {
+            backend.stat("stat: compressed ASTC uploads", 1);
+            backend.stat("stat: compressed ASTC upload bytes", upload_bytes as u64);
+        }
         backend
             .textures
             .insert(texture, (sample, source.clone(), base..base + storage_size));
