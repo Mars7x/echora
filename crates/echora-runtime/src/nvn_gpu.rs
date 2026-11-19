@@ -1080,8 +1080,9 @@ impl Nvn {
                 let end = range.end.min(pool.base + pool.size);
                 if start < end {
                     // The CPU's bytes are newer there than the GPU's.
-                    remove_range(&mut pool.gpu_dirty, start..end);
-                    backend.dirty_removals += 1;
+                    if remove_range(&mut pool.gpu_dirty, start..end) {
+                        backend.dirty_removals += 1;
+                    }
                     add_range(&mut pool.guest_dirty, start..end);
                 }
             }
@@ -1138,8 +1139,6 @@ impl Nvn {
             if piece.start < piece.end {
                 // Both copies hold the cleared words once the fill runs.
                 remove_range(&mut pool.guest_dirty, piece.clone());
-                remove_range(&mut pool.gpu_dirty, piece.clone());
-                backend.dirty_removals += 1;
                 fills.push((pool.base, piece));
             }
         }
@@ -5954,42 +5953,30 @@ impl Nvn {
         {
             return Ok(());
         }
-        let mut wanted = Vec::new();
+        let mut batches = Vec::new();
         for pool in backend.resident.values() {
+            let mut ranges = Vec::new();
             for dirty in &pool.gpu_dirty {
                 let piece = match &range {
                     Some(range) => range.start.max(dirty.start)..range.end.min(dirty.end),
                     None if pool.uncached => dirty.clone(),
                     None => continue,
                 };
-                if piece.start < piece.end {
-                    wanted.push((pool.base, piece));
+                if !piece.is_empty() {
+                    ranges.push((piece.start - pool.base, piece.end - piece.start));
                 }
             }
-        }
-        if wanted.is_empty() {
-            return Ok(());
-        }
-        // One copy per pool, of all its pieces.
-        let mut by_pool: Vec<(u64, Vec<std::ops::Range<u64>>)> = Vec::new();
-        for (base, piece) in &wanted {
-            match by_pool.iter_mut().find(|(known, _)| known == base) {
-                Some((_, pieces)) => pieces.push(piece.clone()),
-                None => by_pool.push((*base, vec![piece.clone()])),
+            if !ranges.is_empty() {
+                batches.push((pool.base, ranges));
             }
         }
-        let mut tokens = Vec::new();
-        for (base, pieces) in by_pool {
-            let ranges: Vec<(u64, u64)> = pieces
-                .iter()
-                .map(|piece| (piece.start - base, piece.end - piece.start))
-                .collect();
-            let read = backend.renderer.read_resident_ranges(base, &ranges)?;
-            tokens.extend(
-                read.into_iter()
-                    .zip(pieces)
-                    .map(|(token, piece)| (token, base, piece)),
-            );
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let mut ids = Vec::new();
+        for (base, ranges) in &batches {
+            ids.extend(backend.renderer.read_resident_ranges(*base, ranges)?);
         }
         let started = std::time::Instant::now();
         backend.renderer.flush()?;
@@ -6005,30 +5992,30 @@ impl Nvn {
         );
         // Only these: pending dispatch and draw results stay for
         // `resolve_copies`.
-        let ids: Vec<u64> = tokens.iter().map(|(token, ..)| *token).collect();
         let mut completed = backend.renderer.take_reads(&ids);
-        backend.stat("stat: resident ranges copied back", wanted.len() as u64);
+        backend.stat("stat: resident ranges copied back", ids.len() as u64);
         // Which call site asked (`#[track_caller]` up the resolve chain).
         backend.stat(caller_stat(std::panic::Location::caller()), 1);
-        // Without a range every dirty range of the pools read was copied
-        // back: their lists empty at once (range by range shifted the
-        // whole list each time, hundreds per frame in the forest).
-        let whole = range.is_none();
-        for (token, base, piece) in tokens {
-            let bytes = completed
-                .remove(&token)
-                .ok_or_else(|| format!("resident read {token} never completed"))?;
-            core.memory
-                .write(piece.start, &bytes)
-                .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-            let backend = self.gpu.as_mut().unwrap();
-            backend.dirty_removals += 1;
+        let mut ids = ids.into_iter();
+        for (base, ranges) in batches {
+            for (offset, _) in ranges {
+                let token = ids.next().ok_or("resident read token missing")?;
+                let bytes = completed
+                    .remove(&token)
+                    .ok_or_else(|| format!("resident read {token} never completed"))?;
+                core.memory
+                    .write(base + offset, &bytes)
+                    .map_err(|trap| format!("resident write-back: {trap:?}"))?;
+            }
+            // Keep this pool's ranges pending until every selected write
+            // has reached guest memory.
             if let Some(pool) = backend.resident.get_mut(&base) {
-                if whole {
-                    pool.gpu_dirty.clear();
+                if let Some(range) = &range {
+                    remove_range(&mut pool.gpu_dirty, range.clone());
                 } else {
-                    remove_range(&mut pool.gpu_dirty, piece);
+                    pool.gpu_dirty.clear();
                 }
+                backend.dirty_removals += 1;
             }
         }
         Ok(())
@@ -6039,8 +6026,13 @@ impl Nvn {
     /// not seen are lost with it, as the pool is.
     pub(super) fn gpu_forget_pool(&mut self, base: u64) {
         if let Some(backend) = self.gpu.as_mut() {
-            backend.resident.remove(&base);
-            backend.dirty_removals += 1;
+            if backend
+                .resident
+                .remove(&base)
+                .is_some_and(|pool| !pool.gpu_dirty.is_empty())
+            {
+                backend.dirty_removals += 1;
+            }
             // Its pages may be released and reused: shared spans of them
             // would keep the old ones.
             if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
@@ -10574,21 +10566,25 @@ fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>
     ranges.splice(low..high, [merged]);
 }
 
-/// Remove `range` from a sorted list of disjoint ranges.
-fn remove_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
+/// Remove `range` from sorted, disjoint ranges. Returns whether any bytes
+/// were removed.
+fn remove_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) -> bool {
+    if range.is_empty() {
+        return false;
+    }
     let low = ranges.partition_point(|existing| existing.end <= range.start);
     let high = ranges.partition_point(|existing| existing.start < range.end);
     if low >= high {
-        return;
+        return false;
     }
-    let mut kept = Vec::with_capacity(2);
-    if ranges[low].start < range.start {
-        kept.push(ranges[low].start..range.start);
-    }
-    if range.end < ranges[high - 1].end {
-        kept.push(range.end..ranges[high - 1].end);
-    }
-    ranges.splice(low..high, kept);
+    let remaining = [
+        ranges[low].start..range.start,
+        range.end..ranges[high - 1].end,
+    ];
+    let first = usize::from(remaining[0].is_empty());
+    let end = remaining.len() - usize::from(remaining[1].is_empty());
+    ranges.splice(low..high, remaining[first..end].iter().cloned());
+    true
 }
 
 /// The parts of a sorted list of disjoint ranges inside `range`.
@@ -10834,7 +10830,8 @@ mod range_tests {
         assert_eq!(ranges, [0..5, 10..15, 25..40]);
         remove_range(&mut ranges, 0..12);
         assert_eq!(ranges, [12..15, 25..40]);
-        remove_range(&mut ranges, 100..200);
+        assert!(!remove_range(&mut ranges, 100..200));
+        assert!(!remove_range(&mut ranges, 13..13));
         assert_eq!(ranges, [12..15, 25..40]);
     }
 }
@@ -11750,6 +11747,83 @@ mod pool_tests {
         let backend = nvn.gpu.as_ref().unwrap();
         assert!(!backend.resident_writes_pending(&(base + 12..base + 16)));
         assert!(backend.resident_writes_pending(&(base + 16..base + 24)));
+    }
+
+    #[test]
+    fn failed_resident_writeback_keeps_unwritten_ranges_pending() {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        let page = 4096;
+        backend.renderer.resident_buffer(base, 2 * page).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 8, &[0x42; 4])
+            .unwrap();
+        backend
+            .renderer
+            .upload_resident(base, page + 8, &[0x7b; 4])
+            .unwrap();
+        let first = base + 8..base + 12;
+        let second = base + page + 8..base + page + 12;
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size: 2 * page,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: vec![first.clone(), second.clone()],
+            },
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                base,
+                page,
+                READ | WRITE,
+                STATE_NORMAL,
+                "writeback first page",
+            )
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        {
+            let mut core = Guest {
+                cpu: &mut cpu,
+                memory: GuestMemory::Checked(&mut memory),
+                counter: Some(0),
+            };
+            assert!(nvn.resolve_resident(&mut core, None).is_err());
+            assert_eq!(core.memory.read_u32(first.start).unwrap(), 0x4242_4242);
+        }
+        assert!(nvn.gpu.as_ref().unwrap().resident_writes_pending(&second));
+        memory
+            .map(
+                base + page,
+                page,
+                READ | WRITE,
+                STATE_NORMAL,
+                "writeback second page",
+            )
+            .unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.resolve_resident(&mut core, None).unwrap();
+        assert_eq!(core.memory.read_u32(second.start).unwrap(), 0x7b7b_7b7b);
+        let backend = nvn.gpu.as_ref().unwrap();
+        assert!(!backend.resident_writes_pending(&first));
+        assert!(!backend.resident_writes_pending(&second));
     }
 
     #[test]
