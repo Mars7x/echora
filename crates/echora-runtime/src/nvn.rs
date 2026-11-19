@@ -647,6 +647,8 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    #[serde(skip)]
+    window_timing: FastMap<u64, WindowTiming>,
     /// Draws into each target since the last present (the capture log
     /// shows the presented texture's).
     #[serde(skip)]
@@ -864,6 +866,25 @@ impl std::ops::Deref for StateSnapshots {
 
     fn deref(&self) -> &Self::Target {
         self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
+
+const WINDOW_TEXTURES: usize = 16;
+
+/// Release times on the modeled 60 Hz docked display.
+#[derive(Debug, Default)]
+struct WindowTiming {
+    next_release: Option<std::time::Instant>,
+    releases: [Option<std::time::Instant>; WINDOW_TEXTURES],
+}
+
+impl WindowTiming {
+    fn present(&mut self, index: usize, now: std::time::Instant, interval: u32) {
+        let start = self.next_release.map_or(now, |previous| previous.max(now));
+        let period = std::time::Duration::from_nanos(16_666_667) * interval;
+        let release = start + period;
+        self.next_release = Some(release);
+        self.releases[index] = Some(release);
     }
 }
 
@@ -3655,6 +3676,9 @@ impl Nvn {
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);
                 }
+                if kind == "Window" {
+                    self.window_timing.remove(&this);
+                }
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
@@ -3676,9 +3700,10 @@ impl Nvn {
                     .copied()
                     .ok_or_else(|| invalid("window textures were never set".into()))?;
                 let count = textures.x[0];
-                if count == 0 || count > 16 {
+                if count == 0 || count > WINDOW_TEXTURES as u64 {
                     return Err(invalid(format!("{count} window textures")));
                 }
+                self.window_timing.remove(&this);
                 self.initialize(this, "Window", builder).map_err(invalid)?;
                 let mut pointers = Vec::new();
                 for index in 0..count {
@@ -3696,12 +3721,15 @@ impl Nvn {
                 return Ok(true);
             }
             // nvnWindowAcquireTexture(NVNwindow*, NVNsync*, int* index) ->
-            // NVNwindowAcquireTextureResult: textures are handed out in order;
-            // the host display never holds one, so the sync is signaled now
-            // and the result is 0 (success, inferred from the application
-            // treating 0 as success).
+            // NVNwindowAcquireTextureResult: textures are handed out in order
+            // when their previous presentation releases them. The worker takes
+            // the wait outside the NVN state lock before making this call.
             "nvnWindowAcquireTexture" => {
                 self.object(x[1], "Sync").map_err(invalid)?;
+                let delay = self.window_texture_wait(this);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 let window = self
                     .objects
                     .get_mut(&this)
@@ -3754,6 +3782,7 @@ impl Nvn {
                     .get(&format!("Texture{index}"))
                     .ok_or_else(|| invalid(format!("window texture {index} does not exist")))?
                     .x[0];
+                self.record_window_present(x[1], index as usize);
                 // With a replay thread the present is queued behind the
                 // frame's work, as the console queues it, and the frame is
                 // shown when the replay reaches it; the caller goes on. The
@@ -4593,6 +4622,47 @@ impl Nvn {
     }
 
     /// Whether a queued present has not been shown yet.
+    /// A visible, synchronized window holds queued textures for the guest's
+    /// requested number of display intervals. Other work can continue while
+    /// those textures are owned by the display.
+    fn record_window_present(&mut self, address: u64, index: usize) {
+        if !self.gpu_has_presenter()
+            || crate::settings::get().display.vsync == echora_config::VsyncMode::Off
+        {
+            return;
+        }
+        let window = &self.objects[&address];
+        let interval = window
+            .state
+            .get("PresentInterval")
+            .or(window.builder.get("PresentInterval"))
+            .map_or(1, |value| value.x[0] as i32);
+        if !(1..=5).contains(&interval) {
+            self.window_timing.remove(&address);
+            return;
+        }
+        self.window_timing.entry(address).or_default().present(
+            index,
+            std::time::Instant::now(),
+            interval as u32,
+        );
+    }
+
+    pub(crate) fn window_texture_wait(&self, address: u64) -> std::time::Duration {
+        if crate::window::STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+            return std::time::Duration::ZERO;
+        }
+        self.window_timing
+            .get(&address)
+            .and_then(|timing| {
+                let index = self.objects.get(&address)?.state.get("NextTexture")?.x[0] as usize;
+                timing.releases.get(index).copied().flatten()
+            })
+            .map_or(std::time::Duration::ZERO, |at| {
+                at.saturating_duration_since(std::time::Instant::now())
+            })
+    }
+
     pub fn present_pending(&self) -> bool {
         self.pending
             .values()
@@ -8728,6 +8798,22 @@ mod tests {
             decoded,
             [1, 0, 255, 128, 255, 65, 128, 1, 255, 0, 0, 1, 128, 255]
         );
+    }
+
+    #[test]
+    fn display_textures_are_released_in_present_order() {
+        let mut timing = WindowTiming::default();
+        let now = std::time::Instant::now();
+        let period = std::time::Duration::from_nanos(16_666_667);
+        assert_eq!(timing.releases[0], None);
+        timing.present(0, now, 1);
+        timing.present(1, now, 2);
+        assert_eq!(timing.releases[0], Some(now + period));
+        assert_eq!(timing.releases[1], Some(now + period * 3));
+        assert_eq!(timing.releases[2], None);
+        timing.present(0, now + period * 8, 1);
+        assert_eq!(timing.releases[0], Some(now + period * 9));
+        assert_eq!(timing.releases[1], Some(now + period * 3));
     }
 
     #[test]

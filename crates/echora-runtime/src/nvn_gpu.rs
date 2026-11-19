@@ -4378,6 +4378,13 @@ impl Nvn {
         }
     }
 
+    pub(super) fn gpu_has_presenter(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .and_then(|backend| backend.presenter.as_ref())
+            .is_some_and(Result::is_ok)
+    }
+
     pub(super) fn gpu_present_window(&mut self, texture: u64) -> Result<bool, String> {
         let Some(window) = crate::window::shared() else {
             return Ok(false);

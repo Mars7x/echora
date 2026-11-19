@@ -5693,6 +5693,22 @@ impl Worker {
             _ => None,
         };
         let name = proc_name(&nvn);
+        if name == Some("nvnWindowAcquireTexture") {
+            while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+                let started = std::time::Instant::now();
+                let delay = nvn.window_texture_wait(self.core.cpu.regs[0]);
+                if delay.is_zero() {
+                    break;
+                }
+                drop(nvn);
+                std::thread::sleep(delay);
+                let asked_again = std::time::Instant::now();
+                nvn = shared.lock_nvn();
+                released += asked_again - started;
+                rewaited += asked_again.elapsed();
+            }
+        }
+
         let machine_call = name.is_some_and(locked_nvn_call);
         // With a replay thread, only calls that need the work's results
         // (or change what it reads) finish it first; others go on.
