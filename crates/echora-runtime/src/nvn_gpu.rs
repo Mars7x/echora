@@ -11693,6 +11693,18 @@ mod pool_tests {
         );
         assert_eq!(nvn.handle_sampler(3 << 20).min_filter, vk::Filter::NEAREST);
         assert_eq!(nvn.handle_sampler(3 << 20).max_anisotropy, 2.5);
+        call(&mut nvn, "nvnSamplerFinalize", [sampler, 0, 0, 0], 0.0);
+        assert!(!nvn.holds_object(sampler));
+        assert_eq!(nvn.handle_sampler(3 << 20).min_filter, vk::Filter::NEAREST);
+        assert_eq!(nvn.handle_sampler(3 << 20).max_anisotropy, 2.5);
+        call(
+            &mut nvn,
+            "nvnSamplerInitialize",
+            [sampler, builder, 0, 0],
+            0.0,
+        );
+        assert_eq!(nvn.handle_sampler(3 << 20).min_filter, vk::Filter::NEAREST);
+        assert_eq!(nvn.handle_sampler(3 << 20).max_anisotropy, 2.5);
     }
 
     #[test]

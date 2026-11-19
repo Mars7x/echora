@@ -5194,6 +5194,9 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -
         "nvnSyncWait" => regs[1] != 0,
         "nvnQueueFinish" => true,
         "nvnCommandBufferInitialize" | "nvnCommandBufferFinalize" => false,
+        // The sampler pool already owns the registered sampler settings.
+        // Finalizing the source object leaves these descriptors readable.
+        "nvnSamplerFinalize" => false,
         // A structure made again without being finalized (finalizing waits
         // already, so work queued since cannot name the old object).
         _ if name.ends_with("Initialize") => nvn.holds_object(regs[0]),
