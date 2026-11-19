@@ -136,6 +136,21 @@ impl Presenter {
         if !gpu.swapchain {
             return Err("the device has no swapchain support".into());
         }
+        let (system, create_surface) = match window {
+            WindowHandle::Wayland { .. } => ("Wayland", c"vkCreateWaylandSurfaceKHR"),
+            WindowHandle::Xlib { .. } => ("X11", c"vkCreateXlibSurfaceKHR"),
+            WindowHandle::Win32 { .. } => ("Win32", c"vkCreateWin32SurfaceKHR"),
+        };
+        // SAFETY: the instance is live and the command name is NUL terminated.
+        let available = unsafe {
+            gpu.entry
+                .get_instance_proc_addr(gpu.instance.handle(), create_surface.as_ptr())
+        };
+        if available.is_none() {
+            return Err(format!(
+                "the Vulkan instance cannot create {system} surfaces"
+            ));
+        }
         // SAFETY: the handles name a live window (see WindowHandle).
         let surface = unsafe {
             match window {
