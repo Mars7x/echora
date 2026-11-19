@@ -1802,12 +1802,26 @@ impl Renderer {
     /// The completed deferred reads among `tokens`, by token; other
     /// readers' results stay for them.
     pub fn take_reads(&mut self, tokens: &[u64]) -> HashMap<u64, Vec<u8>> {
-        let tokens: std::collections::HashSet<u64> = tokens.iter().copied().collect();
-        let (mine, others) = std::mem::take(&mut self.completed_reads)
-            .into_iter()
-            .partition(|(token, _)| tokens.contains(token));
-        self.completed_reads = others;
-        mine.into_iter().collect()
+        let (Some(&first), Some(&last)) = (tokens.first(), tokens.last()) else {
+            return HashMap::new();
+        };
+        // Readback batches usually request consecutive tokens.
+        let contiguous = tokens
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
+        let sparse = (!contiguous).then(|| tokens.iter().copied().collect::<FastSet<_>>());
+        let mut reads = HashMap::with_capacity(tokens.len().min(self.completed_reads.len()));
+        self.completed_reads.retain_mut(|(token, bytes)| {
+            let wanted = match &sparse {
+                Some(tokens) => tokens.contains(token),
+                None => (first..=last).contains(token),
+            };
+            if wanted {
+                reads.insert(*token, std::mem::take(bytes));
+            }
+            !wanted
+        });
+        reads
     }
 
     pub(crate) fn ring_read(&self, offset: u64, length: usize) -> Vec<u8> {
@@ -3263,10 +3277,12 @@ impl Renderer {
         }
         // Deferred results leave the ring before its next use overwrites
         // them.
-        for (token, offset, length) in std::mem::take(&mut self.slot.pending_reads) {
+        let mut pending_reads = std::mem::take(&mut self.slot.pending_reads);
+        for (token, offset, length) in pending_reads.drain(..) {
             let bytes = self.ring_read(offset, length);
             self.completed_reads.push((token, bytes));
         }
+        self.slot.pending_reads = pending_reads;
         self.slot.ring_used = 0;
         self.slot.sets_used = 0;
         self.slot.descriptors_used = [0; 4];
@@ -7021,10 +7037,14 @@ mod tests {
             .unwrap();
         renderer.flush().unwrap();
 
-        let reads = renderer.take_reads(&tokens);
+        assert!(renderer.take_reads(&[]).is_empty());
+        let reads = renderer.take_reads(&[tokens[2], tokens[0], tokens[2]]);
+        assert_eq!(reads.len(), 2);
         assert_eq!(reads[&tokens[0]], [0x22; 4]);
-        assert!(reads[&tokens[1]].is_empty());
         assert_eq!(reads[&tokens[2]], [0x11; 4]);
+        let remaining = renderer.take_reads(&[tokens[1]]);
+        assert!(remaining[&tokens[1]].is_empty());
+        assert!(renderer.take_reads(&tokens).is_empty());
         let stats = renderer.take_stats();
         assert_eq!(stats["stat: barriers in read_resident"], 1);
         assert_eq!(stats["stat: barriers in submit_current"], 1);
