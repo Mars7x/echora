@@ -201,6 +201,12 @@ fn log_allocation(caller: &'static std::panic::Location<'static>, size: u64) {
 /// The largest span `import_file` shares: udmabuf's default size limit.
 const MAX_SHARED_SPAN: u64 = 64 << 20;
 #[cfg(target_os = "linux")]
+const SPAN_PACK_INTERVAL: u64 = 2048;
+#[cfg(target_os = "linux")]
+const SPAN_PACK_MIN_IMPORTS: usize = 128;
+#[cfg(target_os = "linux")]
+const SPAN_PACK_MAX_BYTES: u64 = 512 << 20;
+#[cfg(target_os = "linux")]
 const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
 /// Guest memory pinned by shared spans before the least recently used are
 /// dropped.
@@ -469,11 +475,14 @@ pub struct Renderer {
     shared: Vec<((u64, u64), vk::Buffer, vk::DeviceMemory)>,
     /// Shared spans the GPU page table points into (`address_span`): kept
     /// until their file range is released, never evicted while the table
-    /// may use them. Start, span, buffer, memory and device address.
-    addressed: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
+    /// may use them. Start, span, buffer, memory, device address and the
+    /// submission serial at import.
+    addressed: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64, u64)>,
     /// Page-table spans another joined (`address_span`): the table may
     /// still point into them until it is built whole.
-    superseded: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64)>,
+    superseded: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64, u64)>,
+    #[cfg(target_os = "linux")]
+    last_span_pack_serial: u64,
     packed: Vec<PackedSpans>,
     addressed_file: AddressedFile,
     /// A released range dropped a span that held more than it: other pools
@@ -979,6 +988,8 @@ impl Renderer {
             imported: FastMap::default(),
             addressed: Vec::new(),
             superseded: Vec::new(),
+            #[cfg(target_os = "linux")]
+            last_span_pack_serial: 0,
             packed: Vec::new(),
             addressed_file: AddressedFile::Unset,
             dropped_shared_span: false,
@@ -1421,7 +1432,7 @@ impl Renderer {
             .addressed
             .iter()
             .chain(&self.superseded)
-            .map(|&(offset, size, _, _, address)| (address..address + size, offset));
+            .map(|&(offset, size, _, _, address, _)| (address..address + size, offset));
         let packed = self.packed.iter().flat_map(|group| {
             group
                 .ranges
@@ -1446,7 +1457,7 @@ impl Renderer {
             .rev()
             .take_while(|&&(start, ..)| start + MAX_SHARED_SPAN >= offset)
             .chain(&self.superseded)
-            .any(|&(start, size, _, _, address)| {
+            .any(|&(start, size, _, _, address, _)| {
                 offset
                     .checked_sub(start)
                     .is_some_and(|inside| inside + length <= size && address + inside == device)
@@ -3422,7 +3433,7 @@ impl Renderer {
         let after = self
             .addressed
             .partition_point(|(known, ..)| *known <= start);
-        if let Some(&(known, _, buffer, _, _)) = self.addressed[..after]
+        if let Some(&(known, _, buffer, ..)) = self.addressed[..after]
             .iter()
             .rev()
             .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
@@ -3508,7 +3519,7 @@ impl Renderer {
         let after = self
             .addressed
             .partition_point(|(known, ..)| *known <= start);
-        if let Some(&(known, _, _, _, address)) = self.addressed[..after]
+        if let Some(&(known, _, _, _, address, _)) = self.addressed[..after]
             .iter()
             .rev()
             .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
@@ -3572,24 +3583,57 @@ impl Renderer {
             .addressed
             .partition_point(|(known, ..)| *known <= start);
         self.addressed
-            .insert(at, (start, span, buffer, memory, address));
+            .insert(at, (start, span, buffer, memory, address, self.flushes));
         Ok(Some(address + (offset - start)))
     }
 
-    /// Pack stable page-table imports for use when the caller rebuilds its
-    /// table. Unpacked spans keep their original addresses until that rebuild.
+    /// Pack imports when the caller already needs to rebuild the table.
     #[cfg(target_os = "linux")]
     pub fn pack_addressed_spans(&mut self) -> Result<(), String> {
+        self.pack_addressed_spans_before(None).map(|_| ())
+    }
+
+    /// Pack long-lived imports when there are enough to justify rebuilding
+    /// the table. Keep recent imports separate so releasing one of them does
+    /// not force the other ranges in a packed buffer to be mapped again.
+    #[cfg(target_os = "linux")]
+    pub fn compact_page_table_imports(&mut self) -> Result<bool, String> {
+        if self.addressed.len() < SPAN_PACK_MIN_IMPORTS
+            || self.flushes - self.last_span_pack_serial < SPAN_PACK_INTERVAL
+        {
+            return Ok(false);
+        }
+        let cutoff = self.flushes - SPAN_PACK_INTERVAL;
+        let stable = self.addressed.iter().filter(|entry| entry.5 <= cutoff);
+        if stable.take(SPAN_PACK_MIN_IMPORTS).count() < SPAN_PACK_MIN_IMPORTS {
+            return Ok(false);
+        }
+        self.pack_addressed_spans_before(Some(cutoff))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pack_addressed_spans_before(&mut self, cutoff: Option<u64>) -> Result<bool, String> {
         if self.addressed.len() < 64 {
-            return Ok(());
+            return Ok(false);
         }
         let AddressedFile::Single(file) = self.addressed_file else {
-            return Ok(());
+            return Ok(false);
         };
-        // Avoid copying the old table's references just for packing. Run
-        // only when the old table is rebuilt for a separate reason.
-        let old = std::mem::take(&mut self.addressed);
-        self.addressed.reserve(old.len());
+        self.last_span_pack_serial = self.flushes;
+        let mut bytes = 0;
+        let (old, mut kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
+            .into_iter()
+            .partition(|&(_, size, _, _, _, imported)| {
+                if cutoff
+                    .is_none_or(|cutoff| imported <= cutoff && bytes + size <= SPAN_PACK_MAX_BYTES)
+                {
+                    bytes += size;
+                    true
+                } else {
+                    false
+                }
+            });
+        let mut changed = false;
         let mut start = 0;
         while start < old.len() {
             let mut length = 0;
@@ -3625,7 +3669,9 @@ impl Renderer {
                 }
                 Ok(None) => None,
                 Err(error) => {
-                    self.addressed.extend_from_slice(&old[start..]);
+                    kept.extend_from_slice(&old[start..]);
+                    kept.sort_unstable_by_key(|&(offset, ..)| offset);
+                    self.addressed = kept;
                     return Err(error);
                 }
             };
@@ -3634,17 +3680,25 @@ impl Renderer {
                 self.stat("stat: packed DMA imports", 1);
                 self.packed.push(group);
                 self.superseded.extend_from_slice(&old[start..end]);
+                changed = true;
             } else {
-                self.addressed.extend_from_slice(&old[start..end]);
+                kept.extend_from_slice(&old[start..end]);
             }
             start = end;
         }
-        Ok(())
+        kept.sort_unstable_by_key(|&(offset, ..)| offset);
+        self.addressed = kept;
+        Ok(changed)
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn pack_addressed_spans(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn compact_page_table_imports(&mut self) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// How many joined spans wait for the table to be built whole, the
@@ -3660,7 +3714,7 @@ impl Renderer {
     /// go once work recorded so far has finished.
     pub fn take_superseded(&mut self, count: usize) {
         let count = count.min(self.superseded.len());
-        for (_, _, buffer, memory, _) in self.superseded.drain(..count) {
+        for (_, _, buffer, memory, ..) in self.superseded.drain(..count) {
             self.slot.retired_shared.push((buffer, memory));
         }
         self.dropped_shared_span = false;
@@ -3700,7 +3754,7 @@ impl Renderer {
             .into_iter()
             .partition(|(start, span, ..)| *start < end && offset < start + span);
         self.addressed = kept;
-        for (start, span, buffer, memory, _) in gone {
+        for (start, span, buffer, memory, ..) in gone {
             if start < offset || end < start + span {
                 self.dropped_shared_span = true;
             }
@@ -3712,7 +3766,7 @@ impl Renderer {
             .into_iter()
             .partition(|(start, span, ..)| *start < end && offset < start + span);
         self.superseded = kept;
-        for (_, _, buffer, memory, _) in gone {
+        for (_, _, buffer, memory, ..) in gone {
             self.dropped_shared_span = true;
             self.slot.retired_shared.push((buffer, memory));
         }
@@ -6940,7 +6994,7 @@ impl Drop for Renderer {
                 std::mem::take(&mut self.addressed)
                     .into_iter()
                     .chain(std::mem::take(&mut self.superseded))
-                    .map(|(_, _, buffer, memory, _)| (buffer, memory)),
+                    .map(|(_, _, buffer, memory, ..)| (buffer, memory)),
             )
             .chain(
                 std::mem::take(&mut self.packed)

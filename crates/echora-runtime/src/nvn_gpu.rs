@@ -6286,7 +6286,7 @@ impl Nvn {
         // in them, leave entries only a whole build replaces.
         let (mut superseded, superseded_bytes, dropped) =
             self.gpu.as_ref().unwrap().renderer.superseded_spans();
-        let whole = match &previous {
+        let mut whole = match &previous {
             None => Some("stat: page table built whole (first)"),
             Some(built) if built.first != first => Some("stat: page table built whole (extent)"),
             Some(_) if dropped => Some("stat: page table built whole (span dropped)"),
@@ -6295,13 +6295,17 @@ impl Nvn {
             }
             Some(_) => None,
         };
-        if let Some(reason) = whole {
-            let backend = self.gpu.as_mut().unwrap();
-            backend.stat(reason, 1);
-            if !super::debug_var_os("ECHORA_PACK_DMA_SPANS").is_some_and(|value| value == "0") {
+        let backend = self.gpu.as_mut().unwrap();
+        if !super::debug_var_os("ECHORA_PACK_DMA_SPANS").is_some_and(|value| value == "0") {
+            if whole.is_some() {
                 backend.renderer.pack_addressed_spans()?;
-                superseded = backend.renderer.superseded_spans().0;
+            } else if backend.renderer.compact_page_table_imports()? {
+                whole = Some("stat: page table built whole (stable spans packed)");
             }
+        }
+        if let Some(reason) = whole {
+            backend.stat(reason, 1);
+            superseded = backend.renderer.superseded_spans().0;
         }
         let previous = previous.filter(|_| whole.is_none());
         let mut built_pools = HashMap::default();
