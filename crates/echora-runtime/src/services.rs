@@ -6104,13 +6104,14 @@ impl Services {
         self.audio_thread = true;
     }
 
-    /// The renderers, for the audio thread to render without the machine
-    /// lock.
-    pub(crate) fn shared_renderers(&self) -> Vec<SharedRenderer> {
-        self.audio_renderers
-            .iter()
-            .map(|(renderer, _)| renderer.clone())
-            .collect()
+    /// Renderer sessions are appended in ID order. Share newly opened ones
+    /// with the audio thread so it can render without the machine lock.
+    pub(crate) fn refresh_audio_renderers(&self, shared: &mut Vec<SharedRenderer>) {
+        shared.extend(
+            self.audio_renderers[shared.len()..]
+                .iter()
+                .map(|(renderer, _)| renderer.clone()),
+        );
     }
 
     /// After the audio thread rendered frames of renderer `id`: its event
@@ -6127,12 +6128,12 @@ impl Services {
 
     fn play_renderer(&mut self, id: usize) {
         let mut renderer = lock_renderer(&self.audio_renderers[id].0);
-        let renderer = &mut *renderer;
-        let samples = renderer.take_output();
-        if samples.is_empty() || renderer.output_channels == 0 {
+        let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
+        let output = renderer.drain_output();
+        let samples = output.as_slice();
+        if samples.is_empty() || channels == 0 {
             return;
         }
-        let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
         // ECHORA_AUDIO_DUMP=<file> (debugging): the device sink's samples
         // as they were mixed (interleaved 16-bit little endian), appended
         // to the file; `<file>.txt` holds the rate and channel count.
@@ -6169,8 +6170,10 @@ impl Services {
                 })
         });
         if let Some((host, host_channels)) = host {
+            let stereo;
             let samples = if *host_channels == 2 && channels == 6 {
-                downmix_to_stereo(&samples)
+                stereo = downmix_to_stereo(samples);
+                &stereo
             } else {
                 samples
             };

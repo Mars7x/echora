@@ -813,9 +813,9 @@ impl Renderer {
         rendered > 0
     }
 
-    /// The interleaved samples rendered for the device since the last call.
-    pub fn take_output(&mut self) -> Vec<i16> {
-        std::mem::take(&mut self.output)
+    /// Drain the samples rendered for the device, keeping the buffer for the next frame.
+    pub fn drain_output(&mut self) -> std::vec::Drain<'_, i16> {
+        self.output.drain(..)
     }
 
     fn render_frame(&mut self, memory: Option<&dyn Source>) {
@@ -1794,7 +1794,7 @@ mod tests {
         let start = Instant::now();
         renderer.set_started(true, start);
         renderer.advance(start + Duration::from_millis(10), Some(&wave));
-        let output = renderer.take_output();
+        let output = renderer.drain_output().collect();
         (renderer, output)
     }
 
@@ -1823,7 +1823,7 @@ mod tests {
 
         renderer.voices.clear();
         renderer.render_frame(Some(&Wave(Vec::new())));
-        assert_eq!(renderer.take_output(), vec![0; 480]);
+        assert_eq!(renderer.drain_output().as_slice(), &[0; 480]);
     }
 
     #[test]
@@ -1849,7 +1849,7 @@ mod tests {
             voice.pitch = 0.0;
         }
         renderer.render_frame(Some(&Wave(Vec::new())));
-        assert_eq!(renderer.take_output(), vec![0; 480]);
+        assert_eq!(renderer.drain_output().as_slice(), &[0; 480]);
     }
 
     #[test]

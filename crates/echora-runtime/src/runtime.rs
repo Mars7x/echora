@@ -4994,13 +4994,13 @@ fn audio_thread(shared: &Shared) {
     // How long to sleep with nothing due: a renderer made or started
     // meanwhile is picked up within this.
     const IDLE: std::time::Duration = std::time::Duration::from_millis(2);
-    let (mut renderers, view) = {
+    let mut renderers = Vec::new();
+    let mut rendered = Vec::new();
+    let view = {
         let mut machine = shared.lock_machine();
         machine.services.set_audio_thread();
-        (
-            machine.services.shared_renderers(),
-            crate::services::ViewAudio(std::cell::RefCell::new(machine.memory.view())),
-        )
+        machine.services.refresh_audio_renderers(&mut renderers);
+        crate::services::ViewAudio(std::cell::RefCell::new(machine.memory.view()))
     };
     while !shared.stop.load(std::sync::atomic::Ordering::Acquire) {
         let now = std::time::Instant::now();
@@ -5016,20 +5016,20 @@ fn audio_thread(shared: &Shared) {
             }
             None => {
                 std::thread::sleep(IDLE);
-                // Renderers the game opened since.
-                renderers = shared.lock_machine().services.shared_renderers();
+                shared
+                    .lock_machine()
+                    .services
+                    .refresh_audio_renderers(&mut renderers);
                 continue;
             }
         }
         let started = std::time::Instant::now();
-        let rendered: Vec<usize> = renderers
-            .iter()
-            .enumerate()
-            .filter(|(_, renderer)| {
-                crate::services::lock_renderer(renderer).advance(started, Some(&view))
-            })
-            .map(|(id, _)| id)
-            .collect();
+        rendered.clear();
+        rendered.extend(renderers.iter().enumerate().filter_map(|(id, renderer)| {
+            crate::services::lock_renderer(renderer)
+                .advance(started, Some(&view))
+                .then_some(id)
+        }));
         crate::timeline::span(0, "audio", started, std::time::Instant::now());
         if rendered.is_empty() {
             continue;
@@ -5038,12 +5038,10 @@ fn audio_thread(shared: &Shared) {
             let mut machine = shared.lock_machine();
             machine.audio_thread_frames += rendered.len() as u64;
             let mut signaled = false;
-            for id in rendered {
+            for &id in &rendered {
                 signaled |= machine.services.renderer_frames_rendered(id);
             }
-            if machine.services.shared_renderers().len() != renderers.len() {
-                renderers = machine.services.shared_renderers();
-            }
+            machine.services.refresh_audio_renderers(&mut renderers);
             signaled
         };
         if signaled {
