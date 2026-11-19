@@ -13,7 +13,7 @@ when the code for it does.
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with Echora's own Rust shader translator, and the internal render scale is applied; the resolution planner is not connected yet. |
 | 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler, and again on 2026-11-12 with Echora's own shader translator alone. |
 | 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game; it gets past the New Game movie and draws its first 3D scene close to the console's, with a few faults left ([limitations](limitations.md)). The game's audio is mixed and played. |
-| 8. Native resolution | The internal render size is verified at several resolutions. | Not started. |
+| 8. Native resolution | The internal render size is verified at several resolutions. | In progress. Full-opening runs have verified the guest's 1440p output and the 2160p preset. Some scene passes still use lower internal resolutions. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
@@ -27,7 +27,7 @@ when the code for it does.
    (the opening movie already does): reduce the cost of translated code on
    the guest threads that drive simulation and record draws, and reduce
    the time per draw on the Vulkan replay thread.
-2. Correct the water's colour and scaled fog rendering in the first scene
+2. Correct the water's colour and verify the remaining lighting in the first scene
    after the New Game movie. Then carry on to gameplay.
 3. Sound: the remaining audio renderer effects (delay, biquad filter) and
    depop.

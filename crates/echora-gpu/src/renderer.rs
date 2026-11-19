@@ -5487,8 +5487,6 @@ impl Renderer {
         }
         self.transition(from, vk::ImageLayout::GENERAL)?;
         self.transition(to, vk::ImageLayout::GENERAL)?;
-        self.order_target(from)?;
-        self.order_target(to)?;
         let commands = self.commands()?;
         let (source_target, destination_target) = (&self.targets[&from], &self.targets[&to]);
         let bounds = |target: &Target| [0, 0, target.width as i32, target.height as i32];
@@ -5521,14 +5519,56 @@ impl Renderer {
             .src_offsets(corners(source))
             .dst_subresource(layers(destination_target.format))
             .dst_offsets(corners(destination));
-        let filter = if is_depth(source_target.format) || source[2..] == destination[2..] {
+        let filter = if is_depth(source_target.format)
+            || integer_format(source_target.format)
+            || source[2..] == destination[2..]
+        {
             vk::Filter::NEAREST
         } else {
             vk::Filter::LINEAR
         };
+        let barrier = |target: &Target, src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.image)
+                .subresource_range(range(target.format))
+        };
+        let read_write = vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
+        let before = [
+            barrier(
+                source_target,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+            barrier(
+                destination_target,
+                read_write,
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+        ];
+        let after = barrier(
+            destination_target,
+            vk::AccessFlags::TRANSFER_WRITE,
+            read_write,
+        );
         // SAFETY: recording; both images are live and in GENERAL layout.
         unsafe {
-            self.gpu.device.cmd_blit_image(
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &before,
+            );
+            device.cmd_blit_image(
                 commands,
                 source_target.image,
                 vk::ImageLayout::GENERAL,
@@ -5536,8 +5576,18 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 &[region],
                 filter,
-            )
+            );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[after],
+            );
         };
+        self.stat("stat: barriers in copy_target", 2);
         Ok(())
     }
 
@@ -7502,6 +7552,37 @@ mod fit_tests {
 #[cfg(test)]
 mod rescaling_tests {
     use super::*;
+
+    #[test]
+    fn chained_target_copies_see_previous_writes() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        renderer.set_resolution_scale(Scale::new(3, 2).unwrap());
+        renderer.keep_unscaled(8).unwrap();
+        for key in [7, 8, 9] {
+            renderer
+                .target(key, 16, 8, vk::Format::R8G8B8A8_UNORM)
+                .unwrap();
+            let rgba = if key == 7 {
+                [1.0, 0.0, 0.0, 1.0]
+            } else {
+                [0.0, 0.0, 1.0, 1.0]
+            };
+            renderer
+                .clear_color(key, None, vk::ClearColorValue { float32: rgba })
+                .unwrap();
+        }
+
+        let rect = [0, 0, 16, 8];
+        renderer.copy_target(7, rect, 8, rect).unwrap();
+        renderer.copy_target(8, rect, 9, rect).unwrap();
+        renderer.copy_target(9, rect, 7, rect).unwrap();
+        let (pixels, width, height) = renderer.read_target_scaled(7).unwrap();
+        assert_eq!((width, height), (24, 12));
+        assert!(pixels.iter().all(|pixel| *pixel == [1.0, 0.0, 0.0, 1.0]));
+    }
 
     #[test]
     fn descales_a_replaced_attachment_in_command_order() {

@@ -8,8 +8,10 @@ to be missing or incomplete.
 
 - The game gets past the New Game movie into its first 3D scene, which is
   drawn with its ground cover, plants, fireflies, mist, canopy and the Great
-  Deku Tree. Dialogue subtitles render in the opening. The water is too
-  red, and fog can appear clipped in the Great Deku Tree sequence at 2160p.
+  Deku Tree. The opening subtitles render, and full-opening tests at
+  2160p show fog and scenery across the frame after fixes to render-target
+  scaling. The water is too red. Some passes still run at a lower internal
+  resolution, such as the 854×480 fog composite measured in this scene.
   No gameplay has been reached yet. Every unimplemented operation still
   stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
