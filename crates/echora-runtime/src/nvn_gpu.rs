@@ -297,6 +297,26 @@ impl GuestFileIndex {
         Self { generation, spans }
     }
 
+    fn overlapping(&self, guest: std::ops::Range<u64>) -> impl Iterator<Item = SharedRange> + '_ {
+        let after = self.spans.partition_point(|span| span.guest < guest.end);
+        self.spans[..after]
+            .iter()
+            .rev()
+            .take_while(move |span| span.furthest_end > guest.start)
+            .filter_map(move |span| {
+                let first = span.guest.max(guest.start);
+                let last = span.end.min(guest.end);
+                if first >= last {
+                    return None;
+                }
+                Some(SharedRange {
+                    file: span.file,
+                    start: span.offset.checked_add(first - span.guest)?,
+                    end: span.offset.checked_add(last - span.guest)?,
+                })
+            })
+    }
+
     fn range(&self, guest: u64, length: u64) -> Option<SharedRange> {
         let end = guest.checked_add(length)?;
         let after = self.spans.partition_point(|span| span.guest <= guest);
@@ -5974,7 +5994,27 @@ impl Nvn {
         if size == 0 {
             return Ok(());
         }
-        self.resolve_storage(core, Some(guest..guest + size))
+        let range = guest
+            ..guest
+                .checked_add(size)
+                .ok_or("guest draw input overflows")?;
+        let serial = self.gpu.as_ref().and_then(|backend| {
+            if !backend.page_table_writes {
+                return None;
+            }
+            self.shared_guest_index()?
+                .overlapping(range.clone())
+                .map(|span| backend.shared_write_serial(span))
+                .max()
+        });
+        if let Some(serial) = serial {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.renderer.wait_for(serial)?;
+            if backend.renderer.completed_serial() >= backend.page_table_write_serial {
+                backend.page_table_writes = false;
+            }
+        }
+        self.resolve_storage(core, Some(range))
     }
 
     /// A queued consumer sees preceding GPU writes whether or not a
@@ -7890,6 +7930,10 @@ impl Nvn {
     /// The file bytes that back a guest range represented by one known
     /// in-place span. Comparing file offsets covers aliases of those pages.
     fn shared_guest_range(&self, guest: u64, length: u64) -> Option<SharedRange> {
+        self.shared_guest_index()?.range(guest, length)
+    }
+
+    fn shared_guest_index(&self) -> Option<std::cell::RefMut<'_, GuestFileIndex>> {
         let backend = self.gpu.as_ref()?;
         let mut index = backend.shared_guest_index.borrow_mut();
         if index.generation != backend.share_generation {
@@ -7904,7 +7948,7 @@ impl Nvn {
             });
             *index = GuestFileIndex::new(backend.share_generation, whole.chain(pieces));
         }
-        index.range(guest, length)
+        Some(index)
     }
 
     /// Match the bound page table to the guest file before relying on
@@ -12492,6 +12536,51 @@ mod pool_tests {
             assert_eq!(sampler.max_anisotropy, expected);
             assert_eq!(sampler == defaults, expected == 1.0);
         }
+    }
+
+    #[test]
+    fn draw_input_waits_for_overlapping_page_table_writes() {
+        use echora_guest::{cpu::Cpu, memory::Memory};
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let guest = 0x10_0000;
+        backend
+            .shared_pieces
+            .insert(guest, vec![(0, 8, 1, 0), (8, 8, 2, 48)]);
+        backend.share_generation += 1;
+        backend.renderer.resident_buffer(guest, 4096).unwrap();
+        backend
+            .renderer
+            .upload_resident(guest, 0, &[0x42; 16])
+            .unwrap();
+        let serial = backend.renderer.recorded_serial();
+        backend.record_page_table_write(
+            serial,
+            Some(vec![super::SharedRange {
+                file: 2,
+                start: 49,
+                end: 50,
+            }]),
+        );
+
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.resolve_draw_input(&mut core, guest, 9).unwrap();
+        assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() < serial);
+        nvn.resolve_draw_input(&mut core, guest + 6, 5).unwrap();
+        assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() >= serial);
     }
 
     #[test]
