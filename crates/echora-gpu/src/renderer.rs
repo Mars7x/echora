@@ -459,6 +459,8 @@ pub struct Renderer {
     /// The GPU page table (`set_page_table`): its buffer and the entries
     /// written there.
     page_table: Option<(HostBuffer, Vec<u64>)>,
+    /// Buffers from completed submissions, ready for a table of the same size.
+    free_page_tables: Vec<HostBuffer>,
     /// Spans the driver refused to import (file-backed memory, on drivers
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
@@ -624,6 +626,7 @@ struct Slot {
     pending_reads: Vec<(u64, u64, usize)>,
     retired_uploads: Vec<Target>,
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
+    retired_page_tables: Vec<HostBuffer>,
     retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
@@ -677,6 +680,7 @@ impl Slot {
             pending_reads: Vec::new(),
             retired_uploads: Vec::new(),
             retired_texel_buffers: Vec::new(),
+            retired_page_tables: Vec::new(),
             retired_shared: Vec::new(),
             in_flight: false,
             handed: 0,
@@ -979,6 +983,7 @@ impl Renderer {
             addressed_file: AddressedFile::Unset,
             dropped_shared_span: false,
             page_table: None,
+            free_page_tables: Vec::new(),
             import_refused: Default::default(),
             shared: Vec::new(),
             shared_bytes: 0,
@@ -1319,9 +1324,9 @@ impl Renderer {
 
     /// The GPU page table: `entries[i]` is the device address of guest page
     /// `first_page + i` (0: unmapped; see `echora_shader_abi::PageTable`).
-    /// A new buffer only when the entries change (the old one lives until
-    /// the work that may read it has completed); the value is what programs
-    /// get in their push constants.
+    /// A replacement buffer when mappings change (the old one lives until
+    /// the work that may read it has completed). Programs get this value
+    /// in their push constants.
     pub fn set_page_table(
         &mut self,
         first_page: u32,
@@ -1357,31 +1362,40 @@ impl Renderer {
             for (index, (old, new)) in written.chunks_mut(512).zip(entries.chunks(512)).enumerate()
             {
                 if old != new {
-                    let raw: Vec<u8> = new.iter().flat_map(|entry| entry.to_le_bytes()).collect();
-                    buffer.write(index * 512 * 8, &raw);
+                    buffer.write_page_addresses(index * 512 * 8, new);
                     old.copy_from_slice(new);
                 }
             }
             self.stat("stat: page tables extended in place", 1);
         } else if !current {
-            // A new buffer: work recorded or running may still read the old
-            // one, which is freed with this slot's submission (rewriting it
-            // in place waited for all of that work, once per pool shared).
-            if let Some((old, _)) = self.page_table.take() {
-                self.slot
-                    .retired_texel_buffers
-                    .push((old, vk::BufferView::null()));
+            // Finish allocating before retiring the currently published table.
+            let buffer = if self
+                .free_page_tables
+                .last()
+                .is_some_and(|table| table.size == bytes)
+            {
+                self.stat("stat: page table buffers reused", 1);
+                self.free_page_tables.pop().unwrap()
+            } else {
+                let buffer =
+                    self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+                self.stat("stat: page table buffers allocated", 1);
+                for old in self.free_page_tables.drain(..) {
+                    old.destroy(&self.gpu.device);
+                }
+                buffer
+            };
+            buffer.write_page_addresses(0, entries);
+            if let Some((old, mut written)) = self.page_table.take() {
+                // Work already recorded or submitted can still read the
+                // old buffer. The end of this slot orders all those uses.
+                self.slot.retired_page_tables.push(old);
+                written.clear();
+                written.extend_from_slice(entries);
+                self.page_table = Some((buffer, written));
+            } else {
+                self.page_table = Some((buffer, entries.to_vec()));
             }
-            let buffer =
-                self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-            self.page_table = Some((buffer, Vec::new()));
-            let (buffer, written) = self.page_table.as_mut().unwrap();
-            let raw: Vec<u8> = entries
-                .iter()
-                .flat_map(|entry| entry.to_le_bytes())
-                .collect();
-            buffer.write(0, &raw);
-            *written = entries.to_vec();
         }
         let (buffer, _) = self.page_table.as_ref().unwrap();
         Ok(echora_shader_abi::PageTable {
@@ -3267,6 +3281,18 @@ impl Renderer {
         }
         for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
+        }
+        for buffer in self.slot.retired_page_tables.drain(..) {
+            if self.free_page_tables.len() < 2
+                && self
+                    .page_table
+                    .as_ref()
+                    .is_some_and(|(active, _)| active.size == buffer.size)
+            {
+                self.free_page_tables.push(buffer);
+            } else {
+                buffer.destroy(&self.gpu.device);
+            }
         }
         for (buffer, memory) in std::mem::take(&mut self.slot.retired_shared) {
             // SAFETY: the work reading it has completed.
@@ -6793,6 +6819,24 @@ impl HostBuffer {
         };
     }
 
+    fn write_page_addresses(&self, offset: usize, entries: &[u64]) {
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: u64 has no padding, and bytes have alignment 1.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    entries.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(entries),
+                )
+            };
+            self.write(offset, bytes);
+        }
+        #[cfg(target_endian = "big")]
+        for (index, entry) in entries.iter().enumerate() {
+            self.write(offset + index * 8, &entry.to_le_bytes());
+        }
+    }
+
     /// The first `length` bytes as they are now (debugging: work may still
     /// be writing them).
     pub(crate) fn read_bytes(&self, length: usize) -> Vec<u8> {
@@ -6873,6 +6917,14 @@ impl Drop for Renderer {
         }
         if let Some((buffer, _)) = self.page_table.take() {
             buffer.destroy(&self.gpu.device);
+        }
+        for buffer in self.free_page_tables.drain(..) {
+            buffer.destroy(&self.gpu.device);
+        }
+        for slot in std::iter::once(&mut self.slot).chain(&mut self.spares) {
+            for buffer in slot.retired_page_tables.drain(..) {
+                buffer.destroy(&self.gpu.device);
+            }
         }
         for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
             // SAFETY: the flush above finished every use of the buffer.
@@ -7341,7 +7393,7 @@ mod tests {
         if !renderer.gpu.buffer_device_address {
             return;
         }
-        let (_, created) = renderer.resident_buffer(7, 4096).unwrap();
+        let (_, created) = renderer.resident_buffer(7, 8192).unwrap();
         assert!(created);
         let resident = renderer.resident_address(7).unwrap();
         assert_ne!(resident, 0);
@@ -7355,6 +7407,39 @@ mod tests {
             .set_page_table(0x100, &[resident, 0, resident + 4096])
             .unwrap();
         assert_eq!(again, table);
+
+        let extended = renderer
+            .set_page_table(0x100, &[resident, resident + 4096, resident + 4096])
+            .unwrap();
+        assert_eq!(extended, table);
+
+        renderer.commands().unwrap();
+        let replaced = renderer
+            .set_page_table(0x100, &[0, resident, resident + 4096])
+            .unwrap();
+        assert_ne!(replaced.address, table.address);
+        assert!(renderer.free_page_tables.is_empty());
+        assert_eq!(renderer.slot.retired_page_tables.len(), 1);
+
+        renderer.flush().unwrap();
+        let entries = [resident + 4096, 0, resident];
+        let reused = renderer.set_page_table(0x200, &entries).unwrap();
+        assert_eq!(reused.address, table.address);
+        assert_eq!((reused.first_page, reused.page_count), (0x200, 3));
+        assert_eq!(renderer.page_table_entries(), entries);
+        let expected: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        assert_eq!(
+            renderer
+                .page_table
+                .as_ref()
+                .unwrap()
+                .0
+                .read_bytes(expected.len()),
+            expected
+        );
     }
 
     #[test]
