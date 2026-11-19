@@ -463,6 +463,8 @@ pub struct Layout {
     pub stage: Stage,
     /// A graphics program's header.
     pub header: Option<crate::header::Header>,
+    /// Attribute components the preceding stage writes.
+    pub previous_stores: Option<[u64; 8]>,
     pub workgroup: [u32; 3],
     /// Bytes of shared memory, when known.
     pub shared_bytes: Option<u32>,
@@ -546,6 +548,7 @@ impl Layout {
         Self {
             stage: Stage::Compute,
             header: None,
+            previous_stores: None,
             workgroup,
             shared_bytes: None,
             local_bytes: None,
@@ -4097,6 +4100,7 @@ mod tests {
         let layout = Layout {
             stage: Stage::Compute,
             header: None,
+            previous_stores: None,
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x1000),
             local_bytes: Some(0x40),
@@ -4354,6 +4358,7 @@ mod tests {
         let layout = Layout {
             stage: Stage::Compute,
             header: None,
+            previous_stores: None,
             workgroup: [64, 1, 1],
             shared_bytes: Some(0x100),
             local_bytes: None,
@@ -5252,6 +5257,7 @@ mod tests {
         let layout = Layout {
             stage: Stage::Compute,
             header: None,
+            previous_stores: None,
             workgroup: [32, 1, 1],
             shared_bytes: Some(0x2000),
             local_bytes: None,

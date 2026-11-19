@@ -214,6 +214,16 @@ impl Emitter {
         self.value(op::ACCESS_CHAIN, pointer, &[variable, component])
     }
 
+    fn fragment_input_missing(&self, address: u32) -> bool {
+        let word = address as usize / 4;
+        self.stage == Stage::Fragment
+            && (0x80..0x280).contains(&address)
+            && self
+                .layout
+                .previous_stores
+                .is_some_and(|stores| stores[word / 64] & (1 << (word % 64)) == 0)
+    }
+
     /// One word of the attribute space, read.
     fn attribute(
         &mut self,
@@ -222,6 +232,12 @@ impl Emitter {
         centroid: bool,
     ) -> Result<u32, Unsupported> {
         let address = u32::from(address);
+        // The guest reads zero for an unwritten component. Loading it from
+        // a host varying would use an undefined value, even if other
+        // components of the same vector were written.
+        if self.fragment_input_missing(address) {
+            return Ok(self.constant(0));
+        }
         let word = (address / 4) % 4;
         Ok(match (self.stage, address) {
             (Stage::Vertex, 0x80..=0x27f) => {
@@ -422,7 +438,7 @@ impl Emitter {
     /// it: IPA(attr) * rcp(IPA(w))). Vulkan hands over attr already
     /// corrected.
     fn as_interpolated(&mut self, address: u16, value: u32) -> u32 {
-        if !(0x80..0x280).contains(&address) {
+        if !(0x80..0x280).contains(&address) || self.fragment_input_missing(u32::from(address)) {
             return value;
         }
         // As the input is declared (what Vulkan delivered).

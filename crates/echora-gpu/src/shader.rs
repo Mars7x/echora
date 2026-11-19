@@ -120,6 +120,7 @@ pub fn translate_rust_with_compute_constants(
     constants: Option<&[u8]>,
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
+        previous_stores: parameters.previous_stores,
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
         vertex_trace: parameters.vertex_trace,
         ..Default::default()

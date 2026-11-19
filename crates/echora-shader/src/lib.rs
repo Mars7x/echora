@@ -124,6 +124,7 @@ fn translate_with_constants(
             }),
             loop_trace: loop_trace(),
             vertex_trace: options.vertex_trace.unwrap_or_else(vertex_trace),
+            previous_stores: options.previous_stores,
             float64: options.float64,
             denorm_flush_32: options.denorm_flush_32,
             dual_source_blend: options.dual_source_blend,
@@ -163,6 +164,7 @@ fn translate_with_constants(
         mesh: None,
         loop_trace: loop_trace(),
         vertex_trace: false,
+        previous_stores: None,
         float64: options.float64,
         denorm_flush_32: options.denorm_flush_32,
         dual_source_blend: false,
@@ -553,6 +555,61 @@ mod tests {
         );
         assert_eq!(missing(&list, |_| true), Ok(()));
         let _: &[Requirement] = &list;
+    }
+
+    #[test]
+    fn fragment_reads_zero_for_an_unwritten_varying_component() {
+        let parameters = Parameters::default();
+        let mut vertex = header(1, 1, &[]);
+        vertex.extend(bytes(&[
+            // Store generic 5.y, leaving 5.x unwritten.
+            word(&[
+                (0, 12, 0x322),
+                (24, 8, 255),
+                (32, 8, 255),
+                (40, 10, 0xd4),
+                (64, 8, 255),
+            ]),
+            EXIT,
+        ]));
+        let vertex = translate(&vertex, &parameters).unwrap();
+        assert_eq!(vertex.stores[0], 1 << (0xd4 / 4));
+
+        let mut fragment = header(2, 5, &[232, 234, 576, 577]);
+        for (register, address) in [(0, 0xd0), (1, 0xd4)] {
+            fragment.extend(bytes(&[word(&[
+                (0, 12, 0x326),
+                (16, 8, register),
+                (32, 8, 255),
+                (64, 8, address / 4),
+                (78, 2, 1),
+                (81, 3, 7),
+            ])]));
+        }
+        fragment.extend(bytes(&[EXIT]));
+        let options = Options {
+            previous_stores: Some(vertex.stores),
+            ..Options::default()
+        };
+        let translated = translate_with_options(&fragment, &parameters, &options).unwrap();
+        assert_eq!(spirv::tests::validate(&translated.spirv), None);
+        let machine = sim::Machine::new(&translated.spirv);
+        let inputs = sim::Inputs {
+            locations: [(
+                5,
+                vec![
+                    u64::from(f32::NAN.to_bits()),
+                    u64::from(0.75_f32.to_bits()),
+                    0,
+                    0,
+                ],
+            )]
+            .into(),
+            ..sim::Inputs::default()
+        };
+        let report = machine.simulate(&inputs);
+        let colors = machine.located_outputs(&report.invocations[0]);
+        assert_eq!(&colors[&(0, 0)][..2], &[0, u64::from(0.75_f32.to_bits())]);
     }
 
     #[test]
