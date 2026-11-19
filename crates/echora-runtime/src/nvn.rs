@@ -8418,10 +8418,10 @@ impl Image {
 /// - 15, 16: the per-slot increment of texture and sampler descriptor pools
 ///   (slot count times this value sizes the pool). 32 bytes, the hardware
 ///   texture-header and sampler entry size (NVIDIA open-gpu-doc).
-/// - 17, 18: queried next to 15 and 16 when sizing those pools and used as
-///   their alignment: 256 like the other alignments.
-/// - 19, 20: reserved texture and sampler descriptor counts. The host reserves
-///   no descriptors.
+/// - 17, 18: reserved texture and sampler descriptor counts. NVN reserves
+///   the first 256 entries of each pool.
+/// - 19, 20: command and control memory alignments, respectively. The
+///   Switch 2 NVN device reports 4 and 8 bytes.
 /// - 56, 57: the row-pitch alignment of linear textures (57 when the
 ///   texture's render-target usage bits 0x180 are set); the application rounds
 ///   the pitch up to it before setting the stride (main+0x16b9268). 256, a
@@ -8465,9 +8465,10 @@ fn device_integer(property: u32) -> Option<i32> {
         36 | 37 => Some(0),
         56 | 57 => Some(256),
         42 | 90 => Some(0),
-        4 | 10 | 11 | 12 | 13 | 53 | 54 | 111 | 124 | 17 | 18 => Some(256),
+        4 | 10 | 11 | 12 | 13 | 17 | 18 | 53 | 54 | 111 | 124 => Some(256),
         15 | 16 => Some(32),
-        19 | 20 => Some(0),
+        19 => Some(4),
+        20 => Some(8),
         _ => None,
     }
 }
