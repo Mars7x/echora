@@ -472,7 +472,10 @@ pub(crate) struct ZeroHandleReturn {
 /// owned by the runtime; this store only separates parked and returning waits.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ZeroHandleWaits {
+    /// Waits completed explicitly by a signal or cancellation.
     waiting: BTreeMap<u64, WaitRecord>,
+    /// Waits that can complete during the scheduler's wake scan.
+    polled: BTreeMap<u64, WaitRecord>,
     /// Address waiters by (address, thread), with their insertion order.
     arbiter_orders: BTreeMap<(u64, u64), u64>,
     returns: BTreeMap<u64, ZeroHandleReturn>,
@@ -520,12 +523,12 @@ impl ZeroHandleWaits {
                 "zero-handle untimed wait requires a nonzero thread and negative timeout",
             ));
         }
-        if self.waiting.contains_key(&id) || self.returns.contains_key(&id) {
+        if self.is_parked(id) || self.returns.contains_key(&id) {
             return Err(invalid(
                 "thread already has a zero-handle wait or pending return",
             ));
         }
-        if self.waiting.len() + self.returns.len() >= MAX_WAIT_RECORDS {
+        if self.waiting_count() + self.returns.len() >= MAX_WAIT_RECORDS {
             return Err(invalid(
                 "prototype zero-handle wait/return record limit reached",
             ));
@@ -559,10 +562,10 @@ impl ZeroHandleWaits {
                 "condition wait requires a nonzero thread and timeout",
             ));
         }
-        if self.waiting.contains_key(&id) || self.returns.contains_key(&id) {
+        if self.is_parked(id) || self.returns.contains_key(&id) {
             return Err(invalid("thread already has a wait or pending return"));
         }
-        if self.waiting.len() + self.returns.len() >= MAX_WAIT_RECORDS {
+        if self.waiting_count() + self.returns.len() >= MAX_WAIT_RECORDS {
             return Err(invalid("prototype wait/return record limit reached"));
         }
         let order = self.next_condition_order;
@@ -601,10 +604,10 @@ impl ZeroHandleWaits {
                 "address wait requires a nonzero thread and timeout",
             ));
         }
-        if self.waiting.contains_key(&id) || self.returns.contains_key(&id) {
+        if self.is_parked(id) || self.returns.contains_key(&id) {
             return Err(invalid("thread already has a wait or pending return"));
         }
-        if self.waiting.len() + self.returns.len() >= MAX_WAIT_RECORDS {
+        if self.waiting_count() + self.returns.len() >= MAX_WAIT_RECORDS {
             return Err(invalid("prototype wait/return record limit reached"));
         }
         let order = self.next_condition_order;
@@ -635,15 +638,17 @@ impl ZeroHandleWaits {
 
     /// Condition-variable waiters on `key`: (thread, wait, insertion order).
     pub(crate) fn condition_waiters(&self, key: u64) -> Vec<(u64, ConditionWait)> {
-        self.waiting
-            .iter()
+        let mut waiters: Vec<_> = self
+            .waiting_records()
             .filter_map(|(&id, record)| {
                 record
                     .condition
                     .filter(|wait| wait.key == key)
                     .map(|wait| (id, wait))
             })
-            .collect()
+            .collect();
+        waiters.sort_unstable_by_key(|&(id, _)| id);
+        waiters
     }
 
     /// Remove a signaled condition waiter that now waits on its mutex instead.
@@ -653,7 +658,7 @@ impl ZeroHandleWaits {
         &mut self,
         id: u64,
     ) -> Result<Option<std::time::Instant>, Trap> {
-        match self.waiting.get(&id) {
+        match self.waiting_record(id) {
             Some(record) if record.condition.is_some() => {
                 let deadline = record.deadline;
                 self.remove_waiting(id);
@@ -667,7 +672,15 @@ impl ZeroHandleWaits {
 
     /// A parked wait of either kind (the block-boundary parking check).
     pub(crate) fn is_parked(&self, id: u64) -> bool {
-        self.waiting.contains_key(&id)
+        self.polled.contains_key(&id) || self.waiting.contains_key(&id)
+    }
+
+    fn waiting_record(&self, id: u64) -> Option<&WaitRecord> {
+        self.polled.get(&id).or_else(|| self.waiting.get(&id))
+    }
+
+    fn waiting_records(&self) -> impl Iterator<Item = (&u64, &WaitRecord)> {
+        self.waiting.iter().chain(&self.polled)
     }
 
     /// Park a wait on unsignaled objects (and/or a positive timeout).
@@ -683,10 +696,10 @@ impl ZeroHandleWaits {
                 "object wait requires a nonzero thread, a nonzero timeout and a deadline exactly for positive timeouts",
             ));
         }
-        if self.waiting.contains_key(&id) || self.returns.contains_key(&id) {
+        if self.is_parked(id) || self.returns.contains_key(&id) {
             return Err(invalid("thread already has a wait or pending return"));
         }
-        if self.waiting.len() + self.returns.len() >= MAX_WAIT_RECORDS {
+        if self.waiting_count() + self.returns.len() >= MAX_WAIT_RECORDS {
             return Err(invalid("prototype wait/return record limit reached"));
         }
         self.insert_waiting(
@@ -711,22 +724,17 @@ impl ZeroHandleWaits {
         deadline: std::time::Instant,
     ) -> Result<(), Trap> {
         self.begin_objects(id, timeout_ns.max(1), Vec::new(), Some(deadline))?;
-        self.waiting
+        self.polled
             .get_mut(&id)
-            .expect("id is a current waiter")
+            .expect("sleep is a timed wait")
             .sleep = true;
         Ok(())
     }
 
     /// The parked waits a wake scan can complete: those on handles (which
-    /// may now be signaled) or with a deadline. Address and condition
-    /// waits without one end only when signaled (or cancelled), so the scan
-    /// skips them without copying them.
+    /// may now be signaled) or with a deadline.
     pub(crate) fn waiters(&self) -> impl Iterator<Item = (u64, &WaitRecord)> {
-        self.waiting
-            .iter()
-            .filter(|(_, record)| !record.handles.is_empty() || record.deadline.is_some())
-            .map(|(&id, record)| (id, record))
+        self.polled.iter().map(|(&id, record)| (id, record))
     }
 
     fn insert_waiting(&mut self, id: u64, record: WaitRecord) {
@@ -734,12 +742,20 @@ impl ZeroHandleWaits {
         if let Some(wait) = record.arbiter {
             self.arbiter_orders.insert((wait.address, id), wait.order);
         }
-        let previous = self.waiting.insert(id, record);
+        let list = if !record.handles.is_empty() || record.deadline.is_some() {
+            &mut self.polled
+        } else {
+            &mut self.waiting
+        };
+        let previous = list.insert(id, record);
         debug_assert!(previous.is_none());
     }
 
     fn remove_waiting(&mut self, id: u64) -> Option<WaitRecord> {
-        let record = self.waiting.remove(&id)?;
+        let record = self
+            .polled
+            .remove(&id)
+            .or_else(|| self.waiting.remove(&id))?;
         self.timed -= usize::from(record.deadline.is_some());
         if let Some(wait) = record.arbiter {
             self.arbiter_orders.remove(&(wait.address, id));
@@ -756,7 +772,7 @@ impl ZeroHandleWaits {
         if !self.has_deadline() {
             return None;
         }
-        self.waiting
+        self.polled
             .values()
             .filter_map(|record| record.deadline)
             .min()
@@ -787,19 +803,18 @@ impl ZeroHandleWaits {
 
     /// A parked WaitSynchronization (cancellable by CancelSynchronization).
     pub(crate) fn is_waiting(&self, id: u64) -> bool {
-        self.waiting.get(&id).is_some_and(|record| {
+        self.waiting_record(id).is_some_and(|record| {
             record.condition.is_none() && !record.sleep && record.arbiter.is_none()
         })
     }
 
     pub(crate) fn waiting_count(&self) -> usize {
-        self.waiting.len()
+        self.waiting.len() + self.polled.len()
     }
 
     pub(crate) fn cancel(&mut self, id: u64) -> Result<ZeroHandleReturn, Trap> {
         let timeout_ns = self
-            .waiting
-            .get(&id)
+            .waiting_record(id)
             .map(|record| record.timeout_ns)
             .ok_or_else(|| invalid("zero-handle cancellation requires a parked wait"))?;
         if self.returns.contains_key(&id) {
@@ -831,9 +846,10 @@ impl ZeroHandleWaits {
     }
 
     pub(crate) fn report(&self) -> serde_json::Value {
-        let waiting_threads: Vec<_> = self
-            .waiting
-            .iter()
+        let mut records: Vec<_> = self.waiting_records().collect();
+        records.sort_unstable_by_key(|&(&id, _)| id);
+        let waiting_threads: Vec<_> = records
+            .into_iter()
             .map(|(&id, record)| {
                 serde_json::json!({
                     "thread_id":id, "timeout_ns":record.timeout_ns,
@@ -854,7 +870,7 @@ impl ZeroHandleWaits {
         serde_json::json!({
             "model":"zero_handle_untimed_cancellable_waits",
             "record_limit":MAX_WAIT_RECORDS,
-            "waiting_count":self.waiting.len(), "pending_return_count":self.returns.len(),
+            "waiting_count":self.waiting_count(), "pending_return_count":self.returns.len(),
             "retained_object_reference_count":0, "waited_object_count":0,
             "positive_timeout_timers_implemented":true,
             "object_signaling_implemented":true,
@@ -1316,6 +1332,48 @@ mod zero_handle_tests {
         assert_eq!(state.cancel(u64::MAX).unwrap().timeout_ns, i64::MIN);
         assert_eq!(state.cancel(1).unwrap().timeout_ns, -1);
         assert_eq!(state.waiting_count(), 0);
+    }
+
+    #[test]
+    fn wake_scans_keep_only_handle_and_timed_waits_in_thread_order() {
+        let mut state = ZeroHandleWaits::default();
+        let deadline = std::time::Instant::now();
+        state.begin(2, -1).unwrap();
+        state.begin_sleep(4, 1, deadline).unwrap();
+        state.begin_objects(3, -1, vec![10], None).unwrap();
+        state.begin_arbiter(5, -1, None, 0x1000).unwrap();
+        state.begin_arbiter(1, 1, Some(deadline), 0x2000).unwrap();
+        assert!(state.begin_objects(2, -1, vec![12], None).is_err());
+        assert!(state.begin(3, -1).is_err());
+        assert_eq!(
+            state.waiters().map(|(id, _)| id).collect::<Vec<_>>(),
+            [1, 3, 4]
+        );
+        assert_eq!(state.earliest_deadline(), Some(deadline));
+        assert!(state.is_parked(5));
+        assert_eq!(state.waiting_count(), 5);
+        state.complete(4, 0, -1).unwrap();
+        state.cancel(3).unwrap();
+        state.complete(1, 0xea01, -1).unwrap();
+        assert!(state.waiters().next().is_none());
+        assert_eq!(state.earliest_deadline(), None);
+        assert_eq!(state.waiting_count(), 2);
+
+        state
+            .begin_condition(7, -1, None, 0x3000, 0x4000, 11)
+            .unwrap();
+        state
+            .begin_condition(6, 1, Some(deadline), 0x3000, 0x4000, 12)
+            .unwrap();
+        let condition = state.condition_waiters(0x3000);
+        assert_eq!(
+            condition.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [6, 7]
+        );
+        assert!(condition[0].1.order > condition[1].1.order);
+        assert_eq!(state.transfer_condition(6).unwrap(), Some(deadline));
+        assert_eq!(state.transfer_condition(7).unwrap(), None);
+        assert!(state.waiters().next().is_none());
     }
 
     #[test]
