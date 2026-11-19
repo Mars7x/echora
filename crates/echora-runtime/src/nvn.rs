@@ -2405,10 +2405,7 @@ impl Nvn {
         // does not wait for the GPU (the frame's work runs after it), so
         // what the GPU wrote is stored at the next wait instead.
         let resolves = match name {
-            "nvnSyncWait"
-            | "nvnQueueFinish"
-            | "nvnBufferInvalidateMappedRange"
-            | "nvnTextureReadTexels" => true,
+            "nvnSyncWait" | "nvnQueueFinish" | "nvnTextureReadTexels" => true,
             "nvnQueuePresentTexture" => !Self::present_queued_mode(),
             _ => false,
         };
@@ -2418,9 +2415,6 @@ impl Nvn {
                     match name {
                         "nvnSyncWait" => "stat: resolves before nvnSyncWait",
                         "nvnQueueFinish" => "stat: resolves before nvnQueueFinish",
-                        "nvnBufferInvalidateMappedRange" => {
-                            "stat: resolves before nvnBufferInvalidateMappedRange"
-                        }
                         "nvnTextureReadTexels" => "stat: resolves before nvnTextureReadTexels",
                         _ => "stat: resolves before nvnQueuePresentTexture",
                     },
@@ -3513,13 +3507,26 @@ impl Nvn {
                 return Ok(true);
             }
             "nvnBufferInvalidateMappedRange" => {
-                let size = read_shared(&self.registry)
-                    .buffers
-                    .get(&this)
-                    .ok_or_else(|| invalid("Buffer is not initialized".into()))?
-                    .size;
-                if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
-                    return Err(invalid(format!("range {:#x}+{:#x} outside the buffer", x[1], x[2])));
+                let start = {
+                    let registry = read_shared(&self.registry);
+                    let buffer = registry
+                        .buffers
+                        .get(&this)
+                        .ok_or_else(|| invalid("Buffer is not initialized".into()))?;
+                    if x[1].checked_add(x[2]).is_none_or(|end| end > buffer.size) {
+                        return Err(invalid(format!(
+                            "range {:#x}+{:#x} outside the buffer",
+                            x[1], x[2]
+                        )));
+                    }
+                    let pool = registry.pools.get(&buffer.pool).ok_or_else(|| {
+                        invalid(format!("MemoryPool {:#x} is not initialized", buffer.pool))
+                    })?;
+                    pool.storage + buffer.offset + x[1]
+                };
+                if x[2] != 0 {
+                    self.resolve_gpu_written(core, start..start + x[2])
+                        .map_err(invalid)?;
                 }
                 return Ok(true);
             }

@@ -12539,6 +12539,83 @@ mod pool_tests {
     }
 
     #[test]
+    fn invalidating_a_mapped_buffer_reads_its_requested_cached_range() {
+        use crate::nvn::{RegisteredBuffer, RegisteredPool, write_shared};
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        let size = 4096;
+        backend.renderer.resident_buffer(base, size).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 16, &[0x42; 24])
+            .unwrap();
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size,
+                uncached: false,
+                host_visible: false,
+                guest_dirty: Vec::new(),
+                gpu_dirty: std::iter::once(base + 16..base + 40).collect(),
+            },
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        {
+            let mut registry = write_shared(&nvn.registry);
+            registry.pools.insert(
+                1,
+                RegisteredPool {
+                    storage: base,
+                    size,
+                    gpu: 0,
+                    flags: None,
+                    buffers: 1,
+                },
+            );
+            registry.buffers.insert(
+                2,
+                RegisteredBuffer {
+                    pool: 1,
+                    offset: 12,
+                    size: 32,
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "buffer invalidate")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        cpu.regs[..3].copy_from_slice(&[2, 8, 4]);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert!(
+            nvn.call("nvnBufferInvalidateMappedRange", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(guest.memory.read_u32(base + 16).unwrap(), 0);
+        assert_eq!(guest.memory.read_u32(base + 20).unwrap(), 0x4242_4242);
+        assert_eq!(guest.memory.read_u32(base + 24).unwrap(), 0);
+    }
+
+    #[test]
     fn draw_input_waits_for_overlapping_page_table_writes() {
         use echora_guest::{cpu::Cpu, memory::Memory};
 
