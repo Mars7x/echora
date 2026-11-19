@@ -38,9 +38,10 @@ to be missing or incomplete.
   is opt-in from the command line (`ECHORA_AUDIO=1`); the launcher turns it
   on. Depop, the performance counters, and the delay, biquad filter,
   limiter, capture and compressor effects are not implemented yet.
-- Audio output is not resampled, so the device must accept the game's
-  sample rate. Six channels are mixed down to two where the device cannot
-  play six.
+- On Linux, PipeWire handles sample-rate conversion and mixes six channels
+  down to stereo for stereo outputs. Windows playback requires a device
+  that supports the game's sample rate and mixes six channels down to
+  stereo where the device cannot play six.
 - The guest sometimes sets voice gains to zero during the opening. In an
   isolated 2160p Wayland run, the mixer and host recording stayed aligned
   across sampled movie and forest audio. Display-to-speaker synchronization

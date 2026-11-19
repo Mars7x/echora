@@ -20,7 +20,7 @@ crates chosen for each host.
 | `echora-shader-abi` | The types the translator and the runtime share: translation results, descriptors, the push-constant block and `ABI_VERSION`. |
 | `echora-av1` | AV1 header parsing and reference tracking for decoding the movies on the GPU ([av1-decode](av1-decode.md)). |
 | `echora-input` | Gamepads as a Switch controller: evdev on Linux, gilrs on Windows. |
-| `echora-audio` | Plays the game's audio on the default output device through CPAL. |
+| `echora-audio` | Plays the game's audio on the default output device through PipeWire on Linux and CPAL on Windows. |
 | `echora-resolution` | Plans render and output sizes. Not yet connected to the renderer. |
 | `echora-config` | Versioned settings with validation and migration, shared by the launcher and the runtime. |
 | `echora-launcher` | The GPUI launcher: installs the game, edits settings, prepares the translation and starts the game. |
