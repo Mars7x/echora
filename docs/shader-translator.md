@@ -584,7 +584,8 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | FSETP, ISETP | 0x00b, 0x00c in forms 1, 4, 5, 6 | compare 76-79/76-78, outputs 81 and 84, accumulator 87-90, combine 74-75, ISETP signed 73 and `.EX` 72 |
 | S2R | 0x919 | special register 72-79 |
 | BRA | 0x947 | 50-bit byte offset 32-81 (low two bits the convergence mode), condition 87-90 |
-| EXIT, NOP | 0x94d, 0x918 | |
+| EXIT | 0x94d | condition 87-90, combined with the instruction guard |
+| NOP | 0x918 | |
 | BRX, BRXU | 0x949, 0x958 | to the byte offset from the code's start in register 24 (BRXU: a uniform register); blocks start after every unconditional transfer, and the dispatcher selects blocks by their first instruction's index |
 | CALL, RET | 0x944, 0x950 | CALL.REL to its 50-bit offset at 32-81 (the return address put in a register by a MOV before it); RET.REL to the byte offset (from the code's start) in register 24, like BRX. A program ends at an unconditional EXIT or RET that no earlier branch or call reaches past |
 | FSWZADD | 0x822 | a 24, b 64, pattern 32-39: quad lane n (0 upper left, 1 upper right, 2 lower left, 3 lower right) at bits 6 - 2n gives 0 a + b, 1 a - b, 2 b - a, 3 b. The lane order is NAK's SM70 encoding and Mesa codegen's on GM107 and GV100 (NAK's SM50 encoder and yuzu put lane n at bits 2n, which only differs for codes 0 and 3); the codes are codegen's QOP_ADD, QOP_SUB, QOP_SUBR and QOP_MOV2, its GV100 emitter swapping 1 and 2 against SM50, as its fine derivatives (0x66, 0x5a) and manual TXD (ADD and MOV2: 0xcc, 0xf0) use them |

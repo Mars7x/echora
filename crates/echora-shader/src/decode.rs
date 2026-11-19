@@ -830,7 +830,9 @@ pub enum Op {
         mode: u8,
         condition: Pred,
     },
-    Exit,
+    Exit {
+        condition: Pred,
+    },
     /// CALL.REL to `offset` bytes from the next instruction (the return
     /// address is put in a register before it).
     Call {
@@ -1254,7 +1256,11 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 condition: word.pred(87, 90),
             });
         }
-        0x94d => return Some(Op::Exit),
+        0x94d => {
+            return Some(Op::Exit {
+                condition: word.pred(87, 90),
+            });
+        }
         0x944 => {
             let field = word.bits(32, 50);
             return Some(Op::Call {
@@ -2419,7 +2425,23 @@ mod tests {
                 condition: Pred::TRUE
             }
         );
-        assert_eq!(decode(word(&[(0, 12, 0x94d)])).op, Op::Exit);
+        let exit = decode(word(&[(0, 12, 0x94d), (12, 4, 3), (87, 4, 10)]));
+        assert_eq!(
+            exit.guard,
+            Pred {
+                index: 3,
+                negated: false
+            }
+        );
+        assert_eq!(
+            exit.op,
+            Op::Exit {
+                condition: Pred {
+                    index: 2,
+                    negated: true
+                }
+            }
+        );
     }
 
     #[test]

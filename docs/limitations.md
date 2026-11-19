@@ -8,10 +8,10 @@ to be missing or incomplete.
 
 - The game gets past the New Game movie into its first 3D scene, which is
   drawn with its ground cover, plants, fireflies, mist, canopy and the Great
-  Deku Tree. The water is too red, and subtitles and the speaker's name
-  are not drawn (their text textures stay empty). No gameplay has been
-  reached yet. Every
-  unimplemented operation still stops the run with a report.
+  Deku Tree. Dialogue subtitles render in the opening. The water is too
+  red, and fog can appear clipped in the Great Deku Tree sequence at 2160p.
+  No gameplay has been reached yet. Every unimplemented operation still
+  stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the

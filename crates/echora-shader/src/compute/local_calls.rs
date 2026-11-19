@@ -113,12 +113,15 @@ pub(super) fn inline_leaf(code: &[Instruction]) -> Option<Vec<Instruction>> {
     // Relative branches inside the copy still refer to its own
     // instructions. The old routine is no longer reachable.
     let mut result = code.to_vec();
-    result[end].op = Op::Exit;
+    let exit = Op::Exit {
+        condition: Pred::TRUE,
+    };
+    result[end].op = exit;
     if !ends_linear_path(*result.last()?) {
         result.push(Instruction {
             raw: 0,
             guard: Pred::TRUE,
-            op: Op::Exit,
+            op: exit,
             uniform: false,
         });
     }
@@ -143,8 +146,8 @@ fn branch(from: usize, to: usize) -> Op {
 fn ends_linear_path(instruction: Instruction) -> bool {
     instruction.guard.is_true()
         && match instruction.op {
-            Op::Exit | Op::Ret { .. } => true,
-            Op::Bra { condition, .. } => condition.is_true(),
+            Op::Ret { .. } => true,
+            Op::Bra { condition, .. } | Op::Exit { condition } => condition.is_true(),
             _ => false,
         }
 }
@@ -171,7 +174,7 @@ fn may_write(instruction: Instruction, link: Reg) -> Option<bool> {
         | Op::Isetp { .. }
         | Op::Plop3 { .. }
         | Op::Bra { .. }
-        | Op::Exit
+        | Op::Exit { .. }
         | Op::Bssy
         | Op::Bsync
         | Op::Depbar => return Some(false),
@@ -242,8 +245,12 @@ mod tests {
             mov(10, Src::Imm(7 * 16)),
             caller(6, 10),
             branch(7, 9),
-            Op::Exit,
-            Op::Exit,
+            Op::Exit {
+                condition: Pred::TRUE,
+            },
+            Op::Exit {
+                condition: Pred::TRUE,
+            },
             branch(10, 12),
             Op::Iadd3 {
                 d: Reg(0),

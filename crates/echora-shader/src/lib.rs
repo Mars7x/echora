@@ -314,7 +314,12 @@ pub fn program_code(program: &[u8]) -> Result<Vec<Instruction>, Unsupported> {
             }
             // The end: an unconditional EXIT (or a subroutine's RET) that
             // no earlier branch or call reaches past.
-            Op::Exit | Op::Ret { .. } if instruction.guard.is_true() && index >= last_forward => {
+            Op::Exit {
+                condition: decode::Pred::TRUE,
+            }
+            | Op::Ret { .. }
+                if instruction.guard.is_true() && index >= last_forward =>
+            {
                 return Ok(code);
             }
             _ => {}
@@ -350,7 +355,7 @@ mod tests {
     }
     use echora_shader_abi::PUSH_RESOLUTION_SCALE;
 
-    const EXIT: u128 = 0x794d | 0x7000;
+    const EXIT: u128 = 0x794d | 7 << 87;
     const MOV_R1_5: u128 = 0x7802 | (1 << 16) | (5 << 32);
     const NOP: u128 = 0x7918;
 

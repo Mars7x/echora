@@ -4086,7 +4086,7 @@ mod tests {
     use crate::compute::{Layout, translate_with_registers};
     use crate::decode::decode;
 
-    const EXIT: u128 = 0x94d | 7 << 12;
+    const EXIT: u128 = 0x94d | 7 << 12 | 7 << 87;
 
     /// A word with `fields` (bit offset, width, value) set and a PT guard.
     fn word(fields: &[(u32, u32, u128)]) -> u128 {
@@ -4929,6 +4929,33 @@ mod tests {
     const BAR: u128 = 0xb1d | 7 << 12;
 
     #[test]
+    fn exit_checks_the_guard_and_the_embedded_condition() {
+        for guard in [0, 7] {
+            for condition in [1, 9] {
+                let exit = 0x94d | guard << 12 | condition << 87;
+                for a in [0, 1] {
+                    for b in [0, 1] {
+                        let (registers, _) = run(
+                            &[a, b, 1, 0],
+                            &[less(0, 0, 2), less(1, 1, 2), exit, mov(3, 42)],
+                        );
+                        let guard_holds = guard == 7 || a == 0;
+                        let condition_holds = (b == 0) != (condition == 9);
+                        assert_eq!(
+                            registers[&3],
+                            if guard_holds && condition_holds {
+                                0
+                            } else {
+                                42
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn loops_run_their_iterations_and_stop() {
         // R0 = 0, R1 = 10 (the MOVs are instructions 0 and 1).
         // 2: IADD3 R0, R0, 1; 3: BAR; 4: ISETP.LT P0, R0, R1; 5: @P0 BRA 2
@@ -4937,7 +4964,7 @@ mod tests {
         // An EXIT inside the loop: R2 counts, leaving at R2 == 3.
         // 3: IADD3 R2, R2, 1; 4: ISETP.LT P1, R2, R1 (R1 = 3);
         // 5: @!P1 EXIT; 6: IADD3 R0, R0, 1; 7: BRA 3
-        let exit = |guard: u128| (0x94d | 7 << 12) & !(0xf << 12) | guard << 12;
+        let exit = |guard: u128| EXIT & !(0xf << 12) | guard << 12;
         let (r, _) = run(
             &[0, 3, 0],
             &[
@@ -5034,7 +5061,7 @@ mod tests {
             (84, 3, 7),
             (87, 3, 7),
         ]);
-        let exit = (0x94d | 7 << 12) & !(0xf << 12);
+        let exit = EXIT & !(0xf << 12);
         let body = [s2r, at_least, exit, add(2, 2, 1), BAR, add(2, 2, 1), BAR];
         // Invocations 40-63 exit: the second subgroup goes on partly, its
         // exited invocations reaching the barriers and doing nothing else.
@@ -5476,7 +5503,7 @@ mod tests {
             (84, 3, 7),
             (87, 3, 7),
         ]);
-        let exit = (0x94d | 7 << 12) & !(0xf << 12);
+        let exit = EXIT & !(0xf << 12);
         let shuffle = word(&[
             (0, 12, 0x589),
             (16, 8, 2),

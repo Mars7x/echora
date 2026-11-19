@@ -43,7 +43,7 @@ impl JumpTables {
                     entries.insert(index + 1);
                 }
                 Op::Ret { .. } => return None,
-                Op::Exit => {
+                Op::Exit { .. } => {
                     entries.insert(index + 1);
                 }
                 _ => {}

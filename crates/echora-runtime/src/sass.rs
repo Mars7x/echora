@@ -93,7 +93,9 @@ pub fn program_length(code: &[u8]) -> Option<usize> {
         }
         let always = instruction.predicate() == ALWAYS;
         match instruction.opcode() {
-            opcode::EXIT if always && index >= last_forward => {
+            opcode::EXIT
+                if always && instruction.bits(87, 4) == ALWAYS && index >= last_forward =>
+            {
                 if last_call == 0 {
                     return Some(index + 1);
                 }
@@ -142,18 +144,20 @@ mod tests {
     #[test]
     fn program_ends_at_exit_not_jumped_over() {
         let nop = op(0x918, ALWAYS, 0, 0);
-        // A guarded EXIT does not end the program; a branch past the first
-        // unconditional EXIT moves the end to the second.
+        // Both predicates must be PT, and a forward branch can reach past
+        // an EXIT even when it is unconditional.
+        let unconditional_exit = op(opcode::EXIT, ALWAYS, 0, ALWAYS << 23);
         let code = program(&[
-            op(opcode::EXIT, 0, 0, 0),
+            op(opcode::EXIT, 0, 0, ALWAYS << 23),
+            op(opcode::EXIT, ALWAYS, 0, 2 << 23),
             op(opcode::BRA, 0, 32, 0),
-            op(opcode::EXIT, ALWAYS, 0, 0),
+            unconditional_exit,
             nop,
-            op(opcode::EXIT, ALWAYS, 0, 0),
+            unconditional_exit,
             nop,
         ]);
-        assert_eq!(program_length(&code), Some(5));
-        assert_eq!(program_length(&code[..64]), None);
+        assert_eq!(program_length(&code), Some(6));
+        assert_eq!(program_length(&code[..80]), None);
     }
 
     #[test]
@@ -161,7 +165,7 @@ mod tests {
         let nop = op(0x918, ALWAYS, 0, 0);
         let code = program(&[
             op(opcode::CALL, ALWAYS, 16, 0),
-            op(opcode::EXIT, ALWAYS, 0, 0),
+            op(opcode::EXIT, ALWAYS, 0, ALWAYS << 23),
             nop,
             op(opcode::RET, ALWAYS, 0, 0),
             nop,

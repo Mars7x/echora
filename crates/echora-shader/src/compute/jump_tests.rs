@@ -89,7 +89,9 @@ fn program() -> Vec<Instruction> {
             lanes: 15,
         },
         branch(10, 11),
-        Op::Exit,
+        Op::Exit {
+            condition: Pred::TRUE,
+        },
     ]
     .into_iter()
     .map(word)

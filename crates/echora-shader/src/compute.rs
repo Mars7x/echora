@@ -68,7 +68,7 @@ enum End {
     Indirect { target: Src, condition: Guard },
 }
 
-/// An instruction's guard and a branch condition together.
+/// An instruction's guard and its control-flow condition together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Guard {
     guard: Pred,
@@ -131,7 +131,7 @@ fn blocks_for_targets(
                 leaders.insert(target);
                 leaders.insert(index + 1);
             }
-            Op::Exit | Op::Brx { .. } | Op::Ret { .. } => {
+            Op::Exit { .. } | Op::Brx { .. } | Op::Ret { .. } => {
                 leaders.insert(index + 1);
             }
             Op::Call { offset } => {
@@ -165,12 +165,12 @@ fn blocks_for_targets(
                     },
                 )
             }
-            Op::Exit => (
+            Op::Exit { condition } => (
                 next - 1,
                 End::Exit {
                     condition: Guard {
                         guard: last.guard,
-                        extra: Pred::TRUE,
+                        extra: condition,
                     },
                 },
             ),
@@ -3036,7 +3036,11 @@ impl Emitter {
                 enable,
             )?,
             Op::Bssy | Op::Bsync | Op::Depbar | Op::Errbar | Op::Ldgdepbar => {}
-            Op::Bra { .. } | Op::Exit | Op::Brx { .. } | Op::Call { .. } | Op::Ret { .. } => {
+            Op::Bra { .. }
+            | Op::Exit { .. }
+            | Op::Brx { .. }
+            | Op::Call { .. }
+            | Op::Ret { .. } => {
                 return Err(unsupported(index, "control flow inside a block"));
             }
             Op::Unknown { opcode } => {
@@ -3455,7 +3459,7 @@ mod tests {
         raw
     }
 
-    const EXIT: u128 = 0x94d | 7 << 12;
+    const EXIT: u128 = 0x94d | 7 << 12 | 7 << 87;
 
     #[test]
     fn fragment_subgroup_builtins_are_flat() {
@@ -5558,7 +5562,7 @@ mod tests {
                 (87, 3, 7),
             ]),
             bra(4, 2, 0),
-            word(&[(0, 12, 0x94d), (12, 4, 8)]),
+            word(&[(0, 12, 0x94d), (12, 4, 8), (87, 4, 7)]),
             EXIT,
         ];
         let translated = valid(&words);

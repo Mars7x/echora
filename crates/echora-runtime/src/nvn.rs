@@ -8585,6 +8585,10 @@ mod tests {
                 (crate::sass::ALWAYS << 12) | crate::sass::opcode::EXIT,
             )
             .unwrap();
+        guest
+            .memory
+            .write_u32(base + 0x308, crate::sass::ALWAYS << 23)
+            .unwrap();
         let (first, key) = nvn.stage_code(&guest, gpu).unwrap();
 
         nvn.gpu_invalidate(0x5000..0x6000, None);

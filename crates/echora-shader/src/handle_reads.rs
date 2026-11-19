@@ -216,8 +216,10 @@ impl GlobalWrites {
         let mut writes = Vec::new();
         for &instruction in code {
             match instruction.op {
-                Op::Exit if instruction.guard.is_true() => break,
-                Op::Exit => continue,
+                Op::Exit { condition } if condition.is_true() && instruction.guard.is_true() => {
+                    break;
+                }
+                Op::Exit { .. } => continue,
                 Op::Store {
                     space: Space::Global,
                     address,
@@ -936,7 +938,10 @@ mod tests {
             size: 4,
             strong: false,
         });
-        let code = [base, group, local, offset, store, op(Op::Exit)];
+        let exit = op(Op::Exit {
+            condition: Pred::TRUE,
+        });
+        let code = [base, group, local, offset, store, exit];
         let plan = GlobalWrites::compile(&code).unwrap();
         let constant = |_, offset| match offset {
             32 => Some(0x2000),
@@ -998,7 +1003,9 @@ mod tests {
             size: 4,
             strong: false,
         });
-        let exit = op(Op::Exit);
+        let exit = op(Op::Exit {
+            condition: Pred::TRUE,
+        });
         let plan =
             GlobalWrites::compile_uniform_stores(&[base, branch, vote(6), store, exit]).unwrap();
         let constant = |_, offset| match offset {

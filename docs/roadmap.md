@@ -27,7 +27,7 @@ when the code for it does.
    (the opening movie already does): reduce the cost of translated code on
    the guest threads that drive simulation and record draws, and reduce
    the time per draw on the Vulkan replay thread.
-2. Correct the water's colour and restore subtitles in the first scene
+2. Correct the water's colour and scaled fog rendering in the first scene
    after the New Game movie. Then carry on to gameplay.
 3. Sound: the remaining audio renderer effects (delay, biquad filter) and
    depop.
