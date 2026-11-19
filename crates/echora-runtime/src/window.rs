@@ -134,7 +134,7 @@ pub fn shared() -> Option<&'static Shared> {
         let shared: &'static Shared = Box::leak(Box::new(Shared {
             handle: Mutex::new(None),
             size: AtomicU64::new({
-                let (width, height) = window_size();
+                let (width, height) = initial_size();
                 u64::from(width) << 32 | u64::from(height)
             }),
             buttons: AtomicU64::new(0),
@@ -183,7 +183,7 @@ struct App {
 
 /// The window's initial size: ECHORA_WINDOW_SIZE=WIDTHxHEIGHT, else the
 /// render resolution ECHORA_RESOLUTION, else the settings' window size.
-fn window_size() -> (u32, u32) {
+pub(crate) fn initial_size() -> (u32, u32) {
     let size = |name| {
         let value = std::env::var(name).ok()?;
         let (width, height) = value.trim().split_once(['x', 'X'])?;
@@ -196,6 +196,15 @@ fn window_size() -> (u32, u32) {
             let display = &crate::settings::get().display;
             (display.window_width, display.window_height)
         })
+}
+
+/// The configured startup mode, including the fullscreen debug override.
+pub(crate) fn configured_mode() -> WindowMode {
+    match std::env::var_os("ECHORA_FULLSCREEN") {
+        Some(value) if value != "0" => WindowMode::BorderlessFullscreen,
+        Some(_) => WindowMode::Windowed,
+        None => crate::settings::get().display.window_mode,
+    }
 }
 
 impl App {
@@ -245,18 +254,13 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let (width, height) = window_size();
+        let (width, height) = initial_size();
         let mut attributes = Window::default_attributes()
             .with_title("Echora")
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
         // ECHORA_FULLSCREEN=1 overrides the settings' window mode. Exclusive
         // fullscreen uses the monitor's current mode.
-        let mode = match std::env::var_os("ECHORA_FULLSCREEN") {
-            Some(value) if value != "0" => WindowMode::BorderlessFullscreen,
-            Some(_) => WindowMode::Windowed,
-            None => crate::settings::get().display.window_mode,
-        };
-        match mode {
+        match configured_mode() {
             WindowMode::Windowed => {}
             WindowMode::BorderlessFullscreen => {
                 attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));

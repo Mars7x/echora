@@ -34,14 +34,34 @@ const DEFAULT_GUEST_HEIGHT: u32 = 1080;
 
 /// The render scale (numerator, denominator) the settings ask for, if any.
 pub fn render_scale(guest_height: Option<u32>) -> Option<(u32, u32)> {
-    scale_for(&get().display, guest_height.unwrap_or(DEFAULT_GUEST_HEIGHT))
+    let display = &get().display;
+    let output_height = if display.internal_resolution == InternalResolutionSetting::MatchOutput {
+        match crate::window::configured_mode() {
+            WindowMode::Windowed => Some(crate::window::initial_size().1),
+            _ => crate::window::shared().and_then(|window| {
+                window.handle()?;
+                Some(window.size().1).filter(|&height| height != 0)
+            }),
+        }
+    } else {
+        None
+    };
+    scale_for(
+        display,
+        guest_height.unwrap_or(DEFAULT_GUEST_HEIGHT),
+        output_height,
+    )
 }
 
-fn scale_for(display: &echora_config::DisplaySettings, guest_height: u32) -> Option<(u32, u32)> {
+fn scale_for(
+    display: &echora_config::DisplaySettings,
+    guest_height: u32,
+    output_height: Option<u32>,
+) -> Option<(u32, u32)> {
     match display.internal_resolution {
-        // Matching the output is known only for a window of a set size.
-        InternalResolutionSetting::MatchOutput => (display.window_mode == WindowMode::Windowed)
-            .then_some((display.window_height, guest_height)),
+        InternalResolutionSetting::MatchOutput => {
+            output_height.map(|height| (height, guest_height))
+        }
         InternalResolutionSetting::Height { height } => Some((height, guest_height)),
         InternalResolutionSetting::Scale { percent } => Some((percent, 100)),
     }
@@ -66,15 +86,14 @@ mod tests {
     #[test]
     fn render_scale_follows_the_internal_resolution_setting() {
         let mut display = echora_config::DisplaySettings::default();
-        display.window_height = 1440;
-        assert_eq!(scale_for(&display, 1080), Some((1440, 1080)));
-        assert_eq!(scale_for(&display, 1440), Some((1440, 1440)));
-        display.window_mode = WindowMode::BorderlessFullscreen;
-        assert_eq!(scale_for(&display, 1440), None);
+        assert_eq!(scale_for(&display, 1080, Some(1440)), Some((1440, 1080)));
+        assert_eq!(scale_for(&display, 1440, Some(1440)), Some((1440, 1440)));
+        assert_eq!(scale_for(&display, 1440, None), None);
+        assert_eq!(scale_for(&display, 1080, Some(2160)), Some((2160, 1080)));
         display.internal_resolution = InternalResolutionSetting::Height { height: 2160 };
-        assert_eq!(scale_for(&display, 1080), Some((2160, 1080)));
-        assert_eq!(scale_for(&display, 1440), Some((2160, 1440)));
+        assert_eq!(scale_for(&display, 1080, Some(720)), Some((2160, 1080)));
+        assert_eq!(scale_for(&display, 1440, Some(720)), Some((2160, 1440)));
         display.internal_resolution = InternalResolutionSetting::Scale { percent: 150 };
-        assert_eq!(scale_for(&display, 1440), Some((150, 100)));
+        assert_eq!(scale_for(&display, 1440, Some(720)), Some((150, 100)));
     }
 }
