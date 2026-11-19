@@ -163,6 +163,12 @@ pub enum HostEntry {
     /// The streaming zstd reader's call site (`crate::hle`): performed on
     /// the host when it can be, else by the guest decoder it calls.
     ZstdStreamCall,
+    /// A guest bit-zero branch with an add-on that can always take it.
+    AddonBranch {
+        target: u64,
+        test_register: usize,
+        force_taken: bool,
+    },
 }
 
 #[path = "nvn_gpu.rs"]
