@@ -67,7 +67,9 @@ impl Scale {
 
     /// `numerator / denominator`, reduced; None outside 1/2 to 4.
     pub fn new(numerator: u32, denominator: u32) -> Option<Self> {
-        if denominator == 0 || numerator * 2 < denominator || numerator > denominator * 4 {
+        let n = u64::from(numerator);
+        let d = u64::from(denominator);
+        if d == 0 || n * 2 < d || n > d * 4 {
             return None;
         }
         let (mut a, mut b) = (numerator, denominator);
@@ -122,7 +124,7 @@ impl Scale {
     /// A guest extent in image texels.
     pub fn apply(self, value: u32) -> u32 {
         let scaled = u64::from(value) * u64::from(self.numerator) / u64::from(self.denominator);
-        (scaled as u32).max(u32::from(value > 0))
+        (scaled.min(u64::from(u32::MAX)) as u32).max(u32::from(value > 0))
     }
 
     /// A guest coordinate in image texels (rounded down, as the shaders'
@@ -139,7 +141,12 @@ impl Scale {
         let (left, top) = (self.coordinate(x), self.coordinate(y));
         let right = self.coordinate(x.saturating_add(width));
         let bottom = self.coordinate(y.saturating_add(height));
-        [left, top, right - left, bottom - top]
+        [
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ]
     }
 }
 
@@ -7733,6 +7740,17 @@ mod fit_tests {
         assert_eq!(Scale::new(720, 1080).unwrap().apply(1920), 1280);
         assert!(Scale::new(500, 1080).is_none());
         assert!(Scale::new(5000, 1080).is_none());
+        assert_eq!(Scale::new(u32::MAX, u32::MAX), Some(Scale::ONE));
+        assert!(Scale::new(u32::MAX, 1).is_none());
+        assert!(Scale::new(1, u32::MAX).is_none());
+        assert!(Scale::new(0, 0).is_none());
+
+        let fourfold = Scale::new(4, 1).unwrap();
+        assert_eq!(fourfold.apply(u32::MAX / 4 + 1), u32::MAX);
+        assert_eq!(
+            fourfold.rect([-1_000_000_000, 0, 2_000_000_000, 1]),
+            [i32::MIN, 0, i32::MAX, 4]
+        );
     }
 
     #[test]
