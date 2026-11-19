@@ -708,6 +708,8 @@ pub struct Renderer {
     mixers: BTreeMap<usize, BufferMixer>,
     /// The effect slots with signal processing of their own.
     processors: BTreeMap<usize, Effect>,
+    /// Effect placements in mix, processing order, and slot order.
+    effect_order: Vec<(i32, u32, usize)>,
     /// Each splitter's destination ids, in order.
     splitters: BTreeMap<i32, Vec<i32>>,
     destinations: BTreeMap<i32, Destination>,
@@ -741,6 +743,7 @@ impl Renderer {
             voice_input: Vec::new(),
             mixers: BTreeMap::new(),
             processors: BTreeMap::new(),
+            effect_order: Vec::new(),
             splitters: BTreeMap::new(),
             destinations: BTreeMap::new(),
             device: None,
@@ -963,23 +966,25 @@ impl Renderer {
         order.sort_unstable_by(|a, b| b.cmp(a));
         // Revision 3 lengthened the Reverb's pre-delay line.
         let long_pre_delay = (self.parameters.revision >> 24).saturating_sub(u32::from(b'0')) >= 3;
-        for (steps, id) in order {
-            // The mix's own effects, in their processing order.
-            let mut slots: Vec<(u32, usize)> = self
-                .mixers
+        self.effect_order.clear();
+        self.effect_order.extend(
+            self.mixers
                 .iter()
-                .filter(|(_, mixer)| mixer.mix as i32 == id)
-                .map(|(&slot, mixer)| (mixer.order, slot))
+                .map(|(&slot, mixer)| (mixer.mix as i32, mixer.order, slot))
                 .chain(
                     self.processors
                         .iter()
-                        .filter(|(_, effect)| effect.mix as i32 == id)
-                        .map(|(&slot, effect)| (effect.order, slot)),
-                )
-                .collect();
-            slots.sort_unstable();
+                        .map(|(&slot, effect)| (effect.mix as i32, effect.order, slot)),
+                ),
+        );
+        self.effect_order.sort_unstable();
+        for (steps, id) in order {
             if let Some(own) = buffers.get_mut(&id) {
-                for (_, slot) in slots {
+                let first = self.effect_order.partition_point(|&(mix, _, _)| mix < id);
+                let effects = self.effect_order[first..]
+                    .iter()
+                    .take_while(|&&(mix, _, _)| mix == id);
+                for &(_, _, slot) in effects {
                     if let Some(mixer) = self.mixers.get(&slot) {
                         for &(input, output, volume) in &mixer.pairs {
                             if let Ok([source, destination]) = own.get_disjoint_mut([input, output])
@@ -1796,6 +1801,37 @@ mod tests {
         renderer.advance(start + Duration::from_millis(10), Some(&wave));
         let output = renderer.drain_output().collect();
         (renderer, output)
+    }
+
+    #[test]
+    fn buffer_mixer_effects_follow_their_order_and_slot() {
+        let mut renderer = Renderer::new(parameters(1));
+        renderer.mixes.insert(
+            FINAL_MIX,
+            Mix {
+                volume: 1.0,
+                buffers: 4,
+                destination: UNUSED_MIX,
+                splitter: UNUSED_SPLITTER,
+                volumes: Vec::new(),
+            },
+        );
+        renderer.device = Some(vec![3]);
+        // The first two effects sort by processing order despite their
+        // slot numbers. The last two have the same processing order.
+        for (slot, order, input, output) in [(12, 0, 0, 1), (3, 1, 1, 2), (6, 1, 2, 3)] {
+            renderer.mixers.insert(
+                slot,
+                BufferMixer {
+                    mix: FINAL_MIX as u32,
+                    order,
+                    pairs: vec![(input, output, 1.0)],
+                },
+            );
+        }
+        let mut buffers = BTreeMap::from([(FINAL_MIX, vec![vec![19], vec![0], vec![0], vec![0]])]);
+        renderer.mix_down(&mut buffers, 1, &Wave(Vec::new()));
+        assert_eq!(renderer.drain_output().collect::<Vec<_>>(), [19]);
     }
 
     #[test]
