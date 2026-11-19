@@ -29,21 +29,20 @@ pub fn get() -> &'static Settings {
     })
 }
 
-/// Rows of the guest's render targets that the render scale is measured
-/// against (the console's 1080-row output, as the renderer assumes).
-const GUEST_ROWS: u32 = 1080;
+/// Reference height for applications which have not initialized an NVN window.
+const DEFAULT_GUEST_HEIGHT: u32 = 1080;
 
 /// The render scale (numerator, denominator) the settings ask for, if any.
-pub fn render_scale() -> Option<(u32, u32)> {
-    scale_for(&get().display)
+pub fn render_scale(guest_height: Option<u32>) -> Option<(u32, u32)> {
+    scale_for(&get().display, guest_height.unwrap_or(DEFAULT_GUEST_HEIGHT))
 }
 
-fn scale_for(display: &echora_config::DisplaySettings) -> Option<(u32, u32)> {
+fn scale_for(display: &echora_config::DisplaySettings, guest_height: u32) -> Option<(u32, u32)> {
     match display.internal_resolution {
         // Matching the output is known only for a window of a set size.
         InternalResolutionSetting::MatchOutput => (display.window_mode == WindowMode::Windowed)
-            .then_some((display.window_height, GUEST_ROWS)),
-        InternalResolutionSetting::Height { height } => Some((height, GUEST_ROWS)),
+            .then_some((display.window_height, guest_height)),
+        InternalResolutionSetting::Height { height } => Some((height, guest_height)),
         InternalResolutionSetting::Scale { percent } => Some((percent, 100)),
     }
 }
@@ -68,12 +67,14 @@ mod tests {
     fn render_scale_follows_the_internal_resolution_setting() {
         let mut display = echora_config::DisplaySettings::default();
         display.window_height = 1440;
-        assert_eq!(scale_for(&display), Some((1440, 1080)));
+        assert_eq!(scale_for(&display, 1080), Some((1440, 1080)));
+        assert_eq!(scale_for(&display, 1440), Some((1440, 1440)));
         display.window_mode = WindowMode::BorderlessFullscreen;
-        assert_eq!(scale_for(&display), None);
+        assert_eq!(scale_for(&display, 1440), None);
         display.internal_resolution = InternalResolutionSetting::Height { height: 2160 };
-        assert_eq!(scale_for(&display), Some((2160, 1080)));
+        assert_eq!(scale_for(&display, 1080), Some((2160, 1080)));
+        assert_eq!(scale_for(&display, 1440), Some((2160, 1440)));
         display.internal_resolution = InternalResolutionSetting::Scale { percent: 150 };
-        assert_eq!(scale_for(&display), Some((150, 100)));
+        assert_eq!(scale_for(&display, 1440), Some((150, 100)));
     }
 }

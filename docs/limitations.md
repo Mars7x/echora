@@ -94,8 +94,9 @@ to be missing or incomplete.
   guest address reported, instead of raising a recoverable trap.
 - The ported NVN modules still use `unwrap()` after presence checks; the rest
   of the runtime states its invariants or recovers from poisoned locks.
-- The runtime applies window size and mode, internal render scale (measured
-  against an assumed 1080-row guest output), volume and vibration from the
-  settings. `echora-resolution` is not yet connected to the renderer, and
+- The runtime applies window size and mode, internal render scale, volume
+  and vibration from the settings. Absolute resolution uses the first guest
+  window texture's height when available at renderer startup, with a
+  1080-row fallback. `echora-resolution` is not yet connected to the renderer, and
   widening the view (`AspectPolicy::Expand`) would need game-specific camera
   and interface changes.

@@ -22,7 +22,7 @@ use echora_gpu::draw::{
     TextureSource, UploadRegion, VertexAttribute, VertexStream,
 };
 use echora_gpu::present::Presenter;
-use echora_gpu::renderer::Renderer;
+use echora_gpu::renderer::{Renderer, Scale};
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
 use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, StateSnapshots};
@@ -293,9 +293,25 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    fn configure_render_scale(renderer: &mut Renderer, guest_height: Option<u32>) {
+        if Scale::env_override().is_some() {
+            return;
+        }
+        let Some((numerator, denominator)) = crate::settings::render_scale(guest_height) else {
+            return;
+        };
+        let scale = Scale::new(numerator, denominator).unwrap_or_else(|| {
+            eprintln!(
+                "settings: render scale {numerator}/{denominator} is outside 1/2..4; using 1"
+            );
+            Scale::ONE
+        });
+        renderer.set_resolution_scale(scale);
+    }
+
     /// A backend when ECHORA_GPU is set, the recompiler is linked and a
     /// device with shader objects exists.
-    pub fn create() -> Result<Option<Self>, String> {
+    pub fn create(guest_display_height: Option<u32>) -> Result<Option<Self>, String> {
         if super::debug_var_os("ECHORA_GPU").is_none_or(|value| value == "0") {
             return Ok(None);
         }
@@ -314,16 +330,7 @@ impl Backend {
         {
             renderer.set_shader_cache(directory.into());
         }
-        if echora_gpu::renderer::Scale::env_override().is_none()
-            && let Some((numerator, denominator)) = crate::settings::render_scale()
-        {
-            match echora_gpu::renderer::Scale::new(numerator, denominator) {
-                Some(scale) => renderer.set_resolution_scale(scale),
-                None => eprintln!(
-                    "settings: render scale {numerator}/{denominator} is outside 1/2..4; using 1"
-                ),
-            }
-        }
+        Self::configure_render_scale(&mut renderer, guest_display_height);
         Ok(Some(Self {
             max_extent: renderer.max_image_extent(),
             renderer,
@@ -880,6 +887,26 @@ fn blend_op(value: u64) -> vk::BlendOp {
 }
 
 impl Nvn {
+    pub(super) fn record_window_resolution(&mut self, texture: u64) {
+        if self.guest_display_height.is_some() {
+            return;
+        }
+        let Ok((_, height)) = self.texture_extent(texture) else {
+            return;
+        };
+        self.guest_display_height = Some(height);
+        if let Some(backend) = self.gpu.as_mut()
+            && backend.renderer.targets_created == 0
+            && backend.translations.is_empty()
+            && backend.programs.is_empty()
+            && backend.compute_programs.is_empty()
+        {
+            // Device setup can precede window initialization. Until targets
+            // or programs exist, the real guest height can replace the default.
+            Backend::configure_render_scale(&mut backend.renderer, Some(height));
+        }
+    }
+
     /// Restart the GPU statistics ("stat: " notes; ECHORA_PROFILE_FROM).
     pub(crate) fn reset_gpu_stats(&mut self) {
         if let Some(backend) = self.gpu.as_mut() {
@@ -892,7 +919,7 @@ impl Nvn {
     pub(super) fn gpu(&mut self) -> Option<&mut Backend> {
         if !self.gpu_checked {
             self.gpu_checked = true;
-            match Backend::create() {
+            match Backend::create(self.guest_display_height) {
                 Ok(backend) => self.gpu = backend,
                 Err(error) => {
                     // A driver known to hang the GPU ends the run: going
@@ -10945,7 +10972,7 @@ mod target_tests {
 
     #[test]
     fn mip_storage_aliases_require_compatible_formats() {
-        let Ok(Some(backend)) = Backend::create() else {
+        let Ok(Some(backend)) = Backend::create(None) else {
             return;
         };
         let mut nvn = Nvn {
@@ -11047,7 +11074,7 @@ mod pool_tests {
 
     #[test]
     fn mesh_indirect_accepts_a_count_at_the_end_of_a_pool() {
-        let Ok(Some(backend)) = Backend::create() else {
+        let Ok(Some(backend)) = Backend::create(None) else {
             return;
         };
         let pool = 1;
@@ -11104,7 +11131,7 @@ mod pool_tests {
 
     #[test]
     fn observable_marker_leaves_later_writes_in_the_same_submission_pending() {
-        let Ok(Some(mut backend)) = Backend::create() else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         let base = 0x10_0000;
@@ -11186,7 +11213,7 @@ mod pool_tests {
 
     #[test]
     fn texture_storage_index_preserves_flushes_and_named_invalidations() {
-        let Ok(Some(mut backend)) = Backend::create() else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         backend
@@ -11250,7 +11277,7 @@ mod pool_tests {
 
     #[test]
     fn finalizing_a_pool_drops_all_of_its_shared_pieces() {
-        let Ok(Some(mut backend)) = Backend::create() else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         backend.shared_pieces.insert(
@@ -11431,7 +11458,7 @@ mod pool_tests {
 
     #[test]
     fn draw_input_reads_only_overlapping_resident_bytes() {
-        let Ok(Some(mut backend)) = Backend::create() else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         let base = 0x10_0000;
@@ -11481,7 +11508,7 @@ mod pool_tests {
 
     #[test]
     fn texture_copy_sees_an_earlier_page_table_write() {
-        let Ok(Some(mut backend)) = Backend::create() else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         let pool = 1;
@@ -11567,7 +11594,7 @@ mod pool_tests {
 
     #[test]
     fn pool_list_is_reused_only_while_bindings_stay_current() {
-        let Ok(Some(backend)) = Backend::create() else {
+        let Ok(Some(backend)) = Backend::create(None) else {
             return;
         };
         let mut nvn = Nvn {

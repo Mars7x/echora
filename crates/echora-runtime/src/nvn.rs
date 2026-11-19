@@ -474,6 +474,9 @@ pub struct Nvn {
     bags: Bags,
     /// Initialized objects by guest address.
     objects: BTreeMap<u64, Object>,
+    /// Height of the first window's guest output texture for resolution settings.
+    #[serde(skip)]
+    guest_display_height: Option<u32>,
     /// Next free host GPU virtual address for memory pools.
     next_gpu_address: u64,
     /// Bumped when a memory pool is initialized or finalized: the GPU page
@@ -3567,6 +3570,7 @@ impl Nvn {
                     window.state.insert(format!("Texture{index}"), entry);
                 }
                 window.state.insert("NextTexture".into(), Args::default());
+                self.record_window_resolution(pointers[0]);
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -8903,6 +8907,7 @@ mod tests {
             "nvnWindowInitialize",
             &[window, window_builder],
         );
+        assert_eq!(nvn.guest_display_height, Some(2));
         call(
             &mut nvn,
             &mut core,
