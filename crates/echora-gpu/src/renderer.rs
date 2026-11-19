@@ -2450,6 +2450,9 @@ impl Renderer {
                 return Ok(());
             }
         }
+        if has_stencil(*format) {
+            return Err("a depth-stencil upload needs separate depth and stencil planes".into());
+        }
         if texels.is_empty() && !levels.is_empty() {
             return Err(format!(
                 "upload {key:#x}: texels released without a current image"
@@ -2587,7 +2590,7 @@ impl Renderer {
             .map(|region| vk::BufferImageCopy {
                 buffer_offset: offset + region.offset,
                 image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: aspect(*format),
                     mip_level: region.level,
                     base_array_layer: region.layer,
                     layer_count: 1,
@@ -6753,10 +6756,11 @@ impl Renderer {
         // Depth targets cannot be blitted to a color image: their depth
         // aspect is copied as it is and read as (depth, 0, 0, 1).
         if is_depth(format) {
-            if level != 0 || slice != 0 || (full && scaled != (width, height)) {
-                return Err("a depth target reads back at level 0, unscaled".into());
+            if full && !self.targets[&key].scale.is_one() {
+                return Err("depth readback uses the guest resolution".into());
             }
-            let bytes = self.read_target_bytes(key, 4)?;
+            let bytes =
+                self.read_target_plane_bytes(key, level, slice, 4, [0, 0, width, height])?;
             let depth = |bytes: &[u8]| match format {
                 vk::Format::D16_UNORM => {
                     f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0

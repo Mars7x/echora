@@ -3543,11 +3543,19 @@ impl Nvn {
         // noted.
         let limit = self.gpu.as_ref().unwrap().max_extent;
         let beyond_limit = width > limit || height > limit;
-        // Depth textures hold what the GPU rendered; their guest bytes are
-        // not uploaded (the upload path copies color data only).
-        if echora_gpu::renderer::is_depth(vk_format) {
-            return Err(format!("{} texture never rendered to", info.name));
+        // Combined depth and stencil require two separate Vulkan copies.
+        if echora_gpu::renderer::has_stencil(vk_format) {
+            return Err(format!(
+                "{} texture needs separate upload planes",
+                info.name
+            ));
         }
+        // Vulkan buffer offsets for a depth copy are four-byte aligned.
+        let upload_alignment = if echora_gpu::renderer::is_depth(vk_format) {
+            4
+        } else {
+            1
+        };
         let storage = object
             .builder
             .get("Storage")
@@ -3867,7 +3875,9 @@ impl Nvn {
         };
         let upload_bytes = (0..level_count)
             .try_fold(0usize, |total, level| {
-                total.checked_add(layer_bytes(extent_at(level))?.checked_mul(layers as usize)?)
+                let stride =
+                    layer_bytes(extent_at(level))?.checked_next_multiple_of(upload_alignment)?;
+                total.checked_add(stride.checked_mul(layers as usize)?)
             })
             .ok_or("texture upload size overflow")?;
         let mut texels = Vec::new();
@@ -3943,7 +3953,8 @@ impl Nvn {
             let offset = texels.len();
             let length = layer_bytes([level_width, level_height, level_depth])
                 .expect("the size of each mip was checked");
-            texels.resize(offset + length * layers as usize, 0);
+            let upload_stride = length.next_multiple_of(upload_alignment);
+            texels.resize(offset + upload_stride * layers as usize, 0);
             let output = &mut texels[offset..];
             if decode_astc {
                 crate::nvn_format::decode_astc_layers(
@@ -3954,8 +3965,8 @@ impl Nvn {
                 )
                 .map_err(|error| format!("ASTC decode: {error}"))?;
             } else {
-                for (layer, slice) in output.chunks_exact_mut(length).enumerate() {
-                    gather_layer(layer, slice);
+                for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
+                    gather_layer(layer, &mut slice[..length]);
                 }
             }
             let upload = &output[..length];
@@ -3988,7 +3999,7 @@ impl Nvn {
                 width: level_width,
                 height: level_height,
                 depth: level_depth,
-                offset: (offset + layer as usize * length) as u64,
+                offset: (offset + layer as usize * upload_stride) as u64,
             }));
         }
         // Content-keyed: guest writes that change the texels upload again.
@@ -11383,6 +11394,84 @@ mod target_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use echora_guest::{cpu::Cpu, memory::Memory};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn depth_textures_sample_initialized_guest_storage() {
+        use crate::nvn::{Guest, GuestMemory};
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10_0000;
+        let (pool, texture) = (1, 2);
+        let args = |x| crate::nvn::Args {
+            x,
+            ..Default::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        let builder = BTreeMap::from([
+            ("Storage".into(), args([pool, 0, 0, 0])),
+            ("Width".into(), scalar(1)),
+            ("Height".into(), scalar(1)),
+            ("Depth".into(), scalar(2)),
+            ("Target".into(), scalar(4)),
+            ("Format".into(), scalar(50)),
+        ]);
+        let info = crate::nvn_format::info(50).unwrap();
+        let layout = crate::nvn::texture_layout_layers(&builder, info, [1, 1, 1], 2, 1);
+        let bytes = crate::nvn_format::block_linear_size(info, 1, 1, 1, layout, 1).0;
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([
+                ("Storage".into(), args([base, 0x10000, 0, 0])),
+                ("Flags".into(), scalar(0x24)),
+            ]),
+        )
+        .unwrap();
+        nvn.initialize(texture, "Texture", builder).unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x10000, READ | WRITE, STATE_NORMAL, "depth texture")
+            .unwrap();
+        for (layer, value) in [0x4000u16, 0xc000].into_iter().enumerate() {
+            memory
+                .write(base + layer as u64 * bytes / 2, &value.to_le_bytes())
+                .unwrap();
+        }
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let source = nvn.guest_texture(&guest, texture).unwrap();
+        let echora_gpu::draw::TextureSource::Upload { levels, .. } = &source else {
+            panic!("initial depth comes from guest storage");
+        };
+        assert_eq!(
+            levels.iter().map(|level| level.offset).collect::<Vec<_>>(),
+            [0, 4]
+        );
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.texture_view_for(&source).unwrap();
+        for (layer, value) in [0x4000u16, 0xc000].into_iter().enumerate() {
+            let image = renderer
+                .read_upload_slice(texture, 0, layer as u32)
+                .unwrap();
+            assert_eq!(image.len(), 1);
+            assert!((image[0][0] - f32::from(value) / 65535.0).abs() < 1e-5);
+        }
+    }
 
     #[test]
     fn finalized_render_target_stays_visible_through_a_storage_alias() {
