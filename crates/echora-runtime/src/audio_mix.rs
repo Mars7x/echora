@@ -324,6 +324,10 @@ pub fn biquad(samples: &mut [i32], b: [f32; 3], a: [f32; 2], state: &mut BiquadS
 /// Scale `samples` in place from `previous` to `volume` linearly over the
 /// frame (a constant volume when they are equal).
 pub fn volume_ramp(samples: &mut [i32], previous: f32, volume: f32) {
+    if previous == 0.0 && volume == 0.0 {
+        samples.fill(0);
+        return;
+    }
     if samples.is_empty() {
         return;
     }
@@ -564,6 +568,12 @@ mod tests {
         let mut samples = [1000i32; 2];
         volume_ramp(&mut samples, 0.5, 0.5);
         assert_eq!(samples, [500, 500]);
+        let mut samples = [i32::MAX, -1000, i32::MIN];
+        volume_ramp(&mut samples, -0.0, 0.0);
+        assert_eq!(samples, [0, 0, 0]);
+        let mut samples = [1000; 4];
+        volume_ramp(&mut samples, 1.0, 0.0);
+        assert_eq!(samples, [1000, 750, 500, 250]);
         // A biquad with b0 = 1 and nothing else is the identity.
         let mut samples = [3, -4, 5];
         biquad(
