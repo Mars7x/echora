@@ -527,6 +527,76 @@ mod tests {
     }
 
     #[test]
+    fn image_reductions_can_use_device_scope() {
+        use echora_shader::compute::{Layout, translate};
+        use std::sync::Arc;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let word = |fields: &[(u32, u128)]| {
+            echora_shader::decode(
+                fields
+                    .iter()
+                    .fold(7 << 12, |word, &(shift, value)| word | value << shift),
+            )
+        };
+        let mov = |value| word(&[(0, 0x802), (32, value), (72, 15)]);
+        let reduce = word(&[
+            (0, 0x59f),
+            (16, 255),
+            (24, 255),
+            (32, 0),
+            (40, 0x18),
+            (61, 3),
+            (77, 7),
+            (84, 1),
+            (87, 6),
+        ]);
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let shader = translate(
+            &[mov(0x12), reduce, mov(0x20), reduce, exit],
+            &Layout::workgroup([1, 1, 1]),
+        )
+        .unwrap();
+        let image = shader
+            .descriptors
+            .iter()
+            .find(|d| d.kind() == DescriptorKind::Image)
+            .unwrap()
+            .binding;
+        let program = renderer.create_program(vec![Arc::new(shader)]).unwrap();
+        let output = 1;
+        renderer.target(output, 1, 1, vk::Format::R32_UINT).unwrap();
+        renderer
+            .clear_color(output, None, vk::ClearColorValue { uint32: [0; 4] })
+            .unwrap();
+        let dispatch = Dispatch {
+            program: &program,
+            groups: [1, 1, 1],
+            uniforms: HashMap::new(),
+            storage: HashMap::new(),
+            storage_in_place: HashMap::new(),
+            textures: HashMap::new(),
+            images: [(image, (output, 0))].into(),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: Default::default(),
+        };
+        renderer.dispatch(&dispatch).unwrap();
+        assert_eq!(
+            renderer.read_target_bytes(output, 4).unwrap(),
+            0x32u32.to_le_bytes()
+        );
+        renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
     fn a_dispatch_stores_a_uniform_into_a_storage_buffer() {
         let Ok(gpu) = Gpu::new() else {
             return; // No device (CI).

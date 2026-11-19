@@ -415,6 +415,10 @@ impl Gpu {
                 s11.uniform_and_storage_buffer16_bit_access != 0,
             )
             .shader_draw_parameters(s11.shader_draw_parameters != 0);
+        // Guest atomics use device scope. Keep the legacy memory model
+        // on devices without support for Vulkan device scope.
+        let vulkan_device_scope =
+            s12.vulkan_memory_model != 0 && s12.vulkan_memory_model_device_scope != 0;
         let mut enable12 = vk::PhysicalDeviceVulkan12Features::default()
             .storage_buffer8_bit_access(s12.storage_buffer8_bit_access != 0)
             .uniform_and_storage_buffer8_bit_access(s12.uniform_and_storage_buffer8_bit_access != 0)
@@ -443,7 +447,8 @@ impl Gpu {
             .scalar_block_layout(s12.scalar_block_layout != 0)
             .shader_output_viewport_index(s12.shader_output_viewport_index != 0)
             .shader_output_layer(s12.shader_output_layer != 0)
-            .vulkan_memory_model(s12.vulkan_memory_model != 0)
+            .vulkan_memory_model(vulkan_device_scope)
+            .vulkan_memory_model_device_scope(vulkan_device_scope)
             .timeline_semaphore(s12.timeline_semaphore != 0)
             .buffer_device_address(s12.buffer_device_address != 0);
         let mut enable13 = vk::PhysicalDeviceVulkan13Features::default()
