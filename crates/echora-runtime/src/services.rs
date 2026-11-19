@@ -38,6 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_LIVE_HANDLES: usize = 1024;
 const FIRST_SESSION_HANDLE: u32 = 0x200;
 const MAX_READABLE_EVENTS: usize = 1024;
+const MAX_LIBRARY_APPLETS: usize = 64;
+const MAX_APPLET_STORAGES: usize = 4096;
 const SUSPENDED_TICK_EVENT_ID: ReadableEventId = ReadableEventId(1);
 const GPU_ERROR_EVENT_ID: ReadableEventId = ReadableEventId(2);
 const LIFECYCLE_EVENT_ID: ReadableEventId = ReadableEventId(3);
@@ -778,6 +780,15 @@ enum ServiceObject {
 }
 
 impl ServiceObject {
+    fn refers_to_library_resource(&self) -> bool {
+        matches!(
+            self,
+            Self::LibraryAppletAccessor { .. }
+                | Self::LibraryStorage { .. }
+                | Self::LibraryStorageAccessor { .. }
+        )
+    }
+
     fn service(&self) -> &'static str {
         match self {
             Self::ServiceManager { .. } => "sm:",
@@ -905,6 +916,14 @@ impl Session {
             (Self::Domain { objects, .. }, Some(id)) => objects.get(&id),
             _ => None,
         }
+    }
+
+    fn objects(&self) -> impl Iterator<Item = &ServiceObject> {
+        let (single, domain) = match self {
+            Self::Regular { object } => (Some(object), None),
+            Self::Domain { objects, .. } => (None, Some(objects.values())),
+        };
+        single.into_iter().chain(domain.into_iter().flatten())
     }
 
     fn object_mut(&mut self, object_id: Option<u32>) -> Option<&mut ServiceObject> {
@@ -1156,9 +1175,11 @@ pub struct Services {
     /// The last 600 video decoder requests: command and leading argument
     /// bytes (hex); GetFrame (213) and syncpoint waits add what they did.
     video_log: std::collections::VecDeque<String>,
-    /// Library applets and applet storages.
-    library_applets: Vec<LibraryApplet>,
-    applet_storages: Vec<Vec<u8>>,
+    /// Library applets and storages still reachable by live objects.
+    library_applets: BTreeMap<usize, LibraryApplet>,
+    applet_storages: BTreeMap<usize, Vec<u8>>,
+    next_library_applet_id: usize,
+    next_applet_storage_id: usize,
     /// ISelfController GetLibraryAppletLaunchableEvent (9), always signaled.
     library_applet_launchable_event: Option<ReadableEventId>,
     terminate_result: Option<u32>,
@@ -1292,8 +1313,10 @@ impl Default for Services {
             created: std::time::Instant::now(),
             av1_errors: Default::default(),
             video_log: Default::default(),
-            library_applets: Vec::new(),
-            applet_storages: Vec::new(),
+            library_applets: BTreeMap::new(),
+            applet_storages: BTreeMap::new(),
+            next_library_applet_id: 0,
+            next_applet_storage_id: 0,
             library_applet_launchable_event: None,
             terminate_result: None,
             ssl_next_id: 0,
@@ -1979,6 +2002,14 @@ struct LibraryApplet {
     event_170: Option<ReadableEventId>,
 }
 
+impl LibraryApplet {
+    fn events(&self) -> impl Iterator<Item = ReadableEventId> {
+        [self.state_event, self.pop_out_event, self.event_170]
+            .into_iter()
+            .flatten()
+    }
+}
+
 struct Outcome {
     result: Option<u32>,
     log_disposition: Option<String>,
@@ -2317,12 +2348,72 @@ impl Services {
                         self.session_aliases.insert(alias, successor);
                     }
                 }
+            } else if session
+                .objects()
+                .any(ServiceObject::refers_to_library_resource)
+            {
+                self.collect_library_resources();
             }
             return true;
         }
-        self.readable_event_handles.remove(&handle).is_some()
-            || self.shared_memory_handles.remove(&handle).is_some()
+        if let Some(event) = self.readable_event_handles.remove(&handle) {
+            if self
+                .readable_events
+                .get(&event)
+                .is_some_and(|event| event.kind == ReadableEventKind::LibraryApplet)
+            {
+                self.release_library_event(event);
+            }
+            return true;
+        }
+        self.shared_memory_handles.remove(&handle).is_some()
             || self.writable_event_handles.remove(&handle).is_some()
+    }
+
+    fn collect_library_resources(&mut self) {
+        let mut live_applets = BTreeSet::new();
+        let mut live_storages = BTreeSet::new();
+        for object in self.sessions.values().flat_map(Session::objects) {
+            match *object {
+                ServiceObject::LibraryAppletAccessor { id } => {
+                    live_applets.insert(id);
+                }
+                ServiceObject::LibraryStorage { id }
+                | ServiceObject::LibraryStorageAccessor { id } => {
+                    live_storages.insert(id);
+                }
+                _ => {}
+            }
+        }
+        // An applet keeps pushed input and queued output even if the
+        // application closes its own storage or accessor.
+        let mut released_events = Vec::new();
+        self.library_applets.retain(|id, applet| {
+            if live_applets.contains(id) {
+                live_storages.extend(applet.in_data.iter().chain(&applet.out_data).copied());
+                true
+            } else {
+                released_events.extend(applet.events());
+                false
+            }
+        });
+        self.applet_storages
+            .retain(|id, _| live_storages.contains(id));
+        for event in released_events {
+            self.release_library_event(event);
+        }
+    }
+
+    fn release_library_event(&mut self, event: ReadableEventId) {
+        if self.library_applet_launchable_event != Some(event)
+            && !self.readable_event_handles.values().any(|id| *id == event)
+            && !self
+                .library_applets
+                .values()
+                .any(|applet| applet.events().any(|id| id == event))
+        {
+            self.readable_events.remove(&event);
+        }
     }
 
     /// SignalEvent: only the writable side may signal. `None` is not a
@@ -4426,6 +4517,29 @@ impl Services {
         ))
     }
 
+    fn library_applet_state(&self, id: usize) -> Result<&LibraryApplet, Trap> {
+        self.library_applets
+            .get(&id)
+            .ok_or_else(|| invalid("library applet state is missing"))
+    }
+
+    fn library_applet_state_mut(&mut self, id: usize) -> Result<&mut LibraryApplet, Trap> {
+        self.library_applets
+            .get_mut(&id)
+            .ok_or_else(|| invalid("library applet state is missing"))
+    }
+
+    fn next_applet_storage(&self) -> Result<(usize, usize), Trap> {
+        if self.applet_storages.len() >= MAX_APPLET_STORAGES {
+            return Err(invalid("library storage capacity exhausted"));
+        }
+        let id = self.next_applet_storage_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| invalid("library storage ID range exhausted"))?;
+        Ok((id, next))
+    }
+
     /// Library applets (Switchbrew "Applet Manager services"): the creator,
     /// ILibraryAppletAccessor, IStorage and IStorageAccessor. Applets run
     /// on the host: the controller applet completes as soon as it starts,
@@ -4451,23 +4565,33 @@ impl Services {
                     mode: crate::bytes::le_u32(&arguments[4..8]),
                     ..LibraryApplet::default()
                 };
-                if self.library_applets.len() >= 64 {
+                if self.library_applets.len() >= MAX_LIBRARY_APPLETS {
                     return Err(invalid("library applet capacity exhausted"));
                 }
-                let id = self.library_applets.len();
-                self.library_applets.push(applet);
-                self.reply_new_object(call, ServiceObject::LibraryAppletAccessor { id }, 0)
+                let id = self.next_library_applet_id;
+                let next = id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("library applet ID range exhausted"))?;
+                let outcome =
+                    self.reply_new_object(call, ServiceObject::LibraryAppletAccessor { id }, 0)?;
+                self.library_applets.insert(id, applet);
+                self.next_library_applet_id = next;
+                Ok(outcome)
             }
             // CreateStorage (10): s64 size -> IStorage of that many zeros.
             (ServiceObject::LibraryAppletCreator { .. }, 10) => {
                 call.shape(8, false, false)?;
                 let size = crate::bytes::le_u64(&call.request.arguments[..8]);
-                if size > 0x100_0000 || self.applet_storages.len() >= 4096 {
+                if size > 0x100_0000 || self.applet_storages.len() >= MAX_APPLET_STORAGES {
                     return Err(call.unsupported(service, format!("storage of {size:#x} bytes")));
                 }
-                let id = self.applet_storages.len();
-                self.applet_storages.push(vec![0; size as usize]);
-                self.reply_new_object(call, ServiceObject::LibraryStorage { id }, 0)
+                let (id, next) = self.next_applet_storage()?;
+                let bytes = vec![0; size as usize];
+                let outcome =
+                    self.reply_new_object(call, ServiceObject::LibraryStorage { id }, 0)?;
+                self.applet_storages.insert(id, bytes);
+                self.next_applet_storage_id = next;
+                Ok(outcome)
             }
             // IStorage Open (0) -> IStorageAccessor.
             (ServiceObject::LibraryStorage { id }, 0) => {
@@ -4479,7 +4603,11 @@ impl Services {
             // input buffer); Read (11: s64 offset, output buffer).
             (ServiceObject::LibraryStorageAccessor { id }, 0) => {
                 call.shape(0, false, false)?;
-                let size = self.applet_storages[*id].len() as u64;
+                let size = self
+                    .applet_storages
+                    .get(id)
+                    .ok_or_else(|| invalid("library storage is missing"))?
+                    .len() as u64;
                 reply_u64(call, size)?;
                 Ok(Outcome::success())
             }
@@ -4500,7 +4628,10 @@ impl Services {
                 } else {
                     call.output_buffer()?
                 };
-                let storage = &mut self.applet_storages[*id];
+                let storage = self
+                    .applet_storages
+                    .get_mut(id)
+                    .ok_or_else(|| invalid("library storage is missing"))?;
                 let end = offset
                     .checked_add(size as usize)
                     .filter(|end| *end <= storage.len());
@@ -4521,10 +4652,10 @@ impl Services {
             (ServiceObject::LibraryAppletAccessor { id }, 0) => {
                 call.shape(0, false, false)?;
                 let id = *id;
-                let applet = &self.library_applets[id];
+                let applet = self.library_applet_state(id)?;
                 let (event, outcome) =
                     self.reply_applet_event(call, applet.state_event, applet.completed)?;
-                self.library_applets[id].state_event = Some(event);
+                self.library_applet_state_mut(id)?.state_event = Some(event);
                 Ok(outcome)
             }
             // 170 ([22.0.0+], unnamed): no input; a copied event the SDK
@@ -4534,9 +4665,9 @@ impl Services {
             (ServiceObject::LibraryAppletAccessor { id }, 170) => {
                 call.shape(0, false, false)?;
                 let id = *id;
-                let slot = self.library_applets[id].event_170;
+                let slot = self.library_applet_state(id)?.event_170;
                 let (event, outcome) = self.reply_applet_event(call, slot, false)?;
-                self.library_applets[id].event_170 = Some(event);
+                self.library_applet_state_mut(id)?.event_170 = Some(event);
                 self.provisional_commands
                     .insert("appletOE:library_applet_accessor:170");
                 Ok(outcome)
@@ -4544,7 +4675,7 @@ impl Services {
             // IsCompleted (1) -> u8.
             (ServiceObject::LibraryAppletAccessor { id }, 1) => {
                 call.shape(0, false, false)?;
-                let completed = u32::from(self.library_applets[*id].completed);
+                let completed = u32::from(self.library_applet_state(*id)?.completed);
                 call.reply(0, None, 0, &completed.to_le_bytes())?;
                 Ok(Outcome::success())
             }
@@ -4556,7 +4687,7 @@ impl Services {
                 let id = *id;
                 // The low byte is the AppletId; OoT's controller applet is
                 // 0x0100000c (the high byte's meaning is not known).
-                let output = match self.library_applets[id].applet_id & 0xff {
+                let output = match self.library_applet_state(id)?.applet_id & 0xff {
                     LIBRARY_APPLET_CONTROLLER => {
                         // ControllerSupportResultInfo (yuzu applet_controller.h):
                         // s8 player count, 3 pad bytes, u32 selected npad id,
@@ -4572,9 +4703,11 @@ impl Services {
                         ));
                     }
                 };
-                let storage = self.applet_storages.len();
-                self.applet_storages.push(output);
-                let applet = &mut self.library_applets[id];
+                let (storage, next) = self.next_applet_storage()?;
+                call.reply(0, None, 0, &[])?;
+                self.applet_storages.insert(storage, output);
+                self.next_applet_storage_id = next;
+                let applet = self.library_applet_state_mut(id)?;
                 applet.started = true;
                 applet.completed = true;
                 applet.out_data.push_back(storage);
@@ -4586,7 +4719,6 @@ impl Services {
                         event.signaled = true;
                     }
                 }
-                call.reply(0, None, 0, &[])?;
                 Ok(Outcome::success())
             }
             // RequestExit (20) / Terminate (25): the applet has ended.
@@ -4599,7 +4731,7 @@ impl Services {
                         format!("applet command ({})", call.request.describe()),
                     ));
                 }
-                let applet = &mut self.library_applets[*id];
+                let applet = self.library_applet_state_mut(*id)?;
                 if matches!(command, 20 | 25) {
                     applet.completed = true;
                 }
@@ -4626,20 +4758,24 @@ impl Services {
                         format!("PushInData ({})", call.request.describe()),
                     ));
                 };
-                self.library_applets[id].in_data.push(storage);
                 call.reply(0, None, 0, &[])?;
+                self.library_applet_state_mut(id)?.in_data.push(storage);
                 Ok(Outcome::success())
             }
             // PopOutData (101) -> IStorage, or am ResultNoDataInChannel
             // (module 128, description 2) when empty.
             (ServiceObject::LibraryAppletAccessor { id }, 101) => {
                 call.shape(0, false, false)?;
-                match self.library_applets[*id].out_data.pop_front() {
-                    Some(storage) => self.reply_new_object(
-                        call,
-                        ServiceObject::LibraryStorage { id: storage },
-                        0,
-                    ),
+                match self.library_applet_state(*id)?.out_data.front().copied() {
+                    Some(storage) => {
+                        let outcome = self.reply_new_object(
+                            call,
+                            ServiceObject::LibraryStorage { id: storage },
+                            0,
+                        )?;
+                        self.library_applet_state_mut(*id)?.out_data.pop_front();
+                        Ok(outcome)
+                    }
                     None => {
                         call.reply(0x480, None, 0, &[])?;
                         Ok(Outcome::result(0x480))
@@ -4650,11 +4786,11 @@ impl Services {
             (ServiceObject::LibraryAppletAccessor { id }, 105) => {
                 call.shape(0, false, false)?;
                 let id = *id;
-                let applet = &self.library_applets[id];
+                let applet = self.library_applet_state(id)?;
                 let pending = !applet.out_data.is_empty();
                 let (event, outcome) =
                     self.reply_applet_event(call, applet.pop_out_event, pending)?;
-                self.library_applets[id].pop_out_event = Some(event);
+                self.library_applet_state_mut(id)?.pop_out_event = Some(event);
                 Ok(outcome)
             }
             _ => Err(call.unsupported(
@@ -9249,11 +9385,16 @@ impl Services {
         };
         // Primary SF UnregisterObject ignores missing IDs and treats root and
         // child entries alike. The wrapper/session and sibling objects survive.
-        objects.remove(&id);
+        let released_library_resource = objects
+            .remove(&id)
+            .is_some_and(|object| object.refers_to_library_resource());
         let reply = ipc::build_domain_close_reply(call.request, call.original_bytes)
             .map_err(|error| invalid(format!("build domain close reply: {error:#}")))?;
         call.write_reply(&reply)?;
         self.sessions.insert(call.handle, updated);
+        if released_library_resource {
+            self.collect_library_resources();
+        }
         Ok(Outcome {
             result: None,
             log_disposition: None,
@@ -9423,7 +9564,9 @@ impl Services {
             "decoder_image_pool_requests":self.decoder_image_pool_requests,
             "refused_video_submissions":self.refused_video_submissions,
             "empty_frame_requests":self.empty_frame_requests,
-            "library_applets":self.library_applets,
+            "library_applets":self.library_applets.values().collect::<Vec<_>>(),
+            "library_applets_created":self.next_library_applet_id,
+            "applet_storages_live":self.applet_storages.len(),
             "audio_renderers":self.audio_renderers.iter().map(|(renderer, _)| lock_renderer(renderer).report()).collect::<Vec<_>>(),
             "terminate_result":self.terminate_result,
             "data_storage_reads":self.data_storage_reads,
@@ -10565,6 +10708,152 @@ mod tests {
 
     fn self_controller_fixture(domain: bool) -> (Services, Memory, u32, Option<u32>) {
         application_child_fixture(domain, 1)
+    }
+
+    #[test]
+    fn closing_domain_applets_releases_their_resources() {
+        let (mut services, mut memory, creator, target) = application_child_fixture(true, 11);
+        let root = target.unwrap();
+        let mut create = [0; 16];
+        create[..4].copy_from_slice(&LIBRARY_APPLET_CONTROLLER.to_le_bytes());
+        for _ in 0..72 {
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(root, 3, &create, false, &[]),
+            )
+            .unwrap();
+            let applet = memory.read_u32(0x1030).unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(root, 10, &32u64.to_le_bytes(), false, &[]),
+            )
+            .unwrap();
+            let input = memory.read_u32(0x1030).unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(applet, 100, &[], false, &[input]),
+            )
+            .unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_close_packet(input),
+            )
+            .unwrap();
+            assert_eq!(services.applet_storages.len(), 1);
+
+            let event = copy_event_reply(
+                &mut services,
+                &mut memory,
+                creator,
+                Some(applet),
+                0,
+                0,
+                "appletOE:library_applet_accessor",
+            );
+            let event_id = services.readable_event_handles[&event];
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(applet, 90, &[0; 32], false, &[]),
+            )
+            .unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(applet, 101, &[], false, &[]),
+            )
+            .unwrap();
+            let output = memory.read_u32(0x1030).unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_close_packet(applet),
+            )
+            .unwrap();
+            assert_eq!(services.readable_event_signaled(event).unwrap(), Some(true));
+            assert!(services.close(event));
+            assert!(!services.readable_events.contains_key(&event_id));
+
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(output, 0, &[], false, &[]),
+            )
+            .unwrap();
+            let accessor = memory.read_u32(0x1030).unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_close_packet(output),
+            )
+            .unwrap();
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_packet(accessor, 0, &[], false, &[]),
+            )
+            .unwrap();
+            assert_eq!(memory.read_u64(0x1030).unwrap(), 12);
+            transact(
+                &mut services,
+                &mut memory,
+                creator,
+                &domain_close_packet(accessor),
+            )
+            .unwrap();
+        }
+        assert!(services.library_applets.is_empty());
+        assert!(services.applet_storages.is_empty());
+    }
+
+    #[test]
+    fn library_applet_survives_cloning_and_releases_unclaimed_output_on_close() {
+        let (mut services, mut memory, creator, _) = application_child_fixture(false, 11);
+        let mut create = [0; 8];
+        create[..4].copy_from_slice(&LIBRARY_APPLET_CONTROLLER.to_le_bytes());
+        transact(
+            &mut services,
+            &mut memory,
+            creator,
+            &cmif_packet(4, 0, &create, false),
+        )
+        .unwrap();
+        let applet = memory.read_u32(0x100c).unwrap();
+        transact(
+            &mut services,
+            &mut memory,
+            applet,
+            &cmif_packet(5, 2, &[], false),
+        )
+        .unwrap();
+        let alias = memory.read_u32(0x100c).unwrap();
+        assert!(services.close(applet));
+        assert_eq!(services.library_applets.len(), 1);
+        transact(
+            &mut services,
+            &mut memory,
+            alias,
+            &cmif_packet(4, 10, &[], false),
+        )
+        .unwrap();
+        assert_eq!(services.applet_storages.len(), 1);
+        assert!(services.close(alias));
+        assert!(services.library_applets.is_empty());
+        assert!(services.applet_storages.is_empty());
     }
 
     fn copy_suspended_tick_event(
