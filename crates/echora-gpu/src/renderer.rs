@@ -4203,6 +4203,30 @@ impl Renderer {
         self.shaped_target(key, width, height, shape, format, levels)
     }
 
+    /// Create a storage image at the guest's extent so that shader writes
+    /// address the guest's texels. A retained image keeps its contents.
+    pub fn guest_sized_target(
+        &mut self,
+        key: u64,
+        width: u32,
+        height: u32,
+        shape: crate::draw::ImageShape,
+        format: vk::Format,
+        levels: u32,
+    ) -> Result<(), String> {
+        if !self.targets.contains_key(&key) {
+            self.pending_unscaled.insert(key);
+        }
+        let scaled = !self
+            .shaped_target(key, width, height, shape, format, levels)?
+            .scale
+            .is_one();
+        if scaled {
+            self.keep_unscaled(key)?;
+        }
+        Ok(())
+    }
+
     /// The target for guest texture `key` as a `shape` image: a 3D one for
     /// volumes compute passes write (colour lookup tables).
     pub fn shaped_target(
@@ -8101,6 +8125,47 @@ mod fit_tests {
 #[cfg(test)]
 mod rescaling_tests {
     use super::*;
+
+    #[test]
+    fn storage_targets_keep_the_guest_extent() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let shape = ImageShape::D2 { layers: 1 };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        renderer.set_resolution_scale(Scale::new(2, 1).unwrap());
+
+        renderer
+            .guest_sized_target(7, 16, 8, shape, format, 1)
+            .unwrap();
+        assert_eq!(renderer.targets[&7].extent(0), (16, 8));
+        assert_eq!(renderer.descaled, 0);
+
+        renderer.shaped_target(8, 16, 8, shape, format, 1).unwrap();
+        assert_eq!(renderer.targets[&8].extent(0), (32, 16));
+        renderer
+            .clear_color(
+                8,
+                None,
+                vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .unwrap();
+        renderer
+            .guest_sized_target(8, 16, 8, shape, format, 1)
+            .unwrap();
+        assert_eq!(renderer.targets[&8].extent(0), (16, 8));
+        assert_eq!(renderer.descaled, 1);
+        let pixels = renderer.read_target_bytes(8, 4).unwrap();
+        assert_eq!(pixels.len(), 16 * 8 * 4);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|texel| texel == [255, 0, 0, 255])
+        );
+    }
 
     #[test]
     fn reusing_a_target_keeps_unscaled_only_for_the_marked_description() {

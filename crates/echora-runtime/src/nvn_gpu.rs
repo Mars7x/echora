@@ -4470,26 +4470,39 @@ impl Nvn {
         if self.target_shapes.0 != self.texture_epoch {
             self.target_shapes = (self.texture_epoch, HashMap::default());
         }
-        let (width, height, format, levels, shape) = match self.target_shapes.1.get(&texture) {
-            Some(known) => *known,
-            None => {
-                let (width, height, format) = self.target_shape(texture)?;
-                let known = (
-                    width,
-                    height,
-                    format,
-                    self.texture_levels(texture),
-                    self.render_shape(texture),
-                );
-                self.target_shapes.1.insert(texture, known);
-                known
-            }
-        };
-        self.gpu
-            .as_mut()
-            .unwrap()
-            .renderer
-            .shaped_target(texture, width, height, shape, format, levels)?;
+        let (width, height, format, levels, shape, storage) =
+            match self.target_shapes.1.get(&texture) {
+                Some(known) => *known,
+                None => {
+                    let (width, height, format) = self.target_shape(texture)?;
+                    const TEXTURE_FLAG_IMAGE: u64 = 0x4;
+                    let storage = self
+                        .object(texture, "Texture")?
+                        .builder
+                        .get("Flags")
+                        .is_some_and(|flags| flags.x[0] & TEXTURE_FLAG_IMAGE != 0);
+                    let known = (
+                        width,
+                        height,
+                        format,
+                        self.texture_levels(texture),
+                        self.render_shape(texture),
+                        storage,
+                    );
+                    self.target_shapes.1.insert(texture, known);
+                    known
+                }
+            };
+        let backend = self.gpu.as_mut().unwrap();
+        if storage {
+            backend
+                .renderer
+                .guest_sized_target(texture, width, height, shape, format, levels)?;
+        } else {
+            backend
+                .renderer
+                .shaped_target(texture, width, height, shape, format, levels)?;
+        }
         Ok((width, height))
     }
 
@@ -5113,7 +5126,7 @@ impl Nvn {
                         .as_mut()
                         .unwrap()
                         .renderer
-                        .shaped_target(texture, width, height, shape, format, levels)?;
+                        .guest_sized_target(texture, width, height, shape, format, levels)?;
                     if matches!(shape, ImageShape::D3 { .. })
                         && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
                     {

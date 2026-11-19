@@ -427,13 +427,14 @@ struct CachedPoolEntries {
     additional: Vec<u64>,
 }
 
-/// A render target's width, height, format, mip levels and shape.
+/// A render target's width, height, format, mip levels, shape and storage usage.
 type TargetShape = (
     u32,
     u32,
     echora_gpu::ash::vk::Format,
     u32,
     echora_gpu::draw::ImageShape,
+    bool,
 );
 
 /// A stage's code window and its program key.
