@@ -3215,38 +3215,38 @@ impl Nvn {
         &self,
         key: u64,
         target: &echora_gpu::renderer::Target,
-    ) -> Vec<(u32, u64, (u32, u32))> {
-        let Some(object) = self.objects.get(&key) else {
-            return Vec::new();
-        };
-        let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
-        let Some(info) = get("Format").and_then(crate::nvn_format::info) else {
-            return Vec::new();
-        };
-        let depth = if get("Target") == Some(2) {
-            get("Depth").unwrap_or(1).max(1)
-        } else {
-            1
-        };
-        let dimensions = [target.width, target.height, depth];
-        let layout = super::texture_layout_layers(
-            &object.builder,
-            info,
-            dimensions,
-            target.shape.layers(),
-            target.levels,
-        );
-        crate::nvn_format::block_linear_mips(info, dimensions, layout, target.levels)
-            .enumerate()
-            .skip(1)
-            .map(|(level, mip)| {
-                let extent = (
-                    (target.width >> level).max(1),
-                    (target.height >> level).max(1),
+    ) -> impl Iterator<Item = (u32, u64, (u32, u32))> + use<> {
+        self.objects
+            .get(&key)
+            .and_then(|object| {
+                let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
+                let info = get("Format").and_then(crate::nvn_format::info)?;
+                let depth = if get("Target") == Some(2) {
+                    get("Depth").unwrap_or(1).max(1)
+                } else {
+                    1
+                };
+                let (width, height) = (target.width, target.height);
+                let dimensions = [width, height, depth];
+                let layout = super::texture_layout_layers(
+                    &object.builder,
+                    info,
+                    dimensions,
+                    target.shape.layers(),
+                    target.levels,
                 );
-                (level as u32, mip.offset, extent)
+                Some(
+                    crate::nvn_format::block_linear_mips(info, dimensions, layout, target.levels)
+                        .enumerate()
+                        .skip(1)
+                        .map(move |(level, mip)| {
+                            let extent = ((width >> level).max(1), (height >> level).max(1));
+                            (level as u32, mip.offset, extent)
+                        }),
+                )
             })
-            .collect()
+            .into_iter()
+            .flatten()
     }
 
     /// The alias target (and its size) a draw renders the blocks of
@@ -11161,7 +11161,7 @@ mod target_tests {
             .renderer
             .existing_target(parent)
             .unwrap();
-        let (_, offset, _) = nvn.target_level_offsets(parent, target)[0];
+        let (_, offset, _) = nvn.target_level_offsets(parent, target).next().unwrap();
         nvn.initialize(3, "Texture", texture(8, 1, offset, 37))
             .unwrap();
         nvn.initialize(4, "Texture", texture(8, 1, offset, 56))
