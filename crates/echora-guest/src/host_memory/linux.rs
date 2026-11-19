@@ -167,6 +167,20 @@ impl HostMemory {
         unsafe { &mut *self.physical.as_ptr().add(page as usize).cast() }
     }
 
+    /// Copy bytes into the canonical memory file's physical view.
+    pub(crate) fn write_physical(&mut self, address: u64, bytes: &[u8]) {
+        debug_assert!(address + bytes.len() as u64 <= self.size);
+        // SAFETY: the file is mapped read-write and the whole span fits.
+        // `&mut self` excludes a borrow of its physical storage.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.physical.as_ptr().add(address as usize),
+                bytes.len(),
+            );
+        }
+    }
+
     /// Host address of the physical view's page at file offset `page`.
     pub(crate) fn page_address(&self, page: u64) -> usize {
         self.physical.as_ptr() as usize + page as usize

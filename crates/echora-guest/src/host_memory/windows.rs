@@ -469,6 +469,27 @@ impl HostMemory {
         unsafe { &mut *self.physical.base.as_ptr().add(page as usize).cast() }
     }
 
+    /// Copy bytes into the canonical memory file's physical view, mapping
+    /// each backing section before copying bytes into its view.
+    pub(crate) fn write_physical(&mut self, mut address: u64, mut bytes: &[u8]) {
+        debug_assert!(address + bytes.len() as u64 <= self.size);
+        while !bytes.is_empty() {
+            self.ensure_chunk((address / CHUNK) as usize);
+            let count = ((CHUNK - address % CHUNK) as usize).min(bytes.len());
+            // SAFETY: the mapped chunk holds this span. `&mut self`
+            // excludes a borrow of its physical storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.physical.base.as_ptr().add(address as usize),
+                    count,
+                );
+            }
+            address += count as u64;
+            bytes = &bytes[count..];
+        }
+    }
+
     /// Host address of the physical view's page at file offset `page`.
     /// Valid once the page has been written through `page_mut`.
     pub(crate) fn page_address(&self, page: u64) -> usize {
@@ -688,8 +709,16 @@ mod tests {
 
     #[test]
     fn untouched_chunks_have_no_section() {
-        let host = HostMemory::new(1 << 39);
+        let mut host = HostMemory::new(1 << 39);
         assert!(host.chunks.iter().all(Option::is_none));
         assert_eq!(host.page(0x1234_5000)[0], 0);
+        host.write_physical(CHUNK - 2, &[1, 2, 3, 4]);
+        assert_eq!(
+            host.page(CHUNK - PAGE_SIZE)[PAGE_SIZE as usize - 2..],
+            [1, 2]
+        );
+        assert_eq!(host.page(CHUNK)[..2], [3, 4]);
+        assert!(host.chunks[..2].iter().all(Option::is_some));
+        assert!(host.chunks[2..].iter().all(Option::is_none));
     }
 }

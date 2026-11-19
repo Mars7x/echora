@@ -133,6 +133,7 @@ impl Pages {
         Some(self.host.page(*page))
     }
 
+    #[cfg(test)]
     fn get_or_insert(&mut self, page: u64) -> &mut [u8; PAGE_SIZE as usize] {
         self.resident.insert(page);
         self.host.page_mut(page)
@@ -1419,32 +1420,68 @@ impl Memory {
         Ok(())
     }
 
-    fn write_pages(&mut self, address: u64, bytes: &[u8]) {
-        let mut done = 0;
-        while done < bytes.len() {
-            let current = address + done as u64;
-            let page = current & !(PAGE_SIZE - 1);
-            let offset = (current - page) as usize;
-            let count = (PAGE_SIZE as usize - offset).min(bytes.len() - done);
+    fn write_pages(&mut self, mut address: u64, mut bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let offset = address % PAGE_SIZE;
+        if bytes.len() as u64 <= PAGE_SIZE - offset {
+            let page = address - offset;
             let backing = self.backing_page(page);
-            if let Some(reservation) = self.exclusive {
-                // Any store overlapping the marked bytes, through any alias,
-                // clears the local monitor before data changes.
-                let start = backing + offset as u64;
-                if start < reservation.backing + u64::from(reservation.bytes)
-                    && reservation.backing < start + count as u64
-                {
-                    self.exclusive = None;
-                }
+            self.clear_reservation_for_write(backing + offset, bytes.len());
+            if self.pages.resident.insert(backing) {
+                self.tlb[(page / PAGE_SIZE) as usize % TLB_ENTRIES].set(EMPTY_TLB_ENTRY);
             }
-            if self.pages.slot_of(backing).is_none() {
+            let target = self.pages.host.page_mut(backing);
+            target[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            return;
+        }
+        let end = address + bytes.len() as u64;
+        while !bytes.is_empty() {
+            // Between aliases, guest and backing addresses advance together.
+            // Inside one alias, they advance together from its source.
+            let (backing, span_end) = match self.stack_aliases.range(..=address).next_back() {
+                Some((&start, alias)) if address < start + alias.size => (
+                    alias.source + (address - start),
+                    end.min(start + alias.size),
+                ),
+                _ => {
+                    let next = self.stack_aliases.range(address..end).next();
+                    (address, next.map_or(end, |(&start, _)| start))
+                }
+            };
+            let (span, remaining) = bytes.split_at((span_end - address) as usize);
+            self.write_backing_span(address, backing, span);
+            address = span_end;
+            bytes = remaining;
+        }
+    }
+
+    /// Writes through an alias invalidate the same reservation.
+    fn clear_reservation_for_write(&mut self, backing: u64, length: usize) {
+        if let Some(reservation) = self.exclusive
+            && backing < reservation.backing + u64::from(reservation.bytes)
+            && reservation.backing < backing + length as u64
+        {
+            self.exclusive = None;
+        }
+    }
+
+    /// Record newly written pages and copy one uninterrupted backing range.
+    fn write_backing_span(&mut self, address: u64, backing: u64, bytes: &[u8]) {
+        self.clear_reservation_for_write(backing, bytes.len());
+        let start = address & !(PAGE_SIZE - 1);
+        let backing_start = backing & !(PAGE_SIZE - 1);
+        let mut page = start;
+        let end = address + bytes.len() as u64;
+        while page < end {
+            if self.pages.resident.insert(backing_start + (page - start)) {
                 // Cached read-only while never written (see `fill_tlb`).
                 self.tlb[(page / PAGE_SIZE) as usize % TLB_ENTRIES].set(EMPTY_TLB_ENTRY);
             }
-            let target = self.pages.get_or_insert(backing);
-            target[offset..offset + count].copy_from_slice(&bytes[done..done + count]);
-            done += count;
+            page += PAGE_SIZE;
         }
+        self.pages.host.write_physical(backing, bytes);
     }
 
     fn unmap_exact_unsynced(&mut self, base: u64, size: u64) -> Result<(), Trap> {
@@ -2212,6 +2249,25 @@ mod tests {
         m.write_u64(0x8ffc, 0x1234_5678_9abc_def0).unwrap();
         assert_eq!(&m.pages[&0x1000][0xffc..], &[0xf0, 0xde, 0xbc, 0x9a]);
         assert_eq!(&m.pages[&0x3000][..4], &[0x78, 0x56, 0x34, 0x12]);
+        assert!(!m.pages.contains_key(&0x2000));
+        m.map(
+            0x7000,
+            PAGE_SIZE,
+            READ | WRITE,
+            STATE_NORMAL,
+            "before alias",
+        )
+        .unwrap();
+        let bytes: Vec<_> = (0..2 * PAGE_SIZE + 8)
+            .map(|index| (index * 13 + (index >> 6) + 1) as u8)
+            .collect();
+        m.load_exclusive_single_thread(0x9000, 4, false).unwrap();
+        m.write(0x7ff8, &bytes).unwrap();
+        assert_eq!(m.exclusive_reservation(), None);
+        assert_eq!(&m.pages[&0x7000][0xff8..], &bytes[..8]);
+        let (first, second) = bytes[8..].split_at(PAGE_SIZE as usize);
+        assert_eq!(&m.pages[&0x1000], first);
+        assert_eq!(&m.pages[&0x3000], second);
         assert!(!m.pages.contains_key(&0x2000));
         assert_eq!(
             m.stack_aliases().collect::<Vec<_>>(),
