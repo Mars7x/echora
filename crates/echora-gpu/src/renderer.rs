@@ -2417,7 +2417,7 @@ impl Renderer {
             });
         let after = vk::ImageMemoryBarrier {
             src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-            dst_access_mask: vk::AccessFlags::SHADER_READ,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
             old_layout: vk::ImageLayout::GENERAL,
             ..barrier
         };
@@ -2517,7 +2517,9 @@ impl Renderer {
             self.gpu.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_GRAPHICS
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -6803,6 +6805,41 @@ mod tests {
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.
         Gpu::new().ok().map(|gpu| Renderer::new(gpu).unwrap())
+    }
+
+    #[test]
+    fn reads_an_upload_before_separate_submission() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        for (generation, bytes, rgba) in [
+            (1, [255, 0, 0, 255], [1.0, 0.0, 0.0, 1.0]),
+            (2, [0, 0, 255, 255], [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            renderer
+                .texture_view_for(&TextureSource::Upload {
+                    key: 1,
+                    generation,
+                    width: 1,
+                    height: 1,
+                    shape: ImageShape::D2 { layers: 1 },
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    texels: std::sync::Arc::new(bytes.to_vec()),
+                    levels: [UploadRegion {
+                        level: 0,
+                        layer: 0,
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                        offset: 0,
+                    }]
+                    .into(),
+                })
+                .unwrap();
+            assert_eq!(renderer.read_upload_level(1, 0).unwrap(), [rgba]);
+        }
     }
 
     #[test]
