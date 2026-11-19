@@ -4535,18 +4535,13 @@ impl Renderer {
         if self.scale.is_one() {
             return Ok(Scale::ONE);
         }
-        let scales = || {
-            colors
-                .iter()
-                .chain(depth.iter())
-                .filter_map(|key| self.targets.get(key).map(|target| target.scale))
-        };
-        let colors: Vec<u64> = colors.iter().copied().filter(|key| *key != 0).collect();
-        let first = scales().next().unwrap_or(Scale::ONE);
-        if scales().all(|scale| scale == first) {
+        let attachments = || colors.iter().filter(|&&key| key != 0).chain(depth.iter());
+        let mut scales = attachments().filter_map(|key| self.targets.get(key).map(|t| t.scale));
+        let first = scales.next().unwrap_or(Scale::ONE);
+        if scales.all(|scale| scale == first) {
             return Ok(first);
         }
-        for key in colors.iter().chain(depth.iter()) {
+        for key in attachments() {
             self.keep_unscaled(*key)?;
         }
         Ok(Scale::ONE)
@@ -4596,28 +4591,22 @@ impl Renderer {
     /// a scaled image by a downscaled copy (compute passes write storage
     /// images at guest coordinates).
     pub fn keep_unscaled(&mut self, key: u64) -> Result<(), String> {
-        if !self.unscaled.insert(key) {
-            return Ok(());
-        }
-        let Some(old) = self.targets.get(&key) else {
+        let Some(old) = self
+            .targets
+            .get(&key)
+            .filter(|target| !target.scale.is_one())
+        else {
+            self.unscaled.insert(key);
             return Ok(());
         };
-        if old.scale.is_one() {
-            return Ok(());
-        }
         let (width, height, shape, format, levels) =
             (old.width, old.height, old.shape, old.format, old.levels);
-        self.descaled += 1;
         self.transition(key, vk::ImageLayout::GENERAL)?;
         self.order_target(key)?;
         let target = self.create_target(width, height, shape, format, levels, Scale::ONE)?;
         self.register_views(&target);
         let old = self.targets.insert(key, target).unwrap();
-        self.target_changes += 1;
-        self.changed_targets.push(key);
-        self.transition(key, vk::ImageLayout::GENERAL)?;
-        let commands = self.commands()?;
-        let filter = if is_depth(format) {
+        let filter = if is_depth(format) || integer_format(format) {
             vk::Filter::NEAREST
         } else {
             vk::Filter::LINEAR
@@ -4644,6 +4633,15 @@ impl Renderer {
                 }
             })
             .collect();
+        let source = old.image;
+        let destination = new.image;
+        self.slot.retired_uploads.push(old);
+        self.unscaled.insert(key);
+        self.descaled += 1;
+        self.target_changes += 1;
+        self.changed_targets.push(key);
+        self.transition(key, vk::ImageLayout::GENERAL)?;
+        let commands = self.commands()?;
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -4652,9 +4650,9 @@ impl Renderer {
             let device = &self.gpu.device;
             device.cmd_blit_image(
                 commands,
-                old.image,
+                source,
                 vk::ImageLayout::GENERAL,
-                new.image,
+                destination,
                 vk::ImageLayout::GENERAL,
                 &blits,
                 filter,
@@ -4673,8 +4671,6 @@ impl Renderer {
                 &[],
             );
         }
-        self.flush()?;
-        self.destroy_target(old);
         Ok(())
     }
 
@@ -5174,7 +5170,7 @@ impl Renderer {
         let mut views = extra.clone();
         views.extend([target.view, target.sampled_view]);
         self.forget_pool_views(&views);
-        // SAFETY: the caller flushed, so no work uses the target.
+        // SAFETY: the batch containing the target's last use completed.
         unsafe {
             for view in extra {
                 self.device().destroy_image_view(view, None);
@@ -7500,6 +7496,58 @@ mod fit_tests {
             [0, 0, 3440, 1440]
         );
         assert_eq!(fit_rect((1920, 1080), (0, 0)), [0, 0, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod rescaling_tests {
+    use super::*;
+
+    #[test]
+    fn descales_a_replaced_attachment_in_command_order() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let scale = Scale::new(2, 1).unwrap();
+        let format = vk::Format::R8G8B8A8_UINT;
+        renderer.set_resolution_scale(scale);
+        renderer.keep_unscaled(7).unwrap();
+        renderer.keep_unscaled(8).unwrap();
+        renderer.target(8, 16, 8, format).unwrap();
+        assert_eq!(renderer.target(9, 16, 8, format).unwrap().scale, scale);
+        let source = renderer.targets[&9].image;
+        let left = [200, 25, 41, 255];
+        let right = [8, 65, 79, 255];
+        renderer
+            .clear_color(9, None, vk::ClearColorValue { uint32: left })
+            .unwrap();
+        renderer
+            .clear_color(9, Some([8, 0, 8, 8]), vk::ClearColorValue { uint32: right })
+            .unwrap();
+        renderer.move_target(9, 7).unwrap();
+
+        let submissions = renderer.flushes;
+        assert_eq!(
+            renderer.attachment_scale(&[0, 7, 8], None).unwrap(),
+            Scale::ONE
+        );
+        assert_eq!(renderer.targets[&7].extent(0), (16, 8));
+        assert_eq!(renderer.flushes, submissions);
+        assert!(
+            renderer
+                .slot
+                .retired_uploads
+                .iter()
+                .any(|old| old.image == source)
+        );
+
+        let bytes = renderer.read_target_bytes(7, 4).unwrap();
+        assert_eq!(bytes.len(), 16 * 8 * 4);
+        for row in bytes.chunks_exact(16 * 4) {
+            assert_eq!(&row[..8 * 4], &left.map(|v| v as u8).repeat(8));
+            assert_eq!(&row[8 * 4..], &right.map(|v| v as u8).repeat(8));
+        }
     }
 }
 
