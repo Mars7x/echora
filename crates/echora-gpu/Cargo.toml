@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+zstd.workspace = true
 ash = "0.38"
 echora-av1.workspace = true
 echora-shader.workspace = true

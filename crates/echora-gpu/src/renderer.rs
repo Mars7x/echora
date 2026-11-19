@@ -36,6 +36,49 @@ pub struct Target {
     layout: vk::ImageLayout,
 }
 
+/// Image description available even when the texels are in a host archive.
+#[derive(Clone, Copy)]
+pub struct TargetInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub shape: ImageShape,
+    pub levels: u32,
+    pub scale: Scale,
+}
+
+impl From<&Target> for TargetInfo {
+    fn from(target: &Target) -> Self {
+        Self {
+            width: target.width,
+            height: target.height,
+            format: target.format,
+            shape: target.shape,
+            levels: target.levels,
+            scale: target.scale,
+        }
+    }
+}
+
+struct ArchivedTarget {
+    info: TargetInfo,
+    decoded_bytes: usize,
+    compressed: std::sync::Arc<[u8]>,
+}
+
+struct PendingArchive {
+    token: u64,
+    bytes: u64,
+    image: Option<vk::Image>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveRequest {
+    Queued,
+    Ineligible,
+    Deferred,
+}
+
 impl Target {
     /// The image's extent at mip `level`.
     pub fn extent(&self, level: u32) -> (u32, u32) {
@@ -461,6 +504,10 @@ pub struct Renderer {
     full_barrier_recorded: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     targets: FastMap<u64, Target>,
+    archived_targets: FastMap<u64, ArchivedTarget>,
+    archived_bytes: FastMap<u64, std::sync::Weak<[u8]>>,
+    archive_reads: FastMap<u64, PendingArchive>,
+    archive_read_bytes: u64,
     guest_target_keys: Vec<u64>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
     uploads: FastMap<u64, (u64, Target)>,
@@ -997,6 +1044,10 @@ impl Renderer {
             graphics: Default::default(),
             memory_types,
             targets: FastMap::default(),
+            archived_targets: FastMap::default(),
+            archived_bytes: FastMap::default(),
+            archive_reads: FastMap::default(),
+            archive_read_bytes: 0,
             guest_target_keys: Vec::new(),
             uploads: FastMap::default(),
             upload_lengths: FastMap::default(),
@@ -2041,6 +2092,10 @@ impl Renderer {
         texture_type: u32,
     ) -> Result<vk::ImageView, String> {
         use crate::draw::{ImageShape, TextureSource};
+        if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = source {
+            self.cancel_target_archive(*key);
+            self.restore_archived_target(*key)?;
+        }
         // Incompatible image dimensions need separate uploads: a row of
         // a 2D image as 1D, a flat image as one 3D slice, or the slices of
         // level 0 of a volume as 2D array layers.
@@ -4243,6 +4298,7 @@ impl Renderer {
         format: vk::Format,
         levels: u32,
     ) -> Result<&Target, String> {
+        self.restore_archived_target(key)?;
         let largest = width.max(height).max(shape.depth()).max(1);
         let levels = levels.clamp(1, 32 - largest.leading_zeros());
         let stale = self.targets.get(&key).is_some_and(|target| {
@@ -4480,6 +4536,166 @@ impl Renderer {
         self.targets.get(&key)
     }
 
+    pub fn target_info(&self, key: u64) -> Option<TargetInfo> {
+        self.targets
+            .get(&key)
+            .map(TargetInfo::from)
+            .or_else(|| self.archived_targets.get(&key).map(|target| target.info))
+    }
+
+    /// Schedule one lossless snapshot while the target is inactive. Leave
+    /// the image resident until the copy completes and only use ring space
+    /// available in this submission.
+    pub fn queue_target_archive(&mut self, key: u64) -> Result<ArchiveRequest, String> {
+        let Some(target) = self.targets.get(&key) else {
+            return Ok(ArchiveRequest::Ineligible);
+        };
+        if target.layout == vk::ImageLayout::UNDEFINED
+            || self.fresh_targets.contains(&key)
+            || key >= STAGING_KEYS
+        {
+            return Ok(ArchiveRequest::Ineligible);
+        }
+        let Ok((_, size)) = self.archive_copy(key) else {
+            return Ok(ArchiveRequest::Ineligible);
+        };
+        if !(1 << 20..=RING_SIZE).contains(&size) {
+            return Ok(ArchiveRequest::Ineligible);
+        }
+        if self.archive_reads.contains_key(&key)
+            || self.archive_read_bytes + size > RING_SIZE
+            || !self.slot.ring_fits(size, 16)
+        {
+            return Ok(ArchiveRequest::Deferred);
+        }
+        let image = target.image;
+        let token = self.queue_target_archive_read(key)?;
+        self.archive_reads.insert(
+            key,
+            PendingArchive {
+                token,
+                bytes: size,
+                image: Some(image),
+            },
+        );
+        self.archive_read_bytes += size;
+        Ok(ArchiveRequest::Queued)
+    }
+
+    fn cancel_target_archive(&mut self, key: u64) {
+        if let Some(read) = self.archive_reads.get_mut(&key) {
+            read.image = None;
+        }
+    }
+
+    /// Compress completed copies whose images stayed inactive. Keep their
+    /// keys in the target index so aliases can restore exact texels.
+    pub fn finish_target_archives(&mut self) -> Result<(), String> {
+        if self.archive_reads.is_empty() {
+            return Ok(());
+        }
+        self.poll_completed()?;
+        let mut tokens: Vec<_> = self.archive_reads.values().map(|read| read.token).collect();
+        tokens.sort_unstable();
+        let mut ready = self.take_reads(&tokens);
+        self.archived_bytes
+            .retain(|_, block| block.strong_count() != 0);
+        let completed: Vec<_> = self
+            .archive_reads
+            .iter()
+            .filter(|(_, read)| ready.contains_key(&read.token))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in completed {
+            let read = self.archive_reads.remove(&key).unwrap();
+            let raw = ready.remove(&read.token).unwrap();
+            self.archive_read_bytes -= read.bytes;
+            let Some(target) = self
+                .targets
+                .get(&key)
+                .filter(|target| Some(target.image) == read.image)
+            else {
+                continue;
+            };
+            let info = TargetInfo::from(target);
+            let Ok(compressed) = zstd::bulk::compress(&raw, 1) else {
+                continue;
+            };
+            if compressed.len() >= raw.len() {
+                continue;
+            }
+            use std::hash::Hasher;
+            let mut hasher = crate::fast_map::FastHasher::default();
+            hasher.write(&compressed);
+            let hash = hasher.finish();
+            let compressed = match self
+                .archived_bytes
+                .get(&hash)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                Some(shared) if shared.as_ref() == compressed => shared,
+                _ => {
+                    let shared: std::sync::Arc<[u8]> = compressed.into_boxed_slice().into();
+                    self.archived_bytes
+                        .insert(hash, std::sync::Arc::downgrade(&shared));
+                    shared
+                }
+            };
+            let target = self.targets.remove(&key).unwrap();
+            self.slot.retired_uploads.push(target);
+            self.stat(
+                "stat: inactive target image bytes archived",
+                raw.len() as u64,
+            );
+            self.stat(
+                "stat: inactive target compressed bytes",
+                compressed.len() as u64,
+            );
+            self.archived_targets.insert(
+                key,
+                ArchivedTarget {
+                    info,
+                    decoded_bytes: raw.len(),
+                    compressed,
+                },
+            );
+            self.target_changes += 1;
+            self.changed_targets.push(key);
+        }
+        Ok(())
+    }
+
+    /// Reconstitute an image before a command refers to it. Keep the
+    /// archive until recording the upload has succeeded.
+    pub fn restore_archived_target(&mut self, key: u64) -> Result<(), String> {
+        let Some(archived) = self.archived_targets.get(&key) else {
+            return Ok(());
+        };
+        let info = archived.info;
+        let bytes = zstd::bulk::decompress(&archived.compressed, archived.decoded_bytes)
+            .map_err(|error| error.to_string())?;
+        let target = self.create_target(
+            info.width,
+            info.height,
+            info.shape,
+            info.format,
+            info.levels,
+            info.scale,
+        )?;
+        self.register_views(&target);
+        self.targets.insert(key, target);
+        if let Err(error) = self.restore_target_archive(key, &bytes) {
+            self.slot
+                .retired_uploads
+                .push(self.targets.remove(&key).unwrap());
+            return Err(error);
+        }
+        self.archived_targets.remove(&key);
+        self.target_changes += 1;
+        self.changed_targets.push(key);
+        Ok(())
+    }
+
     /// Keys of the guest render targets (not internal staging images).
     /// Before recording a draw or dispatch: submit once a submission holds
     /// MAX_WORK_ITEMS of them. One submission is one GPU job, and the
@@ -4659,6 +4875,7 @@ impl Renderer {
     }
 
     fn remove_target(&mut self, key: u64) -> Option<Target> {
+        self.cancel_target_archive(key);
         let target = self.targets.remove(&key)?;
         if key < STAGING_KEYS {
             let index = self.guest_target_keys.binary_search(&key).unwrap();
@@ -5003,6 +5220,7 @@ impl Renderer {
     /// Keep target `from` (if any) under key `to` instead, dropping what
     /// `to` held.
     pub fn move_target(&mut self, from: u64, to: u64) -> Result<(), String> {
+        self.restore_archived_target(from)?;
         let Some(target) = self.remove_target(from) else {
             return Ok(());
         };
@@ -5013,6 +5231,9 @@ impl Renderer {
         // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.remove_target(to) {
             self.slot.retired_uploads.push(replaced);
+        } else if self.archived_targets.remove(&to).is_some() {
+            let index = self.guest_target_keys.binary_search(&to).unwrap();
+            self.guest_target_keys.remove(index);
         }
         if self.pending_unscaled.remove(&to) {
             self.unscaled.insert((to, TargetDescription::from(&target)));
@@ -5052,6 +5273,7 @@ impl Renderer {
     /// Target `key` gets its contents otherwise (a clear or a copy): it
     /// needs no initialization.
     pub fn defined(&mut self, key: u64) {
+        self.cancel_target_archive(key);
         self.fresh_targets.retain(|fresh| *fresh != key);
     }
 
@@ -5514,6 +5736,7 @@ impl Renderer {
     /// (a draw sampling a target would otherwise end the pass each time).
     #[track_caller]
     pub(crate) fn transition(&mut self, key: u64, layout: vk::ImageLayout) -> Result<(), String> {
+        self.cancel_target_archive(key);
         if self.targets.get(&key).ok_or("no such target")?.layout == layout {
             return Ok(());
         }
@@ -6652,6 +6875,98 @@ impl Renderer {
         Ok((texels, width, height))
     }
 
+    /// Readback layout for a single-level, single-layer target in its
+    /// real host extent and format, with no resampling or conversion.
+    fn archive_copy(&self, key: u64) -> Result<(vk::BufferImageCopy, u64), String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if target.shape != (ImageShape::D2 { layers: 1 }) || target.levels != 1 {
+            return Err("target has multiple subresources".into());
+        }
+        let texel_bytes = match target.format {
+            vk::Format::D16_UNORM => 2,
+            vk::Format::D32_SFLOAT => 4,
+            format if !is_depth(format) => format_bytes(format),
+            _ => 0,
+        };
+        if !texel_bytes.is_power_of_two() {
+            return Err("target format needs a separate archive layout".into());
+        }
+        let (width, height) = target.extent(0);
+        let size = u64::from(width) * u64::from(height) * u64::from(texel_bytes);
+        let copy = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(aspect(target.format))
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        Ok((copy, size))
+    }
+
+    pub fn queue_target_archive_read(&mut self, key: u64) -> Result<u64, String> {
+        let (copy, size) = self.archive_copy(key)?;
+        let (buffer, offset) = self.ring_alloc(size, 16)?;
+        self.transition(key, vk::ImageLayout::GENERAL)?;
+        self.order_target(key)?;
+        let image = self.targets[&key].image;
+        self.end_pass();
+        self.end_condition();
+        let commands = self.commands()?;
+        // SAFETY: recording outside rendering. Both resources are live,
+        // and the ring has room for the whole plane.
+        unsafe {
+            self.gpu.device.cmd_copy_image_to_buffer(
+                commands,
+                image,
+                vk::ImageLayout::GENERAL,
+                buffer,
+                &[copy.buffer_offset(offset)],
+            );
+            // Later commands can reuse this image before the copy returns.
+            // Order their writes after the transfer has read the snapshot.
+            self.gpu.device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[],
+            );
+        }
+        Ok(self.defer_ring_read(offset, size as usize))
+    }
+
+    pub fn restore_target_archive(&mut self, key: u64, bytes: &[u8]) -> Result<(), String> {
+        let (copy, size) = self.archive_copy(key)?;
+        if bytes.len() as u64 != size {
+            return Err("archived texel count does not match the target".into());
+        }
+        let (buffer, offset) = self.ring_upload(bytes, 16)?;
+        self.transition(key, vk::ImageLayout::GENERAL)?;
+        self.order_target(key)?;
+        let image = self.targets[&key].image;
+        let commands = self.commands()?;
+        // SAFETY: recording outside rendering. Both resources are live.
+        // The upload contains the entire plane in the image's format.
+        unsafe {
+            self.gpu.device.cmd_copy_buffer_to_image(
+                commands,
+                buffer,
+                image,
+                vk::ImageLayout::GENERAL,
+                &[copy.buffer_offset(offset)],
+            );
+        }
+        self.written.insert(image);
+        self.defined(key);
+        Ok(())
+    }
+
     /// Level 0 of a color target as its own format's bytes, rows packed:
     /// `texel_bytes` is that format's texel size, which the caller knows.
     pub fn read_target_bytes(&mut self, key: u64, texel_bytes: u32) -> Result<Vec<u8>, String> {
@@ -7772,6 +8087,44 @@ mod tests {
     }
 
     #[test]
+    fn reusing_a_target_cancels_its_pending_archive() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 7;
+        renderer
+            .target(key, 512, 512, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let clear = |renderer: &mut Renderer, red| {
+            renderer.defined(key);
+            renderer
+                .clear_color(
+                    key,
+                    None,
+                    vk::ClearColorValue {
+                        float32: [red, 0.0, 0.0, 1.0],
+                    },
+                )
+                .unwrap();
+        };
+        clear(&mut renderer, 0.0);
+        renderer.flush().unwrap();
+        assert_eq!(
+            renderer.queue_target_archive(key).unwrap(),
+            ArchiveRequest::Queued
+        );
+        clear(&mut renderer, 1.0);
+        renderer.flush().unwrap();
+        renderer.finish_target_archives().unwrap();
+        assert!(renderer.archived_targets.is_empty());
+        assert_eq!(renderer.archive_read_bytes, 0);
+        assert_eq!(
+            renderer.read_target_bytes(key, 4).unwrap(),
+            [255, 0, 0, 255].repeat(512 * 512)
+        );
+    }
+
+    #[test]
     fn open_pass_tracks_the_image_under_each_target_key() {
         let Some(mut renderer) = renderer() else {
             return;
@@ -7914,6 +8267,39 @@ mod tests {
             ordered,
             "a new rendering pass must wait for the prior store"
         );
+    }
+
+    #[test]
+    fn retiring_an_image_keeps_its_scaled_texels_and_logical_target_key() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R16G16B16A16_SFLOAT;
+        renderer.set_resolution_scale(Scale::new(3, 2).unwrap());
+        let (width, height) = renderer.target(7, 512, 256, format).unwrap().extent(0);
+        assert_eq!((width, height), (768, 384));
+        let color = [0.5, 4.0, 0.25, 1.0];
+        renderer
+            .clear_color(7, None, vk::ClearColorValue { float32: color })
+            .unwrap();
+        assert_eq!(
+            renderer.queue_target_archive(7).unwrap(),
+            ArchiveRequest::Queued
+        );
+        renderer.flush().unwrap();
+        renderer.finish_target_archives().unwrap();
+        let archive = &renderer.archived_targets[&7];
+        assert_eq!(archive.decoded_bytes, (width * height * 8) as usize);
+        assert!(archive.compressed.len() < archive.decoded_bytes);
+        assert!(renderer.existing_target(7).is_none());
+        renderer.move_target(7, 8).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [8]);
+        assert_eq!(
+            renderer.existing_target(8).unwrap().extent(0),
+            (width, height)
+        );
+        let texels = renderer.read_target_scaled(8).unwrap().0;
+        assert!(texels.iter().all(|texel| *texel == color));
     }
 
     #[test]

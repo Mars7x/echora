@@ -229,6 +229,7 @@ pub struct Backend {
     /// their levels resolves to them). Built with `target_index`.
     target_levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
     target_index_stamp: Option<u64>,
+    retired_since: HashMap<u64, u64>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -415,6 +416,7 @@ impl Backend {
             target_index: HashMap::default(),
             target_levels: HashMap::default(),
             target_index_stamp: None,
+            retired_since: HashMap::default(),
         }))
     }
 
@@ -1285,6 +1287,14 @@ impl Nvn {
             backend.texture_checked.remove(&texture);
             let renderer = &mut backend.renderer;
             let retired = super::retired_texture(previous);
+            if renderer.target_info(texture).is_some() {
+                backend.retired_since.insert(retired, self.presented_frames);
+            }
+            if let Some(identity) = identity {
+                backend
+                    .retired_since
+                    .remove(&super::retired_texture(identity));
+            }
             let result = renderer
                 .move_target(texture, retired)
                 .and_then(|_| match identity {
@@ -1337,6 +1347,7 @@ impl Nvn {
             .and_then(|layer| z.checked_add(layer))
             .ok_or("target copy layer overflows")?;
         let backend = self.gpu.as_mut().unwrap();
+        backend.renderer.restore_archived_target(key)?;
         let target = backend.renderer.existing_target(key).unwrap();
         let exact_format = vk_format(format).is_some_and(|format| {
             format == target.format
@@ -3028,7 +3039,7 @@ impl Nvn {
         let matches = |key: &u64| {
             self.texture_storage(*key) == Some(base)
                 && renderer
-                    .existing_target(*key)
+                    .target_info(*key)
                     .is_some_and(|target| (target.width, target.height) == extent)
         };
         if self.target_index_current() {
@@ -3056,7 +3067,7 @@ impl Nvn {
     /// A texture changed, or a pool changed where textures map.
     pub(super) fn invalidate_target_index(&mut self, texture: Option<u64>) {
         if let Some(backend) = self.gpu.as_mut()
-            && texture.is_none_or(|key| backend.renderer.existing_target(key).is_some())
+            && texture.is_none_or(|key| backend.renderer.target_info(key).is_some())
         {
             backend.target_index_stamp = None;
         }
@@ -3081,7 +3092,7 @@ impl Nvn {
             if let Some(base) = base {
                 index.entry(base).or_default().push(key);
             }
-            let (Some(target), Some(base)) = (backend.renderer.existing_target(key), base) else {
+            let (Some(target), Some(base)) = (backend.renderer.target_info(key), base) else {
                 continue;
             };
             if target.levels == 1 {
@@ -3136,7 +3147,7 @@ impl Nvn {
         // applications rotate texture objects through a ring and initialize
         // one again over other storage or in another format (the target
         // the object last named is then another texture).
-        if renderer.existing_target(texture).is_some_and(|target| {
+        if renderer.target_info(texture).is_some_and(|target| {
             (format.is_none() || same_format(target.format))
                 && extent.is_none_or(|extent| (target.width, target.height) == extent)
                 && target.levels >= levels
@@ -3154,7 +3165,7 @@ impl Nvn {
         if self.target_index_current() {
             let backend = self.gpu.as_ref()?;
             for &key in backend.target_index.get(&base).into_iter().flatten() {
-                if renderer.existing_target(key).is_some_and(|target| {
+                if renderer.target_info(key).is_some_and(|target| {
                     (target.width, target.height) == extent
                         && same_format(target.format)
                         && target.levels >= levels
@@ -3168,7 +3179,7 @@ impl Nvn {
                 .iter()
                 .find(|(key, level, level_extent)| {
                     *level_extent == extent
-                        && renderer.existing_target(*key).is_some_and(|target| {
+                        && renderer.target_info(*key).is_some_and(|target| {
                             same_format(target.format) && target.levels - level >= levels
                         })
                 })
@@ -3177,7 +3188,7 @@ impl Nvn {
         let mut mip_match = None;
         for &key in renderer.target_keys_in_order() {
             let Some(target) = renderer
-                .existing_target(key)
+                .target_info(key)
                 .filter(|target| same_format(target.format))
             else {
                 continue;
@@ -3221,7 +3232,7 @@ impl Nvn {
                 .as_ref()
                 .unwrap()
                 .renderer
-                .existing_target(texture)
+                .target_info(texture)
                 .is_none()
             && let Some((alias, 0)) = self.resolve_target_with_levels(texture, 1)
             && self.flat_alias_layout_matches(texture, alias)
@@ -3247,7 +3258,7 @@ impl Nvn {
         };
         let shape = ImageShape::D2 { layers: 1 };
         let renderer = &self.gpu.as_ref().unwrap().renderer;
-        let Some(target) = renderer.existing_target(alias) else {
+        let Some(target) = renderer.target_info(alias) else {
             return false;
         };
         if target.shape != shape
@@ -3277,7 +3288,7 @@ impl Nvn {
     fn target_level_offsets(
         &self,
         key: u64,
-        target: &echora_gpu::renderer::Target,
+        target: echora_gpu::renderer::TargetInfo,
     ) -> impl Iterator<Item = (u32, u64, (u32, u32))> + use<> {
         self.objects
             .get(&key)
@@ -3354,12 +3365,16 @@ impl Nvn {
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         let source = self.texture_source_resolved(core, texture)?;
         // Blocks drawn since it was last sampled come in first.
-        if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = &source
-            && let Some(alias) = self.block_aliases.remove(key)
-        {
+        if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = &source {
             let backend = self.gpu.as_mut().unwrap();
-            backend.renderer.copy_blocks(alias, *key)?;
-            backend.stat("stat: compressed blocks drawn copied in", 1);
+            if let Some(age) = backend.retired_since.get_mut(key) {
+                *age = self.presented_frames;
+            }
+            backend.renderer.restore_archived_target(*key)?;
+            if let Some(alias) = self.block_aliases.remove(key) {
+                backend.renderer.copy_blocks(alias, *key)?;
+                backend.stat("stat: compressed blocks drawn copied in", 1);
+            }
         }
         Ok(source)
     }
@@ -3394,7 +3409,7 @@ impl Nvn {
             .as_ref()
             .unwrap()
             .renderer
-            .existing_target(texture)
+            .target_info(texture)
             .is_some()
         {
             return Ok(TextureSource::Target(texture));
@@ -4360,6 +4375,37 @@ impl Nvn {
         }
     }
 
+    fn archive_inactive_targets(&mut self) -> Result<(), String> {
+        let Some(backend) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        use echora_gpu::renderer::ArchiveRequest;
+        backend.renderer.finish_target_archives()?;
+        let present = self.presented_frames;
+        let mut candidates: Vec<_> = backend
+            .retired_since
+            .iter()
+            .filter_map(|(&key, &seen)| {
+                if present.saturating_sub(seen) < 24 {
+                    return None;
+                }
+                let target = backend.renderer.existing_target(key)?;
+                let (width, height) = target.extent(0);
+                Some((std::cmp::Reverse(u64::from(width) * u64::from(height)), key))
+            })
+            .collect();
+        candidates.sort_unstable();
+        for (_, key) in candidates.into_iter().take(6) {
+            match backend.renderer.queue_target_archive(key)? {
+                ArchiveRequest::Queued | ArchiveRequest::Ineligible => {
+                    backend.retired_since.remove(&key);
+                }
+                ArchiveRequest::Deferred => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The serial of the last finished submission.
     pub(super) fn gpu_completed_serial(&self) -> u64 {
         self.gpu
@@ -4420,6 +4466,7 @@ impl Nvn {
     }
 
     pub(super) fn gpu_submit(&mut self) -> Result<(), String> {
+        self.archive_inactive_targets()?;
         match self.gpu.as_mut() {
             Some(backend) => backend.renderer.submit_frame(),
             None => Ok(()),
@@ -4607,7 +4654,7 @@ impl Nvn {
         // that target.
         let target = |this: &Self, texture: u64| {
             let renderer = &this.gpu.as_ref().unwrap().renderer;
-            if renderer.existing_target(texture).is_some() {
+            if renderer.target_info(texture).is_some() {
                 Some(texture)
             } else {
                 this.target_sharing_storage(texture)
@@ -4625,6 +4672,7 @@ impl Nvn {
         let traced = self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]);
         let present = self.presented_frames;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        renderer.restore_archived_target(from)?;
         renderer.defined(to);
         renderer.copy_target(from, source, to, destination)?;
         // A traced copy: both ends read back after it, and how many texels
@@ -11405,6 +11453,95 @@ mod target_tests {
     }
 
     #[test]
+    fn archived_target_stays_visible_through_a_storage_alias() {
+        use crate::nvn::{Bag, Guest, GuestMemory, retired_texture, write_shared};
+        use echora_gpu::draw::TextureSource;
+        use echora_guest::{cpu::Cpu, memory::Memory};
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        backend
+            .renderer
+            .set_resolution_scale(echora_gpu::renderer::Scale::ONE);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([0x10000, 0x20_0000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.initialize(5, "Device", BTreeMap::new()).unwrap();
+        let builder = BTreeMap::from([
+            ("Device".into(), scalar(5)),
+            ("Width".into(), scalar(512)),
+            ("Height".into(), scalar(512)),
+            ("Format".into(), scalar(52)),
+            ("Storage".into(), args([1, 0, 0, 0])),
+        ]);
+        nvn.initialize(2, "Texture", builder.clone()).unwrap();
+        nvn.initialize(3, "Texture", builder.clone()).unwrap();
+        write_shared(nvn.bags.at(4)).insert(
+            4,
+            Bag {
+                kind: "TextureBuilder".into(),
+                props: builder,
+                ..Bag::default()
+            },
+        );
+        nvn.gpu_clear_depth(2, Some(0.5), None).unwrap();
+
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        cpu.regs[0] = 2;
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        let archive = retired_texture((0x10000, 52));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let image = renderer.existing_target(archive).unwrap();
+        assert_eq!(image.extent(0), (512, 512));
+        assert_eq!(image.levels, 1);
+        assert_eq!(
+            renderer.queue_target_archive(archive).unwrap(),
+            echora_gpu::renderer::ArchiveRequest::Queued
+        );
+        renderer.flush().unwrap();
+        renderer.finish_target_archives().unwrap();
+        assert!(renderer.existing_target(archive).is_none());
+
+        let TextureSource::Target(key) = nvn.texture_source(&core, 3).unwrap() else {
+            panic!("the alias must sample the retained target");
+        };
+        assert_eq!(key, retired_texture((0x10000, 52)));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(renderer.existing_target(2).is_none());
+        assert_eq!(
+            renderer.read_target_bytes(key, 4).unwrap(),
+            0.5_f32.to_le_bytes().repeat(512 * 512)
+        );
+
+        core.cpu.regs[..2].copy_from_slice(&[2, 4]);
+        assert!(nvn.call("nvnTextureInitialize", &mut core).unwrap());
+        assert_eq!(nvn.resolve_target(3), Some((2, 0)));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(renderer.existing_target(key).is_none());
+        assert_eq!(
+            renderer.read_target_bytes(2, 4).unwrap(),
+            0.5_f32.to_le_bytes().repeat(512 * 512)
+        );
+    }
+
+    #[test]
     fn partial_and_conditional_color_clears_keep_guest_texels() {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
@@ -11535,7 +11672,10 @@ mod target_tests {
             .renderer
             .existing_target(parent)
             .unwrap();
-        let (_, offset, _) = nvn.target_level_offsets(parent, target).next().unwrap();
+        let (_, offset, _) = nvn
+            .target_level_offsets(parent, target.into())
+            .next()
+            .unwrap();
         nvn.initialize(3, "Texture", texture(8, 1, offset, 37))
             .unwrap();
         nvn.initialize(4, "Texture", texture(8, 1, offset, 56))

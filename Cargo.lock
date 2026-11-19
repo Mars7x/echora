@@ -1917,6 +1917,7 @@ dependencies = [
  "echora-shader-abi",
  "libc",
  "naga 30.0.1",
+ "zstd",
 ]
 
 [[package]]
