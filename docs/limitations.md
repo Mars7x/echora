@@ -114,6 +114,8 @@ to be missing or incomplete.
   restore the game's adaptive 3D resolution. The launcher prepares the
   updated translation on the next launch. The build and branch match the
   [Lichii Max Resolution add-on](https://github.com/zortos293/Lichii/blob/17baed7/src/core/file_sys/patch_manager.cpp).
+  SMAA is also off by default. Enable it under Game → Add-ons to use the
+  game's edge blending. NDSR runs in both modes.
 - Vertical sync uses tear-free mailbox presentation when available. Adaptive
   sync prefers relaxed FIFO. Disabling sync prefers immediate presentation,
   then mailbox. The fallback is FIFO.

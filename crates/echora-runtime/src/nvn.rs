@@ -530,6 +530,8 @@ impl StageCodeCache {
 pub struct Nvn {
     /// Guest addresses of replaced exports.
     hooks: BTreeMap<u64, HostEntry>,
+    #[serde(skip)]
+    pub(crate) graphics_addons: crate::addons::GraphicsAddons,
     /// Thunk index -> interned entry-point name.
     thunks: Vec<&'static str>,
     #[serde(skip)]

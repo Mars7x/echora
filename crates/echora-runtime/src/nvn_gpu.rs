@@ -5480,6 +5480,12 @@ impl Nvn {
         } else {
             None
         };
+        self.graphics_addons.apply_compute_textures(
+            code_key,
+            &stage,
+            &mut self.gpu.as_mut().unwrap().renderer,
+            &mut textures,
+        )?;
         let sampled_textures: Vec<_> = stage
             .descriptors
             .iter()

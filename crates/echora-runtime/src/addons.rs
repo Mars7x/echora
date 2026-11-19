@@ -1,5 +1,13 @@
 //! Build-specific guest options selected outside the graphics backend.
 
+use std::collections::HashMap;
+
+use echora_gpu::{
+    ash::vk,
+    draw::{ImageShape, Sampler, TextureSource},
+    renderer::Renderer,
+    shader::{DescriptorKind, Translated},
+};
 use echora_loader::{NsoModule, process::PlacedModule};
 
 const OCARINA_TITLE_ID: u64 = 0x0400_4860_24de_c000;
@@ -10,6 +18,104 @@ const OCARINA_BUILD_ID: [u8; 32] = [
 const RESOLUTION_BRANCH: u64 = 0x80_5bd0;
 const RESOLUTION_BRANCH_WORD: u32 = 0x3600_41e8;
 const FIXED_RESOLUTION_PATH: u64 = 0x80_640c;
+const NDSR_NETWORK_STAGE: u64 = 0x4259_3194_bb0b_2b32;
+const NDSR_WEIGHT_HANDLE: u32 = 0xb8;
+const NEUTRAL_WEIGHTS_TARGET: u64 = u64::MAX - 7;
+
+#[derive(Debug, Default)]
+pub(crate) struct GraphicsAddons {
+    neutral_smaa_weights: bool,
+}
+
+impl GraphicsAddons {
+    pub(crate) fn for_game(program_id: u64, modules: &[PlacedModule], smaa: bool) -> Self {
+        let supported = modules.iter().any(|placed| {
+            placed.module.name == "main" && matches_ocarina_build(program_id, &placed.module)
+        });
+        Self {
+            neutral_smaa_weights: supported && !smaa,
+        }
+    }
+
+    fn weight_binding(&self, code_key: u64, stage: &Translated) -> Option<u32> {
+        if !self.neutral_smaa_weights || code_key != NDSR_NETWORK_STAGE {
+            return None;
+        }
+        stage
+            .descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind() == DescriptorKind::Texture
+                    && descriptor.cbuf_index == 0
+                    && descriptor.cbuf_offset == NDSR_WEIGHT_HANDLE
+                    && descriptor.texture_type == 2
+            })
+            .map(|descriptor| descriptor.binding)
+    }
+
+    /// The game's network consumes the SMAA weight plane. A cleared plane
+    /// disables its contribution while the game's network and output pass
+    /// continue to run, including the adaptive-resolve path.
+    pub(crate) fn apply_compute_textures(
+        &self,
+        code_key: u64,
+        stage: &Translated,
+        renderer: &mut Renderer,
+        textures: &mut HashMap<u32, (TextureSource, Sampler)>,
+    ) -> Result<(), String> {
+        let Some(binding) = self.weight_binding(code_key, stage) else {
+            return Ok(());
+        };
+        let Some((source, _)) = textures.get_mut(&binding) else {
+            return Ok(());
+        };
+        let target = match *source {
+            TextureSource::Target(key)
+            | TextureSource::TargetView {
+                key,
+                base_level: 0,
+                base_layer: 0,
+                ..
+            } => key,
+            _ => return Ok(()),
+        };
+        let Some(original) = renderer.existing_target(target).filter(|target| {
+            target.format == vk::Format::R8G8B8A8_UNORM
+                && target.shape == (ImageShape::D2 { layers: 1 })
+                && target.levels == 1
+        }) else {
+            return Ok(());
+        };
+        let (width, height, shape, format) = (
+            original.width,
+            original.height,
+            original.shape,
+            original.format,
+        );
+        let reusable = renderer
+            .existing_target(NEUTRAL_WEIGHTS_TARGET)
+            .is_some_and(|target| (target.width, target.height) == (width, height));
+        if !reusable {
+            renderer.guest_sized_target(NEUTRAL_WEIGHTS_TARGET, width, height, shape, format, 1)?;
+            renderer.clear_color(
+                NEUTRAL_WEIGHTS_TARGET,
+                None,
+                vk::ClearColorValue { float32: [0.0; 4] },
+            )?;
+        }
+        match source {
+            TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                *key = NEUTRAL_WEIGHTS_TARGET;
+            }
+            TextureSource::Upload { .. } => unreachable!(),
+        }
+        Ok(())
+    }
+}
+
+fn matches_ocarina_build(program_id: u64, module: &NsoModule) -> bool {
+    program_id == OCARINA_TITLE_ID && module.build_id == OCARINA_BUILD_ID
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolutionBranch {
@@ -30,7 +136,7 @@ fn match_resolution_branch(
     module: &NsoModule,
     base: u64,
 ) -> Option<ResolutionBranch> {
-    if program_id != OCARINA_TITLE_ID || module.build_id != OCARINA_BUILD_ID {
+    if !matches_ocarina_build(program_id, module) {
         return None;
     }
     let text_start = u64::from(module.text.memory_offset);
@@ -57,6 +163,52 @@ fn match_resolution_branch(
 mod tests {
     use super::*;
     use echora_loader::{Compression, Segment};
+
+    #[test]
+    fn smaa_override_only_selects_the_network_weight_binding() {
+        use echora_gpu::shader::Descriptor;
+        use echora_shader_abi::{ABI_VERSION, Stage};
+        let stage = Translated {
+            abi_version: ABI_VERSION,
+            stage: Stage::Compute,
+            spirv: Vec::new(),
+            descriptors: vec![
+                Descriptor {
+                    kind: 4,
+                    binding: 1,
+                    count: 1,
+                    cbuf_offset: 0xa8,
+                    texture_type: 2,
+                    ..Default::default()
+                },
+                Descriptor {
+                    kind: 4,
+                    binding: 2,
+                    count: 1,
+                    cbuf_offset: NDSR_WEIGHT_HANDLE,
+                    texture_type: 2,
+                    ..Default::default()
+                },
+            ],
+            cbuf_used_sizes: [0; 18],
+            loaded_generics: 0,
+            stored_generics: 0,
+            stores: [0; 8],
+            frag_colors: 0,
+            spec_constants: Vec::new(),
+            push_fields: 0,
+            texture_pool_bindings: 0,
+        };
+        let off = GraphicsAddons {
+            neutral_smaa_weights: true,
+        };
+        assert_eq!(off.weight_binding(NDSR_NETWORK_STAGE, &stage), Some(2));
+        assert_eq!(off.weight_binding(NDSR_NETWORK_STAGE + 1, &stage), None);
+        assert_eq!(
+            GraphicsAddons::default().weight_binding(NDSR_NETWORK_STAGE, &stage),
+            None
+        );
+    }
 
     #[test]
     fn fixed_resolution_requires_the_matching_executable_and_branch() {

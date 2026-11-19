@@ -199,6 +199,8 @@ pub struct AddonSettings {
 pub struct OcarinaOfTimeAddons {
     /// Let the game vary its scene resolution as it does on the console.
     pub dynamic_resolution: bool,
+    /// Use the game's SMAA blend weights in its NDSR pass.
+    pub smaa: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +400,7 @@ pub enum SettingKey {
     Backend,
     GraphicsDevice,
     OcarinaOfTimeDynamicResolution,
+    OcarinaOfTimeSmaa,
     FrameLimit,
     AudioDevice,
     Volume,
@@ -421,7 +424,9 @@ impl SettingKey {
             // different device is not supported, so these wait for a restart.
             Self::Backend | Self::GraphicsDevice => GameRestart,
             // Workers are set up when the game starts.
-            Self::Workers | Self::OcarinaOfTimeDynamicResolution => GameRestart,
+            Self::Workers | Self::OcarinaOfTimeDynamicResolution | Self::OcarinaOfTimeSmaa => {
+                GameRestart
+            }
         }
     }
 }
@@ -589,6 +594,10 @@ impl Settings {
             a.addons.ocarina_of_time.dynamic_resolution
                 != b.addons.ocarina_of_time.dynamic_resolution,
             SettingKey::OcarinaOfTimeDynamicResolution,
+        );
+        diff(
+            a.addons.ocarina_of_time.smaa != b.addons.ocarina_of_time.smaa,
+            SettingKey::OcarinaOfTimeSmaa,
         );
         diff(a.frame.limit != b.frame.limit, SettingKey::FrameLimit);
         diff(a.audio.device != b.audio.device, SettingKey::AudioDevice);
@@ -808,6 +817,19 @@ mod tests {
             )]
         );
         assert_eq!(Settings::from_toml(&settings.to_toml()).unwrap(), settings);
+    }
+
+    #[test]
+    fn smaa_defaults_off_and_can_be_enabled() {
+        let defaults = Settings::from_toml("").unwrap();
+        assert!(!defaults.addons.ocarina_of_time.smaa);
+        let enabled = Settings::from_toml("[addons.ocarina_of_time]\nsmaa = true").unwrap();
+        assert!(enabled.addons.ocarina_of_time.smaa);
+        assert_eq!(
+            defaults.changes(&enabled),
+            [(SettingKey::OcarinaOfTimeSmaa, ApplyClass::GameRestart)]
+        );
+        assert_eq!(Settings::from_toml(&enabled.to_toml()).unwrap(), enabled);
     }
 
     #[test]

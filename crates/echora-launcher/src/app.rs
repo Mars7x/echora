@@ -1598,19 +1598,39 @@ impl Launcher {
                     page.push(
                         ui::group(
                             Some("Add-ons"),
-                            vec![switch(
-                                "ocarina-dynamic-resolution",
-                                ui::titles(
-                                    "Dynamic resolution",
-                                    Some("Let Ocarina of Time change its 3D resolution.".into()),
+                            vec![
+                                switch(
+                                    "ocarina-dynamic-resolution",
+                                    ui::titles(
+                                        "Dynamic resolution",
+                                        Some(
+                                            "Let Ocarina of Time change its 3D resolution.".into(),
+                                        ),
+                                    ),
+                                    settings.addons.ocarina_of_time.dynamic_resolution,
+                                    |settings| {
+                                        let options = &mut settings.addons.ocarina_of_time;
+                                        options.dynamic_resolution = !options.dynamic_resolution;
+                                    },
+                                    cx,
                                 ),
-                                settings.addons.ocarina_of_time.dynamic_resolution,
-                                |settings| {
-                                    let options = &mut settings.addons.ocarina_of_time;
-                                    options.dynamic_resolution = !options.dynamic_resolution;
-                                },
-                                cx,
-                            )],
+                                switch(
+                                    "ocarina-smaa",
+                                    ui::titles(
+                                        "SMAA",
+                                        Some(
+                                            "Smooth edges using Ocarina of Time's SMAA pass."
+                                                .into(),
+                                        ),
+                                    ),
+                                    settings.addons.ocarina_of_time.smaa,
+                                    |settings| {
+                                        let options = &mut settings.addons.ocarina_of_time;
+                                        options.smaa = !options.smaa;
+                                    },
+                                    cx,
+                                ),
+                            ],
                         )
                         .into_any_element(),
                     );
