@@ -41,15 +41,19 @@ to be missing or incomplete.
 - Audio output is not resampled, so the device must accept the game's
   sample rate. Six channels are mixed down to two where the device cannot
   play six.
-- In the first 3D scene, which runs below full speed, the game's sound comes
-  only in short pieces; this has not been looked into yet.
+- The guest sometimes sets voice gains to zero during the opening. In an
+  isolated 2160p Wayland run, the mixer and host recording stayed aligned
+  across sampled movie and forest audio. Display-to-speaker synchronization
+  still needs direct measurement.
 
 ## Performance
 
 - The console runs the game at 60 frames per second. The opening movie
   reaches that speed in Echora. Recent full-opening runs on a Ryzen 7
-  5800X3D and Radeon RX 9070 XT averaged about 20 FPS over 600 forest
-  frames at 2560×1440. The camera and draw workload can vary between runs.
+  5800X3D and Radeon RX 9070 XT averaged about 20 FPS over 600 frames
+  in the first 3D scene at both 2560×1440 and 3840×2160. A longer 2160p
+  Wayland run averaged about 14 FPS over 1,600 frames deeper into the forest.
+  The camera and draw workload can vary between runs.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its
