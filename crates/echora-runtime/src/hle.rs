@@ -179,7 +179,12 @@ pub fn zstd_stream_site(module: &NsoModule) -> Option<(u64, u64)> {
 
 /// Host zstd streams, one per guest stream object the host began.
 #[derive(Default)]
-pub struct ZstdStreams(std::collections::HashMap<u64, zstd::zstd_safe::DCtx<'static>>);
+pub struct ZstdStreams {
+    contexts: std::collections::HashMap<u64, zstd::zstd_safe::DCtx<'static>>,
+    /// Host calls feed one stream at a time, so they can share bounded scratch.
+    input: Vec<u8>,
+    output: Vec<u8>,
+}
 
 /// One call of the streaming reader's decoder (see [`ZstdStreamBuild`]):
 /// `Some(result)` when the host performed it, `None` when the guest decoder
@@ -195,6 +200,7 @@ pub fn zstd_stream_feed(
     use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer};
     const FAILED: u8 = 3;
     const FINISHED: u8 = 4;
+    const SCRATCH_SIZE: usize = 1 << 20;
     let state = memory.read_u8(stream)?;
     match state {
         FAILED => return Ok(Some(-1i32 as u32)),
@@ -228,17 +234,24 @@ pub fn zstd_stream_feed(
                 }
             }
             memory.write_u8(stream, 2)?;
-            streams.0.insert(stream, fresh);
+            streams.contexts.insert(stream, fresh);
         }
-        _ if !streams.0.contains_key(&stream) => return Ok(None),
+        _ if !streams.contexts.contains_key(&stream) => return Ok(None),
         _ => {}
     }
     let input_length = u64::try_from(size.max(0)).unwrap_or(0).min(MAX_INPUT) as usize;
-    let mut input_bytes = vec![0; input_length];
-    memory.read(source, &mut input_bytes)?;
-    let context = streams.0.get_mut(&stream).expect("present above");
-    let mut input = InBuffer::around(&input_bytes);
-    let mut chunk = vec![0u8; 1 << 20];
+    let mut large_input = Vec::new();
+    let input_bytes = if input_length <= SCRATCH_SIZE {
+        &mut streams.input
+    } else {
+        &mut large_input
+    };
+    input_bytes.resize(input_length, 0);
+    memory.read(source, input_bytes)?;
+    let context = streams.contexts.get_mut(&stream).expect("present above");
+    let mut input = InBuffer::around(input_bytes);
+    let chunk = &mut streams.output;
+    chunk.resize(SCRATCH_SIZE, 0);
     let mut finished = false;
     let mut failed = None;
     loop {
@@ -280,7 +293,7 @@ pub fn zstd_stream_feed(
         }
     }
     if let Some(code) = failed {
-        streams.0.remove(&stream);
+        streams.contexts.remove(&stream);
         memory.write_u8(stream, FAILED)?;
         let result = if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL {
             -2
@@ -290,7 +303,7 @@ pub fn zstd_stream_feed(
         return Ok(Some(result as u32));
     }
     if finished {
-        streams.0.remove(&stream);
+        streams.contexts.remove(&stream);
         memory.write_u8(stream, FINISHED)?;
     }
     Ok(Some(memory.read_u32(stream + 0x14)?))
@@ -758,6 +771,19 @@ mod tests {
         // Finished: -3; a dictionary or a guest-begun stream: the guest's.
         let again = zstd_stream_feed(&mut streams, &mut memory, stream, source, 4, 0);
         assert_eq!(again.unwrap(), Some(-3i32 as u32));
+        let input_capacity = streams.input.capacity();
+        let output_buffer = streams.output.as_ptr();
+        memory.write_u8(stream, 1).unwrap();
+        memory.write_u64(stream + 0x8, output).unwrap();
+        memory.write_u32(stream + 0x10, text.len() as u32).unwrap();
+        assert_eq!(
+            zstd_stream_feed(&mut streams, &mut memory, stream, source, (1 << 20) + 1, 0).unwrap(),
+            Some(0)
+        );
+        assert_eq!(streams.input.capacity(), input_capacity);
+        assert_eq!(streams.output.as_ptr(), output_buffer);
+        memory.read(output, &mut out).unwrap();
+        assert_eq!(out, text);
         memory.write_u8(stream, 1).unwrap();
         assert_eq!(
             zstd_stream_feed(&mut streams, &mut memory, stream, source, 4, 0x11000).unwrap(),
