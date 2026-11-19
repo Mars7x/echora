@@ -9987,6 +9987,87 @@ mod tests {
     }
 
     #[test]
+    fn compute_fetch_and_per_tap_gather_follow_the_bound_texture_format() {
+        use crate::compute::{SampleType, SampledTexture};
+        let fetch = word(&[
+            (0, 12, 0xb66),
+            (16, 8, 10),
+            (24, 8, 0),
+            (32, 8, 1),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 255),
+            (72, 4, 1),
+            (81, 3, 7),
+            (87, 3, 1),
+        ]);
+        let gather = word(&[
+            (0, 12, 0xb63),
+            (16, 8, 12),
+            (24, 8, 2),
+            (32, 8, 4),
+            (40, 14, 0x10),
+            (61, 3, 1),
+            (64, 8, 14),
+            (72, 4, 0xf),
+            (76, 2, 2),
+            (81, 3, 7),
+        ]);
+        let program = [
+            mov(0, 0),
+            mov(1, 0),
+            mov(2, 0.5f32.to_bits()),
+            mov(3, 0.5f32.to_bits()),
+            mov(4, 0),
+            mov(5, 0),
+            fetch,
+            gather,
+            EXIT,
+        ];
+        let code: Vec<_> = program.into_iter().map(decode).collect();
+        for (sample_type, value) in [
+            (SampleType::Float, 0.25f32.to_bits()),
+            (SampleType::Unsigned, 0x4321),
+            (SampleType::Signed, (-123i32) as u32),
+        ] {
+            let layout = Layout {
+                sampled_textures: &[SampledTexture {
+                    bank: 0,
+                    offset: 0x40,
+                    view: 2,
+                    sample_type,
+                }],
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (program, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&program.spirv), None);
+            let [descriptor] = program.descriptors.as_slice() else {
+                panic!("one resource must supply both instructions");
+            };
+            let machine = Machine::new(&program.spirv);
+            let image = Image {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 1,
+                texels: vec![[value, 0, 0, 0]; 4].into(),
+            };
+            let report = machine.simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                images: [((0, descriptor.binding), image)].into(),
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            for register in [10, 12, 13, 14, 15] {
+                assert_eq!(
+                    report.invocations[0][&registers[&register]][0],
+                    u64::from(value)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn vertex_programs_sample_at_explicit_levels_and_fetch_texels_exactly() {
         use echora_shader_abi::Stage;
         // An R32F 2 x 2 texture (texel (x, y) = x + 2y; level 1 holds 10)

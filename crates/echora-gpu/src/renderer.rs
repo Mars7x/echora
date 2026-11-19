@@ -8486,32 +8486,38 @@ pub(crate) fn declared_image_format(flags: u32) -> Option<vk::Format> {
 /// Whether texels of `format` are integers (read through int or uint
 /// images), as SpecMeaning::IntegerFormat asks.
 pub fn integer_format(format: vk::Format) -> bool {
+    sampled_texture_type(format) != crate::shader::SampleType::Float
+}
+
+/// SPIR-V sampled type required by a texture format.
+pub fn sampled_texture_type(format: vk::Format) -> crate::shader::SampleType {
+    use crate::shader::SampleType;
     use vk::Format as F;
-    matches!(
-        format,
+    match format {
         F::R8_UINT
-            | F::R8_SINT
-            | F::R8G8_UINT
-            | F::R8G8_SINT
-            | F::R8G8B8A8_UINT
-            | F::R8G8B8A8_SINT
-            | F::R16_UINT
-            | F::R16_SINT
-            | F::R16G16_UINT
-            | F::R16G16_SINT
-            | F::R16G16B16A16_UINT
-            | F::R16G16B16A16_SINT
-            | F::R32_UINT
-            | F::R32_SINT
-            | F::R32G32_UINT
-            | F::R32G32_SINT
-            | F::R32G32B32_UINT
-            | F::R32G32B32_SINT
-            | F::R32G32B32A32_UINT
-            | F::R32G32B32A32_SINT
-            | F::A2B10G10R10_UINT_PACK32
-            | F::S8_UINT
-    )
+        | F::R8G8_UINT
+        | F::R8G8B8A8_UINT
+        | F::R16_UINT
+        | F::R16G16_UINT
+        | F::R16G16B16A16_UINT
+        | F::R32_UINT
+        | F::R32G32_UINT
+        | F::R32G32B32_UINT
+        | F::R32G32B32A32_UINT
+        | F::A2B10G10R10_UINT_PACK32
+        | F::S8_UINT => SampleType::Unsigned,
+        F::R8_SINT
+        | F::R8G8_SINT
+        | F::R8G8B8A8_SINT
+        | F::R16_SINT
+        | F::R16G16_SINT
+        | F::R16G16B16A16_SINT
+        | F::R32_SINT
+        | F::R32G32_SINT
+        | F::R32G32B32_SINT
+        | F::R32G32B32A32_SINT => SampleType::Signed,
+        _ => SampleType::Float,
+    }
 }
 
 /// `usage`, plus device addresses when the device supports them.

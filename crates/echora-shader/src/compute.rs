@@ -457,9 +457,28 @@ fn handle_words(code: &[Instruction]) -> BTreeMap<u8, (u8, u16)> {
         .collect()
 }
 
+/// Numeric type of a bound texture's texels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SampleType {
+    #[default]
+    Float,
+    Unsigned,
+    Signed,
+}
+
+/// An integer view used by a bound texture instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SampledTexture {
+    pub bank: u32,
+    pub offset: u32,
+    pub view: u32,
+    pub sample_type: SampleType,
+}
+
 /// What a program needs beyond its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Layout {
+pub struct Layout<'a> {
+    pub sampled_textures: &'a [SampledTexture],
     pub stage: Stage,
     /// A graphics program's header.
     pub header: Option<crate::header::Header>,
@@ -542,10 +561,11 @@ pub enum MatrixPath {
     Exact,
 }
 
-impl Layout {
+impl Layout<'_> {
     /// A layout with only a workgroup size.
     pub fn workgroup(workgroup: [u32; 3]) -> Self {
         Self {
+            sampled_textures: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -621,7 +641,7 @@ struct Emitter {
     /// The 64-bit integer type, declared (with the Int64 capability) on
     /// first use.
     u64: Option<u32>,
-    layout: Layout,
+    layout: Layout<'static>,
     stage: Stage,
     header: Option<crate::header::Header>,
     memory: memory::Memory,
@@ -663,6 +683,7 @@ struct Emitter {
     /// Combined image samplers by handle bank, offset, texture type and
     /// depth comparison.
     textures: BTreeMap<(u8, u16, u32, bool), u32>,
+    sampled_textures: Vec<SampledTexture>,
     /// Cooperative-matrix scratch by component type, and whether any
     /// cooperative matrix is used.
     matrix_scratch: BTreeMap<u32, u32>,
@@ -763,7 +784,10 @@ impl Emitter {
             uniform_registers: BTreeMap::new(),
             uniform: false,
             u64: None,
-            layout: *layout,
+            layout: Layout {
+                sampled_textures: &[],
+                ..*layout
+            },
             stage: layout.stage,
             header: layout.header,
             memory: memory::Memory::default(),
@@ -786,6 +810,7 @@ impl Emitter {
             descriptors: Vec::new(),
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
+            sampled_textures: layout.sampled_textures.to_vec(),
             images: BTreeMap::new(),
             atomic_images: BTreeMap::new(),
             mesh: None,
@@ -4098,6 +4123,7 @@ mod tests {
             EXIT,
         ];
         let layout = Layout {
+            sampled_textures: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -4356,6 +4382,7 @@ mod tests {
             EXIT,
         ];
         let layout = Layout {
+            sampled_textures: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -5255,6 +5282,7 @@ mod tests {
             EXIT,
         ];
         let layout = Layout {
+            sampled_textures: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,

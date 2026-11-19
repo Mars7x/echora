@@ -8,7 +8,7 @@ use echora_shader_abi::{
     TEXTURE_POOL_SET, Unsupported, texture_pool,
 };
 
-use super::{Emitter, Known, unsupported};
+use super::{Emitter, Known, SampleType, unsupported};
 use crate::decode::{Texture, TextureOp};
 use crate::spirv::{Type, capability, decoration, glsl, op, storage};
 
@@ -64,6 +64,7 @@ const FLAG_DEPTH: u32 = 8;
 struct Types {
     sampled: u32,
     image: u32,
+    component: u32,
 }
 
 /// A pool texture's float and uint views (bindings and types), its index,
@@ -84,15 +85,23 @@ pub(super) struct PoolViews {
 }
 
 impl Emitter {
-    fn texture_types(&mut self, view: &View, depth: bool) -> Types {
+    fn texture_types(&mut self, view: &View, depth: bool, sample_type: SampleType) -> Types {
         if view.dim == 0 {
             self.module.capability(capability::SAMPLED_1D);
         }
         if view.dim == 3 && view.arrayed {
             self.module.capability(capability::SAMPLED_CUBE_ARRAY);
         }
+        let component = match sample_type {
+            SampleType::Float => self.f32,
+            SampleType::Unsigned => self.u32,
+            SampleType::Signed => self.module.ty(Type::Int {
+                width: 32,
+                signed: true,
+            }),
+        };
         let image = self.module.ty(Type::Image {
-            sampled_type: self.f32,
+            sampled_type: component,
             dim: view.dim,
             depth: u32::from(depth),
             arrayed: view.arrayed,
@@ -101,13 +110,27 @@ impl Emitter {
             format: 0,
         });
         let sampled = self.module.ty(Type::SampledImage { image });
-        Types { sampled, image }
+        Types {
+            sampled,
+            image,
+            component,
+        }
     }
 
     /// The combined image sampler for a handle word and view, declared and
     /// reported on first use.
     fn texture_variable(&mut self, texture: &Texture, view: &View, depth: bool) -> (u32, Types) {
-        let types = self.texture_types(view, depth);
+        let sample_type = self
+            .sampled_textures
+            .iter()
+            .find(|bound| {
+                !depth
+                    && bound.bank == u32::from(texture.bank)
+                    && bound.offset == u32::from(texture.handle_offset)
+                    && bound.view == view.texture_type
+            })
+            .map_or(SampleType::Float, |bound| bound.sample_type);
+        let types = self.texture_types(view, depth, sample_type);
         let key = (
             texture.bank,
             texture.handle_offset,
@@ -175,7 +198,7 @@ impl Emitter {
         };
         // The pool's images take no depth flag: the sampler's state
         // decides a comparison.
-        let types = self.texture_types(view, false);
+        let types = self.texture_types(view, false, SampleType::Float);
         let (texture_index, inside, sampler_index) = self.pool_handle(handle);
         self.pool_inside = Some(match self.pool_inside {
             Some(before) => self.value(op::LOGICAL_AND, self.bool, &[before, inside]),
@@ -673,7 +696,7 @@ impl Emitter {
             self.vector(self.f32, &floats)
         };
         let vec4 = self.module.ty(Type::Vector {
-            component: self.f32,
+            component: types.component,
             count: 4,
         });
         // Image operands: a level (explicit; a compute program has no
@@ -753,8 +776,7 @@ impl Emitter {
                     op::IMAGE_GATHER
                 };
                 let gathered = self.value(opcode, vec4, &operands);
-                let tap_value = self.value(op::COMPOSITE_EXTRACT, self.f32, &[gathered, tap]);
-                taps.push(self.value(op::BITCAST, self.u32, &[tap_value]));
+                taps.push(self.texel_bits(types, gathered, tap));
             }
             return Ok(taps);
         }
@@ -898,12 +920,16 @@ impl Emitter {
                 unreachable!("queries are not reads")
             }
         };
-        Ok((0..4)
-            .map(|n| {
-                let component = self.value(op::COMPOSITE_EXTRACT, self.f32, &[result, n]);
-                self.value(op::BITCAST, self.u32, &[component])
-            })
-            .collect())
+        Ok((0..4).map(|n| self.texel_bits(types, result, n)).collect())
+    }
+
+    fn texel_bits(&mut self, types: Types, result: u32, component: u32) -> u32 {
+        let value = self.value(op::COMPOSITE_EXTRACT, types.component, &[result, component]);
+        if types.component == self.u32 {
+            value
+        } else {
+            self.value(op::BITCAST, self.u32, &[value])
+        }
     }
 
     /// TMML: the level a sample would use and the unclamped level, as 8.8
@@ -994,9 +1020,9 @@ impl Emitter {
         let dx: Vec<u32> = d.iter().step_by(2).copied().collect();
         let dy: Vec<u32> = d.iter().skip(1).step_by(2).copied().collect();
         let (dx, dy) = (self.vector(self.f32, &dx), self.vector(self.f32, &dy));
-        let (sampled, _) = self.sampled_image(index, texture, view, false, None)?;
+        let (sampled, types) = self.sampled_image(index, texture, view, false, None)?;
         let vec4 = self.module.ty(Type::Vector {
-            component: self.f32,
+            component: types.component,
             count: 4,
         });
         let result = self.value(
@@ -1004,12 +1030,7 @@ impl Emitter {
             vec4,
             &[sampled, coordinate, OPERAND_GRAD, dx, dy],
         );
-        Ok((0..4)
-            .map(|n| {
-                let component = self.value(op::COMPOSITE_EXTRACT, self.f32, &[result, n]);
-                self.value(op::BITCAST, self.u32, &[component])
-            })
-            .collect())
+        Ok((0..4).map(|n| self.texel_bits(types, result, n)).collect())
     }
 
     /// TXQ (the dimension query): the texture's size, as textureSize gives

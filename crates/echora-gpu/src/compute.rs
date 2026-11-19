@@ -397,6 +397,136 @@ mod tests {
     use crate::vulkan::Gpu;
 
     #[test]
+    fn compute_fetch_matches_the_texture_view_numeric_type() {
+        use crate::draw::{ImageShape, UploadRegion};
+        use echora_shader::compute::{Layout, SampledTexture, translate};
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        use std::sync::Arc;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() || !gpu.buffer_device_address {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let word = |fields: &[(u32, u128)]| {
+            echora_shader::decode(
+                fields
+                    .iter()
+                    .fold(7 << 12, |word, &(shift, value)| word | value << shift),
+            )
+        };
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let guest_address = 0x1_0000u32;
+        let fetch = word(&[
+            (0, 0xb66),
+            (16, 10),
+            (24, 255),
+            (32, 255),
+            (40, 0x10),
+            (61, 1),
+            (64, 255),
+            (72, 1),
+            (81, 7),
+            (87, 1),
+        ]);
+        let store = word(&[(0, 0x386), (24, 4), (32, 10), (72, 1), (73, 4)]);
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let code = [
+            mov(4, u128::from(guest_address)),
+            mov(5, 0),
+            fetch,
+            store,
+            exit,
+        ];
+        let output = 1;
+        let (buffer, _) = renderer.resident_buffer(output, PAGE_SIZE).unwrap();
+        let address = renderer.buffer_address(buffer).unwrap();
+        let table = renderer
+            .set_page_table(guest_address >> PAGE_SHIFT, &[address])
+            .unwrap();
+        for (index, (view, texel, expected)) in [
+            (vk::Format::R16G16_UINT, 0x4321u16, 0x4321),
+            (vk::Format::R16G16_SINT, (-123i16) as u16, (-123i32) as u32),
+            (vk::Format::R16G16_UNORM, u16::MAX, 1.0f32.to_bits()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            renderer.fill_resident(output, 0, 4, 0).unwrap();
+            let formats = [SampledTexture {
+                bank: 0,
+                offset: 0x40,
+                view: 2,
+                sample_type: crate::renderer::sampled_texture_type(view),
+            }];
+            let stage = Arc::new(
+                translate(
+                    &code,
+                    &Layout {
+                        sampled_textures: &formats,
+                        ..Layout::workgroup([1, 1, 1])
+                    },
+                )
+                .unwrap(),
+            );
+            let binding = stage
+                .descriptors
+                .iter()
+                .find(|d| d.kind() == DescriptorKind::Texture)
+                .unwrap()
+                .binding;
+            let program = renderer.create_program(vec![stage]).unwrap();
+            let source = TextureSource::Upload {
+                key: 2 + index as u64,
+                generation: 1,
+                width: 1,
+                height: 1,
+                shape: ImageShape::D2 { layers: 1 },
+                format: view,
+                texels: Arc::new([texel, 0].into_iter().flat_map(u16::to_le_bytes).collect()),
+                levels: vec![UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    offset: 0,
+                }]
+                .into(),
+            };
+            let sampler = Sampler {
+                min_filter: vk::Filter::NEAREST,
+                mag_filter: vk::Filter::NEAREST,
+                ..Sampler::default()
+            };
+            let dispatch = Dispatch {
+                program: &program,
+                groups: [1, 1, 1],
+                uniforms: HashMap::new(),
+                storage: HashMap::new(),
+                storage_in_place: HashMap::new(),
+                textures: [(binding, (source, sampler))].into(),
+                images: HashMap::new(),
+                image_formats: HashMap::new(),
+                indirect: None,
+                page_table: table,
+                pool: Default::default(),
+            };
+            renderer.dispatch(&dispatch).unwrap();
+            let token = renderer.read_resident(output, 0, 4).unwrap();
+            renderer.flush().unwrap();
+            assert_eq!(
+                renderer.take_reads(&[token])[&token],
+                expected.to_le_bytes(),
+                "{view:?}"
+            );
+            renderer.destroy_program(program).unwrap();
+        }
+    }
+
+    #[test]
     fn a_dispatch_stores_a_uniform_into_a_storage_buffer() {
         let Ok(gpu) = Gpu::new() else {
             return; // No device (CI).

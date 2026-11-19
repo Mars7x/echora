@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 
+pub use echora_shader::compute::{SampleType, SampledTexture};
 pub use echora_shader::handle_reads;
 pub use echora_shader::jump_tables::{JumpTables, JumpTargets};
 pub use echora_shader_abi::{
@@ -119,6 +120,15 @@ pub fn translate_rust_with_compute_constants(
     parameters: &Parameters,
     constants: Option<&[u8]>,
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
+    translate_rust_with_sampled_textures(program, parameters, constants, &[])
+}
+
+pub fn translate_rust_with_sampled_textures(
+    program: &[u8],
+    parameters: &Parameters,
+    constants: Option<&[u8]>,
+    sampled_textures: &[SampledTexture],
+) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
         previous_stores: parameters.previous_stores,
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
@@ -126,12 +136,13 @@ pub fn translate_rust_with_compute_constants(
         ..Default::default()
     };
     let parameters = abi_parameters(parameters);
-    let translated = match constants {
-        Some(bytes) => {
-            echora_shader::translate_with_compute_constants(program, &parameters, &options, bytes)
-        }
-        None => echora_shader::translate_with_options(program, &parameters, &options),
-    }?;
+    let translated = echora_shader::translate_with_sampled_textures(
+        program,
+        &parameters,
+        &options,
+        constants,
+        sampled_textures,
+    )?;
     if translated.abi_version != ABI_VERSION {
         return Err(echora_shader_abi::Unsupported {
             reason: format!(

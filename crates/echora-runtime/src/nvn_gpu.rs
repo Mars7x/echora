@@ -592,6 +592,7 @@ type TranslationKey = (
     Option<MeshParameters>,
     bool,
     Option<Arc<shader::JumpTargets>>,
+    Vec<shader::SampledTexture>,
 );
 
 struct ComputeJumps {
@@ -1645,6 +1646,7 @@ impl Nvn {
         compute: [u32; 5],
         mesh: Option<MeshParameters>,
         compute_constants: Option<&[u8]>,
+        sampled_textures: &[shader::SampledTexture],
     ) -> Result<(Arc<Translated>, u64), String> {
         let (code, key) = self
             .stage_code(core, gpu)
@@ -1678,6 +1680,7 @@ impl Nvn {
             mesh,
             native_pointers,
             jump_targets,
+            sampled_textures.to_vec(),
         );
         if let Some(found) = backend.translations.get(&cache_key) {
             return found.clone().map(|stage| (stage, key));
@@ -1776,10 +1779,11 @@ impl Nvn {
             // that holds it; elsewhere such programs stay with the plugin.
             let rust = (translator != shader::Translator::Plugin)
                 .then(|| {
-                    shader::translate_rust_with_compute_constants(
+                    shader::translate_rust_with_sampled_textures(
                         &code,
                         &parameters,
                         constants_for_translation,
+                        sampled_textures,
                     )
                 })
                 .map(|result| {
@@ -2037,8 +2041,17 @@ impl Nvn {
             .state
             .get("BindVertexAttribState")
             .map_or([0; 32], |bind| generic_input_types(&bind.states));
-        let (vertex, vertex_key) =
-            self.translate_stage(core, addresses[0], [0; 3], None, types, [0; 5], None, None)?;
+        let (vertex, vertex_key) = self.translate_stage(
+            core,
+            addresses[0],
+            [0; 3],
+            None,
+            types,
+            [0; 5],
+            None,
+            None,
+            &[],
+        )?;
         let binding_base = vertex
             .descriptors
             .iter()
@@ -2068,6 +2081,7 @@ impl Nvn {
             [0; 5],
             None,
             None,
+            &[],
         )?;
         if vertex.stage != Stage::Vertex || fragment.stage != Stage::Fragment {
             return Err(format!(
@@ -2247,6 +2261,7 @@ impl Nvn {
                 [0; 5],
                 Some(parameters),
                 None,
+                &[],
             )?;
             if stage.stage != Stage::Task {
                 return Err(format!("the task program translated as {:?}", stage.stage));
@@ -2270,6 +2285,7 @@ impl Nvn {
             [0; 5],
             Some(parameters),
             None,
+            &[],
         )?;
         if stage.stage != Stage::Mesh {
             return Err(format!("the mesh program translated as {:?}", stage.stage));
@@ -2288,6 +2304,7 @@ impl Nvn {
             [0; 5],
             None,
             None,
+            &[],
         )?;
         if stage.stage != Stage::Fragment {
             return Err(format!(
@@ -4674,6 +4691,7 @@ impl Nvn {
             compute,
             None,
             constants.as_deref(),
+            &[],
         )?;
         // Storage pointers the NVN tracking found outside c0 were constants,
         // not addresses (floats 1.0 and 10.0 in c1): such a program reads
@@ -4694,6 +4712,7 @@ impl Nvn {
                 compute,
                 None,
                 constants.as_deref(),
+                &[],
             )?;
         }
         if stage.stage != Stage::Compute {
@@ -5390,6 +5409,38 @@ impl Nvn {
         } else {
             None
         };
+        let sampled_textures: Vec<_> = stage
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (source, _) = textures.get(&descriptor.binding)?;
+                let format = self.gpu.as_ref()?.renderer.source_format(source)?;
+                let sample_type = echora_gpu::renderer::sampled_texture_type(format);
+                (sample_type != shader::SampleType::Float).then_some(shader::SampledTexture {
+                    bank: descriptor.cbuf_index,
+                    offset: descriptor.cbuf_offset,
+                    view: descriptor.texture_type,
+                    sample_type,
+                })
+            })
+            .collect();
+        if !sampled_textures.is_empty() {
+            let (typed, _) = self.translate_stage(
+                core,
+                address,
+                [0; 3],
+                None,
+                [0; 32],
+                compute,
+                None,
+                constants.as_deref(),
+                &sampled_textures,
+            )?;
+            if typed.descriptors != stage.descriptors {
+                return Err("integer texture formats changed the compute descriptor layout".into());
+            }
+            stage = typed;
+        }
         // The program, specialized for what is bound: an IntegerFormat
         // constant is 1 when its binding's image or texture is integer. Each
         // combination has its own program for this exact translation.
