@@ -242,6 +242,79 @@ pub fn ratio(source_rate: u32, target_rate: u32, pitch: f32) -> u64 {
     }
 }
 
+const FILTER_PHASES: usize = 128;
+
+struct Polyphase<const TAPS: usize>([[f32; TAPS]; FILTER_PHASES]);
+
+impl<const TAPS: usize> Polyphase<TAPS> {
+    const fn new(table: &[f32]) -> Self {
+        assert!(table.len() == FILTER_PHASES * TAPS);
+        assert!(TAPS <= 8);
+        let mut phases = [[0.0; TAPS]; FILTER_PHASES];
+        let mut phase = 0;
+        while phase < FILTER_PHASES {
+            let mut tap = 0;
+            while tap < TAPS {
+                let gain = table[phase * TAPS + tap];
+                assert!(gain.abs() <= 1.0);
+                phases[phase][tap] = gain;
+                tap += 1;
+            }
+            phase += 1;
+        }
+        Self(phases)
+    }
+
+    fn resample(&self, output: &mut [i32], input: &[i16], ratio: u64, fraction: &mut u64) {
+        let mut read = 0usize;
+        for slot in output {
+            let filter = &self.0[((*fraction & (FRACTION_ONE - 1)) >> 8) as usize];
+            #[expect(
+                unsafe_code,
+                reason = "the filter bank bounds the PCM tap product at compile time"
+            )]
+            let product = |sample: i16, coefficient: f32| {
+                let scaled = f32::from(sample) * coefficient * 256.0;
+                // SAFETY: the verified coefficients are finite and at most one
+                // in magnitude. An i16 product with eight fractional bits
+                // fits in i32, as does the sum of the at most eight taps.
+                unsafe { scaled.to_int_unchecked::<i32>() }
+            };
+            let sum: i32 =
+                if let Some(samples) = input.get(read..).and_then(<[i16]>::first_chunk::<TAPS>) {
+                    samples
+                        .iter()
+                        .zip(filter)
+                        .map(|(&sample, &coefficient)| product(sample, coefficient))
+                        .sum()
+                } else {
+                    filter
+                        .iter()
+                        .enumerate()
+                        .map(|(tap, &coefficient)| {
+                            product(input.get(read + tap).copied().unwrap_or(0), coefficient)
+                        })
+                        .sum()
+                };
+            *slot = sum >> 8;
+            *fraction += ratio;
+            read += (*fraction >> 15) as usize;
+            *fraction &= FRACTION_ONE - 1;
+        }
+    }
+}
+
+const HIGH_FILTERS: [Polyphase<8>; 3] = [
+    Polyphase::new(&HIGH_0),
+    Polyphase::new(&HIGH_1),
+    Polyphase::new(&HIGH_2),
+];
+const NORMAL_FILTERS: [Polyphase<4>; 3] = [
+    Polyphase::new(&NORMAL_0),
+    Polyphase::new(&NORMAL_1),
+    Polyphase::new(&NORMAL_2),
+];
+
 /// Resample `input` (history first, then new samples) into `output` at
 /// `ratio`, starting at phase `fraction` (both 15-bit fixed point);
 /// `fraction` is left as the next frame's phase.
@@ -252,8 +325,6 @@ pub fn resample(
     fraction: &mut u64,
     quality: Quality,
 ) {
-    let sample = |index: usize| f32::from(input.get(index).copied().unwrap_or(0));
-    let mut read = 0usize;
     match quality {
         Quality::Low => {
             if ratio == FRACTION_ONE {
@@ -262,6 +333,7 @@ pub fn resample(
                 }
                 return;
             }
+            let mut read = 0usize;
             for slot in output.iter_mut() {
                 let at = read + usize::from(*fraction >= FRACTION_ONE / 2);
                 *slot = i32::from(input.get(at).copied().unwrap_or(0));
@@ -271,29 +343,17 @@ pub fn resample(
             }
         }
         Quality::Medium | Quality::High => {
-            let taps = if quality == Quality::High { 8 } else { 4 };
-            // One table per ratio band: up to 1.0, below 1.3, above.
-            let unity = FRACTION_ONE;
-            let band = (FRACTION_ONE as f32 * 1.3) as u64;
-            let table: &[f32] = match (quality, ratio) {
-                (Quality::High, r) if r <= unity => &HIGH_2,
-                (Quality::High, r) if r < band => &HIGH_1,
-                (Quality::High, _) => &HIGH_0,
-                (_, r) if r <= unity => &NORMAL_2,
-                (_, r) if r < band => &NORMAL_1,
-                _ => &NORMAL_0,
+            let band = if ratio <= FRACTION_ONE {
+                2
+            } else if ratio < (FRACTION_ONE as f32 * 1.3) as u64 {
+                1
+            } else {
+                0
             };
-            for slot in output.iter_mut() {
-                let phase = ((*fraction & (FRACTION_ONE - 1)) >> 8) as usize * taps;
-                // Each product keeps 8 fractional bits; the sum floors.
-                let mut sum = 0i64;
-                for tap in 0..taps {
-                    sum += (sample(read + tap) * table[phase + tap] * 256.0) as i64;
-                }
-                *slot = (sum >> 8) as i32;
-                *fraction += ratio;
-                read += (*fraction >> 15) as usize;
-                *fraction &= FRACTION_ONE - 1;
+            if quality == Quality::High {
+                HIGH_FILTERS[band].resample(output, input, ratio, fraction);
+            } else {
+                NORMAL_FILTERS[band].resample(output, input, ratio, fraction);
             }
         }
     }
@@ -528,6 +588,48 @@ mod tests {
                 assert!((sample - 1000).abs() <= 2, "{quality:?} gave {sample}");
             }
             assert_eq!(fraction, 0);
+        }
+    }
+
+    #[test]
+    fn polyphase_matches_scalar_products_for_every_starting_phase() {
+        let input: [i16; 23] = std::array::from_fn(|i| match i % 4 {
+            0 => i16::MIN,
+            1 => i16::MAX,
+            2 => (i as i16).wrapping_mul(19381),
+            _ => 0,
+        });
+        for (quality, taps, tables) in [
+            (Quality::Medium, 4, [&NORMAL_0[..], &NORMAL_1, &NORMAL_2]),
+            (Quality::High, 8, [&HIGH_0[..], &HIGH_1, &HIGH_2]),
+        ] {
+            for (ratio, table) in [FRACTION_ONE * 2, FRACTION_ONE + 777, FRACTION_ONE]
+                .into_iter()
+                .zip(tables)
+            {
+                for phase in 0..128u64 {
+                    let initial = (phase << 8) | 255;
+                    let mut expected_phase = initial;
+                    let mut read = 0usize;
+                    let expected: [i32; 19] = std::array::from_fn(|_| {
+                        let coefficient = (expected_phase >> 8) as usize * taps;
+                        let sum = (0..taps)
+                            .map(|tap| {
+                                let sample = input.get(read + tap).copied().unwrap_or(0);
+                                (f32::from(sample) * table[coefficient + tap] * 256.0) as i64
+                            })
+                            .sum::<i64>();
+                        expected_phase += ratio;
+                        read += (expected_phase >> 15) as usize;
+                        expected_phase &= FRACTION_ONE - 1;
+                        (sum >> 8) as i32
+                    });
+                    let mut actual = [0; 19];
+                    let mut phase = initial;
+                    resample(&mut actual, &input, ratio, &mut phase, quality);
+                    assert_eq!((actual, phase), (expected, expected_phase));
+                }
+            }
         }
     }
 
