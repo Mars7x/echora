@@ -729,8 +729,6 @@ pub struct Nvn {
     /// The present ECHORA_TASK_DUMP=first dumps (the first with a mesh draw).
     #[serde(skip)]
     task_dump_present: Option<u64>,
-    #[serde(skip)]
-    input_types_memo: Option<(StateSnapshots, [u8; 32])>,
     /// The last vertex attribute and stream snapshots a draw read, with
     /// their props parsed (`parsed_vertex_state`), the snapshots kept
     /// alive so their addresses name them.

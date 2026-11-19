@@ -82,8 +82,8 @@ pub struct Backend {
     vertex_traces: HashMap<(u64, u64, usize), (usize, u64)>,
     /// Each debug buffer's device address, by its index.
     vertex_trace_addresses: Vec<u64>,
-    /// Linked programs by (vertex key, fragment key).
-    programs: HashMap<(u64, u64), Program>,
+    /// Linked graphics programs by translation identities and trace mode.
+    programs: HashMap<GraphicsProgramKey, Program>,
     /// Compute programs by translation identity and specialization bits.
     compute_programs: HashMap<(usize, u64), Program>,
     /// Counts of work skipped or approximated, by reason.
@@ -513,14 +513,19 @@ impl Backend {
     }
 }
 
-/// The key bits marking a program's vertex-traced variant
-/// (ECHORA_VERTEX_TRACE_BASE).
-const TRACED_VARIANT: u64 = 0x7472_6163_6564_0000;
+/// The translated vertex/fragment or task/mesh/fragment stages of a
+/// graphics pipeline. The cached Program keeps these Arc allocations alive.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct GraphicsProgramKey {
+    stages: [usize; 3],
+    traced: bool,
+}
 
 /// Translated stages and binding counts shared by draws of the program.
 #[derive(Debug)]
 pub(super) struct BoundProgram {
     keys: (u64, u64),
+    pipeline: GraphicsProgramKey,
     stages: Box<[Arc<Translated>]>,
     entries: Box<[super::Args]>,
     uniforms: usize,
@@ -538,8 +543,16 @@ impl BoundProgram {
                 _ => {}
             }
         }
+        let mut identities = [0; 3];
+        for (identity, stage) in identities[..stages.len()].iter_mut().zip(stages.iter()) {
+            *identity = Arc::as_ptr(stage) as usize;
+        }
         Self {
             keys,
+            pipeline: GraphicsProgramKey {
+                stages: identities,
+                traced: false,
+            },
             stages,
             entries,
             uniforms,
@@ -595,21 +608,7 @@ impl ComputeJumps {
     }
 }
 
-/// Shader::AttributeType of each vertex attribute's format: integer formats
-/// must reach integer shader inputs.
-/// The part of a graphics program's identity beyond its stages' code: the
-/// vertex stage is translated for the bound attributes' integer or float
-/// types (`generic_input_types`), so the same code under other types is
-/// another program. Zero for all-float inputs (the code keys alone).
-fn input_types_key(types: &[u8; 32]) -> u64 {
-    if types.iter().all(|&kind| kind == 0) {
-        return 0;
-    }
-    let mut hasher = super::FastHasher::default();
-    std::hash::Hasher::write(&mut hasher, types);
-    std::hash::Hasher::finish(&hasher) | 1 << 62
-}
-
+/// Shader input types for the bound vertex attributes.
 fn generic_input_types(attributes: &[BTreeMap<String, super::Args>]) -> [u8; 32] {
     let mut types = [0; 32];
     for (location, props) in attributes.iter().enumerate().take(32) {
@@ -1929,27 +1928,6 @@ impl Nvn {
                 })
             })
             .ok_or_else(|| format!("bound program has no stage of type {wanted}"))
-    }
-
-    /// `generic_input_types` of the bound vertex attribute state, kept for
-    /// the snapshot asked for last.
-    fn vertex_input_types(&mut self) -> [u8; 32] {
-        let Some(states) = self
-            .render
-            .state
-            .get("BindVertexAttribState")
-            .map(|command| command.states.clone())
-        else {
-            return [0; 32];
-        };
-        if let Some((known, types)) = &self.input_types_memo
-            && known.ptr_eq(&states)
-        {
-            return *types;
-        }
-        let types = generic_input_types(&states);
-        self.input_types_memo = Some((states, types));
-        types
     }
 
     fn bound_program(&mut self, core: &Guest) -> Result<Arc<BoundProgram>, String> {
@@ -8165,14 +8143,13 @@ impl Nvn {
             .and_then(|key| u64::from_str_radix(&key, 16).ok())
             .zip(super::debug_var_os("ECHORA_GPU_DUMP"))
             .filter(|_| self.sequencing());
-        // The program as built: the stages' code and, for the vertex stage,
-        // the input types it was translated for.
-        let types = if mesh_draw {
-            [0; 32]
-        } else {
-            self.vertex_input_types()
+        // The translation identity includes the vertex input types, mesh
+        // control state and any outputs the previous stage provides.
+        let built = program.pipeline;
+        let traced_variant = GraphicsProgramKey {
+            traced: true,
+            ..built
         };
-        let built = (keys.0 ^ input_types_key(&types), keys.1);
         let backend = self.gpu.as_mut().unwrap();
         if !backend.programs.contains_key(&built) {
             // ECHORA_VERTEX_TRACE: each traced stage's record buffer (64
@@ -8287,9 +8264,7 @@ impl Nvn {
                 let traced = backend
                     .renderer
                     .create_program_specialized(stages.to_vec(), &specialization)?;
-                backend
-                    .programs
-                    .insert((built.0, built.1 ^ TRACED_VARIANT), traced);
+                backend.programs.insert(traced_variant, traced);
             }
         }
         // ECHORA_LOOP_TRACE: every 60 presents, each traced stage's loops
@@ -10105,7 +10080,6 @@ impl Nvn {
         } else {
             Vec::new()
         };
-        let traced_variant = (built.0, built.1 ^ TRACED_VARIANT);
         let program_keys = if super::debug_var("ECHORA_VERTEX_TRACE_BASE")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
@@ -10751,6 +10725,47 @@ fn attribute_format_size(format: vk::Format) -> u64 {
         | F::R16G16_SFLOAT
         | F::B10G11R11_UFLOAT_PACK32 => 4,
         _ => 16,
+    }
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::{Arc, BoundProgram, Stage, Translated};
+
+    #[test]
+    fn distinct_translations_of_the_same_guest_code_get_distinct_pipelines() {
+        let translation = |stage| {
+            Arc::new(Translated {
+                abi_version: echora_shader_abi::ABI_VERSION,
+                stage,
+                spirv: Vec::new(),
+                descriptors: Vec::new(),
+                loaded_generics: 0,
+                stored_generics: 0,
+                stores: [0; 8],
+                frag_colors: 0,
+                cbuf_used_sizes: [0; 18],
+                spec_constants: Vec::new(),
+                push_fields: 0,
+                texture_pool_bindings: 0,
+            })
+        };
+        let mesh = translation(Stage::Mesh);
+        let fragment = translation(Stage::Fragment);
+        let bind = |mesh: Arc<Translated>| {
+            BoundProgram::new(
+                (4, 8),
+                Box::new([mesh, fragment.clone()]),
+                Box::new([crate::nvn::Args::default(); 2]),
+            )
+        };
+
+        let first = bind(mesh.clone());
+        let same = bind(mesh);
+        let variant = bind(translation(Stage::Mesh));
+        assert_eq!(first.keys, variant.keys);
+        assert_eq!(first.pipeline, same.pipeline);
+        assert_ne!(first.pipeline, variant.pipeline);
     }
 }
 
