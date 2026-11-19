@@ -39,9 +39,8 @@ fn sin_degrees(degrees: f64) -> f64 {
 /// Copy each input to its output where they differ (a disabled effect).
 pub fn bypass(buffers: &mut [Vec<i32>], inputs: &[usize], outputs: &[usize]) {
     for (&input, &output) in inputs.iter().zip(outputs) {
-        if input != output && input < buffers.len() && output < buffers.len() {
-            let source = buffers[input].clone();
-            buffers[output].copy_from_slice(&source);
+        if let Ok([source, destination]) = buffers.get_disjoint_mut([input, output]) {
+            destination.copy_from_slice(source);
         }
     }
 }

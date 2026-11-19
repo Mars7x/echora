@@ -698,6 +698,8 @@ pub struct Renderer {
     pub survey: BTreeMap<String, u64>,
     resources: BTreeMap<u32, ChannelResource>,
     mixes: BTreeMap<i32, Mix>,
+    /// Channel samples cleared and reused on each render.
+    mix_buffers: BTreeMap<i32, Vec<Vec<i32>>>,
     mixers: BTreeMap<usize, BufferMixer>,
     /// The effect slots with signal processing of their own.
     processors: BTreeMap<usize, Effect>,
@@ -729,6 +731,7 @@ impl Renderer {
             survey: BTreeMap::new(),
             resources: BTreeMap::new(),
             mixes: BTreeMap::new(),
+            mix_buffers: BTreeMap::new(),
             mixers: BTreeMap::new(),
             processors: BTreeMap::new(),
             splitters: BTreeMap::new(),
@@ -813,12 +816,17 @@ impl Renderer {
             f64::from(self.parameters.sample_count) / f64::from(self.parameters.sample_rate);
         let count = self.parameters.sample_count as usize;
         let rate = self.parameters.sample_rate;
-        // Every mix's buffers, silent.
-        let mut buffers: BTreeMap<i32, Vec<Vec<i32>>> = self
-            .mixes
-            .iter()
-            .map(|(&id, mix)| (id, vec![vec![0i32; count]; mix.buffers]))
-            .collect();
+        // Start each mix at silence, retaining allocations across frames.
+        let mut buffers = std::mem::take(&mut self.mix_buffers);
+        buffers.retain(|id, _| self.mixes.contains_key(id));
+        for (&id, mix) in &self.mixes {
+            let channels = buffers.entry(id).or_default();
+            channels.resize_with(mix.buffers, Vec::new);
+            for channel in channels {
+                channel.resize(count, 0);
+                channel.fill(0);
+            }
+        }
         let mut mixed = false;
         for voice in self.voices.values_mut() {
             let playing = voice.render(frame_seconds, memory.is_none());
@@ -894,6 +902,7 @@ impl Renderer {
                 self.mixed_frames += 1;
             }
         }
+        self.mix_buffers = buffers;
         for usage in self.effects.values_mut() {
             usage.1 = false;
         }
@@ -956,9 +965,9 @@ impl Renderer {
                 for (_, slot) in slots {
                     if let Some(mixer) = self.mixers.get(&slot) {
                         for &(input, output, volume) in &mixer.pairs {
-                            if input < own.len() && output < own.len() && input != output {
-                                let source = own[input].clone();
-                                mix::mix(&mut own[output], &source, volume);
+                            if let Ok([source, destination]) = own.get_disjoint_mut([input, output])
+                            {
+                                mix::mix(destination, source, volume);
                             }
                         }
                     } else if let Some(effect) = self.processors.get_mut(&slot) {
@@ -1784,6 +1793,16 @@ mod tests {
         assert_eq!(output[0], 0);
         assert!(output[2 * 120] > 0 && output[2 * 120] < 1200);
         assert_eq!(renderer.mixed_frames, 2);
+    }
+
+    #[test]
+    fn an_idle_mix_does_not_replay_the_previous_frame() {
+        let (mut renderer, output) = play(false);
+        assert!(output.iter().any(|&sample| sample != 0));
+
+        renderer.voices.clear();
+        renderer.render_frame(Some(&Wave(Vec::new())));
+        assert_eq!(renderer.take_output(), vec![0; 480]);
     }
 
     #[test]
