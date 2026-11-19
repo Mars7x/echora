@@ -1,6 +1,6 @@
 //! Presentation to a host window: a Vulkan swapchain on a Wayland, Xlib or
 //! Win32 surface, filled by blitting the presented render target (scaled to the
-//! window) and presented synchronously.
+//! window).
 
 use std::ffi::c_void;
 
@@ -36,7 +36,7 @@ pub struct Presenter {
     swapchain_loader: ash::khr::swapchain::Device,
     surface: vk::SurfaceKHR,
     swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
+    images: Vec<PresentImage>,
     extent: vk::Extent2D,
     format: vk::Format,
     fence: vk::Fence,
@@ -48,6 +48,67 @@ pub struct Presenter {
     /// sRGB format keep their encoded bytes (the console scans out the
     /// display texture's bytes; a UNORM swapchain showed them decoded).
     srgb: bool,
+    /// Whether this presenter can retire the synchronization objects used
+    /// by its queued window presents.
+    queued: bool,
+}
+
+struct PresentImage {
+    image: vk::Image,
+    ready: Option<PresentSync>,
+}
+
+struct PresentSync {
+    blitted: vk::Semaphore,
+    presented: vk::Fence,
+    pending: bool,
+}
+
+impl PresentSync {
+    fn new(device: &ash::Device) -> Result<Self, String> {
+        // SAFETY: valid creation parameters and a live device.
+        unsafe {
+            let blitted = device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .map_err(vk_error("vkCreateSemaphore"))?;
+            let presented = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    device.destroy_semaphore(blitted, None);
+                    return Err(vk_error("vkCreateFence")(error));
+                }
+            };
+            Ok(Self {
+                blitted,
+                presented,
+                pending: false,
+            })
+        }
+    }
+
+    fn wait(&mut self, device: &ash::Device) -> Result<(), String> {
+        if self.pending {
+            // SAFETY: this fence was enqueued with the image's last present.
+            unsafe {
+                device
+                    .wait_for_fences(&[self.presented], true, u64::MAX)
+                    .map_err(vk_error("waiting for presentation"))?;
+                device
+                    .reset_fences(&[self.presented])
+                    .map_err(vk_error("vkResetFences"))?;
+            }
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    fn destroy(self, device: &ash::Device) {
+        // SAFETY: both the blit and all presents using it have finished.
+        unsafe {
+            device.destroy_fence(self.presented, None);
+            device.destroy_semaphore(self.blitted, None);
+        }
+    }
 }
 
 fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
@@ -96,19 +157,28 @@ impl Presenter {
                 gpu.queue_family,
                 surface,
             )
-        }
-        .map_err(vk_error("vkGetPhysicalDeviceSurfaceSupportKHR"))?;
-        if !supported {
+        };
+        if !matches!(supported, Ok(true)) {
             // SAFETY: the surface was just created and is unused.
             unsafe { surface_loader.destroy_surface(surface, None) };
-            return Err("the queue cannot present to this window".into());
+            return Err(supported.err().map_or_else(
+                || "the queue cannot present to this window".into(),
+                vk_error("vkGetPhysicalDeviceSurfaceSupportKHR"),
+            ));
         }
         // SAFETY: valid create info.
         let fence = unsafe {
             gpu.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
-        }
-        .map_err(vk_error("vkCreateFence"))?;
+        };
+        let fence = match fence {
+            Ok(fence) => fence,
+            Err(error) => {
+                // SAFETY: the new surface has no swapchain.
+                unsafe { surface_loader.destroy_surface(surface, None) };
+                return Err(vk_error("vkCreateFence")(error));
+            }
+        };
         Ok(Self {
             surface_loader,
             swapchain_loader: ash::khr::swapchain::Device::new(&gpu.instance, &gpu.device),
@@ -121,12 +191,15 @@ impl Presenter {
             stale: true,
             requested: (0, 0),
             srgb: false,
+            queued: gpu.swapchain_maintenance
+                && std::env::var_os("ECHORA_PRESENT_CPU_WAIT").is_none(),
         })
     }
 
     /// (Re)create the swapchain for the surface's current size. `fallback`
     /// is used when the surface leaves the size to the swapchain (Wayland).
     fn rebuild(&mut self, gpu: &Gpu, fallback: vk::Extent2D) -> Result<(), String> {
+        self.wait_for_presents(gpu)?;
         // SAFETY: live physical device and surface.
         let (capabilities, formats) = unsafe {
             (
@@ -189,22 +262,21 @@ impl Presenter {
             .present_mode(vk::PresentModeKHR::FIFO)
             .clipped(true)
             .old_swapchain(self.swapchain);
-        // SAFETY: the device is idle with respect to the old swapchain (every
-        // present waits for its blit), which is retired here.
-        unsafe {
-            let swapchain = self
-                .swapchain_loader
-                .create_swapchain(&info, None)
-                .map_err(vk_error("vkCreateSwapchainKHR"))?;
-            if self.swapchain != vk::SwapchainKHR::null() {
-                self.swapchain_loader
-                    .destroy_swapchain(self.swapchain, None);
-            }
-            self.swapchain = swapchain;
-            self.images = self
-                .swapchain_loader
-                .get_swapchain_images(swapchain)
-                .map_err(vk_error("vkGetSwapchainImagesKHR"))?;
+        // SAFETY: rendering and pending present operations on the old
+        // swapchain have finished or handed their resources to WSI.
+        let swapchain = unsafe { self.swapchain_loader.create_swapchain(&info, None) };
+        // An old swapchain is retired even when creation fails.
+        self.destroy_swapchain(gpu);
+        self.swapchain = swapchain.map_err(vk_error("vkCreateSwapchainKHR"))?;
+        // SAFETY: the new swapchain is live.
+        let images = unsafe { self.swapchain_loader.get_swapchain_images(self.swapchain) }
+            .map_err(vk_error("vkGetSwapchainImagesKHR"))?;
+        for image in images {
+            let ready = self
+                .queued
+                .then(|| PresentSync::new(&gpu.device))
+                .transpose()?;
+            self.images.push(PresentImage { image, ready });
         }
         self.extent = extent;
         self.format = format.format;
@@ -212,14 +284,42 @@ impl Presenter {
         Ok(())
     }
 
-    pub fn destroy(self, gpu: &Gpu) {
-        // SAFETY: nothing uses the swapchain after the device is idle.
+    fn wait_for_presents(&mut self, gpu: &Gpu) -> Result<(), String> {
+        for image in &mut self.images {
+            if let Some(ready) = &mut image.ready {
+                ready.wait(&gpu.device)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy_swapchain(&mut self, gpu: &Gpu) {
+        for image in self.images.drain(..) {
+            if let Some(ready) = image.ready {
+                ready.destroy(&gpu.device);
+            }
+        }
+        if self.swapchain != vk::SwapchainKHR::null() {
+            // SAFETY: there are no outstanding rendering or present
+            // references. The swapchain's images belong to it.
+            unsafe {
+                self.swapchain_loader
+                    .destroy_swapchain(self.swapchain, None)
+            };
+            self.swapchain = vk::SwapchainKHR::null();
+        }
+    }
+
+    pub fn destroy(mut self, gpu: &Gpu) {
+        // SAFETY: the renderer has drained the submission thread before
+        // destruction and will submit no later work.
         unsafe {
             let _ = gpu.device.device_wait_idle();
-            if self.swapchain != vk::SwapchainKHR::null() {
-                self.swapchain_loader
-                    .destroy_swapchain(self.swapchain, None);
-            }
+        }
+        let _ = self.wait_for_presents(gpu);
+        self.destroy_swapchain(gpu);
+        // SAFETY: no swapchain or pending acquire references the surface/fence.
+        unsafe {
             self.surface_loader.destroy_surface(self.surface, None);
             gpu.device.destroy_fence(self.fence, None);
         }
@@ -290,26 +390,51 @@ impl Renderer {
                 .reset_fences(&[presenter.fence])
                 .map_err(vk_error("vkResetFences"))?;
         }
-        let image = presenter.images[index as usize];
-        self.blit_to_swapchain(key, image, (width, height), presenter.extent)?;
-        self.flush()?;
+        let image = &mut presenter.images[index as usize];
+        if let Some(ready) = &mut image.ready {
+            ready.wait(&self.gpu.device)?;
+        }
+        self.blit_to_swapchain(key, image.image, (width, height), presenter.extent)?;
+        let signal = if let Some(ready) = &image.ready {
+            self.submit_for_present(ready.blitted)?;
+            Some(ready.blitted)
+        } else {
+            self.flush()?;
+            None
+        };
         let swapchains = [presenter.swapchain];
         let indices = [index];
-        let info = vk::PresentInfoKHR::default()
+        let mut info = vk::PresentInfoKHR::default()
             .swapchains(&swapchains)
-            .image_indices(&indices);
+            .image_indices(&indices)
+            .wait_semaphores(signal.as_slice());
+        let fence = image.ready.as_ref().map(|ready| ready.presented);
+        let mut completion = vk::SwapchainPresentFenceInfoEXT::default().fences(fence.as_slice());
+        if fence.is_some() {
+            info = info.push_next(&mut completion);
+        }
         let held = self
             .queue_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: the blit finished (flush waits) and left the image in
-        // PRESENT_SRC_KHR; the queue is held.
+        // SAFETY: the blit either completed or signals the wait semaphore.
+        // It transitions the image to PRESENT_SRC_KHR before WSI reads it.
         let presented = unsafe {
             presenter
                 .swapchain_loader
                 .queue_present(self.gpu.queue, &info)
         };
         drop(held);
+        if let Some(ready) = &mut image.ready {
+            // WSI may reject a surface without cancelling the queue wait.
+            ready.pending = matches!(
+                presented,
+                Ok(_)
+                    | Err(vk::Result::ERROR_OUT_OF_DATE_KHR
+                        | vk::Result::ERROR_SURFACE_LOST_KHR
+                        | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+            );
+        }
         match presented {
             Ok(suboptimal) => presenter.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => presenter.stale = true,

@@ -186,13 +186,19 @@ const MAX_UPLOAD_BYTES: u64 = 1536 << 20;
 /// slots still recorded. ECHORA_SUBMIT_THREAD=0 submits on the recording
 /// thread.
 struct Submitter {
-    sender: Option<std::sync::mpsc::Sender<(vk::CommandBuffer, vk::Fence)>>,
+    sender: Option<std::sync::mpsc::Sender<Submission>>,
     progress: std::sync::Arc<SubmissionProgress>,
     /// Nanoseconds the thread spent in vkQueueSubmit, for the statistics.
     submit_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Batches handed to the thread, in submission order.
     handed: u64,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct Submission {
+    commands: vk::CommandBuffer,
+    fence: vk::Fence,
+    signal: Option<vk::Semaphore>,
 }
 
 /// A batch's fence and command buffer belong to vkQueueSubmit until that call
@@ -269,7 +275,7 @@ impl SubmissionProgress {
 
 impl Submitter {
     fn new(gpu: &Gpu, queue_lock: std::sync::Arc<std::sync::Mutex<()>>) -> Result<Self, String> {
-        let (sender, receiver) = std::sync::mpsc::channel::<(vk::CommandBuffer, vk::Fence)>();
+        let (sender, receiver) = std::sync::mpsc::channel::<Submission>();
         let progress = std::sync::Arc::new(SubmissionProgress::default());
         let submit_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (device, queue) = (gpu.device.clone(), gpu.queue);
@@ -278,9 +284,16 @@ impl Submitter {
             .spawn({
                 let (progress, submit_ns) = (progress.clone(), submit_ns.clone());
                 move || {
-                    for (commands, fence) in receiver {
+                    for Submission {
+                        commands,
+                        fence,
+                        signal,
+                    } in receiver
+                    {
                         let buffers = [commands];
-                        let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+                        let submit = [vk::SubmitInfo::default()
+                            .command_buffers(&buffers)
+                            .signal_semaphores(signal.as_slice())];
                         let start = std::time::Instant::now();
                         let held = queue_lock
                             .lock()
@@ -2688,7 +2701,7 @@ impl Renderer {
     /// are freed.
     pub fn flush(&mut self) -> Result<(), String> {
         if self.recording {
-            self.submit_current()?;
+            self.submit_current(None)?;
         }
         for index in 0..self.spares.len() {
             if self.spares[index].in_flight {
@@ -2861,11 +2874,34 @@ impl Renderer {
     /// while the CPU records the next. For capacity limits (work items,
     /// ring and descriptor space), where nothing reads results.
     pub(crate) fn flush_async(&mut self) -> Result<(), String> {
+        self.flush_async_with_signal(None)
+    }
+
+    /// Queue the blit and its signal. Keep the Vulkan submission ahead of
+    /// the caller's present operation without waiting for the GPU.
+    pub(crate) fn submit_for_present(&mut self, signal: vk::Semaphore) -> Result<(), String> {
+        self.flush_async_with_signal(Some(signal))?;
+        if let Some(submitter) = &self.submitter {
+            submitter.progress.wait(submitter.handed)?;
+        }
+        Ok(())
+    }
+
+    /// Release the window before shutting down this renderer and device.
+    pub fn destroy_presenter(&mut self, presenter: crate::present::Presenter) {
+        let _ = self.flush();
+        if let Some(submitter) = &mut self.submitter {
+            submitter.stop();
+        }
+        presenter.destroy(&self.gpu);
+    }
+
+    fn flush_async_with_signal(&mut self, signal: Option<vk::Semaphore>) -> Result<(), String> {
         if !self.recording {
             return Ok(());
         }
         let start = std::time::Instant::now();
-        self.submit_current()?;
+        self.submit_current(signal)?;
         let submitted = std::time::Instant::now();
         self.stat(
             "stat: flush ns submitting",
@@ -2894,7 +2930,7 @@ impl Renderer {
     }
 
     /// End and submit the current slot's command buffer.
-    fn submit_current(&mut self) -> Result<(), String> {
+    fn submit_current(&mut self, signal: Option<vk::Semaphore>) -> Result<(), String> {
         self.end_pass();
         self.end_condition();
         self.occlusion_before_submit(self.slot.commands);
@@ -3012,7 +3048,11 @@ impl Renderer {
                 .sender
                 .as_ref()
                 .ok_or("the submit thread has stopped")?
-                .send((self.slot.commands, self.slot.fence))
+                .send(Submission {
+                    commands: self.slot.commands,
+                    fence: self.slot.fence,
+                    signal,
+                })
                 .map_err(|_| {
                     submitter
                         .progress
@@ -3033,7 +3073,9 @@ impl Renderer {
                 .swap(0, std::sync::atomic::Ordering::Relaxed);
         } else {
             let buffers = [self.slot.commands];
-            let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+            let submit = [vk::SubmitInfo::default()
+                .command_buffers(&buffers)
+                .signal_semaphores(signal.as_slice())];
             let held = self
                 .queue_lock
                 .lock()

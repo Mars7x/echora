@@ -284,6 +284,14 @@ impl GuestFileIndex {
     }
 }
 
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Some(Ok(presenter)) = self.presenter.take() {
+            self.renderer.destroy_presenter(presenter);
+        }
+    }
+}
+
 impl Backend {
     /// A backend when ECHORA_GPU is set, the recompiler is linked and a
     /// device with shader objects exists.

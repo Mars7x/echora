@@ -19,6 +19,8 @@ pub struct Gpu {
     shader_object: Option<ash::ext::shader_object::Device>,
     /// VK_KHR_swapchain is enabled (windowed presentation is possible).
     pub swapchain: bool,
+    /// Presentation fences can retire swapchains and their semaphores.
+    pub(crate) swapchain_maintenance: bool,
     /// VK_EXT_depth_clip_control is enabled: draws can take clip-space Z
     /// in [-1, 1] (OpenGL style) instead of [0, 1].
     pub depth_clip_control: bool,
@@ -101,30 +103,44 @@ impl Gpu {
         // SAFETY: the entry is loaded.
         let available = unsafe { entry.enumerate_instance_extension_properties(None) }
             .map_err(vk_error("vkEnumerateInstanceExtensionProperties"))?;
-        let surface_extensions: Vec<*const std::ffi::c_char> = [
+        let has = |name| {
+            available
+                .iter()
+                .any(|extension| extension.extension_name_as_c_str() == Ok(name))
+        };
+        let surface_maintenance = has(ash::khr::surface::NAME)
+            && has(ash::khr::get_surface_capabilities2::NAME)
+            && has(ash::ext::surface_maintenance1::NAME);
+        let mut surface_extensions: Vec<*const std::ffi::c_char> = [
             ash::khr::surface::NAME,
             ash::khr::wayland_surface::NAME,
             ash::khr::xlib_surface::NAME,
             ash::khr::win32_surface::NAME,
         ]
         .into_iter()
-        .filter(|wanted| {
-            available
-                .iter()
-                .any(|extension| extension.extension_name_as_c_str() == Ok(*wanted))
-        })
+        .filter(|&wanted| has(wanted))
         .map(|name| name.as_ptr())
         .collect();
+        if surface_maintenance {
+            surface_extensions.extend([
+                ash::khr::get_surface_capabilities2::NAME.as_ptr(),
+                ash::ext::surface_maintenance1::NAME.as_ptr(),
+            ]);
+        }
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&application)
             .enabled_extension_names(&surface_extensions);
         // SAFETY: valid create info; the instance is destroyed in Drop.
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(vk_error("vkCreateInstance"))?;
-        Self::with_instance(entry, instance)
+        Self::with_instance(entry, instance, surface_maintenance)
     }
 
-    fn with_instance(entry: ash::Entry, instance: ash::Instance) -> Result<Self, String> {
+    fn with_instance(
+        entry: ash::Entry,
+        instance: ash::Instance,
+        surface_maintenance: bool,
+    ) -> Result<Self, String> {
         // SAFETY: the instance is live for these queries.
         let physicals = unsafe { instance.enumerate_physical_devices() }
             .map_err(vk_error("vkEnumeratePhysicalDevices"))?;
@@ -174,8 +190,11 @@ impl Gpu {
         let mut supported_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
         let mut supported_compression =
             vk::PhysicalDeviceImageCompressionControlFeaturesEXT::default();
+        let mut supported_maintenance =
+            vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
         let mut supported = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported_compression)
+            .push_next(&mut supported_maintenance)
             .push_next(&mut supported11)
             .push_next(&mut supported12)
             .push_next(&mut supported13)
@@ -268,6 +287,13 @@ impl Gpu {
         let swapchain = has(ash::khr::swapchain::NAME);
         if swapchain {
             enabled_extensions.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+        let swapchain_maintenance = swapchain
+            && surface_maintenance
+            && supported_maintenance.swapchain_maintenance1 != 0
+            && has(ash::ext::swapchain_maintenance1::NAME);
+        if swapchain_maintenance {
+            enabled_extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
         }
         let depth_clip_control = use_objects
             && supported_clip.depth_clip_control != 0
@@ -439,6 +465,11 @@ impl Gpu {
             .push_next(&mut enable13);
         let mut enable_clip =
             vk::PhysicalDeviceDepthClipControlFeaturesEXT::default().depth_clip_control(true);
+        let mut enable_maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(true);
+        if swapchain_maintenance {
+            device_info = device_info.push_next(&mut enable_maintenance);
+        }
         if use_objects {
             device_info = device_info.push_next(&mut enable_objects);
         }
@@ -551,6 +582,7 @@ impl Gpu {
             queue_family,
             shader_object,
             swapchain,
+            swapchain_maintenance,
             depth_clip_control,
             occlusion_query_precise: core.occlusion_query_precise != 0,
             depth_bias_clamp: core.depth_bias_clamp != 0,
