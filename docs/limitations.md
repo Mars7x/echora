@@ -104,7 +104,8 @@ to be missing or incomplete.
 - The runtime applies window size and mode, internal render scale, volume
   and vibration from the settings. Absolute resolution uses the first guest
   window texture's height when available at renderer startup, with a
-  1080-row fallback. `echora-resolution` is not yet connected to the renderer, and
+  1080-row fallback. Match Output uses the host window's physical height at
+  startup. `echora-resolution` is not yet connected to the renderer, and
   widening the view (`AspectPolicy::Expand`) would need game-specific camera
   and interface changes.
 - Vertical sync uses tear-free mailbox presentation when available. Adaptive

@@ -36,13 +36,15 @@ const DEFAULT_GUEST_HEIGHT: u32 = 1080;
 pub fn render_scale(guest_height: Option<u32>) -> Option<(u32, u32)> {
     let display = &get().display;
     let output_height = if display.internal_resolution == InternalResolutionSetting::MatchOutput {
-        match crate::window::configured_mode() {
-            WindowMode::Windowed => Some(crate::window::initial_size().1),
-            _ => crate::window::shared().and_then(|window| {
+        crate::window::shared()
+            .and_then(|window| {
                 window.handle()?;
                 Some(window.size().1).filter(|&height| height != 0)
-            }),
-        }
+            })
+            .or_else(|| {
+                (crate::window::configured_mode() == WindowMode::Windowed)
+                    .then(|| crate::window::initial_size().1)
+            })
     } else {
         None
     };
