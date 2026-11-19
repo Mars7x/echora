@@ -7242,11 +7242,28 @@ const TAGGED_STATES: [&str; 6] = [
     "MultisampleState",
 ];
 
-/// The contents of tagged state structures by tag (the structure's first
-/// word: content-addressed, so equal states share one): the kind, and
-/// what a Bind of it snapshots (`snapshot_states`), made once per tag.
-type StateTags = FastMap<u32, (String, StateSnapshots)>;
+/// The contents of tagged state structures by tag, including the snapshot
+/// shared by recorded Bind commands.
+type StateTags = FastMap<u32, TaggedState>;
 static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
+
+#[derive(Clone)]
+struct TaggedState {
+    kind: &'static str,
+    hash: u64,
+    snapshot: StateSnapshots,
+}
+
+impl TaggedState {
+    fn matches(&self, kind: &str, properties: &BTreeMap<String, Args>, hash: u64) -> bool {
+        self.hash == hash
+            && self.kind == kind
+            && self.snapshot[0]
+                .iter()
+                .filter(|(key, _)| key.as_str() != "@Offset")
+                .eq(properties.iter())
+    }
+}
 
 fn tagged_state(kind: &str, tag: u32) -> Option<StateSnapshots> {
     STATE_TAGS
@@ -7254,16 +7271,11 @@ fn tagged_state(kind: &str, tag: u32) -> Option<StateSnapshots> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()?
         .get(&tag)
-        .filter(|(tagged_kind, _)| tagged_kind == kind)
-        .map(|(_, snapshot)| snapshot.clone())
+        .filter(|state| state.kind == kind)
+        .map(|state| state.snapshot.clone())
 }
 
-/// The tag written into a state's first word. Record its snapshot the
-/// first time the tag is seen and return None for untagged kinds.
-fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
-    if !TAGGED_STATES.contains(&kind) {
-        return None;
-    }
+fn state_hash(kind: &str, props: &BTreeMap<String, Args>) -> u64 {
     use std::hash::{Hash, Hasher};
     // The entries themselves are hashed (formatting them for every setter
     // cost more than the setter), and the table is written only for a tag
@@ -7280,39 +7292,62 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     mixed = (mixed ^ mixed >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     mixed = (mixed ^ mixed >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
     mixed ^= mixed >> 31;
-    let tag = (mixed as u32) | 1;
-    // Tags are only ever added, so one this thread has seen in the table
-    // stays there: the recording threads skip the shared lock for it.
+    mixed
+}
+
+/// The tag written into a state's first word. Existing tags stay valid for
+/// copies of guest state, so resolve collisions without replacing an entry.
+fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
+    let kind = TAGGED_STATES.iter().copied().find(|&known| known == kind)?;
+    let hash = state_hash(kind, props);
     thread_local! {
-        static SEEN: std::cell::RefCell<FastSet<u32>> = std::cell::RefCell::default();
+        static SEEN: std::cell::RefCell<FastMap<u64, (u32, TaggedState)>> =
+            std::cell::RefCell::default();
     }
-    if SEEN.with(|seen| seen.borrow().contains(&tag)) {
+    if let Some(tag) = SEEN.with(|seen| {
+        let seen = seen.borrow();
+        let (tag, state) = seen.get(&hash)?;
+        state.matches(kind, props, hash).then_some(*tag)
+    }) {
         return Some(tag);
     }
-    let known = STATE_TAGS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|tags| tags.contains_key(&tag));
-    SEEN.with(|seen| seen.borrow_mut().insert(tag));
-    if !known {
-        STATE_TAGS
+    let locate = |tags: &StateTags| {
+        let mut tag = (hash as u32) | 1;
+        while let Some(state) = tags.get(&tag) {
+            if state.matches(kind, props, hash) {
+                return (tag, true);
+            }
+            tag = tag.wrapping_add(2);
+        }
+        (tag, false)
+    };
+    let known = {
+        let shared = STATE_TAGS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared.as_ref().and_then(|tags| {
+            let (tag, found) = locate(tags);
+            found.then(|| (tag, tags[&tag].clone()))
+        })
+    };
+    let (tag, state) = known.unwrap_or_else(|| {
+        let mut shared = STATE_TAGS
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(FastMap::default)
-            .entry(tag)
-            .or_insert_with(|| {
-                let mut snapshot = props.clone();
-                snapshot.insert(
-                    "@Offset".into(),
-                    Args {
-                        x: [0; 4],
-                        v: [0; 2],
-                    },
-                );
-                (kind.into(), vec![snapshot].into())
-            });
-    }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tags = shared.get_or_insert_with(FastMap::default);
+        let (tag, _) = locate(tags);
+        let state = tags.entry(tag).or_insert_with(|| {
+            let mut properties = props.clone();
+            properties.insert("@Offset".into(), Args::default());
+            TaggedState {
+                kind,
+                hash,
+                snapshot: vec![properties].into(),
+            }
+        });
+        (tag, state.clone())
+    });
+    SEEN.with(|seen| seen.borrow_mut().insert(hash, (tag, state)));
     Some(tag)
 }
 
@@ -8221,10 +8256,67 @@ mod tests {
         .unwrap();
         assert_eq!(elsewhere, Some(first));
         let tags = STATE_TAGS.read().unwrap();
-        let (kind, snapshot) = tags.as_ref().unwrap().get(&first).unwrap();
-        assert_eq!(kind, "DepthStencilState");
-        assert_eq!(snapshot[0]["DepthFunc"].x[0], 0x6a17);
+        let state = tags.as_ref().unwrap().get(&first).unwrap();
+        assert_eq!(state.kind, "DepthStencilState");
+        assert_eq!(state.snapshot[0]["DepthFunc"].x[0], 0x6a17);
         assert_eq!(state_tag("Unknown", &props), None);
+    }
+
+    #[test]
+    fn colliding_state_tags_keep_both_depth_write_settings() {
+        let kind = "DepthStencilState";
+        let states = [
+            (0x1100, 0, 0xb4ec_e790_3f8e_7b4a),
+            (0x1200, 1, 0x6992_a69f_d7b8_3e02),
+        ];
+        let hashes = states.map(|(_, enabled, unused)| {
+            let props = BTreeMap::from([(
+                "DepthWriteEnable".into(),
+                Args {
+                    x: [enabled, unused, 0, 0],
+                    v: [0; 2],
+                },
+            )]);
+            state_hash(kind, &props) as u32 | 1
+        });
+        assert_eq!(hashes[0], hashes[1]);
+
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        for (address, enabled, unused) in states {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDepthStencilStateSetDepthWriteEnable",
+                &[address, enabled, unused, 0, 0],
+            );
+        }
+        assert_ne!(
+            guest.memory.read_u32(states[0].0).unwrap(),
+            guest.memory.read_u32(states[1].0).unwrap()
+        );
+        for (address, enabled, _) in states {
+            let tag = guest.memory.read_u32(address).unwrap();
+            guest.memory.write_u32(0x1300, tag).unwrap();
+            assert_eq!(
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    "nvnDepthStencilStateGetDepthWriteEnable",
+                    &[0x1300]
+                ),
+                enabled
+            );
+        }
     }
 
     fn call(nvn: &mut Nvn, core: &mut Guest, name: &str, args: &[u64]) -> u64 {
