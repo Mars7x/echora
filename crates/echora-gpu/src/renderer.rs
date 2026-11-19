@@ -25,6 +25,8 @@ pub struct Target {
     pub levels: u32,
     memory: vk::DeviceMemory,
     pub format: vk::Format,
+    /// Uses supported by views with this image's own format.
+    view_usage: vk::ImageUsageFlags,
     /// The guest's extent; the image is `scale` times as wide and high.
     pub width: u32,
     pub height: u32,
@@ -1899,6 +1901,7 @@ impl Renderer {
         if let Some(existing) = self.extra_views.get(&cache) {
             return Ok(*existing);
         }
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
         let create = vk::ImageViewCreateInfo::default()
             .image(info.image)
             .view_type(info.view_type)
@@ -1907,7 +1910,8 @@ impl Renderer {
                 base_mip_level: info.range.base_mip_level + base,
                 level_count: count,
                 ..info.range
-            });
+            })
+            .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let selected = unsafe { self.gpu.device.create_image_view(&create, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -2107,6 +2111,8 @@ impl Renderer {
             if has_stencil(target.format) {
                 subresource.aspect_mask = vk::ImageAspectFlags::DEPTH;
             }
+            let mut usage =
+                vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
             let info = vk::ImageViewCreateInfo::default()
                 .image(target.image)
                 .view_type(view_type)
@@ -2117,7 +2123,8 @@ impl Renderer {
                     base_array_layer: base_layer,
                     layer_count,
                     ..subresource
-                });
+                })
+                .push_next(&mut usage);
             // SAFETY: the image is live; the view is destroyed with it.
             let view = unsafe { self.gpu.device.create_image_view(&info, None) }
                 .map_err(vk_error("vkCreateImageView"))?;
@@ -2252,6 +2259,7 @@ impl Renderer {
         if has_stencil(target.format) {
             subresource.aspect_mask = vk::ImageAspectFlags::DEPTH;
         }
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
             .view_type(wanted)
@@ -2260,7 +2268,8 @@ impl Renderer {
                 level_count: target.levels,
                 layer_count,
                 ..subresource
-            });
+            })
+            .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -4958,6 +4967,7 @@ impl Renderer {
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(target.view_usage);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
             .view_type(own_view_type(target.shape))
@@ -4966,7 +4976,8 @@ impl Renderer {
                 base_mip_level: level,
                 layer_count: target.shape.layers(),
                 ..range(target.format)
-            });
+            })
+            .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -5001,6 +5012,12 @@ impl Renderer {
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
+        let attachment = if is_depth(target.format) {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        } else {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        };
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(attachment);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -5009,7 +5026,8 @@ impl Renderer {
                 base_mip_level: level,
                 base_array_layer: layer,
                 ..range(target.format)
-            });
+            })
+            .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -5177,6 +5195,12 @@ impl Renderer {
         // SAFETY: fresh image and memory of the required size.
         unsafe { device.bind_image_memory(image, memory, 0) }
             .map_err(vk_error("vkBindImageMemory"))?;
+        let view_usage = if store_twin.is_some() {
+            usage & !vk::ImageUsageFlags::STORAGE
+        } else {
+            usage
+        };
+        let mut own_usage = vk::ImageViewUsageCreateInfo::default().usage(view_usage);
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(own_view_type(shape))
@@ -5185,7 +5209,8 @@ impl Renderer {
                 level_count: levels,
                 layer_count: shape.layers(),
                 ..range(format)
-            });
+            })
+            .push_next(&mut own_usage);
         // SAFETY: as above.
         let view = unsafe { device.create_image_view(&view_info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
@@ -5209,6 +5234,7 @@ impl Renderer {
             levels,
             memory,
             format,
+            view_usage,
             width,
             height,
             scale: Scale::ONE,
@@ -7226,6 +7252,47 @@ mod tests {
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (base_level, 1));
         }
+    }
+
+    #[test]
+    fn srgb_target_views_keep_storage_on_the_unorm_twin() {
+        use crate::draw::{ImageShape, Sampler, TextureSource};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_SRGB;
+        let Some(storage) = renderer.storage_twin(format) else {
+            return;
+        };
+        let target = renderer
+            .shaped_target(7, 8, 8, ImageShape::D2 { layers: 2 }, format, 4)
+            .unwrap();
+        assert!(!target.view_usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(target.view_usage.contains(vk::ImageUsageFlags::SAMPLED));
+        let mip = renderer.level_view(7, 2).unwrap();
+        let layer = renderer.attachment_view(7, 2, 1).unwrap();
+        let writable = renderer.level_view_as(7, 2, storage).unwrap();
+        assert_ne!(mip, writable);
+        assert_ne!(layer, writable);
+
+        renderer.texture_view(&TextureSource::Target(7), 2).unwrap();
+        let source = TextureSource::TargetView {
+            key: 7,
+            base_level: 1,
+            level_count: 2,
+            base_layer: 1,
+            layer_count: 1,
+        };
+        let sampler = Sampler {
+            view_levels: Some((1, 1)),
+            ..Default::default()
+        };
+        let view = renderer
+            .texture_view_swizzled(&source, 2, &sampler)
+            .unwrap();
+        let range = renderer.view_infos[&view].range;
+        assert_eq!((range.base_mip_level, range.base_array_layer), (2, 1));
     }
 
     #[test]
