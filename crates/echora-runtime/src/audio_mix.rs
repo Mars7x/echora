@@ -388,6 +388,12 @@ pub fn volume_ramp(samples: &mut [i32], previous: f32, volume: f32) {
         samples.fill(0);
         return;
     }
+    if previous == volume && volume.is_finite() {
+        for sample in samples {
+            *sample = (*sample as f32 * volume) as i32;
+        }
+        return;
+    }
     if samples.is_empty() {
         return;
     }
@@ -408,6 +414,10 @@ pub fn mix_ramp(output: &mut [i32], input: &[i32], previous: f32, volume: f32) -
     let count = output.len().min(input.len());
     if count == 0 {
         return 0;
+    }
+    if previous == volume && volume.is_finite() {
+        mix(output, input, volume);
+        return (input[count - 1] as f32 * volume) as i32;
     }
     let step = (volume - previous) / count as f32;
     let mut current = previous;
@@ -658,6 +668,26 @@ mod tests {
             Quality::Low,
         );
         assert_eq!(fraction, FRACTION_ONE / 2);
+    }
+
+    #[test]
+    fn constant_gain_preserves_saturation_and_the_last_mixed_sample() {
+        let input = [16777217, i32::MAX, i32::MIN, 12];
+        for gain in [0.0, -0.0, 0.3, -2.0, f32::MAX] {
+            let expected = input.map(|sample| (sample as f32 * gain) as i32);
+            let mut scaled = input;
+            volume_ramp(&mut scaled, gain, gain);
+            assert_eq!(scaled, expected);
+            let mut output = [19i32; 3];
+            assert_eq!(mix_ramp(&mut output, &input, gain, gain), expected[2]);
+            assert_eq!(
+                output,
+                std::array::from_fn(|i| 19i32.wrapping_add(expected[i]))
+            );
+        }
+        let mut abrupt = [12, 13, 14];
+        volume_ramp(&mut abrupt, f32::INFINITY, f32::INFINITY);
+        assert_eq!(abrupt, [i32::MAX, 0, 0]);
     }
 
     #[test]
