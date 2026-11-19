@@ -10,7 +10,7 @@
 //! if compressed uploads are unavailable. Driver constant buffers 0..2
 //! read as zeros.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 /// Maps here are keyed by addresses and names looked up on every call: the
 /// fast hasher, not SipHash.
 type HashMap<K, V> = super::FastMap<K, V>;
@@ -58,9 +58,9 @@ pub struct Backend {
     uniform_writes: HashMap<usize, shader::handle_reads::UniformWriteRanges>,
     /// Most recent writer bounded using the page table's shared mappings.
     projected_write_serial: u64,
-    /// Last unbounded store and bounded shared ranges still used by batches.
+    /// Last unbounded store and bounded shared ranges in submission order.
     unbounded_write_serial: u64,
-    shared_writes: Vec<(u64, SharedRange)>,
+    shared_writes: VecDeque<(u64, SharedRange)>,
     /// Compute stage keys translated with raw storage pointers
     /// (`Parameters::native_pointers`).
     native_programs: std::collections::HashSet<u64>,
@@ -349,7 +349,7 @@ impl Backend {
             uniform_writes: HashMap::default(),
             projected_write_serial: 0,
             unbounded_write_serial: 0,
-            shared_writes: Vec::new(),
+            shared_writes: VecDeque::new(),
             native_programs: Default::default(),
             page_table: None,
             page_build: None,
@@ -404,13 +404,41 @@ impl Backend {
         self.page_table_write_serial = serial;
         if let Some(ranges) = bounded {
             let done = self.renderer.completed_serial();
-            self.shared_writes.retain(|(recorded, _)| *recorded > done);
+            self.discard_shared_writes_through(done);
+            debug_assert!(
+                self.shared_writes
+                    .back()
+                    .is_none_or(|&(previous, _)| previous <= serial)
+            );
             self.shared_writes
                 .extend(ranges.into_iter().map(|range| (serial, range)));
         } else {
             self.unbounded_write_serial = serial;
             self.shared_writes.clear();
         }
+    }
+
+    fn discard_shared_writes_through(&mut self, serial: u64) {
+        while self
+            .shared_writes
+            .front()
+            .is_some_and(|&(recorded, _)| recorded <= serial)
+        {
+            self.shared_writes.pop_front();
+        }
+    }
+
+    /// Newest submission that may write these file bytes.
+    fn shared_write_serial(&self, range: SharedRange) -> u64 {
+        let minimum = self
+            .unbounded_write_serial
+            .max(self.renderer.completed_serial());
+        self.shared_writes
+            .iter()
+            .rev()
+            .take_while(|&&(serial, _)| serial > minimum)
+            .find(|&&(_, written)| range.overlaps(written))
+            .map_or(minimum, |&(serial, _)| serial)
     }
 
     fn wait_for_table_writes(&mut self, range: Option<SharedRange>) -> Result<(), String> {
@@ -420,17 +448,9 @@ impl Backend {
             self.page_table_writes = false;
             return Ok(());
         }
-        let serial = if let Some(range) = range {
-            self.shared_writes
-                .iter()
-                .filter(|&(_, written)| range.overlaps(*written))
-                .map(|&(serial, _)| serial)
-                .max()
-                .unwrap_or(0)
-                .max(self.unbounded_write_serial)
-        } else {
-            self.page_table_write_serial
-        };
+        let serial = range.map_or(self.page_table_write_serial, |range| {
+            self.shared_write_serial(range)
+        });
         self.renderer.wait_for(serial)?;
         if self.renderer.completed_serial() >= self.page_table_write_serial {
             self.page_table_writes = false;
@@ -6367,9 +6387,7 @@ impl Nvn {
         let projected = std::mem::take(&mut backend.projected_write_serial);
         if projected > backend.unbounded_write_serial {
             backend.unbounded_write_serial = projected;
-            backend
-                .shared_writes
-                .retain(|(serial, _)| *serial > projected);
+            backend.discard_shared_writes_through(projected);
         }
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
         if whole.is_some() {
@@ -11311,6 +11329,30 @@ mod pool_tests {
         backend.wait_for_table_writes(None).unwrap();
         assert!(backend.renderer.completed_serial() >= serial);
         assert!(!backend.page_table_writes);
+    }
+
+    #[test]
+    fn shared_write_wait_uses_the_newest_overlapping_submission() {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let range = |file, start, end| SharedRange { file, start, end };
+        backend.record_page_table_write(1, None);
+        backend.record_page_table_write(2, Some(vec![range(1, 0, 16)]));
+        backend.record_page_table_write(3, Some(vec![range(2, 0, 16)]));
+        backend.record_page_table_write(4, Some(vec![range(1, 8, 16), range(1, 16, 32)]));
+
+        assert_eq!(backend.shared_write_serial(range(1, 0, 8)), 2);
+        assert_eq!(backend.shared_write_serial(range(1, 7, 9)), 4);
+        assert_eq!(backend.shared_write_serial(range(2, 7, 9)), 3);
+        assert_eq!(backend.shared_write_serial(range(1, 32, 40)), 1);
+        backend.discard_shared_writes_through(2);
+        assert_eq!(backend.shared_writes.front().unwrap().0, 3);
+        assert_eq!(backend.shared_write_serial(range(1, 7, 9)), 4);
+
+        backend.record_page_table_write(5, None);
+        assert!(backend.shared_writes.is_empty());
+        assert_eq!(backend.shared_write_serial(range(1, 0, 16)), 5);
     }
 
     #[test]
