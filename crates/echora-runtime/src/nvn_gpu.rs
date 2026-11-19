@@ -10646,30 +10646,27 @@ fn sample_chunks(
     storage_size: u64,
     read_chunk: impl Fn(u64, &mut [u8; 64]) -> bool,
 ) -> u64 {
-    // The chunks are gathered first, so their reads (cache misses across a
-    // large texture) overlap, then hashed in four independent lanes.
-    let mut chunks = [[0u8; 64]; 256];
-    let mut read = [false; 256];
-    let span = storage_size.saturating_sub(64);
-    for (index, (chunk, read)) in chunks.iter_mut().zip(&mut read).enumerate() {
-        let offset = span * index as u64 / 255;
-        *read = read_chunk(base + offset, chunk);
-    }
-    let mut lanes = [
-        sample,
-        !sample,
-        sample.rotate_left(17),
-        sample.rotate_left(41),
-    ];
-    for (index, (chunk, read)) in chunks.iter().zip(read).enumerate() {
-        if read {
-            let lane = &mut lanes[index % 4];
-            *lane = (*lane ^ hash_bytes(chunk)).wrapping_mul(0x100_0000_01b3);
+    // Gather the same chunks before hashing so their cache misses
+    // overlap. A bitmap distinguishes unreadable chunks from zeroes.
+    const CHUNK_COUNT: usize = 256;
+    const CHUNK_BYTES: usize = 64;
+    let mut data = [0u8; CHUNK_COUNT * CHUNK_BYTES + CHUNK_COUNT / 8];
+    let (chunks, read_mask) = data.split_at_mut(CHUNK_COUNT * CHUNK_BYTES);
+    let span = storage_size.saturating_sub(CHUNK_BYTES as u64);
+    for (index, chunk) in chunks
+        .as_chunks_mut::<CHUNK_BYTES>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let offset = span * index as u64 / (CHUNK_COUNT - 1) as u64;
+        if read_chunk(base + offset, chunk) {
+            read_mask[index / 8] |= 1 << (index % 8);
+        } else {
+            chunk.fill(0);
         }
     }
-    lanes.iter().fold(sample, |sample, lane| {
-        (sample ^ lane).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-    })
+    (sample ^ hash_bytes(&data)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -11414,6 +11411,32 @@ mod pool_tests {
         nvn.gpu_forget_pool(0x1000);
         assert_eq!(nvn.shared_guest_range(0x1020, 8), None);
         assert_eq!(nvn.shared_guest_range(0x1200, 8), None);
+    }
+
+    #[test]
+    fn texture_sample_retains_all_chunks_and_their_readability() {
+        let size = 256 * 64;
+        let empty = super::sample_chunks(7, 0, size, |_, _| true);
+        for index in 0..256 {
+            let changed = super::sample_chunks(7, 0, size, |address, bytes| {
+                if address == index * 64 {
+                    bytes[(index % 64) as usize] = 1;
+                }
+                true
+            });
+            assert_ne!(changed, empty);
+        }
+        let missing = super::sample_chunks(7, 0, size, |address, _| address != 64);
+        assert_ne!(missing, empty);
+        let failed = super::sample_chunks(7, 0, size, |address, bytes| {
+            if address == 64 {
+                bytes.fill(255);
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(failed, missing);
     }
 
     #[test]
