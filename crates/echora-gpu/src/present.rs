@@ -51,6 +51,7 @@ pub struct Presenter {
     /// Whether this presenter can retire the synchronization objects used
     /// by its queued window presents.
     queued: bool,
+    preferred_modes: &'static [vk::PresentModeKHR],
 }
 
 struct PresentImage {
@@ -115,8 +116,23 @@ fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
     move |error| format!("{context}: {error}")
 }
 
+fn select_present_mode(
+    preferred: &[vk::PresentModeKHR],
+    supported: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
+    preferred
+        .iter()
+        .copied()
+        .find(|mode| supported.contains(mode))
+        .unwrap_or(vk::PresentModeKHR::FIFO)
+}
+
 impl Presenter {
-    pub fn new(gpu: &Gpu, window: WindowHandle) -> Result<Self, String> {
+    pub fn new(
+        gpu: &Gpu,
+        window: WindowHandle,
+        preferred_modes: &'static [vk::PresentModeKHR],
+    ) -> Result<Self, String> {
         if !gpu.swapchain {
             return Err("the device has no swapchain support".into());
         }
@@ -193,6 +209,7 @@ impl Presenter {
             srgb: false,
             queued: gpu.swapchain_maintenance
                 && std::env::var_os("ECHORA_PRESENT_CPU_WAIT").is_none(),
+            preferred_modes,
         })
     }
 
@@ -201,7 +218,7 @@ impl Presenter {
     fn rebuild(&mut self, gpu: &Gpu, fallback: vk::Extent2D) -> Result<(), String> {
         self.wait_for_presents(gpu)?;
         // SAFETY: live physical device and surface.
-        let (capabilities, formats) = unsafe {
+        let (capabilities, formats, modes) = unsafe {
             (
                 self.surface_loader
                     .get_physical_device_surface_capabilities(gpu.physical, self.surface)
@@ -209,6 +226,9 @@ impl Presenter {
                 self.surface_loader
                     .get_physical_device_surface_formats(gpu.physical, self.surface)
                     .map_err(vk_error("vkGetPhysicalDeviceSurfaceFormatsKHR"))?,
+                self.surface_loader
+                    .get_physical_device_surface_present_modes(gpu.physical, self.surface)
+                    .map_err(vk_error("vkGetPhysicalDeviceSurfacePresentModesKHR"))?,
             )
         };
         let wanted = if self.srgb {
@@ -259,7 +279,7 @@ impl Presenter {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(select_present_mode(self.preferred_modes, &modes))
             .clipped(true)
             .old_swapchain(self.swapchain);
         // SAFETY: rendering and pending present operations on the old
@@ -441,5 +461,25 @@ impl Renderer {
             Err(error) => return Err(format!("vkQueuePresentKHR: {error}")),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::PresentModeKHR as Mode;
+
+    #[test]
+    fn presentation_uses_the_first_supported_preference() {
+        let preferred = [Mode::IMMEDIATE, Mode::MAILBOX];
+        assert_eq!(
+            select_present_mode(&preferred, &[Mode::FIFO, Mode::MAILBOX, Mode::IMMEDIATE]),
+            Mode::IMMEDIATE
+        );
+        assert_eq!(
+            select_present_mode(&preferred, &[Mode::FIFO, Mode::MAILBOX]),
+            Mode::MAILBOX
+        );
+        assert_eq!(select_present_mode(&preferred, &[Mode::FIFO]), Mode::FIFO);
     }
 }

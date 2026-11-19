@@ -4322,10 +4322,17 @@ impl Nvn {
         };
         let backend = self.gpu.as_mut().unwrap();
         if backend.presenter.is_none() {
+            use echora_config::VsyncMode;
+            use vk::PresentModeKHR as Mode;
+            let preferred_modes: &'static [Mode] = match crate::settings::get().display.vsync {
+                VsyncMode::On => &[Mode::MAILBOX],
+                VsyncMode::Adaptive => &[Mode::FIFO_RELAXED],
+                VsyncMode::Off => &[Mode::IMMEDIATE, Mode::MAILBOX],
+            };
             let created = window
                 .handle()
                 .ok_or_else(|| "no window".to_string())
-                .and_then(|handle| Presenter::new(&backend.renderer.gpu, handle));
+                .and_then(|handle| Presenter::new(&backend.renderer.gpu, handle, preferred_modes));
             backend.presenter = Some(created.map_err(|error| {
                 backend.note(format!("window presentation failed: {error}"));
             }));

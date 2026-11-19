@@ -5,8 +5,8 @@
 //! Debug environment switches (`ECHORA_WINDOW_SIZE`, `ECHORA_FULLSCREEN`,
 //! `ECHORA_RESOLUTION`, `ECHORA_RESOLUTION_SCALE`) take precedence.
 //!
-//! Applied so far: window size and mode, internal render scale, master
-//! volume, and vibration on or off.
+//! Applied so far: window size and mode, internal render scale, vertical
+//! sync, master volume, and vibration on or off.
 
 use std::sync::OnceLock;
 

@@ -100,3 +100,6 @@ to be missing or incomplete.
   1080-row fallback. `echora-resolution` is not yet connected to the renderer, and
   widening the view (`AspectPolicy::Expand`) would need game-specific camera
   and interface changes.
+- Vertical sync uses tear-free mailbox presentation when available. Adaptive
+  sync prefers relaxed FIFO. Disabling sync prefers immediate presentation,
+  then mailbox. The fallback is FIFO.
