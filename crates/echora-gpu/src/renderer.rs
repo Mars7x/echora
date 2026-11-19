@@ -567,12 +567,9 @@ pub struct Renderer {
     /// Color clears limited by the scissor to part of the target.
     pub partial_clears: u64,
     pub flush_wait_microseconds: u64,
-    /// Images rendered to or cleared since the last memory barrier, and the
-    /// attachments of the last rendering pass: a pass or transfer that
-    /// reads one of them (or another pass that writes one) waits for
-    /// those writes first.
+    /// Images rendered to or cleared since the last memory barrier.
+    /// A later pass or transfer using one of them waits for those writes.
     written: FastSet<vk::Image>,
-    last_attachments: Vec<vk::Image>,
     /// Memory barriers recorded for those hazards.
     pub hazard_barriers: u64,
     /// GPU time per submission (ECHORA_GPU_TIME=1).
@@ -1041,7 +1038,6 @@ impl Renderer {
             partial_clears: 0,
             flush_wait_microseconds: 0,
             written: FastSet::default(),
-            last_attachments: Vec::new(),
             hazard_barriers: 0,
             spares,
             slot,
@@ -5958,9 +5954,6 @@ impl Renderer {
                 )
             };
             self.written.insert(target.image);
-            // The same attachments may be rebound next, but this write
-            // happened outside rendering and needs the usual dependency.
-            self.last_attachments.clear();
             return Ok(());
         }
         // Attachment clears support scissoring and conditional rendering.
@@ -6160,14 +6153,12 @@ impl Renderer {
         for key in &present {
             self.transition(*key, vk::ImageLayout::GENERAL)?;
         }
-        // Another pass's writes to these attachments come first.
+        // Separate rendering passes need a memory dependency before
+        // loading attachments that an earlier pass wrote.
         let attachments: Vec<vk::Image> =
             present.iter().map(|key| self.targets[key].image).collect();
-        if attachments != self.last_attachments {
-            self.order_after_rendering(&attachments)?;
-        }
+        self.order_after_rendering(&attachments)?;
         self.written.extend(attachments.iter().copied());
-        self.last_attachments = attachments;
         let commands = self.commands()?;
         let attachments: Vec<_> = views
             .iter()
@@ -7857,6 +7848,33 @@ mod tests {
         assert_eq!(texels[0], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(texels[7], [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(texels[3 * 8 + 3], [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn reopening_the_same_attachment_orders_the_previous_pass() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer
+            .target(1, 8, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        renderer
+            .clear_color(1, Some([0, 0, 4, 4]), vk::ClearColorValue { float32: red })
+            .unwrap();
+        renderer.end_pass();
+        let before = renderer.hazard_barriers;
+        renderer
+            .clear_color(1, Some([4, 0, 4, 4]), vk::ClearColorValue { float32: blue })
+            .unwrap();
+        let ordered = renderer.hazard_barriers > before;
+        let texels = renderer.read_target(1).unwrap();
+        assert_eq!(texels[0..8], [red, red, red, red, blue, blue, blue, blue]);
+        assert!(
+            ordered,
+            "a new rendering pass must wait for the prior store"
+        );
     }
 
     #[test]
