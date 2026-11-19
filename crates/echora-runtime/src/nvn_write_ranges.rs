@@ -13,7 +13,8 @@ pub struct ImportedSpan {
 /// continuous range in a guest memory file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedPages {
-    pub gpu: Range<u64>,
+    gpu: Range<u64>,
+    max_gpu_end: u64,
     pub file: i32,
     pub offset: u64,
 }
@@ -41,6 +42,7 @@ pub fn project_table(
         })
         .collect();
     let mut mapped = Vec::new();
+    let mut max_gpu_end = 0;
     let mut pages = entries.iter().copied().enumerate().peekable();
     while let Some((first, address)) = pages.next() {
         if address == 0 {
@@ -60,8 +62,11 @@ pub fn project_table(
             let start = span.device.start.max(address);
             let stop = span.device.end.min(end);
             if start < stop {
+                let gpu = gpu.checked_add(start - address)?..gpu.checked_add(stop - address)?;
+                max_gpu_end = max_gpu_end.max(gpu.end);
                 mapped.push(SharedPages {
-                    gpu: gpu.checked_add(start - address)?..gpu.checked_add(stop - address)?,
+                    gpu,
+                    max_gpu_end,
                     file: span.file,
                     offset: span.offset.checked_add(start - span.device.start)?,
                 });
@@ -72,31 +77,49 @@ pub fn project_table(
 }
 
 pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<Vec<FileRange>> {
-    let mut physical = Vec::new();
+    let mut physical: Vec<FileRange> = Vec::new();
     for write in writes {
-        for span in mapping.iter().take_while(|span| span.gpu.start < write.end) {
+        // Page-table runs and the imports within each run both start in
+        // ascending order. The prefix maximum also accounts for nested
+        // imports whose end precedes an earlier import's end.
+        let first = mapping.partition_point(|span| span.max_gpu_end <= write.start);
+        for span in mapping[first..]
+            .iter()
+            .take_while(|span| span.gpu.start < write.end)
+        {
             let lo = span.gpu.start.max(write.start);
             let hi = span.gpu.end.min(write.end);
             if lo < hi {
-                physical.push(FileRange {
-                    file: span.file,
-                    bytes: span.offset.checked_add(lo - span.gpu.start)?
-                        ..span.offset.checked_add(hi - span.gpu.start)?,
-                });
+                let start = span.offset.checked_add(lo - span.gpu.start)?;
+                let end = span.offset.checked_add(hi - span.gpu.start)?;
+                // Contiguous imports often project adjacent bytes of the
+                // same file even when their Vulkan address ranges differ.
+                if let Some(last) = physical.last_mut()
+                    && last.file == span.file
+                    && start <= last.bytes.end
+                    && end >= last.bytes.start
+                {
+                    last.bytes.start = last.bytes.start.min(start);
+                    last.bytes.end = last.bytes.end.max(end);
+                } else {
+                    physical.push(FileRange {
+                        file: span.file,
+                        bytes: start..end,
+                    });
+                }
             }
         }
     }
     physical.sort_unstable_by_key(|range| (range.file, range.bytes.start));
-    let mut merged: Vec<FileRange> = Vec::with_capacity(physical.len());
-    for range in physical {
-        match merged.last_mut() {
-            Some(last) if range.file == last.file && range.bytes.start <= last.bytes.end => {
-                last.bytes.end = last.bytes.end.max(range.bytes.end);
-            }
-            _ => merged.push(range),
+    physical.dedup_by(|next, previous| {
+        if previous.file == next.file && next.bytes.start <= previous.bytes.end {
+            previous.bytes.end = previous.bytes.end.max(next.bytes.end);
+            true
+        } else {
+            false
         }
-    }
-    Some(merged)
+    });
+    Some(physical)
 }
 
 #[cfg(test)]
@@ -158,6 +181,42 @@ mod tests {
                 file: 1,
                 bytes: 1005..1015
             }]
+        );
+    }
+
+    #[test]
+    fn projects_writes_past_the_end_of_a_nested_import() {
+        let mapping = project_table(
+            100,
+            20,
+            &[800, 820, 840, 860],
+            vec![
+                ImportedSpan {
+                    device: 800..880,
+                    file: 2,
+                    offset: 1000,
+                },
+                ImportedSpan {
+                    device: 820..840,
+                    file: 1,
+                    offset: 2000,
+                },
+            ],
+        )
+        .unwrap();
+        let writes = project_writes(&mapping, &[150..170, 110..160]).unwrap();
+        assert_eq!(
+            writes,
+            [
+                FileRange {
+                    file: 1,
+                    bytes: 2000..2020,
+                },
+                FileRange {
+                    file: 2,
+                    bytes: 1010..1070,
+                },
+            ]
         );
     }
 
