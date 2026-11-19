@@ -2002,7 +2002,7 @@ const KINDS: &[&str] = &[
 ];
 
 /// Commands a replay runs before it lets other threads' NVN calls in
-/// (ECHORA_REPLAY_CHUNK, default 64; 0 runs it whole).
+/// (ECHORA_REPLAY_CHUNK, default 96; 0 runs it whole).
 /// Threads waiting to take the NVN state's lock (the runtime counts them
 /// while they wait): a replay in pieces stops early for them.
 pub static NVN_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2020,7 +2020,7 @@ fn replay_chunk() -> Option<u32> {
         std::env::var("ECHORA_REPLAY_CHUNK")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(64)
+            .unwrap_or(96)
     });
     (chunk > 0).then_some(chunk)
 }
