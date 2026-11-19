@@ -168,6 +168,11 @@ pub enum HostEntry {
 #[path = "nvn_gpu.rs"]
 mod gpu;
 
+#[path = "nvn_list_archive.rs"]
+mod list_archive;
+
+use list_archive::ArchivedList;
+
 /// One frame's executed commands (each with the queue it ran on) and the
 /// render state when it began (ECHORA_CAPTURE_FRAME).
 #[derive(Debug)]
@@ -552,6 +557,10 @@ pub struct Nvn {
     /// last recording or submission.
     #[serde(skip)]
     command_lists: FastMap<u64, CommandList>,
+    /// Valid handles whose recorded lists are outside the replay cache.
+    #[serde(skip)]
+    archived_lists: FastMap<u64, ArchivedList>,
+    restored_command_lists: u64,
     /// Command handles by that order (least recently used first).
     #[serde(skip)]
     command_list_use: BTreeMap<u64, u64>,
@@ -561,13 +570,9 @@ pub struct Nvn {
     /// application is told (reported, not used to drop lists).
     #[serde(skip)]
     list_memory: BTreeMap<u64, (u64, [u64; 3], [u64; 2])>,
-    /// Lists dropped by the resource cap (`COMMAND_LIST_LIMIT`,
+    /// Lists archived under replay cache pressure (`COMMAND_LIST_LIMIT`,
     /// `COMMAND_LIMIT`) while still valid.
     pub capped_command_lists: u64,
-    /// ECHORA_STALE_LOG (debugging): why and when each dropped list went
-    /// (0 memory reused, 1 resource cap), shown when it is asked for.
-    #[serde(skip)]
-    dropped_lists: BTreeMap<u64, (u8, u64)>,
     command_list_clock: u64,
     /// Commands in `command_lists`.
     command_list_commands: usize,
@@ -1194,11 +1199,21 @@ impl Nvn {
     /// A list run again (submitted or called): most recently used, and
     /// counted as reused (the resource cap's second chance).
     fn use_command_list(&mut self, handle: u64) -> Option<std::sync::Arc<Vec<Command>>> {
-        let list = self.command_lists.get_mut(&handle)?;
+        let list = match self.command_lists.entry(handle) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let commands = self.archived_lists.remove(&handle)?.unpack();
+                self.command_list_commands += commands.len();
+                self.restored_command_lists += 1;
+                entry.insert(CommandList::new(commands, 0))
+            }
+        };
         list.submissions = list.submissions.saturating_add(1);
         self.command_list_clock += 1;
         let previous = std::mem::replace(&mut list.last_used, self.command_list_clock);
-        self.command_list_use.remove(&previous);
+        if previous != 0 {
+            self.command_list_use.remove(&previous);
+        }
         self.command_list_use
             .insert(self.command_list_clock, handle);
         Some(list.commands.clone())
@@ -1222,9 +1237,8 @@ impl Nvn {
             .map_or(0, |args| args.x[0])
     }
 
-    /// A submitted or called list no longer kept: counted, and with
-    /// ECHORA_STALE_LOG=<present> (debugging) each from that present on named, with the
-    /// present and the list's age (handles count up as lists are recorded).
+    /// Count an unavailable command handle. ECHORA_STALE_LOG=<present>
+    /// also prints each handle and its call site from that present onward.
     fn note_stale(&mut self, handle: u64, place: &str) {
         self.stale_command_submissions += 1;
         if let Ok(from) = debug_var("ECHORA_STALE_LOG")
@@ -1233,9 +1247,8 @@ impl Nvn {
                 .is_ok_and(|from| self.presented_frames >= from)
         {
             eprintln!(
-                "stale list present {} {place} {handle:#x} dropped {:?}",
-                self.presented_frames,
-                self.dropped_lists.get(&handle)
+                "stale list present {} {place} {handle:#x}",
+                self.presented_frames
             );
         }
     }
@@ -1277,15 +1290,9 @@ fn is_work_command(rest: &str) -> bool {
     PREFIXES.iter().any(|prefix| rest.starts_with(prefix))
 }
 
-/// A resource cap on the command lists kept for resubmission (least
-/// recently submitted or called dropped first, counted in
-/// `capped_command_lists`); otherwise a list is kept until its handle is
-/// finalized. The game records state lists once while loading and calls
-/// them every frame of the scene after the opening movie, so dropping lists
-/// by age left the terrain without its vertex streams.
+/// Limits on command lists kept ready for replay. Lists moved out of
+/// this cache retain their captured state in a compact representation.
 const COMMAND_LIST_LIMIT: usize = 262_144;
-/// Commands those lists may hold in all (each carries its state
-/// snapshots: about 3 KiB).
 const COMMAND_LIMIT: usize = 400_000;
 /// Lists of at most this many commands are not dropped for the command cap.
 const SMALL_COMMAND_LIST: usize = 16;
@@ -2915,6 +2922,7 @@ impl Nvn {
                         0x8000_0000_0000 | (place & 0x7fff_ffff_ffff)
                     });
                 // The list recorded there before is replaced.
+                self.archived_lists.remove(&handle);
                 if let Some(old) = self.command_lists.remove(&handle) {
                     self.command_list_commands -= old.commands.len();
                     self.command_list_use.remove(&old.last_used);
@@ -2991,13 +2999,9 @@ impl Nvn {
                     CommandList::new(commands, self.command_list_clock),
                 );
                 self.command_list_use.insert(self.command_list_clock, handle);
-                // Command memory is reused by later recordings, and the
-                // application rarely finalizes handles: keep the most
-                // recently recorded or submitted lists. Each holds its
-                // commands' state snapshots; gameplay lists hold ~500
-                // commands, and 65536 (later 8192) lists grew to gigabytes.
-                // Lists passed over this time (small ones under the command
-                // cap): once every kept list was, the loop stops.
+                // Prefer keeping recently used lists ready for replay.
+                // Short lists and reused lists can pass through the eviction
+                // queue before the next eligible list is archived.
                 let mut passed = 0usize;
                 while (self.command_lists.len() > COMMAND_LIST_LIMIT
                     || self.command_list_commands > COMMAND_LIMIT)
@@ -3028,10 +3032,6 @@ impl Nvn {
                             continue;
                         }
                     }
-                    self.list_memory.remove(&oldest);
-                    if debug_var_os("ECHORA_STALE_LOG").is_some() {
-                        self.dropped_lists.insert(oldest, (1, self.presented_frames));
-                    }
                     if let Some(list) = self.command_lists.remove(&oldest) {
                         let list = list.commands;
                         self.capped_command_lists += 1;
@@ -3039,11 +3039,12 @@ impl Nvn {
                             && let Some(bind) = big_vertex_bind(&list)
                         {
                             eprintln!(
-                                "list evicted present {} handle {oldest:#x} bind {bind:x?}",
+                                "list archived present {} handle {oldest:#x} bind {bind:x?}",
                                 self.presented_frames
                             );
                         }
                         self.command_list_commands -= list.len();
+                        self.archived_lists.insert(oldest, ArchivedList::pack(&list));
                         release_list(list);
                     }
                 }
@@ -3054,11 +3055,12 @@ impl Nvn {
             // handle's command list is released; it cannot be submitted again.
             "nvnDeviceFinalizeCommandHandle" => {
                 self.object(this, "Device").map_err(invalid)?;
-                let Some(list) = self.command_lists.remove(&x[1]) else {
+                if let Some(list) = self.command_lists.remove(&x[1]) {
+                    self.command_list_commands -= list.commands.len();
+                    self.command_list_use.remove(&list.last_used);
+                } else if self.archived_lists.remove(&x[1]).is_none() {
                     return Err(invalid(format!("unknown command handle {:#x}", x[1])));
-                };
-                self.command_list_commands -= list.commands.len();
-                self.command_list_use.remove(&list.last_used);
+                }
                 self.list_memory.remove(&x[1]);
                 return Ok(true);
             }
@@ -3076,9 +3078,8 @@ impl Nvn {
                 for index in 0..u64::from(count) {
                     let handle = core.memory.read_u64(x[2] + index * 8)?;
                     let Some(list) = self.use_command_list(handle) else {
-                        // A list dropped from the kept window (the
-                        // application seldom finalizes handles, so lists
-                        // are kept by recent use): skipped, counted.
+                        // Count unavailable NVN handles so the diagnostic
+                        // report identifies skipped work.
                         if handle >> 48 == 0x4e56 {
                             self.note_stale(handle, "submit");
                             continue;
@@ -7051,6 +7052,9 @@ impl Nvn {
             "texture_log": self.texture_log,
             "stale_command_submissions": self.stale_command_submissions,
             "capped_command_lists": self.capped_command_lists,
+            "archived_command_lists": self.archived_lists.len(),
+            "archived_command_bytes": self.archived_lists.values().map(ArchivedList::bytes).sum::<usize>(),
+            "restored_command_lists": self.restored_command_lists,
             "kept_command_lists": self.command_lists.len(),
             "kept_commands": self.command_list_commands,
             "kept_lists_by_buffer": self.kept_lists_by_buffer(),
@@ -8799,6 +8803,61 @@ mod tests {
             ));
             assert!(!read_shared(&nvn.registry).signaled.contains_key(&0x1000));
         }
+    }
+
+    #[test]
+    fn submitted_archived_lists_replay_and_finalize_normally() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let device = 0x2000;
+        let queue = 0x3000;
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        nvn.initialize(queue, "Queue", BTreeMap::new()).unwrap();
+        let handle = 0x4e56_0000_0000_002a;
+        let recorded = Command {
+            name: "nvnCommandBufferSetScissor",
+            x: [0, 11, 12, 13, 14, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        nvn.archived_lists
+            .insert(handle, ArchivedList::pack(std::slice::from_ref(&recorded)));
+        guest.memory.write_u64(0x1000, handle).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnQueueSubmitCommands",
+            &[queue, 1, 0x1000],
+        );
+        assert_eq!(nvn.render.scissor, Some([11, 12, 13, 14]));
+        assert_eq!(nvn.restored_command_lists, 1);
+        assert_eq!(nvn.stale_command_submissions, 0);
+        assert_eq!(nvn.command_list_commands, 1);
+
+        let archived = handle + 1;
+        nvn.archived_lists
+            .insert(archived, ArchivedList::pack(&[recorded]));
+        for handle in [archived, handle] {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDeviceFinalizeCommandHandle",
+                &[device, handle],
+            );
+            assert!(nvn.use_command_list(handle).is_none());
+        }
+        assert_eq!(nvn.command_list_commands, 0);
+        assert!(nvn.command_list_use.is_empty());
     }
 
     #[test]
