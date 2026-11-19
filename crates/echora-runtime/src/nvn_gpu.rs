@@ -10580,15 +10580,33 @@ fn ranges_overlap(ranges: &[std::ops::Range<u64>], range: &std::ops::Range<u64>)
 }
 
 fn add_range(ranges: &mut Vec<std::ops::Range<u64>>, range: std::ops::Range<u64>) {
-    // The list is sorted and disjoint: the ranges touching `range` are one
-    // run, found by binary search, and become one.
+    // The list is sorted and disjoint. Search for the first touching
+    // range, or the position where a new range belongs.
     let low = ranges.partition_point(|existing| existing.end < range.start);
-    let high = ranges.partition_point(|existing| existing.start <= range.end);
-    let mut merged = range;
-    if low < high {
-        merged = merged.start.min(ranges[low].start)..merged.end.max(ranges[high - 1].end);
+    let Some(first) = ranges
+        .get(low)
+        .filter(|existing| existing.start <= range.end)
+    else {
+        ranges.insert(low, range);
+        return;
+    };
+    if first.start <= range.start && range.end <= first.end {
+        return;
     }
-    ranges.splice(low..high, [merged]);
+    let start = first.start.min(range.start);
+    let end = first.end.max(range.end);
+    let following = &ranges[low + 1..];
+    if let Some(next) = following.first().filter(|next| next.start <= end) {
+        if following.get(1).is_some_and(|next| next.start <= end) {
+            let high = low + 1 + following.partition_point(|existing| existing.start <= end);
+            ranges.splice(low..high, [start..end.max(ranges[high - 1].end)]);
+        } else {
+            ranges[low] = start..end.max(next.end);
+            ranges.remove(low + 1);
+        }
+    } else {
+        ranges[low] = start..end;
+    }
 }
 
 /// Remove `range` from sorted, disjoint ranges. Returns whether any bytes
@@ -10850,7 +10868,12 @@ mod range_tests {
         add_range(&mut ranges, 18..32);
         assert_eq!(ranges, [10..40]);
         add_range(&mut ranges, 0..5);
+        add_range(&mut ranges, 12..20);
+        add_range(&mut ranges, 0..2);
         assert_eq!(ranges, [0..5, 10..40]);
+        let mut bridged = vec![0..5, 10..15, 20..25, 30..35];
+        add_range(&mut bridged, 5..30);
+        assert_eq!(bridged.as_slice(), std::slice::from_ref(&(0..35)));
         remove_range(&mut ranges, 15..25);
         assert_eq!(ranges, [0..5, 10..15, 25..40]);
         remove_range(&mut ranges, 0..12);
