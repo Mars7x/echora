@@ -5425,7 +5425,7 @@ impl Nvn {
                 };
                 let source = self.gpu_to_guest(command.x[1], size).map_err(stop)?;
                 // Earlier dispatches' results in the source come back first.
-                self.resolve_storage(core, Some(source..source + size))
+                self.resolve_queued_buffer_read(core, command.x[1], source, size)
                     .map_err(|message| stop(format!("dispatch results: {message}")))?;
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() {
                     let mut sample = vec![0u8; size.min(1 << 20) as usize];

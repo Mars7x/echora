@@ -2552,16 +2552,8 @@ impl Nvn {
                         return None;
                     }
                     let guest = self.gpu_to_guest(address, length).ok()?;
-                    let shared = self.shared_table_range(address, guest, length);
-                    // A consuming draw sees earlier GPU writes even when
-                    // the guest CPU has yet to see a fence.
-                    self.gpu.as_mut()?.wait_for_table_writes(shared).ok()?;
-                    let range = guest..guest.checked_add(length)?;
-                    if shared.is_some() {
-                        self.resolve_storage(core, Some(range)).ok()?;
-                    } else {
-                        self.resolve_gpu_written(core, range).ok()?;
-                    }
+                    self.resolve_queued_buffer_read(core, address, guest, length)
+                        .ok()?;
                     core.memory.read_u32(guest + 4 * u64::from(word)).ok()
                 }
             },
@@ -5700,6 +5692,31 @@ impl Nvn {
             return Ok(());
         }
         self.resolve_storage(core, Some(guest..guest + size))
+    }
+
+    /// A queued consumer sees preceding GPU writes whether or not a
+    /// fence has exposed those writes to guest CPU calls.
+    pub(super) fn resolve_queued_buffer_read(
+        &mut self,
+        core: &mut Guest,
+        address: u64,
+        guest: u64,
+        length: u64,
+    ) -> Result<(), String> {
+        if length == 0 || self.gpu.is_none() {
+            return Ok(());
+        }
+        let end = guest
+            .checked_add(length)
+            .ok_or("guest buffer range overflows")?;
+        let shared = self.shared_table_range(address, guest, length);
+        self.gpu.as_mut().unwrap().wait_for_table_writes(shared)?;
+        let range = guest..end;
+        if shared.is_some() {
+            self.resolve_storage(core, Some(range))
+        } else {
+            self.resolve_gpu_written(core, range)
+        }
     }
 
     pub(super) fn resolve_storage(
@@ -11452,6 +11469,92 @@ mod pool_tests {
         let backend = nvn.gpu.as_ref().unwrap();
         assert!(!backend.resident_writes_pending(&(base + 12..base + 16)));
         assert!(backend.resident_writes_pending(&(base + 16..base + 24)));
+    }
+
+    #[test]
+    fn texture_copy_sees_an_earlier_page_table_write() {
+        let Ok(Some(mut backend)) = Backend::create() else {
+            return;
+        };
+        let pool = 1;
+        let texture = 2;
+        let base = 0x10_0000;
+        let address = 0x20_0000;
+        let page = 4096;
+        backend.renderer.resident_buffer(base, page).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 0, &[0x7b; 16])
+            .unwrap();
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size: page,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: Vec::new(),
+            },
+        );
+        backend.record_page_table_write(backend.renderer.recorded_serial(), None);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 2 * page, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&pool)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([address, 0, 0, 0]));
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Storage".into(), args([pool, page, 0, 0])),
+                ("Width".into(), args([2, 0, 0, 0])),
+                ("Height".into(), args([2, 0, 0, 0])),
+                ("Format".into(), args([37, 0, 0, 0])),
+            ]),
+        )
+        .unwrap();
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 2 * page, READ | WRITE, STATE_NORMAL, "texture copy")
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.resolve_storage(&mut core, Some(base..base + 16))
+            .unwrap();
+        assert_eq!(core.memory.read_u32(base).unwrap(), 0);
+        nvn.execute_command(
+            &Command {
+                name: "nvnCommandBufferCopyBufferToTexture",
+                x: [0, address, texture, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: vec![0, 0, 0, 2, 2, 1, 0, 0, 0],
+                states: Default::default(),
+            },
+            &mut core,
+        )
+        .unwrap();
+        assert_eq!(core.memory.read_u32(base + page).unwrap(), 0x7b7b_7b7b);
     }
 
     #[test]
