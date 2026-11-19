@@ -123,7 +123,7 @@ impl GuestMemory<'_> {
     }
 }
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 /// Maps here are keyed by addresses and names looked up on every call: the
 /// fast hasher, not SipHash.
 type HashMap<K, V> = FastMap<K, V>;
@@ -561,9 +561,10 @@ pub struct Nvn {
     #[serde(skip)]
     archived_lists: FastMap<u64, ArchivedList>,
     restored_command_lists: u64,
-    /// Command handles by that order (least recently used first).
+    /// Recent (clock, handle) entries, oldest first. The current clock
+    /// stored on each list identifies entries that still affect eviction.
     #[serde(skip)]
-    command_list_use: BTreeMap<u64, u64>,
+    command_list_use: VecDeque<(u64, u64)>,
     /// The memory each finished list occupies by the host's model: its
     /// command buffer, the command memory (pool, offset, size) and control
     /// memory (address, size) its recording used, by the used amounts the
@@ -1210,13 +1211,44 @@ impl Nvn {
         };
         list.submissions = list.submissions.saturating_add(1);
         self.command_list_clock += 1;
-        let previous = std::mem::replace(&mut list.last_used, self.command_list_clock);
-        if previous != 0 {
-            self.command_list_use.remove(&previous);
-        }
+        list.last_used = self.command_list_clock;
+        let commands = list.commands.clone();
+        self.note_command_list_use(handle);
+        Some(commands)
+    }
+
+    fn note_command_list_use(&mut self, handle: u64) {
         self.command_list_use
-            .insert(self.command_list_clock, handle);
-        Some(list.commands.clone())
+            .push_back((self.command_list_clock, handle));
+        self.prune_command_list_use();
+    }
+
+    fn prune_command_list_use(&mut self) {
+        let lists = &self.command_lists;
+        if lists.is_empty() {
+            self.command_list_use.clear();
+        } else if self.command_list_use.len() > lists.len().saturating_mul(2).saturating_add(256) {
+            // Retire stale entries in batches, keeping the cost bounded
+            // even when a long-idle list remains at the front.
+            self.command_list_use.retain(|&(clock, handle)| {
+                lists
+                    .get(&handle)
+                    .is_some_and(|list| list.last_used == clock)
+            });
+        }
+    }
+
+    fn pop_oldest_command_list_use(&mut self) -> Option<u64> {
+        while let Some((clock, handle)) = self.command_list_use.pop_front() {
+            if self
+                .command_lists
+                .get(&handle)
+                .is_some_and(|list| list.last_used == clock)
+            {
+                return Some(handle);
+            }
+        }
+        None
     }
 }
 
@@ -2931,7 +2963,6 @@ impl Nvn {
                 self.archived_lists.remove(&handle);
                 if let Some(old) = self.command_lists.remove(&handle) {
                     self.command_list_commands -= old.commands.len();
-                    self.command_list_use.remove(&old.last_used);
                     self.list_memory.remove(&handle);
                     release_list(old.commands);
                 }
@@ -3004,7 +3035,7 @@ impl Nvn {
                     handle,
                     CommandList::new(commands, self.command_list_clock),
                 );
-                self.command_list_use.insert(self.command_list_clock, handle);
+                self.note_command_list_use(handle);
                 // Prefer keeping recently used lists ready for replay.
                 // Short lists and reused lists can pass through the eviction
                 // queue before the next eligible list is archived.
@@ -3013,7 +3044,7 @@ impl Nvn {
                     || self.command_list_commands > COMMAND_LIMIT)
                     && passed <= self.command_lists.len()
                 {
-                    let Some((_, oldest)) = self.command_list_use.pop_first() else {
+                    let Some(oldest) = self.pop_oldest_command_list_use() else {
                         break;
                     };
                     // A list submitted more than once is reused by the
@@ -3027,14 +3058,14 @@ impl Nvn {
                             passed += 1;
                             self.command_list_clock += 1;
                             list.last_used = self.command_list_clock;
-                            self.command_list_use.insert(self.command_list_clock, oldest);
+                            self.note_command_list_use(oldest);
                             continue;
                         }
                         if list.submissions > 1 {
                             list.submissions = 1;
                             self.command_list_clock += 1;
                             list.last_used = self.command_list_clock;
-                            self.command_list_use.insert(self.command_list_clock, oldest);
+                            self.note_command_list_use(oldest);
                             continue;
                         }
                     }
@@ -3054,6 +3085,7 @@ impl Nvn {
                         release_list(list);
                     }
                 }
+                self.prune_command_list_use();
                 core.cpu.regs[0] = handle;
                 return Ok(true);
             }
@@ -3063,7 +3095,7 @@ impl Nvn {
                 self.object(this, "Device").map_err(invalid)?;
                 if let Some(list) = self.command_lists.remove(&x[1]) {
                     self.command_list_commands -= list.commands.len();
-                    self.command_list_use.remove(&list.last_used);
+                    self.prune_command_list_use();
                 } else if self.archived_lists.remove(&x[1]).is_none() {
                     return Err(invalid(format!("unknown command handle {:#x}", x[1])));
                 }
@@ -9041,7 +9073,7 @@ mod tests {
                         clock,
                     ),
                 );
-                nvn.command_list_use.insert(clock, handle);
+                nvn.command_list_use.push_back((clock, handle));
             }
             nvn.command_list_clock = 2;
             let caller = Command {
@@ -9053,7 +9085,8 @@ mod tests {
             };
             nvn.execute(&caller, &mut guest).unwrap();
             assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
-            assert_eq!(nvn.command_list_use, BTreeMap::from([(3, 10), (4, 20)]));
+            assert_eq!(nvn.command_lists[&10].last_used, 3);
+            assert_eq!(nvn.command_lists[&20].last_used, 4);
 
             nvn.render.scissor = None;
             nvn.pending
@@ -9066,10 +9099,40 @@ mod tests {
                 });
             nvn.run_queue(1, &mut guest, false).unwrap();
             assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
-            assert_eq!(nvn.command_list_use, BTreeMap::from([(5, 20), (6, 10)]));
+            assert_eq!(nvn.command_lists[&20].last_used, 5);
+            assert_eq!(nvn.command_lists[&10].last_used, 6);
+            assert_eq!(nvn.pop_oldest_command_list_use(), Some(20));
+            assert_eq!(nvn.pop_oldest_command_list_use(), Some(10));
+            assert_eq!(nvn.pop_oldest_command_list_use(), None);
             assert_eq!(nvn.command_lists[&10].submissions, 2);
             assert_eq!(nvn.command_lists[&20].submissions, 2);
         }
+    }
+
+    #[test]
+    fn command_list_use_pruning_keeps_idle_and_replaced_handles_in_order() {
+        let mut nvn = Nvn::default();
+        let record = |nvn: &mut Nvn, handle| {
+            nvn.command_list_clock += 1;
+            nvn.command_lists
+                .insert(handle, CommandList::new(Vec::new(), nvn.command_list_clock));
+            nvn.note_command_list_use(handle);
+        };
+        for handle in 1..=4 {
+            record(&mut nvn, handle);
+        }
+        for _ in 0..800 {
+            assert!(nvn.use_command_list(2).is_some());
+        }
+        assert!(nvn.command_list_use.len() < 100);
+        nvn.command_lists.remove(&3);
+        record(&mut nvn, 1);
+        assert!(nvn.use_command_list(2).is_some());
+
+        assert_eq!(nvn.pop_oldest_command_list_use(), Some(4));
+        assert_eq!(nvn.pop_oldest_command_list_use(), Some(1));
+        assert_eq!(nvn.pop_oldest_command_list_use(), Some(2));
+        assert_eq!(nvn.pop_oldest_command_list_use(), None);
     }
 
     #[test]
