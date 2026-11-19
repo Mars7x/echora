@@ -5032,6 +5032,18 @@ impl Renderer {
         std::mem::take(&mut self.fresh_targets)
     }
 
+    /// A partial or conditional clear can leave guest texels untouched.
+    pub fn color_clear_needs_initialization(
+        &self,
+        key: u64,
+        level: u32,
+        layer: u32,
+        rect: Option<[i32; 4]>,
+    ) -> bool {
+        self.fresh_targets.contains(&key)
+            && (self.condition.is_some() || level != 0 || layer != 0 || rect.is_some())
+    }
+
     /// Target `key` gets its contents otherwise (a clear or a copy): it
     /// needs no initialization.
     pub fn defined(&mut self, key: u64) {

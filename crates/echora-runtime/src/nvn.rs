@@ -5464,7 +5464,7 @@ impl Nvn {
                 }
                 if self.gpu().is_some() {
                     for layer in layers {
-                        self.gpu_clear_color(texture, level, layer, color, rect)
+                        self.gpu_clear_color(core, (texture, level, layer), color, rect)
                             .map_err(stop)?;
                     }
                     return Ok(());
@@ -5511,7 +5511,7 @@ impl Nvn {
                     // The scissor rectangle limits the clear.
                     let scissor = self.render.scissor;
                     return self
-                        .gpu_clear_color(texture, level as u32, layer, color, scissor)
+                        .gpu_clear_color(core, (texture, level as u32, layer), color, scissor)
                         .map_err(stop);
                 }
                 let (width, height) = self.texture_extent(texture).map_err(stop)?;

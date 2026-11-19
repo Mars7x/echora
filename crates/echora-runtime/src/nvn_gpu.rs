@@ -1158,9 +1158,8 @@ impl Nvn {
     /// ClearColor on the GPU: `color` as the four captured 32-bit words.
     pub(super) fn gpu_clear_color(
         &mut self,
-        texture: u64,
-        level: u32,
-        layer: u32,
+        core: &Guest,
+        (texture, level, layer): (u64, u32, u32),
         color: [u32; 4],
         rect: Option<[i32; 4]>,
     ) -> Result<(), String> {
@@ -1171,6 +1170,15 @@ impl Nvn {
         self.ensure_render_target(texture)?;
         let ensured = std::time::Instant::now();
         crate::timeline::span(u64::MAX - 2, "clear: ensure target", started, ensured);
+        if self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .color_clear_needs_initialization(texture, level, layer, rect)
+        {
+            self.initialize_new_targets(core);
+        }
         let backend = self.gpu.as_mut().unwrap();
         backend.renderer.defined(texture);
         let value = vk::ClearColorValue {
@@ -11179,7 +11187,8 @@ mod bind_key_tests {
 #[cfg(test)]
 mod target_tests {
     use super::{Backend, Nvn};
-    use crate::nvn::Args;
+    use crate::nvn::{Args, Command, Guest, GuestMemory};
+    use echora_guest::{cpu::Cpu, memory::Memory};
     use std::collections::BTreeMap;
 
     #[test]
@@ -11254,6 +11263,98 @@ mod target_tests {
             renderer.read_target_bytes(2, 4).unwrap(),
             0.5_f32.to_le_bytes().repeat(32)
         );
+    }
+
+    #[test]
+    fn partial_and_conditional_color_clears_keep_guest_texels() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        backend
+            .renderer
+            .set_resolution_scale(echora_gpu::renderer::Scale::ONE);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10000;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x2000, 0, 0]))]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x2000, READ | WRITE, STATE_NORMAL, "color targets")
+            .unwrap();
+        for (texture, offset) in [(2, 0), (3, 0x1000)] {
+            nvn.initialize(
+                texture,
+                "Texture",
+                BTreeMap::from([
+                    ("Width".into(), scalar(2)),
+                    ("Height".into(), scalar(1)),
+                    ("Format".into(), scalar(10)),
+                    ("Storage".into(), args([1, offset, 0, 0])),
+                ]),
+            )
+            .unwrap();
+            memory.write_u32(base + offset, 0.25_f32.to_bits()).unwrap();
+            memory
+                .write_u32(base + offset + 4, 0.5_f32.to_bits())
+                .unwrap();
+        }
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut clear = Command {
+            name: "nvnCommandBufferClearTexture",
+            x: [0, 2, 0, 0, 0, 0xf, 0, 0],
+            v: [0; 8],
+            captured: vec![
+                u64::from(0.75_f32.to_bits()),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                0,
+                0,
+            ],
+            states: Default::default(),
+        };
+        nvn.execute_command(&clear, &mut core).unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let expected = [0.75_f32, 0.5].map(f32::to_le_bytes).concat();
+        assert_eq!(renderer.read_target_bytes(2, 4).unwrap(), expected);
+
+        if renderer.supports_conditions() {
+            let (predicate, _) = renderer.resident_buffer(4, 16).unwrap();
+            renderer.fill_resident(4, 0, 16, 0).unwrap();
+            renderer.set_condition(Some((predicate, 0, false)));
+            clear.x[1] = 3;
+            clear.captured.truncate(6);
+            nvn.execute_command(&clear, &mut core).unwrap();
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            let expected = [0.25_f32, 0.5].map(f32::to_le_bytes).concat();
+            assert_eq!(renderer.read_target_bytes(3, 4).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -11339,10 +11440,17 @@ mod target_tests {
             .unwrap();
         let red = [1.0f32, 0.0, 0.0, 1.0];
         let blue = [0.0f32, 0.0, 1.0, 1.0];
-        nvn.gpu_clear_color(9, 0, 0, red.map(f32::to_bits), None)
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        nvn.gpu_clear_color(&core, (9, 0, 0), red.map(f32::to_bits), None)
             .unwrap();
         nvn.refresh_target_index();
-        nvn.gpu_clear_color(10, 2, 0, blue.map(f32::to_bits), None)
+        nvn.gpu_clear_color(&core, (10, 2, 0), blue.map(f32::to_bits), None)
             .unwrap();
         assert_eq!(nvn.resolve_target(9), Some((10, 0)));
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
@@ -12114,8 +12222,6 @@ mod pool_tests {
         .unwrap();
         let blue = [0.0f32, 0.0, 1.0, 1.0].map(f32::to_bits);
         let red = [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits);
-        nvn.gpu_clear_color(texture, 1, 0, blue, None).unwrap();
-        nvn.gpu_clear_color(texture, 1, 1, red, None).unwrap();
         use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
         let mut memory = Memory::new(1 << 39);
         memory
@@ -12128,6 +12234,10 @@ mod pool_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: Some(0),
         };
+        nvn.gpu_clear_color(&core, (texture, 1, 0), blue, None)
+            .unwrap();
+        nvn.gpu_clear_color(&core, (texture, 1, 1), red, None)
+            .unwrap();
         nvn.execute_command(
             &Command {
                 name: "nvnCommandBufferCopyTextureToBuffer",
