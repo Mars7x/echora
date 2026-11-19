@@ -5013,7 +5013,12 @@ impl Renderer {
             self.unscaled.insert((to, TargetDescription::from(&target)));
         }
         self.insert_target(to, target);
-        self.fresh_targets.retain(|fresh| *fresh != from);
+        let needs_initialization = self.fresh_targets.contains(&from);
+        self.fresh_targets
+            .retain(|fresh| *fresh != from && *fresh != to);
+        if needs_initialization {
+            self.fresh_targets.push(to);
+        }
         Ok(())
     }
 
@@ -7781,6 +7786,23 @@ mod tests {
         assert_eq!(renderer.target_keys_in_order(), [1]);
         renderer.move_target(STAGING_KEYS + 1, 4).unwrap();
         assert_eq!(renderer.target_keys_in_order(), [1, 4]);
+    }
+
+    #[test]
+    fn moving_a_target_keeps_its_guest_initialization_state() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R32_SFLOAT;
+        renderer.target(1, 1, 1, format).unwrap();
+        renderer.target(2, 1, 1, format).unwrap();
+        renderer.defined(2);
+        renderer.move_target(1, 2).unwrap();
+        assert_eq!(renderer.take_fresh_targets(), [2]);
+
+        renderer.target(3, 1, 1, format).unwrap();
+        renderer.move_target(2, 3).unwrap();
+        assert!(renderer.take_fresh_targets().is_empty());
     }
 
     #[test]
