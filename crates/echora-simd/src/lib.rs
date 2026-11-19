@@ -2247,7 +2247,7 @@ fn int_lane(op: VecIntOp, bits: u32, a: u64, b: u64, d: u64, saturated: &mut boo
     value & mask
 }
 
-/// Lanewise integer operation on explicit Vn and Vm values.
+/// Lanewise integer operation on Vn and an operand per lane.
 #[allow(clippy::too_many_arguments)]
 fn vec_int_values(
     cpu: &mut Cpu,
@@ -2257,7 +2257,7 @@ fn vec_int_values(
     scalar: bool,
     rd: u8,
     n: u128,
-    m: u128,
+    operand: impl Fn(u32) -> u64,
 ) {
     let d = cpu.vectors[rd as usize];
     let mut saturated = false;
@@ -2267,7 +2267,7 @@ fn vec_int_values(
             op,
             bits,
             get_lane(n, bits, lane),
-            get_lane(m, bits, lane),
+            operand(lane),
             get_lane(d, bits, lane),
             &mut saturated,
         );
@@ -2277,16 +2277,6 @@ fn vec_int_values(
         cpu.fpsr |= FPSR_QC;
     }
     cpu.vectors[rd as usize] = finish_vector(result, bits, q, scalar);
-}
-
-/// Every `bits`-wide lane set to lane `index` of `value`.
-fn broadcast(value: u128, bits: u32, index: u8) -> u128 {
-    let element = get_lane(value, bits, u32::from(index));
-    let mut result = 0u128;
-    for lane in 0..128 / bits {
-        set_lane(&mut result, bits, lane, element);
-    }
-    result
 }
 
 /// Integer operation by element: every lane of Vn with lane `index` of Vm.
@@ -2303,11 +2293,9 @@ pub fn vec_int_element(
     index: u8,
 ) {
     let bits = u32::from(bits);
-    let (n, m) = (
-        cpu.vectors[rn as usize],
-        broadcast(cpu.vectors[rm as usize], bits, index),
-    );
-    vec_int_values(cpu, op, bits, q, scalar, rd, n, m);
+    let n = cpu.vectors[rn as usize];
+    let element = get_lane(cpu.vectors[rm as usize], bits, u32::from(index));
+    vec_int_values(cpu, op, bits, q, scalar, rd, n, |_| element);
 }
 
 /// ADDP/SMAXP/SMINP/UMAXP/UMINP. Vector: result lane i combines lanes 2i and
@@ -2387,7 +2375,10 @@ pub fn vec_int(
     rm: u8,
 ) {
     let (n, m) = (cpu.vectors[rn as usize], cpu.vectors[rm as usize]);
-    vec_int_values(cpu, op, u32::from(bits), q, scalar, rd, n, m);
+    let bits = u32::from(bits);
+    vec_int_values(cpu, op, bits, q, scalar, rd, n, |lane| {
+        get_lane(m, bits, lane)
+    });
 }
 
 fn leading_zeros_lane(value: u64, bits: u32) -> u64 {
@@ -2953,7 +2944,10 @@ pub fn vec_long(
     rm: u8,
 ) {
     let (n, m) = (cpu.vectors[rn as usize], cpu.vectors[rm as usize]);
-    vec_long_values(cpu, op, signed, u32::from(bits), upper, rd, n, m);
+    let bits = u32::from(bits);
+    vec_long_values(cpu, op, signed, bits, upper, rd, n, |lane| {
+        get_lane(m, bits, lane)
+    });
 }
 
 /// Widening operation by element (SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL).
@@ -2970,11 +2964,9 @@ pub fn vec_long_element(
     index: u8,
 ) {
     let bits = u32::from(bits);
-    let (n, m) = (
-        cpu.vectors[rn as usize],
-        broadcast(cpu.vectors[rm as usize], bits, index),
-    );
-    vec_long_values(cpu, op, signed, bits, upper, rd, n, m);
+    let n = cpu.vectors[rn as usize];
+    let element = get_lane(cpu.vectors[rm as usize], bits, u32::from(index));
+    vec_long_values(cpu, op, signed, bits, upper, rd, n, |_| element);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2986,7 +2978,7 @@ fn vec_long_values(
     upper: bool,
     rd: u8,
     n: u128,
-    m: u128,
+    operand: impl Fn(u32) -> u64,
 ) {
     let d = cpu.vectors[rd as usize];
     let wide = bits * 2;
@@ -3006,7 +2998,7 @@ fn vec_long_values(
         } else {
             extend(get_lane(n, bits, source))
         };
-        let b = extend(get_lane(m, bits, source));
+        let b = extend(operand(source));
         let acc = get_lane(d, wide, lane);
         // Both operands are extended to 64 bits, so the difference is exact.
         let abs_diff = if signed {
@@ -3928,6 +3920,8 @@ mod vector_tests {
         cpu.vectors[2] = lanes32([5, 6, 7, 1]);
         vec_int(&mut cpu, VecIntOp::Add, 32, true, false, 0, 1, 2);
         assert_eq!(cpu.vectors[0], lanes32([6, 8, 10, 0]));
+        vec_int_element(&mut cpu, VecIntOp::Mla, 32, false, false, 2, 1, 2, 2);
+        assert_eq!(cpu.vectors[2], lanes32([12, 20, 0, 0]));
     }
 
     #[test]
@@ -4453,6 +4447,12 @@ mod vector_tests {
         assert_eq!(cpu.vectors[0], 21 | (u128::from((-2i64) as u64) << 64));
         vec_long(&mut cpu, VecLongOp::Mull, false, 32, true, 0, 1, 2);
         assert_eq!(cpu.vectors[0], 55 | (72u128 << 64));
+        cpu.vectors[2] = lanes32([7, 2, 11, u32::MAX]);
+        vec_long_element(&mut cpu, VecLongOp::Mull, true, 32, true, 2, 1, 2, 3);
+        assert_eq!(
+            cpu.vectors[2],
+            u128::from(-5i64 as u64) | (u128::from(-6i64 as u64) << 64)
+        );
     }
 
     #[cfg(any(target_os = "linux", windows))]
