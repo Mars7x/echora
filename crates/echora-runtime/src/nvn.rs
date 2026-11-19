@@ -929,6 +929,8 @@ pub struct RenderState {
     /// SetRenderEnableConditional(mode, address) (`Some((mode, address))`):
     /// draws, clears and dispatches run only while it holds (`render_enabled`).
     pub render_enable: Option<(u64, u64)>,
+    /// The current queue's predicate is being evaluated by the GPU.
+    gpu_render_condition: bool,
     /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset,
     /// with ECHORA_OCCLUSION_ASSUME_VISIBLE (debugging, an approximation):
     /// occlusion counts are not measured, so each draw executed counts as
@@ -1237,9 +1239,10 @@ impl Nvn {
         self.replaying = true;
         self.bump_binding_serial("stat: binding serial by a restored capture");
         let result = (|| {
+            self.restore_render_condition(core)?;
             for (queue, epoch, command) in &capture.commands {
                 if let Some(queue) = *queue {
-                    self.switch_render_queue(queue);
+                    self.switch_render_queue(queue, core)?;
                 }
                 self.select_descriptors(*epoch);
                 self.execute(command, core)
@@ -1256,7 +1259,8 @@ impl Nvn {
         self.replay_budget = budget;
         self.replay_paused = paused;
         self.bump_binding_serial("stat: binding serial after a replay");
-        result
+        let restored = self.restore_render_condition(core);
+        result.and(restored)
     }
 }
 
@@ -4834,12 +4838,18 @@ impl Nvn {
     /// runs through waits), with that queue's own GPU state. Returns
     /// whether anything ran.
     fn run_queue(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
-        self.switch_render_queue(queue);
+        self.switch_render_queue(queue, core)
+            .map_err(|message| Trap::UnsupportedService {
+                pc: core.cpu.pc,
+                service: "nvn".into(),
+                command_id: None,
+                message: format!("restore queue {queue:#x} render condition: {message}"),
+            })?;
         self.run_queue_work(queue, core, force)
     }
 
     /// Make `queue`'s GPU state the current one.
-    fn switch_render_queue(&mut self, queue: u64) {
+    fn switch_render_queue(&mut self, queue: u64, core: &mut Guest) -> Result<(), String> {
         if self.render_queue != Some(queue) {
             self.pool_inputs += 1;
             let incoming = self.queue_render.remove(&queue).unwrap_or_default();
@@ -4853,7 +4863,9 @@ impl Nvn {
                 self.queue_memos.insert(previous, outgoing_memo);
             }
             self.render_queue = Some(queue);
+            self.restore_render_condition(core)?;
         }
+        Ok(())
     }
 
     fn run_queue_work(&mut self, queue: u64, core: &mut Guest, force: bool) -> Result<bool, Trap> {
@@ -5139,6 +5151,9 @@ impl Nvn {
     /// it writes counter 1 to ask for one, and the report after the clear
     /// writes 0, so the frame's later gated clears do nothing.
     fn render_enabled(&self, core: &Guest) -> bool {
+        if self.render.gpu_render_condition {
+            return true;
+        }
         match self.render.render_enable {
             None => true,
             Some((2, _)) => false,
@@ -5156,10 +5171,26 @@ impl Nvn {
         }
     }
 
+    fn restore_render_condition(&mut self, core: &mut Guest) -> Result<(), String> {
+        self.render.gpu_render_condition = false;
+        if self.gpu().is_some() {
+            if let Some((mode, address)) = self.render.render_enable
+                && mode <= 1
+                && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_none()
+            {
+                self.render.gpu_render_condition = self.gpu_condition(core, mode, address)?;
+            } else {
+                self.gpu_clear_condition();
+            }
+        }
+        Ok(())
+    }
+
     fn execute_command(&mut self, command: &Command, core: &mut Guest) -> Result<(), Trap> {
         match command.name {
             "nvnCommandBufferSetRenderEnable" => {
                 self.render.render_enable = (command.x[1] & 0xff == 0).then_some((2, 0));
+                self.render.gpu_render_condition = false;
                 if self.gpu().is_some() {
                     self.gpu_clear_condition();
                 }
@@ -5186,17 +5217,15 @@ impl Nvn {
                 let (mode, address) = (command.x[1] & 0xffff_ffff, command.x[2]);
                 // On the GPU when the counter is a measured report there;
                 // else (counters the CPU wrote) evaluated here.
-                let on_gpu = self.gpu().is_some()
-                    && debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_none()
-                    && self.gpu_condition(core, mode, address).map_err(|message| {
-                        Trap::UnsupportedService {
-                            pc: core.cpu.pc,
-                            service: "nvn".into(),
-                            command_id: None,
-                            message: format!("{}: {message}", command.name),
-                        }
-                    })?;
-                self.render.render_enable = (!on_gpu).then_some((mode, address));
+                self.render.render_enable = Some((mode, address));
+                self.restore_render_condition(core).map_err(|message| {
+                    Trap::UnsupportedService {
+                        pc: core.cpu.pc,
+                        service: "nvn".into(),
+                        command_id: None,
+                        message: format!("{}: {message}", command.name),
+                    }
+                })?;
                 return Ok(());
             }
             name if (name.starts_with("nvnCommandBufferDraw")
@@ -8479,6 +8508,98 @@ mod tests {
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
     #[test]
+    fn gpu_render_condition_follows_its_queue() {
+        use echora_gpu::ash::vk;
+
+        let Ok(Some(backend)) = gpu::Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.supports_conditions() {
+            return;
+        }
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let address = 0x10_0000;
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [address, 4096, 0, 0],
+                    ..Args::default()
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.objects.get_mut(&1).unwrap().state.insert(
+            "GpuAddress".into(),
+            Args {
+                x: [address, 0, 0, 0],
+                ..Args::default()
+            },
+        );
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(address, 4096, READ | WRITE, STATE_NORMAL, "condition test")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let target = 7;
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .target(target, 4, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let clear = |nvn: &mut Nvn, float32| {
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .clear_color(target, None, vk::ClearColorValue { float32 })
+                .unwrap();
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+
+        nvn.switch_render_queue(1, &mut guest).unwrap();
+        clear(&mut nvn, red);
+        nvn.gpu_samples_reset().unwrap();
+        assert!(nvn.gpu_samples_report(&mut guest, address, 0).unwrap());
+        let condition = Command {
+            name: "nvnCommandBufferSetRenderEnableConditional",
+            x: [0, 1, address, 0, 0, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        nvn.execute(&condition, &mut guest).unwrap();
+        assert!(nvn.render.gpu_render_condition);
+
+        nvn.switch_render_queue(2, &mut guest).unwrap();
+        clear(&mut nvn, green);
+        nvn.switch_render_queue(1, &mut guest).unwrap();
+        clear(&mut nvn, blue);
+        let texels = nvn
+            .gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .read_target(target)
+            .unwrap();
+        assert_eq!(texels, vec![green; 16]);
+    }
+
+    #[test]
     fn recorder_thunks_keep_their_command_and_property_routes() {
         for &name in REGISTRY_CALLS {
             assert!(matches!(
@@ -9245,10 +9366,17 @@ mod tests {
             )
             .unwrap();
         }
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
         assert_eq!(nvn.depth_mode(), 0);
-        nvn.switch_render_queue(0x4000);
+        nvn.switch_render_queue(0x4000, &mut guest).unwrap();
         assert_eq!(nvn.depth_mode(), 1);
-        nvn.switch_render_queue(0x3000);
+        nvn.switch_render_queue(0x3000, &mut guest).unwrap();
         assert_eq!(nvn.depth_mode(), 0);
     }
 

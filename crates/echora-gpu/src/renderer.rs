@@ -1188,7 +1188,7 @@ impl Renderer {
         self.slot.fence
     }
 
-    /// Gate the draws and dispatches recorded from now on on the 32-bit
+    /// Gate draws, dispatches and attachment clears on the 32-bit
     /// word at `offset` in `buffer` (the guest memory's device copy): they
     /// run while it is nonzero, or zero when `inverted`; None: always.
     /// The GPU reads the word in place, as the console reads a render
@@ -1215,7 +1215,7 @@ impl Renderer {
                 .is_some_and(|occlusion| occlusion.pending_at(buffer, offset))
     }
 
-    /// Before a draw's rendering pass begins: the report its condition
+    /// Before a rendering pass begins: the report its condition
     /// reads is written (ending an open pass) when it still waits.
     pub(crate) fn prepare_condition(&mut self) -> Result<(), String> {
         if self.condition_needs_resolve() {
@@ -1226,7 +1226,7 @@ impl Renderer {
     }
 
     /// Begin the wanted condition if it is not active (before recording a
-    /// draw or dispatch, inside the draw's rendering pass or outside any):
+    /// draw, attachment clear or dispatch, inside a rendering pass or outside any):
     /// one begun inside a pass ends with it.
     pub(crate) fn apply_condition(&mut self) -> Result<(), String> {
         let Some((buffer, offset, inverted)) = self.condition else {
@@ -5938,7 +5938,7 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
-        if [x, y, width, height] == whole {
+        if [x, y, width, height] == whole && self.condition.is_none() {
             self.transition(key, vk::ImageLayout::GENERAL)?;
             self.order_target(key)?;
             let commands = self.commands()?;
@@ -5963,8 +5963,10 @@ impl Renderer {
             self.last_attachments.clear();
             return Ok(());
         }
-        // A partial clear runs as an attachment clear in a render pass.
+        // Attachment clears support scissoring and conditional rendering.
+        self.prepare_condition()?;
         self.begin_rendering(&[key], &[level], &[layer], &[], None, 0, [0; 4])?;
+        self.apply_condition()?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -6020,7 +6022,9 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
+        self.prepare_condition()?;
         self.begin_rendering(&[], &[], &[], &[], Some(key), layer, [0; 4])?;
+        self.apply_condition()?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
             aspect_mask: aspects,
@@ -7853,6 +7857,58 @@ mod tests {
         assert_eq!(texels[0], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(texels[7], [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(texels[3 * 8 + 3], [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn color_and_depth_clears_follow_a_gpu_condition() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.supports_conditions() {
+            return;
+        }
+        let (predicate, _) = renderer.resident_buffer(1, 16).unwrap();
+        renderer.fill_resident(1, 0, 16, 0).unwrap();
+        renderer
+            .target(2, 8, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        renderer.target(3, 8, 4, vk::Format::D32_SFLOAT).unwrap();
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        renderer
+            .clear_color(2, None, vk::ClearColorValue { float32: red })
+            .unwrap();
+        renderer
+            .clear_depth_stencil(3, 0, None, Some(0.25), None)
+            .unwrap();
+
+        renderer.set_condition(Some((predicate, 0, false)));
+        renderer
+            .clear_color(2, None, vk::ClearColorValue { float32: blue })
+            .unwrap();
+        renderer
+            .clear_depth_stencil(3, 0, None, Some(0.75), None)
+            .unwrap();
+        assert_eq!(renderer.read_target(2).unwrap(), vec![red; 32]);
+        let depth = renderer.read_target_bytes(3, 4).unwrap();
+        assert_eq!(depth, 0.25_f32.to_le_bytes().repeat(32));
+
+        renderer.set_condition(Some((predicate, 0, true)));
+        renderer
+            .clear_color(2, Some([4, 0, 4, 4]), vk::ClearColorValue { float32: blue })
+            .unwrap();
+        renderer
+            .clear_depth_stencil(3, 0, Some([4, 0, 4, 4]), Some(0.75), None)
+            .unwrap();
+        let colors = renderer.read_target(2).unwrap();
+        let depth = renderer.read_target_bytes(3, 4).unwrap();
+        for row in colors.chunks_exact(8) {
+            assert_eq!(row, [red, red, red, red, blue, blue, blue, blue]);
+        }
+        for row in depth.chunks_exact(32) {
+            assert_eq!(&row[..16], 0.25_f32.to_le_bytes().repeat(4));
+            assert_eq!(&row[16..], 0.75_f32.to_le_bytes().repeat(4));
+        }
     }
 }
 
