@@ -184,6 +184,49 @@ struct FrameCapture {
     oldest_descriptor_epoch: u64,
 }
 
+/// Lossless PNG encoding only needs the finished CPU image. Bound the
+/// memory and keep captures in order by finishing one before starting another.
+#[derive(Debug, Default)]
+struct PngCapture {
+    worker: Option<std::thread::JoinHandle<Result<(), Trap>>>,
+}
+
+impl PngCapture {
+    fn write(&mut self, path: std::path::PathBuf, image: Image) -> Result<(), Trap> {
+        self.finish()?;
+        self.worker = Some(
+            std::thread::Builder::new()
+                .name("echora-png".into())
+                .spawn(move || {
+                    std::fs::write(&path, image.png()).map_err(|error| Trap::InvalidState {
+                        message: format!("write {}: {error}", path.display()),
+                    })
+                })
+                .map_err(|error| Trap::InvalidState {
+                    message: format!("start PNG capture worker: {error}"),
+                })?,
+        );
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), Trap> {
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| Trap::InvalidState {
+                message: "PNG capture worker panicked".into(),
+            })??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PngCapture {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            eprintln!("PNG capture: {error:?}");
+        }
+    }
+}
+
 /// Queued work of one queue (see `Nvn::pending`).
 #[derive(Debug)]
 enum QueueItem {
@@ -644,6 +687,8 @@ pub struct Nvn {
     /// `replay_captured_frame`).
     #[serde(skip)]
     frame_capture: Option<Box<FrameCapture>>,
+    #[serde(skip)]
+    png_capture: PngCapture,
     /// A captured frame is being replayed (its commands are not captured
     /// again).
     #[serde(skip)]
@@ -4229,8 +4274,7 @@ impl Nvn {
                         invalid(format!("create {}: {error}", directory.display()))
                     })?;
                     let path = directory.join(format!("frame-{:05}.png", self.presented_frames));
-                    std::fs::write(&path, image.png())
-                        .map_err(|error| invalid(format!("write {}: {error}", path.display())))?;
+                    self.png_capture.write(path, image)?;
                 }
             }
         }
@@ -6779,6 +6823,11 @@ impl Nvn {
         keys
     }
 
+    /// Finish the requested images before returning the run's result.
+    pub(crate) fn finish_png_capture(&mut self) -> Result<(), Trap> {
+        self.png_capture.finish()
+    }
+
     /// Presents so far.
     pub fn presents(&self) -> u64 {
         self.presented_frames
@@ -8628,6 +8677,31 @@ mod tests {
         assert_eq!(copy.region, [1, 2, 0, 3, 4, 1]);
         assert_eq!(copy.bases, [2, 0]);
         assert_eq!(copy.strides, [32, 256]);
+    }
+
+    #[test]
+    fn background_png_capture_finishes_the_requested_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.png");
+        let image = Image {
+            width: 1,
+            height: 1,
+            texels: vec![[0.125, 0.25, 0.75, 1.0]],
+        };
+        let expected = image.png();
+        let mut capture = PngCapture::default();
+        capture.write(first.clone(), image.clone()).unwrap();
+        capture.write(second.clone(), image.clone()).unwrap();
+        capture.finish().unwrap();
+        assert_eq!(std::fs::read(first).unwrap(), expected);
+        assert_eq!(std::fs::read(second).unwrap(), expected);
+
+        capture.write(directory.path().to_owned(), image).unwrap();
+        assert!(matches!(
+            capture.finish(),
+            Err(Trap::InvalidState { message }) if message.starts_with("write ")
+        ));
     }
 
     #[test]

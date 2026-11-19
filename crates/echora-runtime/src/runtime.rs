@@ -2706,19 +2706,32 @@ impl Machine {
         let _profile = crate::host_profile::start();
         // ECHORA_PARALLEL_PATH (diagnostic): the worker machinery even for
         // one worker.
-        if self.layout.workers > 1 || crate::nvn::debug_var_os("ECHORA_PARALLEL_PATH").is_some() {
-            return self.run_parallel(&dispatch);
-        }
-        let _watch = crate::fault::watch(&self.core);
-        self.core.rearm();
-        loop {
-            rearm_lowered_dispatch_limit(&self.core);
-            let result = dispatch(&mut self.core);
-            if result.is_ok() {
-                continue;
-            }
-            self.boundary(result)?;
+        let result = if self.layout.workers > 1
+            || crate::nvn::debug_var_os("ECHORA_PARALLEL_PATH").is_some()
+        {
+            self.run_parallel(&dispatch)
+        } else {
+            let _watch = crate::fault::watch(&self.core);
             self.core.rearm();
+            loop {
+                rearm_lowered_dispatch_limit(&self.core);
+                let result = dispatch(&mut self.core);
+                if result.is_ok() {
+                    continue;
+                }
+                if let Err(stop) = self.boundary(result) {
+                    break Err(stop);
+                }
+                self.core.rearm();
+            }
+        };
+        match self.nvn.finish_png_capture() {
+            Ok(()) => result,
+            Err(error) if matches!(&result, Ok(()) | Err(Trap::Exit { code: 0 })) => Err(error),
+            Err(error) => {
+                eprintln!("PNG capture: {error:?}");
+                result
+            }
         }
     }
 
