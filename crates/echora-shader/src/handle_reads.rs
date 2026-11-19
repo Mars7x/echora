@@ -1188,3 +1188,382 @@ mod tests {
         assert!(HandleReads::compile(&code).is_empty());
     }
 }
+
+/// All bytes a compute program can write through pointers initialized by
+/// complete uniform constant-bank loads, independent of control flow.
+#[derive(Debug)]
+pub struct UniformWriteRanges(Vec<UniformPointer>);
+
+#[derive(Debug)]
+struct UniformPointer {
+    offsets: std::ops::RangeInclusive<i64>,
+    constant: (u8, u16),
+}
+
+impl UniformWriteRanges {
+    pub fn from_program(program: &[u8]) -> Option<Self> {
+        if crate::is_graphics(program) {
+            return None;
+        }
+        let code = crate::program_code(program).ok()?;
+        Self::compile_reaching(&code)
+    }
+
+    /// Constant-bank pointer definitions that reach every path to a write.
+    /// Any incoming path with a different or unknown definition invalidates
+    /// the pair until a later unconditional full-width load defines it.
+    fn compile_reaching(code: &[Instruction]) -> Option<Self> {
+        type Input = (u8, u16);
+        type State = [Option<Input>; 64];
+
+        let mut successors = Vec::with_capacity(code.len());
+        let mut writes = Vec::new();
+        for (index, instruction) in code.iter().enumerate() {
+            let next = (index + 1 < code.len()).then_some(index + 1);
+            successors.push(match instruction.op {
+                Op::Bra {
+                    mode: 0,
+                    offset,
+                    condition,
+                } => {
+                    let target = crate::compute::relative_target(index, offset, code.len())?;
+                    let fallthrough = if instruction.guard.is_true() && condition.is_true() {
+                        None
+                    } else {
+                        next
+                    };
+                    [Some(target), fallthrough]
+                }
+                Op::Exit { condition } if condition.is_true() && instruction.guard.is_true() => {
+                    [None, None]
+                }
+                Op::Bra { .. }
+                | Op::Brx { .. }
+                | Op::Call { .. }
+                | Op::Ret { .. }
+                | Op::Unknown { .. } => return None,
+                Op::Store {
+                    space: Space::Global,
+                    address,
+                    ..
+                }
+                | Op::Atomic {
+                    space: Space::Global,
+                    address,
+                    ..
+                } => {
+                    writes.push((index, address));
+                    [next, None]
+                }
+                _ => [next, None],
+            });
+        }
+        if writes.is_empty() {
+            return None;
+        }
+
+        let mut inputs: Vec<Option<State>> = vec![None; code.len()];
+        inputs[0] = Some([None; 64]);
+        let mut pending = std::collections::VecDeque::from([0]);
+        let mut queued = vec![false; code.len()];
+        while let Some(at) = pending.pop_front() {
+            queued[at] = false;
+            let mut output = inputs[at]?;
+            let instruction = &code[at];
+            match instruction.op {
+                Op::Uldc { d, src, size } => {
+                    let at = usize::from(d.0);
+                    if at != 63 {
+                        output[at.saturating_sub(1)..=at + usize::from(size == 5)].fill(None);
+                        if instruction.guard.is_true()
+                            && size == 5
+                            && at < 62
+                            && let Src::Const { bank, offset } = src
+                        {
+                            output[at] = Some((bank, offset & !3));
+                        }
+                    }
+                }
+                Op::Bra { .. } | Op::Exit { .. } => {}
+                // An arithmetic result overwrites only that uniform word.
+                Op::Iadd3 { d, .. } if instruction.uniform => {
+                    let at = usize::from(d.0);
+                    if at < 63 {
+                        output[at.saturating_sub(1)..=at].fill(None);
+                    }
+                }
+                Op::R2ur { .. }
+                | Op::Redux { .. }
+                | Op::Vote {
+                    uniform_out: true, ..
+                } => output.fill(None),
+                _ if instruction.uniform => output.fill(None),
+                _ => {}
+            }
+            for next in successors[at].into_iter().flatten() {
+                let changed = if let Some(input) = &mut inputs[next] {
+                    let mut changed = false;
+                    for (old, new) in input.iter_mut().zip(output) {
+                        if old.is_some() && *old != new {
+                            *old = None;
+                            changed = true;
+                        }
+                    }
+                    changed
+                } else {
+                    inputs[next] = Some(output);
+                    true
+                };
+                if changed && !queued[next] {
+                    pending.push_back(next);
+                    queued[next] = true;
+                }
+            }
+        }
+
+        let mut ranges = std::collections::BTreeMap::new();
+        for (index, address) in writes {
+            let Some(state) = &inputs[index] else {
+                continue;
+            };
+            let (pointer, true) = address.uniform? else {
+                return None;
+            };
+            let dynamic = address.reg != Reg::ZERO;
+            if address.wide && dynamic {
+                return None;
+            }
+            let source = state[usize::from(pointer.0)]?;
+            let first = i64::from(address.offset);
+            let last = first + if dynamic { i64::from(u32::MAX) } else { 0 };
+            ranges
+                .entry(source)
+                .and_modify(|(lo, hi): &mut (i64, i64)| {
+                    *lo = (*lo).min(first);
+                    *hi = (*hi).max(last);
+                })
+                .or_insert((first, last));
+        }
+        (!ranges.is_empty()).then(|| {
+            Self(
+                ranges
+                    .into_iter()
+                    .map(|(source, (lo, hi))| UniformPointer {
+                        offsets: lo..=hi,
+                        constant: source,
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    pub fn intervals(
+        &self,
+        mut constant: impl FnMut(u8, u16) -> Option<u32>,
+    ) -> Option<Vec<std::ops::Range<u64>>> {
+        let mut ranges = Vec::new();
+        for pointer in &self.0 {
+            let (bank, offset) = pointer.constant;
+            let base = u64::from(constant(bank, offset)?)
+                | u64::from(constant(bank, offset.wrapping_add(4))?) << 32;
+            // Subword stores can update a whole aligned word. One translated
+            // instruction writes at most sixteen bytes.
+            let first = base.checked_add_signed(*pointer.offsets.start())? & !3;
+            let end = base
+                .checked_add_signed(*pointer.offsets.end())?
+                .checked_add(16)?;
+            ranges.push(first..end);
+        }
+        Some(ranges)
+    }
+}
+
+#[cfg(test)]
+mod uniform_range_tests {
+    use super::*;
+
+    fn ins(op: Op) -> Instruction {
+        Instruction {
+            raw: 0,
+            guard: Pred::TRUE,
+            uniform: false,
+            op,
+        }
+    }
+
+    fn load(d: u8, offset: u16, size: u8) -> Instruction {
+        let mut load = ins(Op::Uldc {
+            d: UniformReg(d),
+            src: Src::Const { bank: 0, offset },
+            size,
+        });
+        load.guard = Pred {
+            index: 0,
+            negated: true,
+        };
+        load.uniform = true;
+        load
+    }
+
+    fn store(reg: Reg, wide: bool, offset: i32) -> Instruction {
+        ins(Op::Store {
+            address: Address {
+                reg,
+                wide,
+                offset,
+                scale: 1,
+                uniform: Some((UniformReg(4), true)),
+            },
+            data: Reg(3),
+            space: Space::Global,
+            size: 6,
+            strong: false,
+        })
+    }
+
+    #[test]
+    fn complete_pair_definitions_after_partial_writes_bound_straight_line_stores() {
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let partial = load(5, 64, 4);
+        let write = store(Reg(2), false, 0);
+        let plan = UniformWriteRanges::compile_reaching(&[partial, pair, write]).unwrap();
+        let constants = |_, at| match at {
+            32 => Some(0x100),
+            36 => Some(8),
+            _ => None,
+        };
+        assert_eq!(
+            plan.intervals(constants).unwrap()[0],
+            0x8_0000_0100..0x9_0000_010f
+        );
+        assert!(UniformWriteRanges::compile_reaching(&[pair, partial, write]).is_none());
+    }
+
+    fn branch(offset: i64, unconditional: bool) -> Instruction {
+        let mut branch = ins(Op::Bra {
+            offset,
+            mode: 0,
+            condition: Pred::TRUE,
+        });
+        if !unconditional {
+            branch.guard = Pred {
+                index: 0,
+                negated: false,
+            };
+        }
+        branch
+    }
+
+    #[test]
+    fn reaching_definitions_survive_only_when_every_path_agrees() {
+        let pair = |offset| {
+            let mut pair = load(4, offset, 5);
+            pair.guard = Pred::TRUE;
+            pair
+        };
+        let write = store(Reg(2), false, 0);
+        let mut code = [
+            branch(32, false),
+            pair(32),
+            branch(16, true),
+            pair(32),
+            write,
+        ];
+        let matching = UniformWriteRanges::compile_reaching(&code).unwrap();
+        assert_eq!(matching.intervals(|_, _| Some(0)).unwrap().len(), 1);
+        code[3] = pair(64);
+        assert!(UniformWriteRanges::compile_reaching(&code).is_none());
+    }
+
+    #[test]
+    fn back_edges_can_invalidate_a_definition_seen_on_the_first_iteration() {
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let partial = load(5, 64, 4);
+        let write = store(Reg(2), false, 0);
+        assert!(
+            UniformWriteRanges::compile_reaching(&[pair, write, partial, branch(-48, false)])
+                .is_none()
+        );
+        assert!(
+            UniformWriteRanges::compile_reaching(&[pair, write, partial, branch(-64, false)])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn branch_around_a_load_cannot_define_the_pointer() {
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let write = store(Reg(2), false, 0);
+        assert!(UniformWriteRanges::compile_reaching(&[branch(16, false), pair, write]).is_none());
+        assert!(
+            UniformWriteRanges::compile_reaching(&[pair, branch(16, true), load(5, 64, 4), write])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_conditional_exit_keeps_the_fallthrough_write_reachable() {
+        let exit = ins(Op::Exit {
+            condition: Pred {
+                index: 0,
+                negated: false,
+            },
+        });
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let write = store(Reg::ZERO, false, 4);
+        let plan = UniformWriteRanges::compile_reaching(&[exit, pair, write]).unwrap();
+        let ranges = plan.intervals(|_, _| Some(0)).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 4..20);
+        let exit = ins(Op::Exit {
+            condition: Pred::TRUE,
+        });
+        assert!(UniformWriteRanges::compile_reaching(&[exit, pair, write]).is_none());
+    }
+
+    #[test]
+    fn uniform_add_only_invalidates_the_pair_it_overwrites() {
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let value = Operand {
+            src: Src::Imm(1),
+            abs: false,
+            neg: false,
+        };
+        let add = |d| {
+            let mut instruction = ins(Op::Iadd3 {
+                d: Reg(d),
+                a: value,
+                b: value,
+                c: value,
+                carry_out: [Pred::TRUE; 2],
+                carry_in: [Pred::TRUE; 2],
+                extended: false,
+            });
+            instruction.uniform = true;
+            instruction
+        };
+        let write = store(Reg(2), false, 0);
+        for d in [0, 3, 6, 62, 63] {
+            assert!(UniformWriteRanges::compile_reaching(&[pair, add(d), write]).is_some());
+        }
+        for d in [4, 5] {
+            assert!(UniformWriteRanges::compile_reaching(&[pair, add(d), write]).is_none());
+        }
+    }
+
+    #[test]
+    fn declines_wrapping_addresses() {
+        let mut pair = load(4, 32, 5);
+        pair.guard = Pred::TRUE;
+        let plan = UniformWriteRanges::compile_reaching(&[pair, store(Reg(2), false, 8)]).unwrap();
+        assert!(plan.intervals(|_, _| Some(u32::MAX)).is_none());
+        let plan =
+            UniformWriteRanges::compile_reaching(&[pair, store(Reg::ZERO, true, -8)]).unwrap();
+        assert!(plan.intervals(|_, _| Some(0)).is_none());
+    }
+}

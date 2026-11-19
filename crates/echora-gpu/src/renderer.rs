@@ -1364,6 +1364,25 @@ impl Renderer {
             .map_or(&[], |(_, entries)| entries.as_slice())
     }
 
+    /// Device address ranges and their offsets in the imported guest file.
+    pub fn shared_device_file_mappings(&self) -> Option<(i32, Vec<(std::ops::Range<u64>, u64)>)> {
+        let AddressedFile::Single(file) = self.addressed_file else {
+            return None;
+        };
+        let ordinary = self
+            .addressed
+            .iter()
+            .chain(&self.superseded)
+            .map(|&(offset, size, _, _, address)| (address..address + size, offset));
+        let packed = self.packed.iter().flat_map(|group| {
+            group
+                .ranges
+                .iter()
+                .map(|&(offset, size, at)| (group.address + at..group.address + at + size, offset))
+        });
+        Some((file, ordinary.chain(packed).collect()))
+    }
+
     /// Whether a device address covers these exact bytes of the shared
     /// guest file. Previous imports remain valid until the table replaces
     /// their device addresses.

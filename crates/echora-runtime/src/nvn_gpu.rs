@@ -40,7 +40,11 @@ pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
     pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize), bool)>,
+    shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
 }
+
+#[path = "nvn_write_ranges.rs"]
+mod writer_ranges;
 
 pub struct Backend {
     pub renderer: Renderer,
@@ -51,6 +55,9 @@ pub struct Backend {
     /// keeps each addressed translation alive.
     handle_reads: HashMap<usize, Arc<shader::handle_reads::HandleReads>>,
     global_writes: HashMap<usize, (shader::handle_reads::GlobalWrites, [u32; 3])>,
+    uniform_writes: HashMap<usize, shader::handle_reads::UniformWriteRanges>,
+    /// Most recent writer bounded using the page table's shared mappings.
+    projected_write_serial: u64,
     /// Last unbounded store and bounded shared ranges still used by batches.
     unbounded_write_serial: u64,
     shared_writes: Vec<(u64, SharedRange)>,
@@ -338,6 +345,8 @@ impl Backend {
             compute_jumps: HashMap::default(),
             handle_reads: HashMap::default(),
             global_writes: HashMap::default(),
+            uniform_writes: HashMap::default(),
+            projected_write_serial: 0,
             unbounded_write_serial: 0,
             shared_writes: Vec::new(),
             native_programs: Default::default(),
@@ -1787,12 +1796,15 @@ impl Nvn {
             && stage.stage == Stage::Compute
             && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0
             && stage.push_fields & echora_shader_abi::PUSH_PAGE_TABLE_READ_ONLY == 0
-            && let Some(writes) = shader::handle_reads::GlobalWrites::from_program(&code)
         {
-            let local = [compute[0], compute[1], compute[2]].map(|size| size.max(1));
-            backend
-                .global_writes
-                .insert(Arc::as_ptr(stage) as usize, (writes, local));
+            let id = Arc::as_ptr(stage) as usize;
+            if let Some(writes) = shader::handle_reads::GlobalWrites::from_program(&code) {
+                let local = [compute[0], compute[1], compute[2]].map(|size| size.max(1));
+                backend.global_writes.insert(id, (writes, local));
+            }
+            if let Some(writes) = shader::handle_reads::UniformWriteRanges::from_program(&code) {
+                backend.uniform_writes.insert(id, writes);
+            }
         }
         backend.translations.insert(cache_key, translated.clone());
         translated.map(|stage| (stage, key))
@@ -5496,14 +5508,18 @@ impl Nvn {
             }
         }
         let groups = [command.x[1], command.x[2], command.x[3]].map(|count| count as u32);
-        let bounded = if writes_page_table && indirect.is_none() {
-            self.compute_shared_writes(&stage, groups, |bank, offset| {
-                let descriptor = stage.descriptors.iter().find(|descriptor| {
-                    descriptor.kind() == DescriptorKind::UniformBuffer
-                        && descriptor.index == u32::from(bank)
-                })?;
-                shader_word(uniforms.get(&descriptor.binding)?, usize::from(offset))
-            })
+        let bounded = if writes_page_table {
+            self.compute_shared_writes(
+                &stage,
+                indirect.is_none().then_some(groups),
+                |bank, offset| {
+                    let descriptor = stage.descriptors.iter().find(|descriptor| {
+                        descriptor.kind() == DescriptorKind::UniformBuffer
+                            && descriptor.index == u32::from(bank)
+                    })?;
+                    shader_word(uniforms.get(&descriptor.binding)?, usize::from(offset))
+                },
+            )
         } else {
             None
         };
@@ -5547,7 +5563,15 @@ impl Nvn {
             .into_iter()
             .collect();
         if writes_page_table {
-            backend.record_page_table_write(backend.renderer.recorded_serial(), bounded);
+            let serial = backend.renderer.recorded_serial();
+            let (ranges, projected) = bounded.map_or((None, false), |(ranges, projected)| {
+                (Some(ranges), projected)
+            });
+            if projected {
+                backend.projected_write_serial = serial;
+                backend.stat("stat: bounded uniform writes", 1);
+            }
+            backend.record_page_table_write(serial, ranges);
         }
         backend.stat(
             "stat: dispatch renderer microseconds",
@@ -6323,6 +6347,15 @@ impl Nvn {
             "stat: page table map microseconds",
             started.elapsed().as_micros() as u64,
         );
+        // Rebuilding can add mappings in place. A program already queued
+        // may now reach pages absent from the table used to bound its writes.
+        let projected = std::mem::take(&mut backend.projected_write_serial);
+        if projected > backend.unbounded_write_serial {
+            backend.unbounded_write_serial = projected;
+            backend
+                .shared_writes
+                .retain(|(serial, _)| *serial > projected);
+        }
         let table = backend.renderer.set_page_table(first as u32, &entries)?;
         if whole.is_some() {
             backend.renderer.take_superseded(superseded);
@@ -6331,6 +6364,7 @@ impl Nvn {
             first,
             entries,
             pools: built_pools,
+            shared_mapping: std::cell::OnceCell::new(),
         });
         backend.stat(
             "stat: page table pinned MiB",
@@ -7630,27 +7664,71 @@ impl Nvn {
         Some(shared)
     }
 
-    /// Compute writes whose byte ranges lie entirely in known shared
-    /// storage. Unbounded, indirect and resident writes remain global.
+    /// Bound writes to shared guest memory, first using the dispatch's
+    /// invocation counts, then the full ranges of its uniform pointers.
     fn compute_shared_writes(
         &self,
         stage: &Arc<Translated>,
-        groups: [u32; 3],
-        constant: impl FnMut(u8, u16) -> Option<u32>,
-    ) -> Option<Vec<SharedRange>> {
-        let (plan, local) = self
-            .gpu
-            .as_ref()?
-            .global_writes
-            .get(&(Arc::as_ptr(stage) as usize))?;
-        plan.intervals(groups, *local, constant)?
-            .into_iter()
-            .map(|range| {
-                let length = range.end - range.start;
-                let guest = self.gpu_to_guest(range.start, length).ok()?;
-                self.shared_table_range(range.start, guest, length)
+        groups: Option<[u32; 3]>,
+        mut constant: impl FnMut(u8, u16) -> Option<u32>,
+    ) -> Option<(Vec<SharedRange>, bool)> {
+        let backend = self.gpu.as_ref()?;
+        let key = Arc::as_ptr(stage) as usize;
+        if let Some(groups) = groups
+            && let Some((plan, local)) = backend.global_writes.get(&key)
+            && let Some(exact) = plan.intervals(groups, *local, &mut constant)
+            && let Some(shared) = exact
+                .into_iter()
+                .map(|range| {
+                    let length = range.end - range.start;
+                    let guest = self.gpu_to_guest(range.start, length).ok()?;
+                    self.shared_table_range(range.start, guest, length)
+                })
+                .collect::<Option<Vec<_>>>()
+        {
+            return Some((shared, false));
+        }
+
+        let mut ranges = backend.uniform_writes.get(&key)?.intervals(constant)?;
+        let (stamp, _) = backend.page_table?;
+        if stamp != (backend.share_generation, self.pool_epoch) {
+            return None;
+        }
+        let built = backend.page_build.as_ref()?;
+        let mapping = built
+            .shared_mapping
+            .get_or_init(|| {
+                use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+                let (file, imports) = backend.renderer.shared_device_file_mappings()?;
+                let imports = imports
+                    .into_iter()
+                    .map(|(device, offset)| writer_ranges::ImportedSpan {
+                        file,
+                        device,
+                        offset,
+                    })
+                    .collect();
+                writer_ranges::project_table(
+                    built.first << PAGE_SHIFT,
+                    PAGE_SIZE,
+                    &built.entries,
+                    imports,
+                )
             })
-            .collect()
+            .as_ref()?;
+        merge_ranges(&mut ranges);
+        let shared = writer_ranges::project_writes(mapping, &ranges)?;
+        Some((
+            shared
+                .into_iter()
+                .map(|range| SharedRange {
+                    file: range.file,
+                    start: range.bytes.start,
+                    end: range.bytes.end,
+                })
+                .collect(),
+            true,
+        ))
     }
 
     /// The buffer and offset that share `length` guest bytes at `guest` with
