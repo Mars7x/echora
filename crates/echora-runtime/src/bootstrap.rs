@@ -274,6 +274,20 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
             .nvn
             .add_hook(address, crate::nvn::HostEntry::BootstrapLoader);
     }
+    // Game add-ons use the original branch when disabled.
+    if let Some(branch) = crate::addons::resolution_branch(npdm.program_id, &placed) {
+        machine.nvn.add_hook(
+            branch.address,
+            crate::nvn::HostEntry::AddonBranch {
+                target: branch.target,
+                test_register: branch.test_register,
+                force_taken: !crate::settings::get()
+                    .addons
+                    .ocarina_of_time
+                    .dynamic_resolution,
+            },
+        );
+    }
     // Host replacements for known library functions, matched by exact code.
     if std::env::var_os("ECHORA_NO_HLE").is_none() {
         for p in &placed {

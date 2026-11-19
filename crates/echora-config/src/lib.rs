@@ -47,6 +47,7 @@ pub struct Settings {
     pub input: InputSettings,
     pub cpu: CpuSettings,
     pub launcher: LauncherSettings,
+    pub addons: AddonSettings,
 }
 
 impl Default for Settings {
@@ -60,6 +61,7 @@ impl Default for Settings {
             input: InputSettings::default(),
             cpu: CpuSettings::default(),
             launcher: LauncherSettings::default(),
+            addons: AddonSettings::default(),
         }
     }
 }
@@ -184,6 +186,19 @@ impl Default for GraphicsSettings {
             device: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AddonSettings {
+    pub ocarina_of_time: OcarinaOfTimeAddons,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OcarinaOfTimeAddons {
+    /// Let the game vary its scene resolution as it does on the console.
+    pub dynamic_resolution: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +397,7 @@ pub enum SettingKey {
     Vsync,
     Backend,
     GraphicsDevice,
+    OcarinaOfTimeDynamicResolution,
     FrameLimit,
     AudioDevice,
     Volume,
@@ -405,7 +421,7 @@ impl SettingKey {
             // different device is not supported, so these wait for a restart.
             Self::Backend | Self::GraphicsDevice => GameRestart,
             // Workers are set up when the game starts.
-            Self::Workers => GameRestart,
+            Self::Workers | Self::OcarinaOfTimeDynamicResolution => GameRestart,
         }
     }
 }
@@ -568,6 +584,11 @@ impl Settings {
         diff(
             a.graphics.device != b.graphics.device,
             SettingKey::GraphicsDevice,
+        );
+        diff(
+            a.addons.ocarina_of_time.dynamic_resolution
+                != b.addons.ocarina_of_time.dynamic_resolution,
+            SettingKey::OcarinaOfTimeDynamicResolution,
         );
         diff(a.frame.limit != b.frame.limit, SettingKey::FrameLimit);
         diff(a.audio.device != b.audio.device, SettingKey::AudioDevice);
@@ -770,6 +791,23 @@ mod tests {
         let text = s.to_toml();
         assert_eq!(Settings::from_toml(&text).unwrap(), s);
         assert_eq!(Settings::from_toml("").unwrap(), s);
+    }
+
+    #[test]
+    fn dynamic_resolution_defaults_off_and_can_be_enabled() {
+        let legacy = Settings::from_toml("[graphics]\nbackend = \"auto\"").unwrap();
+        assert!(!legacy.addons.ocarina_of_time.dynamic_resolution);
+        let settings =
+            Settings::from_toml("[addons.ocarina_of_time]\ndynamic_resolution = true").unwrap();
+        assert!(settings.addons.ocarina_of_time.dynamic_resolution);
+        assert_eq!(
+            legacy.changes(&settings),
+            [(
+                SettingKey::OcarinaOfTimeDynamicResolution,
+                ApplyClass::GameRestart
+            )]
+        );
+        assert_eq!(Settings::from_toml(&settings.to_toml()).unwrap(), settings);
     }
 
     #[test]

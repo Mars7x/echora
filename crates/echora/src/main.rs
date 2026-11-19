@@ -558,12 +558,23 @@ fn discover_game(
     // exported-function roots and calls would otherwise translate them.
     let call_sites = echora_runtime::bootstrap::hle_call_sites(&placed);
     roots.extend(call_sites.iter().map(|site| site + 4));
+    let program_id = inv.packages[pkg]
+        .exefs
+        .iter()
+        .find_map(|module| module.npdm.as_ref()?.program_id.as_deref())
+        .and_then(|id| u64::from_str_radix(id, 16).ok());
+    let resolution_branch =
+        program_id.and_then(|id| echora_runtime::addons::resolution_branch(id, &placed));
+    if let Some(branch) = resolution_branch {
+        roots.extend([branch.address + 4, branch.target]);
+    }
     roots.sort_unstable();
     roots.dedup();
     let host_entries = echora_runtime::bootstrap::hooked_export_addresses(&placed)?
         .into_iter()
         .chain(echora_runtime::bootstrap::hle_function_addresses(&placed))
         .chain(call_sites)
+        .chain(resolution_branch.map(|branch| branch.address))
         .collect();
     let start = Instant::now();
     let mut translation =

@@ -1592,7 +1592,31 @@ impl Launcher {
             .into_any_element()
         };
         match self.settings_tab {
-            SettingsTab::Game => self.game_page(live, cx),
+            SettingsTab::Game => {
+                let mut page = self.game_page(live, cx);
+                if self.game.is_some() {
+                    page.push(
+                        ui::group(
+                            Some("Add-ons"),
+                            vec![switch(
+                                "ocarina-dynamic-resolution",
+                                ui::titles(
+                                    "Dynamic resolution",
+                                    Some("Let Ocarina of Time change its 3D resolution.".into()),
+                                ),
+                                settings.addons.ocarina_of_time.dynamic_resolution,
+                                |settings| {
+                                    let options = &mut settings.addons.ocarina_of_time;
+                                    options.dynamic_resolution = !options.dynamic_resolution;
+                                },
+                                cx,
+                            )],
+                        )
+                        .into_any_element(),
+                    );
+                }
+                page
+            }
             SettingsTab::Display => vec![
                 ui::group(
                     None,

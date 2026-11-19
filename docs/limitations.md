@@ -109,6 +109,11 @@ to be missing or incomplete.
   startup. `echora-resolution` is not yet connected to the renderer, and
   widening the view (`AspectPolicy::Expand`) would need game-specific camera
   and interface changes.
+- Ocarina of Time's Dynamic resolution add-on is off by default and uses
+  the game's fixed-resolution path. Enable it under Game → Add-ons to
+  restore the game's adaptive 3D resolution. The launcher prepares the
+  updated translation on the next launch. The build and branch match the
+  [Lichii Max Resolution add-on](https://github.com/zortos293/Lichii/blob/17baed7/src/core/file_sys/patch_manager.cpp).
 - Vertical sync uses tear-free mailbox presentation when available. Adaptive
   sync prefers relaxed FIFO. Disabling sync prefers immediate presentation,
   then mailbox. The fallback is FIFO.

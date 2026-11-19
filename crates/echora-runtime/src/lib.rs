@@ -8,6 +8,7 @@
 // tracked as cleanup in docs/limitations.md.
 #![allow(missing_debug_implementations, clippy::all)]
 
+pub mod addons;
 pub mod audio;
 mod audio_effects;
 pub mod audio_mix;

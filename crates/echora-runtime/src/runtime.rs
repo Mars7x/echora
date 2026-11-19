@@ -2971,6 +2971,20 @@ impl Machine {
             HostEntry::InflateFinishCall => "hle:inflate_finish".to_string(),
             HostEntry::ZstdStreamCall => "hle:zstd_stream".to_string(),
             HostEntry::ZstdFrames => "hle:zstd_frames".to_string(),
+            HostEntry::AddonBranch {
+                target,
+                test_register,
+                force_taken,
+            } => {
+                self.host_call_continue = Some(
+                    if *force_taken || self.core.cpu.regs[*test_register] & 1 == 0 {
+                        *target
+                    } else {
+                        self.core.cpu.pc + 4
+                    },
+                );
+                return Ok(());
+            }
         };
         if entry == HostEntry::ZstdFrames {
             *self.nvn.calls.entry(name).or_default() += 1;
@@ -3075,7 +3089,8 @@ impl Machine {
             | HostEntry::ZstdDecompress
             | HostEntry::InflateFinishCall
             | HostEntry::ZstdStreamCall
-            | HostEntry::ZstdFrames => None,
+            | HostEntry::ZstdFrames
+            | HostEntry::AddonBranch { .. } => None,
         };
         if let Some(address) = lookup {
             let requested = self.read_string(address, crate::nvn::MAX_NAME)?;
@@ -5969,6 +5984,33 @@ fn rearm_lowered_dispatch_limit(core: &Core) {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_resolution_addon_can_preserve_or_force_the_guest_branch() {
+        let mut machine = Machine::new(Layout::default(), 100);
+        let address = 0x805bd0;
+        let target = 0x80640c;
+        let return_address = 0x1234;
+        machine.core.cpu.pc = address;
+        machine.core.cpu.regs[30] = return_address;
+        for (force_taken, register_value, destination) in [
+            (false, 0, target),
+            (false, 1, address + 4),
+            (true, 1, target),
+        ] {
+            machine.core.cpu.regs[8] = register_value;
+            machine
+                .call_nvn(crate::nvn::HostEntry::AddonBranch {
+                    target,
+                    test_register: 8,
+                    force_taken,
+                })
+                .unwrap();
+            assert_eq!(machine.host_call_continue.take(), Some(destination));
+            assert_eq!(machine.core.cpu.regs[8], register_value);
+            assert_eq!(machine.core.cpu.regs[30], return_address);
+        }
+    }
 
     /// Names decided once and asked again give the same answer as the
     /// substring tests, also for names sharing a prefix.
