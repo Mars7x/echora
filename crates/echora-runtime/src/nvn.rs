@@ -2745,7 +2745,8 @@ impl Nvn {
                     let request = [word(0)?, word(8)?, word(0x10)?, word(0x18)?];
                     mappings.push(request);
                 }
-                // Each request changes the set of translations immediately.
+                // Each request changes GPU and CPU translations immediately.
+                self.pool_epoch += 1;
                 self.pool_ranges.get_mut().epoch = None;
                 self.storage_memo.get_mut().clear();
                 self.invalidate_target_index(None);

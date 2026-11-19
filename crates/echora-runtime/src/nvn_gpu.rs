@@ -39,8 +39,31 @@ pub(super) struct DrawBindings {
 pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
-    pools: HashMap<(u64, u64, u64, u64), ((u64, u64, usize), bool)>,
+    pools: HashMap<PagePool, ((u64, u64, usize), bool)>,
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
+}
+
+/// One GPU address range backed by a physical allocation. Virtual pools
+/// can name a subrange of the same allocation at a different GPU address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PagePool {
+    base: u64,
+    backing_size: u64,
+    offset: u64,
+    gpu: u64,
+    size: u64,
+    flags: u64,
+}
+
+impl PagePool {
+    fn pages(self, first: u64, count: usize) -> std::ops::Range<usize> {
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        let start = (self.gpu >> PAGE_SHIFT).saturating_sub(first);
+        let end = (self.gpu + self.size)
+            .div_ceil(PAGE_SIZE)
+            .saturating_sub(first);
+        start as usize..end.min(count as u64) as usize
+    }
 }
 
 #[path = "nvn_write_ranges.rs"]
@@ -6224,6 +6247,86 @@ impl Nvn {
         })
     }
 
+    fn page_pools(&self) -> Vec<PagePool> {
+        let mut ranges = Vec::new();
+        for object in &self.memory_pools {
+            let Some(pool) = self.objects.get(object) else {
+                continue;
+            };
+            let (Some(storage), Some(address)) =
+                (pool.builder.get("Storage"), pool.state.get("GpuAddress"))
+            else {
+                continue;
+            };
+            let [base, size, ..] = storage.x;
+            let gpu = address.x[0];
+            let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
+            if gpu == 0 || size == 0 {
+                continue;
+            }
+            if base != 0 {
+                // GPU_NO_ACCESS exposes the allocation only through aliases.
+                if flags & 8 == 0 {
+                    ranges.push(PagePool {
+                        base,
+                        backing_size: size,
+                        offset: 0,
+                        gpu,
+                        size,
+                        flags,
+                    });
+                }
+                continue;
+            }
+            for (name, mapping) in &pool.state {
+                let Some(virtual_offset) = name
+                    .strip_prefix(super::VIRTUAL_MAPPING)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                else {
+                    continue;
+                };
+                let [physical, offset, size, _] = mapping.x;
+                let Some(backing) = self
+                    .objects
+                    .get(&physical)
+                    .filter(|obj| obj.kind == "MemoryPool")
+                else {
+                    continue;
+                };
+                let Some(storage) = backing.builder.get("Storage") else {
+                    continue;
+                };
+                let [base, backing_size, ..] = storage.x;
+                if base == 0
+                    || offset
+                        .checked_add(size)
+                        .is_none_or(|end| end > backing_size)
+                {
+                    continue;
+                }
+                let address = gpu + virtual_offset;
+                // NVN virtual mappings have page-granular offsets and sizes.
+                use echora_shader_abi::PAGE_SIZE;
+                if !offset.is_multiple_of(PAGE_SIZE) || !address.is_multiple_of(PAGE_SIZE) {
+                    continue;
+                }
+                let flags = backing
+                    .builder
+                    .get("Flags")
+                    .map_or(0x21, |flags| flags.x[0]);
+                ranges.push(PagePool {
+                    base,
+                    backing_size,
+                    offset,
+                    gpu: address,
+                    size,
+                    flags,
+                });
+            }
+        }
+        ranges
+    }
+
     /// The GPU page table programs reach global memory through
     /// (`echora_shader_abi::PageTable`; ECHORA_PAGE_TABLE=0, debugging,
     /// leaves it empty), rebuilt when the
@@ -6295,30 +6398,15 @@ impl Nvn {
             );
             self.new_pools.extend(unshared);
         }
-        let pools: Vec<(u64, u64, u64, u64)> = self
-            .memory_pools
-            .iter()
-            .filter_map(|address| self.objects.get(address))
-            .filter(|object| object.kind == "MemoryPool")
-            .filter_map(|pool| {
-                let storage = pool.builder.get("Storage")?;
-                let gpu = pool.state.get("GpuAddress")?.x[0];
-                let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
-                Some((storage.x[0], storage.x[1], gpu, flags))
-            })
-            .filter(|&(base, size, gpu, _)| base != 0 && size != 0 && gpu != 0)
-            // GPU_NO_ACCESS (8): a physical pool the GPU reaches only
-            // through a virtual pool's mappings, never at its own address.
-            .filter(|&(_, _, _, flags)| flags & 8 == 0)
-            .collect();
+        let pools = self.page_pools();
         let first = pools
             .iter()
-            .map(|(_, _, gpu, _)| gpu >> PAGE_SHIFT)
+            .map(|pool| pool.gpu >> PAGE_SHIFT)
             .min()
             .unwrap_or(0);
         let end = pools
             .iter()
-            .map(|(_, size, gpu, _)| (gpu + size).div_ceil(PAGE_SIZE))
+            .map(|pool| (pool.gpu + pool.size).div_ceil(PAGE_SIZE))
             .max()
             .unwrap_or(first);
         // A table past 16 million pages (64 GiB) means the pools are not
@@ -6334,7 +6422,7 @@ impl Nvn {
             eprintln!(
                 "pool trace page table (present {}): listed {:x?}, recorded {:x?}, generation {}",
                 self.presented_frames,
-                pools.iter().find(|pool| pool.0 == traced),
+                pools.iter().find(|pool| pool.base == traced),
                 self.gpu
                     .as_ref()
                     .and_then(|backend| backend.shared_pools.get(&traced)),
@@ -6350,12 +6438,7 @@ impl Nvn {
         // builds it whole.
         let signatures: Vec<_> = pools
             .iter()
-            .map(|&(base, size, gpu, flags)| {
-                (
-                    (base, size, gpu, flags),
-                    self.pool_share_signature(base, flags),
-                )
-            })
+            .map(|&pool| (pool, self.pool_share_signature(pool.base, pool.flags)))
             .collect();
         let previous = self.gpu.as_mut().unwrap().page_build.take();
         let current: std::collections::HashSet<_> =
@@ -6404,11 +6487,7 @@ impl Nvn {
             .collect();
         for pool in gone {
             built_pools.remove(&pool);
-            let (_, size, gpu, _) = pool;
-            let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
-                ..((gpu + size).div_ceil(PAGE_SIZE).saturating_sub(first)).min(count as u64)
-                    as usize;
-            if let Some(range) = entries.get_mut(pages) {
+            if let Some(range) = entries.get_mut(pool.pages(first, count)) {
                 range.fill(0);
             }
             self.gpu
@@ -6416,8 +6495,8 @@ impl Nvn {
                 .unwrap()
                 .stat("stat: page table pools unmapped", 1);
             // A pool kept over the same GPU pages is mapped again.
-            built_pools.retain(|&(_, kept_size, kept_gpu, _), _| {
-                kept_gpu + kept_size <= gpu || gpu + size <= kept_gpu
+            built_pools.retain(|kept, _| {
+                kept.gpu + kept.size <= pool.gpu || pool.gpu + pool.size <= kept.gpu
             });
         }
         self.gpu.as_mut().unwrap().stat(
@@ -6441,19 +6520,17 @@ impl Nvn {
                     built_pools.get(&pool)
                 );
             }
-            let (base, size, gpu, flags) = pool;
             let backend = self.gpu.as_mut().unwrap();
             backend.stat("stat: page table pools mapped", 1);
             if built_pools.contains_key(&pool) {
                 backend.stat("stat: page table pools mapped again", 1);
-                backend.stat("stat: page table bytes mapped again", size);
+                backend.stat("stat: page table bytes mapped again", pool.size);
             }
-            let pages = (gpu >> PAGE_SHIFT).saturating_sub(first) as usize
-                ..((gpu + size).div_ceil(PAGE_SIZE) - first).min(count as u64) as usize;
+            let pages = pool.pages(first, count);
             if let Some(range) = entries.get_mut(pages.clone()) {
                 range.fill(0);
             }
-            self.map_pool_pages(core, base, size, gpu, flags, first, &mut entries)?;
+            self.map_pool_pages(core, pool, first, &mut entries)?;
             // A pool with unmapped pages, mapped without the guest's page
             // table, is mapped again by a build that has it.
             let complete = entries
@@ -6461,7 +6538,7 @@ impl Nvn {
                 .is_some_and(|range| range.iter().all(|&entry| entry != 0));
             // Its signature after mapping (a GPU-only pool's resident
             // buffer exists from its first mapping on).
-            let mapped = self.pool_share_signature(base, flags);
+            let mapped = self.pool_share_signature(pool.base, pool.flags);
             built_pools.insert(pool, (mapped, !complete && !checked));
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -6524,19 +6601,23 @@ impl Nvn {
         (shared.0, shared.1, pieces)
     }
 
-    /// Write pool `base`'s page entries (pages from `first`) into `entries`.
-    #[allow(clippy::too_many_arguments)]
+    /// Write the GPU page entries for both a direct pool and a virtual alias.
     fn map_pool_pages(
         &mut self,
         core: &mut Guest,
-        base: u64,
-        size: u64,
-        gpu: u64,
-        flags: u64,
+        pool: PagePool,
         first: u64,
         entries: &mut [u64],
     ) -> Result<(), String> {
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        let PagePool {
+            base,
+            backing_size,
+            offset: backing_offset,
+            size,
+            gpu,
+            flags,
+        } = pool;
         // A page under the largest span shared at once, so a chunk whose
         // file offset is not page-aligned still fits once rounded to pages.
         const CHUNK: u64 = (64 << 20) - PAGE_SIZE;
@@ -6550,16 +6631,17 @@ impl Nvn {
             .cloned();
         if let Some(pieces) = pieces {
             for (piece_offset, piece_length, file, at) in pieces {
-                let mut done = 0;
-                while done < piece_length {
-                    let length = (piece_length - done).min(CHUNK);
+                let end = (piece_offset + piece_length).min(backing_offset + size);
+                let mut current = piece_offset.max(backing_offset);
+                while current < end {
+                    let length = (end - current).min(CHUNK);
                     let address = self.gpu.as_mut().unwrap().renderer.address_span(
                         file,
-                        at + done,
+                        at + current - piece_offset,
                         length,
                     )?;
                     if let Some(address) = address {
-                        let first_page = (gpu + piece_offset + done) >> PAGE_SHIFT;
+                        let first_page = (gpu + current - backing_offset) >> PAGE_SHIFT;
                         for page in 0..length.div_ceil(PAGE_SIZE) {
                             if let Some(entry) =
                                 entries.get_mut((first_page + page - first) as usize)
@@ -6568,7 +6650,7 @@ impl Nvn {
                             }
                         }
                     }
-                    done += length;
+                    current += length;
                 }
             }
             return Ok(());
@@ -6582,10 +6664,13 @@ impl Nvn {
                     .gpu
                     .as_ref()
                     .and_then(|backend| backend.shared_pools.get(&base))
-                    .filter(|(shared_size, ..)| *shared_size >= offset + length)
-                    .map(|&(_, file, at)| (file, at + offset));
+                    .filter(|(shared_size, ..)| *shared_size >= backing_offset + offset + length)
+                    .map(|&(_, file, at)| (file, at + backing_offset + offset));
                 recorded_span = recorded.is_some();
-                match recorded.or_else(|| core.memory.shared_span(base + offset, length)) {
+                match recorded.or_else(|| {
+                    core.memory
+                        .shared_span(base + backing_offset + offset, length)
+                }) {
                     Some((file, at)) => self
                         .gpu
                         .as_mut()
@@ -6595,13 +6680,13 @@ impl Nvn {
                     None => None,
                 }
             } else {
-                self.resident_pool_binding(core, base, size)?;
+                self.resident_pool_binding(core, base, backing_size)?;
                 self.gpu
                     .as_ref()
                     .unwrap()
                     .renderer
                     .resident_address(base)
-                    .map(|address| address + offset)
+                    .map(|address| address + backing_offset + offset)
             };
             // A chunk no single span shares (a page unmapped, or the
             // backing not contiguous): the runs of pages that are.
@@ -6610,7 +6695,10 @@ impl Nvn {
                 let mut page = 0;
                 while page * PAGE_SIZE < length {
                     let at = offset + page * PAGE_SIZE;
-                    if let Some((file, file_at)) = core.memory.shared_span(base + at, PAGE_SIZE) {
+                    if let Some((file, file_at)) = core
+                        .memory
+                        .shared_span(base + backing_offset + at, PAGE_SIZE)
+                    {
                         match runs.last_mut() {
                             Some(run)
                                 if run.2 == file
@@ -11516,6 +11604,166 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn virtual_gpu_pages_use_the_physical_pool_and_follow_remapping() {
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.gpu.buffer_device_address {
+            return;
+        }
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        let storage = 0x10_0000;
+        let request = 0x12_0000;
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                storage,
+                4 * PAGE_SIZE,
+                READ | WRITE,
+                STATE_NORMAL,
+                "physical pool",
+            )
+            .unwrap();
+        memory
+            .map(
+                request,
+                PAGE_SIZE,
+                READ | WRITE,
+                STATE_NORMAL,
+                "mapping requests",
+            )
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let call = |nvn: &mut Nvn, guest: &mut Guest, name: &str, args: &[u64]| {
+            guest.cpu.regs[..args.len()].copy_from_slice(args);
+            assert!(nvn.call(name, guest).unwrap());
+            guest.cpu.regs[0]
+        };
+        let physical = 0x30_0000;
+        let virtual_pool = physical + 0x100;
+        let builder = physical + 0x200;
+        let device = physical + 0x300;
+        let device_builder = physical + 0x400;
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDeviceBuilderSetDefaults",
+            &[device_builder],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDeviceInitialize",
+            &[device, device_builder],
+        );
+        for (object, base, size, flags) in [
+            (physical, storage, 4 * PAGE_SIZE, 8),
+            (virtual_pool, 0, 8 * PAGE_SIZE, 0x100),
+        ] {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMemoryPoolBuilderSetDefaults",
+                &[builder],
+            );
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMemoryPoolBuilderSetDevice",
+                &[builder, device],
+            );
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMemoryPoolBuilderSetFlags",
+                &[builder, flags],
+            );
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMemoryPoolBuilderSetStorage",
+                &[builder, base, size],
+            );
+            assert_eq!(
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    "nvnMemoryPoolInitialize",
+                    &[object, builder]
+                ),
+                1
+            );
+        }
+        let gpu = call(
+            &mut nvn,
+            &mut guest,
+            "nvnMemoryPoolGetBufferAddress",
+            &[virtual_pool],
+        );
+        nvn.page_table(&mut guest).unwrap();
+        let page = |nvn: &mut Nvn, guest: &mut Guest, address: u64| {
+            let table = nvn.page_table(guest).unwrap();
+            let index = (address >> PAGE_SHIFT).checked_sub(u64::from(table.first_page));
+            index
+                .and_then(|index| {
+                    nvn.gpu
+                        .as_ref()?
+                        .renderer
+                        .page_table_entries()
+                        .get(index as usize)
+                })
+                .copied()
+                .unwrap_or(0)
+        };
+        let address = gpu + 3 * PAGE_SIZE;
+        for (backing, offset) in [(physical, 2 * PAGE_SIZE), (physical, PAGE_SIZE), (0, 0)] {
+            for (index, word) in [backing, offset, 3 * PAGE_SIZE, PAGE_SIZE]
+                .into_iter()
+                .enumerate()
+            {
+                guest
+                    .memory
+                    .write(request + index as u64 * 8, &word.to_le_bytes())
+                    .unwrap();
+            }
+            assert_eq!(
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    "nvnMemoryPoolMapVirtual",
+                    &[virtual_pool, 1, request]
+                ),
+                1
+            );
+            let actual = page(&mut nvn, &mut guest, address);
+            let expected = if backing == 0 {
+                0
+            } else {
+                nvn.gpu
+                    .as_ref()
+                    .unwrap()
+                    .renderer
+                    .resident_address(storage)
+                    .unwrap()
+                    + offset
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(page(&mut nvn, &mut guest, address - PAGE_SIZE), 0);
+        }
+    }
 
     #[test]
     fn mesh_indirect_accepts_a_count_at_the_end_of_a_pool() {
