@@ -45,7 +45,8 @@ What works today:
   ([shader plugins](docs/shader-plugin.md)).
 - The first 3D scene is drawn: the forest floor with its ground cover,
   plants, fireflies, mist with shafts of light, the canopy, and the Great
-  Deku Tree, lit and shadowed by the game's own passes.
+  Deku Tree, lit and shadowed by the game's own passes. The opening
+  dialogue subtitles render.
 - Sound. The game's audio renderer is mixed, with its voices, mixes and
   effects, and played through your sound device (the launcher turns it on).
 - The game's threads run on up to six CPU cores by default, and the game's
@@ -55,12 +56,13 @@ What works today:
 
 What doesn't work yet:
 
-- The first 3D scene still has faults. The water is too red, and subtitles
-  and the speaker's name are not drawn. Nothing past that scene has been
-  reached.
+- The water in the first 3D scene is too red. Some effects still use a
+  lower internal resolution, including the fog. Stable gameplay is still
+  ahead.
 - Speed. The console runs the game at 60 frames per second. Here the opening
   movie, decoded on the GPU, now plays at that full speed, but the first 3D
-  scene runs at about 20 at 2560×1440 on the hardware below.
+  scene runs at about 20 FPS at 1440p and 2160p on the hardware below, with
+  slower sections later in the forest.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 
