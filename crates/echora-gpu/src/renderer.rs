@@ -206,6 +206,27 @@ const SPAN_PACK_INTERVAL: u64 = 2048;
 const SPAN_PACK_MIN_IMPORTS: usize = 128;
 #[cfg(target_os = "linux")]
 const SPAN_PACK_MAX_BYTES: u64 = 512 << 20;
+/// Select the most stable imports that fit the packing byte budget. The
+/// flags are returned in file offset order for the packer's range lookups.
+#[cfg(target_os = "linux")]
+fn select_stable_spans(sizes: impl ExactSizeIterator<Item = Option<u64>>) -> Vec<bool> {
+    let mut selected = vec![false; sizes.len()];
+    let mut candidates: Vec<_> = sizes
+        .enumerate()
+        .filter_map(|(index, size)| size.map(|size| (size, index)))
+        .collect();
+    candidates.sort_unstable();
+    let mut remaining = SPAN_PACK_MAX_BYTES;
+    for (size, index) in candidates {
+        if size > remaining {
+            break;
+        }
+        selected[index] = true;
+        remaining -= size;
+    }
+    selected
+}
+
 #[cfg(target_os = "linux")]
 const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
 /// Guest memory pinned by shared spans before the least recently used are
@@ -3622,19 +3643,19 @@ impl Renderer {
             return Ok(false);
         };
         self.last_span_pack_serial = self.flushes;
-        let mut bytes = 0;
+        let mut selected = cutoff
+            .map(|cutoff| {
+                select_stable_spans(
+                    self.addressed
+                        .iter()
+                        .map(|&(_, size, _, _, _, imported)| (imported <= cutoff).then_some(size)),
+                )
+            })
+            .into_iter()
+            .flatten();
         let (old, mut kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
             .into_iter()
-            .partition(|&(_, size, _, _, _, imported)| {
-                if cutoff
-                    .is_none_or(|cutoff| imported <= cutoff && bytes + size <= SPAN_PACK_MAX_BYTES)
-                {
-                    bytes += size;
-                    true
-                } else {
-                    false
-                }
-            });
+            .partition(|_| selected.next().unwrap_or(true));
         let mut changed = false;
         let mut start = 0;
         while start < old.len() {
@@ -7378,6 +7399,20 @@ mod tests {
             }
             output.destroy(&renderer.gpu.device);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_span_packing_favors_smaller_imports_within_its_budget() {
+        let large = Some(64 << 20);
+        let medium = Some(16 << 20);
+        let small = Some(1 << 20);
+        let mut sizes = [large; 21];
+        sizes[16..].copy_from_slice(&[medium, None, small, medium, small]);
+        let selected = select_stable_spans(sizes.into_iter());
+        assert!(selected[..7].iter().all(|&entry| entry));
+        assert!(selected[7..16].iter().all(|&entry| !entry));
+        assert_eq!(selected[16..], [true, false, true, true, true]);
     }
 
     #[cfg(target_os = "linux")]
