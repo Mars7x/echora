@@ -127,6 +127,27 @@ fn select_present_mode(
         .unwrap_or(vk::PresentModeKHR::FIFO)
 }
 
+fn select_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    srgb: bool,
+) -> Option<vk::SurfaceFormatKHR> {
+    use vk::Format;
+
+    formats
+        .iter()
+        .min_by_key(|format| {
+            let other_color_space = format.color_space != vk::ColorSpaceKHR::SRGB_NONLINEAR;
+            let rank = match (srgb, format.format) {
+                (true, Format::B8G8R8A8_SRGB) | (false, Format::B8G8R8A8_UNORM) => 0,
+                (true, Format::R8G8B8A8_SRGB) | (false, Format::R8G8B8A8_UNORM) => 1,
+                (_, Format::B8G8R8A8_UNORM) => 2,
+                _ => 3,
+            };
+            (other_color_space, rank)
+        })
+        .copied()
+}
+
 impl Presenter {
     pub fn new(
         gpu: &Gpu,
@@ -246,22 +267,8 @@ impl Presenter {
                     .map_err(vk_error("vkGetPhysicalDeviceSurfacePresentModesKHR"))?,
             )
         };
-        let wanted = if self.srgb {
-            vk::Format::B8G8R8A8_SRGB
-        } else {
-            vk::Format::B8G8R8A8_UNORM
-        };
-        let format = formats
-            .iter()
-            .find(|format| format.format == wanted)
-            .or_else(|| {
-                formats
-                    .iter()
-                    .find(|format| format.format == vk::Format::B8G8R8A8_UNORM)
-            })
-            .or_else(|| formats.first())
-            .copied()
-            .ok_or("the surface has no formats")?;
+        let format =
+            select_surface_format(&formats, self.srgb).ok_or("the surface has no formats")?;
         let extent = if capabilities.current_extent.width != u32::MAX {
             capabilities.current_extent
         } else {
@@ -496,5 +503,74 @@ mod tests {
             Mode::MAILBOX
         );
         assert_eq!(select_present_mode(&preferred, &[Mode::FIFO]), Mode::FIFO);
+    }
+
+    #[test]
+    fn presentation_preserves_encoding_with_either_channel_order() {
+        let nonlinear = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let surface_format = |format, color_space| vk::SurfaceFormatKHR {
+            format,
+            color_space,
+        };
+        let bgra = surface_format(vk::Format::B8G8R8A8_UNORM, nonlinear);
+        let rgba_srgb = surface_format(vk::Format::R8G8B8A8_SRGB, nonlinear);
+        let bgra_hdr = surface_format(
+            vk::Format::B8G8R8A8_SRGB,
+            vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+        );
+        let supported = [bgra_hdr, bgra, rgba_srgb];
+        assert_eq!(select_surface_format(&supported, true), Some(rgba_srgb));
+        assert_eq!(select_surface_format(&supported, false), Some(bgra));
+        assert_eq!(select_surface_format(&[rgba_srgb], false), Some(rgba_srgb));
+    }
+
+    #[test]
+    fn matching_surface_encoding_preserves_the_display_values_of_a_scaled_blit() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let color_space = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let source = vk::Format::R8G8B8A8_SRGB;
+        let formats = [
+            vk::SurfaceFormatKHR::default()
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .color_space(color_space),
+            vk::SurfaceFormatKHR::default()
+                .format(source)
+                .color_space(color_space),
+        ];
+        let surface = select_surface_format(&formats, true).unwrap();
+        renderer.target(1, 2, 2, source).unwrap();
+        renderer.target(2, 3, 3, surface.format).unwrap();
+        renderer.target(3, 3, 3, formats[0].format).unwrap();
+        renderer
+            .clear_color(
+                1,
+                None,
+                vk::ClearColorValue {
+                    float32: [0.21586, 0.21586, 0.21586, 1.0],
+                },
+            )
+            .unwrap();
+        renderer
+            .copy_target(1, [0, 0, 2, 2], 2, [0, 0, 3, 3])
+            .unwrap();
+        renderer
+            .copy_target(1, [0, 0, 2, 2], 3, [0, 0, 3, 3])
+            .unwrap();
+        let encoded = renderer.read_target_bytes(2, 4).unwrap();
+        let linear = renderer.read_target_bytes(3, 4).unwrap();
+        let uniform = |bytes: &[u8], value: u8| {
+            bytes.len() == 36
+                && bytes.chunks_exact(4).all(|pixel| {
+                    pixel[3] == 255
+                        && pixel[..3]
+                            .iter()
+                            .all(|&channel| channel.abs_diff(value) <= 1)
+                })
+        };
+        assert!(uniform(&encoded, 128), "sRGB destination {encoded:?}");
+        assert!(uniform(&linear, 55), "UNORM destination {linear:?}");
     }
 }
