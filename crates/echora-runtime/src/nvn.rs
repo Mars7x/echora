@@ -197,6 +197,26 @@ enum QueueItem {
     Present { texture: u64 },
 }
 
+#[derive(Debug)]
+struct CommandList {
+    commands: std::sync::Arc<Vec<Command>>,
+    last_used: u64,
+    submissions: u32,
+    small: bool,
+}
+
+impl CommandList {
+    fn new(commands: Vec<Command>, last_used: u64) -> Self {
+        let small = commands.len() <= SMALL_COMMAND_LIST;
+        Self {
+            commands: std::sync::Arc::new(commands),
+            last_used,
+            submissions: 0,
+            small,
+        }
+    }
+}
+
 /// A descriptor registration, with the sampler or texture view state
 /// captured when it was registered.
 #[derive(Debug)]
@@ -531,7 +551,7 @@ pub struct Nvn {
     /// Finished command lists by NVNcommandHandle, with the order of their
     /// last recording or submission.
     #[serde(skip)]
-    command_lists: BTreeMap<u64, (std::sync::Arc<Vec<Command>>, u64, u32)>,
+    command_lists: FastMap<u64, CommandList>,
     /// Command handles by that order (least recently used first).
     #[serde(skip)]
     command_list_use: BTreeMap<u64, u64>,
@@ -988,12 +1008,13 @@ impl Nvn {
     /// hold the most captured bytes): lists, commands, captured bytes.
     fn kept_lists_by_buffer(&self) -> Vec<(String, u64, u64, u64)> {
         let mut by: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
-        for (handle, (list, ..)) in &self.command_lists {
+        for (handle, list) in &self.command_lists {
             let buffer = self.list_memory.get(handle).map_or(0, |memory| memory.0);
             let entry = by.entry(buffer).or_default();
             entry.0 += 1;
-            entry.1 += list.len() as u64;
+            entry.1 += list.commands.len() as u64;
             entry.2 += list
+                .commands
                 .iter()
                 .map(|command| (command.captured.len() * 8) as u64)
                 .sum::<u64>();
@@ -1173,14 +1194,14 @@ impl Nvn {
     /// A list run again (submitted or called): most recently used, and
     /// counted as reused (the resource cap's second chance).
     fn use_command_list(&mut self, handle: u64) -> Option<std::sync::Arc<Vec<Command>>> {
-        let (list, used, submits) = self.command_lists.get_mut(&handle)?;
-        *submits = submits.saturating_add(1);
+        let list = self.command_lists.get_mut(&handle)?;
+        list.submissions = list.submissions.saturating_add(1);
         self.command_list_clock += 1;
-        let previous = std::mem::replace(used, self.command_list_clock);
+        let previous = std::mem::replace(&mut list.last_used, self.command_list_clock);
         self.command_list_use.remove(&previous);
         self.command_list_use
             .insert(self.command_list_clock, handle);
-        Some(list.clone())
+        Some(list.commands.clone())
     }
 }
 
@@ -2894,11 +2915,11 @@ impl Nvn {
                         0x8000_0000_0000 | (place & 0x7fff_ffff_ffff)
                     });
                 // The list recorded there before is replaced.
-                if let Some((old, used, _)) = self.command_lists.remove(&handle) {
-                    self.command_list_commands -= old.len();
-                    self.command_list_use.remove(&used);
+                if let Some(old) = self.command_lists.remove(&handle) {
+                    self.command_list_commands -= old.commands.len();
+                    self.command_list_use.remove(&old.last_used);
                     self.list_memory.remove(&handle);
-                    release_list(old);
+                    release_list(old.commands);
                 }
                 // Only in a sequenced present: lists are recorded by the
                 // dozen per frame.
@@ -2967,7 +2988,7 @@ impl Nvn {
                 self.command_list_commands += commands.len();
                 self.command_lists.insert(
                     handle,
-                    (std::sync::Arc::new(commands), self.command_list_clock, 0),
+                    CommandList::new(commands, self.command_list_clock),
                 );
                 self.command_list_use.insert(self.command_list_clock, handle);
                 // Command memory is reused by later recordings, and the
@@ -2991,19 +3012,18 @@ impl Nvn {
                     // the command cap alone a small list stays (it costs
                     // little; the state lists loaded once are small).
                     let under_list_cap = self.command_lists.len() <= COMMAND_LIST_LIMIT;
-                    if let Some(entry) = self.command_lists.get_mut(&oldest) {
-                        let small = entry.0.len() <= SMALL_COMMAND_LIST && under_list_cap;
-                        if small {
+                    if let Some(list) = self.command_lists.get_mut(&oldest) {
+                        if list.small && under_list_cap {
                             passed += 1;
                             self.command_list_clock += 1;
-                            entry.1 = self.command_list_clock;
+                            list.last_used = self.command_list_clock;
                             self.command_list_use.insert(self.command_list_clock, oldest);
                             continue;
                         }
-                        if entry.2 > 1 {
-                            entry.2 = 1;
+                        if list.submissions > 1 {
+                            list.submissions = 1;
                             self.command_list_clock += 1;
-                            entry.1 = self.command_list_clock;
+                            list.last_used = self.command_list_clock;
                             self.command_list_use.insert(self.command_list_clock, oldest);
                             continue;
                         }
@@ -3012,7 +3032,8 @@ impl Nvn {
                     if debug_var_os("ECHORA_STALE_LOG").is_some() {
                         self.dropped_lists.insert(oldest, (1, self.presented_frames));
                     }
-                    if let Some((list, ..)) = self.command_lists.remove(&oldest) {
+                    if let Some(list) = self.command_lists.remove(&oldest) {
+                        let list = list.commands;
                         self.capped_command_lists += 1;
                         if debug_var_os("ECHORA_LIST_LOG").is_some()
                             && let Some(bind) = big_vertex_bind(&list)
@@ -3033,11 +3054,11 @@ impl Nvn {
             // handle's command list is released; it cannot be submitted again.
             "nvnDeviceFinalizeCommandHandle" => {
                 self.object(this, "Device").map_err(invalid)?;
-                let Some((list, used, _)) = self.command_lists.remove(&x[1]) else {
+                let Some(list) = self.command_lists.remove(&x[1]) else {
                     return Err(invalid(format!("unknown command handle {:#x}", x[1])));
                 };
-                self.command_list_commands -= list.len();
-                self.command_list_use.remove(&used);
+                self.command_list_commands -= list.commands.len();
+                self.command_list_use.remove(&list.last_used);
                 self.list_memory.remove(&x[1]);
                 return Ok(true);
             }
@@ -3054,7 +3075,7 @@ impl Nvn {
                 }
                 for index in 0..u64::from(count) {
                     let handle = core.memory.read_u64(x[2] + index * 8)?;
-                    let Some((list, used, submits)) = self.command_lists.get_mut(&handle) else {
+                    let Some(list) = self.use_command_list(handle) else {
                         // A list dropped from the kept window (the
                         // application seldom finalizes handles, so lists
                         // are kept by recent use): skipped, counted.
@@ -3064,8 +3085,6 @@ impl Nvn {
                         }
                         return Err(invalid(format!("unknown command handle {handle:#x}")));
                     };
-                    *submits = submits.saturating_add(1);
-                    let list = list.clone();
                     if debug_var_os("ECHORA_LIST_LOG").is_some()
                         && let Some(bind) = big_vertex_bind(&list)
                     {
@@ -3074,11 +3093,6 @@ impl Nvn {
                             self.presented_frames
                         );
                     }
-                    // Submitted again: most recently used.
-                    self.command_list_clock += 1;
-                    let previous = std::mem::replace(used, self.command_list_clock);
-                    self.command_list_use.remove(&previous);
-                    self.command_list_use.insert(self.command_list_clock, handle);
                     if debug_var_os("ECHORA_GPU_FLOW").is_some() {
                         let work = list
                             .iter()
@@ -8806,16 +8820,15 @@ mod tests {
                 commands.push(handle);
                 nvn.command_lists.insert(
                     handle,
-                    (
-                        std::sync::Arc::new(vec![Command {
+                    CommandList::new(
+                        vec![Command {
                             name: "nvnCommandBufferSetScissor",
                             x: [0, handle, 2, 3, 4, 0, 0, 0],
                             v: [0; 8],
                             captured: Vec::new(),
                             states: StateSnapshots::default(),
-                        }]),
+                        }],
                         clock,
-                        0,
                     ),
                 );
                 nvn.command_list_use.insert(clock, handle);
@@ -8844,8 +8857,8 @@ mod tests {
             nvn.run_queue(1, &mut guest, false).unwrap();
             assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
             assert_eq!(nvn.command_list_use, BTreeMap::from([(5, 20), (6, 10)]));
-            assert_eq!(nvn.command_lists[&10].2, 2);
-            assert_eq!(nvn.command_lists[&20].2, 2);
+            assert_eq!(nvn.command_lists[&10].submissions, 2);
+            assert_eq!(nvn.command_lists[&20].submissions, 2);
         }
     }
 

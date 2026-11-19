@@ -1391,15 +1391,11 @@ impl Nvn {
         if !self.presented_frames.is_multiple_of(every) {
             return;
         }
-        let commands: usize = self
-            .command_lists
-            .values()
-            .map(|(list, ..)| list.len())
-            .sum();
+        let commands = self.command_list_commands;
         let captured: usize = self
             .command_lists
             .values()
-            .flat_map(|(list, ..)| list.iter())
+            .flat_map(|list| list.commands.iter())
             .map(|command| command.captured.len() * 8 + command.states.len() * 512)
             .sum();
         let mut line = format!(
