@@ -565,12 +565,9 @@ pub struct Nvn {
     /// stored on each list identifies entries that still affect eviction.
     #[serde(skip)]
     command_list_use: VecDeque<(u64, u64)>,
-    /// The memory each finished list occupies by the host's model: its
-    /// command buffer, the command memory (pool, offset, size) and control
-    /// memory (address, size) its recording used, by the used amounts the
-    /// application is told (reported, not used to drop lists).
+    /// The command buffer that recorded each live or archived handle.
     #[serde(skip)]
-    list_memory: BTreeMap<u64, (u64, [u64; 3], [u64; 2])>,
+    list_recorders: FastMap<u64, u64>,
     /// Lists archived under replay cache pressure (`COMMAND_LIST_LIMIT`,
     /// `COMMAND_LIMIT`) while still valid.
     pub capped_command_lists: u64,
@@ -1015,7 +1012,7 @@ impl Nvn {
     fn kept_lists_by_buffer(&self) -> Vec<(String, u64, u64, u64)> {
         let mut by: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
         for (handle, list) in &self.command_lists {
-            let buffer = self.list_memory.get(handle).map_or(0, |memory| memory.0);
+            let buffer = self.list_recorders.get(handle).copied().unwrap_or(0);
             let entry = by.entry(buffer).or_default();
             entry.0 += 1;
             entry.1 += list.commands.len() as u64;
@@ -1464,6 +1461,8 @@ pub struct Recording {
     /// Set by EndRecording: a recorder's cached handle to it is stale.
     ended: bool,
     command_memory: u64,
+    /// Control chunk address and used bytes when recording began.
+    control_start: (u64, u64),
 }
 
 /// Recordings by command buffer.
@@ -2887,32 +2886,18 @@ impl Nvn {
                 return Ok(true);
             }
             "nvnCommandBufferBeginRecording" => {
-                self.object(this, "CommandBuffer").map_err(invalid)?;
-                {
-                    let mut recordings = write_shared(&self.recording);
-                    let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this)
-                    else {
-                        return Err(invalid("command buffer is already recording".into()));
-                    };
-                    slot.insert(std::sync::Arc::new(std::sync::Mutex::new(
-                        Recording::default(),
-                    )));
-                }
-                // Where the list starts in the memory chunks (the used
-                // amounts the application sees, and which chunks), for the
-                // memory it ends up occupying (`list_memory`).
-                let object = self.objects.get_mut(&this).unwrap();
-                let value = |key: &str| object.state.get(key).map_or([0; 4], |args| args.x);
-                let start = Args {
-                    x: [
-                        value("CommandMemoryUsed")[0],
-                        value("ControlMemoryUsed")[0],
-                        value("CommandMemoryChunk")[1],
-                        value("ControlMemoryChunk")[0],
-                    ],
-                    v: [0; 2],
+                let object = self.object(this, "CommandBuffer").map_err(invalid)?;
+                let first = |key| object.state.get(key).map_or(0, |args| args.x[0]);
+                let control_start = (first("ControlMemoryChunk"), first("ControlMemoryUsed"));
+                let mut recordings = write_shared(&self.recording);
+                let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this)
+                else {
+                    return Err(invalid("command buffer is already recording".into()));
                 };
-                object.state.insert("ListStart".into(), start);
+                slot.insert(std::sync::Arc::new(std::sync::Mutex::new(Recording {
+                    control_start,
+                    ..Recording::default()
+                })));
                 return Ok(true);
             }
             "nvnCommandBufferIsRecording" => {
@@ -2925,10 +2910,13 @@ impl Nvn {
                 let recording = write_shared(&self.recording)
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
-                let commands = {
+                let (commands, (start_chunk, start_used)) = {
                     let mut recording = lock_shared(&recording);
                     recording.ended = true;
-                    std::mem::take(&mut recording.commands)
+                    (
+                        std::mem::take(&mut recording.commands),
+                        recording.control_start,
+                    )
                 };
                 if !commands.is_empty() {
                     self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
@@ -2940,19 +2928,17 @@ impl Nvn {
                 // used when the recording began (from the chunk's start when
                 // memory was added during it), by the host's used amounts,
                 // which are the ones the application allocates by.
-                let state = |key: &str| {
-                    self.objects
-                        .get(&this)
-                        .and_then(|object| object.state.get(key))
-                        .map_or([0; 4], |args| args.x)
-                };
-                let (control_chunk, list_start) = (state("ControlMemoryChunk"), state("ListStart"));
-                let place = if control_chunk[0] == 0 {
+                let control_chunk = self
+                    .objects
+                    .get(&this)
+                    .and_then(|object| object.state.get("ControlMemoryChunk"))
+                    .map_or(0, |args| args.x[0]);
+                let place = if control_chunk == 0 {
                     None
-                } else if list_start[3] == control_chunk[0] {
-                    Some(control_chunk[0] + list_start[1])
+                } else if start_chunk == control_chunk {
+                    Some(control_chunk + start_used)
                 } else {
-                    Some(control_chunk[0])
+                    Some(control_chunk)
                 };
                 self.next_command_handle += 1;
                 let handle = 0x4e56_0000_0000_0000
@@ -2963,7 +2949,6 @@ impl Nvn {
                 self.archived_lists.remove(&handle);
                 if let Some(old) = self.command_lists.remove(&handle) {
                     self.command_list_commands -= old.commands.len();
-                    self.list_memory.remove(&handle);
                     release_list(old.commands);
                 }
                 // Only in a sequenced present: lists are recorded by the
@@ -2999,36 +2984,7 @@ impl Nvn {
                         commands.len()
                     );
                 }
-                // The memory the list occupies: from where its recording
-                // began to the used amount now, in each chunk (from the
-                // chunk's start when memory was added during the recording).
-                let value = |key: &str| {
-                    self.objects
-                        .get(&this)
-                        .and_then(|object| object.state.get(key))
-                        .map_or([0; 4], |args| args.x)
-                };
-                let (command, control) = (value("CommandMemoryChunk"), value("ControlMemoryChunk"));
-                let start = value("ListStart");
-                let (command_used, control_used) =
-                    (value("CommandMemoryUsed")[0], value("ControlMemoryUsed")[0]);
-                let command_from = if start[2] == command[1] { start[0] } else { 0 };
-                let control_from = if start[3] == control[0] { start[1] } else { 0 };
-                self.list_memory.insert(
-                    handle,
-                    (
-                        this,
-                        [
-                            command[0],
-                            command[1] + command_from,
-                            command_used.saturating_sub(command_from),
-                        ],
-                        [
-                            control[0] + control_from,
-                            control_used.saturating_sub(control_from),
-                        ],
-                    ),
-                );
+                self.list_recorders.insert(handle, this);
                 self.command_list_clock += 1;
                 self.command_list_commands += commands.len();
                 self.command_lists.insert(
@@ -3099,7 +3055,7 @@ impl Nvn {
                 } else if self.archived_lists.remove(&x[1]).is_none() {
                     return Err(invalid(format!("unknown command handle {:#x}", x[1])));
                 }
-                self.list_memory.remove(&x[1]);
+                self.list_recorders.remove(&x[1]);
                 return Ok(true);
             }
             // nvnQueueSubmitCommands(NVNqueue*, int count, const
@@ -8960,6 +8916,12 @@ mod tests {
         call(
             &mut nvn,
             &mut guest,
+            "nvnCommandBufferAddControlMemory",
+            &[buffer, 0x1600, 0x100],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
             "nvnCommandBufferBeginRecording",
             &[buffer],
         );
@@ -8982,10 +8944,47 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
+        assert_eq!(handle, 0x4e56_8000_0000_1600);
         let list = &nvn.command_lists[&handle].commands;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "nvnCommandBufferSetScissor");
         assert_eq!(&list[0].x[1..5], &[11, 12, 13, 14]);
+        assert_eq!(
+            nvn.kept_lists_by_buffer()[0],
+            (format!("{buffer:#x}"), 1, 1, 0),
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDeviceFinalizeCommandHandle",
+            &[device, handle],
+        );
+        assert!(!nvn.list_recorders.contains_key(&handle));
+        assert!(nvn.kept_lists_by_buffer().is_empty());
+
+        for (new_chunk, expected) in [(None, 0x1610), (Some(0x1700), 0x1700)] {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnCommandBufferBeginRecording",
+                &[buffer],
+            );
+            if let Some(chunk) = new_chunk {
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    "nvnCommandBufferAddControlMemory",
+                    &[buffer, chunk, 0x100],
+                );
+            }
+            let handle = call(
+                &mut nvn,
+                &mut guest,
+                "nvnCommandBufferEndRecording",
+                &[buffer],
+            );
+            assert_eq!(handle, 0x4e56_8000_0000_0000 | expected);
+        }
     }
 
     #[test]
