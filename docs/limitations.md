@@ -10,8 +10,9 @@ to be missing or incomplete.
   drawn with its ground cover, plants, fireflies, mist, canopy and the Great
   Deku Tree. The opening subtitles render, and full-opening tests at
   2160p show fog and scenery across the frame after fixes to render-target
-  scaling. The water is too red. Some passes still run at a lower internal
-  resolution, such as the 854×480 fog composite measured in this scene.
+  scaling. In one sampled forest frame, the 854×480 guest scene targets
+  were rendered at 1281×720 before the final 3840×2160 output. The water
+  is too red.
   No gameplay has been reached yet. Every unimplemented operation still
   stops the run with a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
@@ -53,7 +54,7 @@ to be missing or incomplete.
   reaches that speed in Echora. Recent full-opening runs on a Ryzen 7
   5800X3D and Radeon RX 9070 XT averaged about 20 FPS over 600 frames
   in the first 3D scene at both 2560×1440 and 3840×2160. A longer 2160p
-  Wayland run averaged about 14 FPS over 1,600 frames deeper into the forest.
+  Wayland run averaged about 16 FPS over 1,600 frames deeper into the forest.
   The camera and draw workload can vary between runs.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
