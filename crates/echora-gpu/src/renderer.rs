@@ -1570,9 +1570,10 @@ impl Renderer {
     }
 
     /// `read_resident` of several `(at, length)` ranges of buffer `key`,
-    /// recorded as one copy between one pair of barriers (a frame's
-    /// copy-back reads hundreds of small pieces of a pool). One token per
-    /// range, in order.
+    /// recorded as one copy (a frame's copy-back reads hundreds of small
+    /// pieces of a pool). Submission makes the results visible to the
+    /// host along with the other deferred reads. One token per range, in
+    /// order.
     pub fn read_resident_ranges(
         &mut self,
         key: u64,
@@ -1606,59 +1607,39 @@ impl Renderer {
             // resolve's dispatch ends first; the next draw begins it again.
             self.end_condition();
             self.occlusion_resolve(commands);
-            let mut regions = Vec::with_capacity(last - first);
+            let mut copies = Vec::with_capacity(last - first);
             let mut offset = base;
             for &(at, length) in &ranges[first..last] {
                 offset = offset.next_multiple_of(16);
-                regions.push(vk::BufferCopy {
-                    src_offset: at,
-                    dst_offset: offset,
-                    size: length,
-                });
+                if length != 0 {
+                    copies.push(vk::BufferCopy {
+                        src_offset: at,
+                        dst_offset: offset,
+                        size: length,
+                    });
+                }
+                tokens.push(self.defer_ring_read(offset, length as usize));
                 offset += length;
             }
-            let before = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            let after = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ);
-            let copied: Vec<vk::BufferCopy> = regions
-                .iter()
-                .copied()
-                .filter(|region| region.size != 0)
-                .collect();
-            // SAFETY: recording outside rendering; both buffers are live.
-            unsafe {
-                let device = &self.gpu.device;
-                *self
-                    .stats
-                    .entry("stat: barriers in read_resident")
-                    .or_default() += 2;
-                device.cmd_pipeline_barrier(
-                    commands,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[before],
-                    &[],
-                    &[],
-                );
-                if !copied.is_empty() {
-                    device.cmd_copy_buffer(commands, buffer, target, &copied);
+            if !copies.is_empty() {
+                let before = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                self.stat("stat: barriers in read_resident", 1);
+                // SAFETY: recording outside rendering; both buffers are live.
+                unsafe {
+                    let device = &self.gpu.device;
+                    device.cmd_pipeline_barrier(
+                        commands,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[before],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer(commands, buffer, target, &copies);
                 }
-                device.cmd_pipeline_barrier(
-                    commands,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[after],
-                    &[],
-                    &[],
-                );
-            }
-            for region in regions {
-                tokens.push(self.defer_ring_read(region.dst_offset, region.size as usize));
             }
             first = last;
         }
@@ -6845,6 +6826,28 @@ mod tests {
         let reads = renderer.take_reads(&[first, second]);
         assert_eq!(reads[&first], [0x11; 4]);
         assert_eq!(reads[&second], [0x22; 4]);
+    }
+
+    #[test]
+    fn resident_readback_batches_keep_ranges_in_order() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer.resident_buffer(1, 16).unwrap();
+        renderer.fill_resident(1, 0, 8, 0x11_11_11_11).unwrap();
+        renderer.fill_resident(1, 8, 8, 0x22_22_22_22).unwrap();
+        let tokens = renderer
+            .read_resident_ranges(1, &[(8, 4), (16, 0), (4, 4)])
+            .unwrap();
+        renderer.flush().unwrap();
+
+        let reads = renderer.take_reads(&tokens);
+        assert_eq!(reads[&tokens[0]], [0x22; 4]);
+        assert!(reads[&tokens[1]].is_empty());
+        assert_eq!(reads[&tokens[2]], [0x11; 4]);
+        let stats = renderer.take_stats();
+        assert_eq!(stats["stat: barriers in read_resident"], 1);
+        assert_eq!(stats["stat: barriers in submit_current"], 1);
     }
 
     #[test]
