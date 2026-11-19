@@ -440,6 +440,7 @@ pub struct Renderer {
     full_barrier_recorded: bool,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     targets: FastMap<u64, Target>,
+    guest_target_keys: Vec<u64>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
     uploads: FastMap<u64, (u64, Target)>,
     /// The texel bytes each upload was made from: a caller may drop its
@@ -978,6 +979,7 @@ impl Renderer {
             graphics: Default::default(),
             memory_types,
             targets: FastMap::default(),
+            guest_target_keys: Vec::new(),
             uploads: FastMap::default(),
             upload_lengths: FastMap::default(),
             texel_buffers: FastMap::default(),
@@ -4215,7 +4217,7 @@ impl Renderer {
             // (retired with this batch), not after a wait for it all.
             self.target_changes += 1;
             self.changed_targets.push(key);
-            let old = self.targets.remove(&key).unwrap();
+            let old = self.remove_target(key).unwrap();
             // The same memory taller or shorter, as the application
             // re-initializes a texture over it (a shadow map 2048 wide and
             // 2048 or 4096 high): rows both shapes have keep their texels,
@@ -4256,7 +4258,7 @@ impl Renderer {
             self.register_views(&target);
             self.target_changes += 1;
             self.changed_targets.push(key);
-            self.targets.insert(key, target);
+            self.insert_target(key, target);
             if tiny {
                 self.fresh_targets.push(key);
             } else if chain || std::env::var_os("ECHORA_ZERO_TARGETS").is_some() {
@@ -4314,7 +4316,7 @@ impl Renderer {
         self.register_views(&target);
         self.target_changes += 1;
         self.changed_targets.push(key);
-        self.targets.insert(key, target);
+        self.insert_target(key, target);
         if levels > 1 && retained < levels && !compressed {
             self.zero_target_levels(key, retained)?;
         }
@@ -4597,22 +4599,37 @@ impl Renderer {
         ]
     }
 
+    fn insert_target(&mut self, key: u64, target: Target) -> Option<Target> {
+        let previous = self.targets.insert(key, target);
+        if previous.is_none() && key < STAGING_KEYS {
+            let index = self.guest_target_keys.binary_search(&key).unwrap_err();
+            self.guest_target_keys.insert(index, key);
+        }
+        previous
+    }
+
+    fn remove_target(&mut self, key: u64) -> Option<Target> {
+        let target = self.targets.remove(&key)?;
+        if key < STAGING_KEYS {
+            let index = self.guest_target_keys.binary_search(&key).unwrap();
+            self.guest_target_keys.remove(index);
+        }
+        Some(target)
+    }
+
+    /// Guest render-target keys in address order.
+    pub fn target_keys_in_order(&self) -> &[u64] {
+        &self.guest_target_keys
+    }
+
     pub fn target_keys(&self) -> Vec<u64> {
-        let mut keys = Vec::new();
-        self.collect_target_keys(&mut keys);
-        keys
+        self.target_keys_in_order().to_vec()
     }
 
     /// Collect guest render-target keys in address order, reusing the buffer.
     pub fn collect_target_keys(&self, keys: &mut Vec<u64>) {
         keys.clear();
-        keys.extend(
-            self.targets
-                .keys()
-                .copied()
-                .filter(|key| *key < STAGING_KEYS),
-        );
-        keys.sort_unstable();
+        keys.extend_from_slice(self.target_keys_in_order());
     }
 
     /// The largest 1D/2D image extent the device supports.
@@ -4826,7 +4843,7 @@ impl Renderer {
         self.order_target(key)?;
         let target = self.create_target(width, height, shape, format, levels, Scale::ONE)?;
         self.register_views(&target);
-        let old = self.targets.insert(key, target).unwrap();
+        let old = self.insert_target(key, target).unwrap();
         let filter = if is_depth(format) || integer_format(format) {
             vk::Filter::NEAREST
         } else {
@@ -4936,7 +4953,7 @@ impl Renderer {
     /// Keep target `from` (if any) under key `to` instead, dropping what
     /// `to` held.
     pub fn move_target(&mut self, from: u64, to: u64) -> Result<(), String> {
-        let Some(target) = self.targets.remove(&from) else {
+        let Some(target) = self.remove_target(from) else {
             return Ok(());
         };
         self.target_changes += 1;
@@ -4944,13 +4961,13 @@ impl Renderer {
         self.changed_targets.push(to);
         // What `to` held goes once the work recorded so far has run
         // (retired with this batch), not after a wait for it all.
-        if let Some(replaced) = self.targets.remove(&to) {
+        if let Some(replaced) = self.remove_target(to) {
             self.slot.retired_uploads.push(replaced);
         }
         if self.pending_unscaled.remove(&to) {
             self.unscaled.insert((to, TargetDescription::from(&target)));
         }
-        self.targets.insert(to, target);
+        self.insert_target(to, target);
         self.fresh_targets.retain(|fresh| *fresh != from);
         Ok(())
     }
@@ -6386,11 +6403,11 @@ impl Renderer {
     ) -> Result<Vec<[f32; 4]>, String> {
         let (generation, target) = self.uploads.remove(&key).ok_or("no such upload")?;
         let temporary = u64::MAX - 1;
-        self.targets.insert(temporary, target);
+        self.insert_target(temporary, target);
         let texels = self
             .read_level(temporary, level, false, slice)
             .map(|(texels, ..)| texels);
-        let target = self.targets.remove(&temporary).unwrap();
+        let target = self.remove_target(temporary).unwrap();
         self.uploads.insert(key, (generation, target));
         texels
     }
@@ -7676,12 +7693,21 @@ mod tests {
         assert_eq!(renderer.stats["stat: render passes begun"], 1);
 
         renderer.move_target(1, 2).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [2, 3]);
         renderer.target(1, 4, 4, format).unwrap();
+        renderer.target(STAGING_KEYS + 1, 4, 4, format).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [1, 2, 3]);
         renderer
             .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, 0, [2, 2, 2, 2])
             .unwrap();
         renderer.flush().unwrap();
         assert_eq!(renderer.stats["stat: render passes begun"], 2);
+        renderer.move_target(2, 3).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [1, 3]);
+        renderer.move_target(3, STAGING_KEYS + 1).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [1]);
+        renderer.move_target(STAGING_KEYS + 1, 4).unwrap();
+        assert_eq!(renderer.target_keys_in_order(), [1, 4]);
     }
 
     #[test]

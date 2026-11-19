@@ -206,7 +206,6 @@ pub struct Backend {
     /// their levels resolves to them). Built with `target_index`.
     target_levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
     target_index_stamp: Option<u64>,
-    target_keys: Vec<u64>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -393,7 +392,6 @@ impl Backend {
             target_index: HashMap::default(),
             target_levels: HashMap::default(),
             target_index_stamp: None,
-            target_keys: Vec::new(),
         }))
     }
 
@@ -2993,7 +2991,11 @@ impl Nvn {
                 .copied()
                 .find(|key| matches(key));
         }
-        renderer.target_keys().into_iter().find(|key| matches(key))
+        renderer
+            .target_keys_in_order()
+            .iter()
+            .copied()
+            .find(matches)
     }
 
     /// Whether `target_index` describes the current targets and storage.
@@ -3023,12 +3025,10 @@ impl Nvn {
         let started = std::time::Instant::now();
         let mut index = std::mem::take(&mut backend.target_index);
         let mut levels = std::mem::take(&mut backend.target_levels);
-        let mut keys = std::mem::take(&mut backend.target_keys);
         index.values_mut().for_each(Vec::clear);
         levels.values_mut().for_each(Vec::clear);
-        backend.renderer.collect_target_keys(&mut keys);
         let backend = self.gpu.as_ref().unwrap();
-        for &key in &keys {
+        for &key in backend.renderer.target_keys_in_order() {
             let base = self.texture_storage(key);
             if let Some(base) = base {
                 index.entry(base).or_default().push(key);
@@ -3051,7 +3051,6 @@ impl Nvn {
         levels.retain(|_, targets| !targets.is_empty());
         backend.target_index = index;
         backend.target_levels = levels;
-        backend.target_keys = keys;
         backend.target_index_stamp = Some(backend.renderer.target_changes);
         backend.stat("stat: target index rebuilds", 1);
         backend.stat(
@@ -3128,7 +3127,7 @@ impl Nvn {
                 .map(|&(key, level, _)| (key, level));
         }
         let mut mip_match = None;
-        for key in renderer.target_keys() {
+        for &key in renderer.target_keys_in_order() {
             let Some(target) = renderer
                 .existing_target(key)
                 .filter(|target| same_format(target.format))
