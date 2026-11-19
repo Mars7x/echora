@@ -3606,9 +3606,8 @@ impl Nvn {
                 }
                 let builder = self.bag(x[1], "TextureBuilder").map_err(invalid)?;
                 self.require_device(&builder).map_err(invalid)?;
-                let previous = self
-                    .texture_identity(this)
-                    .or_else(|| self.finalized_storage.remove(&this));
+                let finalized = self.finalized_storage.remove(&this);
+                let previous = self.texture_identity(this).or(finalized);
                 if let Some(object) = self.objects.get(&this).filter(|o| o.kind == "Texture") {
                     if let Some(identity) = self.texture_identity(this) {
                         let retired = retired_texture(identity);
@@ -3650,7 +3649,9 @@ impl Nvn {
                         self.presented_frames,
                     ));
                 }
-                if let Some(previous) = previous.filter(|previous| Some(*previous) != identity) {
+                if let Some(previous) =
+                    previous.filter(|previous| finalized.is_some() || Some(*previous) != identity)
+                {
                     self.gpu_move_texture(this, previous, identity);
                 }
                 core.cpu.regs[0] = 1;
@@ -3676,6 +3677,7 @@ impl Nvn {
                     let retired = retired_texture(identity);
                     self.objects.insert(retired, object);
                     self.object_changed(retired, "Texture");
+                    self.gpu_move_texture(this, identity, None);
                 }
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);

@@ -1209,7 +1209,7 @@ impl Nvn {
     /// Release what was cached for texture object `texture`, finalized:
     /// its upload (CPU texels and GPU image), saved storage copy and hashes.
     /// Gameplay streams textures, and these grew without bound. Render
-    /// targets stay (what the GPU rendered stays with its memory).
+    /// targets are retained by storage, independently of the texture object.
     pub(super) fn gpu_forget_texture(&mut self, texture: u64) {
         let Some(backend) = self.gpu.as_mut() else {
             return;
@@ -11181,6 +11181,80 @@ mod target_tests {
     use super::{Backend, Nvn};
     use crate::nvn::Args;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn finalized_render_target_stays_visible_through_a_storage_alias() {
+        use crate::nvn::{Bag, Guest, GuestMemory, retired_texture, write_shared};
+        use echora_gpu::draw::TextureSource;
+        use echora_guest::{cpu::Cpu, memory::Memory};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([0x10000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.initialize(5, "Device", BTreeMap::new()).unwrap();
+        let builder = BTreeMap::from([
+            ("Device".into(), scalar(5)),
+            ("Width".into(), scalar(8)),
+            ("Height".into(), scalar(4)),
+            ("Format".into(), scalar(52)),
+            ("Storage".into(), args([1, 0, 0, 0])),
+        ]);
+        nvn.initialize(2, "Texture", builder.clone()).unwrap();
+        nvn.initialize(3, "Texture", builder.clone()).unwrap();
+        write_shared(nvn.bags.at(4)).insert(
+            4,
+            Bag {
+                kind: "TextureBuilder".into(),
+                props: builder,
+                ..Bag::default()
+            },
+        );
+        nvn.gpu_clear_depth(2, Some(0.5), None).unwrap();
+
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        cpu.regs[0] = 2;
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+
+        let TextureSource::Target(key) = nvn.texture_source(&core, 3).unwrap() else {
+            panic!("the alias must sample the retained target");
+        };
+        assert_eq!(key, retired_texture((0x10000, 52)));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(renderer.existing_target(2).is_none());
+        assert_eq!(
+            renderer.read_target_bytes(key, 4).unwrap(),
+            0.5_f32.to_le_bytes().repeat(32)
+        );
+
+        core.cpu.regs[..2].copy_from_slice(&[2, 4]);
+        assert!(nvn.call("nvnTextureInitialize", &mut core).unwrap());
+        assert_eq!(nvn.resolve_target(3), Some((2, 0)));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(renderer.existing_target(key).is_none());
+        assert_eq!(
+            renderer.read_target_bytes(2, 4).unwrap(),
+            0.5_f32.to_le_bytes().repeat(32)
+        );
+    }
 
     #[test]
     fn mip_storage_aliases_require_compatible_formats() {
