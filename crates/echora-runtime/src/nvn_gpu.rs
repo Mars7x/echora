@@ -2475,26 +2475,17 @@ impl Nvn {
     /// Bytes of a texture object's block-linear storage (all levels and
     /// layers).
     pub(super) fn texture_storage_size(&self, texture: u64) -> Option<u64> {
-        // Remembered as `texture_storage` is (the shape walk below is the
-        // same for every draw that binds the texture).
-        let generation = (self.object_generation, self.texture_epoch);
-        if let Ok(mut memo) = self.size_memo.try_borrow_mut() {
-            if memo.0 != generation {
-                *memo = (generation, Default::default());
-            }
-            if let Some(found) = memo.1.get(&texture) {
-                return *found;
-            }
+        let mut memo = self.size_memo.borrow_mut();
+        if let Some(&size) = memo.get(&texture) {
+            return size;
         }
-        let found = self.texture_storage_size_uncached(texture);
-        if let Ok(mut memo) = self.size_memo.try_borrow_mut() {
-            memo.1.insert(texture, found);
-        }
-        found
+        let size = self.texture_storage_size_uncached(texture);
+        memo.insert(texture, size);
+        size
     }
 
     fn texture_storage_size_uncached(&self, texture: u64) -> Option<u64> {
-        let object = self.objects.get(&texture)?;
+        let object = self.objects.get(&texture).filter(|o| o.kind == "Texture")?;
         let get = |key: &str| object.builder.get(key).map(|value| value.x[0] as u32);
         let info = crate::nvn_format::info(get("Format")?)?;
         let depth = get("Depth").unwrap_or(1).max(1);
@@ -2919,28 +2910,22 @@ impl Nvn {
     }
 
     pub(super) fn texture_storage(&self, texture: u64) -> Option<u64> {
-        // Remembered until an object is created or removed, a texture is
-        // initialized or finalized, or a virtual pool is remapped: the
-        // property walk below was a third of the draw path's time.
-        let generation = (self.object_generation, self.texture_epoch);
-        if let Ok(mut memo) = self.storage_memo.try_borrow_mut() {
-            if memo.0 != generation {
-                *memo = (generation, Default::default());
-            }
-            if let Some(found) = memo.1.get(&texture) {
-                return *found;
-            }
+        let mut memo = self.storage_memo.borrow_mut();
+        if let Some(&address) = memo.get(&texture) {
+            return address;
         }
-        let found = self.texture_storage_uncached(texture);
-        if let Ok(mut memo) = self.storage_memo.try_borrow_mut() {
-            memo.1.insert(texture, found);
-        }
-        found
+        let address = self.texture_storage_uncached(texture);
+        memo.insert(texture, address);
+        address
     }
 
     fn texture_storage_uncached(&self, texture: u64) -> Option<u64> {
-        let storage = self.objects.get(&texture)?.builder.get("Storage")?;
-        let pool = self.objects.get(&storage.x[0])?;
+        let texture = self.objects.get(&texture).filter(|o| o.kind == "Texture")?;
+        let storage = texture.builder.get("Storage")?;
+        let pool = self
+            .objects
+            .get(&storage.x[0])
+            .filter(|o| o.kind == "MemoryPool")?;
         let base = pool.builder.get("Storage")?.x[0];
         if base != 0 {
             return Some(base + storage.x[1]);

@@ -495,10 +495,6 @@ pub struct Nvn {
     /// virtual mapping changes.
     #[serde(skip)]
     pool_ranges: std::cell::RefCell<PoolRanges>,
-    /// Bumped whenever an object is created or removed, or a virtual pool
-    /// is remapped: what `texture_storage` answers can change only then.
-    #[serde(skip)]
-    object_generation: u64,
     /// The tiled level `copy_texels` builds a whole-level copy in, kept
     /// between copies.
     #[serde(skip)]
@@ -519,11 +515,12 @@ pub struct Nvn {
     /// again over a live one, a window going): the memo starts empty.
     #[serde(skip)]
     binding_epoch: u64,
-    /// `texture_storage` answers by texture, at an object generation.
+    /// Texture sizes depend only on each initialized texture's builder.
     #[serde(skip)]
-    /// `texture_storage_size` results, kept as `storage_memo` is.
-    size_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
-    storage_memo: std::cell::RefCell<((u64, u64), FastMap<u64, Option<u64>>)>,
+    size_memo: std::cell::RefCell<FastMap<u64, Option<u64>>>,
+    /// Texture addresses also depend on the current memory pools and mappings.
+    #[serde(skip)]
+    storage_memo: std::cell::RefCell<FastMap<u64, Option<u64>>>,
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
     recording: Recordings,
@@ -2523,7 +2520,7 @@ impl Nvn {
                 }
                 // Each request changes the set of translations immediately.
                 self.pool_ranges.get_mut().epoch = None;
-                self.object_generation += 1;
+                self.storage_memo.get_mut().clear();
                 for [physical, physical_offset, offset, size] in mappings {
                     if size == 0 || offset.checked_add(size).is_none_or(|end| end > pool_size) {
                         return Err(invalid(format!(
@@ -3454,8 +3451,6 @@ impl Nvn {
                     self.texture_epoch += 1;
                     self.binding_epoch += 1;
                 } else {
-                    self.storage_memo.borrow_mut().1.remove(&this);
-                    self.size_memo.borrow_mut().1.remove(&this);
                     self.target_shapes.1.remove(&this);
                 }
                 let builder = self.bag(x[1], "TextureBuilder").map_err(invalid)?;
@@ -3465,8 +3460,9 @@ impl Nvn {
                     .or_else(|| self.finalized_storage.remove(&this));
                 if let Some(object) = self.objects.get(&this).filter(|o| o.kind == "Texture") {
                     if let Some(identity) = self.texture_identity(this) {
-                        self.objects.insert(retired_texture(identity), object.clone());
-                        self.object_generation += 1;
+                        let retired = retired_texture(identity);
+                        self.objects.insert(retired, object.clone());
+                        self.object_changed(retired, "Texture");
                     }
                 }
                 self.initialize(this, "Texture", builder).map_err(invalid)?;
@@ -3526,15 +3522,16 @@ impl Nvn {
                 if let Some(identity) = self.texture_identity(this) {
                     self.finalized_storage.insert(this, identity);
                     let object = self.objects[&this].clone();
-                    self.objects.insert(retired_texture(identity), object);
-                    self.object_generation += 1;
+                    let retired = retired_texture(identity);
+                    self.objects.insert(retired, object);
+                    self.object_changed(retired, "Texture");
                 }
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);
                 }
                 self.objects.remove(&this);
                 self.memory_pools.remove(&this);
-                self.object_generation += 1;
+                self.object_changed(this, kind);
                 self.images.remove(&this);
                 if let Some(recording) = write_shared(&self.recording).remove(&this) {
                     // A recorder's cached handle to it is stale now.
@@ -6960,19 +6957,17 @@ impl Nvn {
         Ok(())
     }
 
-    /// An object made or removed at `address`: `texture_storage` answers
-    /// change for pools (which every texture's storage goes through),
-    /// textures, and an address it has answered for.
+    /// An object made or removed at `address` invalidates the cached
+    /// properties that depend on its builder or memory pool.
     fn object_changed(&mut self, address: u64, kind: &str) {
-        // Bound programs resolve again (`program_memo`).
-        if kind == "Program" {
-            self.flush_epoch += 1;
-        }
-        if kind == "MemoryPool"
-            || kind == "Texture"
-            || self.storage_memo.borrow().1.contains_key(&address)
-        {
-            self.object_generation += 1;
+        match kind {
+            "Program" => self.flush_epoch += 1,
+            "MemoryPool" => self.storage_memo.get_mut().clear(),
+            "Texture" => {
+                self.storage_memo.get_mut().remove(&address);
+                self.size_memo.get_mut().remove(&address);
+            }
+            _ => {}
         }
     }
 
@@ -8744,6 +8739,27 @@ mod tests {
         };
         pool(&mut nvn, &mut core, 0x10_2000, 0x10_3000, 0x10_8000, 0x4000);
         let virtual_gpu = pool(&mut nvn, &mut core, 0x10_2000, 0x10_3100, 0, 0x8000);
+        let texture = 0x10_3200;
+        let props = BTreeMap::from([
+            (
+                "Storage".into(),
+                Args {
+                    x: [0x10_3100, 0x2010, 0, 0],
+                    ..Args::default()
+                },
+            ),
+            (
+                "Format".into(),
+                Args {
+                    x: [37, 0, 0, 0],
+                    ..Args::default()
+                },
+            ),
+        ]);
+        assert_eq!(nvn.texture_storage_size(texture), None);
+        nvn.initialize(texture, "Texture", props).unwrap();
+        let texture_size = nvn.texture_storage_size(texture).unwrap();
+        assert_eq!(nvn.texture_storage(texture), None);
         // Physical offset 0x1000 of the first pool at virtual offset 0x2000.
         let request = 0x10_5000;
         for (index, word) in [0x10_3000u64, 0x1000, 0x2000, 0x2000].iter().enumerate() {
@@ -8757,10 +8773,21 @@ mod tests {
             1
         );
         assert_eq!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10), Ok(0x10_9010));
+        assert_eq!(nvn.texture_storage(texture), Some(0x10_9010));
+        assert_eq!(nvn.texture_storage_size(texture), Some(texture_size));
+        // Remapping the same virtual range must change a cached address.
+        core.memory.write(request + 8, &0u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnMemoryPoolMapVirtual", &map),
+            1
+        );
+        assert_eq!(nvn.texture_storage(texture), Some(0x10_8010));
         assert!(nvn.gpu_to_guest(virtual_gpu + 0x3ff0, 0x20).is_err());
         assert!(nvn.gpu_to_guest(virtual_gpu, 4).is_err());
         call(&mut nvn, &mut core, "nvnMemoryPoolFinalize", &[0x10_3000]);
         assert!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10).is_err());
+        assert_eq!(nvn.texture_storage(texture), None);
+        assert_eq!(nvn.texture_storage_size(texture), Some(texture_size));
         // A null physical pool unmaps the range.
         core.memory.write(request, &0u64.to_le_bytes()).unwrap();
         assert_eq!(
