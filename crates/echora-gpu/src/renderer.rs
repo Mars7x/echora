@@ -150,6 +150,27 @@ impl Scale {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TargetDescription {
+    width: u32,
+    height: u32,
+    shape: ImageShape,
+    format: vk::Format,
+    levels: u32,
+}
+
+impl From<&Target> for TargetDescription {
+    fn from(target: &Target) -> Self {
+        Self {
+            width: target.width,
+            height: target.height,
+            shape: target.shape,
+            format: target.format,
+            levels: target.levels,
+        }
+    }
+}
+
 /// Allocations at least this large are logged with their caller.
 const LARGE_ALLOCATION: u64 = 512 << 20;
 
@@ -504,9 +525,12 @@ pub struct Renderer {
     pub descaled: u64,
     /// Render target resolution scale (`Scale::from_env`).
     scale: Scale,
-    /// Targets kept at the guest's resolution: compute passes write them
-    /// as storage images, or they were bound with an unscaled target.
-    unscaled: FastSet<u64>,
+    /// Descriptions kept at guest resolution by storage writes or by a
+    /// pass with mixed attachment scales. A key can be reused for a
+    /// different image description.
+    unscaled: FastSet<(u64, TargetDescription)>,
+    /// Targets marked before an image exists for the key.
+    pending_unscaled: FastSet<u64>,
     /// Color clears limited by the scissor to part of the target.
     pub partial_clears: u64,
     pub flush_wait_microseconds: u64,
@@ -974,6 +998,7 @@ impl Renderer {
             descaled: 0,
             scale: Scale::from_env(),
             unscaled: FastSet::default(),
+            pending_unscaled: FastSet::default(),
             partial_clears: 0,
             flush_wait_microseconds: 0,
             written: FastSet::default(),
@@ -4109,8 +4134,18 @@ impl Renderer {
             self.slot.retired_uploads.push(old);
         }
         if !self.targets.contains_key(&key) {
-            let scale = self.scale_for(key, width, height, shape);
+            let description = TargetDescription {
+                width,
+                height,
+                shape,
+                format,
+                levels,
+            };
+            let scale = self.scale_for(key, description);
             let target = self.create_target(width, height, shape, format, levels, scale)?;
+            if self.pending_unscaled.remove(&key) {
+                self.unscaled.insert((key, description));
+            }
             // Tiny targets (exposure values adapting from their previous
             // frame) start from guest memory, as on the console; mip chains
             // (bloom) start zeroed, as levels sampled before they are drawn
@@ -4598,11 +4633,18 @@ impl Renderer {
     /// The resolution scale a new target `key` of this extent gets: the
     /// renderer's for 2D targets larger than a few texels (tiny ones hold
     /// values such as exposure, not images).
-    fn scale_for(&self, key: u64, width: u32, height: u32, shape: ImageShape) -> Scale {
+    fn scale_for(&self, key: u64, description: TargetDescription) -> Scale {
+        let TargetDescription {
+            width,
+            height,
+            shape,
+            ..
+        } = description;
         let scalable = matches!(shape, ImageShape::D2 { .. })
             && width * height > 64
             && key < STAGING_KEYS
-            && !self.unscaled.contains(&key)
+            && !self.pending_unscaled.contains(&key)
+            && !self.unscaled.contains(&(key, description))
             && self.scale.apply(width.max(height)) <= self.max_image_extent();
         if scalable { self.scale } else { Scale::ONE }
     }
@@ -4669,18 +4711,19 @@ impl Renderer {
         self.scale
     }
 
-    /// Keep target `key` at the guest's resolution from now on, replacing
-    /// a scaled image by a downscaled copy (compute passes write storage
-    /// images at guest coordinates).
+    /// Keep the current image at guest resolution, replacing a scaled
+    /// image by a downscaled copy. Storage image writes use guest coordinates.
+    /// If the key has no image, mark its next image.
     pub fn keep_unscaled(&mut self, key: u64) -> Result<(), String> {
-        let Some(old) = self
-            .targets
-            .get(&key)
-            .filter(|target| !target.scale.is_one())
-        else {
-            self.unscaled.insert(key);
+        let Some(old) = self.targets.get(&key) else {
+            self.pending_unscaled.insert(key);
             return Ok(());
         };
+        let description = TargetDescription::from(old);
+        if old.scale.is_one() {
+            self.unscaled.insert((key, description));
+            return Ok(());
+        }
         let (width, height, shape, format, levels) =
             (old.width, old.height, old.shape, old.format, old.levels);
         self.transition(key, vk::ImageLayout::GENERAL)?;
@@ -4718,7 +4761,7 @@ impl Renderer {
         let source = old.image;
         let destination = new.image;
         self.slot.retired_uploads.push(old);
-        self.unscaled.insert(key);
+        self.unscaled.insert((key, description));
         self.descaled += 1;
         self.target_changes += 1;
         self.changed_targets.push(key);
@@ -4807,6 +4850,9 @@ impl Renderer {
         // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.targets.remove(&to) {
             self.slot.retired_uploads.push(replaced);
+        }
+        if self.pending_unscaled.remove(&to) {
+            self.unscaled.insert((to, TargetDescription::from(&target)));
         }
         self.targets.insert(to, target);
         self.fresh_targets.retain(|fresh| *fresh != from);
@@ -7776,6 +7822,42 @@ mod fit_tests {
 #[cfg(test)]
 mod rescaling_tests {
     use super::*;
+
+    #[test]
+    fn reusing_a_target_keeps_unscaled_only_for_the_marked_description() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let format = vk::Format::R8G8B8A8_UNORM;
+        renderer.set_resolution_scale(Scale::new(2, 1).unwrap());
+
+        assert_eq!(
+            renderer.target(7, 16, 8, format).unwrap().extent(0),
+            (32, 16)
+        );
+        renderer.keep_unscaled(7).unwrap();
+        renderer.move_target(7, 8).unwrap();
+        assert_eq!(
+            renderer.target(7, 32, 8, format).unwrap().extent(0),
+            (64, 16)
+        );
+        assert_eq!(renderer.existing_target(8).unwrap().extent(0), (16, 8));
+        assert_eq!(
+            renderer.target(7, 16, 8, format).unwrap().extent(0),
+            (16, 8)
+        );
+
+        renderer.keep_unscaled(9).unwrap();
+        assert_eq!(
+            renderer.target(9, 16, 8, format).unwrap().extent(0),
+            (16, 8)
+        );
+        assert_eq!(
+            renderer.target(9, 32, 8, format).unwrap().extent(0),
+            (64, 16)
+        );
+    }
 
     #[test]
     fn chained_target_copies_see_previous_writes() {
