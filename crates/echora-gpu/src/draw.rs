@@ -19,7 +19,6 @@ pub struct Program {
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) shaders: Vec<vk::ShaderEXT>,
     shader_stages: Vec<vk::ShaderStageFlags>,
-    unused_graphics_stages: Vec<vk::ShaderStageFlags>,
     /// With resolution scaling: the stages given the rescaling push
     /// constants, and each texture binding's (stage index, binding) by its
     /// scaling bit (the recompiler numbers texture descriptors in binding
@@ -755,7 +754,7 @@ impl Renderer {
                 infos[0] = infos[0].flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
             }
         }
-        let shaders = crate::shader_cache::create_shaders(
+        let mut shaders = crate::shader_cache::create_shaders(
             objects,
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
@@ -769,7 +768,7 @@ impl Renderer {
                 },
             ),
         )?;
-        let shader_stages: Vec<_> = stages
+        let mut shader_stages: Vec<_> = stages
             .iter()
             .map(|stage| stage_flags(stage.stage))
             .collect();
@@ -782,18 +781,22 @@ impl Renderer {
             vk::ShaderStageFlags::MESH_EXT,
         ];
         let enabled = if self.gpu.mesh_shader.is_some() { 6 } else { 4 };
-        let unused_graphics_stages = graphics_stages[..enabled]
-            .iter()
-            .copied()
-            .filter(|stage| !shader_stages.contains(stage))
-            .collect();
+        if shader_stages != [vk::ShaderStageFlags::COMPUTE] {
+            // Bind all graphics stages in one command, unbinding any
+            // stages a previous program used and this program does not.
+            for &stage in &graphics_stages[..enabled] {
+                if !shader_stages.contains(&stage) {
+                    shader_stages.push(stage);
+                    shaders.push(vk::ShaderEXT::null());
+                }
+            }
+        }
         Ok(Program {
             stages,
             layout,
             pipeline_layout,
             shaders,
             shader_stages,
-            unused_graphics_stages,
             push_stages,
             texture_bits,
             abi_stages,
@@ -808,7 +811,9 @@ impl Renderer {
         // SAFETY: flushed, so nothing uses the program.
         unsafe {
             for shader in program.shaders {
-                objects.destroy_shader(shader, None);
+                if shader != vk::ShaderEXT::null() {
+                    objects.destroy_shader(shader, None);
+                }
             }
             self.gpu
                 .device
@@ -1260,11 +1265,7 @@ impl Renderer {
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             if self.graphics.program != Some(program.pipeline_layout) {
-                // Explicitly unbind graphics stages the program does not use.
-                let null_shaders = [vk::ShaderEXT::null(); 6];
                 objects.cmd_bind_shaders(commands, &program.shader_stages, &program.shaders);
-                let unused = &program.unused_graphics_stages;
-                objects.cmd_bind_shaders(commands, unused, &null_shaders[..unused.len()]);
                 self.graphics.program = Some(program.pipeline_layout);
                 self.graphics.reset_program_bindings();
             }
