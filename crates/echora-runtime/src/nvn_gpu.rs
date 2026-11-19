@@ -2576,10 +2576,13 @@ impl Nvn {
                     if !address.is_multiple_of(length) || !bound_storage(address, length) {
                         return None;
                     }
-                    let guest = self.gpu_to_guest(address, length).ok()?;
-                    self.resolve_queued_buffer_read(core, address, guest, length)
+                    // Validate the full shader load, then synchronize only
+                    // the word the handle expression actually reads.
+                    let offset = 4 * u64::from(word);
+                    let guest = self.gpu_to_guest(address, length).ok()? + offset;
+                    self.resolve_queued_buffer_read(core, address + offset, guest, 4)
                         .ok()?;
-                    core.memory.read_u32(guest + 4 * u64::from(word)).ok()
+                    core.memory.read_u32(guest).ok()
                 }
             },
             |handle| {
