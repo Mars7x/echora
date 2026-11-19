@@ -6504,22 +6504,49 @@ impl Renderer {
         texel_bytes: u32,
         rect: Option<[u32; 4]>,
     ) -> Result<Vec<u8>, String> {
-        let key = self.unscaled_copy(key)?;
-        let (image, full_width, full_height, format) = {
-            let target = self.targets.get(&key).ok_or("no such target")?;
-            (target.image, target.width, target.height, target.format)
-        };
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        let (full_width, full_height) = (target.width, target.height);
         let [x, y, width, height] = rect.unwrap_or([0, 0, full_width, full_height]);
         let (x, y) = (x.min(full_width), y.min(full_height));
         let (width, height) = (width.min(full_width - x), height.min(full_height - y));
+        self.read_target_plane_bytes(key, 0, 0, texel_bytes, [x, y, width, height])
+    }
+
+    /// A rectangle of a mip level's array layer or 3D slice, in the
+    /// guest's texel grid, with no buffer padding between rows.
+    pub fn read_target_plane_bytes(
+        &mut self,
+        key: u64,
+        level: u32,
+        plane: u32,
+        texel_bytes: u32,
+        [x, y, width, height]: [u32; 4],
+    ) -> Result<Vec<u8>, String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if level >= target.levels
+            || x.checked_add(width)
+                .is_none_or(|end| end > (target.width >> level).max(1))
+            || y.checked_add(height)
+                .is_none_or(|end| end > (target.height >> level).max(1))
+        {
+            return Err("target copy rectangle is outside the mip level".into());
+        }
+        let (slice, layer, planes) = if matches!(target.shape, ImageShape::D3 { .. }) {
+            (plane, 0, (target.shape.depth() >> level).max(1))
+        } else {
+            (0, plane, target.shape.layers())
+        };
+        if plane >= planes {
+            return Err("target copy layer or slice is outside the mip level".into());
+        }
         if width == 0 || height == 0 {
             return Ok(Vec::new());
         }
         // Depth targets: their depth aspect (2 bytes per texel for D16, 4
         // for the others: a float for the D32 formats, the depth in the
         // low 24 bits for D24).
-        let (aspect_mask, texel_bytes) = if is_depth(format) {
-            let bytes = if format == vk::Format::D16_UNORM {
+        let (aspect_mask, texel_bytes) = if is_depth(target.format) {
+            let bytes = if target.format == vk::Format::D16_UNORM {
                 2
             } else {
                 4
@@ -6528,6 +6555,17 @@ impl Renderer {
         } else {
             (vk::ImageAspectFlags::COLOR, texel_bytes)
         };
+        let (key, level, layer, slice) = if target.scale.is_one() {
+            (key, level, layer, slice)
+        } else {
+            (
+                self.unscaled_copy(key, level, layer, slice, aspect_mask)?,
+                0,
+                0,
+                0,
+            )
+        };
+        let image = self.targets[&key].image;
         self.transition(key, vk::ImageLayout::GENERAL)?;
         self.order_target(key)?;
         let size = u64::from(width) * u64::from(height) * u64::from(texel_bytes);
@@ -6536,14 +6574,14 @@ impl Renderer {
         let copy = vk::BufferImageCopy {
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask,
-                mip_level: 0,
-                base_array_layer: 0,
+                mip_level: level,
+                base_array_layer: layer,
                 layer_count: 1,
             },
             image_offset: vk::Offset3D {
                 x: x as i32,
                 y: y as i32,
-                z: 0,
+                z: slice as i32,
             },
             image_extent: vk::Extent3D {
                 width,
@@ -6571,25 +6609,33 @@ impl Renderer {
         Ok(bytes)
     }
 
-    /// `key`, or for a scaled target a copy of its level 0 at the guest's
-    /// resolution (a staging target), for reading back the guest's texels.
-    fn unscaled_copy(&mut self, key: u64) -> Result<u64, String> {
+    /// Copy one plane of a scaled target into a staging target at the
+    /// guest's resolution.
+    fn unscaled_copy(
+        &mut self,
+        key: u64,
+        level: u32,
+        layer: u32,
+        slice: u32,
+        aspect_mask: vk::ImageAspectFlags,
+    ) -> Result<u64, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
-        if target.scale.is_one() {
-            return Ok(key);
-        }
-        let (width, height, format) = (target.width, target.height, target.format);
-        let (scaled_width, scaled_height) = target.extent(0);
+        let (width, height, format) = (
+            (target.width >> level).max(1),
+            (target.height >> level).max(1),
+            target.format,
+        );
+        let (scaled_width, scaled_height) = target.extent(level);
         let staging_key = STAGING_KEYS + 1;
         self.target_with_levels(staging_key, width, height, format, 1)?;
         self.transition(key, vk::ImageLayout::GENERAL)?;
         self.order_target(key)?;
         self.transition(staging_key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
-        let layers = vk::ImageSubresourceLayers {
-            aspect_mask: range(format).aspect_mask,
-            mip_level: 0,
-            base_array_layer: 0,
+        let subresource = vk::ImageSubresourceLayers {
+            aspect_mask,
+            mip_level: level,
+            base_array_layer: layer,
             layer_count: 1,
         };
         let corner = |width: u32, height: u32| vk::Offset3D {
@@ -6598,9 +6644,22 @@ impl Renderer {
             z: 1,
         };
         let blit = vk::ImageBlit {
-            src_subresource: layers,
-            src_offsets: [vk::Offset3D::default(), corner(scaled_width, scaled_height)],
-            dst_subresource: layers,
+            src_subresource: subresource,
+            src_offsets: [
+                vk::Offset3D {
+                    z: slice as i32,
+                    ..Default::default()
+                },
+                vk::Offset3D {
+                    z: slice as i32 + 1,
+                    ..corner(scaled_width, scaled_height)
+                },
+            ],
+            dst_subresource: vk::ImageSubresourceLayers {
+                mip_level: 0,
+                base_array_layer: 0,
+                ..subresource
+            },
             dst_offsets: [vk::Offset3D::default(), corner(width, height)],
         };
         let barrier = vk::MemoryBarrier::default()

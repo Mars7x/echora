@@ -1270,80 +1270,101 @@ impl Nvn {
         }
     }
 
-    /// ReadTexels of a texture the GPU rendered: guest memory holds only
-    /// what the CPU wrote there, so the region comes from the host target
-    /// (its own format's bytes, rows as the guest stores them). False when
-    /// the texture is not a rendered single-level region this can serve.
+    /// Copy the GPU's latest texels for a rendered texture. Return false when
+    /// the texture's bytes are in guest memory.
     pub(super) fn gpu_read_texels(
         &mut self,
         core: &mut Guest,
         texture: u64,
-        region: [u32; 6],
+        transfer: super::TexelTransfer,
         destination: u64,
     ) -> Result<bool, String> {
-        if self.gpu.is_none() {
+        let Some((key, base_level)) = self.resolve_target(texture) else {
             return Ok(false);
+        };
+        let object = self.object(texture, "Texture")?;
+        let get = |key: &str, default| {
+            object
+                .builder
+                .get(key)
+                .map_or(default, |args| args.x[0] as u32)
+        };
+        let format = get("Format", 0);
+        let info = crate::nvn_format::info(format)
+            .ok_or_else(|| format!("texture format {format} is not modeled"))?;
+        let [x, y, z, width, height, layers] = transfer.region_for(get("Target", 1));
+        let linear = transfer.layout(object)?;
+        if linear.size == 0 {
+            return Ok(true);
         }
-        let Some((key, 0)) = self.resolve_target(texture) else {
-            return Ok(false);
-        };
-        let format = self
-            .object(texture, "Texture")?
-            .builder
-            .get("Format")
-            .map_or(0, |value| value.x[0] as u32);
-        let Some(info) = crate::nvn_format::info(format) else {
-            return Ok(false);
-        };
+        let [level, layer] = transfer.bases;
+        let level = u32::try_from(level)
+            .ok()
+            .and_then(|level| base_level.checked_add(level))
+            .ok_or("target copy mip level overflows")?;
+        let layer = u32::try_from(layer)
+            .ok()
+            .and_then(|layer| z.checked_add(layer))
+            .ok_or("target copy layer overflows")?;
         let backend = self.gpu.as_mut().unwrap();
         let target = backend.renderer.existing_target(key).unwrap();
-        let (width, height) = (target.width, target.height);
-        let [x, y, z, columns, rows, depth] = region;
+        let exact_format = vk_format(format).is_some_and(|format| {
+            format == target.format
+                || echora_gpu::renderer::srgb_twin(target.format) == Some(format)
+        });
         if info.block_width != 1
             || info.block_height != 1
-            || vk_format(format) != Some(target.format)
-            || z != 0
-            || depth > 1
-            || x + columns > width
-            || y + rows > height
+            || !exact_format
+            || matches!(
+                target.format,
+                vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+            )
         {
-            backend.note(format!(
-                "texels read from guest memory for rendered {} {width}x{height}",
+            return Err(format!(
+                "raw readback of rendered format {} is unsupported",
                 info.name
             ));
-            return Ok(false);
         }
-        let texel = info.bytes_per_block as usize;
-        let bytes = backend.renderer.read_target_bytes(key, texel as u32)?;
-        backend.note(format!(
-            "texels read from the GPU: {} {width}x{height} region {columns}x{rows}",
-            info.name
-        ));
+        let planes = match target.shape {
+            ImageShape::D3 { depth } if level < 32 => (depth >> level).max(1),
+            shape => shape.layers(),
+        };
+        if level >= target.levels || layer.checked_add(layers).is_none_or(|end| end > planes) {
+            return Err("texture copy subresources are outside the rendered target".into());
+        }
+        let texel = info.bytes_per_block;
+        let row_bytes = width as usize * texel as usize;
+        for plane in 0..layers {
+            let bytes = backend.renderer.read_target_plane_bytes(
+                key,
+                level,
+                layer + plane,
+                texel,
+                [x, y, width, height],
+            )?;
+            let destination = destination + u64::from(plane) * linear.image_stride;
+            if linear.row_stride == row_bytes as u64 {
+                core.memory
+                    .write(destination, &bytes)
+                    .map_err(|trap| format!("texture copy destination: {trap:?}"))?;
+            } else {
+                for (row, bytes) in bytes.chunks_exact(row_bytes).enumerate() {
+                    core.memory
+                        .write(destination + row as u64 * linear.row_stride, bytes)
+                        .map_err(|trap| format!("texture copy destination: {trap:?}"))?;
+                }
+            }
+        }
+        backend.stat("stat: texture readbacks", 1);
+        backend.stat(
+            "stat: texture readback bytes",
+            row_bytes as u64 * u64::from(height) * u64::from(layers),
+        );
         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
-            let words: Vec<String> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .step_by((bytes.len() / 4 / 48).max(1))
-                .take(48)
-                .map(|word| format!("{}", f32::from_le_bytes(*word)))
-                .collect();
             backend.note(format!(
-                "flow texels read {key:x} frame {} {}: [{}]",
-                self.presented_frames,
-                info.name,
-                words.join(" ")
+                "texels read from GPU {key:x} level {level} layers {layer}+{layers}: {} region {x},{y} {width}x{height}",
+                info.name
             ));
-        }
-        let row_bytes = columns as usize * texel;
-        for row in 0..rows as usize {
-            let start = ((y as usize + row) * width as usize + x as usize) * texel;
-            core.memory
-                .write(
-                    destination + (row * row_bytes) as u64,
-                    &bytes[start..start + row_bytes],
-                )
-                .map_err(|trap| format!("ReadTexels destination: {trap:?}"))?;
         }
         Ok(true)
     }
@@ -11910,6 +11931,89 @@ mod pool_tests {
         )
         .unwrap();
         assert_eq!(core.memory.read_u32(base + page).unwrap(), 0x7b7b_7b7b);
+    }
+
+    #[test]
+    fn texture_copy_reads_the_rendered_mip_and_preserves_buffer_padding() {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        backend
+            .renderer
+            .set_resolution_scale(echora_gpu::renderer::Scale::new(3, 2).unwrap());
+        let pool = 1;
+        let texture = 2;
+        let base = 0x10_0000;
+        let address = 0x20_0000;
+        let page = 4096;
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 8 * page, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&pool)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([address, 0, 0, 0]));
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Storage".into(), args([pool, page, 0, 0])),
+                ("Width".into(), args([8, 0, 0, 0])),
+                ("Height".into(), args([8, 0, 0, 0])),
+                ("Depth".into(), args([2, 0, 0, 0])),
+                ("Target".into(), args([4, 0, 0, 0])),
+                ("Levels".into(), args([2, 0, 0, 0])),
+                ("Format".into(), args([37, 0, 0, 0])),
+            ]),
+        )
+        .unwrap();
+        let blue = [0.0f32, 0.0, 1.0, 1.0].map(f32::to_bits);
+        let red = [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(texture, 1, 0, blue, None).unwrap();
+        nvn.gpu_clear_color(texture, 1, 1, red, None).unwrap();
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 8 * page, READ | WRITE, STATE_NORMAL, "texture copy")
+            .unwrap();
+        memory.write(base, &[0x4b; 64]).unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.execute_command(
+            &Command {
+                name: "nvnCommandBufferCopyTextureToBuffer",
+                x: [0, texture, 0, 0, address, 0, 0, 0],
+                v: [0; 8],
+                captured: vec![1, 1, 0, 2, 2, 1, 1, 1, 1, 12, 0],
+                states: Default::default(),
+            },
+            &mut core,
+        )
+        .unwrap();
+        let mut output = [0; 24];
+        core.memory.read(base, &mut output).unwrap();
+        let red_row = [255, 0, 0, 255, 255, 0, 0, 255];
+        assert_eq!(&output[..8], &red_row);
+        assert_eq!(&output[8..12], &[0x4b; 4]);
+        assert_eq!(&output[12..20], &red_row);
+        assert_eq!(&output[20..], &[0x4b; 4]);
     }
 
     #[test]

@@ -1350,7 +1350,13 @@ const COMMAND_BUFFER_MANAGEMENT: &[&str] = &[
     "IsRecording",
     "SetDebugLabel",
     "SetRecordingMode",
+    "SetCopyRowStride",
+    "GetCopyRowStride",
+    "SetCopyImageStride",
+    "GetCopyImageStride",
 ];
+
+const COPY_STRIDE_KEYS: [&str; 2] = ["CopyRowStride", "CopyImageStride"];
 
 /// Command buffer memory the host counts as used (GetCommandMemoryUsed,
 /// GetControlMemoryUsed): per recorded command, and per non-empty list for
@@ -1463,6 +1469,7 @@ pub struct Recording {
     command_memory: u64,
     /// Control chunk address and used bytes when recording began.
     control_start: (u64, u64),
+    copy_strides: [u64; 2],
 }
 
 /// Recordings by command buffer.
@@ -2887,10 +2894,30 @@ impl Nvn {
                 object.state.insert(property.into(), args);
                 return Ok(true);
             }
+            // Copy strides belong to the command buffer. Both copies
+            // snapshot them while recording, without emitting a setter.
+            "nvnCommandBufferSetCopyRowStride"
+            | "nvnCommandBufferSetCopyImageStride"
+            | "nvnCommandBufferGetCopyRowStride"
+            | "nvnCommandBufferGetCopyImageStride" => {
+                let slot = usize::from(name.ends_with("ImageStride"));
+                let property = COPY_STRIDE_KEYS[slot];
+                let object = self.object(this, "CommandBuffer").map_err(invalid)?;
+                if name.starts_with("nvnCommandBufferGet") {
+                    core.cpu.regs[0] = object.state.get(property).map_or(0, |stride| stride.x[0]);
+                } else {
+                    self.objects.get_mut(&this).unwrap().state.insert(property.into(), args);
+                    if let Some(recording) = read_shared(&self.recording).get(&this) {
+                        lock_shared(recording).copy_strides[slot] = x[1];
+                    }
+                }
+                return Ok(true);
+            }
             "nvnCommandBufferBeginRecording" => {
                 let object = self.object(this, "CommandBuffer").map_err(invalid)?;
                 let first = |key| object.state.get(key).map_or(0, |args| args.x[0]);
                 let control_start = (first("ControlMemoryChunk"), first("ControlMemoryUsed"));
+                let copy_strides = COPY_STRIDE_KEYS.map(first);
                 let mut recordings = write_shared(&self.recording);
                 let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this)
                 else {
@@ -2898,6 +2925,7 @@ impl Nvn {
                 };
                 slot.insert(std::sync::Arc::new(std::sync::Mutex::new(Recording {
                     control_start,
+                    copy_strides,
                     ..Recording::default()
                 })));
                 return Ok(true);
@@ -3419,11 +3447,14 @@ impl Nvn {
                 };
                 let region = read_region(core, x[2])?;
                 let to_texture = name == "nvnTextureWriteTexels";
-                let base_view = view.as_ref().is_none_or(|view| {
-                    ["Levels", "Layers"]
-                        .iter()
-                        .all(|key| view.get(*key).is_none_or(|value| value.x[0] == 0))
+                let bases = ["Levels", "Layers"].map(|key| {
+                    view.as_ref().and_then(|view| view.get(key)).map_or(0, |value| value.x[0])
                 });
+                let transfer = TexelTransfer {
+                    region,
+                    bases,
+                    strides: [0; 2],
+                };
                 if to_texture && debug_var_os("ECHORA_GPU_FLOW").is_some() {
                     let mut sample = [0u8; 16];
                     let _ = core.memory.read(x[3], &mut sample);
@@ -3433,15 +3464,15 @@ impl Nvn {
                     );
                     self.gpu_note(note);
                 }
-                if !to_texture && base_view {
-                    match self.gpu_read_texels(core, this, region, x[3]) {
+                if !to_texture && bases == [0; 2] {
+                    match self.gpu_read_texels(core, this, transfer, x[3]) {
                         Ok(true) => return Ok(true),
                         Ok(false) => {}
                         Err(error) => self.gpu_note(format!("texel read: {error}")),
                     }
                 }
                 let copied = self
-                    .copy_texels(core, this, view.as_ref(), region, x[3], to_texture)
+                    .copy_texels(core, this, transfer, x[3], to_texture)
                     .map_err(|error| error.into_trap(name, core.cpu.pc))?;
                 if to_texture {
                     self.gpu_invalidate(0..0, Some(this));
@@ -5419,39 +5450,14 @@ impl Nvn {
             }
             // CopyBufferToTexture(cmd, NVNbufferAddress src, const NVNtexture*
             // dst, const NVNtextureView*, const NVNcopyRegion*, int flags):
-            // packed texels from pool memory into the texture (as
-            // WriteTexels). Captured: the region, then whether a view was
-            // given and the view's level and layer bases.
+            // rows of texels from pool memory into the texture.
             "nvnCommandBufferCopyBufferToTexture" => {
-                let region: [u32; 6] = std::array::from_fn(|index| command.captured[index] as u32);
-                let mut view = BTreeMap::new();
-                if command.captured[6] != 0 {
-                    for (key, base) in [
-                        ("Levels", command.captured[7]),
-                        ("Layers", command.captured[8]),
-                    ] {
-                        view.insert(
-                            key.to_string(),
-                            Args {
-                                x: [base, 0, 0, 0],
-                                v: [0; 2],
-                            },
-                        );
-                    }
+                let transfer = TexelTransfer::recorded(command);
+                let texture = self.object(command.x[2], "Texture").map_err(stop)?;
+                let size = transfer.layout(texture).map_err(stop)?.size;
+                if size == 0 {
+                    return Ok(());
                 }
-                let size = {
-                    let texture = self.object(command.x[2], "Texture").map_err(stop)?;
-                    let format = texture
-                        .builder
-                        .get("Format")
-                        .map_or(0, |value| value.x[0] as u32);
-                    let info = crate::nvn_format::info(format)
-                        .ok_or_else(|| stop(format!("texture format {format} is not modeled")))?;
-                    u64::from(region[3].div_ceil(info.block_width))
-                        * u64::from(region[4].div_ceil(info.block_height))
-                        * u64::from(region[5])
-                        * u64::from(info.bytes_per_block)
-                };
                 let source = self.gpu_to_guest(command.x[1], size).map_err(stop)?;
                 // Earlier dispatches' results in the source come back first.
                 self.resolve_queued_buffer_read(core, command.x[1], source, size)
@@ -5466,14 +5472,44 @@ impl Nvn {
                         if nonzero { "has data" } else { "is zero" }
                     ));
                 }
-                let view = (command.captured[6] != 0).then_some(&view);
                 let copied = self
-                    .copy_texels(core, command.x[2], view, region, source, true)
+                    .copy_texels(core, command.x[2], transfer, source, true)
                     .map_err(|error| error.into_trap(&command.name, core.cpu.pc))?;
                 // As WriteTexels: the texture's contents changed (new glyphs
                 // in a font atlas, say), so its cached upload is dropped.
                 self.gpu_invalidate(0..0, Some(command.x[2]));
                 self.record_copied_level(command.x[2], copied);
+                Ok(())
+            }
+            // CopyTextureToBuffer(cmd, src texture, src view, src region,
+            // dst buffer address, flags): the rows the GPU last produced,
+            // or the texture's guest storage when it was never rendered.
+            "nvnCommandBufferCopyTextureToBuffer" => {
+                let transfer = TexelTransfer::recorded(command);
+                let (texture, address) = (command.x[1], command.x[4]);
+                let object = self.object(texture, "Texture").map_err(stop)?;
+                let size = transfer.layout(object).map_err(stop)?.size;
+                if size == 0 {
+                    return Ok(());
+                }
+                let guest = self.gpu_to_guest(address, size).map_err(stop)?;
+                self.resolve_queued_buffer_read(core, address, guest, size)
+                    .map_err(stop)?;
+                if !self
+                    .gpu_read_texels(core, texture, transfer, guest)
+                    .map_err(stop)?
+                {
+                    if let Some((base, length)) = self
+                        .texture_storage(texture)
+                        .zip(self.texture_storage_size(texture))
+                    {
+                        self.resolve_gpu_written(core, base..base + length)
+                            .map_err(stop)?;
+                    }
+                    self.copy_texels(core, texture, transfer, guest, false)
+                        .map_err(|error| error.into_trap(&command.name, core.cpu.pc))?;
+                }
+                self.gpu_invalidate(guest..guest + size, None);
                 Ok(())
             }
             // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU
@@ -6115,8 +6151,7 @@ impl Nvn {
         &self,
         core: &mut Guest,
         texture: u64,
-        view: Option<&BTreeMap<String, Args>>,
-        region: [u32; 6],
+        transfer: TexelTransfer,
         source: u64,
         to_texture: bool,
     ) -> Result<Option<(u64, Vec<u8>)>, TexelError> {
@@ -6124,14 +6159,6 @@ impl Nvn {
         let texture = self
             .object(texture, "Texture")
             .map_err(TexelError::Invalid)?;
-        if let Some(view) = view {
-            let base = |key: &str| view.get(key).map_or(0, |value| value.x[0]);
-            if base("Levels") != 0 || base("Layers") != 0 {
-                return Err(TexelError::Stop(
-                    "texture views of other levels or layers".into(),
-                ));
-            }
-        }
         let get = |key: &str| texture.builder.get(key).map(|value| value.x[0] as u32);
         let format = get("Format").unwrap_or(0);
         let info = crate::nvn_format::info(format)
@@ -6149,17 +6176,19 @@ impl Nvn {
         // (target 3) keeps its layers in Height and selects them with the
         // region's y: each layer is one row, the region's y/height become
         // its z/depth.
-        let mut region = region;
         let layers = match target {
             4 | 6 | 8 | 9 => get("Depth").unwrap_or(1),
-            3 => {
-                let [rx, ry, _, rw, rh, _] = region;
-                region = [rx, 0, ry, rw, 1, rh];
-                std::mem::replace(&mut height, 1)
-            }
+            3 => std::mem::replace(&mut height, 1),
             _ => 1,
         };
-        let levels = get("Levels").unwrap_or(1);
+        let levels = get("Levels").unwrap_or(1).max(1);
+        let [level, layer] = transfer.bases;
+        if level >= u64::from(levels) || level >= 32 || layer >= u64::from(layers.max(1)) {
+            return Err(TexelError::Invalid(
+                "texture view is outside the texture".into(),
+            ));
+        }
+        let level = level as u32;
         let layout = texture_layout_layers(
             &texture.builder,
             info,
@@ -6173,7 +6202,16 @@ impl Nvn {
         } else {
             0
         };
-        let [rx, ry, rz, rw, rh, rd] = region;
+        let [rx, ry, rz, rw, rh, rd] = transfer.region_for(target);
+        let rz = rz
+            .checked_add(layer as u32)
+            .ok_or_else(|| TexelError::Invalid("texture view layer overflows".into()))?;
+        let base_extent = [width, height, depth];
+        let (width, height, depth) = (
+            (width >> level).max(1),
+            (height >> level).max(1),
+            (depth >> level).max(1),
+        );
         let stride = texture.builder.get("Stride").map_or(0, |value| value.x[0]);
         if !matches!(target, 0..=4 | 7..=10)
             || rz.checked_add(rd).is_none_or(|end| end > depth.max(layers))
@@ -6202,15 +6240,32 @@ impl Nvn {
         if rx % bw != 0 || ry % bh != 0 {
             return Err(TexelError::Invalid("region is not block aligned".into()));
         }
+        let linear = transfer.layout(texture).map_err(TexelError::Invalid)?;
+        if linear.size == 0 {
+            return Ok(None);
+        }
         let bytes = u64::from(info.bytes_per_block);
         let (columns, rows) = (rw.div_ceil(bw), rh.div_ceil(bh));
         let row_size = u64::from(columns) * bytes;
+        let [base_width, base_height, base_depth] = base_extent;
+        let shape =
+            crate::nvn_format::level_block_shape(info, base_height, base_depth, layout, level);
+        let base = base
+            + crate::nvn_format::block_linear_level_offset(
+                info,
+                base_width,
+                base_height,
+                base_depth,
+                layout,
+                level,
+            );
         // A copy into the whole of a single 2D block-linear level (a movie
         // picture every present): tiled in memory with the rows' 16-byte
         // runs, then written back at once, instead of a guest write per run.
         // The level's storage is read first so its padding keeps its bytes.
         if to_texture
             && stride == 0
+            && level == 0
             && matches!(target, 1 | 7)
             && layers == 1
             && depth == 1
@@ -6218,8 +6273,8 @@ impl Nvn {
             && (rw, rh) == (width, height)
             && bytes != 0
             && 16 % bytes == 0
+            && linear.row_stride == row_size
         {
-            let shape = crate::nvn_format::level_block_shape(info, height, 1, layout, 0);
             let size = crate::nvn_format::block_linear_size(info, width, height, 1, layout, 1).0;
             // The buffer is kept between copies (a picture each present).
             // Without padding the rows cover every byte; otherwise the
@@ -6269,8 +6324,9 @@ impl Nvn {
         };
         for slice in 0..rd {
             for row in 0..rows {
-                let from =
-                    source + (u64::from(slice) * u64::from(rows) + u64::from(row)) * row_size;
+                let from = source
+                    + u64::from(slice) * linear.image_stride
+                    + u64::from(row) * linear.row_stride;
                 if to_texture {
                     core.memory
                         .read(from, &mut line)
@@ -6295,12 +6351,11 @@ impl Nvn {
                         let run =
                             crate::nvn_format::block_linear_run(info, x).min(columns - column);
                         let offset = layer * layer_stride
-                            + crate::nvn_format::block_linear_offset(
+                            + crate::nvn_format::block_linear_offset_in(
                                 info,
                                 width,
                                 height,
-                                depth,
-                                layout,
+                                shape,
                                 x,
                                 ry / bh + row,
                                 z,
@@ -7193,6 +7248,93 @@ enum TexelError {
     Trap(Trap),
 }
 
+/// A texture region and the view and byte strides captured for the transfer.
+#[derive(Clone, Copy)]
+struct TexelTransfer {
+    region: [u32; 6],
+    bases: [u64; 2],
+    strides: [u64; 2],
+}
+
+struct LinearTexelLayout {
+    row_stride: u64,
+    image_stride: u64,
+    size: u64,
+}
+
+impl TexelTransfer {
+    fn recorded(command: &Command) -> Self {
+        Self {
+            region: std::array::from_fn(|index| command.captured[index] as u32),
+            bases: [command.captured[7], command.captured[8]],
+            strides: command.captured.get(9..11).map_or([0; 2], |s| [s[0], s[1]]),
+        }
+    }
+
+    fn region_for(self, target: u32) -> [u32; 6] {
+        if target == 3 {
+            let [x, layer, _, width, layers, _] = self.region;
+            [x, 0, layer, width, 1, layers]
+        } else {
+            self.region
+        }
+    }
+
+    fn layout(self, texture: &Object) -> Result<LinearTexelLayout, String> {
+        let get = |key: &str, default| {
+            texture
+                .builder
+                .get(key)
+                .map_or(default, |value| value.x[0] as u32)
+        };
+        let format = get("Format", 0);
+        let info = crate::nvn_format::info(format)
+            .ok_or_else(|| format!("texture format {format} is not modeled"))?;
+        let [_, _, _, width, height, depth] = self.region_for(get("Target", 1));
+        if width == 0 || height == 0 || depth == 0 {
+            return Ok(LinearTexelLayout {
+                row_stride: 0,
+                image_stride: 0,
+                size: 0,
+            });
+        }
+        let row_size =
+            u64::from(width.div_ceil(info.block_width)) * u64::from(info.bytes_per_block);
+        let rows = u64::from(height.div_ceil(info.block_height));
+        let [row_stride, image_stride] = self.strides;
+        let row_stride = if row_stride == 0 {
+            row_size
+        } else {
+            row_stride
+        };
+        if row_stride < row_size || row_stride > i64::MAX as u64 || image_stride > i64::MAX as u64 {
+            return Err("invalid texture copy stride".into());
+        }
+        let span = || "texture copy span overflows".to_string();
+        let plane = (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|start| start.checked_add(row_size))
+            .ok_or_else(span)?;
+        let image_stride = if image_stride == 0 {
+            rows.checked_mul(row_stride).ok_or_else(span)?
+        } else {
+            image_stride
+        };
+        if depth > 1 && image_stride < plane {
+            return Err("texture copy image stride overlaps previous rows".into());
+        }
+        let size = (u64::from(depth) - 1)
+            .checked_mul(image_stride)
+            .and_then(|start| start.checked_add(plane))
+            .ok_or_else(span)?;
+        Ok(LinearTexelLayout {
+            row_stride,
+            image_stride,
+            size,
+        })
+    }
+}
+
 impl TexelError {
     fn into_trap(self, name: &str, pc: u64) -> Trap {
         match self {
@@ -7749,11 +7891,21 @@ fn record_command(
         }
     }
     snapshot_states(bags, core, &mut command);
-    if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
-        let view_bags = read_shared(bags.at(command.x[3]));
-        let view = bag_in(&view_bags, command.x[3], "TextureView").map_err(invalid)?;
-        for (index, key) in ["Levels", "Layers"].iter().enumerate() {
-            command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
+    let copy_view = match command.name {
+        "nvnCommandBufferCopyBufferToTexture" => Some(command.x[3]),
+        "nvnCommandBufferCopyTextureToBuffer" => Some(command.x[2]),
+        _ => None,
+    };
+    if let Some(view_address) = copy_view {
+        if view_address != 0 {
+            let view_bags = read_shared(bags.at(view_address));
+            let view = bag_in(&view_bags, view_address, "TextureView").map_err(invalid)?;
+            for (index, key) in ["Levels", "Layers"].iter().enumerate() {
+                command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
+            }
+        }
+        if recording.copy_strides != [0, 0] {
+            command.captured.extend(recording.copy_strides);
         }
     }
     if command.name == "nvnCommandBufferClearTexture" {
@@ -7902,8 +8054,13 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
             command.captured = read_u64s(command.x[2], count)?;
             command.captured.extend(read_u64s(command.x[3], count)?);
         }
-        "nvnCommandBufferCopyBufferToTexture" => {
-            command.captured = read_region(core, command.x[4])?
+        "nvnCommandBufferCopyBufferToTexture" | "nvnCommandBufferCopyTextureToBuffer" => {
+            let view_index = if command.name == "nvnCommandBufferCopyBufferToTexture" {
+                3
+            } else {
+                2
+            };
+            command.captured = read_region(core, command.x[view_index + 1])?
                 .iter()
                 .map(|value| u64::from(*value))
                 .collect();
@@ -7911,7 +8068,7 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
             // Nvn::call, which holds the view's property bag).
             command
                 .captured
-                .extend([u64::from(command.x[3] != 0), 0, 0]);
+                .extend([u64::from(command.x[view_index] != 0), 0, 0]);
         }
         // CopyTextureToTexture(cmd, src texture, src view, src region,
         // dst texture, dst view, dst region, flags) (inferred from the
@@ -8369,6 +8526,95 @@ mod tests {
         assert_eq!(bind.states[0]["DepthFunc"].x[0], 3);
         assert_eq!(bind.states[0]["DepthWriteEnable"].x[0], 1);
         assert_eq!(guest.memory.read_u32(source).unwrap(), original);
+    }
+
+    #[test]
+    fn texture_copy_captures_command_buffer_strides_and_view() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "copy region")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (buffer, view, region) = (0x1100, 0x1200, 0x1300);
+        nvn.initialize(buffer, "CommandBuffer", BTreeMap::new())
+            .unwrap();
+        for (index, word) in [1u32, 2, 0, 3, 4, 1].into_iter().enumerate() {
+            core.memory
+                .write_u32(region + index as u64 * 4, word)
+                .unwrap();
+        }
+        call(&mut nvn, &mut core, "nvnTextureViewSetDefaults", &[view]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLevels",
+            &[view, 2, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetCopyRowStride",
+            &[buffer, 32],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetCopyImageStride",
+            &[buffer, 256],
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnCommandBufferGetCopyRowStride",
+                &[buffer]
+            ),
+            32,
+        );
+        let recorder = nvn.recorder();
+        core.cpu.regs[..5].copy_from_slice(&[buffer, 0x1700, view, region, 0x1f00]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferCopyTextureToBuffer", &mut core)
+                .unwrap()
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetCopyRowStride",
+            &[buffer, 0],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLevels",
+            &[view, 0, 1],
+        );
+        core.memory.write_u32(region, 0).unwrap();
+        let handle = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let list = nvn.use_command_list(handle).unwrap();
+        assert_eq!(list.len(), 1);
+        let copy = TexelTransfer::recorded(&list[0]);
+        assert_eq!(copy.region, [1, 2, 0, 3, 4, 1]);
+        assert_eq!(copy.bases, [2, 0]);
+        assert_eq!(copy.strides, [32, 256]);
     }
 
     #[test]
