@@ -5150,22 +5150,27 @@ impl Nvn {
     /// equal (mode 0) or different (mode 1). The game gates clears with it:
     /// it writes counter 1 to ask for one, and the report after the clear
     /// writes 0, so the frame's later gated clears do nothing.
-    fn render_enabled(&self, core: &Guest) -> bool {
+    fn render_enabled(&mut self, core: &mut Guest) -> Result<bool, String> {
         if self.render.gpu_render_condition {
-            return true;
+            return Ok(true);
         }
         match self.render.render_enable {
-            None => true,
-            Some((2, _)) => false,
+            None => Ok(true),
+            Some((2, _)) => Ok(false),
             Some((mode, address)) => {
-                let counter = |at: u64| {
-                    self.gpu_to_guest(at, 8)
-                        .ok()
-                        .and_then(|guest| core.memory.read_u64(guest).ok())
+                let second_address = address.checked_add(16);
+                let first = self.gpu_to_guest(address, 8).ok();
+                let second = second_address.and_then(|at| self.gpu_to_guest(at, 8).ok());
+                let (Some(first), Some(second)) = (first, second) else {
+                    return Ok(true);
                 };
-                match (counter(address), counter(address + 16)) {
-                    (Some(first), Some(second)) => (first == second) == (mode == 0),
-                    _ => true,
+                // Some comparisons cannot use a Vulkan predicate. Resolve
+                // any queued reports before reading their values on the CPU.
+                self.resolve_storage(core, Some(first..first + 8))?;
+                self.resolve_storage(core, Some(second..second + 8))?;
+                match (core.memory.read_u64(first), core.memory.read_u64(second)) {
+                    (Ok(first), Ok(second)) => Ok((first == second) == (mode == 0)),
+                    _ => Ok(true),
                 }
             }
         }
@@ -5232,7 +5237,14 @@ impl Nvn {
                 || name.starts_with("nvnCommandBufferDispatch")
                 || name.starts_with("nvnCommandBufferClear"))
                 && name != "nvnCommandBufferClearBuffer"
-                && !self.render_enabled(core) =>
+                && !self
+                    .render_enabled(core)
+                    .map_err(|message| Trap::UnsupportedService {
+                        pc: core.cpu.pc,
+                        service: "nvn".into(),
+                        command_id: None,
+                        message: format!("{name}: resolve render condition: {message}"),
+                    })? =>
             {
                 *self
                     .skipped_work
@@ -8597,6 +8609,26 @@ mod tests {
             .read_target(target)
             .unwrap();
         assert_eq!(texels, vec![green; 16]);
+
+        // A CPU comparison with a nonzero second counter must see the
+        // preceding GPU report overwrite the first counter.
+        guest.memory.write_u64(address, 1).unwrap();
+        guest.memory.write_u64(address + 16, 1).unwrap();
+        nvn.gpu_samples_reset().unwrap();
+        assert!(nvn.gpu_samples_report(&mut guest, address, 0).unwrap());
+        let mut equal = condition;
+        equal.x[1] = 0;
+        nvn.execute(&equal, &mut guest).unwrap();
+        assert!(!nvn.render.gpu_render_condition);
+        let skipped_clear = Command {
+            name: "nvnCommandBufferClearColor",
+            x: [0; 8],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        nvn.execute(&skipped_clear, &mut guest).unwrap();
+        assert_eq!(nvn.skipped_work["rendering disabled"], 1);
     }
 
     #[test]
