@@ -1172,15 +1172,15 @@ impl Nvn {
 impl Nvn {
     /// A list run again (submitted or called): most recently used, and
     /// counted as reused (the resource cap's second chance).
-    fn touch_command_list(&mut self, handle: u64) {
-        if let Some((_, used, submits)) = self.command_lists.get_mut(&handle) {
-            *submits = submits.saturating_add(1);
-            self.command_list_clock += 1;
-            let previous = std::mem::replace(used, self.command_list_clock);
-            self.command_list_use.remove(&previous);
-            self.command_list_use
-                .insert(self.command_list_clock, handle);
-        }
+    fn use_command_list(&mut self, handle: u64) -> Option<std::sync::Arc<Vec<Command>>> {
+        let (list, used, submits) = self.command_lists.get_mut(&handle)?;
+        *submits = submits.saturating_add(1);
+        self.command_list_clock += 1;
+        let previous = std::mem::replace(used, self.command_list_clock);
+        self.command_list_use.remove(&previous);
+        self.command_list_use
+            .insert(self.command_list_clock, handle);
+        Some(list.clone())
     }
 }
 
@@ -4763,10 +4763,8 @@ impl Nvn {
                         // The called lists run next, in order, ahead of
                         // the rest of this one (their waits block too).
                         for handle in command.captured.iter().rev() {
-                            match self.command_lists.get(handle) {
-                                Some((list, ..)) => {
-                                    let list = list.clone();
-                                    self.touch_command_list(*handle);
+                            match self.use_command_list(*handle) {
+                                Some(list) => {
                                     if debug_var_os("ECHORA_LIST_LOG").is_some()
                                         && let Some(bind) = big_vertex_bind(&list)
                                     {
@@ -5116,13 +5114,11 @@ impl Nvn {
                 if self.call_depth >= 8 {
                     return Err(stop("command lists call each other too deeply".into()));
                 }
-                for handle in command.captured.clone() {
-                    let Some((list, ..)) = self.command_lists.get(&handle) else {
+                for &handle in &command.captured {
+                    let Some(list) = self.use_command_list(handle) else {
                         self.note_stale(handle, "call");
                         continue;
                     };
-                    let list = list.clone();
-                    self.touch_command_list(handle);
                     self.call_depth += 1;
                     let result = list
                         .iter()
@@ -8788,6 +8784,68 @@ mod tests {
                 Some(QueueItem::Fence { sync: 0x1000, .. })
             ));
             assert!(!read_shared(&nvn.registry).signaled.contains_key(&0x1000));
+        }
+    }
+
+    #[test]
+    fn called_lists_refresh_use_order_in_direct_and_queued_replay() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        for name in [
+            "nvnCommandBufferCallCommands",
+            "nvnCommandBufferCopyCommands",
+        ] {
+            let mut nvn = Nvn::default();
+            let mut commands = Vec::new();
+            for (clock, handle) in [(1, 10), (2, 20)] {
+                commands.push(handle);
+                nvn.command_lists.insert(
+                    handle,
+                    (
+                        std::sync::Arc::new(vec![Command {
+                            name: "nvnCommandBufferSetScissor",
+                            x: [0, handle, 2, 3, 4, 0, 0, 0],
+                            v: [0; 8],
+                            captured: Vec::new(),
+                            states: StateSnapshots::default(),
+                        }]),
+                        clock,
+                        0,
+                    ),
+                );
+                nvn.command_list_use.insert(clock, handle);
+            }
+            nvn.command_list_clock = 2;
+            let caller = Command {
+                name,
+                x: [0; 8],
+                v: [0; 8],
+                captured: commands,
+                states: StateSnapshots::default(),
+            };
+            nvn.execute(&caller, &mut guest).unwrap();
+            assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
+            assert_eq!(nvn.command_list_use, BTreeMap::from([(3, 10), (4, 20)]));
+
+            nvn.render.scissor = None;
+            nvn.pending
+                .entry(1)
+                .or_default()
+                .push_back(QueueItem::List {
+                    commands: std::sync::Arc::new(vec![caller]),
+                    next: 0,
+                    descriptor_epoch: 0,
+                });
+            nvn.run_queue(1, &mut guest, false).unwrap();
+            assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
+            assert_eq!(nvn.command_list_use, BTreeMap::from([(5, 20), (6, 10)]));
+            assert_eq!(nvn.command_lists[&10].2, 2);
+            assert_eq!(nvn.command_lists[&20].2, 2);
         }
     }
 
