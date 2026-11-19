@@ -621,6 +621,35 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             }
         }
     }
+    if matches!(
+        op,
+        FpBinaryOp::Max | FpBinaryOp::Min | FpBinaryOp::MaxNum | FpBinaryOp::MinNum
+    ) {
+        let sign = format.sign_bit();
+        let exponent = format.exponent_mask();
+        let accepts = |absolute| {
+            absolute <= exponent && (!fp.mode.fz || absolute == 0 || absolute & exponent != 0)
+        };
+        if accepts(a & !sign) && accepts(b & !sign) {
+            // Matching magnitudes order by sign, including signed zeros.
+            let a_lower = match (a & sign != 0, b & sign != 0) {
+                (false, true) => false,
+                (true, false) => true,
+                (false, false) => a < b,
+                (true, true) => a > b,
+            };
+            let max = matches!(op, FpBinaryOp::Max | FpBinaryOp::MaxNum);
+            return if a_lower == max { b } else { a };
+        }
+    }
+    binary_lane_fallback(fp, op, a, b)
+}
+
+#[cold]
+#[inline(never)]
+fn binary_lane_fallback(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
+    let size = fp.size;
+    let format = fp.format;
     let a = fp.input(a);
     let b = fp.input(b);
     let numeric = matches!(op, FpBinaryOp::MaxNum | FpBinaryOp::MinNum);
@@ -4612,6 +4641,33 @@ mod fast_path_tests {
             cpu.vectors[index + 1] = u128::from(*value) | 0xdead << 100;
         }
         cpu
+    }
+
+    #[test]
+    fn scalar_extrema_match_full_float_state() {
+        for size in [FpSize::S, FpSize::D] {
+            let values = samples(size);
+            for fpcr in [0, FPCR_DN, FPCR_FZ, FPCR_DN | FPCR_FZ] {
+                for &a in &values {
+                    for &b in &values {
+                        for op in [
+                            FpBinaryOp::Min,
+                            FpBinaryOp::MinNum,
+                            FpBinaryOp::Max,
+                            FpBinaryOp::MaxNum,
+                        ] {
+                            let mut actual = cpu_with((fpcr, FPSR_QC), &[a, b]);
+                            let mut expected = actual.clone();
+                            let mut fp = Fp::new(&mut expected, size).unwrap();
+                            let result = binary_lane_fallback(&mut fp, op, a, b);
+                            write_fp(&mut expected, 0, size, result);
+                            fp_binary(&mut actual, op, size, 0, 1, 2).unwrap();
+                            assert_eq!(actual, expected, "{op:?} {size:?} {fpcr:#x} {a:#x} {b:#x}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
