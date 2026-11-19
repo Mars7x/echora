@@ -1541,11 +1541,12 @@ struct RegisteredPool {
     buffers: u64,
 }
 
-/// A buffer: its builder's properties (Storage is pool, offset, size) and
-/// the state its setters recorded (a debug label).
+/// A buffer's fixed range and the state set after initialization.
 #[derive(Clone, Debug)]
 struct RegisteredBuffer {
-    builder: BTreeMap<String, Args>,
+    pool: u64,
+    offset: u64,
+    size: u64,
     state: BTreeMap<String, Args>,
 }
 
@@ -1882,16 +1883,19 @@ fn registry_call(
         // nvnBufferInitialize(NVNbuffer*, const NVNbufferBuilder*): Storage
         // is (pool, offset, size) within an initialized pool.
         "nvnBufferInitialize" => {
-            let builder =
-                bag_in(&read_shared(bags.at(x[1])), x[1], "BufferBuilder").map_err(invalid)?;
-            let device = builder
-                .get("Device")
-                .ok_or_else(|| invalid("builder device was never set".into()))?
-                .x[0];
-            let storage = builder
-                .get("Storage")
-                .copied()
-                .ok_or_else(|| invalid("buffer storage was never set".into()))?;
+            let (device, storage) = {
+                let bags = read_shared(bags.at(x[1]));
+                let builder = bag_in(&bags, x[1], "BufferBuilder").map_err(invalid)?;
+                let device = builder
+                    .get("Device")
+                    .ok_or_else(|| invalid("builder device was never set".into()))?
+                    .x[0];
+                let storage = builder
+                    .get("Storage")
+                    .copied()
+                    .ok_or_else(|| invalid("buffer storage was never set".into()))?;
+                (device, storage)
+            };
             let (pool, offset, size) = (storage.x[0], storage.x[1], storage.x[2]);
             let mut registry = write_shared(registry);
             if !registry.devices.contains(&device) {
@@ -1913,7 +1917,9 @@ fn registry_call(
             registry.buffers.insert(
                 this,
                 RegisteredBuffer {
-                    builder,
+                    pool,
+                    offset,
+                    size,
                     state: BTreeMap::new(),
                 },
             );
@@ -1928,8 +1934,7 @@ fn registry_call(
         "nvnBufferFinalize" => {
             let mut registry = write_shared(registry);
             if let Some(buffer) = registry.buffers.remove(&this) {
-                let pool = buffer.builder["Storage"].x[0];
-                if let Some(pool) = registry.pools.get_mut(&pool) {
+                if let Some(pool) = registry.pools.get_mut(&buffer.pool) {
                     pool.buffers = pool.buffers.saturating_sub(1);
                 }
             }
@@ -1941,17 +1946,16 @@ fn registry_call(
                 .buffers
                 .get(&this)
                 .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?;
-            let storage = buffer.builder["Storage"];
             core.cpu.regs[0] = match name {
-                "nvnBufferGetSize" => storage.x[2],
+                "nvnBufferGetSize" => buffer.size,
                 _ => {
-                    let pool = registry.pools.get(&storage.x[0]).ok_or_else(|| {
-                        invalid(format!("MemoryPool {:#x} is not initialized", storage.x[0]))
+                    let pool = registry.pools.get(&buffer.pool).ok_or_else(|| {
+                        invalid(format!("MemoryPool {:#x} is not initialized", buffer.pool))
                     })?;
                     if name == "nvnBufferGetAddress" {
-                        pool.gpu + storage.x[1]
+                        pool.gpu + buffer.offset
                     } else {
-                        pool.storage + storage.x[1]
+                        pool.storage + buffer.offset
                     }
                 }
             };
@@ -1959,15 +1963,14 @@ fn registry_call(
         }
         "nvnBufferGetMemoryPool" | "nvnBufferGetMemoryOffset" => {
             let registry = read_shared(registry);
-            let storage = registry
+            let buffer = registry
                 .buffers
                 .get(&this)
-                .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?
-                .builder["Storage"];
+                .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?;
             core.cpu.regs[0] = if name.ends_with("Pool") {
-                storage.x[0]
+                buffer.pool
             } else {
-                storage.x[1]
+                buffer.offset
             };
             Ok(true)
         }
@@ -1979,8 +1982,7 @@ fn registry_call(
                 .buffers
                 .get(&this)
                 .ok_or_else(|| invalid(format!("Buffer {this:#x} is not initialized")))?
-                .builder["Storage"]
-                .x[2];
+                .size;
             if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
                 return Err(invalid(format!(
                     "range {:#x}+{:#x} outside the buffer",
@@ -2018,14 +2020,14 @@ fn registry_call(
     }
 }
 
-fn bag_in(
-    bags: &BTreeMap<u64, Bag>,
+fn bag_in<'a>(
+    bags: &'a BTreeMap<u64, Bag>,
     address: u64,
     kind: &str,
-) -> Result<BTreeMap<String, Args>, String> {
+) -> Result<&'a BTreeMap<String, Args>, String> {
     bags.get(&address)
         .filter(|bag| bag.kind == kind)
-        .map(|bag| bag.props.clone())
+        .map(|bag| &bag.props)
         .ok_or_else(|| format!("no {kind} at {address:#x}"))
 }
 
@@ -3392,8 +3394,7 @@ impl Nvn {
                     .buffers
                     .get(&this)
                     .ok_or_else(|| invalid("Buffer is not initialized".into()))?
-                    .builder["Storage"]
-                    .x[2];
+                    .size;
                 if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
                     return Err(invalid(format!("range {:#x}+{:#x} outside the buffer", x[1], x[2])));
                 }
@@ -6846,7 +6847,7 @@ impl Nvn {
     }
 
     fn bag(&self, address: u64, kind: &str) -> Result<BTreeMap<String, Args>, String> {
-        bag_in(&read_shared(self.bags.at(address)), address, kind)
+        bag_in(&read_shared(self.bags.at(address)), address, kind).cloned()
     }
 
     /// The handle workers record command buffers through without the NVN
@@ -7749,12 +7750,8 @@ fn record_command(
     }
     snapshot_states(bags, core, &mut command);
     if command.name == "nvnCommandBufferCopyBufferToTexture" && command.x[3] != 0 {
-        let view = bag_in(
-            &read_shared(bags.at(command.x[3])),
-            command.x[3],
-            "TextureView",
-        )
-        .map_err(invalid)?;
+        let view_bags = read_shared(bags.at(command.x[3]));
+        let view = bag_in(&view_bags, command.x[3], "TextureView").map_err(invalid)?;
         for (index, key) in ["Levels", "Layers"].iter().enumerate() {
             command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
         }
@@ -7763,12 +7760,8 @@ fn record_command(
         let bases = if command.x[2] == 0 {
             [0, 0]
         } else {
-            let view = bag_in(
-                &read_shared(bags.at(command.x[2])),
-                command.x[2],
-                "TextureView",
-            )
-            .map_err(invalid)?;
+            let view_bags = read_shared(bags.at(command.x[2]));
+            let view = bag_in(&view_bags, command.x[2], "TextureView").map_err(invalid)?;
             ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
         };
         command.captured.extend(bases);
@@ -7780,8 +7773,8 @@ fn record_command(
             let bases = if view == 0 {
                 [0, 0]
             } else {
-                let view =
-                    bag_in(&read_shared(bags.at(view)), view, "TextureView").map_err(invalid)?;
+                let view_bags = read_shared(bags.at(view));
+                let view = bag_in(&view_bags, view, "TextureView").map_err(invalid)?;
                 ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
             };
             command.captured.extend(bases);
@@ -7799,8 +7792,8 @@ fn record_command(
         let mut formats = vec![0; count];
         for (index, view) in views.iter_mut().enumerate() {
             if *view != 0 {
-                let bag =
-                    bag_in(&read_shared(bags.at(*view)), *view, "TextureView").map_err(invalid)?;
+                let view_bags = read_shared(bags.at(*view));
+                let bag = bag_in(&view_bags, *view, "TextureView").map_err(invalid)?;
                 if let (Some(format), Some(slot)) = (bag.get("Format"), formats.get_mut(index)) {
                     *slot = format.x[0];
                 }
@@ -9132,6 +9125,78 @@ mod tests {
         assert_eq!(nvn.pop_oldest_command_list_use(), Some(1));
         assert_eq!(nvn.pop_oldest_command_list_use(), Some(2));
         assert_eq!(nvn.pop_oldest_command_list_use(), None);
+    }
+
+    #[test]
+    fn buffer_queries_keep_the_range_from_initialization() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (device, pool, builder, buffer) = (0x1100, 0x1200, 0x1300, 0x1400);
+        {
+            let mut registry = write_shared(&nvn.registry);
+            registry.devices.insert(device);
+            registry.pools.insert(
+                pool,
+                RegisteredPool {
+                    storage: 0x8000,
+                    size: 0x1000,
+                    gpu: 0x4_0000,
+                    flags: None,
+                    buffers: 0,
+                },
+            );
+        }
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferBuilderSetDevice",
+            &[builder, device],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferBuilderSetStorage",
+            &[builder, pool, 0x180, 0x100],
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnBufferInitialize",
+                &[buffer, builder]
+            ),
+            1
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferBuilderSetStorage",
+            &[builder, pool, 0x280, 0x200],
+        );
+        for (name, value) in [
+            ("nvnBufferMap", 0x8180),
+            ("nvnBufferGetAddress", 0x4_0180),
+            ("nvnBufferGetSize", 0x100),
+            ("nvnBufferGetMemoryPool", pool),
+            ("nvnBufferGetMemoryOffset", 0x180),
+        ] {
+            assert_eq!(call(&mut nvn, &mut guest, name, &[buffer]), value);
+        }
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferFlushMappedRange",
+            &[buffer, 0x20, 0xe0],
+        );
+        assert_eq!(read_shared(&nvn.registry).pools[&pool].buffers, 1);
+        call(&mut nvn, &mut guest, "nvnBufferFinalize", &[buffer]);
+        assert_eq!(read_shared(&nvn.registry).pools[&pool].buffers, 0);
     }
 
     #[test]
