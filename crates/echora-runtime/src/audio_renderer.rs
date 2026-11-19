@@ -501,7 +501,7 @@ impl Voice {
         false
     }
 
-    /// This frame's `count` output samples of channel `channel`: wave
+    /// Fill this frame's output samples of channel `channel`: wave
     /// buffers decoded from the voice's position and resampled by its
     /// pitch. `commit` keeps the advanced position (the last channel's
     /// pass; every channel reads the same range).
@@ -510,10 +510,12 @@ impl Voice {
         memory: &dyn Source,
         channel: usize,
         target_rate: u32,
-        count: usize,
         commit: bool,
-    ) -> Vec<i32> {
-        let mut output = vec![0i32; count];
+        output: &mut [i32],
+        input: &mut Vec<i16>,
+    ) {
+        output.fill(0);
+        let count = output.len();
         let ratio = mix::ratio(self.sample_rate, target_rate, self.pitch);
         let taps = self.quality.history();
         if self.channel_state.len() <= channel {
@@ -525,10 +527,11 @@ impl Voice {
         let wanted = (state.fraction + count as u64 * ratio) >> 15;
         if ratio == 0 || taps as u64 + wanted > TEMP_BUFFER_SIZE {
             self.channel_state[channel] = state;
-            return output;
+            return;
         }
         let wanted = wanted as u32;
-        let mut temp = state.history.clone();
+        input.clear();
+        input.extend_from_slice(&state.history);
         // The position, advanced on a copy unless this pass commits.
         let (mut index, mut offset, mut loops) = (self.index, self.offset as u32, self.loops);
         let (mut played, mut consumed) = (self.played, self.consumed);
@@ -563,7 +566,7 @@ impl Voice {
                     end,
                     offset,
                     wanted - read,
-                    &mut temp,
+                    input,
                 ),
                 Format::Adpcm => {
                     let mut coefficients = [0i16; 16];
@@ -583,7 +586,7 @@ impl Voice {
                         end,
                         offset,
                         wanted - read,
-                        &mut temp,
+                        input,
                     )
                 }
                 Format::Invalid => 0,
@@ -615,9 +618,9 @@ impl Voice {
             }
         }
         // Input the buffers could not supply reads as silence.
-        temp.resize(taps + wanted as usize, 0);
-        mix::resample(&mut output, &temp, ratio, &mut state.fraction, self.quality);
-        state.history = temp[wanted as usize..].to_vec();
+        input.resize(taps + wanted as usize, 0);
+        mix::resample(output, input, ratio, &mut state.fraction, self.quality);
+        state.history.copy_from_slice(&input[wanted as usize..]);
         self.channel_state[channel] = state;
         if commit {
             self.index = index;
@@ -627,7 +630,6 @@ impl Voice {
             self.consumed = consumed;
             self.valid = valid;
         }
-        output
     }
 
     /// Consume `frame_seconds` of input at the voice's rate from the
@@ -700,6 +702,9 @@ pub struct Renderer {
     mixes: BTreeMap<i32, Mix>,
     /// Channel samples cleared and reused on each render.
     mix_buffers: BTreeMap<i32, Vec<Vec<i32>>>,
+    /// Working samples for one voice channel, reused across the mixer.
+    voice_samples: Vec<i32>,
+    voice_input: Vec<i16>,
     mixers: BTreeMap<usize, BufferMixer>,
     /// The effect slots with signal processing of their own.
     processors: BTreeMap<usize, Effect>,
@@ -732,6 +737,8 @@ impl Renderer {
             resources: BTreeMap::new(),
             mixes: BTreeMap::new(),
             mix_buffers: BTreeMap::new(),
+            voice_samples: Vec::new(),
+            voice_input: Vec::new(),
             mixers: BTreeMap::new(),
             processors: BTreeMap::new(),
             splitters: BTreeMap::new(),
@@ -828,6 +835,10 @@ impl Renderer {
             }
         }
         let mut mixed = false;
+        let samples = &mut self.voice_samples;
+        if memory.is_some() {
+            samples.resize(count, 0);
+        }
         for voice in self.voices.values_mut() {
             let playing = voice.render(frame_seconds, memory.is_none());
             let Some(memory) = memory else {
@@ -838,16 +849,22 @@ impl Renderer {
             }
             let channels = (voice.channels.max(1) as usize).min(voice.resources.len());
             for channel in 0..channels {
-                let mut samples =
-                    voice.source(memory, channel, rate, count, channel + 1 == channels);
+                voice.source(
+                    memory,
+                    channel,
+                    rate,
+                    channel + 1 == channels,
+                    samples,
+                    &mut self.voice_input,
+                );
                 for filter in 0..2 {
                     let (enabled, b, a) = voice.biquads[filter];
                     if enabled {
                         let state = &mut voice.channel_state[channel].biquads[filter];
-                        mix::biquad(&mut samples, b, a, state);
+                        mix::biquad(samples, b, a, state);
                     }
                 }
-                mix::volume_ramp(&mut samples, voice.previous_volume, voice.volume);
+                mix::volume_ramp(samples, voice.previous_volume, voice.volume);
                 if voice.mix != UNUSED_MIX {
                     let Some(resource) = self.resources.get_mut(&voice.resources[channel]) else {
                         continue;
@@ -856,7 +873,7 @@ impl Renderer {
                         for (index, buffer) in target.iter_mut().enumerate() {
                             mix::mix_ramp(
                                 buffer,
-                                &samples,
+                                samples,
                                 resource.previous[index],
                                 resource.volumes[index],
                             );
@@ -870,7 +887,7 @@ impl Renderer {
                     let ids = self
                         .splitters
                         .get(&voice.splitter)
-                        .cloned()
+                        .map(Vec::as_slice)
                         .unwrap_or_default();
                     for id in ids.iter().skip(channel).step_by(channels) {
                         let Some(destination) = self.destinations.get_mut(id) else {
@@ -883,7 +900,7 @@ impl Renderer {
                             for (index, buffer) in target.iter_mut().enumerate() {
                                 mix::mix_ramp(
                                     buffer,
-                                    &samples,
+                                    samples,
                                     destination.previous[index],
                                     destination.volumes[index],
                                 );
@@ -979,43 +996,47 @@ impl Renderer {
                 continue;
             }
             let mix = &self.mixes[&id];
-            let Some(source) = buffers.get(&id).cloned() else {
+            let Some(source) = buffers.get_mut(&id).map(std::mem::take) else {
                 continue;
             };
+            // Keep the source unchanged while routing it. Usually its
+            // destination is another mix, so the buffers can be moved
+            // back afterward without copying their contents.
             if mix.destination == UNUSED_MIX {
                 // Through a splitter: destination d takes this mix's buffer
                 // d modulo its buffer count.
-                if mix.splitter == UNUSED_SPLITTER || source.is_empty() {
-                    continue;
-                }
-                let ids = self
-                    .splitters
-                    .get(&mix.splitter)
-                    .cloned()
-                    .unwrap_or_default();
-                for (index, destination_id) in ids.iter().enumerate() {
-                    let Some(destination) = self.destinations.get(destination_id) else {
-                        continue;
-                    };
-                    if !destination.in_use || destination.mix == UNUSED_MIX {
-                        continue;
-                    }
-                    let samples = &source[index % source.len()];
-                    if let Some(target) = buffers.get_mut(&destination.mix) {
-                        for (to, buffer) in target.iter_mut().enumerate() {
-                            mix::mix(buffer, samples, mix.volume * destination.volumes[to]);
+                if !source.is_empty()
+                    && mix.splitter != UNUSED_SPLITTER
+                    && let Some(ids) = self.splitters.get(&mix.splitter)
+                {
+                    for (index, destination_id) in ids.iter().enumerate() {
+                        let Some(destination) = self.destinations.get(destination_id) else {
+                            continue;
+                        };
+                        if !destination.in_use || destination.mix == UNUSED_MIX {
+                            continue;
+                        }
+                        let samples = &source[index % source.len()];
+                        if let Some(target) = buffers.get_mut(&destination.mix) {
+                            if destination.mix == id && target.is_empty() {
+                                target.clone_from(&source);
+                            }
+                            for (to, buffer) in target.iter_mut().enumerate() {
+                                mix::mix(buffer, samples, mix.volume * destination.volumes[to]);
+                            }
                         }
                     }
                 }
-                continue;
-            }
-            let Some(target) = buffers.get_mut(&mix.destination) else {
-                continue;
-            };
-            for (from, samples) in source.iter().enumerate() {
-                for (to, buffer) in target.iter_mut().enumerate() {
-                    mix::mix(buffer, samples, mix.volume * mix.volumes[from][to]);
+            } else if let Some(target) = buffers.get_mut(&mix.destination) {
+                for (from, samples) in source.iter().enumerate() {
+                    for (to, buffer) in target.iter_mut().enumerate() {
+                        mix::mix(buffer, samples, mix.volume * mix.volumes[from][to]);
+                    }
                 }
+            }
+            let own = buffers.get_mut(&id).expect("mix source is still present");
+            if own.is_empty() {
+                *own = source;
             }
         }
         // Destinations mixed into this frame start the next from here.
@@ -1817,6 +1838,57 @@ mod tests {
             assert_eq!(output[2 * n + 1], sample / 4, "right {n}");
         }
         assert_eq!(renderer.mixed_frames, 2);
+    }
+
+    #[test]
+    fn a_voice_with_zero_pitch_clears_reused_output_samples() {
+        let (mut renderer, output) = play(false);
+        assert!(output.iter().any(|&sample| sample != 0));
+
+        for voice in renderer.voices.values_mut() {
+            voice.pitch = 0.0;
+        }
+        renderer.render_frame(Some(&Wave(Vec::new())));
+        assert_eq!(renderer.take_output(), vec![0; 480]);
+    }
+
+    #[test]
+    fn a_splitter_can_route_to_its_own_source_without_changing_other_outputs() {
+        let mut renderer = Renderer::new(parameters(0));
+        let source = 1;
+        let splitter = 10;
+        renderer.mixes.insert(
+            source,
+            Mix {
+                volume: 1.0,
+                buffers: 1,
+                destination: UNUSED_MIX,
+                splitter,
+                volumes: Vec::new(),
+            },
+        );
+        renderer.splitters.insert(splitter, vec![11, 12, 13]);
+        for (key, mix, gain) in [
+            (11, FINAL_MIX, 1.0),
+            (12, source, 0.5),
+            (13, FINAL_MIX, 1.0),
+        ] {
+            let mut destination = Destination {
+                in_use: true,
+                mix,
+                ..Default::default()
+            };
+            destination.volumes[0] = gain;
+            renderer.destinations.insert(key, destination);
+        }
+        let mut buffers = [
+            (source, vec![vec![100, 200]]),
+            (FINAL_MIX, vec![vec![0, 0]]),
+        ]
+        .into();
+        renderer.mix_down(&mut buffers, 2, &Wave(Vec::new()));
+        assert_eq!(buffers[&source], [vec![150, 300]]);
+        assert_eq!(buffers[&FINAL_MIX], [vec![200, 400]]);
     }
 
     #[test]
