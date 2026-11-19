@@ -1316,10 +1316,33 @@ pub struct Args {
     pub v: [u64; 2],
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Bag {
     pub kind: String,
     pub props: BTreeMap<String, Args>,
+    #[serde(skip)]
+    tag: Option<u32>,
+}
+
+impl PartialEq for Bag {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.props == other.props
+    }
+}
+
+impl Eq for Bag {}
+
+impl Bag {
+    fn set(&mut self, property: &str, args: Args) {
+        match self.props.get_mut(property) {
+            Some(value) if *value == args => return,
+            Some(value) => *value = args,
+            None => {
+                self.props.insert(property.into(), args);
+            }
+        }
+        self.tag = None;
+    }
 }
 
 /// Builder and state bags by guest address, shared with workers that
@@ -3903,7 +3926,7 @@ impl Nvn {
                 let mut bags = write_shared(self.bags.at(this));
                 let bag = bags.entry(this).or_insert_with(|| Bag {
                     kind: kind.into(),
-                    props: BTreeMap::new(),
+                    ..Bag::default()
                 });
                 if bag.kind != kind {
                     return Err(invalid(format!("no SamplerBuilder at {this:#x}")));
@@ -7211,23 +7234,18 @@ const TAGGED_STATES: [&str; 6] = [
 type StateTags = FastMap<u32, (String, StateSnapshots)>;
 static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
 
-/// After a setter changed a state structure at `address`: its contents'
-/// tag, written into the structure's first word (all are at least 4
-/// bytes), where a Bind of it or of a copy finds them.
-fn tag_state(
-    core: &mut Guest,
-    address: u64,
-    kind: &str,
-    props: &BTreeMap<String, Args>,
-) -> Result<(), Trap> {
-    match state_tag(kind, props) {
-        Some(tag) => core.memory.write_u32(address, tag),
-        None => Ok(()),
-    }
+fn tagged_state(kind: &str, tag: u32) -> Option<StateSnapshots> {
+    STATE_TAGS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()?
+        .get(&tag)
+        .filter(|(tagged_kind, _)| tagged_kind == kind)
+        .map(|(_, snapshot)| snapshot.clone())
 }
 
-/// The tag of a tagged state kind's contents (`tag_state`), its snapshot
-/// recorded the first time the tag is seen; None for other kinds.
+/// The tag written into a state's first word. Record its snapshot the
+/// first time the tag is seen and return None for untagged kinds.
 fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     if !TAGGED_STATES.contains(&kind) {
         return None;
@@ -7303,15 +7321,11 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
     // untagged one (never set through NVN) is the defaults, not another
     // structure's state.
     if TAGGED_STATES.contains(&kind) {
-        let tagged = core.memory.read_u32(base).ok().and_then(|tag| {
-            STATE_TAGS
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()?
-                .get(&tag)
-                .filter(|(tagged_kind, _)| tagged_kind == kind)
-                .map(|(_, snapshot)| snapshot.clone())
-        });
+        let tagged = core
+            .memory
+            .read_u32(base)
+            .ok()
+            .and_then(|tag| tagged_state(kind, tag));
         if let Some(snapshot) = tagged {
             command.states = snapshot;
             return;
@@ -7467,16 +7481,23 @@ fn bag_call(
             .and_then(|bag| bag.props.get("Device").copied());
         let mut bag = Bag {
             kind: kind.into(),
-            props: BTreeMap::new(),
+            ..Bag::default()
         };
         if let Some(device) = device {
             bag.props.insert("Device".into(), device);
         }
-        tag_state(core, this, kind, &bag.props)?;
+        bag.tag = state_tag(kind, &bag.props);
+        if let Some(tag) = bag.tag {
+            core.memory.write_u32(this, tag)?;
+        }
         write_shared(bags.at(this)).insert(this, bag);
         return Ok(true);
     }
     if bag_like {
+        let memory_tag = TAGGED_STATES
+            .contains(&kind)
+            .then(|| core.memory.read_u32(this).ok())
+            .flatten();
         if let Some(property) = rest.strip_prefix("Set") {
             // Structures live in application memory (often the stack):
             // a setter of another kind at the same address means the old
@@ -7488,14 +7509,24 @@ fn bag_call(
                     if bag.kind != kind {
                         *bag = Bag {
                             kind: kind.into(),
-                            props: BTreeMap::new(),
+                            ..Bag::default()
                         };
                     }
                 })
                 .or_insert_with(|| Bag {
                     kind: kind.into(),
-                    props: BTreeMap::new(),
+                    ..Bag::default()
                 });
+            // A copy of a state structure carries the source's tag, even
+            // when the destination address held a different state before.
+            if let Some(tag) = memory_tag
+                && bag.tag != Some(tag)
+                && let Some(snapshot) = tagged_state(kind, tag)
+            {
+                bag.props.clone_from(&snapshot[0]);
+                bag.props.remove("@Offset");
+                bag.tag = Some(tag);
+            }
             // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
             // combined forms of SetWidth/SetHeight/SetDepth.
             if let Some(dimensions) = property
@@ -7526,7 +7557,7 @@ fn bag_call(
                 if property == "ChannelMask" {
                     args.v[1] = x[5];
                 }
-                bag.props.insert(format!("{property}/{}", args.x[0]), args);
+                bag.set(&format!("{property}/{}", args.x[0]), args);
             }
             let mut args = args;
             // SetPackagedTextureLayout(builder, const
@@ -7539,13 +7570,9 @@ fn bag_call(
                     0
                 };
             }
-            match bag.props.get_mut(property) {
-                Some(value) => *value = args,
-                None => {
-                    bag.props.insert(property.into(), args);
-                }
-            }
-            let tag = state_tag(kind, &bag.props);
+            bag.set(property, args);
+            let tag = bag.tag.or_else(|| state_tag(kind, &bag.props));
+            bag.tag = tag;
             drop(bags);
             if let Some(tag) = tag {
                 core.memory.write_u32(this, tag)?;
@@ -7553,6 +7580,14 @@ fn bag_call(
             return Ok(true);
         }
         if let Some(property) = rest.strip_prefix("Get") {
+            if let Some(snapshot) = memory_tag.and_then(|tag| tagged_state(kind, tag)) {
+                let value = snapshot[0]
+                    .get(property)
+                    .ok_or_else(|| stop(format!("{property} was never set")))?;
+                core.cpu.regs[0] = value.x[0];
+                core.cpu.vectors[0] = u128::from(value.v[0]);
+                return Ok(true);
+            }
             let bags = read_shared(bags.at(this));
             let bag = bags
                 .get(&this)
@@ -8185,6 +8220,65 @@ mod tests {
     }
 
     #[test]
+    fn setters_preserve_other_properties_of_a_copied_state() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (source, destination) = (0x1100, 0x1200);
+        for (address, depth) in [(source, 3), (destination, 5)] {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDepthStencilStateSetDefaults",
+                &[address],
+            );
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDepthStencilStateSetDepthFunc",
+                &[address, depth],
+            );
+        }
+        let original = guest.memory.read_u32(source).unwrap();
+        guest.memory.write_u32(destination, original).unwrap();
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDepthStencilStateGetDepthFunc",
+                &[destination]
+            ),
+            3
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDepthStencilStateSetDepthWriteEnable",
+            &[destination, 1],
+        );
+        let mut bind = Command {
+            name: "nvnCommandBufferBindDepthStencilState",
+            x: [0; 8],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        bind.x[1] = destination;
+        snapshot_states(&nvn.bags, &guest, &mut bind);
+        assert_eq!(bind.states[0]["DepthFunc"].x[0], 3);
+        assert_eq!(bind.states[0]["DepthWriteEnable"].x[0], 1);
+        assert_eq!(guest.memory.read_u32(source).unwrap(), original);
+    }
+
+    #[test]
     fn png_sub_filter_preserves_pixels_across_row_boundaries() {
         let image = Image {
             width: 2,
@@ -8306,6 +8400,7 @@ mod tests {
                         ..Args::default()
                     },
                 )]),
+                ..Bag::default()
             });
             nvn.apply_registration(Registration {
                 pool,
