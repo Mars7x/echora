@@ -60,16 +60,13 @@ pub fn open_device(sample_rate: u32, channels: u32) -> Option<Sender<Vec<u8>>> {
 
 /// Appends PCM16 bytes as samples, keeping at most `limit` samples.
 fn push_pcm(queue: &mut VecDeque<i16>, pcm: &[u8], limit: usize) {
-    queue.extend(
-        pcm.as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| i16::from_le_bytes(*pair)),
-    );
-    if queue.len() > limit {
-        let excess = queue.len() - limit;
+    let (samples, _) = pcm.as_chunks::<2>();
+    let samples = &samples[samples.len().saturating_sub(limit)..];
+    let excess = queue.len().saturating_sub(limit - samples.len());
+    if excess != 0 {
         queue.drain(..excess);
     }
+    queue.extend(samples.iter().map(|pair| i16::from_le_bytes(*pair)));
 }
 
 /// Fills `out` from the queue, padding with silence.
@@ -80,9 +77,19 @@ fn pull<T: Copy>(
     silence: T,
 ) {
     let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
-    for slot in out {
-        *slot = queue.pop_front().map_or(silence, &convert);
+    let count = out.len().min(queue.len());
+    let (ready, remaining) = out.split_at_mut(count);
+    let (front, back) = queue.as_slices();
+    let (first, second) = ready.split_at_mut(front.len().min(count));
+    for (slot, &sample) in first.iter_mut().zip(front) {
+        *slot = convert(sample);
     }
+    for (slot, &sample) in second.iter_mut().zip(back) {
+        *slot = convert(sample);
+    }
+    queue.drain(..count);
+    drop(queue);
+    remaining.fill(silence);
 }
 
 fn build_stream(
@@ -174,5 +181,26 @@ mod tests {
         let mut out = [0f32; 6];
         pull(&queue, &mut out, f32::from, -1.0);
         assert_eq!(out, [3.0, 4.0, 5.0, 6.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn pull_preserves_wrapped_queue_order_across_callbacks() {
+        let mut queue = VecDeque::with_capacity(4);
+        let capacity = queue.capacity() as i16;
+        queue.extend(0..capacity);
+        queue.drain(..2);
+        let pcm: Vec<_> = (capacity..capacity + 2)
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        push_pcm(&mut queue, &pcm, capacity as usize);
+
+        let queue = Mutex::new(queue);
+        let mut first = vec![0; capacity as usize - 1];
+        pull(&queue, &mut first, |sample| sample, 0);
+        assert_eq!(first, (2..capacity + 1).collect::<Vec<_>>());
+        let mut last = [0; 2];
+        pull(&queue, &mut last, |sample| sample, -1);
+        assert_eq!(last, [capacity + 1, -1]);
+        assert!(queue.into_inner().unwrap().is_empty());
     }
 }
