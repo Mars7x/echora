@@ -1435,7 +1435,7 @@ pub struct Recording {
 }
 
 /// Recordings by command buffer.
-type RecordingMap = std::sync::RwLock<BTreeMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>;
+type RecordingMap = std::sync::RwLock<FastMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>;
 type Recordings = std::sync::Arc<RecordingMap>;
 
 fn read_shared<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -2856,9 +2856,15 @@ impl Nvn {
             }
             "nvnCommandBufferBeginRecording" => {
                 self.object(this, "CommandBuffer").map_err(invalid)?;
-                let fresh = std::sync::Arc::new(std::sync::Mutex::new(Recording::default()));
-                if write_shared(&self.recording).insert(this, fresh).is_some() {
-                    return Err(invalid("command buffer is already recording".into()));
+                {
+                    let mut recordings = write_shared(&self.recording);
+                    let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this)
+                    else {
+                        return Err(invalid("command buffer is already recording".into()));
+                    };
+                    slot.insert(std::sync::Arc::new(std::sync::Mutex::new(
+                        Recording::default(),
+                    )));
                 }
                 // Where the list starts in the memory chunks (the used
                 // amounts the application sees, and which chunks), for the
@@ -8895,6 +8901,59 @@ mod tests {
             ));
             assert!(!read_shared(&nvn.registry).signaled.contains_key(&0x1000));
         }
+    }
+
+    #[test]
+    fn a_second_begin_preserves_the_active_recording() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let device = 0x1100;
+        let buffer = 0x1200;
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferInitialize",
+            &[buffer, device],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferSetScissor",
+            &[buffer, 11, 12, 13, 14],
+        );
+
+        guest.cpu.regs[0] = buffer;
+        assert!(matches!(
+            nvn.call("nvnCommandBufferBeginRecording", &mut guest),
+            Err(Trap::InvalidState { message }) if message.contains("already recording")
+        ));
+
+        let handle = call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let list = &nvn.command_lists[&handle].commands;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "nvnCommandBufferSetScissor");
+        assert_eq!(&list[0].x[1..5], &[11, 12, 13, 14]);
     }
 
     #[test]
