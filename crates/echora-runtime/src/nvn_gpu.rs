@@ -201,12 +201,6 @@ pub struct Backend {
     /// compares the whole storage: a sample misses a few new glyphs in a
     /// font atlas.
     shadows: HashMap<u64, Vec<u8>>,
-    /// Consecutive whole-storage checks each shadowed texture passed
-    /// unchanged: a texture quiet for long is compared in full only every
-    /// 2nd, then 4th present, with a 256-chunk sample in between (see
-    /// `guest_texture`; ECHORA_EXACT_TEXTURE_CHECKS=1 compares every
-    /// present).
-    shadow_quiet: HashMap<u64, u32>,
     /// Dispatch results not yet stored to guest memory: (renderer read
     /// token, guest range, binding, program, GPU address). They are
     /// stored at the end of the submission, or before work that may read
@@ -484,7 +478,6 @@ impl Backend {
             cached_texture_ranges: None,
             copied_levels: HashMap::default(),
             shadows: HashMap::default(),
-            shadow_quiet: HashMap::default(),
             pending_storage: Vec::new(),
             in_place_writes: Vec::new(),
             gpu_writes: 0,
@@ -3901,51 +3894,18 @@ impl Nvn {
             crate::nvn_format::block_linear_size(info, width, height, depth, layout, levels_set).0
         };
         let check_started = std::time::Instant::now();
-        let shadowed = self.gpu.as_ref().unwrap().shadows.contains_key(&texture);
-        // A shadowed texture that stayed unchanged for many presents is
-        // compared in full every 2nd, then 4th present; between those the
-        // 256-chunk sample below checks it (most textures are written once
-        // and compared whole every present otherwise, the largest part of
-        // texture validation).
-        let skip_full = shadowed && {
-            let quiet = self
-                .gpu
-                .as_ref()
-                .unwrap()
-                .shadow_quiet
-                .get(&texture)
-                .copied()
-                .unwrap_or(0);
-            let interval = match quiet {
-                0..16 => 1,
-                16..32 => 2,
-                _ => 4,
-            };
-            !frame.is_multiple_of(interval)
-                && super::debug_var_os("ECHORA_EXACT_TEXTURE_CHECKS").is_none()
-        };
-        // Uploads from uncached pools: the whole storage against its copy.
-        let shadow_changed = !skip_full && {
-            let backend = self.gpu.as_ref().unwrap();
-            backend.shadows.get(&texture).is_some_and(|shadow| {
-                shadow.len() as u64 != storage_size
-                    || !core.memory.equals(base, shadow).unwrap_or(false)
-            })
-        };
-        // Whether a whole-storage check passed (recorded below, with the
-        // backend borrowed mutably).
-        let full_check_passed = (shadowed && !skip_full).then_some(!shadow_changed);
+        let backend = self.gpu.as_ref().unwrap();
+        let shadow = backend.shadows.get(&texture);
+        let shadowed = shadow.is_some();
+        // Uncached memory can change in any frame without a flush.
+        let shadow_changed = shadow.is_some_and(|shadow| {
+            shadow.len() as u64 != storage_size
+                || !core.memory.equals(base, shadow).unwrap_or(false)
+        });
         // An unchanged copy proves the cached upload current: its sample
         // stands for the storage.
-        let kept_sample = (shadowed && !shadow_changed && !skip_full)
-            .then(|| {
-                self.gpu
-                    .as_ref()
-                    .unwrap()
-                    .textures
-                    .get(&texture)
-                    .map(|entry| entry.0)
-            })
+        let kept_sample = (shadowed && !shadow_changed)
+            .then(|| backend.textures.get(&texture).map(|entry| entry.0))
             .flatten();
         let sample = kept_sample.unwrap_or_else(|| {
             texture_sample(
@@ -3983,10 +3943,6 @@ impl Nvn {
                 let backend = self.gpu.as_mut().unwrap();
                 let source = backend.textures[&texture].1.clone();
                 backend.texture_checked.insert(texture, frame);
-                if full_check_passed == Some(true) {
-                    let quiet = backend.shadow_quiet.entry(texture).or_default();
-                    *quiet = quiet.saturating_add(1);
-                }
                 backend.stat("stat: texture checks", 1);
                 backend.stat("stat: texture check microseconds", check_micros);
                 if shadowed {
@@ -4373,7 +4329,6 @@ impl Nvn {
             );
             *backend.notes.entry(note).or_default() += 1;
         }
-        backend.shadow_quiet.remove(&texture);
         backend.stat("stat: texture checks", 1);
         backend.stat("stat: texture check microseconds", check_micros);
         if beyond_limit {
@@ -11720,14 +11675,10 @@ mod target_tests {
         }
     }
 
-    #[test]
-    fn a_small_flush_refreshes_a_large_cached_texture() {
-        use echora_gpu::draw::TextureSource;
+    fn texture_cache_fixture(flags: u64) -> Option<(Nvn, Memory, u64, u64)> {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
-        let Ok(Some(backend)) = Backend::create(None) else {
-            return;
-        };
+        let backend = Backend::create(None).ok()??;
         let mut nvn = Nvn {
             gpu: Some(backend),
             gpu_checked: true,
@@ -11746,7 +11697,7 @@ mod target_tests {
             "MemoryPool",
             BTreeMap::from([
                 ("Storage".into(), args([base, size, 0, 0])),
-                ("Flags".into(), scalar(0x24)),
+                ("Flags".into(), scalar(flags)),
             ]),
         )
         .unwrap();
@@ -11764,8 +11715,18 @@ mod target_tests {
         .unwrap();
         let mut memory = Memory::new(1 << 39);
         memory
-            .map(base, size, READ | WRITE, STATE_NORMAL, "cached texture")
+            .map(base, size, READ | WRITE, STATE_NORMAL, "texture storage")
             .unwrap();
+        Some((nvn, memory, base, texture))
+    }
+
+    #[test]
+    fn a_small_flush_refreshes_a_large_cached_texture() {
+        use echora_gpu::draw::TextureSource;
+
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
         let mut cpu = Cpu::default();
         let mut guest = Guest {
             cpu: &mut cpu,
@@ -11783,6 +11744,44 @@ mod target_tests {
         assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
         guest.memory.write(base + offset, &rgba).unwrap();
         nvn.gpu_invalidate(base + offset..base + offset + 4, None);
+        let TextureSource::Upload {
+            generation: updated,
+            texels,
+            ..
+        } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the refreshed texture upload");
+        };
+        assert_ne!(updated, generation);
+        assert_eq!(texels[offset as usize..][..4], rgba);
+    }
+
+    #[test]
+    fn an_uncached_texture_sees_a_write_after_many_unchanged_frames() {
+        use echora_gpu::draw::TextureSource;
+
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x22) else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let TextureSource::Upload { generation, .. } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the initial texture upload");
+        };
+        for _ in 0..128 {
+            nvn.presented_frames += 1;
+            nvn.guest_texture(&guest, texture).unwrap();
+        }
+        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        nvn.presented_frames += 1;
+        let rgba = [32, 64, 128, 255];
+        let offset = 256;
+        guest.memory.write(base + offset, &rgba).unwrap();
         let TextureSource::Upload {
             generation: updated,
             texels,
