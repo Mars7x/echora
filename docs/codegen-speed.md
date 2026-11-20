@@ -728,7 +728,7 @@ within noise.
 
 - TBL/TBX: the byte lookup over the table registers, out-of-range indices
   zero (TBL) or Vd's byte (TBX).
-- LD1-LD4/ST1-ST4 (single structure, to a lane), LD1R-LD4R and
+- LD2-LD4/ST2-ST4 (single structure, to a lane), LD1R-LD4R and
   LD1-LD4/ST1-ST4 (multiple structures): the helper's own single
   `GuestView::read` or `write` of the whole transfer, into a buffer on the
   stack instead of a heap vector, then the lanes placed as the helper
@@ -749,6 +749,10 @@ within noise.
   (the helper's own arithmetic once the FPCR is accepted).
 
 INS and DUP from a general register are `inline-vector-int`'s already.
+
+LD1 and ST1 of a single lane always use a checked scalar guest-memory
+access at the lane width. Loads preserve the other lanes, and post-indexing
+updates the base after a successful transfer.
 
 `tests/vector_misc.rs` samples random words of these (one of each form,
 120 of each kind), lifted with the option and without, and runs each from

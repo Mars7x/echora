@@ -4,7 +4,8 @@
 //! FMAXV/FMINV/FMAXNMV/FMINNMV, and the conversions with fraction bits or
 //! a directed rounding, and vector SCVTF/UCVTF.
 //!
-//! The memory forms make the helper's own single `GuestView::read` or
+//! Single-register lane transfers use checked scalar memory accesses even
+//! without the option. The other memory forms make a single `GuestView::read` or
 //! `write` of the whole transfer (so the same access, the same fault and
 //! nothing written on a fault), into a buffer on the stack instead of a
 //! vector, and place the lanes as the helper does. The float forms run a
@@ -68,6 +69,34 @@ fn buffer_lane(from: usize, esize: usize) -> String {
 /// bytes moved, as `structure_transfer` expects), or `None` to keep the
 /// call. `address` is the computed address.
 pub(crate) fn emit_transfer(op: &SimdOp) -> Option<String> {
+    if let SimdOp::TransferSingle {
+        rt,
+        registers: 1,
+        bits,
+        index,
+        load,
+        ..
+    } = *op
+    {
+        let shift = u32::from(index) * u32::from(bits);
+        let size = bits / 8;
+        let access = if load {
+            let mask = lane_mask(u32::from(bits)) << shift;
+            format!(
+                "let lane = u128::from(m.memory.read_u{bits}(address)?) << {shift}; \
+                m.cpu.vectors[{rt}] = (m.cpu.vectors[{rt}] & !{mask:#x}u128) | lane;"
+            )
+        } else {
+            format!(
+                "let lane = (m.cpu.vectors[{rt}] >> {shift}) as u{bits}; \
+                m.memory.write_u{bits}(address, lane)?;"
+            )
+        };
+        return Some(crate::simd::census_mark(
+            "misc",
+            format!("{{ {access} {size}u64 }}"),
+        ));
+    }
     if !ON.get() {
         return None;
     }

@@ -13,7 +13,7 @@ use echora_aot_tests::golden;
 fn default_emission_is_unchanged() {
     assert_eq!(
         golden::DEFAULT_OUTPUT,
-        0xcf54_b8e1_f847_4227,
+        0x684e_9a30_e9cd_51b5,
         "{:#018x}",
         golden::DEFAULT_OUTPUT
     );
@@ -23,7 +23,7 @@ fn default_emission_is_unchanged() {
 fn inline_vector_emission_is_unchanged() {
     assert_eq!(
         golden::INLINE_VECTOR_OUTPUT,
-        0xc3b1_2ece_ae4f_5c14,
+        0x7833_7f23_590e_a830,
         "{:#018x}",
         golden::INLINE_VECTOR_OUTPUT
     );
