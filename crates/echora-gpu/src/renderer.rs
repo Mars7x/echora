@@ -581,7 +581,7 @@ pub struct Renderer {
     /// written there.
     page_table: Option<PageTableBuffer>,
     /// Buffers from completed submissions, ready for a table of the same size.
-    free_page_tables: Vec<HostBuffer>,
+    free_page_tables: Vec<RecycledPageTable>,
     /// Spans the driver refused to import (file-backed memory, on drivers
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
@@ -733,7 +733,7 @@ struct Slot {
     pending_reads: Vec<(u64, u64, usize)>,
     retired_uploads: Vec<Target>,
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
-    retired_page_tables: Vec<HostBuffer>,
+    retired_page_tables: Vec<RecycledPageTable>,
     retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
@@ -1494,7 +1494,7 @@ impl Renderer {
         }) {
             return self.patch_page_table(first_page, entries.len(), &[(0, entries)]);
         }
-        self.replace_page_table(first_page, entries.len(), |current| {
+        self.replace_page_table(first_page, entries.len(), 0..entries.len(), |current| {
             current.clear();
             current.extend_from_slice(entries);
         })?;
@@ -1558,7 +1558,9 @@ impl Renderer {
             }
         }
         if replace {
-            self.replace_page_table(first_page, count, |entries| {
+            let (first, _) = patches.first().unwrap();
+            let (last, patch) = patches.last().unwrap();
+            self.replace_page_table(first_page, count, *first..*last + patch.len(), |entries| {
                 for &(start, patch) in patches {
                     entries[start..start + patch.len()].copy_from_slice(patch);
                 }
@@ -1567,6 +1569,9 @@ impl Renderer {
         }
         let extended = !added.is_empty();
         if extended {
+            let (first, _) = added.first().unwrap();
+            let (last, entries) = added.last().unwrap();
+            self.mark_recycled_page_tables_dirty(*first..*last + entries.len());
             let table = self.page_table.as_mut().unwrap();
             for (start, entries) in added {
                 table.buffer.write_page_addresses(start * 8, entries);
@@ -1577,18 +1582,29 @@ impl Renderer {
         Ok((self.page_table_binding(), extended))
     }
 
+    /// Remember changes without touching buffers that the GPU can still read.
+    fn mark_recycled_page_tables_dirty(&mut self, changed: std::ops::Range<usize>) {
+        let retired = std::iter::once(&mut self.slot)
+            .chain(&mut self.spares)
+            .flat_map(|slot| &mut slot.retired_page_tables);
+        for table in self.free_page_tables.iter_mut().chain(retired) {
+            table.mark_dirty(changed.clone());
+        }
+    }
+
     fn replace_page_table(
         &mut self,
         first_page: u32,
         count: usize,
+        changed: std::ops::Range<usize>,
         update: impl FnOnce(&mut Vec<u64>),
     ) -> Result<(), String> {
         let bytes = (count.max(1) * 8) as u64;
         // Acquire the new buffer before retiring the current one.
-        let buffer = if self
+        let mut storage = if self
             .free_page_tables
             .last()
-            .is_some_and(|table| table.size == bytes)
+            .is_some_and(|table| table.buffer.size == bytes)
         {
             self.stat("stat: page table buffers reused", 1);
             self.free_page_tables.pop().unwrap()
@@ -1597,21 +1613,32 @@ impl Renderer {
                 self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
             self.stat("stat: page table buffers allocated", 1);
             for old in self.free_page_tables.drain(..) {
-                old.destroy(&self.gpu.device);
+                old.buffer.destroy(&self.gpu.device);
             }
-            buffer
+            RecycledPageTable {
+                buffer,
+                dirty: 0..count,
+            }
         };
+        self.mark_recycled_page_tables_dirty(changed.clone());
+        storage.mark_dirty(changed.clone());
         let mut entries = if let Some(old) = self.page_table.take() {
             // Work already recorded or submitted can still read the old
             // buffer. The end of this slot orders all those uses.
-            self.slot.retired_page_tables.push(old.buffer);
+            self.slot.retired_page_tables.push(RecycledPageTable {
+                buffer: old.buffer,
+                dirty: changed,
+            });
             old.entries
         } else {
             Vec::new()
         };
         update(&mut entries);
         debug_assert_eq!(entries.len(), count);
-        buffer.write_page_addresses(0, &entries);
+        // A recycled buffer holds every entry outside its dirty span.
+        let range = storage.dirty.start.min(count)..storage.dirty.end.min(count);
+        let buffer = storage.buffer;
+        buffer.write_page_addresses(range.start * 8, &entries[range]);
         self.page_table = Some(PageTableBuffer {
             address: self.buffer_address(buffer.buffer).unwrap_or(0),
             buffer,
@@ -3643,16 +3670,16 @@ impl Renderer {
         for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        for buffer in self.slot.retired_page_tables.drain(..) {
+        for storage in self.slot.retired_page_tables.drain(..) {
             if self.free_page_tables.len() < 2
                 && self
                     .page_table
                     .as_ref()
-                    .is_some_and(|table| table.buffer.size == buffer.size)
+                    .is_some_and(|table| table.buffer.size == storage.buffer.size)
             {
-                self.free_page_tables.push(buffer);
+                self.free_page_tables.push(storage);
             } else {
-                buffer.destroy(&self.gpu.device);
+                storage.buffer.destroy(&self.gpu.device);
             }
         }
         for (buffer, memory) in std::mem::take(&mut self.slot.retired_shared) {
@@ -7823,6 +7850,27 @@ impl Renderer {
     }
 }
 
+struct RecycledPageTable {
+    buffer: HostBuffer,
+    // Covers changes since this memory was the current table. The buffer
+    // itself stays immutable until its last submitted references finish.
+    dirty: std::ops::Range<usize>,
+}
+
+impl RecycledPageTable {
+    fn mark_dirty(&mut self, changed: std::ops::Range<usize>) {
+        if changed.is_empty() {
+            return;
+        }
+        if self.dirty.is_empty() {
+            self.dirty = changed;
+        } else {
+            self.dirty.start = self.dirty.start.min(changed.start);
+            self.dirty.end = self.dirty.end.max(changed.end);
+        }
+    }
+}
+
 struct PageTableBuffer {
     address: u64,
     buffer: HostBuffer,
@@ -7979,12 +8027,12 @@ impl Drop for Renderer {
         if let Some(table) = self.page_table.take() {
             table.buffer.destroy(&self.gpu.device);
         }
-        for buffer in self.free_page_tables.drain(..) {
-            buffer.destroy(&self.gpu.device);
+        for storage in self.free_page_tables.drain(..) {
+            storage.buffer.destroy(&self.gpu.device);
         }
         for slot in std::iter::once(&mut self.slot).chain(&mut self.spares) {
-            for buffer in slot.retired_page_tables.drain(..) {
-                buffer.destroy(&self.gpu.device);
+            for storage in slot.retired_page_tables.drain(..) {
+                storage.buffer.destroy(&self.gpu.device);
             }
         }
         for (_, (buffer, memory)) in std::mem::take(&mut self.imported) {
@@ -8558,6 +8606,63 @@ mod tests {
         assert!(!extended);
         assert_ne!(original.address, after.address);
         assert_eq!(renderer.page_table_entries(), [address, address + 4096]);
+    }
+
+    #[test]
+    fn recycled_page_table_includes_changes_after_its_retirement() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.gpu.buffer_device_address {
+            return;
+        }
+        renderer.resident_buffer(7, 8192).unwrap();
+        let address = renderer.resident_address(7).unwrap();
+        let mut entries = vec![0; 1025];
+        entries[128] = address;
+        entries[131] = address + 4096;
+        entries[1024] = address;
+        let (original, _) = renderer.set_page_table(0x100, &entries).unwrap();
+        renderer.commands().unwrap();
+        renderer.record_page_table_read(original.address);
+        entries[128] = address + 4096;
+        let (replacement, extended) = renderer
+            .patch_page_table(0x100, entries.len(), &[(128, &entries[128..129])])
+            .unwrap();
+        assert!(!extended);
+        assert_ne!(original.address, replacement.address);
+
+        entries[130] = address + 4096;
+        let (extended_in_place, extended) = renderer
+            .patch_page_table(0x100, entries.len(), &[(130, &entries[130..131])])
+            .unwrap();
+        assert!(extended);
+        assert_eq!(replacement.address, extended_in_place.address);
+        let old = &renderer.slot.retired_page_tables[0].buffer;
+        let prefix = old.read_bytes(132 * 8);
+        assert_eq!(&prefix[128 * 8..129 * 8], &address.to_le_bytes());
+        assert_eq!(&prefix[130 * 8..131 * 8], &[0; 8]);
+        renderer.flush().unwrap();
+
+        entries[131] = address;
+        let (reused, extended) = renderer
+            .patch_page_table(0x100, entries.len(), &[(131, &entries[131..132])])
+            .unwrap();
+        assert!(!extended);
+        assert_eq!(reused.address, original.address);
+        let expected: Vec<_> = entries
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(
+            renderer
+                .page_table
+                .as_ref()
+                .unwrap()
+                .buffer
+                .read_bytes(expected.len()),
+            expected,
+        );
     }
 
     #[test]
