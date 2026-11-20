@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 
-use echora_shader_abi::{PUSH_VERTEX_FETCH, Stage, Unsupported};
+use echora_shader_abi::{
+    PUSH_VERTEX_FETCH, SpecConstant, SpecMeaning, Stage, Unsupported, VERTEX_FORMAT_SPEC_BASE,
+};
 
 use super::{Emitter, unsupported};
 use crate::decode::{Instruction, Op};
@@ -65,7 +67,14 @@ impl Emitter {
         let pointer = self.module.pointer(storage::FUNCTION, uvec4);
         for location in locations {
             let argument = self.constant(location);
-            let value = self.value(op::FUNCTION_CALL, uvec4, &[fetch, argument]);
+            let id = VERTEX_FORMAT_SPEC_BASE + location;
+            let format = self.module.u32_spec_constant(0);
+            self.module.decorate(format, 1, &[id]);
+            self.spec_constants.push(SpecConstant {
+                id,
+                meaning: SpecMeaning::VertexFormat(location as u8),
+            });
+            let value = self.value(op::FUNCTION_CALL, uvec4, &[fetch, argument, format]);
             let variable = self.function.variable(&mut self.module, pointer, None);
             self.function.emit(op::STORE, &[variable, value]);
             self.fetched.insert(location, variable);
@@ -96,19 +105,19 @@ impl Emitter {
         })
     }
 
-    /// The helper `uvec4 fetch(uint location)`, emitted as its own
+    /// The helper `uvec4 fetch(uint location, uint preferred_format)`, emitted as its own
     /// function.
     fn fetch_function(&mut self) -> u32 {
         let uvec4 = self.uvec4();
         let function_type = self.module.ty(Type::Function {
             result: uvec4,
-            parameters: vec![self.u32],
+            parameters: vec![self.u32; 2],
         });
         let (function, parameters) =
-            Function::with_parameters(&mut self.module, uvec4, function_type, &[self.u32]);
+            Function::with_parameters(&mut self.module, uvec4, function_type, &[self.u32; 2]);
         let id = function.id;
         let main = std::mem::replace(&mut self.function, function);
-        let result = self.fetch_body(parameters[0]);
+        let result = self.fetch_body(parameters[0], parameters[1]);
         self.function.emit(op::RETURN_VALUE, &[result]);
         let helper = std::mem::replace(&mut self.function, main);
         helper.finish(&mut self.module);
@@ -125,7 +134,7 @@ impl Emitter {
     }
 
     /// The fetch helper's body; returns the fetched words.
-    fn fetch_body(&mut self, location: u32) -> u32 {
+    fn fetch_body(&mut self, location: u32, preferred_format: u32) -> u32 {
         let uvec4 = self.uvec4();
         let pointer = self.module.pointer(storage::FUNCTION, uvec4);
         let result = self.function.variable(&mut self.module, pointer, None);
@@ -170,6 +179,10 @@ impl Emitter {
             let components = e.value(op::BITWISE_AND, e.u32, &[format, seven]);
             let formatted = e.value(op::I_NOT_EQUAL, e.bool, &[components, zero]);
             e.when(formatted, |e| {
+                // The table still decides whether the stream is bound.
+                let known = e.value(op::I_NOT_EQUAL, e.bool, &[preferred_format, zero]);
+                let format = e.pick(known, preferred_format, format);
+                let components = e.value(op::BITWISE_AND, e.u32, &[format, seven]);
                 let decoded = e.decode_element(
                     address,
                     stride,

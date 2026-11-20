@@ -222,6 +222,8 @@ pub type Translate = fn(&[u8], &Parameters) -> Result<Translated, Unsupported>;
 pub enum SpecMeaning {
     /// Vertex attribute `index`'s type: 0 float, 1 signed, 2 unsigned.
     GenericInputType(u8),
+    /// Encoded vertex format at this location. Zero uses the format from the fetch table.
+    VertexFormat(u8),
     /// The sampled texture or image at descriptor `binding` is integer.
     IntegerFormat(u32),
     /// The entries the texture pool's arrays (set `TEXTURE_POOL_SET`)
@@ -412,6 +414,8 @@ pub const LOOP_TRACE_HIGH_SPEC_ID: u32 = 30;
 pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
 /// The first `SpecMeaning::IntegerFormat` constant's id; the others follow.
 pub const INTEGER_FORMAT_SPEC_BASE: u32 = 32;
+/// The first specialization constant id for vertex formats, followed by the other locations.
+pub const VERTEX_FORMAT_SPEC_BASE: u32 = 0x1_0000;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 /// Entries per texture array, which the renderer gives programs as

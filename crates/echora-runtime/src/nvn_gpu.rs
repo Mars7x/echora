@@ -933,6 +933,8 @@ impl Backend {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GraphicsProgramKey {
     stages: [usize; 3],
+    // The fetch ABI encodes vertex formats in bits 0 through 12.
+    vertex_formats: [u16; 32],
     traced: bool,
 }
 
@@ -966,6 +968,7 @@ impl BoundProgram {
             keys,
             pipeline: GraphicsProgramKey {
                 stages: identities,
+                vertex_formats: [0; 32],
                 traced: false,
             },
             stages,
@@ -2668,11 +2671,27 @@ impl Nvn {
                 vertex.stage, fragment.stage
             ));
         }
-        Ok(BoundProgram::new(
+        let mut formats = [0; 32];
+        if let Some(state) = self.render.state.get("BindVertexAttribState") {
+            for constant in &vertex.spec_constants {
+                if let echora_shader_abi::SpecMeaning::VertexFormat(location) = constant.meaning {
+                    let location = usize::from(location);
+                    formats[location] = state
+                        .states
+                        .get(location)
+                        .and_then(|props| props.get("Format"))
+                        .and_then(|value| vertex_format(value.x[0] as u32))
+                        .map_or(0, |format| format.encode() as u16);
+                }
+            }
+        }
+        let mut program = BoundProgram::new(
             (vertex_key, fragment_key),
             Box::new([vertex, fragment]),
             Box::new(entries),
-        ))
+        );
+        program.pipeline.vertex_formats = formats;
+        Ok(program)
     }
 
     /// The task (if any), mesh and fragment stages of the programs bound for
@@ -9375,6 +9394,14 @@ impl Nvn {
             for (index, stage) in stages.iter().enumerate() {
                 let mut values = Vec::new();
                 for constant in &stage.spec_constants {
+                    if let echora_shader_abi::SpecMeaning::VertexFormat(location) = constant.meaning
+                    {
+                        values.push((
+                            constant.id,
+                            u32::from(built.vertex_formats[usize::from(location)]),
+                        ));
+                        continue;
+                    }
                     // ECHORA_FRAGMENT_TRACE_PIXEL=X,Y (debugging): the
                     // pixel a traced fragment program records (none
                     // without it).

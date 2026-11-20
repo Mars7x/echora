@@ -8558,6 +8558,7 @@ mod tests {
 
     #[test]
     fn vertex_pulling_decodes_every_format_as_the_abi_defines() {
+        use echora_shader_abi::VERTEX_FORMAT_SPEC_BASE;
         use echora_shader_abi::{
             PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET, PUSH_VERTEX_FETCH_OFFSET, Stage, VertexAttribute,
             VertexFormat, VertexLayout as L, VertexNumeric as N,
@@ -8688,7 +8689,7 @@ mod tests {
             push[at..at + 8].copy_from_slice(&page_table.to_le_bytes());
             push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
             push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
-            let report = machine.simulate(&Inputs {
+            let mut inputs = Inputs {
                 workgroup_count: [1, 1, 1],
                 push,
                 builtins: HashMap::from([(42, vec![u64::from(vertex)]), (43, vec![0])]),
@@ -8698,16 +8699,35 @@ mod tests {
                     (table, attribute.to_bytes().to_vec()),
                 ]),
                 ..Inputs::default()
-            });
-            assert!(
-                report.problems.is_empty(),
-                "{format:?}: {:?}",
-                report.problems
-            );
+            };
+            for preferred in [0, format.encode()] {
+                inputs
+                    .specialization
+                    .insert(VERTEX_FORMAT_SPEC_BASE, preferred);
+                let report = machine.simulate(&inputs);
+                assert!(
+                    report.problems.is_empty(),
+                    "{format:?}: {:?}",
+                    report.problems
+                );
+                let got: Vec<u32> = (0..4u8)
+                    .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                    .collect();
+                assert_eq!(
+                    got,
+                    expected(format),
+                    "{format:?} specialization {preferred}"
+                );
+            }
+            inputs
+                .memory
+                .insert(table, VertexAttribute::default().to_bytes().to_vec());
+            let unbound = machine.simulate(&inputs);
             let got: Vec<u32> = (0..4u8)
-                .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                .map(|n| unbound.invocations[0][&registers[&n]][0] as u32)
                 .collect();
-            assert_eq!(got, expected(format), "{format:?}");
+            assert!(unbound.problems.is_empty(), "{:?}", unbound.problems);
+            assert_eq!(got, [0, 0, 0, 1.0f32.to_bits()]);
         }
         // Per instance: base 2, InstanceIndex 7, divisor 3: element 3 (a
         // 32-bit uint, the first word of element 3).
