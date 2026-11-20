@@ -67,9 +67,45 @@ struct ArchivedTarget {
 }
 
 struct PendingArchive {
-    token: u64,
+    read: Option<u64>,
     bytes: u64,
     image: Option<vk::Image>,
+}
+
+struct ArchiveCompressor {
+    jobs: std::sync::mpsc::Sender<(u64, Vec<u8>)>,
+    results: std::sync::mpsc::Receiver<(u64, Option<Vec<u8>>)>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl ArchiveCompressor {
+    fn start() -> Option<Self> {
+        let (jobs, pending) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+        let (finished, results) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("echora-target-archive".into())
+            .spawn(move || {
+                let mut compressor = zstd::bulk::Compressor::new(1).ok();
+                for (key, raw) in pending {
+                    let compressed = compressor.as_mut().and_then(|c| c.compress(&raw).ok());
+                    if finished.send((key, compressed)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            jobs,
+            results,
+            thread,
+        })
+    }
+
+    fn stop(self) {
+        drop(self.results);
+        drop(self.jobs);
+        let _ = self.thread.join();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -506,8 +542,9 @@ pub struct Renderer {
     targets: FastMap<u64, Target>,
     archived_targets: FastMap<u64, ArchivedTarget>,
     archived_bytes: FastMap<u64, std::sync::Weak<[u8]>>,
-    archive_reads: FastMap<u64, PendingArchive>,
-    archive_read_bytes: u64,
+    pending_archives: FastMap<u64, PendingArchive>,
+    pending_archive_bytes: u64,
+    archive_compressor: std::cell::OnceCell<Option<ArchiveCompressor>>,
     guest_target_keys: Vec<u64>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
     uploads: FastMap<u64, (u64, Target)>,
@@ -1046,8 +1083,9 @@ impl Renderer {
             targets: FastMap::default(),
             archived_targets: FastMap::default(),
             archived_bytes: FastMap::default(),
-            archive_reads: FastMap::default(),
-            archive_read_bytes: 0,
+            pending_archives: FastMap::default(),
+            pending_archive_bytes: 0,
+            archive_compressor: std::cell::OnceCell::new(),
             guest_target_keys: Vec::new(),
             uploads: FastMap::default(),
             upload_lengths: FastMap::default(),
@@ -4565,107 +4603,138 @@ impl Renderer {
         if !(1 << 20..=RING_SIZE).contains(&size) {
             return Ok(ArchiveRequest::Ineligible);
         }
-        if self.archive_reads.contains_key(&key)
-            || self.archive_read_bytes + size > RING_SIZE
+        if self.pending_archives.contains_key(&key)
+            || self.pending_archive_bytes + size > RING_SIZE
             || !self.slot.ring_fits(size, 16)
         {
             return Ok(ArchiveRequest::Deferred);
         }
         let image = target.image;
         let token = self.queue_target_archive_read(key)?;
-        self.archive_reads.insert(
+        self.pending_archives.insert(
             key,
             PendingArchive {
-                token,
+                read: Some(token),
                 bytes: size,
                 image: Some(image),
             },
         );
-        self.archive_read_bytes += size;
+        self.pending_archive_bytes += size;
         Ok(ArchiveRequest::Queued)
     }
 
     fn cancel_target_archive(&mut self, key: u64) {
-        if let Some(read) = self.archive_reads.get_mut(&key) {
+        if let Some(read) = self.pending_archives.get_mut(&key) {
             read.image = None;
         }
     }
 
-    /// Compress completed copies whose images stayed inactive. Keep their
-    /// keys in the target index so aliases can restore exact texels.
+    /// Move completed copies to the compression worker and collect its
+    /// results. A target remains live, and can cancel its archive, until
+    /// the result is collected. The readback limit covers both stages.
     pub fn finish_target_archives(&mut self) -> Result<(), String> {
-        if self.archive_reads.is_empty() {
+        if self.pending_archives.is_empty() {
+            return Ok(());
+        }
+        self.archived_bytes
+            .retain(|_, block| block.strong_count() != 0);
+        let compressed: Vec<_> = self
+            .archive_compressor
+            .get()
+            .and_then(Option::as_ref)
+            .into_iter()
+            .flat_map(|worker| worker.results.try_iter())
+            .collect();
+        for (key, bytes) in compressed {
+            self.finish_target_archive(key, bytes);
+        }
+        let mut tokens: Vec<_> = self
+            .pending_archives
+            .values()
+            .filter_map(|archive| archive.read)
+            .collect();
+        if tokens.is_empty() {
             return Ok(());
         }
         self.poll_completed()?;
-        let mut tokens: Vec<_> = self.archive_reads.values().map(|read| read.token).collect();
         tokens.sort_unstable();
         let mut ready = self.take_reads(&tokens);
-        self.archived_bytes
-            .retain(|_, block| block.strong_count() != 0);
         let completed: Vec<_> = self
-            .archive_reads
+            .pending_archives
             .iter()
-            .filter(|(_, read)| ready.contains_key(&read.token))
-            .map(|(&key, _)| key)
+            .filter_map(|(&key, archive)| Some((key, ready.remove(&archive.read?)?)))
             .collect();
-        for key in completed {
-            let read = self.archive_reads.remove(&key).unwrap();
-            let raw = ready.remove(&read.token).unwrap();
-            self.archive_read_bytes -= read.bytes;
-            let Some(target) = self
-                .targets
-                .get(&key)
-                .filter(|target| Some(target.image) == read.image)
-            else {
-                continue;
-            };
-            let info = TargetInfo::from(target);
-            let Ok(compressed) = zstd::bulk::compress(&raw, 1) else {
-                continue;
-            };
-            if compressed.len() >= raw.len() {
+        for (key, raw) in completed {
+            let archive = self.pending_archives.get_mut(&key).unwrap();
+            archive.read = None;
+            if archive.image.is_none() {
+                self.finish_target_archive(key, None);
                 continue;
             }
-            use std::hash::Hasher;
-            let mut hasher = crate::fast_map::FastHasher::default();
-            hasher.write(&compressed);
-            let hash = hasher.finish();
-            let compressed = match self
-                .archived_bytes
-                .get(&hash)
-                .and_then(std::sync::Weak::upgrade)
-            {
-                Some(shared) if shared.as_ref() == compressed => shared,
-                _ => {
-                    let shared: std::sync::Arc<[u8]> = compressed.into_boxed_slice().into();
-                    self.archived_bytes
-                        .insert(hash, std::sync::Arc::downgrade(&shared));
-                    shared
-                }
-            };
-            let target = self.targets.remove(&key).unwrap();
-            self.slot.retired_uploads.push(target);
-            self.stat(
-                "stat: inactive target image bytes archived",
-                raw.len() as u64,
-            );
-            self.stat(
-                "stat: inactive target compressed bytes",
-                compressed.len() as u64,
-            );
-            self.archived_targets.insert(
-                key,
-                ArchivedTarget {
-                    info,
-                    decoded_bytes: raw.len(),
-                    compressed,
+            let worker = self
+                .archive_compressor
+                .get_or_init(ArchiveCompressor::start);
+            let raw = match worker {
+                Some(worker) => match worker.jobs.send((key, raw)) {
+                    Ok(()) => continue,
+                    Err(error) => error.0.1,
                 },
-            );
-            self.target_changes += 1;
-            self.changed_targets.push(key);
+                None => raw,
+            };
+            self.finish_target_archive(key, zstd::bulk::compress(&raw, 1).ok());
         }
         Ok(())
+    }
+
+    fn finish_target_archive(&mut self, key: u64, compressed: Option<Vec<u8>>) {
+        let archive = self.pending_archives.remove(&key).unwrap();
+        self.pending_archive_bytes -= archive.bytes;
+        let Some(compressed) = compressed.filter(|bytes| bytes.len() < archive.bytes as usize)
+        else {
+            return;
+        };
+        let Some(target) = self
+            .targets
+            .get(&key)
+            .filter(|target| Some(target.image) == archive.image)
+        else {
+            return;
+        };
+        let info = TargetInfo::from(target);
+        use std::hash::Hasher;
+        let mut hasher = crate::fast_map::FastHasher::default();
+        hasher.write(&compressed);
+        let hash = hasher.finish();
+        let compressed = match self
+            .archived_bytes
+            .get(&hash)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(shared) if shared.as_ref() == compressed => shared,
+            _ => {
+                let shared: std::sync::Arc<[u8]> = compressed.into_boxed_slice().into();
+                self.archived_bytes
+                    .insert(hash, std::sync::Arc::downgrade(&shared));
+                shared
+            }
+        };
+        let target = self.targets.remove(&key).unwrap();
+        self.slot.retired_uploads.push(target);
+        self.stat("stat: inactive target image bytes archived", archive.bytes);
+        self.stat(
+            "stat: inactive target compressed bytes",
+            compressed.len() as u64,
+        );
+        self.archived_targets.insert(
+            key,
+            ArchivedTarget {
+                info,
+                decoded_bytes: archive.bytes as usize,
+                compressed,
+            },
+        );
+        self.target_changes += 1;
+        self.changed_targets.push(key);
     }
 
     /// Reconstitute an image before a command refers to it. Keep the
@@ -7346,6 +7415,9 @@ fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        if let Some(Some(compressor)) = self.archive_compressor.take() {
+            compressor.stop();
+        }
         let flushed = self.flush();
         if let Some(mut submitter) = self.submitter.take() {
             submitter.stop();
@@ -8140,11 +8212,33 @@ mod tests {
         renderer.flush().unwrap();
         renderer.finish_target_archives().unwrap();
         assert!(renderer.archived_targets.is_empty());
-        assert_eq!(renderer.archive_read_bytes, 0);
+        assert_eq!(renderer.pending_archive_bytes, 0);
         assert_eq!(
             renderer.read_target_bytes(key, 4).unwrap(),
             [255, 0, 0, 255].repeat(512 * 512)
         );
+
+        assert_eq!(
+            renderer.queue_target_archive(key).unwrap(),
+            ArchiveRequest::Queued
+        );
+        renderer.flush().unwrap();
+        renderer.finish_target_archives().unwrap();
+        if let Some(worker) = renderer.archive_compressor.get().and_then(Option::as_ref) {
+            let (result, compressed) = worker
+                .results
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(result, key);
+            clear(&mut renderer, 0.0);
+            renderer.finish_target_archive(result, compressed);
+            assert!(renderer.archived_targets.is_empty());
+            assert_eq!(renderer.pending_archive_bytes, 0);
+            assert_eq!(
+                renderer.read_target_bytes(key, 4).unwrap(),
+                [0, 0, 0, 255].repeat(512 * 512)
+            );
+        }
     }
 
     #[test]
@@ -8310,7 +8404,12 @@ mod tests {
             ArchiveRequest::Queued
         );
         renderer.flush().unwrap();
-        renderer.finish_target_archives().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while renderer.existing_target(7).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            renderer.finish_target_archives().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let archive = &renderer.archived_targets[&7];
         assert_eq!(archive.decoded_bytes, (width * height * 8) as usize);
         assert!(archive.compressed.len() < archive.decoded_bytes);

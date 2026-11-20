@@ -11704,8 +11704,12 @@ mod target_tests {
             echora_gpu::renderer::ArchiveRequest::Queued
         );
         renderer.flush().unwrap();
-        renderer.finish_target_archives().unwrap();
-        assert!(renderer.existing_target(archive).is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while renderer.existing_target(archive).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            renderer.finish_target_archives().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         let TextureSource::Target(key) = nvn.texture_source(&core, 3).unwrap() else {
             panic!("the alias must sample the retained target");
