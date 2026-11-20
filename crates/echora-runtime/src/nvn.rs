@@ -2704,20 +2704,24 @@ impl Nvn {
                         "memory pool storage {memory:#x}+{size:#x}"
                     )));
                 }
-                if self.next_gpu_address == 0 {
-                    self.next_gpu_address = GPU_ADDRESS_BASE;
-                }
-                let gpu = self.next_gpu_address;
-                self.next_gpu_address = (gpu + size)
-                    .checked_next_multiple_of(GPU_ADDRESS_ALIGNMENT)
+                let gpu = if self.next_gpu_address == 0 {
+                    GPU_ADDRESS_BASE
+                } else {
+                    self.next_gpu_address
+                };
+                let next_gpu_address = gpu
+                    .checked_add(size)
+                    .and_then(|end| end.checked_next_multiple_of(GPU_ADDRESS_ALIGNMENT))
                     .ok_or_else(|| invalid("GPU address space exhausted".into()))?;
-                // SHADER_CODE (0x40): program code lives here; a flush over
-                // it resolves bound programs again (`program_memo`).
-                if builder.get("Flags").is_some_and(|flags| flags.x[0] & 0x40 != 0) {
-                    self.code_pools.insert(memory, size);
-                }
+                let flags = builder.get("Flags").copied();
                 self.initialize(this, "MemoryPool", builder)
                     .map_err(invalid)?;
+                self.next_gpu_address = next_gpu_address;
+                // SHADER_CODE (0x40): program code lives here; a flush over
+                // it resolves bound programs again (`program_memo`).
+                if flags.is_some_and(|flags| flags.x[0] & 0x40 != 0) {
+                    self.code_pools.insert(memory, size);
+                }
                 let pool = self.objects.get_mut(&this).unwrap();
                 pool.state.insert(
                     "GpuAddress".into(),
@@ -2726,7 +2730,6 @@ impl Nvn {
                         v: [0; 2],
                     },
                 );
-                let flags = pool.builder.get("Flags").copied();
                 write_shared(&self.registry).pools.insert(
                     this,
                     RegisteredPool {
@@ -10461,6 +10464,86 @@ mod tests {
         assert_eq!(read_shared(&nvn.registry).pools[&pool].buffers, 1);
         call(&mut nvn, &mut guest, "nvnBufferFinalize", &[buffer]);
         assert_eq!(read_shared(&nvn.registry).pools[&pool].buffers, 0);
+    }
+
+    #[test]
+    fn failed_memory_pool_initialization_keeps_gpu_addresses_available() {
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn {
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let (device, builder, pool, other_pool) = (0x10000, 0x11000, 0x12000, 0x13000);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetDefaults",
+            &[builder],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetDevice",
+            &[builder, device],
+        );
+        let set_storage = |nvn: &mut Nvn, core: &mut Guest, address, size| {
+            call(
+                nvn,
+                core,
+                "nvnMemoryPoolBuilderSetStorage",
+                &[builder, address, size],
+            );
+        };
+        let initialize = |nvn: &mut Nvn, core: &mut Guest, object| {
+            core.cpu.regs[..2].copy_from_slice(&[object, builder]);
+            nvn.call("nvnMemoryPoolInitialize", core)
+        };
+
+        set_storage(&mut nvn, &mut core, 0x20000, 0x1000);
+        assert!(initialize(&mut nvn, &mut core, pool).unwrap());
+        let next = nvn.next_gpu_address;
+
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetFlags",
+            &[builder, 0x61],
+        );
+        set_storage(&mut nvn, &mut core, 0x30000, 0x1000);
+        assert!(matches!(
+            initialize(&mut nvn, &mut core, pool),
+            Err(Trap::InvalidState { .. })
+        ));
+        assert_eq!(nvn.next_gpu_address, next);
+        assert!(!nvn.code_pools.contains_key(&0x30000));
+
+        set_storage(&mut nvn, &mut core, 0, u64::MAX);
+        assert!(matches!(
+            initialize(&mut nvn, &mut core, other_pool),
+            Err(Trap::InvalidState { .. })
+        ));
+        assert_eq!(nvn.next_gpu_address, next);
+        assert!(!nvn.objects.contains_key(&other_pool));
+
+        set_storage(&mut nvn, &mut core, 0x30000, 0x1000);
+        assert!(initialize(&mut nvn, &mut core, other_pool).unwrap());
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnMemoryPoolGetBufferAddress",
+                &[other_pool]
+            ),
+            next
+        );
+        assert_eq!(nvn.code_pools[&0x30000], 0x1000);
     }
 
     #[test]
