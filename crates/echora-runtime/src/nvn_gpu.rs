@@ -54,9 +54,16 @@ enum PoolShareVersion {
 struct TargetIndex {
     stamp: Option<u64>,
     storage: HashMap<u64, Vec<u64>>,
-    mips: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
+    mips: HashMap<u64, Vec<TargetMip>>,
     by_target: HashMap<u64, (u64, Vec<u64>)>,
     changed: super::FastSet<u64>,
+}
+
+struct TargetMip {
+    key: u64,
+    level: u32,
+    extent: (u32, u32),
+    contiguous_bytes: Option<u64>,
 }
 
 /// Guest storage as seen at successive byte offsets in a texture.
@@ -188,22 +195,17 @@ fn texture_height_and_depth(target: u32, height: u32, depth: u32) -> (u32, u32) 
 }
 
 impl TargetIndex {
-    fn insert(
-        &mut self,
-        key: u64,
-        base: u64,
-        levels: impl Iterator<Item = (u32, u64, (u32, u32))>,
-    ) {
+    fn insert(&mut self, key: u64, base: u64, levels: impl Iterator<Item = (u64, TargetMip)>) {
         // Alias searches choose the first key in renderer order, even if
         // that target was inserted after the other candidates.
         let targets = self.storage.entry(base).or_default();
         targets.insert(targets.partition_point(|&target| target < key), key);
         let mut mip_storage = Vec::new();
-        for (level, offset, extent) in levels {
-            let address = base + offset;
+        for (address, mip) in levels {
             let mips = self.mips.entry(address).or_default();
-            let at = mips.partition_point(|&(target, mip, _)| (target, mip) < (key, level));
-            mips.insert(at, (key, level, extent));
+            let at =
+                mips.partition_point(|previous| (previous.key, previous.level) < (key, mip.level));
+            mips.insert(at, mip);
             mip_storage.push(address);
         }
         self.by_target.insert(key, (base, mip_storage));
@@ -223,7 +225,7 @@ impl TargetIndex {
         }
         for address in mip_storage {
             if let Entry::Occupied(mut entry) = self.mips.entry(address) {
-                entry.get_mut().retain(|&(target, ..)| target != key);
+                entry.get_mut().retain(|mip| mip.key != key);
                 if entry.get().is_empty() {
                     entry.remove();
                 }
@@ -3791,7 +3793,7 @@ impl Nvn {
                 && let Some(base) = self.texture_storage(key)
             {
                 let levels = (target.levels > 1)
-                    .then(|| self.target_level_offsets(key, target))
+                    .then(|| self.target_level_addresses(key, target, base))
                     .into_iter()
                     .flatten();
                 index.insert(key, base, levels);
@@ -3907,13 +3909,14 @@ impl Nvn {
                 .mips
                 .get(&base)?
                 .iter()
-                .find(|(key, level, level_extent)| {
-                    *level_extent == extent
-                        && renderer.target_info(*key).is_some_and(|target| {
-                            same_format(target.format) && target.levels - level >= levels
+                .find(|mip| {
+                    mip.extent == extent
+                        && renderer.target_info(mip.key).is_some_and(|target| {
+                            same_format(target.format) && target.levels - mip.level >= levels
                         })
+                        && self.mip_matches_backing(mip, texture)
                 })
-                .map(|&(key, level, _)| (key, level));
+                .map(|mip| (mip.key, mip.level));
         }
         let mut mip_match = None;
         for &key in renderer.target_keys_in_order() {
@@ -3932,20 +3935,32 @@ impl Nvn {
             {
                 return Some((key, 0));
             }
-            if mip_match.is_some() || target.levels == 1 || base <= target_base {
+            if mip_match.is_some()
+                || target.levels == 1
+                || (base <= target_base && self.virtual_texture_address(key).is_none())
+            {
                 continue;
             }
-            for (level, offset, level_extent) in self.target_level_offsets(key, target) {
-                if target_base + offset == base
-                    && level_extent == extent
-                    && target.levels - level >= levels
+            for (address, mip) in self.target_level_addresses(key, target, target_base) {
+                if address == base
+                    && mip.extent == extent
+                    && target.levels - mip.level >= levels
+                    && self.mip_matches_backing(&mip, texture)
                 {
-                    mip_match = Some((key, level));
+                    mip_match = Some((key, mip.level));
                     break;
                 }
             }
         }
         mip_match
+    }
+
+    /// A texture alias of a virtually mapped mip must fit its physical span.
+    fn mip_matches_backing(&self, mip: &TargetMip, texture: u64) -> bool {
+        mip.contiguous_bytes.is_none_or(|bytes| {
+            matches!(self.texture_object_backing(texture), Some(TextureBacking::Linear((_, range)))
+                if range.end - range.start <= bytes)
+        })
     }
 
     /// A renderable view of a compatible image covering the texture's
@@ -4012,14 +4027,14 @@ impl Nvn {
             .is_some_and(|(a, b)| a == b)
     }
 
-    /// Each level above 0 of render target `key`: its offset from the
-    /// target's storage and its extent (none when the texture object is
-    /// gone or its format unknown).
-    fn target_level_offsets(
+    /// Each level above 0 of a render target that occupies a contiguous
+    /// physical range, with the address and extent of that level.
+    fn target_level_addresses(
         &self,
         key: u64,
         target: echora_gpu::renderer::TargetInfo,
-    ) -> impl Iterator<Item = (u32, u64, (u32, u32))> + use<> {
+        base: u64,
+    ) -> impl Iterator<Item = (u64, TargetMip)> + use<> {
         self.objects
             .get(&key)
             .and_then(|object| {
@@ -4029,6 +4044,20 @@ impl Nvn {
                     get("Depth").unwrap_or(1).max(1)
                 } else {
                     1
+                };
+                let backing = if self.virtual_texture_address(key).is_some() {
+                    let backing = self.texture_object_backing(key)?;
+                    // Block-linear mips of an array are interleaved with the
+                    // other levels in each layer. Keep the normal offsets
+                    // for arrays whose physical layout is contiguous.
+                    if target.shape.layers() != 1
+                        && matches!(backing, TextureBacking::Virtual { .. })
+                    {
+                        return None;
+                    }
+                    Some(backing)
+                } else {
+                    None
                 };
                 let (width, height) = (target.width, target.height);
                 let dimensions = [width, height, depth];
@@ -4043,9 +4072,29 @@ impl Nvn {
                     crate::nvn_format::block_linear_mips(info, dimensions, layout, target.levels)
                         .enumerate()
                         .skip(1)
-                        .map(move |(level, mip)| {
+                        .filter_map(move |(level, mip)| {
+                            let (address, contiguous_bytes) = if let Some(backing) = &backing {
+                                let remaining = backing.size().checked_sub(mip.offset)?;
+                                let (offset, range) =
+                                    backing.subranges(mip.offset, remaining as usize).next()?;
+                                let bytes = range.end - range.start;
+                                if offset != 0 || bytes < mip.size {
+                                    return None;
+                                }
+                                (range.start, Some(bytes))
+                            } else {
+                                (base.checked_add(mip.offset)?, None)
+                            };
                             let extent = ((width >> level).max(1), (height >> level).max(1));
-                            (level as u32, mip.offset, extent)
+                            Some((
+                                address,
+                                TargetMip {
+                                    key,
+                                    level: level as u32,
+                                    extent,
+                                    contiguous_bytes,
+                                },
+                            ))
                         }),
                 )
             })
@@ -13480,10 +13529,12 @@ mod target_tests {
             .renderer
             .existing_target(parent)
             .unwrap();
-        let (_, offset, _) = nvn
-            .target_level_offsets(parent, target.into())
+        let base = nvn.texture_storage(parent).unwrap();
+        let (address, _) = nvn
+            .target_level_addresses(parent, target.into(), base)
             .next()
             .unwrap();
+        let offset = address - base;
         nvn.initialize(3, "Texture", texture(8, 2, offset, 37))
             .unwrap();
         nvn.initialize(4, "Texture", texture(8, 1, offset, 56))
@@ -13594,6 +13645,117 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn rendered_mip_alias_uses_its_own_virtual_mapping() {
+        use crate::nvn::TexelTransfer;
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x20_0000;
+        let (physical, virtual_pool, parent, mip, decoy, mismapped_tail) = (1, 2, 3, 4, 5, 6);
+        let args = |x| Args { x, v: [0; 2] };
+        for (pool, start, size) in [(physical, base, 0x20_000), (virtual_pool, 0, 0x6000)] {
+            nvn.initialize(
+                pool,
+                "MemoryPool",
+                BTreeMap::from([("Storage".into(), args([start, size, 0, 0]))]),
+            )
+            .unwrap();
+        }
+        nvn.objects
+            .get_mut(&virtual_pool)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([0x40_0000, 0, 0, 0]));
+        for (key, pool, offset, width, levels) in [
+            (parent, virtual_pool, 0, 64, 3),
+            (mip, physical, 0x2000, 32, 1),
+            (decoy, physical, 0x14000, 32, 1),
+            (mismapped_tail, physical, 0x2000, 32, 2),
+        ] {
+            let scalar = |value| args([value, 0, 0, 0]);
+            nvn.initialize(
+                key,
+                "Texture",
+                BTreeMap::from([
+                    ("Storage".into(), args([pool, offset, 0, 0])),
+                    ("Width".into(), scalar(width)),
+                    ("Height".into(), scalar(width)),
+                    ("Levels".into(), scalar(levels)),
+                    ("Format".into(), scalar(37)),
+                ]),
+            )
+            .unwrap();
+        }
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                base,
+                0x20_000,
+                READ | WRITE,
+                STATE_NORMAL,
+                "virtual render mip backing",
+            )
+            .unwrap();
+        let request = base + 0x18000;
+        for (index, words) in [
+            [physical, 0x10000, 0, 0x4000],
+            [physical, 0x2000, 0x4000, 0x1000],
+            [physical, 0x4000, 0x5000, 0x1000],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (word, value) in words.into_iter().enumerate() {
+                memory
+                    .write_u64(request + index as u64 * 0x28 + word as u64 * 8, value)
+                    .unwrap();
+            }
+        }
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        core.cpu.regs[..3].copy_from_slice(&[virtual_pool, 3, request]);
+        assert!(nvn.call("nvnMemoryPoolMapVirtual", &mut core).unwrap());
+
+        let color = [0.0_f32, 1.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (parent, 1, 0), color, None, 0xf, 0)
+            .unwrap();
+        assert!(!nvn.target_index_current());
+        for indexed in [false, true] {
+            if indexed {
+                nvn.refresh_target_index();
+                assert!(nvn.target_index_current());
+            }
+            assert_eq!(nvn.resolve_target(mip), Some((parent, 1)));
+            assert_eq!(nvn.resolve_target(decoy), None);
+            assert_eq!(nvn.resolve_target(mismapped_tail), None);
+        }
+        let transfer = TexelTransfer {
+            region: [0, 0, 0, 2, 2, 1],
+            bases: [0; 2],
+            strides: [0; 2],
+        };
+        let destination = base + 0x19000;
+        assert!(
+            nvn.gpu_read_texels(&mut core, mip, transfer, destination)
+                .unwrap()
+        );
+        let mut pixels = [0; 16];
+        core.memory.read(destination, &mut pixels).unwrap();
+        assert_eq!(pixels.as_slice(), [0_u8, 255, 0, 255].repeat(4));
+    }
 
     #[test]
     fn a_remapped_render_target_keeps_pixels_with_its_physical_storage() {

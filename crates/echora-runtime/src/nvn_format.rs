@@ -463,7 +463,7 @@ fn levels_size(
 pub struct BlockLinearMip {
     pub offset: u64,
     pub shape: BlockShape,
-    size: u64,
+    pub(crate) size: u64,
 }
 
 /// Block-linear mips in storage order within one layer.
