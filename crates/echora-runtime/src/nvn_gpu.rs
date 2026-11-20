@@ -2874,47 +2874,44 @@ impl Nvn {
         // game binds its tile classifier) stays in the compute slot while
         // later graphics binds (0xdf) replace the rest; its fragment stage
         // then drew every following mesh draw.
-        let programs: Vec<u64> = self
+        let programs = self
             .render
             .state
             .iter()
             .filter(|(key, _)| key.starts_with("BindProgram@") && **key != "BindProgram@5")
-            .map(|(_, bind)| bind.x[1])
-            .collect();
+            .map(|(_, bind)| bind.x[1]);
         // For the skip reasons: each bound bit's program and its stages'
         // header types and +0x60 words.
-        let bound: Vec<String> = self
-            .render
-            .state
-            .iter()
-            .filter_map(|(key, bind)| Some((key.strip_prefix("BindProgram@")?, bind)))
-            .map(|(bit, bind)| {
-                let stages: Vec<String> = (0..6)
-                    .filter_map(|index| {
-                        let stage = self
-                            .objects
-                            .get(&bind.x[1])?
-                            .state
-                            .get(&format!("Stage{index}"))?;
-                        let (code, _) = self.stage_code(core, stage.x[0])?;
-                        let kind = code.get(..4).map_or(0, |word| {
-                            (u32::from_le_bytes(word.try_into().unwrap()) >> 10) & 0xf
-                        });
-                        let sizes = core.memory.read_u32(stage.x[1] + 0x60).unwrap_or(0);
-                        Some(format!("t{kind}/{sizes:x}"))
-                    })
-                    .collect();
-                format!("{bit}:{}", stages.join("+"))
-            })
-            .collect();
-        let bound = bound.join(" ");
+        let bound = || {
+            self.render
+                .state
+                .iter()
+                .filter_map(|(key, bind)| Some((key.strip_prefix("BindProgram@")?, bind)))
+                .map(|(bit, bind)| {
+                    let stages: Vec<String> = super::PROGRAM_STAGE_KEYS
+                        .into_iter()
+                        .filter_map(|key| {
+                            let stage = self.objects.get(&bind.x[1])?.state.get(key)?;
+                            let (code, _) = self.stage_code(core, stage.x[0])?;
+                            let kind = code.get(..4).map_or(0, |word| {
+                                (u32::from_le_bytes(word.try_into().unwrap()) >> 10) & 0xf
+                            });
+                            let sizes = core.memory.read_u32(stage.x[1] + 0x60).unwrap_or(0);
+                            Some(format!("t{kind}/{sizes:x}"))
+                        })
+                        .collect();
+                    format!("{bit}:{}", stages.join("+"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let mut stages: Vec<super::Args> = Vec::new();
         for program in programs {
             let Some(object) = self.objects.get(&program) else {
                 continue;
             };
-            for index in 0..6 {
-                if let Some(stage) = object.state.get(&format!("Stage{index}")) {
+            for key in super::PROGRAM_STAGE_KEYS {
+                if let Some(stage) = object.state.get(key) {
                     if !stages.iter().any(|known| known.x[0] == stage.x[0]) {
                         stages.push(*stage);
                     }
@@ -2950,9 +2947,12 @@ impl Nvn {
                 _ => {}
             }
         }
-        let (mesh, _) = mesh.ok_or_else(|| format!("no mesh program is bound ({bound})"))?;
+        let (mesh, _) = mesh.ok_or_else(|| format!("no mesh program is bound ({})", bound()))?;
         let fragment = fragment.ok_or_else(|| {
-            format!("no fragment program is bound with the mesh program ({bound})")
+            format!(
+                "no fragment program is bound with the mesh program ({})",
+                bound()
+            )
         })?;
         let sizes = control(&mesh, 0x60);
         let (vertices, primitives) = (sizes & 0xffff, sizes >> 16);
