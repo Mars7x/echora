@@ -1772,23 +1772,61 @@ impl Nvn {
                 // Partial/overlapping remaps need per-subresource merging.
                 _ => continue,
             };
-            let mut old = self.objects[&texture].clone();
-            let Some(format) = old.builder.get("Format").map(|value| value.x[0]) else {
+            let Some(format) = self.objects[&texture]
+                .builder
+                .get("Format")
+                .map(|value| value.x[0])
+            else {
                 continue;
             };
             let previous_identity = (previous.start, format);
-            let retired = super::retired_texture(previous_identity);
-            old.state.insert(
+            self.retain_texture_object(texture, previous_identity, Some(previous));
+            self.gpu_move_texture(texture, previous_identity, new.map(|base| (base, format)));
+        }
+    }
+
+    /// Retain a texture's description alongside the image that holds its rendered texels.
+    pub(super) fn retain_texture_object(
+        &mut self,
+        texture: u64,
+        identity: (u64, u64),
+        previous: Option<std::ops::Range<u64>>,
+    ) {
+        let retired = super::retired_texture(identity);
+        let renderer = self.gpu.as_ref().map(|backend| &backend.renderer);
+        let has_target = renderer.is_some_and(|renderer| renderer.target_info(texture).is_some());
+        // An alias with no image of its own leaves the existing image and its
+        // description together.
+        if !has_target
+            && renderer.is_some_and(|renderer| renderer.target_info(retired).is_some())
+            && self.objects.contains_key(&retired)
+        {
+            return;
+        }
+        let mut object = self.objects[&texture].clone();
+        // A retained render target still contains the image of its physical
+        // allocation after the virtual address is mapped elsewhere.
+        let backing = previous.or_else(|| {
+            if !has_target {
+                return None;
+            }
+            self.virtual_texture_address(texture)?;
+            match self.texture_object_backing(texture)? {
+                TextureBacking::Linear((_, range)) => Some(range),
+                TextureBacking::Virtual { .. } => None,
+            }
+        });
+        if let Some(backing) = backing.filter(|backing| backing.start == identity.0) {
+            object.state.insert(
                 "RetiredBacking".into(),
                 super::Args {
-                    x: [previous.start, previous.end - previous.start, 0, 0],
+                    x: [backing.start, backing.end - backing.start, 0, 0],
                     ..Default::default()
                 },
             );
-            self.objects.insert(retired, old);
-            self.object_changed(retired, "Texture");
-            self.gpu_move_texture(texture, previous_identity, new.map(|base| (base, format)));
         }
+        self.objects.insert(retired, object);
+        self.object_changed(retired, "Texture");
     }
 
     /// Discard guest texture uploads whose virtual storage may change.
@@ -13935,6 +13973,15 @@ mod pool_tests {
 
     #[test]
     fn a_remapped_render_target_keeps_pixels_with_its_physical_storage() {
+        check_rendered_physical_alias_after_remap(false);
+    }
+
+    #[test]
+    fn a_finalized_virtual_target_stays_on_its_last_physical_storage() {
+        check_rendered_physical_alias_after_remap(true);
+    }
+
+    fn check_rendered_physical_alias_after_remap(finalized: bool) {
         use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
         let Ok(Some(backend)) = Backend::create(None) else {
@@ -13966,8 +14013,13 @@ mod pool_tests {
             .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
         let texture = 4;
         let physical_alias = 5;
+        let virtual_alias = 7;
         let scalar = |value| args([value, 0, 0, 0]);
-        for (key, pool) in [(texture, pool), (physical_alias, old)] {
+        for (key, pool) in [
+            (texture, pool),
+            (physical_alias, old),
+            (virtual_alias, pool),
+        ] {
             nvn.initialize(
                 key,
                 "Texture",
@@ -14038,14 +14090,21 @@ mod pool_tests {
         let drawn = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
         nvn.gpu_clear_color(&core, (texture, 0, 0), drawn, None, 0xf, 0)
             .unwrap();
+        if finalized {
+            core.cpu.regs[0] = texture;
+            assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+            core.cpu.regs[0] = virtual_alias;
+            assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        }
         map(&mut nvn, &mut core, new);
-        assert_eq!(nvn.handle_texture(1), Ok(texture));
-
-        let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, texture).unwrap()
-        else {
-            panic!("the new physical range must not reuse the previous render target");
-        };
-        assert_eq!(texels.as_slice(), colors);
+        if !finalized {
+            assert_eq!(nvn.handle_texture(1), Ok(texture));
+            let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, texture).unwrap()
+            else {
+                panic!("the new mapping must read the bytes of its physical range");
+            };
+            assert_eq!(texels.as_slice(), colors);
+        }
         let TextureSource::Target(key) = nvn.texture_source(&core, physical_alias).unwrap() else {
             panic!("the alias of the old storage must keep the rendered texels");
         };
@@ -14059,6 +14118,9 @@ mod pool_tests {
                 .unwrap(),
             rendered
         );
+        if finalized {
+            return;
+        }
         map(&mut nvn, &mut core, old);
         let (restored, level) = nvn.resolve_target(texture).unwrap();
         assert_eq!(level, 0);

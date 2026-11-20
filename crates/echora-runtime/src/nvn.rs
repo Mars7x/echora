@@ -3690,12 +3690,10 @@ impl Nvn {
                 self.require_device(&builder).map_err(invalid)?;
                 let finalized = self.finalized_storage.remove(&this);
                 let previous = self.texture_identity(this).or(finalized);
-                if let Some(object) = self.objects.get(&this).filter(|o| o.kind == "Texture") {
-                    if let Some(identity) = self.texture_identity(this) {
-                        let retired = retired_texture(identity);
-                        self.objects.insert(retired, object.clone());
-                        self.object_changed(retired, "Texture");
-                    }
+                if self.objects.get(&this).is_some_and(|o| o.kind == "Texture")
+                    && let Some(identity) = self.texture_identity(this)
+                {
+                    self.retain_texture_object(this, identity, None);
                 }
                 self.initialize(this, "Texture", builder).map_err(invalid)?;
                 // A texture structure reused for other storage or another
@@ -3755,10 +3753,7 @@ impl Nvn {
                 self.object(this, kind).map_err(invalid)?;
                 if let Some(identity) = self.texture_identity(this) {
                     self.finalized_storage.insert(this, identity);
-                    let object = self.objects[&this].clone();
-                    let retired = retired_texture(identity);
-                    self.objects.insert(retired, object);
-                    self.object_changed(retired, "Texture");
+                    self.retain_texture_object(this, identity, None);
                     self.gpu_move_texture(this, identity, None);
                 }
                 if kind == "Texture" {
