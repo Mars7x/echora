@@ -118,7 +118,9 @@ to be missing or incomplete.
   game's edge blending. Sharpening is on by default. Turn it off under
   Game → Add-ons to zero the game's sharpening strength in both the
   fixed and adaptive NDSR resolves. The game's reconstruction and
-  presentation still run.
+  presentation still run. Both resolve shaders scale fixed filter weights
+  by the sharpening strength. AMD's [FSR 1 RCAS filter](https://gpuopen.com/fidelityfx-superresolution/)
+  calculates sharpening weights from nearby pixel values.
 - Vertical sync uses tear-free mailbox presentation when available. Adaptive
   sync prefers relaxed FIFO. Disabling sync prefers immediate presentation,
   then mailbox. The fallback is FIFO.
