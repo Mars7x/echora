@@ -1785,14 +1785,7 @@ impl Nvn {
             format == target.format
                 || echora_gpu::renderer::srgb_twin(target.format) == Some(format)
         });
-        if info.block_width != 1
-            || info.block_height != 1
-            || !exact_format
-            || matches!(
-                target.format,
-                vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
-            )
-        {
+        if info.block_width != 1 || info.block_height != 1 || !exact_format {
             return Err(format!(
                 "raw readback of rendered format {} is unsupported",
                 info.name
@@ -1805,16 +1798,39 @@ impl Nvn {
         if level >= target.levels || layer.checked_add(layers).is_none_or(|end| end > planes) {
             return Err("texture copy subresources are outside the rendered target".into());
         }
+        let combined = target.format == vk::Format::D32_SFLOAT_S8_UINT;
         let texel = info.bytes_per_block;
         let row_bytes = width as usize * texel as usize;
         for plane in 0..layers {
-            let bytes = backend.renderer.read_target_plane_bytes(
-                key,
-                level,
-                layer + plane,
-                texel,
-                [x, y, width, height],
-            )?;
+            let rect = [x, y, width, height];
+            let bytes = if combined {
+                let planes = backend.renderer.read_target_depth_stencil_plane_bytes(
+                    key,
+                    level,
+                    layer + plane,
+                    rect,
+                )?;
+                let (depths, stencils) = planes.split_at(planes.len() / 5 * 4);
+                let mut packed = Vec::with_capacity(stencils.len() * texel as usize);
+                for (depth, &stencil) in depths.as_chunks::<4>().0.iter().zip(stencils) {
+                    if texel == 4 {
+                        let normalized = f64::from(f32::from_le_bytes(*depth));
+                        let depth24 = (normalized * 16_777_215.0)
+                            .clamp(0.0, 16_777_215.0)
+                            .round_ties_even() as u32;
+                        packed
+                            .extend_from_slice(&(depth24 << 8 | u32::from(stencil)).to_le_bytes());
+                    } else {
+                        packed.extend_from_slice(depth);
+                        packed.extend_from_slice(&[stencil, 0, 0, 0]);
+                    }
+                }
+                packed
+            } else {
+                backend
+                    .renderer
+                    .read_target_plane_bytes(key, level, layer + plane, texel, rect)?
+            };
             let destination = destination + u64::from(plane) * linear.image_stride;
             if linear.row_stride == row_bytes as u64 {
                 core.memory
@@ -12959,14 +12975,14 @@ mod target_tests {
         nvn.initialize(
             1,
             "MemoryPool",
-            BTreeMap::from([("Storage".into(), args([base, 0x2000, 0, 0]))]),
+            BTreeMap::from([("Storage".into(), args([base, 0x3000, 0, 0]))]),
         )
         .unwrap();
         let mut memory = Memory::new(1 << 39);
         memory
             .map(
                 base,
-                0x2000,
+                0x3000,
                 READ | WRITE,
                 STATE_NORMAL,
                 "depth and stencil",
@@ -13005,23 +13021,34 @@ mod target_tests {
             memory.write(base + offset, &packed).unwrap();
         }
         let mut cpu = Cpu::default();
-        let core = Guest {
+        let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
             counter: None,
         };
-        let expected = [depths24.map(|depth| depth as f32 / 16_777_215.0), depths32];
-        for (key, depths) in [2, 3].into_iter().zip(expected) {
+        let transfer = super::super::TexelTransfer {
+            region: [0, 0, 0, 2, 1, 1],
+            bases: [0; 2],
+            strides: [0; 2],
+        };
+        let expected24: Vec<_> = depths24
+            .into_iter()
+            .flat_map(|depth| (depth << 8 | 1).to_le_bytes())
+            .collect();
+        let expected32: Vec<_> = depths32
+            .into_iter()
+            .flat_map(|depth| depth.to_le_bytes().into_iter().chain([1, 0, 0, 0]))
+            .collect();
+        for (key, expected) in [(2, expected24), (3, expected32)] {
             nvn.gpu_clear_depth(&core, key, None, Some(1)).unwrap();
-            assert_eq!(
-                nvn.gpu
-                    .as_mut()
+            let output = base + 0x2000;
+            assert!(
+                nvn.gpu_read_texels(&mut core, key, transfer, output)
                     .unwrap()
-                    .renderer
-                    .read_target_bytes(key, 4)
-                    .unwrap(),
-                depths.map(f32::to_le_bytes).concat()
             );
+            let mut actual = vec![0; expected.len()];
+            core.memory.read(output, &mut actual).unwrap();
+            assert_eq!(actual, expected);
         }
     }
 

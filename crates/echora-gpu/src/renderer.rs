@@ -1022,8 +1022,7 @@ fn aspect(format: vk::Format) -> vk::ImageAspectFlags {
 
 /// Buffer/image transfers name one aspect for each plane. For a combined
 /// depth-stencil upload, the four-byte depth texels precede the stencil bytes.
-fn transfer_aspects(format: vk::Format) -> impl Iterator<Item = vk::ImageAspectFlags> {
-    let flags = aspect(format);
+fn transfer_aspects(flags: vk::ImageAspectFlags) -> impl Iterator<Item = vk::ImageAspectFlags> {
     let stencil = vk::ImageAspectFlags::STENCIL;
     [flags & !stencil, flags & stencil]
         .into_iter()
@@ -1035,7 +1034,7 @@ fn upload_copies(
     format: vk::Format,
     offset: u64,
 ) -> impl Iterator<Item = vk::BufferImageCopy> {
-    transfer_aspects(format).map(move |aspect_mask| {
+    transfer_aspects(aspect(format)).map(move |aspect_mask| {
         let mut buffer_offset = offset + region.offset;
         if aspect_mask == vk::ImageAspectFlags::STENCIL {
             buffer_offset +=
@@ -5669,7 +5668,9 @@ impl Renderer {
             .filter(|region| {
                 region.level < source.levels.min(target.levels) && region.layer < shape.layers()
             })
-            .flat_map(|region| transfer_aspects(*format).map(move |aspect| (region, aspect)));
+            .flat_map(|region| {
+                transfer_aspects(aspect(*format)).map(move |aspect| (region, aspect))
+            });
         let mut copies = Vec::new();
         let mut blits = Vec::new();
         if scaled {
@@ -6522,7 +6523,7 @@ impl Renderer {
             base_array_layer,
             layer_count: 1,
         };
-        let regions: Vec<_> = transfer_aspects(source_target.format)
+        let regions: Vec<_> = transfer_aspects(aspect(source_target.format))
             .map(|aspect_mask| {
                 vk::ImageBlit::default()
                     .src_subresource(subresource(aspect_mask, source_level, source_layer))
@@ -7500,6 +7501,22 @@ impl Renderer {
         self.read_target_aspect_bytes(key, (level, plane), rect, (aspect_mask, texel_bytes))
     }
 
+    /// Read a depth and stencil plane in one transfer. Four-byte depth
+    /// texels are followed by one stencil byte for each texel.
+    pub fn read_target_depth_stencil_plane_bytes(
+        &mut self,
+        key: u64,
+        level: u32,
+        plane: u32,
+        rect: [u32; 4],
+    ) -> Result<Vec<u8>, String> {
+        let format = self.targets.get(&key).ok_or("no such target")?.format;
+        if !has_stencil(format) {
+            return Err("depth-stencil readback requires both aspects".into());
+        }
+        self.read_target_aspect_bytes(key, (level, plane), rect, (aspect(format), 5))
+    }
+
     fn read_target_aspect_bytes(
         &mut self,
         key: u64,
@@ -7543,25 +7560,29 @@ impl Renderer {
         let size = u64::from(width) * u64::from(height) * u64::from(texel_bytes);
         let buffer = self.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let commands = self.commands()?;
-        let copy = vk::BufferImageCopy {
-            image_subresource: vk::ImageSubresourceLayers {
-                aspect_mask,
-                mip_level: level,
-                base_array_layer: layer,
-                layer_count: 1,
-            },
-            image_offset: vk::Offset3D {
-                x: x as i32,
-                y: y as i32,
-                z: slice as i32,
-            },
-            image_extent: vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            },
-            ..Default::default()
-        };
+        let copies: Vec<_> = transfer_aspects(aspect_mask)
+            .enumerate()
+            .map(|(index, aspect_mask)| vk::BufferImageCopy {
+                buffer_offset: index as u64 * 4 * u64::from(width) * u64::from(height),
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask,
+                    mip_level: level,
+                    base_array_layer: layer,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D {
+                    x: x as i32,
+                    y: y as i32,
+                    z: slice as i32,
+                },
+                image_extent: vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                ..Default::default()
+            })
+            .collect();
         // SAFETY: recording; the image is in GENERAL layout; the buffer fits.
         unsafe {
             self.gpu.device.cmd_copy_image_to_buffer(
@@ -7569,7 +7590,7 @@ impl Renderer {
                 image,
                 vk::ImageLayout::GENERAL,
                 buffer.buffer,
-                &[copy],
+                &copies,
             );
         }
         self.flush()?;
@@ -7615,25 +7636,33 @@ impl Renderer {
             y: height as i32,
             z: 1,
         };
-        let blit = vk::ImageBlit {
-            src_subresource: subresource,
-            src_offsets: [
-                vk::Offset3D {
-                    z: slice as i32,
-                    ..Default::default()
-                },
-                vk::Offset3D {
-                    z: slice as i32 + 1,
-                    ..corner(scaled_width, scaled_height)
-                },
-            ],
-            dst_subresource: vk::ImageSubresourceLayers {
-                mip_level: 0,
-                base_array_layer: 0,
-                ..subresource
-            },
-            dst_offsets: [vk::Offset3D::default(), corner(width, height)],
-        };
+        let blits: Vec<_> = transfer_aspects(aspect_mask)
+            .map(|aspect_mask| {
+                let subresource = vk::ImageSubresourceLayers {
+                    aspect_mask,
+                    ..subresource
+                };
+                vk::ImageBlit {
+                    src_subresource: subresource,
+                    src_offsets: [
+                        vk::Offset3D {
+                            z: slice as i32,
+                            ..Default::default()
+                        },
+                        vk::Offset3D {
+                            z: slice as i32 + 1,
+                            ..corner(scaled_width, scaled_height)
+                        },
+                    ],
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        ..subresource
+                    },
+                    dst_offsets: [vk::Offset3D::default(), corner(width, height)],
+                }
+            })
+            .collect();
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -7647,7 +7676,7 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 staging,
                 vk::ImageLayout::GENERAL,
-                &[blit],
+                &blits,
                 vk::Filter::NEAREST,
             );
             *self
@@ -8674,6 +8703,9 @@ mod tests {
         let TextureSource::Upload { texels, .. } = renderer.with_texels(&source).unwrap() else {
             unreachable!();
         };
+        renderer.set_resolution_scale(Scale::new(2, 1).unwrap());
+        renderer.shaped_target(10, 2, 1, shape, format, 2).unwrap();
+        renderer.initialize_target(10, &source).unwrap();
         for (region, (level, layer, depth, stencil)) in levels.iter().zip(contents) {
             let rect = [0, 0, region.width, 1];
             let start = region.offset as usize;
@@ -8698,6 +8730,15 @@ mod tests {
                     .unwrap(),
                 stencil
             );
+            let expected = [depth, stencil].concat();
+            for key in [9, 10] {
+                assert_eq!(
+                    renderer
+                        .read_target_depth_stencil_plane_bytes(key, level, layer, rect)
+                        .unwrap(),
+                    expected
+                );
+            }
         }
     }
 
