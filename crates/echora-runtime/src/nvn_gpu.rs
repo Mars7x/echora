@@ -11320,18 +11320,20 @@ const SHADOW_LIMIT: u64 = 16 << 20;
 const STORAGE_CHUNK: u64 = 64 << 10;
 
 /// Read guest storage into `bytes`, substituting zeros for unreadable pages.
-fn read_storage_into(core: &Guest, base: u64, bytes: &mut [u8]) {
+fn read_storage_into(core: &Guest, base: u64, mut bytes: &mut [u8]) {
     if core.memory.read(base, bytes).is_ok() {
         return;
     }
-    for (index, chunk) in bytes.chunks_mut(1 << 12).enumerate() {
-        if core
-            .memory
-            .read(base + (index << 12) as u64, chunk)
-            .is_err()
-        {
+    let mut address = base;
+    let page_size = echora_shader_abi::PAGE_SIZE;
+    while !bytes.is_empty() {
+        let available = (page_size - address % page_size) as usize;
+        let (chunk, rest) = bytes.split_at_mut(available.min(bytes.len()));
+        if core.memory.read(address, chunk).is_err() {
             chunk.fill(0);
         }
+        address += chunk.len() as u64;
+        bytes = rest;
     }
 }
 
@@ -13191,6 +13193,35 @@ mod pool_tests {
             }
         });
         assert_eq!(failed, missing);
+    }
+
+    #[test]
+    fn unaligned_storage_reads_keep_bytes_next_to_unmapped_pages() {
+        use crate::nvn::{Guest, GuestMemory};
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let mut memory = Memory::new(1 << 39);
+        for base in [0x10_0000, 0x10_2000] {
+            memory
+                .map(base, 0x1000, READ | WRITE, STATE_NORMAL, "storage")
+                .unwrap();
+        }
+        memory.write(0x10_0ffe, &[1, 2]).unwrap();
+        memory.write(0x10_2000, &[3, 4]).unwrap();
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut data = [0xff; 0x1004];
+        super::read_storage_into(&guest, 0x10_0ffe, &mut data);
+        assert_eq!(data[..2], [1, 2]);
+        assert!(data[2..0x1002].iter().all(|&byte| byte == 0));
+        assert_eq!(data[0x1002..], [3, 4]);
     }
 
     #[test]
