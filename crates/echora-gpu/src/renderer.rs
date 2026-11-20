@@ -5547,8 +5547,8 @@ impl Renderer {
         std::mem::take(&mut self.fresh_targets)
     }
 
-    /// The clear leaves some of the image's original texels untouched.
-    pub fn clear_needs_initialization(
+    /// A write to a fresh target leaves some of its original texels intact.
+    pub fn partial_write_needs_initialization(
         &self,
         key: u64,
         level: u32,
@@ -6538,6 +6538,7 @@ impl Renderer {
             );
         };
         self.stat("stat: barriers in copy_target", 2);
+        self.defined(to);
         Ok(())
     }
 

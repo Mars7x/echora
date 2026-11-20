@@ -1576,7 +1576,7 @@ impl Nvn {
             .as_ref()
             .unwrap()
             .renderer
-            .clear_needs_initialization(texture, level, layer, rect)
+            .partial_write_needs_initialization(texture, level, layer, rect)
         {
             self.initialize_new_targets(core);
         }
@@ -1621,7 +1621,7 @@ impl Nvn {
                 .as_ref()
                 .unwrap()
                 .renderer
-                .clear_needs_initialization(texture, 0, layer, scissor)
+                .partial_write_needs_initialization(texture, 0, layer, scissor)
         {
             self.initialize_new_targets(core);
         }
@@ -5280,7 +5280,7 @@ impl Nvn {
 
     pub(super) fn gpu_copy_texture(
         &mut self,
-        _core: &Guest,
+        core: &Guest,
         command: &Command,
     ) -> Result<(), String> {
         if self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]) {
@@ -5326,11 +5326,19 @@ impl Nvn {
             );
         }
         self.ensure_render_target(to)?;
+        if self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .partial_write_needs_initialization(to, 0, 0, Some(destination))
+        {
+            self.initialize_new_targets(core);
+        }
         let traced = self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]);
         let present = self.presented_frames;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.restore_archived_target(from)?;
-        renderer.defined(to);
         renderer.copy_target(from, source, to, destination)?;
         // A traced copy: both ends read back after it, and how many texels
         // differ (a depth copy a later EQUAL test relies on must be exact).
@@ -12958,6 +12966,81 @@ mod target_tests {
             let expected = [0.25_f32, 0.5].map(f32::to_le_bytes).concat();
             assert_eq!(renderer.read_target_bytes(3, 4).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn partial_texture_copies_keep_untouched_guest_texels() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10000;
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x3000, 0, 0]))]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x3000, READ | WRITE, STATE_NORMAL, "texture copies")
+            .unwrap();
+        for (key, offset) in [(2, 0), (3, 0x1000), (4, 0x2000)] {
+            nvn.initialize(
+                key,
+                "Texture",
+                BTreeMap::from([
+                    ("Width".into(), scalar(3)),
+                    ("Height".into(), scalar(1)),
+                    ("Format".into(), scalar(10)),
+                    ("Storage".into(), args([1, offset, 0, 0])),
+                ]),
+            )
+            .unwrap();
+            memory
+                .write(
+                    base + offset,
+                    &[0.125_f32, 0.25, 0.5].map(f32::to_le_bytes).concat(),
+                )
+                .unwrap();
+        }
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let color = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (2, 0, 0), color, None).unwrap();
+        let mut command = Command {
+            name: "nvnCommandBufferCopyTextureToTexture",
+            x: [0, 2, 0, 0, 3, 0, 0, 0],
+            v: [0; 8],
+            captured: vec![0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+            states: Default::default(),
+        };
+        nvn.gpu_copy_texture(&mut core, &command).unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let expected = [0.125_f32, 0.75, 0.5].map(f32::to_le_bytes).concat();
+        assert_eq!(renderer.read_target_bytes(3, 4).unwrap(), expected);
+
+        command.x[4] = 4;
+        command.captured[3] = 0;
+        command.captured[6] = 0;
+        command.captured[9] = 3;
+        nvn.gpu_copy_texture(&mut core, &command).unwrap();
+        nvn.gpu_clear_color(&core, (4, 0, 0), color, Some([1, 0, 1, 1]))
+            .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(renderer.read_target_bytes(4, 4).unwrap(), expected);
     }
 
     #[test]
