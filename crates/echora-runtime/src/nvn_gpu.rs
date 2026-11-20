@@ -13035,6 +13035,78 @@ mod pool_tests {
     }
 
     #[test]
+    fn deferred_texture_bind_reads_the_gpu_written_handle() {
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        let size = 4096;
+        let handle = 0x1000_00ab_u64;
+        backend.renderer.resident_buffer(base, size).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 0, &[handle.to_le_bytes(); 2].concat())
+            .unwrap();
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: std::iter::once(base..base + 16).collect(),
+            },
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                base,
+                size,
+                READ | WRITE,
+                STATE_NORMAL,
+                "deferred texture binds",
+            )
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        nvn.execute(
+            &Command {
+                name: "nvnCommandBufferBindTexturesDeferred",
+                x: [0, 0, 1, 1, base, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+            &mut core,
+        )
+        .unwrap();
+
+        assert_eq!(nvn.render.bound_textures.get(0, 1), Some(&handle));
+        assert_eq!(core.memory.read_u64(base + 8).unwrap(), 0);
+        assert!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .resident_writes_pending(&(base + 8..base + 16))
+        );
+    }
+
+    #[test]
     fn failed_resident_writeback_keeps_unwritten_ranges_pending() {
         let Ok(Some(mut backend)) = Backend::create(None) else {
             return;

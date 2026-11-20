@@ -5842,7 +5842,9 @@ impl Nvn {
                 if let Some((single, words)) = plural_bind(rest) {
                     let count = (command.x[3] as usize).min(32);
                     let values = if rest.ends_with("Deferred") {
-                        // Deferred: the array as it is when the work runs.
+                        // Deferred bindings read the array in queue order.
+                        self.resolve_draw_input(core, command.x[4], (count * words * 8) as u64)
+                            .map_err(stop)?;
                         let mut values = Vec::with_capacity(count * words);
                         for index in 0..(count * words) as u64 {
                             values.push(core.memory.read_u64(command.x[4] + index * 8)?);
