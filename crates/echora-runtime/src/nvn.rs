@@ -1049,6 +1049,17 @@ impl TextureBindings {
 }
 
 impl RenderState {
+    fn viewport(&self) -> Option<[f32; 4]> {
+        let command = self.state.get("SetViewport")?;
+        if command.name == "nvnCommandBufferSetViewports" {
+            let rect = command.captured.first_chunk::<4>()?;
+            return Some(rect.map(|bits| f32::from_bits(bits as u32)));
+        }
+        Some(std::array::from_fn(|index| {
+            command.x[index + 1] as i32 as f32
+        }))
+    }
+
     /// Properties captured for the latest bind of this kind, or the defaults.
     fn properties(&self, key: &str) -> &BTreeMap<String, Args> {
         static EMPTY: BTreeMap<String, Args> = BTreeMap::new();
@@ -5455,16 +5466,11 @@ impl Nvn {
                 if command.x[1] != 0 || command.captured.len() < 4 {
                     return Ok(());
                 }
-                let rect: [u64; 4] = std::array::from_fn(|index| command.captured[index]);
                 if command.name.ends_with("Viewports") {
-                    let mut viewport = command.clone();
-                    viewport.name = "nvnCommandBufferSetViewport";
-                    for (index, value) in rect.iter().enumerate() {
-                        viewport.x[1 + index] = f32::from_bits(*value as u32) as i32 as u64;
-                    }
-                    self.render.state.insert("SetViewport", viewport);
+                    self.render.state.insert("SetViewport", command.clone());
                 } else {
-                    self.render.scissor = Some(rect.map(|value| value as u32 as i32));
+                    self.render.scissor =
+                        Some(std::array::from_fn(|index| command.captured[index] as i32));
                 }
                 Ok(())
             }
@@ -9098,6 +9104,61 @@ mod tests {
         assert_eq!(copy.region, [1, 2, 0, 3, 4, 1]);
         assert_eq!(copy.bases, [2, 0]);
         assert_eq!(copy.strides, [32, 256]);
+    }
+
+    #[test]
+    fn recorded_viewport_arrays_preserve_fractional_coordinates() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "viewports")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (buffer, ranges) = (0x1100, 0x1200);
+        nvn.initialize(buffer, "CommandBuffer", BTreeMap::new())
+            .unwrap();
+        let viewport = [0.75f32, -0.5, 19.25, 8.75];
+        for (index, value) in viewport.into_iter().enumerate() {
+            core.memory
+                .write_u32(ranges + index as u64 * 4, value.to_bits())
+                .unwrap();
+        }
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetViewports",
+            &[buffer, 0, 1, ranges],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetViewport",
+            &[buffer, 0, 0xffff_fffe, 8, 8],
+        );
+        core.memory.write_u32(ranges, 0).unwrap();
+        let handle = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let list = nvn.use_command_list(handle).unwrap();
+        assert_eq!(list.len(), 2);
+        nvn.execute_command(&list[0], &mut core).unwrap();
+        assert_eq!(nvn.render.viewport(), Some(viewport));
+        nvn.execute_command(&list[1], &mut core).unwrap();
+        assert_eq!(nvn.render.viewport(), Some([0.0, -2.0, 8.0, 8.0]));
     }
 
     #[test]

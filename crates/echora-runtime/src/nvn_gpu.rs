@@ -10509,6 +10509,7 @@ impl Nvn {
                 })
                 .unwrap_or(texture)
         });
+        let bound_viewport = self.render.viewport();
         if let Some(texture) = depth.filter(|&texture| self.depth_traced(texture)) {
             eprintln!(
                 "depth trace present {} draw {:016x}/{:016x} depth {texture:x} (bound {:x}) viewport {:?} scissor {:?}",
@@ -10516,12 +10517,7 @@ impl Nvn {
                 keys.0,
                 keys.1,
                 self.render.depth,
-                self.render.state.get("SetViewport").map(|bind| [
-                    bind.x[1] as i32,
-                    bind.x[2] as i32,
-                    bind.x[3] as i32,
-                    bind.x[4] as i32
-                ]),
+                bound_viewport,
                 self.render.scissor
             );
         }
@@ -10533,9 +10529,9 @@ impl Nvn {
         // game reads texels back into a buffer from a vertex program, with
         // a fragment program that only exits): the area is the viewport's.
         let extent = extent.or_else(|| {
-            let bind = self.render.state.get("SetViewport")?;
-            let (width, height) = (bind.x[3] as i32, bind.x[4] as i32);
-            (width > 0 && height > 0).then_some((width as u32, height as u32))
+            let [_, _, width, height] = bound_viewport?;
+            (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+                .then_some((width.ceil() as u32, height.ceil() as u32))
         });
         let (width, height) = extent.ok_or_else(|| {
             format!(
@@ -10544,19 +10540,7 @@ impl Nvn {
             )
         })?;
         self.initialize_new_targets(core);
-        let viewport = self
-            .render
-            .state
-            .get("SetViewport")
-            .map(|bind| {
-                [
-                    bind.x[1] as i32 as f32,
-                    bind.x[2] as i32 as f32,
-                    bind.x[3] as i32 as f32,
-                    bind.x[4] as i32 as f32,
-                ]
-            })
-            .unwrap_or([0.0, 0.0, width as f32, height as f32]);
+        let viewport = bound_viewport.unwrap_or([0.0, 0.0, width as f32, height as f32]);
         // The application passes 1 to SetWindowOriginMode: UPPER_LEFT, the
         // D3D convention (window row 0 at the top, clip +Y up to it). A
         // pass sampling the depth buffer by clip-space position showed the
