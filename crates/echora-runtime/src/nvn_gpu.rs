@@ -3268,7 +3268,7 @@ impl Nvn {
             };
             let (source, storage) = self.resolve_sampled_texture(core, texture)?;
             let source = self.through_view(source, handle);
-            let sampler_state = self.binding_sampler(handle, &source);
+            let sampler_state = self.binding_sampler(handle, texture, &source);
             self.binding_memo.1.insert(
                 handle,
                 (
@@ -3307,10 +3307,28 @@ impl Nvn {
     /// (a view of those levels: its level 0 is the base, as on the
     /// console; the guest sampler itself stays as the game set it, one
     /// Vulkan sampler for every texture paired with it).
-    fn binding_sampler(&self, handle: u64, source: &TextureSource) -> Sampler {
+    fn binding_sampler(&self, handle: u64, texture: u64, source: &TextureSource) -> Sampler {
         let mut sampler = self.handle_sampler(handle);
         sampler.components = self.handle_components(handle);
         sampler.format = self.handle_view_format(handle);
+        // A separate texture can name the same render storage in the other
+        // color space even when the descriptor has no explicit view format.
+        if sampler.format.is_none()
+            && let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = source
+            && *key != texture
+            && let Some(format) = self
+                .objects
+                .get(&texture)
+                .and_then(|object| object.builder.get("Format"))
+                .and_then(|value| vk_format(value.x[0] as u32))
+            && let Some(target) = self
+                .gpu
+                .as_ref()
+                .and_then(|backend| backend.renderer.target_info(*key))
+            && echora_gpu::renderer::srgb_twin(target.format) == Some(format)
+        {
+            sampler.format = Some(format);
+        }
         // A decoded ASTC upload is an RGBA image. Its alternate ASTC view
         // still selects the other color space through the RGBA format.
         if let TextureSource::Upload { key, format, .. } = source
@@ -3329,7 +3347,6 @@ impl Nvn {
             sampler.format = echora_gpu::renderer::srgb_twin(*format);
         }
         if sampler.format.is_some() && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
-            let texture = self.handle_texture(handle).unwrap_or(0);
             let own = self
                 .objects
                 .get(&texture)
@@ -5830,7 +5847,7 @@ impl Nvn {
                         "stat: dispatch texture microseconds",
                         started.elapsed().as_micros() as u64,
                     );
-                    let sampler = self.binding_sampler(handle, &source);
+                    let sampler = self.binding_sampler(handle, texture, &source);
                     textures.insert(descriptor.binding, (source, sampler));
                 }
                 // Images a compute program writes become render targets, so
@@ -9614,7 +9631,7 @@ impl Nvn {
                                 self.gpu_note(note);
                             }
                         }
-                        let sampler = self.binding_sampler(handle, &source);
+                        let sampler = self.binding_sampler(handle, texture, &source);
                         self.binding_memo.1.insert(
                             handle,
                             (
@@ -12602,7 +12619,7 @@ mod target_tests {
                 texels: Default::default(),
                 levels: Default::default(),
             };
-            let sampler = nvn.binding_sampler(u64::from(index), &source);
+            let sampler = nvn.binding_sampler(u64::from(index), texture, &source);
             assert_eq!(sampler.format, Some(expected));
             assert_eq!(sampler.view_levels, Some((1, 0)));
             assert_eq!(sampler.view_layers, Some((1, 2)));
@@ -12945,7 +12962,7 @@ mod target_tests {
 
     #[test]
     fn mip_storage_aliases_require_compatible_formats() {
-        use super::TextureSource;
+        use super::{TextureSource, vk};
 
         let Ok(Some(backend)) = Backend::create(None) else {
             return;
@@ -13047,6 +13064,9 @@ mod target_tests {
                 ..
             }
         ));
+        let srgb = nvn.texture_source_resolved(&core, 4).unwrap();
+        let sampler = nvn.binding_sampler(4, 4, &srgb);
+        assert_eq!(sampler.format, Some(vk::Format::R8G8B8A8_SRGB));
         nvn.ensure_render_target(3).unwrap();
         assert_eq!(nvn.resolve_target(4), Some((3, 0)));
         nvn.refresh_target_index();
