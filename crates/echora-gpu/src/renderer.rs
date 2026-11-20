@@ -5544,7 +5544,7 @@ impl Renderer {
         std::mem::take(&mut self.fresh_targets)
     }
 
-    /// A partial or conditional clear can leave guest texels untouched.
+    /// The clear leaves some of the image's original texels untouched.
     pub fn color_clear_needs_initialization(
         &self,
         key: u64,
@@ -5553,7 +5553,14 @@ impl Renderer {
         rect: Option<[i32; 4]>,
     ) -> bool {
         self.fresh_targets.contains(&key)
-            && (self.condition.is_some() || level != 0 || layer != 0 || rect.is_some())
+            && (self.condition.is_some()
+                || level != 0
+                || layer != 0
+                || rect.is_some()
+                || self
+                    .targets
+                    .get(&key)
+                    .is_some_and(|target| target.levels > 1 || target.shape.layers() > 1))
     }
 
     /// Target `key` gets its contents otherwise (a clear or a copy): it
@@ -5563,8 +5570,7 @@ impl Renderer {
         self.fresh_targets.retain(|fresh| *fresh != key);
     }
 
-    /// Copy an upload's level 0 into level 0 of target `key` (same format
-    /// and size only).
+    /// Initialize target `key` from a matching upload's subresources.
     pub fn initialize_target(
         &mut self,
         key: u64,
@@ -5575,48 +5581,99 @@ impl Renderer {
             width,
             height,
             format,
-            shape: crate::draw::ImageShape::D2 { layers: 1 },
+            shape,
+            levels,
             ..
         } = source
         else {
-            return Err("only single 2D uploads initialize targets".into());
+            return Err("target initialization needs a guest upload".into());
         };
         let target = self.targets.get(&key).ok_or("no such target")?;
-        if (target.width, target.height, target.format) != (*width, *height, *format) {
+        if (target.width, target.height, target.format, target.shape)
+            != (*width, *height, *format, *shape)
+        {
             return Err("upload and target differ".into());
         }
-        self.upload(source)?;
-        self.transition(key, vk::ImageLayout::GENERAL)?;
-        let commands = self.commands()?;
-        let (from, to) = (self.uploads[upload].1.image, self.targets[&key].image);
-        let (scaled_width, scaled_height) = self.targets[&key].extent(0);
-        let layers = vk::ImageSubresourceLayers {
-            aspect_mask: range(*format).aspect_mask,
-            mip_level: 0,
-            base_array_layer: 0,
+        let aspects = range(*format).aspect_mask;
+        let subresources = |region: &crate::draw::UploadRegion| vk::ImageSubresourceLayers {
+            aspect_mask: aspects,
+            mip_level: region.level,
+            base_array_layer: region.layer,
             layer_count: 1,
         };
-        // A scaled target: the guest's texels, scaled up.
-        let corner = |width: u32, height: u32| vk::Offset3D {
-            x: width as i32,
-            y: height as i32,
-            z: 1,
+        let scaled = target.extent(0) != (*width, *height);
+        let blit_filter = if scaled {
+            // SAFETY: the instance and physical device are live.
+            let features = unsafe {
+                self.gpu
+                    .instance
+                    .get_physical_device_format_properties(self.gpu.physical, *format)
+            }
+            .optimal_tiling_features;
+            if !features
+                .contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
+            {
+                return Err(format!("cannot initialize a scaled {format:?} image"));
+            }
+            if !is_depth(*format)
+                && features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+            {
+                vk::Filter::LINEAR
+            } else {
+                vk::Filter::NEAREST
+            }
+        } else {
+            vk::Filter::NEAREST
         };
-        let blit = vk::ImageBlit {
-            src_subresource: layers,
-            src_offsets: [vk::Offset3D::default(), corner(*width, *height)],
-            dst_subresource: layers,
-            dst_offsets: [vk::Offset3D::default(), corner(scaled_width, scaled_height)],
-        };
-        let scaled = (scaled_width, scaled_height) != (*width, *height);
-        let region = vk::ImageCopy::default()
-            .src_subresource(layers)
-            .dst_subresource(layers)
-            .extent(vk::Extent3D {
-                width: *width,
-                height: *height,
-                depth: 1,
-            });
+        self.upload(source)?;
+        let source = &self.uploads[upload].1;
+        let target = &self.targets[&key];
+        let regions = levels.iter().filter(|region| {
+            region.level < source.levels.min(target.levels) && region.layer < shape.layers()
+        });
+        let mut copies = Vec::new();
+        let mut blits = Vec::new();
+        if scaled {
+            let corner = |width: u32, height: u32, depth: u32| vk::Offset3D {
+                x: width as i32,
+                y: height as i32,
+                z: depth as i32,
+            };
+            blits.extend(regions.map(|region| {
+                let layers = subresources(region);
+                let (scaled_width, scaled_height) = target.extent(region.level);
+                vk::ImageBlit {
+                    src_subresource: layers,
+                    src_offsets: [
+                        vk::Offset3D::default(),
+                        corner(region.width, region.height, region.depth),
+                    ],
+                    dst_subresource: layers,
+                    dst_offsets: [
+                        vk::Offset3D::default(),
+                        corner(scaled_width, scaled_height, region.depth),
+                    ],
+                }
+            }));
+        } else {
+            copies.extend(regions.map(|region| {
+                let layers = subresources(region);
+                vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .extent(vk::Extent3D {
+                        width: region.width,
+                        height: region.height,
+                        depth: region.depth,
+                    })
+            }));
+        }
+        if copies.is_empty() && blits.is_empty() {
+            return Ok(());
+        }
+        let (from, to) = (source.image, target.image);
+        self.transition(key, vk::ImageLayout::GENERAL)?;
+        let commands = self.commands()?;
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -5629,12 +5686,8 @@ impl Renderer {
                     vk::ImageLayout::GENERAL,
                     to,
                     vk::ImageLayout::GENERAL,
-                    &[blit],
-                    if is_depth(*format) {
-                        vk::Filter::NEAREST
-                    } else {
-                        vk::Filter::LINEAR
-                    },
+                    &blits,
+                    blit_filter,
                 );
             } else {
                 self.gpu.device.cmd_copy_image(
@@ -5643,7 +5696,7 @@ impl Renderer {
                     vk::ImageLayout::GENERAL,
                     to,
                     vk::ImageLayout::GENERAL,
-                    &[region],
+                    &copies,
                 );
             }
             *self

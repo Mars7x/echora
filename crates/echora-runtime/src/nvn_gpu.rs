@@ -4001,10 +4001,8 @@ impl Nvn {
         self.guest_texture(core, texture)
     }
 
-    /// Render targets created since the last call start with their guest
-    /// memory's contents (level 0), as on the console, where a target is
-    /// that memory: values a pass reads before it writes them (an
-    /// auto-exposure adapting from its last value) are then defined.
+    /// Start new render targets with their guest memory's contents, so
+    /// later passes can read subresources the renderer has yet to write.
     pub(super) fn initialize_new_targets(&mut self, core: &Guest) {
         let fresh: Vec<u64> = self.gpu.as_mut().unwrap().renderer.take_fresh_targets();
         for key in fresh {
@@ -12249,6 +12247,78 @@ mod target_tests {
                     .unwrap();
                 assert_eq!(pixels, vec![color; 16]);
             }
+        }
+    }
+
+    #[test]
+    fn clearing_the_base_layer_preserves_the_other_texture_subresources() {
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let props = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+        props.remove("Stride");
+        for (key, value) in [
+            ("Width", 8),
+            ("Height", 8),
+            ("Depth", 2),
+            ("Target", 4),
+            ("Levels", 2),
+        ] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let address = base + (1 << 20);
+        for (level, byte) in [(0, 0x40), (1, 0x80)] {
+            let extent = 8 >> level;
+            guest
+                .memory
+                .write(address, &vec![byte; (extent * extent * 2 * 4) as usize])
+                .unwrap();
+            assert!(
+                nvn.copy_texels(
+                    &mut guest,
+                    texture,
+                    crate::nvn::TexelTransfer {
+                        region: [0, 0, 0, extent, extent, 2],
+                        bases: [level, 0],
+                        strides: [0; 2],
+                    },
+                    address,
+                    true,
+                )
+                .is_ok()
+            );
+        }
+        let red = [1.0_f32, 0.0, 0.0, 1.0];
+        nvn.gpu_clear_color(&guest, (texture, 0, 0), red.map(f32::to_bits), None)
+            .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(
+            renderer.read_target_slice(texture, 0, 0).unwrap(),
+            vec![red; 64]
+        );
+        for (level, layer, byte) in [(0, 1, 0x40), (1, 0, 0x80), (1, 1, 0x80)] {
+            let pixels = renderer.read_target_slice(texture, level, layer).unwrap();
+            let channels = (8 >> level) * (8 >> level);
+            assert_eq!(pixels.len(), channels);
+            let expected = byte as f32 / 255.0;
+            assert!(
+                pixels
+                    .iter()
+                    .flatten()
+                    .all(|pixel| (pixel - expected).abs() < 1e-6)
+            );
         }
     }
 
