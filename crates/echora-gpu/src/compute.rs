@@ -11,6 +11,16 @@ use crate::draw::{Program, Sampler, TextureSource};
 use crate::renderer::{Renderer, descriptor_buffer_range};
 use crate::shader::DescriptorKind;
 
+/// A compute binding to one mip and a range of a target's array layers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageImage {
+    pub target: u64,
+    pub level: u32,
+    pub base_layer: u32,
+    /// Zero selects the remaining layers.
+    pub layer_count: u32,
+}
+
 pub struct Dispatch<'a> {
     /// A program of one compute stage (see `Renderer::create_program`).
     pub program: &'a Program,
@@ -26,7 +36,7 @@ pub struct Dispatch<'a> {
     /// Sampled textures by binding.
     pub textures: HashMap<u32, (TextureSource, Sampler)>,
     /// Storage images by binding: the render target each binding writes.
-    pub images: HashMap<u32, (u64, u32)>,
+    pub images: HashMap<u32, StorageImage>,
     /// The format of the NVN texture view an image binding writes through,
     /// when it is the target's unsigned word alias (`uint_alias`) (a program packing
     /// RGB9E5 or R11G11B10 itself stores words through an R32UI view).
@@ -48,9 +58,9 @@ impl Renderer {
     pub fn dispatch_deferred(&mut self, dispatch: &Dispatch) -> Result<Vec<(u32, u64)>, String> {
         // Storage images are written at the guest's coordinates: their
         // targets stay unscaled (before recording: that may flush).
-        for (key, _) in dispatch.images.values() {
+        for image in dispatch.images.values() {
             if !self.resolution_scale().is_one() {
-                self.keep_unscaled(*key)?;
+                self.keep_unscaled(image.target)?;
             }
         }
         self.bound_submission()?;
@@ -117,10 +127,11 @@ impl Renderer {
                 continue;
             }
             if descriptor.kind() == DescriptorKind::Image {
-                let (key, level) = *dispatch
+                let image = dispatch
                     .images
                     .get(&binding)
                     .ok_or_else(|| format!("no image for compute binding {binding}"))?;
+                let key = image.target;
                 let format = self
                     .existing_target(key)
                     .ok_or("compute image is not a target")?
@@ -134,7 +145,8 @@ impl Renderer {
                 })?;
                 self.transition(key, vk::ImageLayout::GENERAL)?;
                 // Storage image views name one mip level.
-                let image_view = self.level_view_as(key, level, view_format)?;
+                let image_view =
+                    self.storage_image_view(*image, descriptor.texture_type, view_format)?;
                 storage_images.push((
                     binding,
                     [vk::DescriptorImageInfo {
@@ -759,7 +771,14 @@ mod tests {
             storage: HashMap::new(),
             storage_in_place: HashMap::new(),
             textures: HashMap::new(),
-            images: [(image, (output, 0))].into(),
+            images: [(
+                image,
+                StorageImage {
+                    target: output,
+                    ..Default::default()
+                },
+            )]
+            .into(),
             image_formats: HashMap::new(),
             indirect: None,
             page_table: Default::default(),
@@ -771,6 +790,101 @@ mod tests {
             0x32u32.to_le_bytes()
         );
         renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
+    fn storage_image_view_addresses_layers_relative_to_its_base() {
+        use crate::draw::ImageShape;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let target = 1;
+        renderer
+            .shaped_target(
+                target,
+                2,
+                2,
+                ImageShape::D2 { layers: 3 },
+                vk::Format::R32_UINT,
+                2,
+            )
+            .unwrap();
+        for layer in 0..3 {
+            renderer
+                .clear_color_level(
+                    target,
+                    1,
+                    layer,
+                    None,
+                    vk::ClearColorValue {
+                        uint32: [10 + layer; 4],
+                    },
+                )
+                .unwrap();
+        }
+        let cases = [
+            ("2d_array", "0, ", 3, 1, 2, [10_u32, 77, 12]),
+            ("2d", "", 2, 2, 1, [10, 77, 77]),
+        ];
+        for (shape, relative_layer, texture_type, base_layer, layer_count, expected) in cases {
+            let code = spirv(
+                &format!(
+                    "@group(0) @binding(0) var image: texture_storage_{shape}<r32uint, write>;
+                    @compute @workgroup_size(1) fn main() {{
+                        textureStore(image, vec2<i32>(0), {relative_layer}vec4<u32>(77u));
+                    }}"
+                ),
+                naga::ShaderStage::Compute,
+            );
+            let program = renderer
+                .create_program(vec![translated(
+                    Stage::Compute,
+                    code,
+                    vec![Descriptor {
+                        kind: DescriptorKind::Image as u32,
+                        binding: 0,
+                        count: 1,
+                        texture_type,
+                        ..Default::default()
+                    }],
+                )])
+                .unwrap();
+            let image = StorageImage {
+                target,
+                level: 1,
+                base_layer,
+                layer_count,
+            };
+            let dispatch = Dispatch {
+                program: &program,
+                groups: [1; 3],
+                uniforms: HashMap::new(),
+                storage: HashMap::new(),
+                storage_in_place: HashMap::new(),
+                textures: HashMap::new(),
+                images: [(0, image)].into(),
+                image_formats: HashMap::new(),
+                indirect: None,
+                page_table: Default::default(),
+                pool: Default::default(),
+            };
+            renderer.dispatch(&dispatch).unwrap();
+            renderer.destroy_program(program).unwrap();
+            for (layer, expected) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    renderer
+                        .read_target_plane_bytes(target, 1, layer as u32, 4, [0, 0, 1, 1])
+                        .unwrap(),
+                    expected.to_le_bytes(),
+                    "{shape} view, array layer {layer}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -818,7 +932,13 @@ mod tests {
             storage: HashMap::new(),
             storage_in_place: HashMap::new(),
             textures: HashMap::new(),
-            images: HashMap::from([(1, (target, 0))]),
+            images: HashMap::from([(
+                1,
+                StorageImage {
+                    target,
+                    ..Default::default()
+                },
+            )]),
             image_formats: HashMap::new(),
             indirect: None,
             page_table: Default::default(),

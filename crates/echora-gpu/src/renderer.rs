@@ -11,6 +11,7 @@ use crate::fast_map::{FastMap, FastSet};
 
 use ash::vk;
 
+use crate::compute::StorageImage;
 use crate::draw::ImageShape;
 use crate::vulkan::Gpu;
 
@@ -704,9 +705,12 @@ enum ExtraView {
         components: [vk::ComponentSwizzle; 4],
     },
     Level(u32),
-    StorageLevel {
+    StorageImage {
         format: vk::Format,
+        view_type: vk::ImageViewType,
         level: u32,
+        base_layer: u32,
+        layer_count: u32,
     },
     Attachment {
         format: vk::Format,
@@ -5825,36 +5829,84 @@ impl Renderer {
         Ok(())
     }
 
-    /// A 2D view of one mip level of target `key` (the target's own view
-    /// when it has a single level), for attachments and storage images.
-    /// A view of mip level `level` of target `key` in `format` (a format
-    /// the target was created to allow), for storage through a twin.
-    pub(crate) fn level_view_as(
+    /// Select one mip and the layers addressed by the storage image shader.
+    pub(crate) fn storage_image_view(
         &mut self,
-        key: u64,
-        level: u32,
+        image: StorageImage,
+        texture_type: u32,
         format: vk::Format,
     ) -> Result<vk::ImageView, String> {
+        let StorageImage {
+            target: key,
+            level,
+            base_layer,
+            layer_count,
+        } = image;
         let target = self.targets.get(&key).ok_or("no such target")?;
-        if format == target.format {
-            return self.level_view(key, level);
-        }
         if level >= target.levels {
             return Err(format!("level {level} of a {}-level target", target.levels));
         }
-        let cache = (target.image, ExtraView::StorageLevel { format, level });
+        let total = target.shape.layers();
+        let own_type = own_view_type(target.shape);
+        let view_type = match (texture_type, target.shape) {
+            (2, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => vk::ImageViewType::TYPE_2D,
+            (3, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => {
+                vk::ImageViewType::TYPE_2D_ARRAY
+            }
+            _ => own_type,
+        };
+        let (base_layer, layer_count) = if view_type == vk::ImageViewType::TYPE_3D {
+            // A storage volume's z coordinate selects a slice.
+            (0, 1)
+        } else {
+            let available = total.saturating_sub(base_layer);
+            if available == 0 || layer_count > available {
+                return Err(format!(
+                    "storage image layer range {base_layer}+{layer_count} exceeds {total} layers"
+                ));
+            }
+            let layer_count = match view_type {
+                vk::ImageViewType::TYPE_2D_ARRAY | vk::ImageViewType::TYPE_1D_ARRAY => {
+                    if layer_count == 0 {
+                        available
+                    } else {
+                        layer_count
+                    }
+                }
+                _ => 1,
+            };
+            (base_layer, layer_count)
+        };
+        if format == target.format
+            && view_type == own_type
+            && base_layer == 0
+            && layer_count == total
+        {
+            return self.level_view(key, level);
+        }
+        let cache = (
+            target.image,
+            ExtraView::StorageImage {
+                format,
+                view_type,
+                level,
+                base_layer,
+                layer_count,
+            },
+        );
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::STORAGE);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
-            .view_type(own_view_type(target.shape))
+            .view_type(view_type)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
                 base_mip_level: level,
                 level_count: 1,
-                layer_count: target.shape.layers(),
+                base_array_layer: base_layer,
+                layer_count,
                 ..range(target.format)
             })
             .push_next(&mut usage);
@@ -9088,7 +9140,17 @@ mod tests {
         assert!(target.view_usage.contains(vk::ImageUsageFlags::SAMPLED));
         let mip = renderer.level_view(7, 2).unwrap();
         let layer = renderer.attachment_view(7, 2, 1, None).unwrap();
-        let writable = renderer.level_view_as(7, 2, storage).unwrap();
+        let writable = renderer
+            .storage_image_view(
+                StorageImage {
+                    target: 7,
+                    level: 2,
+                    ..Default::default()
+                },
+                2,
+                storage,
+            )
+            .unwrap();
         assert_ne!(mip, writable);
         assert_ne!(layer, writable);
 

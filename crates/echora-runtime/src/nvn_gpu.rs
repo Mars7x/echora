@@ -17,6 +17,7 @@ type HashMap<K, V> = super::FastMap<K, V>;
 use std::sync::Arc;
 
 use echora_gpu::ash::vk;
+use echora_gpu::compute::StorageImage;
 use echora_gpu::draw::{
     Blend, Draw, Fixed, ImageShape, Indices, MeshGroups, Program, Sampler, StencilFace,
     TextureSource, UploadRegion, VertexAttribute, VertexStream,
@@ -5740,10 +5741,7 @@ impl Nvn {
     fn prepare_compute_image(&mut self, texture: u64) -> Result<(u64, vk::Format), String> {
         let (width, height, format) = self.target_shape(texture)?;
         let levels = self.texture_levels(texture);
-        let shape = match self.render_shape(texture) {
-            volume @ ImageShape::D3 { .. } => volume,
-            _ => ImageShape::D2 { layers: 1 },
-        };
+        let shape = self.render_shape(texture);
         // An image binding can name the same physical texels as an earlier
         // attachment. A new image initialized from guest RAM would lose
         // those GPU writes, including any texels this dispatch leaves alone.
@@ -6295,7 +6293,17 @@ impl Nvn {
                             self.presented_frames, descriptor.binding
                         );
                     }
-                    images.insert(descriptor.binding, (target, level));
+                    let (base_layer, layer_count) =
+                        self.handle_view_layers(handle).unwrap_or((0, 0));
+                    images.insert(
+                        descriptor.binding,
+                        StorageImage {
+                            target,
+                            level,
+                            base_layer,
+                            layer_count,
+                        },
+                    );
                     if let Some(view) = self
                         .handle_view_format(handle)
                         .filter(|view| echora_gpu::renderer::uint_alias(format) == Some(*view))
@@ -6353,7 +6361,7 @@ impl Nvn {
                 "flow dispatch {:016x} reads {} writes {} storage {} flags {:?}",
                 code_key,
                 self.describe_sources(textures.values().map(|(source, _)| source)),
-                self.describe_targets(images.values().map(|(key, _)| *key)),
+                self.describe_targets(images.values().map(|image| image.target)),
                 storage.len(),
                 stage
                     .descriptors
@@ -6386,7 +6394,7 @@ impl Nvn {
                 self.sequence_note(&line);
             }
         }
-        let image_keys: Vec<u64> = images.values().map(|(key, _)| *key).collect();
+        let image_keys: Vec<u64> = images.values().map(|image| image.target).collect();
         // ECHORA_DISPATCH_SOURCE_LOG=<program key hex>[,...] (debugging):
         // each dispatch of those programs logs the textures it reads, with
         // the program and present that last wrote each, and its images.
@@ -6598,10 +6606,10 @@ impl Nvn {
                 other => return Err(format!("compute spec constant {other:?}")),
             };
             let format = match images.get(&binding) {
-                Some((texture, _)) => image_formats.get(&binding).copied().or_else(|| {
+                Some(image) => image_formats.get(&binding).copied().or_else(|| {
                     backend
                         .renderer
-                        .existing_target(*texture)
+                        .existing_target(image.target)
                         .map(|target| target.format)
                 }),
                 None => textures
@@ -6739,8 +6747,8 @@ impl Nvn {
                     textures
                         .iter()
                         .map(|(binding, (source, _))| (*binding, source.clone()))
-                        .chain(images.iter().map(|(binding, (target, _))| {
-                            (*binding, TextureSource::Target(*target))
+                        .chain(images.iter().map(|(binding, image)| {
+                            (*binding, TextureSource::Target(image.target))
                         }))
                         .collect();
                 eprintln!(
