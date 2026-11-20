@@ -6942,6 +6942,25 @@ impl Nvn {
         }
     }
 
+    /// Finish GPU accesses to in-place memory before a queued CPU write.
+    /// Separate resident buffers stay ordered through their dirty ranges.
+    pub(super) fn prepare_queued_buffer_write(
+        &mut self,
+        core: &mut Guest,
+        range: std::ops::Range<u64>,
+    ) -> Result<(), String> {
+        let shared = self
+            .shared_guest_index()
+            .is_some_and(|index| index.overlapping(range.clone()).next().is_some());
+        if shared {
+            let backend = self.gpu.as_mut().unwrap();
+            backend
+                .renderer
+                .wait_for(backend.renderer.recorded_serial())?;
+        }
+        self.resolve_storage(core, Some(range))
+    }
+
     pub(super) fn resolve_storage(
         &mut self,
         core: &mut Guest,
@@ -15110,6 +15129,91 @@ mod pool_tests {
         let backend = nvn.gpu.as_ref().unwrap();
         assert!(!backend.resident_writes_pending(&(base + 12..base + 16)));
         assert!(backend.resident_writes_pending(&(base + 16..base + 24)));
+    }
+
+    #[test]
+    fn buffer_copy_reads_gpu_results_and_invalidates_the_destination() {
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        let size = 4096;
+        backend.renderer.resident_buffer(base, size).unwrap();
+        let old = [11u32, 22, 33, 44, 55];
+        let bytes: Vec<_> = old.into_iter().flat_map(u32::to_le_bytes).collect();
+        backend.renderer.upload_resident(base, 0, &bytes).unwrap();
+        backend.resident.insert(
+            base,
+            super::ResidentPool {
+                base,
+                size,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: std::iter::once(base..base + bytes.len() as u64).collect(),
+            },
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [base, size, 0, 0],
+                    ..Args::default()
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.objects.get_mut(&1).unwrap().state.insert(
+            "GpuAddress".into(),
+            Args {
+                x: [base, 0, 0, 0],
+                ..Args::default()
+            },
+        );
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "buffer copy")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+
+        // The destination overlaps the source and has its own older GPU bytes.
+        nvn.execute(
+            &Command {
+                name: "nvnCommandBufferCopyBufferToBuffer",
+                x: [0, base, base + 4, 12, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+            &mut core,
+        )
+        .unwrap();
+        let backend = nvn.gpu.as_ref().unwrap();
+        let pool = &backend.resident[&base];
+        assert_eq!(pool.guest_dirty.as_slice(), &[base + 4..base + 16]);
+        assert_eq!(pool.gpu_dirty.as_slice(), &[base + 16..base + 20]);
+        nvn.resolve_draw_input(&mut core, base, 20).unwrap();
+        let copied: Vec<_> = (0..5)
+            .map(|word| core.memory.read_u32(base + word * 4).unwrap())
+            .collect();
+        assert_eq!(copied, [11, 11, 22, 33, 55]);
     }
 
     #[test]

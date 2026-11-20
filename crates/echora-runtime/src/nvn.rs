@@ -5648,11 +5648,19 @@ impl Nvn {
                 if size > 1 << 32 {
                     return Err(stop(format!("{size:#x}-byte copy")));
                 }
+                if size == 0 {
+                    return Ok(());
+                }
                 let from = self.gpu_to_guest(source, size).map_err(stop)?;
                 let to = self.gpu_to_guest(destination, size).map_err(stop)?;
+                self.resolve_queued_buffer_read(core, source, from, size)
+                    .map_err(stop)?;
+                self.prepare_queued_buffer_write(core, to..to + size)
+                    .map_err(stop)?;
                 let mut bytes = vec![0u8; size as usize];
                 core.memory.read(from, &mut bytes)?;
                 core.memory.write(to, &bytes)?;
+                self.gpu_invalidate(to..to + size, None);
                 Ok(())
             }
             // FenceSync(cmd, NVNsync*, condition, flags) in a command buffer:
