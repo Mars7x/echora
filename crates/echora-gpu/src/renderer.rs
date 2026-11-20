@@ -6028,54 +6028,68 @@ impl Renderer {
             unsafe { device.create_image(&info, None) }.map_err(vk_error("vkCreateImage"))?;
         // SAFETY: the image is live.
         let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        // SAFETY: fresh image and memory of the required size.
-        unsafe { device.bind_image_memory(image, memory, 0) }
-            .map_err(vk_error("vkBindImageMemory"))?;
-        let view_usage = if store_twin.is_some() {
-            usage & !vk::ImageUsageFlags::STORAGE
-        } else {
-            usage
-        };
-        let mut own_usage = vk::ImageViewUsageCreateInfo::default().usage(view_usage);
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(own_view_type(shape))
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                level_count: levels,
-                layer_count: shape.layers(),
-                ..range(format)
-            })
-            .push_next(&mut own_usage);
-        // SAFETY: as above.
-        let view = unsafe { device.create_image_view(&view_info, None) }
-            .map_err(vk_error("vkCreateImageView"))?;
-        let sampled_view = if has_stencil(format) {
-            let depth_only = view_info.subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                ..view_info.subresource_range
-            });
+        let mut memory = vk::DeviceMemory::null();
+        let mut view = vk::ImageView::null();
+        let target = (|| {
+            memory = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            // SAFETY: fresh image and memory of the required size.
+            unsafe { device.bind_image_memory(image, memory, 0) }
+                .map_err(vk_error("vkBindImageMemory"))?;
+            let view_usage = if store_twin.is_some() {
+                usage & !vk::ImageUsageFlags::STORAGE
+            } else {
+                usage
+            };
+            let mut own_usage = vk::ImageViewUsageCreateInfo::default().usage(view_usage);
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(own_view_type(shape))
+                .format(format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    level_count: levels,
+                    layer_count: shape.layers(),
+                    ..range(format)
+                })
+                .push_next(&mut own_usage);
             // SAFETY: as above.
-            unsafe { device.create_image_view(&depth_only, None) }
-                .map_err(vk_error("vkCreateImageView"))?
-        } else {
-            view
-        };
-        Ok(Target {
-            image,
-            view,
-            sampled_view,
-            shape,
-            levels,
-            memory,
-            format,
-            view_usage,
-            width,
-            height,
-            scale: Scale::ONE,
-            layout: vk::ImageLayout::UNDEFINED,
-        })
+            view = unsafe { device.create_image_view(&view_info, None) }
+                .map_err(vk_error("vkCreateImageView"))?;
+            let sampled_view = if has_stencil(format) {
+                let depth_only = view_info.subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    ..view_info.subresource_range
+                });
+                // SAFETY: as above.
+                unsafe { device.create_image_view(&depth_only, None) }
+                    .map_err(vk_error("vkCreateImageView"))?
+            } else {
+                view
+            };
+            Ok(Target {
+                image,
+                view,
+                sampled_view,
+                shape,
+                levels,
+                memory,
+                format,
+                view_usage,
+                width,
+                height,
+                scale: Scale::ONE,
+                layout: vk::ImageLayout::UNDEFINED,
+            })
+        })();
+        if target.is_err() {
+            // SAFETY: construction did not publish any resource or record any use.
+            // A resource whose creation failed still holds a null handle.
+            unsafe {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+        }
+        target
     }
 
     fn destroy_target(&mut self, target: Target) {
@@ -8905,6 +8919,28 @@ mod tests {
             renderer.read_target_level(1, 1).unwrap(),
             vec![green; 8 * 2]
         );
+    }
+
+    #[test]
+    fn target_allocation_failure_can_be_retried() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let memories = renderer.memory_types.memory_type_count;
+        renderer.memory_types.memory_type_count = 0;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let key = 1;
+        let error = renderer.target(key, 2, 2, format).err();
+        renderer.memory_types.memory_type_count = memories;
+        assert_eq!(error.as_deref(), Some("no memory type with DEVICE_LOCAL"));
+        assert!(renderer.existing_target(key).is_none());
+
+        renderer.target(key, 2, 2, format).unwrap();
+        let color = [1.0, 0.0, 1.0, 1.0];
+        renderer
+            .clear_color(key, None, vk::ClearColorValue { float32: color })
+            .unwrap();
+        assert_eq!(renderer.read_target(key).unwrap(), vec![color; 4]);
     }
 
     #[test]
