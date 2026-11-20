@@ -6879,16 +6879,44 @@ impl Nvn {
             }
             // Its pages may be released and reused: shared spans of them
             // would keep the old ones.
-            if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
+            let whole = backend.shared_pools.remove(&base);
+            let pieces = backend.shared_pieces.remove(&base);
+            let released = whole.iter().copied().chain(
+                pieces
+                    .iter()
+                    .flatten()
+                    .map(|&(_, size, file, offset)| (size, file, offset)),
+            );
+            for (size, _, offset) in released.clone() {
                 backend.renderer.release_file_range(offset, size);
             }
-            if let Some(pieces) = backend.shared_pieces.remove(&base) {
-                for (_, size, _, offset) in pieces {
-                    backend.renderer.release_file_range(offset, size);
-                }
+            if backend.pool_share_versions.remove(&base).is_none() {
+                return;
             }
-            if backend.pool_share_versions.remove(&base).is_some() {
-                backend.share_generation += 1;
+            backend.share_generation += 1;
+            // Other guest pools referring to the same file bytes can have
+            // pages pointing at the retired Vulkan buffer as well.
+            let overlaps = |size: u64, file, offset: u64| {
+                released.clone().any(|(length, backing, start)| {
+                    file == backing && offset < start + length && start < offset + size
+                })
+            };
+            let whole = backend
+                .shared_pools
+                .iter()
+                .filter_map(|(&base, &(size, file, offset))| {
+                    overlaps(size, file, offset).then_some(base)
+                });
+            let split = backend.shared_pieces.iter().filter_map(|(&base, pieces)| {
+                pieces
+                    .iter()
+                    .any(|&(_, size, file, offset)| overlaps(size, file, offset))
+                    .then_some(base)
+            });
+            for alias in whole.chain(split) {
+                backend
+                    .pool_share_versions
+                    .insert(alias, backend.share_generation);
             }
         }
     }
@@ -13787,6 +13815,14 @@ mod pool_tests {
             vec![(0, 0x100, 3, 0x8000), (0x200, 0x100, 3, 0xa000)],
         );
         backend.record_pool_share(0x1000);
+        backend.shared_pools.insert(0x2000, (0x100, 3, 0x8000));
+        backend.record_pool_share(0x2000);
+        backend
+            .shared_pieces
+            .insert(0x3000, vec![(0, 0x40, 3, 0xa040)]);
+        backend.record_pool_share(0x3000);
+        backend.shared_pools.insert(0x4000, (0x100, 3, 0xc000));
+        backend.record_pool_share(0x4000);
         let mut nvn = Nvn {
             gpu: Some(backend),
             gpu_checked: true,
@@ -13795,9 +13831,17 @@ mod pool_tests {
         assert_eq!(nvn.shared_guest_range(0x1020, 8).unwrap().start, 0x8020);
         assert_eq!(nvn.shared_guest_range(0x1200, 8).unwrap().start, 0xa000);
         let previous = nvn.pool_share_signature(0x1000, 4);
+        let whole_alias = nvn.pool_share_signature(0x2000, 4);
+        let split_alias = nvn.pool_share_signature(0x3000, 4);
+        let unrelated = nvn.pool_share_signature(0x4000, 4);
         nvn.gpu_forget_pool(0x1000);
         assert_eq!(nvn.shared_guest_range(0x1020, 8), None);
         assert_eq!(nvn.shared_guest_range(0x1200, 8), None);
+        assert_ne!(nvn.pool_share_signature(0x2000, 4), whole_alias);
+        assert_ne!(nvn.pool_share_signature(0x3000, 4), split_alias);
+        assert_eq!(nvn.pool_share_signature(0x4000, 4), unrelated);
+        assert_eq!(nvn.shared_guest_range(0x2000, 8).unwrap().start, 0x8000);
+        assert_eq!(nvn.shared_guest_range(0x3000, 8).unwrap().start, 0xa040);
 
         // A replacement with the same span count can point elsewhere.
         let backend = nvn.gpu.as_mut().unwrap();
