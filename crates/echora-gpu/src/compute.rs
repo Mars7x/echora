@@ -292,6 +292,9 @@ impl Renderer {
         if pool.is_some() {
             self.record_texture_pool_use();
         }
+        if !program.abi_stages.is_empty() {
+            self.record_page_table_read(dispatch.page_table.address);
+        }
         // SAFETY: recording outside rendering; the program and set are live.
         unsafe {
             let device = &self.gpu.device;

@@ -1282,6 +1282,9 @@ impl Renderer {
         if pool.is_some() {
             self.record_texture_pool_use();
         }
+        if abi.is_some() {
+            self.record_page_table_read(draw.page_table.address);
+        }
         // SAFETY: recording inside rendering; every handle is live.
         unsafe {
             if self.graphics.program != Some(program.pipeline_layout) {

@@ -1459,7 +1459,7 @@ impl Renderer {
         // Preserve the table in place when its only changes fill unmapped
         // pages. Keep the changed chunks so this comparison only runs once.
         const CHUNK: usize = 512;
-        let additions = self.page_table.as_ref().and_then(|table| {
+        let mut additions = self.page_table.as_ref().and_then(|table| {
             if table.first_page != first_page || table.entries.len() != entries.len() {
                 return None;
             }
@@ -1484,6 +1484,26 @@ impl Renderer {
             }
             Some(changed)
         });
+        if additions
+            .as_ref()
+            .is_some_and(|changed| !changed.is_empty())
+            && self
+                .page_table
+                .as_ref()
+                .is_some_and(|table| table.submitted_read > self.completed_serial)
+        {
+            self.poll_completed()?;
+            if self
+                .page_table
+                .as_ref()
+                .is_some_and(|table| table.submitted_read > self.completed_serial)
+            {
+                // Submitted shaders still read this mapping buffer. Keep
+                // those entries stable and give later commands a new one.
+                additions = None;
+                self.stat("stat: page tables replaced with submitted readers", 1);
+            }
+        }
         let extended = additions
             .as_ref()
             .is_some_and(|changed| !changed.is_empty());
@@ -1530,20 +1550,33 @@ impl Renderer {
             written.clear();
             written.extend_from_slice(entries);
             self.page_table = Some(PageTableBuffer {
+                address: self.buffer_address(buffer.buffer).unwrap_or(0),
                 buffer,
                 entries: written,
                 first_page,
+                recorded_read: false,
+                submitted_read: 0,
             });
         }
         let table = self.page_table.as_ref().unwrap();
         Ok((
             echora_shader_abi::PageTable {
-                address: self.buffer_address(table.buffer.buffer).unwrap_or(0),
+                address: table.address,
                 first_page,
                 page_count: entries.len() as u32,
             },
             extended,
         ))
+    }
+
+    /// Remember a command recorded with the current page-table buffer.
+    pub(crate) fn record_page_table_read(&mut self, address: u64) {
+        if address != 0
+            && let Some(table) = &mut self.page_table
+            && table.address == address
+        {
+            table.recorded_read = true;
+        }
     }
 
     /// The page table's entries as last written (`set_page_table`).
@@ -3315,6 +3348,11 @@ impl Renderer {
                 .or_default() += start.elapsed().as_nanos() as u64;
         }
         self.slot.in_flight = true;
+        if let Some(table) = &mut self.page_table
+            && std::mem::take(&mut table.recorded_read)
+        {
+            table.submitted_read = self.slot.serial;
+        }
         Ok(())
     }
 
@@ -7333,9 +7371,12 @@ impl Renderer {
 }
 
 struct PageTableBuffer {
+    address: u64,
     buffer: HostBuffer,
     entries: Vec<u64>,
     first_page: u32,
+    recorded_read: bool,
+    submitted_read: u64,
 }
 
 /// A mapped host-visible buffer.
@@ -7958,6 +7999,69 @@ mod tests {
         renderer.release_file_range(gap, page);
         assert!(renderer.packed.is_empty());
         assert!(renderer.superseded_spans().2);
+    }
+
+    #[test]
+    fn page_table_extension_preserves_a_submitted_readers_buffer() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let (buffer, _) = renderer.resident_buffer(9, 8192).unwrap();
+        let Some(address) = renderer.buffer_address(buffer) else {
+            return;
+        };
+        let (original, _) = renderer.set_page_table(8, &[address, 0]).unwrap();
+        let device = renderer.device().clone();
+        let mut timeline = vk::PhysicalDeviceVulkan12Features::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
+        // SAFETY: the instance and physical device are live.
+        unsafe {
+            renderer
+                .gpu
+                .instance
+                .get_physical_device_features2(renderer.gpu.physical, &mut features);
+        }
+        if timeline.timeline_semaphore == 0 {
+            return;
+        }
+        let mut kind =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
+        // SAFETY: the feature is enabled and the device is live.
+        let gate = unsafe { device.create_semaphore(&info, None) }.unwrap();
+
+        renderer.commands().unwrap();
+        renderer.record_page_table_read(original.address);
+        let wait = [gate];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut value = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&[1]);
+        let prior = vk::SubmitInfo::default()
+            .wait_semaphores(&wait)
+            .wait_dst_stage_mask(&stages)
+            .push_next(&mut value);
+        let queue = renderer.gpu.queue;
+        {
+            let _hold = renderer.queue_lock.lock().unwrap();
+            // SAFETY: the queue is held and the live timeline semaphore
+            // is signaled below, before waiting for either submission.
+            unsafe { device.queue_submit(queue, &[prior], vk::Fence::null()) }.unwrap();
+        }
+        let submitted = renderer.submit_frame();
+        let replacement = renderer.set_page_table(8, &[address, address + 4096]);
+        let signal = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
+        // SAFETY: signal a new value on a live timeline semaphore.
+        let released = unsafe { device.signal_semaphore(&signal) };
+        let finished = renderer.flush();
+        submitted.unwrap();
+        released.unwrap();
+        finished.unwrap();
+        // SAFETY: the last submission's fence orders the earlier wait.
+        unsafe { device.destroy_semaphore(gate, None) };
+
+        let (after, extended) = replacement.unwrap();
+        assert!(!extended);
+        assert_ne!(original.address, after.address);
+        assert_eq!(renderer.page_table_entries(), [address, address + 4096]);
     }
 
     #[test]
