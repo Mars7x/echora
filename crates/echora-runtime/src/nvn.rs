@@ -5729,13 +5729,8 @@ impl Nvn {
                     .gpu_read_texels(core, texture, transfer, guest)
                     .map_err(stop)?
                 {
-                    if let Some((base, length)) = self
-                        .texture_storage(texture)
-                        .zip(self.texture_storage_size(texture))
-                    {
-                        self.resolve_gpu_written(core, base..base + length)
-                            .map_err(stop)?;
-                    }
+                    self.resolve_texture_copy_read(core, texture)
+                        .map_err(stop)?;
                     self.copy_texels(core, texture, transfer, guest, false)
                         .map_err(|error| error.into_trap(&command.name, core.cpu.pc))?;
                 }
@@ -6380,7 +6375,7 @@ impl Nvn {
     }
 
     fn copy_texels(
-        &self,
+        &mut self,
         core: &mut Guest,
         texture: u64,
         transfer: TexelTransfer,
@@ -6459,15 +6454,6 @@ impl Nvn {
                 "region {rx},{ry} {rw}x{rh} outside {width}x{height}"
             )));
         }
-        let storage = texture
-            .builder
-            .get("Storage")
-            .ok_or_else(|| TexelError::Stop("texture has no storage".into()))?;
-        self.object(storage.x[0], "MemoryPool")
-            .map_err(TexelError::Invalid)?;
-        let base = self
-            .texture_storage(texture_object)
-            .ok_or_else(|| TexelError::Stop("texture storage is in no mapped memory".into()))?;
         let (bw, bh) = (info.block_width, info.block_height);
         if rx % bw != 0 || ry % bh != 0 {
             return Err(TexelError::Invalid("region is not block aligned".into()));
@@ -6482,20 +6468,34 @@ impl Nvn {
         let [base_width, base_height, base_depth] = base_extent;
         let shape =
             crate::nvn_format::level_block_shape(info, base_height, base_depth, layout, level);
-        let base = base
-            + crate::nvn_format::block_linear_level_offset(
-                info,
-                base_width,
-                base_height,
-                base_depth,
-                layout,
-                level,
-            );
+        let level_offset = crate::nvn_format::block_linear_level_offset(
+            info,
+            base_width,
+            base_height,
+            base_depth,
+            layout,
+            level,
+        );
+        let storage = texture
+            .builder
+            .get("Storage")
+            .ok_or_else(|| TexelError::Stop("texture has no storage".into()))?;
+        let size = self
+            .texture_storage_size(texture_object)
+            .ok_or_else(|| TexelError::Stop("texture storage size is unknown".into()))?;
+        let backing = self
+            .texture_backing(storage, size)
+            .map_err(TexelError::Stop)?;
+        let base = match &backing {
+            gpu::TextureBacking::Linear((_, range)) => Some(range.start),
+            gpu::TextureBacking::Virtual { .. } => None,
+        };
         // A copy into the whole of a single 2D block-linear level (a movie
         // picture every present): tiled in memory with the rows' 16-byte
         // runs, then written back at once, instead of a guest write per run.
         // The level's storage is read first so its padding keeps its bytes.
-        if to_texture
+        if let Some(base) = base
+            && to_texture
             && stride == 0
             && level == 0
             && matches!(target, 1 | 7)
@@ -6537,76 +6537,111 @@ impl Nvn {
             *self.tiled_scratch.borrow_mut() = tiled;
             // A single-level texture's upload can take these rows as they
             // are while its storage stays as written here.
-            let copied = (get("Levels").unwrap_or(1) <= 1).then(|| {
+            let copied = (levels == 1).then(|| {
                 let sample = gpu::texture_sample(core, base, size, format, [width, height, 1]);
                 (sample, linear)
             });
             return Ok(copied);
         }
-        let mut line = vec![0u8; row_size as usize];
-        // Move `length` bytes between the CPU line at `start` and texture
-        // storage at `address`, in the copy's direction.
-        let transfer = |core: &mut Guest, line: &mut [u8], address: u64| {
-            if to_texture {
-                core.memory.write(address, line)
-            } else {
-                core.memory.read(address, line)
-            }
-            .map_err(TexelError::Trap)
-        };
-        for slice in 0..rd {
-            for row in 0..rows {
-                let from = source
-                    + u64::from(slice) * linear.image_stride
-                    + u64::from(row) * linear.row_stride;
-                if to_texture {
-                    core.memory
-                        .read(from, &mut line)
-                        .map_err(TexelError::Trap)?;
-                }
-                if target == 10 {
-                    // Buffer textures have one linear row.
-                    transfer(core, &mut line, base + u64::from(rx) * bytes)?;
-                } else if stride != 0 {
-                    let offset = u64::from(ry / bh + row) * stride + u64::from(rx / bw) * bytes;
-                    transfer(core, &mut line, base + offset)?;
-                } else {
-                    let (z, layer) = if layers > 1 {
-                        (0, u64::from(rz + slice))
-                    } else {
-                        (rz + slice, 0)
-                    };
-                    // A run of blocks at consecutive addresses at a time.
-                    let mut column = 0;
-                    while column < columns {
-                        let x = rx / bw + column;
-                        let run =
-                            crate::nvn_format::block_linear_run(info, x).min(columns - column);
-                        let offset = layer * layer_stride
-                            + crate::nvn_format::block_linear_offset_in(
-                                info,
-                                width,
-                                height,
-                                shape,
-                                x,
-                                ry / bh + row,
-                                z,
-                            );
-                        let start = (u64::from(column) * bytes) as usize;
-                        transfer(
-                            core,
-                            &mut line[start..start + (u64::from(run) * bytes) as usize],
-                            base + offset,
-                        )?;
-                        column += run;
-                    }
-                }
-                if !to_texture {
-                    core.memory.write(from, &line).map_err(TexelError::Trap)?;
-                }
+        if base.is_none() {
+            for (_, range) in backing.pieces() {
+                self.resolve_storage(core, Some(range.clone()))
+                    .map_err(TexelError::Stop)?;
             }
         }
-        Ok(None)
+        let mut line = vec![0u8; row_size as usize];
+        let mut written = Vec::new();
+        // Move `length` bytes between the CPU line at `start` and texture
+        // storage at `offset`, in the copy's direction.
+        let mut transfer = |core: &mut Guest, line: &mut [u8], offset: u64| {
+            let offset = level_offset + offset;
+            if let Some(base) = base {
+                return if to_texture {
+                    core.memory.write(base + offset, line)
+                } else {
+                    core.memory.read(base + offset, line)
+                }
+                .map_err(TexelError::Trap);
+            }
+            // Unmapped bytes behave as they do in a sampled upload.
+            if !to_texture {
+                line.fill(0);
+            }
+            for (start, range) in backing.subranges(offset, line.len()) {
+                let end = start + (range.end - range.start) as usize;
+                if to_texture {
+                    core.memory
+                        .write(range.start, &line[start..end])
+                        .map_err(TexelError::Trap)?;
+                    written.push(range);
+                } else {
+                    core.memory
+                        .read(range.start, &mut line[start..end])
+                        .map_err(TexelError::Trap)?;
+                }
+            }
+            Ok(())
+        };
+        let result = (|| {
+            for slice in 0..rd {
+                for row in 0..rows {
+                    let from = source
+                        + u64::from(slice) * linear.image_stride
+                        + u64::from(row) * linear.row_stride;
+                    if to_texture {
+                        core.memory
+                            .read(from, &mut line)
+                            .map_err(TexelError::Trap)?;
+                    }
+                    if target == 10 {
+                        // Buffer textures have one linear row.
+                        transfer(core, &mut line, u64::from(rx) * bytes)?;
+                    } else if stride != 0 {
+                        let offset = u64::from(ry / bh + row) * stride + u64::from(rx / bw) * bytes;
+                        transfer(core, &mut line, offset)?;
+                    } else {
+                        let (z, layer) = if layers > 1 {
+                            (0, u64::from(rz + slice))
+                        } else {
+                            (rz + slice, 0)
+                        };
+                        // A run of blocks at consecutive addresses at a time.
+                        let mut column = 0;
+                        while column < columns {
+                            let x = rx / bw + column;
+                            let run =
+                                crate::nvn_format::block_linear_run(info, x).min(columns - column);
+                            let offset = layer * layer_stride
+                                + crate::nvn_format::block_linear_offset_in(
+                                    info,
+                                    width,
+                                    height,
+                                    shape,
+                                    x,
+                                    ry / bh + row,
+                                    z,
+                                );
+                            let start = (u64::from(column) * bytes) as usize;
+                            transfer(
+                                core,
+                                &mut line[start..start + (u64::from(run) * bytes) as usize],
+                                offset,
+                            )?;
+                            column += run;
+                        }
+                    }
+                    if !to_texture {
+                        core.memory.write(from, &line).map_err(TexelError::Trap)?;
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        gpu::merge_ranges(&mut written);
+        for range in written {
+            self.gpu_invalidate(range, None);
+        }
+        result
     }
 
     /// The code window of the stage at GPU address `gpu` (up to 256 KiB:

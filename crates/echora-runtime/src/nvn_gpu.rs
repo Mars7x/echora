@@ -67,7 +67,7 @@ impl TextureBacking {
         Self::Linear((0, base..base + size))
     }
 
-    fn pieces(&self) -> &[(u64, std::ops::Range<u64>)] {
+    pub(super) fn pieces(&self) -> &[(u64, std::ops::Range<u64>)] {
         match self {
             Self::Linear(piece) => std::slice::from_ref(piece),
             Self::Virtual { pieces, .. } => pieces,
@@ -81,27 +81,39 @@ impl TextureBacking {
         }
     }
 
+    /// Offsets within a request and the physical ranges that back them.
+    pub(super) fn subranges(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Iterator<Item = (usize, std::ops::Range<u64>)> + '_ {
+        let end = offset + length as u64;
+        let pieces = self.pieces();
+        let first =
+            pieces.partition_point(|(start, range)| start + (range.end - range.start) <= offset);
+        pieces[first..]
+            .iter()
+            .take_while(move |(start, _)| *start < end)
+            .map(move |(start, range)| {
+                let left = offset.max(*start);
+                let right = end.min(start + (range.end - range.start));
+                let physical = range.start + (left - start);
+                (
+                    (left - offset) as usize,
+                    physical..physical + (right - left),
+                )
+            })
+    }
+
     fn read_into(&self, core: &Guest, offset: u64, bytes: &mut [u8]) {
         if let Self::Linear((_, range)) = self {
             read_storage_into(core, range.start + offset, bytes);
             return;
         }
         bytes.fill(0);
-        let end = offset + bytes.len() as u64;
-        let pieces = self.pieces();
-        let first =
-            pieces.partition_point(|(start, range)| start + (range.end - range.start) <= offset);
-        for (start, range) in &pieces[first..] {
-            if *start >= end {
-                break;
-            }
-            let left = offset.max(*start);
-            let right = end.min(start + (range.end - range.start));
-            read_storage_into(
-                core,
-                range.start + (left - start),
-                &mut bytes[(left - offset) as usize..(right - offset) as usize],
-            );
+        for (start, range) in self.subranges(offset, bytes.len()) {
+            let end = start + (range.end - range.start) as usize;
+            read_storage_into(core, range.start, &mut bytes[start..end]);
         }
     }
 
@@ -3456,7 +3468,11 @@ impl Nvn {
         self.pool_for(gpu).map(|(guest, _)| guest)
     }
 
-    fn texture_backing(&self, storage: &super::Args, size: u64) -> Result<TextureBacking, String> {
+    pub(super) fn texture_backing(
+        &self,
+        storage: &super::Args,
+        size: u64,
+    ) -> Result<TextureBacking, String> {
         let pool = self.object(storage.x[0], "MemoryPool")?;
         let [base, pool_size, ..] = pool
             .builder
@@ -3895,17 +3911,33 @@ impl Nvn {
         core: &mut Guest,
         texture: u64,
     ) -> Result<(TextureSource, Option<TextureBacking>), String> {
-        let storage = self.objects.get(&texture).and_then(|object| {
-            let size = self.texture_storage_size(texture)?;
-            self.texture_backing(object.builder.get("Storage")?, size)
-                .ok()
-        });
+        let storage = self.texture_object_backing(texture);
         if let Some(backing) = &storage {
             for (_, range) in backing.pieces() {
                 self.resolve_storage(core, Some(range.clone()))?;
             }
         }
         Ok((self.texture_source(core, texture)?, storage))
+    }
+
+    fn texture_object_backing(&self, texture: u64) -> Option<TextureBacking> {
+        let object = self.objects.get(&texture)?;
+        let size = self.texture_storage_size(texture)?;
+        self.texture_backing(object.builder.get("Storage")?, size)
+            .ok()
+    }
+
+    pub(super) fn resolve_texture_copy_read(
+        &mut self,
+        core: &mut Guest,
+        texture: u64,
+    ) -> Result<(), String> {
+        if let Some(backing) = self.texture_object_backing(texture) {
+            for (_, range) in backing.pieces() {
+                self.resolve_gpu_written(core, range.clone())?;
+            }
+        }
+        Ok(())
     }
 
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
@@ -11285,7 +11317,7 @@ fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str
     })
 }
 
-fn merge_ranges(ranges: &mut Vec<std::ops::Range<u64>>) {
+pub(super) fn merge_ranges(ranges: &mut Vec<std::ops::Range<u64>>) {
     ranges.sort_unstable_by_key(|range| range.start);
     ranges.dedup_by(|next, previous| {
         if next.start <= previous.end {
@@ -12257,6 +12289,46 @@ mod target_tests {
         guest.memory.write(physical, &red).unwrap();
         nvn.gpu_invalidate(physical..physical + 4, None);
         assert_eq!(upload(&mut nvn, &mut guest)[0x2100..0x2104], red);
+
+        // Transfer three pitch rows with an unmapped middle row. The
+        // neighboring physical pages hold unrelated data.
+        let input = base + 0x12_0000;
+        let output = base + 0x13_0000;
+        for (row, sample) in [0x31, 0x52, 0x73].into_iter().enumerate() {
+            guest
+                .memory
+                .write(input + row as u64 * 0x1000, &[sample; 0x1000])
+                .unwrap();
+        }
+        let transfer = crate::nvn::TexelTransfer {
+            region: [0, 0, 0, 1024, 3, 1],
+            bases: [0; 2],
+            strides: [0; 2],
+        };
+        assert!(
+            nvn.copy_texels(&mut guest, texture, transfer, input, true)
+                .is_ok()
+        );
+        assert_eq!(
+            guest.memory.read_u32(base + 0x61_000).unwrap(),
+            u32::from_le_bytes(blue)
+        );
+        assert_eq!(
+            guest.memory.read_u32(base + 0x62_100).unwrap(),
+            u32::from_le_bytes(blue)
+        );
+        let updated = upload(&mut nvn, &mut guest);
+        assert_eq!(updated[0..4], [0x31; 4]);
+        assert_eq!(updated[0x2100..0x2104], [0x73; 4]);
+        assert!(
+            nvn.copy_texels(&mut guest, texture, transfer, output, false)
+                .is_ok()
+        );
+        let mut read = [0xff; 0x3000];
+        guest.memory.read(output, &mut read).unwrap();
+        assert_eq!(&read[..0x1000], &[0x31; 0x1000]);
+        assert_eq!(&read[0x1000..0x2000], &[0; 0x1000]);
+        assert_eq!(&read[0x2000..], &[0x73; 0x1000]);
 
         map(&mut nvn, &mut guest, [0, 0, 0, 0x1000]);
         map(
