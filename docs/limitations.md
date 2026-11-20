@@ -115,7 +115,10 @@ to be missing or incomplete.
   updated translation on the next launch. The build and branch match the
   [Lichii Max Resolution add-on](https://github.com/zortos293/Lichii/blob/17baed7/src/core/file_sys/patch_manager.cpp).
   SMAA is also off by default. Enable it under Game → Add-ons to use the
-  game's edge blending. NDSR runs in both modes.
+  game's edge blending. Sharpening is on by default. Turn it off under
+  Game → Add-ons to zero the game's sharpening strength in both the
+  fixed and adaptive NDSR resolves. The game's reconstruction and
+  presentation still run.
 - Vertical sync uses tear-free mailbox presentation when available. Adaptive
   sync prefers relaxed FIFO. Disabling sync prefers immediate presentation,
   then mailbox. The fallback is FIFO.

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use echora_config::OcarinaOfTimeAddons;
 use echora_gpu::{
     ash::vk,
     draw::{ImageShape, Sampler, TextureSource},
@@ -18,27 +19,47 @@ const OCARINA_BUILD_ID: [u8; 32] = [
 const RESOLUTION_BRANCH: u64 = 0x80_5bd0;
 const RESOLUTION_BRANCH_WORD: u32 = 0x3600_41e8;
 const FIXED_RESOLUTION_PATH: u64 = 0x80_640c;
-const NDSR_NETWORK_STAGE: u64 = 0x4259_3194_bb0b_2b32;
+const NDSR_INPUT_PREP: u64 = 0x4259_3194_bb0b_2b32;
 const NDSR_WEIGHT_HANDLE: u32 = 0xb8;
+const NDSR_FIXED_RESOLVE: u64 = 0xda6d_f3e5_4c71_6df2;
+const NDSR_ADAPTIVE_RESOLVE: u64 = 0xf48d_b748_1be8_56b9;
+const NDSR_SHARPENING_STRENGTH: std::ops::Range<usize> = 0x80..0x84;
 const NEUTRAL_WEIGHTS_TARGET: u64 = u64::MAX - 7;
 
 #[derive(Debug, Default)]
 pub(crate) struct GraphicsAddons {
     neutral_smaa_weights: bool,
+    disable_ndsr_sharpening: bool,
 }
 
 impl GraphicsAddons {
-    pub(crate) fn for_game(program_id: u64, modules: &[PlacedModule], smaa: bool) -> Self {
+    pub(crate) fn for_game(
+        program_id: u64,
+        modules: &[PlacedModule],
+        options: &OcarinaOfTimeAddons,
+    ) -> Self {
         let supported = modules.iter().any(|placed| {
             placed.module.name == "main" && matches_ocarina_build(program_id, &placed.module)
         });
         Self {
-            neutral_smaa_weights: supported && !smaa,
+            neutral_smaa_weights: supported && !options.smaa,
+            disable_ndsr_sharpening: supported && !options.sharpening,
+        }
+    }
+
+    /// Both resolve shaders read the gain for their sharpening filter from
+    /// c0. Zero gain keeps the rest of the resolve and its output intact.
+    pub(crate) fn apply_compute_constants(&self, code_key: u64, constants: &mut [u8]) {
+        if self.disable_ndsr_sharpening
+            && matches!(code_key, NDSR_FIXED_RESOLVE | NDSR_ADAPTIVE_RESOLVE)
+            && let Some(strength) = constants.get_mut(NDSR_SHARPENING_STRENGTH)
+        {
+            strength.fill(0);
         }
     }
 
     fn weight_binding(&self, code_key: u64, stage: &Translated) -> Option<u32> {
-        if !self.neutral_smaa_weights || code_key != NDSR_NETWORK_STAGE {
+        if !self.neutral_smaa_weights || code_key != NDSR_INPUT_PREP {
             return None;
         }
         stage
@@ -53,8 +74,8 @@ impl GraphicsAddons {
             .map(|descriptor| descriptor.binding)
     }
 
-    /// The game's network consumes the SMAA weight plane. A cleared plane
-    /// disables its contribution while the game's network and output pass
+    /// The game blends SMAA weights when it prepares input for NDSR.
+    /// A cleared plane disables edge blending while the resolve and output pass
     /// continue to run, including the adaptive-resolve path.
     pub(crate) fn apply_compute_textures(
         &self,
@@ -165,7 +186,7 @@ mod tests {
     use echora_loader::{Compression, Segment};
 
     #[test]
-    fn smaa_override_only_selects_the_network_weight_binding() {
+    fn smaa_override_only_selects_the_input_weights() {
         use echora_gpu::shader::Descriptor;
         use echora_shader_abi::{ABI_VERSION, Stage};
         let stage = Translated {
@@ -201,13 +222,36 @@ mod tests {
         };
         let off = GraphicsAddons {
             neutral_smaa_weights: true,
+            ..Default::default()
         };
-        assert_eq!(off.weight_binding(NDSR_NETWORK_STAGE, &stage), Some(2));
-        assert_eq!(off.weight_binding(NDSR_NETWORK_STAGE + 1, &stage), None);
+        assert_eq!(off.weight_binding(NDSR_INPUT_PREP, &stage), Some(2));
+        assert_eq!(off.weight_binding(NDSR_INPUT_PREP + 1, &stage), None);
         assert_eq!(
-            GraphicsAddons::default().weight_binding(NDSR_NETWORK_STAGE, &stage),
+            GraphicsAddons::default().weight_binding(NDSR_INPUT_PREP, &stage),
             None
         );
+    }
+
+    #[test]
+    fn sharpening_override_only_zeros_the_resolve_gain() {
+        let off = GraphicsAddons {
+            disable_ndsr_sharpening: true,
+            ..Default::default()
+        };
+        let original = [0xff; 192];
+        let mut expected = original;
+        expected[128..132].fill(0);
+        for code_key in [NDSR_FIXED_RESOLVE, NDSR_ADAPTIVE_RESOLVE] {
+            let mut constants = original;
+            GraphicsAddons::default().apply_compute_constants(code_key, &mut constants);
+            assert_eq!(constants, original);
+            off.apply_compute_constants(code_key, &mut constants);
+            assert_eq!(constants, expected);
+        }
+        let mut constants = original;
+        off.apply_compute_constants(NDSR_INPUT_PREP, &mut constants);
+        off.apply_compute_constants(NDSR_FIXED_RESOLVE, &mut constants[..131]);
+        assert_eq!(constants, original);
     }
 
     #[test]

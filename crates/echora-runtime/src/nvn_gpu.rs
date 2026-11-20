@@ -5381,6 +5381,8 @@ impl Nvn {
             if descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0 {
                 let used = (stage.cbuf_used_sizes[0] as usize).max(16);
                 let mut bytes = c0.clone();
+                self.graphics_addons
+                    .apply_compute_constants(code_key, &mut bytes);
                 bytes.resize(used.max(bytes.len()), 0);
                 uniforms.insert(descriptor.binding, bytes);
             }

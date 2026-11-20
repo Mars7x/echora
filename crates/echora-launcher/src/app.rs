@@ -1630,6 +1630,22 @@ impl Launcher {
                                     },
                                     cx,
                                 ),
+                                switch(
+                                    "ocarina-sharpening",
+                                    ui::titles(
+                                        "Sharpening",
+                                        Some(
+                                            "Sharpen the image during Ocarina of Time's resolve."
+                                                .into(),
+                                        ),
+                                    ),
+                                    settings.addons.ocarina_of_time.sharpening,
+                                    |settings| {
+                                        let options = &mut settings.addons.ocarina_of_time;
+                                        options.sharpening = !options.sharpening;
+                                    },
+                                    cx,
+                                ),
                             ],
                         )
                         .into_any_element(),

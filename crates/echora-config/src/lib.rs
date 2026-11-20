@@ -194,13 +194,25 @@ pub struct AddonSettings {
     pub ocarina_of_time: OcarinaOfTimeAddons,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OcarinaOfTimeAddons {
     /// Let the game vary its scene resolution as it does on the console.
     pub dynamic_resolution: bool,
     /// Use the game's SMAA blend weights in its NDSR pass.
     pub smaa: bool,
+    /// Apply the game's sharpening within the NDSR resolve.
+    pub sharpening: bool,
+}
+
+impl Default for OcarinaOfTimeAddons {
+    fn default() -> Self {
+        Self {
+            dynamic_resolution: false,
+            smaa: false,
+            sharpening: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +413,7 @@ pub enum SettingKey {
     GraphicsDevice,
     OcarinaOfTimeDynamicResolution,
     OcarinaOfTimeSmaa,
+    OcarinaOfTimeSharpening,
     FrameLimit,
     AudioDevice,
     Volume,
@@ -423,10 +436,10 @@ impl SettingKey {
             // Guest GPU objects live in the backend; rebuilding them under a
             // different device is not supported, so these wait for a restart.
             Self::Backend | Self::GraphicsDevice => GameRestart,
-            // Workers are set up when the game starts.
-            Self::Workers | Self::OcarinaOfTimeDynamicResolution | Self::OcarinaOfTimeSmaa => {
-                GameRestart
-            }
+            Self::Workers
+            | Self::OcarinaOfTimeDynamicResolution
+            | Self::OcarinaOfTimeSmaa
+            | Self::OcarinaOfTimeSharpening => GameRestart,
         }
     }
 }
@@ -598,6 +611,10 @@ impl Settings {
         diff(
             a.addons.ocarina_of_time.smaa != b.addons.ocarina_of_time.smaa,
             SettingKey::OcarinaOfTimeSmaa,
+        );
+        diff(
+            a.addons.ocarina_of_time.sharpening != b.addons.ocarina_of_time.sharpening,
+            SettingKey::OcarinaOfTimeSharpening,
         );
         diff(a.frame.limit != b.frame.limit, SettingKey::FrameLimit);
         diff(a.audio.device != b.audio.device, SettingKey::AudioDevice);
@@ -830,6 +847,19 @@ mod tests {
             [(SettingKey::OcarinaOfTimeSmaa, ApplyClass::GameRestart)]
         );
         assert_eq!(Settings::from_toml(&enabled.to_toml()).unwrap(), enabled);
+    }
+
+    #[test]
+    fn sharpening_defaults_on_and_can_be_disabled() {
+        let legacy = Settings::from_toml("[addons.ocarina_of_time]\nsmaa = false").unwrap();
+        assert!(legacy.addons.ocarina_of_time.sharpening);
+        let disabled = Settings::from_toml("[addons.ocarina_of_time]\nsharpening = false").unwrap();
+        assert!(!disabled.addons.ocarina_of_time.sharpening);
+        assert_eq!(
+            legacy.changes(&disabled),
+            [(SettingKey::OcarinaOfTimeSharpening, ApplyClass::GameRestart)]
+        );
+        assert_eq!(Settings::from_toml(&disabled.to_toml()).unwrap(), disabled);
     }
 
     #[test]

@@ -276,7 +276,7 @@ pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
     }
     let options = &crate::settings::get().addons.ocarina_of_time;
     machine.nvn.graphics_addons =
-        crate::addons::GraphicsAddons::for_game(npdm.program_id, &placed, options.smaa);
+        crate::addons::GraphicsAddons::for_game(npdm.program_id, &placed, options);
     if let Some(branch) = crate::addons::resolution_branch(npdm.program_id, &placed) {
         machine.nvn.add_hook(
             branch.address,
