@@ -294,9 +294,12 @@ impl Memory {
     }
 
     pub fn resize_heap(&mut self, base: u64, old_size: u64, new_size: u64) -> Result<(), Trap> {
-        let result = self.resize_heap_unsynced(base, old_size, new_size);
-        self.sync_guest_view(&[(base, old_size.max(new_size))]);
-        result
+        self.resize_heap_unsynced(base, old_size, new_size)?;
+        let changed = old_size.abs_diff(new_size);
+        if changed != 0 {
+            self.sync_guest_view(&[(base + old_size.min(new_size), changed)]);
+        }
+        Ok(())
     }
 
     pub fn lock_range(
@@ -364,29 +367,60 @@ impl Memory {
             let mut runs: Vec<(u64, u64, Option<u64>, u8)> = Vec::new();
             let mut page = start;
             while page < end {
-                let (backing, access) = match self.guest_view_page(page) {
-                    Some((backing, access)) => (Some(backing), access),
-                    None => (None, 0),
-                };
+                let (backing, access, next) = self.guest_view_run(page, end);
+                let length = next - page;
                 match runs.last_mut() {
-                    Some((_, length, run_backing, run_access))
+                    Some((_, run_length, run_backing, run_access))
                         if *run_access == access
                             && match (*run_backing, backing) {
-                                (Some(first), Some(next)) => first + *length == next,
+                                (Some(first), Some(backing)) => first + *run_length == backing,
                                 (None, None) => true,
                                 _ => false,
                             } =>
                     {
-                        *length += PAGE_SIZE;
+                        *run_length += length;
                     }
-                    _ => runs.push((page, PAGE_SIZE, backing, access)),
+                    _ => runs.push((page, length, backing, access)),
                 }
-                page += PAGE_SIZE;
+                page = next;
             }
             for (address, length, backing, access) in runs {
                 self.pages.host.map_guest(address, length, backing, access);
             }
         }
+    }
+
+    /// The backing and access over a run of pages in the guest view.
+    fn guest_view_run(&self, page: u64, end: u64) -> (Option<u64>, u8, u64) {
+        let Some(mapping) = self.mapping_at(page) else {
+            let next = self
+                .mappings
+                .range((std::ops::Bound::Excluded(page), std::ops::Bound::Unbounded))
+                .next();
+            let next_page = next.map_or(end, |(&base, _)| base.next_multiple_of(PAGE_SIZE));
+            return (None, 0, next_page.min(end));
+        };
+        let mapped_end = end.min(mapping.end() & !(PAGE_SIZE - 1));
+        if mapped_end <= page {
+            return (None, 0, page + PAGE_SIZE);
+        }
+        if mapping.state == STATE_FREE {
+            return (None, 0, mapped_end);
+        }
+        let (backing, mapped_end) = self.backing_span(page, mapped_end);
+        let access = mapping.permissions & (READ | WRITE);
+        let backing_end = backing + (mapped_end - page);
+        if access & WRITE != 0
+            && self.translated_ranges.iter().any(|&(start, stop)| {
+                (page < stop && start < mapped_end) || (backing < stop && start < backing_end)
+            })
+        {
+            // A range of translated code can start or end within the run.
+            // Apply its existing per-page protection there, including aliases.
+            let (backing, access) = self.guest_view_page(page).expect("mapped page");
+            return (Some(backing), access, page + PAGE_SIZE);
+        }
+        (Some(backing), access, mapped_end)
     }
 
     /// The backing page and READ/WRITE access of guest page `page` in the
@@ -1545,7 +1579,7 @@ impl Memory {
             cursor = mapping.end();
         }
         if new_size > old_size {
-            self.map(
+            self.map_unsynced(
                 old_end,
                 new_size - old_size,
                 READ | WRITE,
@@ -1892,6 +1926,38 @@ mod tests {
             .map(0x10000, 0x4000, READ | WRITE, STATE_NORMAL, "heap")
             .unwrap();
         assert_eq!(memory.load_u64(0x10008), 0);
+    }
+
+    #[test]
+    fn guest_view_runs_match_page_mappings_and_access() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x4000, 0x5000, READ | WRITE, STATE_NORMAL, "data")
+            .unwrap();
+        memory.map_stack_alias(0x10000, 0x5000, 0x2000).unwrap();
+        memory.set_permissions(0x8000, 0x1000, READ).unwrap();
+        memory.protect_translated_code(0x610c, 0x24).unwrap();
+        memory
+            .map(0xc000, 0x3000, READ, STATE_NORMAL, "split")
+            .unwrap();
+        // The gap ends inside a page, so the next full page is still mapped.
+        memory.split_at(0xc080);
+        memory.mappings.remove(&0xc000);
+
+        let end = 0x14000;
+        let mut page = 0;
+        while page < end {
+            let (backing, access, next) = memory.guest_view_run(page, end);
+            assert!(next > page && next <= end && next.is_multiple_of(PAGE_SIZE));
+            for address in (page..next).step_by(PAGE_SIZE as usize) {
+                assert_eq!(
+                    memory.guest_view_page(address),
+                    backing.map(|backing| (backing + address - page, access)),
+                    "guest page {address:#x}"
+                );
+            }
+            page = next;
+        }
     }
 
     #[test]
@@ -2330,8 +2396,10 @@ mod tests {
         m.resize_heap(0x1000, 0x3000, 0x5000).unwrap();
         assert_eq!(m.read_u64(0x8000).unwrap(), 42);
         assert_eq!(m.query(0x2000).attributes, ATTRIBUTE_LOCKED);
-        assert_eq!(m.read_u64(0x4000).unwrap(), 0);
-        m.write_u64(0x5000, 99).unwrap();
+        let mut view = m.view();
+        assert_eq!(view.load_u64(0x4000), 0);
+        view.store_u64(0x5000, 99);
+        assert_eq!(m.read_u64(0x5000).unwrap(), 99);
         m.resize_heap(0x1000, 0x5000, 0x3000).unwrap();
         assert_eq!(m.query(0x4000).state, STATE_FREE);
         assert!(!m.pages.contains_key(&0x5000));
