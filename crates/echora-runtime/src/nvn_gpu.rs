@@ -6511,13 +6511,16 @@ impl Nvn {
             .collect();
         if writes_page_table {
             let serial = backend.renderer.recorded_serial();
-            if bounded
+            let uniform_writes = bounded
                 .as_ref()
-                .is_some_and(|writes| !writes.virtual_ranges.is_empty())
-            {
-                backend.stat("stat: bounded uniform writes", 1);
-            }
+                .is_some_and(|writes| !writes.virtual_ranges.is_empty());
             backend.record_page_table_write(serial, bounded);
+            if uniform_writes {
+                backend.stat("stat: bounded uniform writes", 1);
+                // Start an existing batch before a later draw needs its
+                // results on the CPU. The draw still waits for its writer.
+                backend.renderer.submit_for_cpu_dependency()?;
+            }
         }
         backend.stat(
             "stat: dispatch renderer microseconds",

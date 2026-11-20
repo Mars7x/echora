@@ -3228,6 +3228,17 @@ impl Renderer {
         Ok(())
     }
 
+    /// Start GPU work early when the CPU may need a result. Keep small
+    /// recordings together so an early submission can overlap useful work.
+    pub fn submit_for_cpu_dependency(&mut self) -> Result<(), String> {
+        const MIN_BATCH_ITEMS: u32 = 32;
+        if self.recording && self.work_items >= MIN_BATCH_ITEMS {
+            self.flush_async()?;
+            self.stat("stat: early CPU dependency submissions", 1);
+        }
+        Ok(())
+    }
+
     /// Whether the submit thread's vkQueueSubmit of batch `handed` has
     /// returned (always, for batches submitted on this thread).
     fn submit_returned(&self, handed: u64) -> bool {
