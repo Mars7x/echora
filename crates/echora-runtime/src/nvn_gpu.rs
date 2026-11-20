@@ -1615,13 +1615,10 @@ impl Nvn {
         self.ensure_render_target(texture)?;
         let scissor = self.render.scissor;
         let layer = self.render.depth_layer;
-        if !has_stencil
-            && self
-                .gpu
-                .as_ref()
-                .unwrap()
-                .renderer
-                .partial_write_needs_initialization(texture, 0, layer, scissor)
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        let untouched_aspect = has_stencil && (depth.is_none() || stencil.is_none());
+        if (untouched_aspect && renderer.target_needs_initialization(texture))
+            || renderer.partial_write_needs_initialization(texture, 0, layer, scissor)
         {
             self.initialize_new_targets(core);
         }
@@ -4184,13 +4181,9 @@ impl Nvn {
         // noted.
         let limit = self.gpu.as_ref().unwrap().max_extent;
         let beyond_limit = width > limit || height > limit;
-        // Combined depth and stencil require two separate Vulkan copies.
-        if echora_gpu::renderer::has_stencil(vk_format) {
-            return Err(format!(
-                "{} texture needs separate upload planes",
-                info.name
-            ));
-        }
+        // The combined NVN encodings are packed. Vulkan transfers the
+        // depth and stencil planes individually.
+        let combined_depth_stencil = echora_gpu::renderer::has_stencil(vk_format);
         // Vulkan buffer offsets for a depth copy are four-byte aligned.
         let upload_alignment = if echora_gpu::renderer::is_depth(vk_format) {
             4
@@ -4406,6 +4399,7 @@ impl Nvn {
         let identity = matches!(shape, ImageShape::D3 { .. })
             && block == 4
             && !astc
+            && !combined_depth_stencil
             && super::debug_var_os("ECHORA_IDENTITY_LUT").is_some();
         let raw = if identity {
             let channel = |value: u32, extent: u32| (value * 255 / (extent - 1).max(1)) as u8;
@@ -4454,6 +4448,8 @@ impl Nvn {
         let layer_bytes = |[w, h, d]: [u32; 3]| {
             let (columns, rows, block_bytes) = if decode_astc {
                 (w, h, 4)
+            } else if combined_depth_stencil {
+                (w, h, 5)
             } else {
                 (
                     w.div_ceil(info.block_width),
@@ -4568,6 +4564,32 @@ impl Nvn {
                         gather_layer,
                     )
                     .map_err(|error| format!("ASTC decode: {error}"))?;
+                } else if combined_depth_stencil {
+                    let samples = length / 5;
+                    let mut packed = vec![0; samples * block];
+                    for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
+                        gather_layer(layer, &mut packed);
+                        let (depth, stencil) = slice[..length].split_at_mut(samples * 4);
+                        for ((packed, depth), stencil) in packed
+                            .chunks_exact(block)
+                            .zip(depth.as_chunks_mut::<4>().0)
+                            .zip(stencil)
+                        {
+                            if block == 4 {
+                                // NVN DEPTH24_STENCIL8 uses NVIDIA Z24S8:
+                                // low-byte stencil, high 24-bit UNORM depth.
+                                let word = u32::from_le_bytes(packed.try_into().unwrap());
+                                let depth32 = (word >> 8) as f32 / 16_777_215.0;
+                                *depth = depth32.to_le_bytes();
+                                *stencil = word as u8;
+                            } else {
+                                // ZF32_X24S8: float depth, low byte of
+                                // the next word for stencil, then padding.
+                                depth.copy_from_slice(&packed[..4]);
+                                *stencil = packed[4];
+                            }
+                        }
+                    }
                 } else {
                     for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
                         gather_layer(layer, &mut slice[..length]);
@@ -4593,7 +4615,12 @@ impl Nvn {
                         "tex-{base:x}-{level_width}x{level_height}-{}.ppm",
                         info.name
                     ));
-                    if level == 0 && block == 4 && level_depth == 1 && level_width >= 512 {
+                    if level == 0
+                        && block == 4
+                        && !combined_depth_stencil
+                        && level_depth == 1
+                        && level_width >= 512
+                    {
                         let mut ppm =
                             format!("P6\n{level_width} {level_height}\n255\n").into_bytes();
                         for texel in upload.as_chunks::<4>().0 {
@@ -12874,6 +12901,90 @@ mod target_tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         assert_eq!(pixels, expected.repeat(4));
+    }
+
+    #[test]
+    fn a_first_stencil_clear_preserves_both_depth_encodings() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10000;
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x2000, 0, 0]))]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                base,
+                0x2000,
+                READ | WRITE,
+                STATE_NORMAL,
+                "depth and stencil",
+            )
+            .unwrap();
+        let depths24 = [0x345678_u32, 0xabcd12];
+        let depths32 = [0.125_f32, 0.875];
+        for (key, offset, format) in [(2, 0, 53), (3, 0x1000, 54)] {
+            nvn.initialize(
+                key,
+                "Texture",
+                BTreeMap::from([
+                    ("Width".into(), scalar(2)),
+                    ("Height".into(), scalar(1)),
+                    ("Format".into(), scalar(format)),
+                    ("Storage".into(), args([1, offset, 0, 0])),
+                ]),
+            )
+            .unwrap();
+            let packed: Vec<u8> = if format == 53 {
+                depths24
+                    .into_iter()
+                    .flat_map(|depth| (depth << 8 | 42).to_le_bytes())
+                    .collect()
+            } else {
+                depths32
+                    .into_iter()
+                    .flat_map(|depth| {
+                        depth
+                            .to_le_bytes()
+                            .into_iter()
+                            .chain([63, 0xab, 0xcd, 0xef])
+                    })
+                    .collect()
+            };
+            memory.write(base + offset, &packed).unwrap();
+        }
+        let mut cpu = Cpu::default();
+        let core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let expected = [depths24.map(|depth| depth as f32 / 16_777_215.0), depths32];
+        for (key, depths) in [2, 3].into_iter().zip(expected) {
+            nvn.gpu_clear_depth(&core, key, None, Some(1)).unwrap();
+            assert_eq!(
+                nvn.gpu
+                    .as_mut()
+                    .unwrap()
+                    .renderer
+                    .read_target_bytes(key, 4)
+                    .unwrap(),
+                depths.map(f32::to_le_bytes).concat()
+            );
+        }
     }
 
     #[test]

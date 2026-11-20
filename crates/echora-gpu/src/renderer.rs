@@ -1020,6 +1020,45 @@ fn aspect(format: vk::Format) -> vk::ImageAspectFlags {
     }
 }
 
+/// Buffer/image transfers name one aspect for each plane. For a combined
+/// depth-stencil upload, the four-byte depth texels precede the stencil bytes.
+fn transfer_aspects(format: vk::Format) -> impl Iterator<Item = vk::ImageAspectFlags> {
+    let flags = aspect(format);
+    let stencil = vk::ImageAspectFlags::STENCIL;
+    [flags & !stencil, flags & stencil]
+        .into_iter()
+        .filter(|flags| !flags.is_empty())
+}
+
+fn upload_copies(
+    region: &crate::draw::UploadRegion,
+    format: vk::Format,
+    offset: u64,
+) -> impl Iterator<Item = vk::BufferImageCopy> {
+    transfer_aspects(format).map(move |aspect_mask| {
+        let mut buffer_offset = offset + region.offset;
+        if aspect_mask == vk::ImageAspectFlags::STENCIL {
+            buffer_offset +=
+                4 * u64::from(region.width) * u64::from(region.height) * u64::from(region.depth);
+        }
+        vk::BufferImageCopy {
+            buffer_offset,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask,
+                mip_level: region.level,
+                base_array_layer: region.layer,
+                layer_count: 1,
+            },
+            image_extent: vk::Extent3D {
+                width: region.width,
+                height: region.height,
+                depth: region.depth,
+            },
+            ..Default::default()
+        }
+    })
+}
+
 impl Renderer {
     pub fn new(gpu: Gpu) -> Result<Self, String> {
         let queue_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
@@ -2634,9 +2673,6 @@ impl Renderer {
                 return Ok(());
             }
         }
-        if has_stencil(*format) {
-            return Err("a depth-stencil upload needs separate depth and stencil planes".into());
-        }
         if generated.is_some() && (self.uploads.contains_key(key) || levels.is_empty()) {
             return Err("a generated upload needs an unused key and subresource layout".into());
         }
@@ -2648,6 +2684,20 @@ impl Renderer {
         let size = generated
             .as_ref()
             .map_or(texels.len(), |generated| generated.size);
+        if has_stencil(*format)
+            && (levels.is_empty()
+                || levels.iter().any(|region| {
+                    !region.offset.is_multiple_of(4)
+                        || u64::from(region.width)
+                            .checked_mul(u64::from(region.height))
+                            .and_then(|texels| texels.checked_mul(u64::from(region.depth)))
+                            .and_then(|texels| texels.checked_mul(5))
+                            .and_then(|length| region.offset.checked_add(length))
+                            .is_none_or(|end| end > size as u64)
+                }))
+        {
+            return Err("depth-stencil upload does not contain both planes".into());
+        }
         let level_count = levels
             .iter()
             .map(|region| region.level + 1)
@@ -2791,21 +2841,7 @@ impl Renderer {
         let copies: Vec<vk::BufferImageCopy> = levels
             .iter()
             .filter(|region| region.level < target.levels && region.layer < shape.layers())
-            .map(|region| vk::BufferImageCopy {
-                buffer_offset: offset + region.offset,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: aspect(*format),
-                    mip_level: region.level,
-                    base_array_layer: region.layer,
-                    layer_count: 1,
-                },
-                image_extent: vk::Extent3D {
-                    width: region.width,
-                    height: region.height,
-                    depth: region.depth,
-                },
-                ..Default::default()
-            })
+            .flat_map(|region| upload_copies(region, *format, offset))
             .collect();
         // SAFETY: recording; the image and ring are live.
         unsafe {
@@ -2957,21 +2993,7 @@ impl Renderer {
         let copies: Vec<vk::BufferImageCopy> = levels
             .iter()
             .filter(|region| region.level < image_levels && region.layer < image_layers)
-            .map(|region| vk::BufferImageCopy {
-                buffer_offset: region.offset,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: range(format).aspect_mask,
-                    mip_level: region.level,
-                    base_array_layer: region.layer,
-                    layer_count: 1,
-                },
-                image_extent: vk::Extent3D {
-                    width: region.width,
-                    height: region.height,
-                    depth: region.depth,
-                },
-                ..Default::default()
-            })
+            .flat_map(|region| upload_copies(region, format, 0))
             .collect();
         if length > RING_SIZE {
             eprintln!("gpu: with_texels {key:#x} reads back {length} bytes");
@@ -5547,6 +5569,10 @@ impl Renderer {
         std::mem::take(&mut self.fresh_targets)
     }
 
+    pub fn target_needs_initialization(&self, key: u64) -> bool {
+        self.fresh_targets.contains(&key)
+    }
+
     /// A write to a fresh target leaves some of its original texels intact.
     pub fn partial_write_needs_initialization(
         &self,
@@ -5555,7 +5581,7 @@ impl Renderer {
         layer: u32,
         rect: Option<[i32; 4]>,
     ) -> bool {
-        if !self.fresh_targets.contains(&key) {
+        if !self.target_needs_initialization(key) {
             return false;
         }
         let Some(target) = self.targets.get(&key) else {
@@ -5604,13 +5630,13 @@ impl Renderer {
         {
             return Err("upload and target differ".into());
         }
-        let aspects = range(*format).aspect_mask;
-        let subresources = |region: &crate::draw::UploadRegion| vk::ImageSubresourceLayers {
-            aspect_mask: aspects,
-            mip_level: region.level,
-            base_array_layer: region.layer,
-            layer_count: 1,
-        };
+        let subresources =
+            |(region, aspect_mask): (&crate::draw::UploadRegion, _)| vk::ImageSubresourceLayers {
+                aspect_mask,
+                mip_level: region.level,
+                base_array_layer: region.layer,
+                layer_count: 1,
+            };
         let scaled = target.extent(0) != (*width, *height);
         let blit_filter = if scaled {
             // SAFETY: the instance and physical device are live.
@@ -5638,9 +5664,12 @@ impl Renderer {
         self.upload(source)?;
         let source = &self.uploads[upload].1;
         let target = &self.targets[&key];
-        let regions = levels.iter().filter(|region| {
-            region.level < source.levels.min(target.levels) && region.layer < shape.layers()
-        });
+        let regions = levels
+            .iter()
+            .filter(|region| {
+                region.level < source.levels.min(target.levels) && region.layer < shape.layers()
+            })
+            .flat_map(|region| transfer_aspects(*format).map(move |aspect| (region, aspect)));
         let mut copies = Vec::new();
         let mut blits = Vec::new();
         if scaled {
@@ -5649,8 +5678,8 @@ impl Renderer {
                 y: height as i32,
                 z: depth as i32,
             };
-            blits.extend(regions.map(|region| {
-                let layers = subresources(region);
+            blits.extend(regions.map(|(region, aspect)| {
+                let layers = subresources((region, aspect));
                 let (scaled_width, scaled_height) = target.extent(region.level);
                 vk::ImageBlit {
                     src_subresource: layers,
@@ -5666,8 +5695,8 @@ impl Renderer {
                 }
             }));
         } else {
-            copies.extend(regions.map(|region| {
-                let layers = subresources(region);
+            copies.extend(regions.map(|(region, aspect)| {
+                let layers = subresources((region, aspect));
                 vk::ImageCopy::default()
                     .src_subresource(layers)
                     .dst_subresource(layers)
@@ -7405,7 +7434,31 @@ impl Renderer {
         level: u32,
         plane: u32,
         texel_bytes: u32,
+        rect: [u32; 4],
+    ) -> Result<Vec<u8>, String> {
+        // Depth targets: their depth aspect (2 bytes per texel for D16, 4
+        // for the others: a float for the D32 formats, the depth in the
+        // low 24 bits for D24).
+        let format = self.targets.get(&key).ok_or("no such target")?.format;
+        let (aspect_mask, texel_bytes) = if is_depth(format) {
+            let bytes = if format == vk::Format::D16_UNORM {
+                2
+            } else {
+                4
+            };
+            (vk::ImageAspectFlags::DEPTH, bytes)
+        } else {
+            (vk::ImageAspectFlags::COLOR, texel_bytes)
+        };
+        self.read_target_aspect_bytes(key, (level, plane), rect, (aspect_mask, texel_bytes))
+    }
+
+    fn read_target_aspect_bytes(
+        &mut self,
+        key: u64,
+        (level, plane): (u32, u32),
         [x, y, width, height]: [u32; 4],
+        (aspect_mask, texel_bytes): (vk::ImageAspectFlags, u32),
     ) -> Result<Vec<u8>, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
         if level >= target.levels
@@ -7427,19 +7480,6 @@ impl Renderer {
         if width == 0 || height == 0 {
             return Ok(Vec::new());
         }
-        // Depth targets: their depth aspect (2 bytes per texel for D16, 4
-        // for the others: a float for the D32 formats, the depth in the
-        // low 24 bits for D24).
-        let (aspect_mask, texel_bytes) = if is_depth(target.format) {
-            let bytes = if target.format == vk::Format::D16_UNORM {
-                2
-            } else {
-                4
-            };
-            (vk::ImageAspectFlags::DEPTH, bytes)
-        } else {
-            (vk::ImageAspectFlags::COLOR, texel_bytes)
-        };
         let (key, level, layer, slice) = if target.scale.is_one() {
             (key, level, layer, slice)
         } else {
@@ -8531,6 +8571,87 @@ mod tests {
         let view = renderer.texture_view(&volume, 4).unwrap();
         let range = renderer.view_infos[&view].range;
         assert_eq!((range.base_mip_level, range.level_count), (1, 2));
+    }
+
+    #[test]
+    fn combined_depth_stencil_uploads_copy_each_plane() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::D32_SFLOAT_S8_UINT;
+        let shape = ImageShape::D2 { layers: 2 };
+        if renderer.shaped_target(9, 2, 1, shape, format, 2).is_err() {
+            // D32_SFLOAT_S8_UINT is optional.
+            return;
+        }
+        let contents = [
+            (0, 0, vec![0.125_f32, 0.25_f32], vec![9, 25]),
+            (0, 1, vec![0.375, 0.5], vec![72, 255]),
+            (1, 0, vec![0.625], vec![94]),
+            (1, 1, vec![0.75], vec![141]),
+        ];
+        let mut texels = Vec::new();
+        let levels: std::sync::Arc<[UploadRegion]> = contents
+            .iter()
+            .map(|(level, layer, depth, stencil)| {
+                let offset = texels.len() as u64;
+                texels.extend(depth.iter().flat_map(|value| value.to_le_bytes()));
+                texels.extend(stencil);
+                texels.resize(texels.len().next_multiple_of(4), 0);
+                UploadRegion {
+                    level: *level,
+                    layer: *layer,
+                    width: depth.len() as u32,
+                    height: 1,
+                    depth: 1,
+                    offset,
+                }
+            })
+            .collect();
+        let mut source = TextureSource::Upload {
+            key: 6,
+            generation: 1,
+            width: 2,
+            height: 1,
+            shape,
+            format,
+            texels: std::sync::Arc::new(texels),
+            levels: levels.clone(),
+        };
+        renderer.initialize_target(9, &source).unwrap();
+        if let TextureSource::Upload { texels, .. } = &mut source {
+            *texels = Default::default();
+        }
+        let TextureSource::Upload { texels, .. } = renderer.with_texels(&source).unwrap() else {
+            unreachable!();
+        };
+        for (region, (level, layer, depth, stencil)) in levels.iter().zip(contents) {
+            let rect = [0, 0, region.width, 1];
+            let start = region.offset as usize;
+            let depth: Vec<_> = depth.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let split = start + depth.len();
+            assert_eq!(texels[start..split], depth);
+            assert_eq!(texels[split..split + stencil.len()], stencil);
+            assert_eq!(
+                renderer
+                    .read_target_plane_bytes(9, level, layer, 4, rect)
+                    .unwrap(),
+                depth
+            );
+            assert_eq!(
+                renderer
+                    .read_target_aspect_bytes(
+                        9,
+                        (level, layer),
+                        rect,
+                        (vk::ImageAspectFlags::STENCIL, 1)
+                    )
+                    .unwrap(),
+                stencil
+            );
+        }
     }
 
     #[test]

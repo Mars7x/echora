@@ -389,8 +389,10 @@ impl ImageShape {
     }
 }
 
-/// One mip level of one layer of an upload: its texel extent and the byte
-/// offset of its packed texels (slices of a 3D level follow each other).
+/// One mip level of one layer of an upload and the byte offset of its
+/// texels. Slices of a 3D level follow each other. For combined depth and
+/// stencil, the depth plane uses four bytes per texel, followed by a
+/// one-byte-per-texel stencil plane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UploadRegion {
     pub level: u32,
