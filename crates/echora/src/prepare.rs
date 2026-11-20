@@ -87,26 +87,50 @@ fn cargo() -> PathBuf {
     "cargo".into()
 }
 
-/// Build jobs that fit in memory: each region crate's compiler can use
-/// about 1.2 GB, so jobs are capped by the host's memory as well as its
-/// processors.
+/// Use available memory as well as logical CPUs to choose build parallelism.
 pub fn default_jobs() -> usize {
     let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-    let by_memory = total_memory_gib().map_or(cpus, |gib| ((gib - 4.0) / 1.5).max(1.0) as usize);
-    cpus.min(by_memory).max(1)
+    jobs_for_memory(cpus, available_memory())
 }
 
-fn total_memory_gib() -> Option<f64> {
+fn jobs_for_memory(cpus: usize, available: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const RESERVE: u64 = 4 * GIB;
+    // Several large translated regions exceed 4 GiB of compiler RSS.
+    const PER_JOB: u64 = 5 * GIB;
+    let jobs = available.map_or(1, |bytes| bytes.saturating_sub(RESERVE) / PER_JOB);
+    cpus.min(usize::try_from(jobs).unwrap_or(usize::MAX)).max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory() -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kib: f64 = info
+    let kib: u64 = info
         .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .split_ascii_whitespace()
+        .next()?
         .parse()
         .ok()?;
-    Some(kib / f64::from(1 << 20))
+    kib.checked_mul(1024)
+}
+
+#[cfg(windows)]
+fn available_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the structure is writable and declares its required size.
+    let success = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (success != 0).then_some(status.ullAvailPhys)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn available_memory() -> Option<u64> {
+    None
 }
 
 /// Whether a cargo JSON message reports a region crate as built.
@@ -206,7 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn jobs_are_at_least_one() {
-        assert!(default_jobs() >= 1);
+    fn jobs_reserve_memory_and_respect_the_cpu_limit() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(jobs_for_memory(16, Some(8 * GIB)), 1);
+        assert_eq!(jobs_for_memory(16, Some(24 * GIB)), 4);
+        assert_eq!(jobs_for_memory(2, Some(64 * GIB)), 2);
+        assert_eq!(jobs_for_memory(16, None), 1);
     }
 }
