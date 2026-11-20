@@ -7072,22 +7072,10 @@ impl Nvn {
                 else {
                     continue;
                 };
-                let [physical, physical_offset, size, _] = mapping.x;
-                let Some(storage) = self
-                    .objects
-                    .get(&physical)
-                    .filter(|pool| pool.kind == "MemoryPool")
-                    .map(|pool| pool.builder["Storage"])
-                    .filter(|storage| {
-                        storage.x[0] != 0
-                            && physical_offset
-                                .checked_add(size)
-                                .is_some_and(|end| end <= storage.x[1])
-                    })
-                else {
+                let Some(range) = self.virtual_mapping_storage(mapping) else {
                     continue;
                 };
-                add(gpu + offset, size, storage.x[0] + physical_offset);
+                add(gpu + offset, range.end - range.start, range.start);
             }
         }
         ranges.sort_by_key(|range| range.gpu);
@@ -7096,6 +7084,21 @@ impl Nvn {
             end = end.max(range.gpu.saturating_add(range.size));
             range.furthest_end = end;
         }
+    }
+
+    fn virtual_mapping_storage(&self, mapping: &Args) -> Option<std::ops::Range<u64>> {
+        let [physical, offset, size, _] = mapping.x;
+        let storage = self
+            .object(physical, "MemoryPool")
+            .ok()?
+            .builder
+            .get("Storage")?;
+        let end = offset.checked_add(size)?;
+        let base = storage.x[0];
+        if base == 0 || end > storage.x[1] {
+            return None;
+        }
+        Some(base.checked_add(offset)?..base.checked_add(end)?)
     }
 
     fn texture_extent(&self, texture: u64) -> Result<(u32, u32), String> {

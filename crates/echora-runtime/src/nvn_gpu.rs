@@ -52,6 +52,100 @@ struct TargetIndex {
     changed: super::FastSet<u64>,
 }
 
+/// Guest storage as seen at successive byte offsets in a texture.
+#[derive(PartialEq, Eq)]
+enum TextureBacking {
+    Linear((u64, std::ops::Range<u64>)),
+    Virtual {
+        size: u64,
+        pieces: Vec<(u64, std::ops::Range<u64>)>,
+    },
+}
+
+impl TextureBacking {
+    fn linear(base: u64, size: u64) -> Self {
+        Self::Linear((0, base..base + size))
+    }
+
+    fn pieces(&self) -> &[(u64, std::ops::Range<u64>)] {
+        match self {
+            Self::Linear(piece) => std::slice::from_ref(piece),
+            Self::Virtual { pieces, .. } => pieces,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::Linear((_, range)) => range.end - range.start,
+            Self::Virtual { size, .. } => *size,
+        }
+    }
+
+    fn read_into(&self, core: &Guest, offset: u64, bytes: &mut [u8]) {
+        if let Self::Linear((_, range)) = self {
+            read_storage_into(core, range.start + offset, bytes);
+            return;
+        }
+        bytes.fill(0);
+        let end = offset + bytes.len() as u64;
+        let pieces = self.pieces();
+        let first =
+            pieces.partition_point(|(start, range)| start + (range.end - range.start) <= offset);
+        for (start, range) in &pieces[first..] {
+            if *start >= end {
+                break;
+            }
+            let left = offset.max(*start);
+            let right = end.min(start + (range.end - range.start));
+            read_storage_into(
+                core,
+                range.start + (left - start),
+                &mut bytes[(left - offset) as usize..(right - offset) as usize],
+            );
+        }
+    }
+
+    fn read(&self, core: &Guest) -> Vec<u8> {
+        let mut bytes = vec![0; self.size() as usize];
+        self.read_into(core, 0, &mut bytes);
+        bytes
+    }
+
+    fn equals(&self, core: &Guest, expected: &[u8]) -> bool {
+        if expected.len() as u64 != self.size() {
+            return false;
+        }
+        let mut end = 0;
+        for (start, range) in self.pieces() {
+            let start = *start as usize;
+            if expected[end..start].iter().any(|&byte| byte != 0) {
+                return false;
+            }
+            end = start + (range.end - range.start) as usize;
+            if !core
+                .memory
+                .equals(range.start, &expected[start..end])
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        expected[end..].iter().all(|&byte| byte == 0)
+    }
+
+    fn sample(&self, core: &Guest, format: u32, dimensions: [u32; 3]) -> u64 {
+        if let Self::Linear((_, range)) = self {
+            return texture_sample(core, range.start, self.size(), format, dimensions);
+        }
+        let seed = texture_sample_seed(format, dimensions);
+        sample_chunks(seed, 0, self.size(), |offset, bytes| {
+            let length = bytes.len().min((self.size() - offset) as usize);
+            self.read_into(core, offset, &mut bytes[..length]);
+            true
+        })
+    }
+}
+
 impl TargetIndex {
     fn insert(
         &mut self,
@@ -177,7 +271,7 @@ pub struct Backend {
     presenter: Option<Result<Presenter, ()>>,
     /// Untiled guest textures with a sample of their raw storage and its
     /// guest address range (see `texture_source`).
-    textures: HashMap<u64, (u64, TextureSource, std::ops::Range<u64>)>,
+    textures: HashMap<u64, (u64, TextureSource, TextureBacking)>,
     /// The present during which each cached texture's sample last matched:
     /// within one frame a texture is sampled once, not on every draw.
     texture_checked: HashMap<u64, u64>,
@@ -725,7 +819,7 @@ impl Backend {
             let mut ranges: Vec<_> = self
                 .textures
                 .values()
-                .map(|(_, _, range)| range.clone())
+                .flat_map(|(_, _, backing)| backing.pieces().iter().map(|(_, range)| range.clone()))
                 .collect();
             merge_ranges(&mut ranges);
             ranges
@@ -1361,22 +1455,23 @@ impl Nvn {
             }
             let mut touched = Vec::new();
             if backend.cached_textures_overlap(&range) {
-                touched.extend(
-                    backend
-                        .textures
+                touched.extend(backend.textures.iter().flat_map(|(&key, (_, _, backing))| {
+                    let range = &range;
+                    backing
+                        .pieces()
                         .iter()
-                        .filter_map(|(&key, (_, _, storage))| {
-                            if storage.end > range.start && range.end > storage.start {
-                                Some((
+                        .filter_map(move |(offset, storage)| {
+                            let start = range.start.max(storage.start);
+                            let end = range.end.min(storage.end);
+                            (start < end).then(|| {
+                                (
                                     key,
-                                    range.start.max(storage.start) - storage.start
-                                        ..range.end.min(storage.end) - storage.start,
-                                ))
-                            } else {
-                                None
-                            }
-                        }),
-                );
+                                    offset + (start - storage.start)
+                                        ..offset + (end - storage.start),
+                                )
+                            })
+                        })
+                }));
             }
             backend.stat("stat: textures invalidated", touched.len() as u64);
             if !touched.is_empty() {
@@ -3331,6 +3426,66 @@ impl Nvn {
         self.pool_for(gpu).map(|(guest, _)| guest)
     }
 
+    fn texture_backing(&self, storage: &super::Args, size: u64) -> Result<TextureBacking, String> {
+        let pool = self.object(storage.x[0], "MemoryPool")?;
+        let [base, pool_size, ..] = pool.builder["Storage"].x;
+        let start = storage.x[1];
+        let end = start
+            .checked_add(size)
+            .ok_or("texture storage size overflows")?;
+        if base != 0 {
+            base.checked_add(end)
+                .ok_or("texture storage address overflows")?;
+            return Ok(TextureBacking::linear(base + start, size));
+        }
+        if end > pool_size {
+            return Err("texture storage exceeds its virtual pool".into());
+        }
+        let mut pieces: Vec<(u64, std::ops::Range<u64>)> = Vec::new();
+        // Fixed-width keys give increasing virtual offsets.
+        let bounds = (
+            std::ops::Bound::Included(super::VIRTUAL_MAPPING),
+            std::ops::Bound::Unbounded,
+        );
+        for (name, mapping) in pool.state.range::<str, _>(bounds) {
+            let Some(hex) = name.strip_prefix(super::VIRTUAL_MAPPING) else {
+                break;
+            };
+            let Ok(offset) = u64::from_str_radix(hex, 16) else {
+                continue;
+            };
+            if offset >= end {
+                break;
+            }
+            let Some(range) = self.virtual_mapping_storage(mapping) else {
+                continue;
+            };
+            let left = start.max(offset);
+            let right = end.min(offset + (range.end - range.start));
+            if left >= right {
+                continue;
+            }
+            let physical = range.start + (left - offset)..range.start + (right - offset);
+            if let Some((last_offset, last)) = pieces.last_mut()
+                && *last_offset + (last.end - last.start) == left - start
+                && last.end == physical.start
+            {
+                last.end = physical.end;
+            } else {
+                pieces.push((left - start, physical));
+            }
+        }
+        if let [(0, range)] = pieces.as_slice()
+            && range.end - range.start == size
+        {
+            return Ok(TextureBacking::linear(range.start, size));
+        }
+        if pieces.is_empty() {
+            return Err("texture storage is in no mapped memory".into());
+        }
+        Ok(TextureBacking::Virtual { size, pieces })
+    }
+
     /// A render target whose texture object shares `texture`'s storage and
     /// size, if any.
     fn target_sharing_storage(&self, texture: u64) -> Option<u64> {
@@ -3816,7 +3971,7 @@ impl Nvn {
                 backend.textures.get(&texture),
                 backend.storage_hashes.get(&texture),
             ) {
-                (Some((_, _, storage)), Some(hashes)) => {
+                (Some((_, _, backing)), Some(hashes)) => {
                     // A flush can change bytes missed by the periodic texture
                     // sample. Check every chunk the flush touches.
                     let mut chunks: Vec<_> = ranges
@@ -3827,9 +3982,9 @@ impl Nvn {
                     let mut bytes = vec![0; STORAGE_CHUNK as usize];
                     chunks.into_iter().flatten().all(|chunk| {
                         let start = chunk * STORAGE_CHUNK;
-                        let length = STORAGE_CHUNK.min(storage.end - storage.start - start);
+                        let length = STORAGE_CHUNK.min(backing.size() - start);
                         let bytes = &mut bytes[..length as usize];
-                        read_storage_into(core, storage.start + start, bytes);
+                        backing.read_into(core, start, bytes);
                         hashes.get(chunk as usize) == Some(&hash_bytes(bytes))
                     })
                 }
@@ -3893,11 +4048,6 @@ impl Nvn {
             .get("Storage")
             .ok_or("texture has no storage")?;
         let pool = self.object(storage.x[0], "MemoryPool")?;
-        // Through texture_storage: a virtual pool's offset resolves to the
-        // physical memory mapped there.
-        let base = self
-            .texture_storage(texture)
-            .ok_or("texture storage is in no mapped memory")?;
         // NVN memory pool flags (same bits as NVN1): CPU_UNCACHED 2,
         // CPU_CACHED 4; the builder default 0x21 gives the CPU no access.
         let pool_flags = pool.builder.get("Flags").map_or(0x21, |value| value.x[0]);
@@ -3951,29 +4101,25 @@ impl Nvn {
         } else {
             crate::nvn_format::block_linear_size(info, width, height, depth, layout, levels_set).0
         };
+        let backing = self.texture_backing(storage, storage_size)?;
+        let base = backing.pieces().first().map_or(0, |(_, range)| range.start);
         let check_started = std::time::Instant::now();
         let backend = self.gpu.as_ref().unwrap();
+        let mapping_changed = backend
+            .textures
+            .get(&texture)
+            .is_some_and(|(_, _, previous)| *previous != backing);
         let shadow = backend.shadows.get(&texture);
         let shadowed = shadow.is_some();
         // Uncached memory can change in any frame without a flush.
-        let shadow_changed = shadow.is_some_and(|shadow| {
-            shadow.len() as u64 != storage_size
-                || !core.memory.equals(base, shadow).unwrap_or(false)
-        });
+        let shadow_changed = shadow.is_some_and(|shadow| !backing.equals(core, shadow));
         // An unchanged copy proves the cached upload current: its sample
         // stands for the storage.
         let kept_sample = (shadowed && !shadow_changed)
             .then(|| backend.textures.get(&texture).map(|entry| entry.0))
             .flatten();
-        let sample = kept_sample.unwrap_or_else(|| {
-            texture_sample(
-                core,
-                base,
-                storage_size,
-                format,
-                [width, height, depth_or_layers],
-            )
-        });
+        let sample = kept_sample
+            .unwrap_or_else(|| backing.sample(core, format, [width, height, depth_or_layers]));
         let check_micros = check_started.elapsed().as_micros() as u64;
         // ECHORA_GPU_VERIFY_UPLOADS=1 (debugging): a cached upload whose
         // sample still matches is also checked against its whole storage.
@@ -3982,7 +4128,7 @@ impl Nvn {
             let sampled = backend.textures.get(&texture).map(|entry| entry.0);
             sampled == Some(sample)
                 && backend.storage_hashes.get(&texture).is_some_and(|hashes| {
-                    let raw = read_storage(core, base, storage_size);
+                    let raw = backing.read(core);
                     let now: Vec<u64> =
                         raw.chunks(STORAGE_CHUNK as usize).map(hash_bytes).collect();
                     let changed = now.iter().zip(hashes).filter(|(a, b)| a != b).count();
@@ -3996,7 +4142,7 @@ impl Nvn {
             );
         }
         if let Some((sampled, _, _)) = self.gpu.as_ref().unwrap().textures.get(&texture) {
-            if *sampled == sample && !stale && !shadow_changed {
+            if *sampled == sample && !stale && !shadow_changed && !mapping_changed {
                 self.release_upload_texels(texture);
                 let backend = self.gpu.as_mut().unwrap();
                 let source = backend.textures[&texture].1.clone();
@@ -4033,13 +4179,19 @@ impl Nvn {
         // The rows of the last whole-level copy into the texture, when the
         // storage still samples as the copy left it: they are level 0
         // untiled, so neither the storage read nor untiling is needed.
-        let copied = (level_count == 1 && layers == 1 && depth == 1 && !astc && !uncached)
-            .then(|| {
-                let backend = self.gpu.as_ref().unwrap();
-                let (copied_sample, rows) = backend.copied_levels.get(&texture)?;
-                (*copied_sample == sample).then(|| rows.clone())
-            })
-            .flatten();
+        let copied = (level_count == 1
+            && layers == 1
+            && depth == 1
+            && !astc
+            && !uncached
+            && !mapping_changed
+            && matches!(backing, TextureBacking::Linear(_)))
+        .then(|| {
+            let backend = self.gpu.as_ref().unwrap();
+            let (copied_sample, rows) = backend.copied_levels.get(&texture)?;
+            (*copied_sample == sample).then(|| rows.clone())
+        })
+        .flatten();
         // The whole storage, read once: untiling reads it block by block.
         let raw = if copied.is_some() {
             self.gpu
@@ -4048,7 +4200,7 @@ impl Nvn {
                 .stat("stat: texture uploads from copies", 1);
             Vec::new()
         } else {
-            read_storage(core, base, storage_size)
+            backing.read(core)
         };
         if matches!(shape, ImageShape::D3 { .. })
             && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
@@ -4360,9 +4512,12 @@ impl Nvn {
             backend.stat("stat: compressed ASTC uploads", 1);
             backend.stat("stat: compressed ASTC upload bytes", upload_bytes as u64);
         }
+        if matches!(&backing, TextureBacking::Virtual { .. }) {
+            backend.stat("stat: texture uploads across virtual mappings", 1);
+        }
         backend
             .textures
-            .insert(texture, (sample, source.clone(), base..base + storage_size));
+            .insert(texture, (sample, source.clone(), backing));
         backend.cached_texture_ranges = None;
         backend.storage_hashes.insert(texture, storage_hashes);
         if uncached && storage_size <= SHADOW_LIMIT {
@@ -11164,15 +11319,7 @@ const SHADOW_LIMIT: u64 = 16 << 20;
 /// Granularity of upload storage hashes (see `Backend::storage_hashes`).
 const STORAGE_CHUNK: u64 = 64 << 10;
 
-/// `length` bytes of guest memory at `base` (unreadable bytes read as
-/// zeros).
-fn read_storage(core: &Guest, base: u64, length: u64) -> Vec<u8> {
-    let mut bytes = vec![0u8; length as usize];
-    read_storage_into(core, base, &mut bytes);
-    bytes
-}
-
-/// `read_storage` into `bytes`.
+/// Read guest storage into `bytes`, substituting zeros for unreadable pages.
 fn read_storage_into(core: &Guest, base: u64, bytes: &mut [u8]) {
     if core.memory.read(base, bytes).is_ok() {
         return;
@@ -11188,7 +11335,6 @@ fn read_storage_into(core: &Guest, base: u64, bytes: &mut [u8]) {
     }
 }
 
-/// A fast 64-bit hash of `bytes`.
 /// A texture storage's sample: its shape, and 256 evenly spaced 64-byte
 /// chunks of its `storage_size` bytes at `base` (see `guest_texture`).
 pub(super) fn texture_sample(
@@ -11196,10 +11342,9 @@ pub(super) fn texture_sample(
     base: u64,
     storage_size: u64,
     format: u32,
-    [width, height, depth_or_layers]: [u32; 3],
+    dimensions: [u32; 3],
 ) -> u64 {
-    let mut sample = u64::from(format) << 48 ^ u64::from(width) << 24 ^ u64::from(height);
-    sample ^= u64::from(depth_or_layers) << 40;
+    let sample = texture_sample_seed(format, dimensions);
     // At this size the evenly spaced samples cover the entire texture.
     // Read it once, without hashing overlapping chunks or touching bytes
     // beyond the texture when it occupies less than one sample.
@@ -11223,6 +11368,13 @@ pub(super) fn texture_sample(
             })
         }
     }
+}
+
+fn texture_sample_seed(format: u32, [width, height, depth_or_layers]: [u32; 3]) -> u64 {
+    u64::from(format) << 48
+        ^ u64::from(width) << 24
+        ^ u64::from(height)
+        ^ u64::from(depth_or_layers) << 40
 }
 
 fn sample_chunks(
@@ -11838,6 +11990,89 @@ mod target_tests {
     }
 
     #[test]
+    fn virtual_texture_uploads_follow_each_mapping_and_its_flushes() {
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let physical_pool = 1;
+        let virtual_pool = 3;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            virtual_pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([0, 2 << 20, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&texture)
+            .unwrap()
+            .builder
+            .insert("Storage".into(), args([virtual_pool, 0, 0, 0]));
+        let request = base + 0x10_0000;
+        let map = |nvn: &mut Nvn, guest: &mut Guest, words: [u64; 4]| {
+            for (index, word) in words.into_iter().enumerate() {
+                guest
+                    .memory
+                    .write(request + index as u64 * 8, &word.to_le_bytes())
+                    .unwrap();
+            }
+            guest.cpu.regs[..3].copy_from_slice(&[virtual_pool, 1, request]);
+            assert!(nvn.call("nvnMemoryPoolMapVirtual", guest).unwrap());
+            assert_eq!(guest.cpu.regs[0], 1);
+        };
+        map(&mut nvn, &mut guest, [physical_pool, 0, 0, 0x1000]);
+        map(
+            &mut nvn,
+            &mut guest,
+            [physical_pool, 0x40_000, 0x2000, 0x1000],
+        );
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        guest.memory.write(base, &red).unwrap();
+        // These bytes follow the first allocation physically but are not
+        // mapped into the corresponding virtual offsets.
+        guest.memory.write(base + 0x1000, &blue).unwrap();
+        guest.memory.write(base + 0x2100, &blue).unwrap();
+        let physical = base + 0x40_100;
+        guest.memory.write(physical, &green).unwrap();
+        let upload = |nvn: &mut Nvn, guest: &Guest| {
+            let super::TextureSource::Upload { texels, .. } =
+                nvn.guest_texture(guest, texture).unwrap()
+            else {
+                panic!("expected a texture upload");
+            };
+            texels
+        };
+        let texels = upload(&mut nvn, &guest);
+        assert_eq!(texels[..4], red);
+        assert_eq!(texels[0x1000..0x1004], [0; 4]);
+        assert_eq!(texels[0x2100..0x2104], green);
+        guest.memory.write(physical, &red).unwrap();
+        nvn.gpu_invalidate(physical..physical + 4, None);
+        assert_eq!(upload(&mut nvn, &guest)[0x2100..0x2104], red);
+
+        map(&mut nvn, &mut guest, [0, 0, 0, 0x1000]);
+        map(
+            &mut nvn,
+            &mut guest,
+            [physical_pool, 0x2000, 0x2000, 0x1000],
+        );
+        let texels = upload(&mut nvn, &guest);
+        assert_eq!(texels[..4], [0; 4]);
+        assert_eq!(texels[0x2100..0x2104], blue);
+    }
+
+    #[test]
     fn an_uncached_texture_sees_a_write_after_many_unchanged_frames() {
         use echora_gpu::draw::TextureSource;
 
@@ -12241,7 +12476,9 @@ mod target_tests {
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{Backend, GuestFileIndex, Nvn, Sampler, SharedRange, TextureSource, vk};
+    use super::{
+        Backend, GuestFileIndex, Nvn, Sampler, SharedRange, TextureBacking, TextureSource, vk,
+    };
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -12839,12 +13076,22 @@ mod pool_tests {
         let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
-        backend
-            .textures
-            .insert(1, (0, TextureSource::Target(1), 0x1000..0x1080));
-        backend
-            .textures
-            .insert(2, (0, TextureSource::Target(2), 0x1080..0x1100));
+        backend.textures.insert(
+            1,
+            (
+                0,
+                TextureSource::Target(1),
+                TextureBacking::linear(0x1000, 0x80),
+            ),
+        );
+        backend.textures.insert(
+            2,
+            (
+                0,
+                TextureSource::Target(2),
+                TextureBacking::linear(0x1080, 0x80),
+            ),
+        );
         let mut nvn = Nvn {
             gpu: Some(backend),
             gpu_checked: true,
