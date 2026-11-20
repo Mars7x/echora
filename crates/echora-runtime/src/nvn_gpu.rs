@@ -5736,6 +5736,59 @@ impl Nvn {
         Ok(())
     }
 
+    /// Storage writes use guest texel coordinates, including volume slices.
+    fn prepare_compute_image(&mut self, texture: u64) -> Result<(u64, vk::Format), String> {
+        let (width, height, format) = self.target_shape(texture)?;
+        let levels = self.texture_levels(texture);
+        let shape = match self.render_shape(texture) {
+            volume @ ImageShape::D3 { .. } => volume,
+            _ => ImageShape::D2 { layers: 1 },
+        };
+        // An image binding can name the same physical texels as an earlier
+        // attachment. A new image initialized from guest RAM would lose
+        // those GPU writes, including any texels this dispatch leaves alone.
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        let target = if shape == (ImageShape::D2 { layers: 1 })
+            && renderer
+                .target_info(texture)
+                .is_none_or(|info| !info.initialized)
+        {
+            self.refresh_target_index();
+            self.resolve_target_with_levels(texture, levels, true)
+                .filter(|&(alias, level)| {
+                    level == 0
+                        && self
+                            .gpu
+                            .as_ref()
+                            .unwrap()
+                            .renderer
+                            .target_info(alias)
+                            .is_some_and(|info| info.levels == levels && info.scale.is_one())
+                        && self.flat_alias_layout_matches(texture, alias)
+                        && self.texture_object_backing(texture).is_some_and(|backing| {
+                            self.texture_object_backing(alias).as_ref() == Some(&backing)
+                        })
+                })
+                .map_or(texture, |(alias, _)| alias)
+        } else {
+            texture
+        };
+        let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        renderer.guest_sized_target(target, width, height, shape, format, levels)?;
+        if target != texture {
+            renderer.discard_undefined_target(texture);
+        }
+        if matches!(shape, ImageShape::D3 { .. })
+            && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
+        {
+            eprintln!(
+                "present {}: dispatch writes 3D image {texture:x} {width}x{height} {shape:?}",
+                self.presented_frames
+            );
+        }
+        Ok((target, format))
+    }
+
     pub(super) fn gpu_dispatch(
         &mut self,
         core: &mut Guest,
@@ -6230,34 +6283,7 @@ impl Nvn {
                         .x[3];
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
                     let texture = self.handle_texture(handle)?;
-                    let (width, height, format) = self.target_shape(texture)?;
-                    let levels = self.texture_levels(texture);
-                    // 3D textures (colour lookup tables a pass blends) are
-                    // written as volumes.
-                    let builder = &self.object(texture, "Texture")?.builder;
-                    let shape = if builder.get("Target").map(|value| value.x[0]) == Some(2) {
-                        ImageShape::D3 {
-                            depth: builder
-                                .get("Depth")
-                                .map_or(1, |value| value.x[0] as u32)
-                                .max(1),
-                        }
-                    } else {
-                        ImageShape::D2 { layers: 1 }
-                    };
-                    self.gpu
-                        .as_mut()
-                        .unwrap()
-                        .renderer
-                        .guest_sized_target(texture, width, height, shape, format, levels)?;
-                    if matches!(shape, ImageShape::D3 { .. })
-                        && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
-                    {
-                        eprintln!(
-                            "present {}: dispatch writes 3D image {texture:x} {width}x{height} {shape:?}",
-                            self.presented_frames
-                        );
-                    }
+                    let (target, format) = self.prepare_compute_image(texture)?;
                     let level = if super::mip_targets() {
                         self.handle_view_levels(handle).map_or(0, |(base, _)| base)
                     } else {
@@ -6269,7 +6295,7 @@ impl Nvn {
                             self.presented_frames, descriptor.binding
                         );
                     }
-                    images.insert(descriptor.binding, (texture, level));
+                    images.insert(descriptor.binding, (target, level));
                     if let Some(view) = self
                         .handle_view_format(handle)
                         .filter(|view| echora_gpu::renderer::uint_alias(format) == Some(*view))
@@ -13236,7 +13262,7 @@ mod target_tests {
         };
         let args = |x| Args { x, v: [0; 2] };
         let scalar = |value| args([value, 0, 0, 0]);
-        let (pool, rendered, sampled) = (1, 2, 3);
+        let (pool, rendered, sampled, linear) = (1, 2, 3, 4);
         nvn.initialize(
             pool,
             "MemoryPool",
@@ -13251,10 +13277,24 @@ mod target_tests {
         ]);
         nvn.initialize(rendered, "Texture", properties.clone())
             .unwrap();
-        nvn.initialize(sampled, "Texture", properties).unwrap();
+        nvn.initialize(sampled, "Texture", properties.clone())
+            .unwrap();
+        let mut linear_properties = properties;
+        linear_properties.insert("Stride".into(), scalar(128));
+        nvn.initialize(linear, "Texture", linear_properties)
+            .unwrap();
         let mut cpu = Cpu::default();
         let mut memory = Memory::new(1 << 39);
         let output = 0x20000;
+        memory
+            .map(
+                0x10000,
+                0x10000,
+                READ | WRITE,
+                STATE_NORMAL,
+                "texture backing",
+            )
+            .unwrap();
         memory
             .map(output, 0x1000, READ | WRITE, STATE_NORMAL, "texel readback")
             .unwrap();
@@ -13301,6 +13341,29 @@ mod target_tests {
                 .unwrap(),
             expected
         );
+
+        let (storage_image, _) = nvn.prepare_compute_image(sampled).unwrap();
+        nvn.initialize_new_targets(&core);
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(
+            renderer.read_target_bytes(storage_image, 4).unwrap(),
+            expected
+        );
+        assert_eq!(storage_image, rendered);
+
+        let rect = Some([1, 0, 1, 1]);
+        let update = [0.25_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (storage_image, 0, 0), update, rect, 0xf, 0)
+            .unwrap();
+        assert!(
+            nvn.gpu_read_texels(&mut core, sampled, transfer, output)
+                .unwrap()
+        );
+        core.memory.read(output, &mut readback).unwrap();
+        let mut expected = expected;
+        expected[4..8].copy_from_slice(&0.25_f32.to_le_bytes());
+        assert_eq!(readback.as_slice(), expected);
+        assert_eq!(nvn.prepare_compute_image(linear).unwrap().0, linear);
     }
 
     #[test]
