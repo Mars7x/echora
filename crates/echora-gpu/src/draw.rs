@@ -511,7 +511,8 @@ pub struct Draw<'a> {
     /// written).
     pub color_formats: &'a [Option<vk::Format>],
     pub depth: Option<u64>,
-    /// The array layer the depth target renders into.
+    /// The mip level and array layer the depth target renders into.
+    pub depth_level: u32,
     pub depth_layer: u32,
     pub attributes: Vec<VertexAttribute>,
     pub streams: Vec<VertexStream>,
@@ -939,12 +940,30 @@ impl Renderer {
         value: u32,
         mask: u8,
     ) -> Result<(), String> {
+        self.clear_stencil_masked_level(key, (0, layer), rect, value, mask)
+    }
+
+    /// Replace stencil bits at a particular mip and array layer.
+    pub fn clear_stencil_masked_level(
+        &mut self,
+        key: u64,
+        (level, layer): (u32, u32),
+        rect: Option<[i32; 4]>,
+        value: u32,
+        mask: u8,
+    ) -> Result<(), String> {
         let target = self.target_info(key).ok_or("no such stencil target")?;
+        if level >= target.levels {
+            return Err(format!(
+                "mip level {level} of a {}-level stencil target",
+                target.levels
+            ));
+        }
         if mask == 0 || !has_stencil(target.format) {
             return Ok(());
         }
-        let width = target.scale.apply(target.width);
-        let height = target.scale.apply(target.height);
+        let width = (target.scale.apply(target.width) >> level).max(1);
+        let height = (target.scale.apply(target.height) >> level).max(1);
         let whole = [0, 0, width as i32, height as i32];
         let rect = rect.map(|rect| target.scale.rect(rect));
         let scissor = crate::renderer::clip(rect.unwrap_or(whole), whole);
@@ -974,6 +993,7 @@ impl Renderer {
             color_layers: &[],
             color_formats: &[],
             depth: Some(key),
+            depth_level: level,
             depth_layer: layer,
             attributes: Vec::new(),
             streams: Vec::new(),
@@ -1330,8 +1350,8 @@ impl Renderer {
             draw.color_levels,
             draw.color_layers,
             draw.color_formats,
-            draw.depth,
-            draw.depth_layer,
+            draw.depth
+                .map(|key| (key, draw.depth_level, draw.depth_layer)),
             area,
         )?;
         self.apply_condition()?;
@@ -1957,6 +1977,7 @@ pub(crate) mod tests {
             color_layers: &[0],
             color_formats: &[],
             depth: None,
+            depth_level: 0,
             depth_layer: 0,
             attributes: vec![VertexAttribute {
                 location: 0,

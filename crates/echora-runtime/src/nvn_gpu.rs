@@ -1613,6 +1613,11 @@ impl Nvn {
         }
         self.ensure_render_target(texture)?;
         let scissor = self.render.scissor;
+        let level = if super::mip_targets() {
+            self.render.depth_level
+        } else {
+            0
+        };
         let layer = self.render.depth_layer;
         let renderer = &self.gpu.as_ref().unwrap().renderer;
         let full_stencil = stencil
@@ -1620,14 +1625,20 @@ impl Nvn {
             .map(|(value, _)| value & 0xff);
         let untouched_aspect = has_stencil && (depth.is_none() || full_stencil.is_none());
         if (untouched_aspect && renderer.target_needs_initialization(texture))
-            || renderer.partial_write_needs_initialization(texture, 0, layer, scissor)
+            || renderer.partial_write_needs_initialization(texture, level, layer, scissor)
         {
             self.initialize_new_targets(core);
         }
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
-        renderer.clear_depth_stencil(texture, layer, scissor, depth, full_stencil)?;
+        renderer.clear_depth_stencil_level(
+            texture,
+            (level, layer),
+            scissor,
+            depth,
+            full_stencil,
+        )?;
         if let Some((value, mask)) = stencil.filter(|&(_, mask)| mask != u8::MAX) {
-            renderer.clear_stencil_masked(texture, layer, scissor, value, mask)?;
+            renderer.clear_stencil_masked_level(texture, (level, layer), scissor, value, mask)?;
         }
         renderer.defined(texture);
         Ok(())
@@ -10495,6 +10506,7 @@ impl Nvn {
         // target is that target (the game builds a new object over the
         // same depth memory for its lit pass, testing EQUAL against what
         // the prepass wrote).
+        let depth_level = if mips { self.render.depth_level } else { 0 };
         let depth = (self.render.depth != 0).then(|| {
             let texture = self.render.depth;
             let renderer = &self.gpu.as_ref().unwrap().renderer;
@@ -10503,9 +10515,9 @@ impl Nvn {
             }
             self.target_sharing_storage(texture)
                 .filter(|&target| {
-                    renderer
-                        .existing_target(target)
-                        .is_some_and(|target| echora_gpu::renderer::is_depth(target.format))
+                    renderer.existing_target(target).is_some_and(|target| {
+                        echora_gpu::renderer::is_depth(target.format) && depth_level < target.levels
+                    })
                 })
                 .unwrap_or(texture)
         });
@@ -10522,7 +10534,9 @@ impl Nvn {
             );
         }
         if let Some(texture) = depth {
-            extent.get_or_insert(self.ensure_render_target(texture)?);
+            let (width, height) = self.ensure_render_target(texture)?;
+            let mip_extent = |size: u32| size.checked_shr(depth_level).unwrap_or(0).max(1);
+            extent.get_or_insert((mip_extent(width), mip_extent(height)));
         }
         let depth_layer = self.render.depth_layer;
         // With no target bound the draw still runs its vertex stage (the
@@ -11205,6 +11219,7 @@ impl Nvn {
             color_layers,
             color_formats,
             depth,
+            depth_level,
             depth_layer,
             attributes,
             streams,

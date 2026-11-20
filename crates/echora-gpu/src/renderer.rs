@@ -775,7 +775,7 @@ struct OpenPass {
     /// replaced under the same key while the pass is open.
     target_changes: u64,
     colors: Vec<Option<ColorAttachment>>,
-    depth: Option<(u64, u32)>,
+    depth: Option<(u64, u32, u32)>,
     /// The requested area only matters when there are no attachments.
     requested_area: Option<[i32; 4]>,
     views: Vec<vk::ImageView>,
@@ -5849,18 +5849,26 @@ impl Renderer {
         layer: u32,
     ) -> Result<vk::ImageView, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
+        if level >= target.levels {
+            return Err(format!(
+                "mip level {level} of a {}-level attachment",
+                target.levels
+            ));
+        }
         // A volume's attachment is one slice of the level (a 3D view is no
         // attachment), viewed 2D through TYPE_2D_ARRAY_COMPATIBLE.
         let layers = match target.shape {
             ImageShape::D3 { depth } => (depth >> level).max(1),
-            shape if shape.layers() == 1 => return self.level_view(key, level),
             shape => shape.layers(),
         };
-        if level >= target.levels || layer >= layers {
+        if layer >= layers {
             return Err(format!(
                 "level {level} layer {layer} of a {}-level {layers}-layer target",
                 target.levels
             ));
+        }
+        if layers == 1 && !matches!(target.shape, ImageShape::D3 { .. }) {
+            return self.level_view(key, level);
         }
         let cache = (target.image, ExtraView::Layer { level, layer });
         if let Some(view) = self.extra_views.get(&cache) {
@@ -6696,7 +6704,7 @@ impl Renderer {
         }
         // Attachment clears support scissoring and conditional rendering.
         self.prepare_condition()?;
-        self.begin_rendering(&[key], &[level], &[layer], &[], None, 0, [0; 4])?;
+        self.begin_rendering(&[key], &[level], &[layer], &[], None, [0; 4])?;
         self.apply_condition()?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
@@ -6734,7 +6742,26 @@ impl Renderer {
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), String> {
-        let format = self.targets.get(&key).ok_or("no such target")?.format;
+        self.clear_depth_stencil_level(key, (0, layer), rect, depth, stencil)
+    }
+
+    /// Clear depth and/or stencil of the selected mip and array layer.
+    pub fn clear_depth_stencil_level(
+        &mut self,
+        key: u64,
+        (level, layer): (u32, u32),
+        rect: Option<[i32; 4]>,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Result<(), String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if level >= target.levels {
+            return Err(format!(
+                "mip level {level} of a {}-level depth target",
+                target.levels
+            ));
+        }
+        let format = target.format;
         let mut aspects = vk::ImageAspectFlags::empty();
         if depth.is_some() {
             aspects |= vk::ImageAspectFlags::DEPTH;
@@ -6745,8 +6772,7 @@ impl Renderer {
         if aspects.is_empty() {
             return Ok(());
         }
-        let target = &self.targets[&key];
-        let (whole_width, whole_height) = target.extent(0);
+        let (whole_width, whole_height) = target.extent(level);
         let whole = [0, 0, whole_width as i32, whole_height as i32];
         let rect = rect.map(|rect| target.scaled(rect));
         let [x, y, width, height] = clip(rect.unwrap_or(whole), whole);
@@ -6754,7 +6780,7 @@ impl Renderer {
             return Ok(());
         }
         self.prepare_condition()?;
-        self.begin_rendering(&[], &[], &[], &[], Some(key), layer, [0; 4])?;
+        self.begin_rendering(&[], &[], &[], &[], Some((key, level, layer)), [0; 4])?;
         self.apply_condition()?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
@@ -6792,7 +6818,7 @@ impl Renderer {
     /// attachment at that location (a fragment output there is dropped).
     /// Each color target renders into its mip level in `levels` and its
     /// layer in `layers` (0 when missing), as the format in `formats`
-    /// (its own when missing); the depth target into layer `depth_layer`.
+    /// (its own when missing). The depth binding gives its key, mip and layer.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_rendering(
         &mut self,
@@ -6800,8 +6826,7 @@ impl Renderer {
         levels: &[u32],
         layers: &[u32],
         formats: &[Option<vk::Format>],
-        depth: Option<u64>,
-        depth_layer: u32,
+        depth: Option<(u64, u32, u32)>,
         area: [i32; 4],
     ) -> Result<(), String> {
         let level = |index: usize| levels.get(index).copied().unwrap_or(0);
@@ -6815,10 +6840,9 @@ impl Renderer {
                 format: format(index),
             })
         });
-        let depth_binding = depth.map(|key| (key, depth_layer));
         if self.slot.open_pass.as_ref().is_some_and(|pass| {
             pass.target_changes == self.target_changes
-                && pass.depth == depth_binding
+                && pass.depth == depth
                 && pass
                     .requested_area
                     .is_none_or(|requested| requested == area)
@@ -6846,7 +6870,7 @@ impl Renderer {
             views.push(view);
         }
         let depth_view = match depth {
-            Some(key) => Some(self.attachment_view(key, 0, depth_layer)?),
+            Some((key, level, layer)) => Some(self.attachment_view(key, level, layer)?),
             None => None,
         };
         // The render area is the attachments' common extent (the
@@ -6861,7 +6885,7 @@ impl Renderer {
             .enumerate()
             .filter(|(_, key)| **key != 0)
             .map(|(index, key)| extent(key, level(index)))
-            .chain(depth.iter().map(|key| extent(key, 0)))
+            .chain(depth.iter().map(|(key, level, _)| extent(key, *level)))
             .fold((i32::MAX, i32::MAX), |(w, h), (tw, th)| {
                 (w.min(tw), h.min(th))
             });
@@ -6877,7 +6901,7 @@ impl Renderer {
             pass.target_changes = self.target_changes;
             pass.colors.clear();
             pass.colors.extend(color_bindings);
-            pass.depth = depth_binding;
+            pass.depth = depth;
             pass.requested_area = requested_area;
             return Ok(());
         }
@@ -6886,7 +6910,7 @@ impl Renderer {
             .iter()
             .copied()
             .filter(|key| *key != 0)
-            .chain(depth)
+            .chain(depth.map(|(key, _, _)| key))
             .collect();
         for key in &present {
             self.transition(*key, vk::ImageLayout::GENERAL)?;
@@ -6930,7 +6954,7 @@ impl Renderer {
             .color_attachments(&attachments);
         if let Some(depth_attachment) = depth_attachment.as_ref() {
             info = info.depth_attachment(depth_attachment);
-            if depth.is_some_and(|key| has_stencil(self.targets[&key].format)) {
+            if depth.is_some_and(|(key, _, _)| has_stencil(self.targets[&key].format)) {
                 info = info.stencil_attachment(depth_attachment);
             }
         }
@@ -6945,7 +6969,7 @@ impl Renderer {
         self.slot.open_pass = Some(OpenPass {
             target_changes: self.target_changes,
             colors: color_bindings.collect(),
-            depth: depth_binding,
+            depth,
             requested_area,
             views,
             depth_view,
@@ -9105,11 +9129,11 @@ mod tests {
         let format = vk::Format::R8G8B8A8_UNORM;
         renderer.target(1, 4, 4, format).unwrap();
         renderer
-            .begin_rendering(&[1], &[], &[], &[], None, 0, [0, 0, 2, 2])
+            .begin_rendering(&[1], &[], &[], &[], None, [0, 0, 2, 2])
             .unwrap();
         renderer.target(3, 4, 4, format).unwrap();
         renderer
-            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, 0, [2, 2, 2, 2])
+            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, [2, 2, 2, 2])
             .unwrap();
         assert_eq!(renderer.stats["stat: render passes begun"], 1);
 
@@ -9119,7 +9143,7 @@ mod tests {
         renderer.target(STAGING_KEYS + 1, 4, 4, format).unwrap();
         assert_eq!(renderer.target_keys_in_order(), [1, 2, 3]);
         renderer
-            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, 0, [2, 2, 2, 2])
+            .begin_rendering(&[1], &[0], &[0], &[Some(format)], None, [2, 2, 2, 2])
             .unwrap();
         renderer.flush().unwrap();
         assert_eq!(renderer.stats["stat: render passes begun"], 2);

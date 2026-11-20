@@ -943,7 +943,8 @@ pub struct RenderState {
     /// texture's own), as an RGBA8_SRGB view of an RGBA8 texture.
     pub color_formats: Vec<u32>,
     pub depth: u64,
-    /// The array layer the depth target's view selects.
+    /// The mip level and array layer the depth target view selects.
+    pub depth_level: u32,
     pub depth_layer: u32,
     pub scissor: Option<[i32; 4]>,
     /// SetRenderEnable(false) (`Some((2, 0))`) or
@@ -5439,7 +5440,9 @@ impl Nvn {
                 self.render.color_levels = (0..count)
                     .map(|index| views.get(index).copied().unwrap_or(0))
                     .collect();
-                self.render.depth_layer = views.get(count).map_or(0, |view| (view >> 32) as u32);
+                let depth_view = views.get(count).copied().unwrap_or(0);
+                self.render.depth_level = depth_view as u32;
+                self.render.depth_layer = (depth_view >> 32) as u32;
                 self.render.color_formats = (0..count)
                     .map(|index| views.get(count + 1 + index).copied().unwrap_or(0) as u32)
                     .collect();
@@ -5676,10 +5679,11 @@ impl Nvn {
                     let texture = self.render.depth;
                     if self.depth_traced(texture) {
                         eprintln!(
-                            "depth trace present {} clear {texture:x} value {depth} write {depth_mask} args {:x?} scissor {:?} layer {}",
+                            "depth trace present {} clear {texture:x} value {depth} write {depth_mask} args {:x?} scissor {:?} level {} layer {}",
                             self.presented_frames,
                             &command.x[1..4],
                             self.render.scissor,
+                            self.render.depth_level,
                             self.render.depth_layer
                         );
                     }
@@ -9159,6 +9163,123 @@ mod tests {
         assert_eq!(nvn.render.viewport(), Some(viewport));
         nvn.execute_command(&list[1], &mut core).unwrap();
         assert_eq!(nvn.render.viewport(), Some([0.0, -2.0, 8.0, 8.0]));
+    }
+
+    #[test]
+    fn depth_view_clears_only_its_recorded_mip_and_layer() {
+        use echora_gpu::{ash::vk, draw::ImageShape, renderer::Scale};
+
+        let mut nvn = Nvn::default();
+        if nvn.gpu().is_none() {
+            return;
+        }
+        let (buffer, texture, view) = (0x1100, 0x1200, 0x1300);
+        let scalar = |value| Args {
+            x: [value, 0, 0, 0],
+            ..Args::default()
+        };
+        nvn.initialize(buffer, "CommandBuffer", BTreeMap::new())
+            .unwrap();
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Width".into(), scalar(4)),
+                ("Height".into(), scalar(4)),
+                ("Depth".into(), scalar(2)),
+                ("Levels".into(), scalar(2)),
+                ("Target".into(), scalar(4)),
+                ("Format".into(), scalar(54)),
+            ]),
+        )
+        .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.set_resolution_scale(Scale::ONE);
+        renderer
+            .shaped_target(
+                texture,
+                4,
+                4,
+                ImageShape::D2 { layers: 2 },
+                vk::Format::D32_SFLOAT_S8_UINT,
+                2,
+            )
+            .unwrap();
+        for (level, layer) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            renderer
+                .clear_depth_stencil_level(texture, (level, layer), None, Some(0.25), Some(0xa4))
+                .unwrap();
+        }
+        renderer.defined(texture);
+
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        call(&mut nvn, &mut core, "nvnTextureViewSetDefaults", &[view]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLevels",
+            &[view, 1, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLayers",
+            &[view, 1, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetRenderTargets",
+            &[buffer, 0, 0, 0, texture, view],
+        );
+        core.cpu.vectors[0] = u128::from(0.75f32.to_bits());
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferClearDepthStencil",
+            &[buffer, 1, 0x97, 0x0f],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLevels",
+            &[view, 0, 1],
+        );
+        let handle = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let list = nvn.use_command_list(handle).unwrap();
+        for command in list.iter() {
+            nvn.execute_command(command, &mut core).unwrap();
+        }
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        for (level, layer) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let pixels = renderer
+                .read_target_depth_stencil_plane_bytes(texture, level, layer, [0, 0, 2, 2])
+                .unwrap();
+            let (depth, stencil) = if (level, layer) == (1, 1) {
+                (0.75f32, 0xa7)
+            } else {
+                (0.25, 0xa4)
+            };
+            assert_eq!(&pixels[..16], depth.to_le_bytes().repeat(4));
+            assert_eq!(&pixels[16..], &[stencil; 4]);
+        }
     }
 
     #[test]
