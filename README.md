@@ -180,18 +180,18 @@ last faults and gameplay.
 - A Vulkan GPU, about 16 GB of RAM and about 30 GB of free disk space
 - On AMD GPUs, the Mesa RADV driver 26.1.4 or newer (older versions hang the
   GPU in 3D scenes, so Echora refuses to start on them)
-- Rust 1.88 or newer (CI builds with 1.99.1), `git`, a C compiler, NASM,
+- Rust 1.88 or newer (CI builds with 1.99.1), `git`, C and C++ compilers, NASM,
   `pkg-config` and these system libraries:
 
 ```sh
 # Ubuntu
 sudo apt install build-essential nasm pkg-config libclang-dev libpipewire-0.3-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev
 # Fedora
-sudo dnf install gcc nasm pkgconf-pkg-config clang-devel pipewire-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
+sudo dnf install gcc gcc-c++ nasm pkgconf-pkg-config clang-devel pipewire-devel systemd-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel freetype-devel libxcb-devel vulkan-loader-devel
 ```
 
-The C compiler is for libzstd and the system libraries' bindings, and NASM
-for the AV1 decoder's assembly; Echora's own code is all Rust.
+The C and C++ compilers build the native libraries, including libzstd and
+the software sRGB ASTC decoder. NASM builds the AV1 decoder's assembly.
 
 ### Getting started
 

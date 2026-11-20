@@ -14,6 +14,10 @@
 //! emulators. The application writes pre-tiled packaged texture data into
 //! this storage, so sizes must match the hardware layout.
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[path = "nvn_astc.rs"]
+mod srgb;
+
 /// Decode an ASTC mip's layers into consecutive RGBA8 images. Packed
 /// blocks are gathered from guest layout when each worker needs them.
 pub(crate) fn decode_astc_layers(
@@ -92,6 +96,17 @@ fn decode_astc_with_workers(
     debug_assert_eq!(destination.len(), output_slice * depth as usize);
     let workers = workers.min(input_slice.div_ceil(256 << 10)).min(block_rows);
     let decode = |input, output: &mut [u8], height| {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if info.name == "ASTC_SRGB" && srgb::available() {
+            // The sRGB ASTC operation mode produces UNORM8 components.
+            // The Vulkan image applies the sRGB transfer function to RGB.
+            return srgb::decode(
+                input,
+                output,
+                [width, height],
+                [info.block_width, info.block_height],
+            );
+        }
         astc_decode::astc_decode(input, width, height, footprint, |x, y, color| {
             let at = y as usize * row + x as usize * 4;
             output[at..at + 4].copy_from_slice(&color);
@@ -777,6 +792,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn astc_srgb_decodes_constant_colors_and_invalid_blocks() {
+        if !super::srgb::available() {
+            return;
+        }
+        let mut block = [0xff; 16];
+        block[..2].copy_from_slice(&[0xfc, 0xfd]);
+        for (out, value) in block[8..]
+            .chunks_exact_mut(2)
+            .zip([0x12ffu16, 0x2081, 0xff02, 0x3980])
+        {
+            out.copy_from_slice(&value.to_le_bytes());
+        }
+        let mut blocks = [0; 32];
+        blocks[..16].copy_from_slice(&block);
+        let mut output = [0; 7 * 3 * 4];
+        decode_astc_with_workers(&blocks, &mut output, [7, 3, 1], f("ASTC_SRGB", 4, 4, 16), 1)
+            .unwrap();
+        for (index, rgba) in output.as_chunks::<4>().0.iter().enumerate() {
+            let expected = if index % 7 < 4 {
+                [0x12, 0x20, 0xff, 0x39]
+            } else {
+                [255, 0, 255, 255]
+            };
+            assert_eq!(*rgba, expected);
+        }
+    }
+
+    #[test]
     fn astc_bands_match_whole_slices_at_block_edges() {
         let info = f("ASTC", 5, 4, 16);
         let (width, height, depth) = (1027_u32, 795_u32, 2);
@@ -801,7 +845,6 @@ mod tests {
 
     #[test]
     fn astc_array_workers_preserve_layer_order_at_partial_blocks() {
-        let info = f("ASTC", 5, 4, 16);
         let extent = [321, 241, 1];
         let layer_bytes = extent[0] as usize * extent[1] as usize * 4;
         let layers = 12;
@@ -814,13 +857,16 @@ mod tests {
                 }
             }
         };
-        let mut serial = vec![0; layers * layer_bytes];
-        let mut parallel = serial.clone();
-        decode_astc_layers_with_workers(&mut serial, extent, info, 1, gather).unwrap();
-        decode_astc_layers_with_workers(&mut parallel, extent, info, 4, gather).unwrap();
-        assert_eq!(parallel, serial);
-        for (layer, bytes) in parallel.chunks_exact(layer_bytes).enumerate() {
-            assert_eq!(&bytes[..4], &[layer as u8, 0, 0, 255]);
+        for name in ["ASTC", "ASTC_SRGB"] {
+            let info = f(name, 5, 4, 16);
+            let mut serial = vec![0; layers * layer_bytes];
+            let mut parallel = serial.clone();
+            decode_astc_layers_with_workers(&mut serial, extent, info, 1, gather).unwrap();
+            decode_astc_layers_with_workers(&mut parallel, extent, info, 4, gather).unwrap();
+            assert_eq!(parallel, serial);
+            for (layer, bytes) in parallel.chunks_exact(layer_bytes).enumerate() {
+                assert_eq!(&bytes[..4], &[layer as u8, 0, 0, 255]);
+            }
         }
     }
 
