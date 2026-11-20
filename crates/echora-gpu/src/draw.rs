@@ -1361,23 +1361,45 @@ impl Renderer {
                 objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
             }
             if self.graphics.raster.as_ref() != Some(&raster) {
-                objects.cmd_set_viewport_with_count(commands, &[viewport]);
-                objects.cmd_set_scissor_with_count(commands, &[scissor]);
-                objects.cmd_set_primitive_topology(commands, raster.topology);
-                objects.cmd_set_primitive_restart_enable(commands, raster.primitive_restart);
-                objects.cmd_set_cull_mode(commands, raster.cull);
-                objects.cmd_set_front_face(commands, raster.front_face);
-                if self.gpu.depth_clip_control {
+                // Dynamic state remains set for this command buffer. Emit
+                // only the groups that changed.
+                let previous = self.graphics.raster.as_ref();
+                macro_rules! changed {
+                    ($($field:ident),+) => {
+                        previous.is_none_or(|last| $(last.$field != raster.$field)||+)
+                    };
+                }
+                if changed!(viewport, scissor) {
+                    objects.cmd_set_viewport_with_count(commands, &[viewport]);
+                    objects.cmd_set_scissor_with_count(commands, &[scissor]);
+                }
+                if changed!(topology, primitive_restart) {
+                    objects.cmd_set_primitive_topology(commands, raster.topology);
+                    objects.cmd_set_primitive_restart_enable(commands, raster.primitive_restart);
+                }
+                if changed!(cull, front_face, polygon_mode) {
+                    objects.cmd_set_cull_mode(commands, raster.cull);
+                    objects.cmd_set_front_face(commands, raster.front_face);
+                    objects.cmd_set_polygon_mode(commands, raster.polygon_mode);
+                }
+                if self.gpu.depth_clip_control && changed!(depth_minus_one_to_one) {
                     objects.cmd_set_depth_clip_negative_one_to_one(
                         commands,
                         raster.depth_minus_one_to_one,
                     );
                 }
-                objects.cmd_set_polygon_mode(commands, raster.polygon_mode);
-                objects.cmd_set_alpha_to_coverage_enable(commands, raster.alpha_to_coverage);
-                device.cmd_set_blend_constants(commands, &fixed.blend_constants);
-                objects.cmd_set_depth_bias_enable(commands, raster.depth_bias.is_some());
-                if let Some((bias, force_unorm)) = raster.depth_bias {
+                if changed!(alpha_to_coverage) {
+                    objects.cmd_set_alpha_to_coverage_enable(commands, raster.alpha_to_coverage);
+                }
+                if changed!(blend_constants) {
+                    device.cmd_set_blend_constants(commands, &fixed.blend_constants);
+                }
+                if changed!(depth_bias) {
+                    objects.cmd_set_depth_bias_enable(commands, raster.depth_bias.is_some());
+                }
+                if changed!(depth_bias)
+                    && let Some((bias, force_unorm)) = raster.depth_bias
+                {
                     let [constant, clamp, slope] = bias.map(f32::from_bits);
                     match self.gpu.depth_bias_control.as_ref() {
                         Some(control) if force_unorm => {
@@ -1396,11 +1418,17 @@ impl Renderer {
                         _ => device.cmd_set_depth_bias(commands, constant, clamp, slope),
                     }
                 }
-                objects.cmd_set_depth_test_enable(commands, raster.depth_test);
-                objects.cmd_set_depth_write_enable(commands, raster.depth_write);
-                objects.cmd_set_depth_compare_op(commands, raster.depth_compare);
-                objects.cmd_set_stencil_test_enable(commands, raster.stencil.is_some());
-                if let Some(faces) = raster.stencil {
+                if changed!(depth_test, depth_write, depth_compare) {
+                    objects.cmd_set_depth_test_enable(commands, raster.depth_test);
+                    objects.cmd_set_depth_write_enable(commands, raster.depth_write);
+                    objects.cmd_set_depth_compare_op(commands, raster.depth_compare);
+                }
+                if changed!(stencil) {
+                    objects.cmd_set_stencil_test_enable(commands, raster.stencil.is_some());
+                }
+                if changed!(stencil)
+                    && let Some(faces) = raster.stencil
+                {
                     for (flags, face) in [
                         (vk::StencilFaceFlags::FRONT, faces[0]),
                         (vk::StencilFaceFlags::BACK, faces[1]),
