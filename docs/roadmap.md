@@ -12,12 +12,12 @@ when the code for it does.
 | 4. Guest runtime | Translated startup reaches a recorded milestone. | Done 2026-11-06. Startup runs through boot, the system services and GPU setup to presented frames. |
 | 5. Graphics and resolution | Synthetic workloads run at arbitrary sizes and resize safely. | In progress. NVN runs on Vulkan with Echora's own Rust shader translator, and the internal render scale is applied; the resolution planner is not connected yet. |
 | 6. First game frame | A correct frame drawn by the game. | Done 2026-11-06 with the earlier C++ shader recompiler, and again on 2026-11-12 with Echora's own shader translator alone. |
-| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Input reaches the game; it gets past the New Game movie and draws its first 3D scene close to the console's, with a few faults left ([limitations](limitations.md)). The game's audio is mixed and played. |
+| 7. Interactive gameplay | A playable scene with graphics, input and audio. | In progress. Linux tests reach the forest after the opening and load an existing save to play into the village. The game's audio is mixed and played. See [known limitations](limitations.md). |
 | 8. Native resolution | The internal render size is verified at several resolutions. | In progress. Full-opening runs have verified the guest's 1440p output and the 2160p preset. Some scene passes still use lower internal resolutions. |
 | 9. Launcher | The launcher configures and starts Echora, and its settings work. | In progress. It installs the game (as a clone or hard link where possible), edits and saves settings, prepares the translation and starts the game, with mouse, keyboard and controller. |
 | 10. Full-game compatibility | The game can be completed without known major failures. | Not started. |
 | 11. High frame rates | Frame rates above 60 with no timing, physics or animation problems. | Not started. |
-| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie reaches 60 pictures per second (`ECHORA_MOVIE_RATE`). Recent runs measured about 20 frames per second (`ECHORA_PRESENT_RATE`) in the first 3D scene at both 1440p and 2160p ([test hardware](limitations.md#performance)). |
+| 12. Performance | Reproducible measurements show gains without regressions. | In progress. The opening movie reaches 60 pictures per second (`ECHORA_MOVIE_RATE`). Sustained 60 FPS in gameplay remains open. See the [forest and village measurements](limitations.md#performance). |
 | 13. Other platforms | Real game code runs on another OS or CPU without rewriting the core. | Not started. |
 | 14. Release quality | A clean build, setup and launch with user-supplied data. | Not started. |
 

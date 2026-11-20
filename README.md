@@ -12,10 +12,10 @@ code, and runs it on a reimplementation of the Switch's operating system and
 graphics.
 
 > [!CAUTION]
-> Echora cannot be used to play Ocarina of Time yet. It does not reach
-> gameplay, runs well below full speed, and can hang, crash or render
-> incorrectly at any point. Saves are untested. Please do not report gameplay
-> problems as bugs for now.
+> Echora reaches early gameplay on Linux. It runs well below full speed in
+> the forest and can hang, crash or render incorrectly. Tests cover loading
+> an existing save and playing into the village. Please do not report
+> gameplay problems as bugs for now.
 
 Echora is a personal project that I build for my own enjoyment. It doesn't
 include any game code, assets or keys, so you'll need your own copy of the
@@ -26,18 +26,19 @@ game.
 
 ## Status
 
-In short: Echora runs the game's code and draws its first 3D scene with its
-own shader translator, close to how the console draws it, with sound, but
-still well below full speed.
+Echora runs the game's code with its own shader translator and plays the
+game's audio. The opening movie reaches 60 FPS, and early gameplay runs
+well below that speed.
 
 What works today:
 
 - Echora reads and checks your NUP file or dump, and translates the whole
-  game, 17.6 million discovered instructions, into native code. The first start takes
-  about an hour; after that it starts straight away.
+  game, 17.6 million discovered instructions, into native code. The first
+  launch builds that translation. Later launches reuse it.
 - The translated game runs. It boots through the system services, takes
   input, and gets through New Game and the opening movie into its first 3D
-  scene.
+  scene. Linux tests also load a save, move through the forest and enter the
+  village.
 - Echora's own shader translator, written in Rust, translates all 6,215
   shader stages the game has used in test runs so far. The old shader
   recompiler is no longer needed. It can still be loaded as an optional
@@ -56,13 +57,11 @@ What works today:
 
 What doesn't work yet:
 
-- The water in the first 3D scene is too red. Some effects still use a
-  lower internal resolution, including the fog. Stable gameplay is still
-  ahead.
-- Speed. The console runs the game at 60 frames per second. Here the opening
-  movie, decoded on the GPU, now plays at that full speed, but the first 3D
-  scene runs at about 20 FPS at 1440p and 2160p on the hardware below, with
-  slower sections later in the forest.
+- Water color, flicker and texture detail need further verification across
+  scenes. Some effects, including fog, use a lower internal resolution.
+- Sustained 60 FPS during gameplay. A fixed-1440p test averaged about 11 FPS
+  on a forest route after the scene loaded. See the
+  [performance notes](docs/limitations.md#performance) for the test scope.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
 

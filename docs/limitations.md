@@ -1,8 +1,7 @@
 # Known limitations
 
-Echora is not ready for stable gameplay. Runs can hang, crash or render
-incorrectly, and saves are untested. The points below describe what is known
-to be missing or incomplete.
+Echora is in development. Runs can hang, crash or render incorrectly.
+Linux tests cover loading an existing save and reaching the village.
 
 ## Gameplay and graphics
 
@@ -10,11 +9,10 @@ to be missing or incomplete.
   drawn with its ground cover, plants, fireflies, mist, canopy and the Great
   Deku Tree. The opening subtitles render, and full-opening tests at
   2160p show fog and scenery across the frame after fixes to render-target
-  scaling. In one sampled forest frame, the 854×480 guest scene targets
-  were rendered at 1281×720 before the final 3840×2160 output. The water
-  is too red.
-  No gameplay has been reached yet. Every unimplemented operation still
-  stops the run with a report.
+  scaling. With Dynamic resolution disabled, a 1440p test used 2560×1440
+  scene targets. The adaptive path used 854×480 targets in the sampled scene.
+  Water color and temporal stability still need verification. Unimplemented
+  operations can stop the run and produce a report.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
@@ -51,11 +49,11 @@ to be missing or incomplete.
 ## Performance
 
 - The console runs the game at 60 frames per second. The opening movie
-  reaches that speed in Echora. Recent full-opening runs on a Ryzen 7
-  5800X3D and Radeon RX 9070 XT averaged about 20 FPS over 600 frames
-  in the first 3D scene at both 2560×1440 and 3840×2160. A longer 2160p
-  Wayland run averaged about 16 FPS over 1,600 frames deeper into the forest.
-  The camera and draw workload can vary between runs.
+  reaches that speed in Echora. With a Ryzen 7 5800X3D, a Radeon RX 9070 XT
+  and a warm shader cache, an isolated 2560×1440 Wayland test averaged
+  about 11 FPS over 175 frames on a saved forest route. An earlier stock
+  Linux build ran at around 6 FPS toward the end of a different village
+  route. Camera position, effects and scene loading change the workload.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its
