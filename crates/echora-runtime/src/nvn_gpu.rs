@@ -39,8 +39,15 @@ pub(super) struct DrawBindings {
 pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
-    pools: HashMap<PagePool, ((u64, u64, usize), bool)>,
+    pools: HashMap<PagePool, (PoolShareVersion, bool)>,
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolShareVersion {
+    Unshared,
+    Resident(u64),
+    Imported(usize),
 }
 
 #[derive(Default)]
@@ -383,6 +390,9 @@ pub struct Backend {
     /// length, file, offset in the file).
     shared_pieces: HashMap<u64, Vec<(u64, u64, i32, u64)>>,
     shared_guest_index: std::cell::RefCell<GuestFileIndex>,
+    /// The publication of each live share, even when its span count or
+    /// file offsets match those of an earlier share.
+    pool_share_versions: HashMap<u64, usize>,
     /// Bumped whenever a pool is shared (or shared again): the page table
     /// is rebuilt after it changes.
     share_generation: usize,
@@ -622,6 +632,7 @@ impl Backend {
             shared_pools: HashMap::default(),
             shared_pieces: HashMap::default(),
             shared_guest_index: Default::default(),
+            pool_share_versions: HashMap::default(),
             share_generation: 0,
             target_index: TargetIndex::default(),
             retired_since: HashMap::default(),
@@ -700,6 +711,11 @@ impl Backend {
             }
         }
         Ok(table)
+    }
+
+    fn record_pool_share(&mut self, base: u64) {
+        self.share_generation += 1;
+        self.pool_share_versions.insert(base, self.share_generation);
     }
 
     fn extend_pending_writes(&mut self) {
@@ -6865,12 +6881,13 @@ impl Nvn {
             // would keep the old ones.
             if let Some((size, _, offset)) = backend.shared_pools.remove(&base) {
                 backend.renderer.release_file_range(offset, size);
-                backend.share_generation += 1;
             }
             if let Some(pieces) = backend.shared_pieces.remove(&base) {
                 for (_, size, _, offset) in pieces {
                     backend.renderer.release_file_range(offset, size);
                 }
+            }
+            if backend.pool_share_versions.remove(&base).is_some() {
                 backend.share_generation += 1;
             }
         }
@@ -7298,22 +7315,20 @@ impl Nvn {
     /// What decides how pool `base` maps into the page table besides its
     /// own properties: its recorded share (whole or in pieces) and, for a
     /// GPU-only pool, its resident buffer's address.
-    fn pool_share_signature(&self, base: u64, flags: u64) -> (u64, u64, usize) {
+    fn pool_share_signature(&self, base: u64, flags: u64) -> PoolShareVersion {
         let Some(backend) = self.gpu.as_ref() else {
-            return (0, 0, 0);
+            return PoolShareVersion::Unshared;
         };
         if flags & 6 == 0 {
-            return (backend.renderer.resident_address(base).unwrap_or(0), 0, 0);
+            return PoolShareVersion::Resident(
+                backend.renderer.resident_address(base).unwrap_or(0),
+            );
         }
-        let shared = backend
-            .shared_pools
+        backend
+            .pool_share_versions
             .get(&base)
-            .map_or((0, 0), |&(size, file, at)| (size, (file as u64) << 48 ^ at));
-        let pieces = backend
-            .shared_pieces
-            .get(&base)
-            .map_or(0, |pieces| pieces.len());
-        (shared.0, shared.1, pieces)
+            .copied()
+            .map_or(PoolShareVersion::Unshared, PoolShareVersion::Imported)
     }
 
     /// Write the GPU page entries for both a direct pool and a virtual alias.
@@ -8515,7 +8530,7 @@ impl Nvn {
                 let backend = self.gpu.as_mut().unwrap();
                 backend.stat("stat: pools shared whole", 1);
                 backend.shared_pools.insert(base, (size, file, offset));
-                backend.share_generation += 1;
+                backend.record_pool_share(base);
                 continue;
             }
             // Page by page: runs of pages whose backing follows on.
@@ -8541,7 +8556,7 @@ impl Nvn {
             let backend = self.gpu.as_mut().unwrap();
             backend.stat("stat: pools shared in pieces", 1);
             backend.shared_pieces.insert(base, pieces);
-            backend.share_generation += 1;
+            backend.record_pool_share(base);
         }
     }
 
@@ -13771,7 +13786,7 @@ mod pool_tests {
             0x1000,
             vec![(0, 0x100, 3, 0x8000), (0x200, 0x100, 3, 0xa000)],
         );
-        backend.share_generation += 1;
+        backend.record_pool_share(0x1000);
         let mut nvn = Nvn {
             gpu: Some(backend),
             gpu_checked: true,
@@ -13779,9 +13794,21 @@ mod pool_tests {
         };
         assert_eq!(nvn.shared_guest_range(0x1020, 8).unwrap().start, 0x8020);
         assert_eq!(nvn.shared_guest_range(0x1200, 8).unwrap().start, 0xa000);
+        let previous = nvn.pool_share_signature(0x1000, 4);
         nvn.gpu_forget_pool(0x1000);
         assert_eq!(nvn.shared_guest_range(0x1020, 8), None);
         assert_eq!(nvn.shared_guest_range(0x1200, 8), None);
+
+        // A replacement with the same span count can point elsewhere.
+        let backend = nvn.gpu.as_mut().unwrap();
+        backend.shared_pieces.insert(
+            0x1000,
+            vec![(0, 0x100, 3, 0x9000), (0x200, 0x100, 3, 0xb000)],
+        );
+        backend.record_pool_share(0x1000);
+        assert_ne!(nvn.pool_share_signature(0x1000, 4), previous);
+        assert_eq!(nvn.shared_guest_range(0x1020, 8).unwrap().start, 0x9020);
+        assert_eq!(nvn.shared_guest_range(0x1200, 8).unwrap().start, 0xb000);
     }
 
     #[test]
@@ -14098,7 +14125,7 @@ mod pool_tests {
         backend
             .shared_pieces
             .insert(guest, vec![(0, 8, 1, 0), (8, 8, 2, 48)]);
-        backend.share_generation += 1;
+        backend.record_pool_share(guest);
         backend.renderer.resident_buffer(guest, 4096).unwrap();
         backend
             .renderer
@@ -14148,7 +14175,7 @@ mod pool_tests {
         let base = 0x10_0000;
         let size = 4096;
         backend.shared_pieces.insert(base, vec![(0, size, 1, 0)]);
-        backend.share_generation += 1;
+        backend.record_pool_share(base);
         backend.renderer.resident_buffer(base, size).unwrap();
         backend.renderer.upload_resident(base, 16, &[0; 8]).unwrap();
         let serial = backend.renderer.recorded_serial();
