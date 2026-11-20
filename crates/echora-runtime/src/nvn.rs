@@ -5184,8 +5184,8 @@ impl Nvn {
                 };
                 // Some comparisons cannot use a Vulkan predicate. Resolve
                 // any queued reports before reading their values on the CPU.
-                self.resolve_storage(core, Some(first..first + 8))?;
-                self.resolve_storage(core, Some(second..second + 8))?;
+                self.resolve_draw_input(core, first, 8)?;
+                self.resolve_draw_input(core, second, 8)?;
                 match (core.memory.read_u64(first), core.memory.read_u64(second)) {
                     (Ok(first), Ok(second)) => Ok((first == second) == (mode == 0)),
                     _ => Ok(true),

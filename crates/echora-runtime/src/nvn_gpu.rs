@@ -5983,9 +5983,9 @@ impl Nvn {
         backend.resident_writes_pending(range)
     }
 
-    /// Make a mapped draw input current before the CPU reads it or copies
-    /// it into the upload ring.
-    fn resolve_draw_input(
+    /// Make a mapped rendering input current before comparing it on the
+    /// CPU or copying it into the upload ring.
+    pub(super) fn resolve_draw_input(
         &mut self,
         core: &mut Guest,
         guest: u64,
@@ -8306,6 +8306,7 @@ impl Nvn {
             && mode <= 1
         {
             let other = self.gpu_to_guest(address + 16, 8)?;
+            self.resolve_draw_input(core, other, 8)?;
             if core
                 .memory
                 .read_u64(other)
@@ -12657,6 +12658,73 @@ mod pool_tests {
         nvn.resolve_draw_input(&mut core, guest, 9).unwrap();
         assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() < serial);
         nvn.resolve_draw_input(&mut core, guest + 6, 5).unwrap();
+        assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() >= serial);
+    }
+
+    #[test]
+    fn cpu_render_condition_waits_for_imported_gpu_writes() {
+        use echora_guest::{
+            cpu::Cpu,
+            memory::{Memory, READ, STATE_NORMAL, WRITE},
+        };
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        let size = 4096;
+        backend.shared_pieces.insert(base, vec![(0, size, 1, 0)]);
+        backend.share_generation += 1;
+        backend.renderer.resident_buffer(base, size).unwrap();
+        backend.renderer.upload_resident(base, 16, &[0; 8]).unwrap();
+        let serial = backend.renderer.recorded_serial();
+        backend.record_page_table_write(
+            serial,
+            Some(vec![super::SharedRange {
+                file: 1,
+                start: 16,
+                end: 24,
+            }]),
+        );
+
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [base, size, 0, 0],
+                    ..Args::default()
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.objects.get_mut(&1).unwrap().state.insert(
+            "GpuAddress".into(),
+            Args {
+                x: [base, 0, 0, 0],
+                ..Args::default()
+            },
+        );
+        nvn.render.render_enable = Some((0, base));
+
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "render condition")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() < serial);
+        assert!(nvn.render_enabled(&mut core).unwrap());
         assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() >= serial);
     }
 
