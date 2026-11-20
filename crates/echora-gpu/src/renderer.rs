@@ -5920,7 +5920,11 @@ impl Renderer {
         };
         let after = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
         // SAFETY: recording outside rendering; both images are live and in
         // GENERAL layout; a volume's depth maps to the array's layers
         // (Vulkan 1.1).
@@ -8041,6 +8045,21 @@ mod tests {
         assert_eq!(&texels[..4], &[0, 0, 0, 255]);
         assert_eq!(&texels[4 * 511..], &[255, 255, 255, 255]);
         assert_eq!(&texels[4 * 163..4 * 164], &[109, 145, 72, 255]);
+    }
+
+    #[test]
+    fn repeated_volume_array_copies_are_ordered() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        renderer
+            .shaped_target(1, 4, 4, ImageShape::D3 { depth: 2 }, format, 1)
+            .unwrap();
+        renderer.zero_target(1).unwrap();
+        renderer.volume_as_layers(1, 2, 4, 4, 2, format).unwrap();
+        renderer.volume_as_layers(1, 2, 4, 4, 2, format).unwrap();
+        assert_eq!(renderer.read_target_bytes(2, 4).unwrap(), vec![0; 64]);
     }
 
     #[test]
