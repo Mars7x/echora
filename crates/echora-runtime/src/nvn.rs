@@ -953,6 +953,7 @@ pub struct RenderState {
     pub render_enable: Option<(u64, u64)>,
     /// The current queue's predicate is being evaluated by the GPU.
     gpu_render_condition: bool,
+    stencil_values: [StencilValues; 2],
     /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset,
     /// with ECHORA_OCCLUSION_ASSUME_VISIBLE (debugging, an approximation):
     /// occlusion counts are not measured, so each draw executed counts as
@@ -977,6 +978,23 @@ pub struct RenderState {
     /// Slots set in each stage's 16-entry storage buffer table, including
     /// explicit bindings with a zero address or size.
     storage_slots: [u16; 8],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StencilValues {
+    reference: u32,
+    compare_mask: u32,
+    write_mask: u32,
+}
+
+impl Default for StencilValues {
+    fn default() -> Self {
+        Self {
+            reference: 0,
+            compare_mask: 0xff,
+            write_mask: 0xff,
+        }
+    }
 }
 
 /// Texture handles by stage and slot.
@@ -6033,6 +6051,23 @@ impl Nvn {
                     );
                 }
                 if is_state_command(rest) {
+                    if matches!(
+                        rest,
+                        "SetStencilRef" | "SetStencilValueMask" | "SetStencilMask"
+                    ) {
+                        let faces = command.x[1];
+                        let value = command.x[2] as u32;
+                        for (index, face) in self.render.stencil_values.iter_mut().enumerate() {
+                            if faces & (1 << index) != 0 {
+                                match rest {
+                                    "SetStencilRef" => face.reference = value,
+                                    "SetStencilValueMask" => face.compare_mask = value,
+                                    _ => face.write_mask = value,
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     // Per-slot bindings are kept per stage and slot; the
                     // others keep their latest command.
                     let key = match rest {
@@ -8003,6 +8038,28 @@ impl Nvn {
     }
 }
 
+fn stencil_property_keys(property: &str) -> Option<[&'static str; 2]> {
+    match property {
+        "StencilFunc" => Some(["StencilFunc/1", "StencilFunc/2"]),
+        "StencilOp" => Some(["StencilOp/1", "StencilOp/2"]),
+        _ => None,
+    }
+}
+
+fn stencil_face_property<'a>(
+    props: &'a BTreeMap<String, Args>,
+    property: &str,
+    face: usize,
+) -> Option<&'a Args> {
+    let key = stencil_property_keys(property)?[face];
+    props.get(key).or_else(|| {
+        // Earlier recorded state snapshots used a single masked setting.
+        props
+            .get(property)
+            .filter(|args| args.x[0] & (1 << face) != 0)
+    })
+}
+
 /// The generic property bags (SetDefaults / Set<Prop> / Get<Prop> on
 /// builders, fixed-function state structures and texture views): Ok(true)
 /// when `kind`/`rest` is one of those calls and it was made. They touch
@@ -8127,7 +8184,17 @@ fn bag_call(
                     0
                 };
             }
-            bag.set(property, args);
+            if kind == "DepthStencilState"
+                && let Some(keys) = stencil_property_keys(property)
+            {
+                for (face, key) in keys.into_iter().enumerate() {
+                    if args.x[0] & (1 << face) != 0 {
+                        bag.set(key, args);
+                    }
+                }
+            } else {
+                bag.set(property, args);
+            }
             let tag = bag.tag.or_else(|| state_tag(kind, &bag.props));
             bag.tag = tag;
             drop(bags);
@@ -8137,20 +8204,38 @@ fn bag_call(
             return Ok(true);
         }
         if let Some(property) = rest.strip_prefix("Get") {
-            if let Some(snapshot) = memory_tag.and_then(|tag| tagged_state(kind, tag)) {
-                let value = snapshot[0]
-                    .get(property)
-                    .ok_or_else(|| stop(format!("{property} was never set")))?;
-                core.cpu.regs[0] = value.x[0];
-                core.cpu.vectors[0] = u128::from(value.v[0]);
+            let snapshot = memory_tag.and_then(|tag| tagged_state(kind, tag));
+            let locked;
+            let props = if let Some(snapshot) = &snapshot {
+                &snapshot[0]
+            } else {
+                locked = read_shared(bags.at(this));
+                &locked
+                    .get(&this)
+                    .filter(|bag| bag.kind == kind)
+                    .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?
+                    .props
+            };
+            if kind == "DepthStencilState" && stencil_property_keys(property).is_some() {
+                let face = match x[1] as u32 {
+                    1 => 0,
+                    2 => 1,
+                    face => return Err(invalid(format!("invalid stencil face {face}"))),
+                };
+                let value = stencil_face_property(props, property, face);
+                if property == "StencilFunc" {
+                    core.cpu.regs[0] = value.map_or(8, |value| value.x[1]);
+                } else {
+                    let ops = value.map_or([1; 3], |value| [value.x[1], value.x[2], value.x[3]]);
+                    for (address, op) in x[2..5].iter().copied().zip(ops) {
+                        if address != 0 {
+                            core.memory.write_u32(address, op as u32)?;
+                        }
+                    }
+                }
                 return Ok(true);
             }
-            let bags = read_shared(bags.at(this));
-            let bag = bags
-                .get(&this)
-                .filter(|bag| bag.kind == kind)
-                .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?;
-            let Some(value) = bag.props.get(property).copied() else {
+            let Some(value) = props.get(property) else {
                 return Err(stop(format!("{property} was never set")));
             };
             core.cpu.regs[0] = value.x[0];

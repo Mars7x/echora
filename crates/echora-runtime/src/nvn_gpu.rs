@@ -5138,48 +5138,23 @@ impl Nvn {
         sampler
     }
 
-    /// Front and back stencil state: the snapshot's StencilFunc(face, func)
-    /// and StencilOp(face, fail, depth fail, pass) with the command
-    /// buffer's SetStencilRef / SetStencilValueMask / SetStencilMask(face,
-    /// value). Faces 1 front, 2 back, 3 both (inferred); each keeps only its
-    /// latest call, which applies to the faces it names.
+    /// Combine the bound depth-stencil state's operations with the current
+    /// queue's stencil masks and reference for each face.
     fn stencil_faces(&self, depth_state: &BTreeMap<String, super::Args>) -> [StencilFace; 2] {
-        let mut faces = [StencilFace {
-            fail: vk::StencilOp::KEEP,
-            pass: vk::StencilOp::KEEP,
-            depth_fail: vk::StencilOp::KEEP,
-            compare: vk::CompareOp::ALWAYS,
-            compare_mask: 0xff,
-            write_mask: 0xff,
-            reference: 0,
-        }; 2];
-        let applies = |face: u64, index: usize| face >> index & 1 != 0;
-        for (index, face) in faces.iter_mut().enumerate() {
-            if let Some(args) = depth_state.get("StencilFunc") {
-                if applies(args.x[0], index) {
-                    face.compare = compare_op(args.x[1]);
-                }
+        std::array::from_fn(|face| {
+            let values = self.render.stencil_values[face];
+            let function = super::stencil_face_property(depth_state, "StencilFunc", face);
+            let ops = super::stencil_face_property(depth_state, "StencilOp", face);
+            StencilFace {
+                fail: ops.map_or(vk::StencilOp::KEEP, |args| stencil_op(args.x[1])),
+                depth_fail: ops.map_or(vk::StencilOp::KEEP, |args| stencil_op(args.x[2])),
+                pass: ops.map_or(vk::StencilOp::KEEP, |args| stencil_op(args.x[3])),
+                compare: function.map_or(vk::CompareOp::ALWAYS, |args| compare_op(args.x[1])),
+                compare_mask: values.compare_mask,
+                write_mask: values.write_mask,
+                reference: values.reference,
             }
-            if let Some(args) = depth_state.get("StencilOp") {
-                if applies(args.x[0], index) {
-                    face.fail = stencil_op(args.x[1]);
-                    face.depth_fail = stencil_op(args.x[2]);
-                    face.pass = stencil_op(args.x[3]);
-                }
-            }
-            for (name, value) in [
-                ("SetStencilRef", &mut face.reference),
-                ("SetStencilValueMask", &mut face.compare_mask),
-                ("SetStencilMask", &mut face.write_mask),
-            ] {
-                if let Some(command) = self.render.state.get(name) {
-                    if applies(command.x[1], index) {
-                        *value = command.x[2] as u32;
-                    }
-                }
-            }
-        }
-        faces
+        })
     }
 
     /// Show presented texture `texture` in the host window (ECHORA_WINDOW).
@@ -13203,6 +13178,120 @@ mod target_tests {
             .read_target_bytes(texture, 4)
             .unwrap();
         assert_eq!(pixels, [17, 255, 100, 190].repeat(32));
+    }
+
+    #[test]
+    fn stencil_binds_preserve_settings_for_each_face() {
+        use super::vk;
+        use crate::nvn::snapshot_states;
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "stencil state")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let state = 0x1100;
+        for (name, values) in [
+            ("nvnDepthStencilStateSetDefaults", [0, 0, 0, 0]),
+            ("nvnDepthStencilStateSetStencilFunc", [3, 3, 0, 0]),
+            ("nvnDepthStencilStateSetStencilOp", [3, 1, 2, 3]),
+            ("nvnDepthStencilStateSetStencilFunc", [2, 6, 0, 0]),
+            ("nvnDepthStencilStateSetStencilOp", [2, 4, 5, 6]),
+            ("nvnDepthStencilStateSetStencilFunc", [0, 1, 0, 0]),
+        ] {
+            guest.cpu.regs[..5]
+                .copy_from_slice(&[state, values[0], values[1], values[2], values[3]]);
+            assert!(nvn.call(name, &mut guest).unwrap());
+        }
+        guest.cpu.regs[..2].copy_from_slice(&[state, 1]);
+        assert!(
+            nvn.call("nvnDepthStencilStateGetStencilFunc", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(guest.cpu.regs[0], 3);
+        guest.cpu.regs[..5].copy_from_slice(&[state, 2, 0x1200, 0x1204, 0x1208]);
+        assert!(
+            nvn.call("nvnDepthStencilStateGetStencilOp", &mut guest)
+                .unwrap()
+        );
+        for (address, op) in [(0x1200, 4), (0x1204, 5), (0x1208, 6)] {
+            assert_eq!(guest.memory.read_u32(address).unwrap(), op);
+        }
+
+        let mut bind = Command {
+            name: "nvnCommandBufferBindDepthStencilState",
+            x: [0, state, 0, 0, 0, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: Default::default(),
+        };
+        snapshot_states(&nvn.bags, &guest, &mut bind);
+        // The queued bind keeps its snapshot after the guest reuses the state.
+        guest.cpu.regs[0] = state;
+        assert!(
+            nvn.call("nvnDepthStencilStateSetDefaults", &mut guest)
+                .unwrap()
+        );
+
+        nvn.switch_render_queue(1, &mut guest).unwrap();
+        nvn.execute(&bind, &mut guest).unwrap();
+        for (name, face, value) in [
+            ("nvnCommandBufferSetStencilRef", 3, 0x11),
+            ("nvnCommandBufferSetStencilValueMask", 3, 0x7f),
+            ("nvnCommandBufferSetStencilMask", 3, 0x0f),
+            ("nvnCommandBufferSetStencilRef", 2, 0x22),
+            ("nvnCommandBufferSetStencilValueMask", 2, 0x80),
+            ("nvnCommandBufferSetStencilMask", 2, 0xf0),
+        ] {
+            nvn.execute(
+                &Command {
+                    name,
+                    x: [0, face, value, 0, 0, 0, 0, 0],
+                    v: [0; 8],
+                    captured: Vec::new(),
+                    states: Default::default(),
+                },
+                &mut guest,
+            )
+            .unwrap();
+        }
+        nvn.switch_render_queue(2, &mut guest).unwrap();
+        assert_eq!(nvn.render.stencil_values[0].write_mask, 0xff);
+        nvn.switch_render_queue(1, &mut guest).unwrap();
+        let [front, back] = nvn.stencil_faces(nvn.render.properties("BindDepthStencilState"));
+        assert_eq!(front.compare, vk::CompareOp::EQUAL);
+        assert_eq!(back.compare, vk::CompareOp::NOT_EQUAL);
+        assert_eq!(
+            [front.fail, front.depth_fail, front.pass],
+            [
+                vk::StencilOp::KEEP,
+                vk::StencilOp::ZERO,
+                vk::StencilOp::REPLACE
+            ]
+        );
+        assert_eq!(
+            [back.fail, back.depth_fail, back.pass],
+            [
+                vk::StencilOp::INCREMENT_AND_CLAMP,
+                vk::StencilOp::DECREMENT_AND_CLAMP,
+                vk::StencilOp::INVERT
+            ]
+        );
+        assert_eq!(
+            [front.reference, front.compare_mask, front.write_mask],
+            [0x11, 0x7f, 0x0f]
+        );
+        assert_eq!(
+            [back.reference, back.compare_mask, back.write_mask],
+            [0x22, 0x80, 0xf0]
+        );
     }
 
     #[test]
