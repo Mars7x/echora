@@ -788,17 +788,39 @@ impl Memory {
         let start = address & !(PAGE_SIZE - 1);
         let end = address
             .checked_add(length.max(1))?
-            .next_multiple_of(PAGE_SIZE);
-        let (first, _) = self.guest_view_page(start)?;
-        let mut page = start + PAGE_SIZE;
+            .checked_next_multiple_of(PAGE_SIZE)?;
+        let mut first = None;
+        let mut page = start;
         while page < end {
-            let (backing, _) = self.guest_view_page(page)?;
-            if backing != first + (page - start) {
+            let mapping = self.mapping_at(page)?;
+            let mapping_end = mapping.end() & !(PAGE_SIZE - 1);
+            if mapping.state == STATE_FREE || mapping_end <= page {
                 return None;
             }
-            page += PAGE_SIZE;
+            // Within a run of mapped pages and between alias boundaries,
+            // guest and backing addresses advance together.
+            let (backing, span_end) = self.backing_span(page, end.min(mapping_end));
+            let initial = *first.get_or_insert(backing);
+            if backing != initial + (page - start) {
+                return None;
+            }
+            page = span_end;
         }
-        Some((file, first + (address - start)))
+        Some((file, first? + (address - start)))
+    }
+
+    /// Backing address and the end of a span before the next alias boundary.
+    fn backing_span(&self, address: u64, end: u64) -> (u64, u64) {
+        match self.stack_aliases.range(..=address).next_back() {
+            Some((&start, alias)) if address < start + alias.size => (
+                alias.source + (address - start),
+                end.min(start + alias.size),
+            ),
+            _ => {
+                let next = self.stack_aliases.range(address..end).next();
+                (address, next.map_or(end, |(&start, _)| start))
+            }
+        }
     }
 
     fn backing_page(&self, page: u64) -> u64 {
@@ -1438,18 +1460,7 @@ impl Memory {
         }
         let end = address + bytes.len() as u64;
         while !bytes.is_empty() {
-            // Between aliases, guest and backing addresses advance together.
-            // Inside one alias, they advance together from its source.
-            let (backing, span_end) = match self.stack_aliases.range(..=address).next_back() {
-                Some((&start, alias)) if address < start + alias.size => (
-                    alias.source + (address - start),
-                    end.min(start + alias.size),
-                ),
-                _ => {
-                    let next = self.stack_aliases.range(address..end).next();
-                    (address, next.map_or(end, |(&start, _)| start))
-                }
-            };
+            let (backing, span_end) = self.backing_span(address, end);
             let (span, remaining) = bytes.split_at((span_end - address) as usize);
             self.write_backing_span(address, backing, span);
             address = span_end;
@@ -1841,12 +1852,19 @@ mod tests {
         let (file, offset) = memory.shared_span(0x10010, 0x3000).unwrap();
         assert!(file >= 0);
         assert_eq!(offset, 0x10010);
+        memory.set_permissions(0x12000, 0x1000, READ).unwrap();
+        assert_eq!(memory.shared_span(0x10010, 0x3000), Some((file, offset)));
         // Past the mapping, or unmapped: not shareable.
         assert!(memory.shared_span(0x13000, 0x2000).is_none());
         assert!(memory.shared_span(0x20000, 0x10).is_none());
+        assert!(memory.shared_span(u64::MAX - 1, 1).is_none());
         // An alias is backed by its source pages.
         memory.map_stack_alias(0x40000, 0x11000, 0x1000).unwrap();
         assert_eq!(memory.shared_span(0x40008, 8).unwrap().1, 0x11008);
+        memory
+            .map(0x41000, 0x1000, READ, STATE_NORMAL, "neighbor")
+            .unwrap();
+        assert!(memory.shared_span(0x40fff, 2).is_none());
     }
 
     #[test]
