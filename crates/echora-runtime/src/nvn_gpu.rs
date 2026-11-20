@@ -22,7 +22,7 @@ use echora_gpu::draw::{
     TextureSource, UploadRegion, VertexAttribute, VertexStream,
 };
 use echora_gpu::present::Presenter;
-use echora_gpu::renderer::{Renderer, Scale};
+use echora_gpu::renderer::{Renderer, Scale, TargetInfo};
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
 use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, StateSnapshots};
@@ -1930,7 +1930,9 @@ impl Nvn {
         transfer: super::TexelTransfer,
         destination: u64,
     ) -> Result<bool, String> {
-        let Some((key, base_level)) = self.resolve_target(texture) else {
+        let Some((key, base_level)) =
+            self.resolve_target_with_levels(texture, self.texture_levels(texture), true)
+        else {
             return Ok(false);
         };
         let object = self.object(texture, "Texture")?;
@@ -3837,16 +3839,17 @@ impl Nvn {
 
     /// A render target whose texture object shares `texture`'s storage and
     /// size, if any.
-    fn target_sharing_storage(&self, texture: u64) -> Option<u64> {
+    fn target_sharing_storage(&self, texture: u64, initialized_only: bool) -> Option<u64> {
         let base = self.texture_storage(texture)?;
         let extent = self.texture_extent(texture).ok()?;
         let backend = self.gpu.as_ref()?;
         let renderer = &backend.renderer;
         let matches = |key: &u64| {
             self.texture_storage(*key) == Some(base)
-                && renderer
-                    .target_info(*key)
-                    .is_some_and(|target| (target.width, target.height) == extent)
+                && renderer.target_info(*key).is_some_and(|target| {
+                    (target.width, target.height) == extent
+                        && (!initialized_only || target.initialized)
+                })
         };
         if self.target_index_current() {
             return backend
@@ -3961,10 +3964,15 @@ impl Nvn {
     /// texture object per level, as bloom chains use; levels above 0 as
     /// `mip_targets` allows).
     fn resolve_target(&self, texture: u64) -> Option<(u64, u32)> {
-        self.resolve_target_with_levels(texture, self.texture_levels(texture))
+        self.resolve_target_with_levels(texture, self.texture_levels(texture), false)
     }
 
-    fn resolve_target_with_levels(&self, texture: u64, levels: u32) -> Option<(u64, u32)> {
+    fn resolve_target_with_levels(
+        &self,
+        texture: u64,
+        levels: u32,
+        initialized_only: bool,
+    ) -> Option<(u64, u32)> {
         let renderer = &self.gpu.as_ref()?.renderer;
         // Its own format (or its sRGB twin): a texture object
         // reinterpreting the memory in another format (RGB9E5 over the HDR
@@ -3979,6 +3987,10 @@ impl Nvn {
                     || echora_gpu::renderer::srgb_twin(target_format) == Some(format)
             })
         };
+        let covers_levels = |target: TargetInfo, base: u32| {
+            (!initialized_only || target.initialized)
+                && target.levels.saturating_sub(base) >= levels
+        };
         // The object's own target, while the object still describes it:
         // applications rotate texture objects through a ring and initialize
         // one again over other storage or in another format (the target
@@ -3986,13 +3998,15 @@ impl Nvn {
         if renderer.target_info(texture).is_some_and(|target| {
             (format.is_none() || same_format(target.format))
                 && extent.is_none_or(|extent| (target.width, target.height) == extent)
-                && target.levels >= levels
+                && covers_levels(target, 0)
         }) {
             return Some((texture, 0));
         }
         let mips = super::mip_targets();
         if !mips {
-            return self.target_sharing_storage(texture).map(|key| (key, 0));
+            return self
+                .target_sharing_storage(texture, initialized_only)
+                .map(|key| (key, 0));
         }
         let base = self.texture_storage(texture)?;
         let extent = extent?;
@@ -4010,7 +4024,7 @@ impl Nvn {
                 if renderer.target_info(key).is_some_and(|target| {
                     (target.width, target.height) == extent
                         && same_format(target.format)
-                        && target.levels >= levels
+                        && covers_levels(target, 0)
                 }) {
                     return Some((key, 0));
                 }
@@ -4023,7 +4037,7 @@ impl Nvn {
                 .find(|mip| {
                     mip.extent == extent
                         && renderer.target_info(mip.key).is_some_and(|target| {
-                            same_format(target.format) && target.levels - mip.level >= levels
+                            same_format(target.format) && covers_levels(target, mip.level)
                         })
                         && self.mip_matches_backing(mip, texture)
                 })
@@ -4042,7 +4056,7 @@ impl Nvn {
             };
             if target_base == base
                 && (target.width, target.height) == extent
-                && target.levels >= levels
+                && covers_levels(target, 0)
             {
                 return Some((key, 0));
             }
@@ -4055,7 +4069,7 @@ impl Nvn {
             for (address, mip) in self.target_level_addresses(key, target, target_base) {
                 if address == base
                     && mip.extent == extent
-                    && target.levels - mip.level >= levels
+                    && covers_levels(target, mip.level)
                     && self.mip_matches_backing(&mip, texture)
                 {
                     mip_match = Some((key, mip.level));
@@ -4079,7 +4093,7 @@ impl Nvn {
     /// already written through its shorter alias.
     fn resolve_color_target(&mut self, texture: u64, level: u32) -> Result<(u64, u32), String> {
         let levels = self.texture_levels(texture);
-        if let Some((key, base)) = self.resolve_target_with_levels(texture, levels) {
+        if let Some((key, base)) = self.resolve_target_with_levels(texture, levels, false) {
             return Ok((key, base + level));
         }
         if levels > 1
@@ -4090,7 +4104,7 @@ impl Nvn {
                 .renderer
                 .target_info(texture)
                 .is_none()
-            && let Some((alias, 0)) = self.resolve_target_with_levels(texture, 1)
+            && let Some((alias, 0)) = self.resolve_target_with_levels(texture, 1, false)
             && self.flat_alias_layout_matches(texture, alias)
         {
             self.gpu
@@ -4314,7 +4328,9 @@ impl Nvn {
         // over the HDR scene's R11G11B10 memory once the scene is used):
         // the target in the texture's own format is the one it reads.
         let levels = self.texture_levels(texture);
-        if let Some((key, level)) = self.resolve_target_with_levels(texture, levels) {
+        // A fresh allocation has no texels. Read a populated alias or
+        // the guest backing until work writes that allocation.
+        if let Some((key, level)) = self.resolve_target_with_levels(texture, levels, true) {
             if level > 0
                 || (key != texture
                     && self
@@ -4343,14 +4359,14 @@ impl Nvn {
             .unwrap()
             .renderer
             .target_info(texture)
-            .is_some()
+            .is_some_and(|target| target.initialized)
         {
             return Ok(TextureSource::Target(texture));
         }
         // Another texture object over the same storage may be the one the
         // GPU rendered into (a separate object for sampling is common):
         // sample that render target.
-        if let Some(target) = self.target_sharing_storage(texture) {
+        if let Some(target) = self.target_sharing_storage(texture, true) {
             return Ok(TextureSource::Target(target));
         }
         self.guest_texture(core, texture)
@@ -5637,8 +5653,10 @@ impl Nvn {
         // A view or another texture object may name a region of an existing
         // target. Rendered mips keep their own level in that target.
         let target = |texture| {
-            self.resolve_target(texture)
-                .or_else(|| self.target_sharing_storage(texture).map(|key| (key, 0)))
+            self.resolve_target(texture).or_else(|| {
+                self.target_sharing_storage(texture, false)
+                    .map(|key| (key, 0))
+            })
         };
         let (from, source_base) = target(from).ok_or("source is not a render target")?;
         let (to, destination_base) = target(to).unwrap_or((to, 0));
@@ -10680,7 +10698,7 @@ impl Nvn {
             if renderer.existing_target(texture).is_some() {
                 return texture;
             }
-            self.target_sharing_storage(texture)
+            self.target_sharing_storage(texture, false)
                 .filter(|&target| {
                     renderer.existing_target(target).is_some_and(|target| {
                         echora_gpu::renderer::is_depth(target.format) && depth_level < target.levels
@@ -13202,6 +13220,90 @@ mod target_tests {
     }
 
     #[test]
+    fn sampling_an_untouched_target_keeps_texels_written_through_an_alias() {
+        use crate::nvn::{Guest, GuestMemory, TexelTransfer};
+        use echora_gpu::draw::TextureSource;
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        use echora_guest::{cpu::Cpu, memory::Memory};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        let (pool, rendered, sampled) = (1, 2, 3);
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([0x10000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        let properties = BTreeMap::from([
+            ("Width".into(), scalar(4)),
+            ("Height".into(), scalar(4)),
+            ("Format".into(), scalar(10)),
+            ("Storage".into(), args([pool, 0, 0, 0])),
+        ]);
+        nvn.initialize(rendered, "Texture", properties.clone())
+            .unwrap();
+        nvn.initialize(sampled, "Texture", properties).unwrap();
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let output = 0x20000;
+        memory
+            .map(output, 0x1000, READ | WRITE, STATE_NORMAL, "texel readback")
+            .unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let clear = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (rendered, 0, 0), clear, None, 0xf, 0)
+            .unwrap();
+        nvn.ensure_render_target(sampled).unwrap();
+        assert!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .target_is_undefined(sampled)
+        );
+
+        let TextureSource::Target(key) = nvn.texture_source(&core, sampled).unwrap() else {
+            panic!("sampling must find the target with the rendered texels");
+        };
+        assert_eq!(key, rendered);
+        let transfer = TexelTransfer {
+            region: [0, 0, 0, 4, 4, 1],
+            bases: [0; 2],
+            strides: [0; 2],
+        };
+        assert!(
+            nvn.gpu_read_texels(&mut core, sampled, transfer, output)
+                .unwrap()
+        );
+        let expected = 0.75_f32.to_le_bytes().repeat(16);
+        let mut readback = [0; 64];
+        core.memory.read(output, &mut readback).unwrap();
+        assert_eq!(readback.as_slice(), expected);
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(key, 4)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn archived_target_stays_visible_through_a_storage_alias() {
         use crate::nvn::{Bag, Guest, GuestMemory, retired_texture, write_shared};
         use echora_gpu::draw::TextureSource;
@@ -13842,6 +13944,12 @@ mod target_tests {
         nvn.initialize(parent, "Texture", texture(16, 4, 0, 37))
             .unwrap();
         nvn.ensure_render_target(parent).unwrap();
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .clear_color(parent, None, vk::ClearColorValue { float32: [0.5; 4] })
+            .unwrap();
         let target = nvn
             .gpu
             .as_ref()

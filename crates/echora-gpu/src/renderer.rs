@@ -45,6 +45,8 @@ pub struct TargetInfo {
     pub shape: ImageShape,
     pub levels: u32,
     pub scale: Scale,
+    /// The image has been initialized or used by recorded GPU work.
+    pub initialized: bool,
 }
 
 impl From<&Target> for TargetInfo {
@@ -56,6 +58,7 @@ impl From<&Target> for TargetInfo {
             shape: target.shape,
             levels: target.levels,
             scale: target.scale,
+            initialized: target.layout != vk::ImageLayout::UNDEFINED,
         }
     }
 }
