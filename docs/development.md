@@ -22,11 +22,10 @@ target/release/echora shaders /path/to/game.nup   # count every GPU program the 
 
 See [content input](content.md) for the formats Echora reads.
 
-`prepare` does nothing when the game is already prepared. The steps it
-runs can also be run one at a time: `echora lift`, then
-`cargo build --release -p echora-run` in the
-translation folder it prints. A translation built by hand this way is
-used as it is.
+`prepare` reuses a runner after this build of Echora stamps it. It
+rebuilds unstamped runners so the launcher picks up changes to generated
+code. To manage a translation by hand, use `echora lift` and then
+`cargo build --release -p echora-run` in the translation folder it prints.
 
 `echora run` starts the built translation directly, which is how the game
 is tested:

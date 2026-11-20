@@ -46,15 +46,12 @@ pub fn runner_path(translation: &Path) -> PathBuf {
         .with_extension(std::env::consts::EXE_EXTENSION)
 }
 
-/// Whether the translation's runner exists and no other build of Echora
-/// prepared it. A runner built by hand (no stamp) is used as it is, since
-/// whoever built it manages it.
+/// Whether the translation's runner was prepared by this build of Echora.
+/// Hand-built runners are still available through the direct run command.
 pub fn is_ready(translation: &Path) -> bool {
     runner_path(translation).is_file()
-        && match std::fs::read_to_string(translation.join(STAMP)) {
-            Ok(stamp) => stamp == binary_identity(),
-            Err(_) => true,
-        }
+        && std::fs::read_to_string(translation.join(STAMP))
+            .is_ok_and(|stamp| !stamp.is_empty() && stamp == binary_identity())
 }
 
 pub fn mark_ready(translation: &Path) -> Result<()> {
@@ -193,13 +190,13 @@ mod tests {
     }
 
     #[test]
-    fn a_translation_needs_its_runner_and_no_other_builds_stamp() {
+    fn a_translation_needs_its_runner_and_this_builds_stamp() {
         let dir = std::env::temp_dir().join(format!("echora-prepare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("target/release")).unwrap();
         assert!(!is_ready(&dir));
         std::fs::write(runner_path(&dir), b"").unwrap();
-        assert!(is_ready(&dir), "a runner built by hand is used as it is");
+        assert!(!is_ready(&dir), "an unstamped runner might be stale");
         mark_ready(&dir).unwrap();
         assert!(is_ready(&dir));
         std::fs::write(dir.join(STAMP), "another build\n").unwrap();
