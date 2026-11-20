@@ -1009,6 +1009,7 @@ fn watch_controllers(window: &mut Window, cx: &mut Context<Launcher>) {
 /// The one game build Echora translates: Ocarina of Time's update 1.1.1.
 const SUPPORTED_TITLE: &str = "0400486024DEC000";
 const SUPPORTED_VERSION: u32 = 131072;
+const SUPPORTED_DISPLAY_VERSION: &str = "1.1.1";
 
 /// `game`, if it is the build Echora supports; other games and versions are
 /// refused before anything is installed.
@@ -1018,7 +1019,7 @@ fn supported_build(game: Game) -> Result<Game, String> {
             Ok(game)
         }
         Some((title, _)) if title == SUPPORTED_TITLE => Err(format!(
-            "This is {} of the game; Echora needs version 1.1.1",
+            "This is {} of the game; Echora needs version {SUPPORTED_DISPLAY_VERSION}",
             game.version.to_lowercase()
         )),
         _ => Err(
@@ -1036,7 +1037,18 @@ fn read_game(path: &Path) -> Result<Game, String> {
         .program_package
         .map(|index| &inventory.packages[index])
         .ok_or("That selection has no game program in it")?;
-    let version = match &package.display_version {
+    let build = package
+        .title_id
+        .as_ref()
+        .map(|title| (title.to_ascii_uppercase(), package.version));
+    let known = build
+        .as_ref()
+        .is_some_and(|(title, version)| title == SUPPORTED_TITLE && *version == SUPPORTED_VERSION);
+    let display = package
+        .display_version
+        .as_deref()
+        .or_else(|| known.then_some(SUPPORTED_DISPLAY_VERSION));
+    let version = match display {
         Some(display) => format!("Version {display}"),
         None => format!(
             "Version {}.{}.{}",
@@ -1055,14 +1067,13 @@ fn read_game(path: &Path) -> Result<Game, String> {
     });
     Ok(Game {
         path: path.to_path_buf(),
-        build: package
-            .title_id
-            .clone()
-            .map(|title| (title.to_ascii_uppercase(), package.version)),
+        build,
         title: package
             .title_name
-            .clone()
-            .unwrap_or_else(|| "Unknown game".into())
+            .as_deref()
+            .or_else(|| known.then_some("The Legend of Zelda: Ocarina of Time"))
+            .unwrap_or("Unknown game")
+            .to_owned()
             .into(),
         version: version.into(),
         icon,

@@ -58,17 +58,42 @@ impl Progress {
 /// Copies `source` (a NUP file or a dump folder) into `games`, replacing any
 /// earlier install. Returns the installed path.
 pub fn install(source: &Path, games: &Path, progress: &Progress) -> io::Result<PathBuf> {
-    let name = if source.is_dir() { "dump" } else { "game.nup" };
+    let source = source.canonicalize()?;
+    let metadata = fs::metadata(&source)?;
+    let name = if metadata.is_dir() {
+        "dump"
+    } else if metadata.is_file() {
+        "game.nup"
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Choose a NUP file or an extracted game folder",
+        ));
+    };
     let target = games.join(name);
-    if source.canonicalize().ok() == target.canonicalize().ok() {
+    if target
+        .canonicalize()
+        .is_ok_and(|installed| installed == source)
+    {
         return Ok(target);
     }
+    let outside_source = |destination: &Path| {
+        if destination.starts_with(&source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Choose a game folder that does not contain Echora's installation folder",
+            ));
+        }
+        Ok(())
+    };
+    outside_source(&std::path::absolute(games)?)?;
     fs::create_dir_all(games)?;
-    progress.total.store(size_of(source)?, Ordering::Relaxed);
+    outside_source(&games.canonicalize()?)?;
+    progress.total.store(size_of(&source)?, Ordering::Relaxed);
     let staging = games.join(".installing");
     remove(&staging)?;
     let mut copying = Copying::Unchecked;
-    if let Err(error) = place(source, &staging, progress, &mut copying) {
+    if let Err(error) = place(&source, &staging, progress, &mut copying) {
         // Leave nothing half-made behind; the previous install stays.
         let _ = remove(&staging);
         return Err(error);
@@ -81,11 +106,12 @@ pub fn install(source: &Path, games: &Path, progress: &Progress) -> io::Result<P
 }
 
 fn size_of(path: &Path) -> io::Result<u64> {
-    let meta = fs::metadata(path)?;
-    if !meta.is_dir() {
-        return Ok(meta.len());
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        fs::read_dir(path)?.try_fold(0, |sum, entry| Ok(sum + size_of(&entry?.path())?))
+    } else {
+        Ok(if meta.is_file() { meta.len() } else { 0 })
     }
-    fs::read_dir(path)?.try_fold(0, |sum, entry| Ok(sum + size_of(&entry?.path())?))
 }
 
 /// Whether a real copy has had its free space checked.
@@ -102,7 +128,8 @@ fn place(
     progress: &Progress,
     copying: &mut Copying,
 ) -> io::Result<()> {
-    if source.is_dir() {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
         fs::create_dir_all(target)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
@@ -115,7 +142,12 @@ fn place(
         }
         return Ok(());
     }
-    let size = fs::metadata(source)?.len();
+    // The extracted-content reader counts only regular files and never
+    // follows symlinks. Installation copies the same tree.
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let size = metadata.len();
     if clone(source, target).is_ok() || fs::hard_link(source, target).is_ok() {
         progress.copied.fetch_add(size, Ordering::Relaxed);
         return Ok(());
@@ -252,6 +284,26 @@ mod tests {
         let installed = install(&dir.join("source"), &dir.join("games"), &progress).unwrap();
         assert_eq!(fs::read(installed.join("exefs/main")).unwrap(), b"code");
         assert_eq!(fs::read(installed.join("romfs.bin")).unwrap(), b"assets");
+        remove(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_install_ignores_links_to_other_paths() {
+        let dir = scratch("dump-links");
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("romfs")).unwrap();
+        fs::write(source.join("romfs/asset"), b"asset").unwrap();
+        fs::write(dir.join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), source.join("romfs/link")).unwrap();
+        std::os::unix::fs::symlink(&source, source.join("cycle")).unwrap();
+
+        let progress = Progress::default();
+        let installed = install(&source, &dir.join("games"), &progress).unwrap();
+        assert_eq!(fs::read(installed.join("romfs/asset")).unwrap(), b"asset");
+        assert!(!installed.join("romfs/link").exists());
+        assert!(!installed.join("cycle").exists());
+        assert_eq!(progress.total.load(Ordering::Relaxed), 5);
         remove(&dir).unwrap();
     }
 
