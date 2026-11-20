@@ -4115,7 +4115,9 @@ impl Nvn {
                 .target_info(texture)
                 .is_none()
             && let Some((alias, 0)) = self.resolve_target_with_levels(texture, 1, false)
-            && self.flat_alias_layout_matches(texture, alias)
+            && let Some(target) = self.gpu.as_ref().unwrap().renderer.target_info(alias)
+            && target.shape == (ImageShape::D2 { layers: 1 })
+            && self.texture_alias_layout_matches(texture, alias, target)
         {
             self.gpu
                 .as_mut()
@@ -4127,22 +4129,17 @@ impl Nvn {
         Ok((texture, level))
     }
 
-    /// The layouts that the renderer can extend in place: a single flat
-    /// surface with the same format, storage, stride and level-0 tiling.
-    fn flat_alias_layout_matches(&self, texture: u64, alias: u64) -> bool {
+    /// Check that both objects interpret their backing with the same shape,
+    /// format, stride, sample count and block tiling.
+    fn texture_alias_layout_matches(&self, texture: u64, alias: u64, target: TargetInfo) -> bool {
         let Some(identity) = self.texture_identity(texture) else {
             return false;
         };
         let Some(info) = crate::nvn_format::info(identity.1 as u32) else {
             return false;
         };
-        let shape = ImageShape::D2 { layers: 1 };
-        let renderer = &self.gpu.as_ref().unwrap().renderer;
-        let Some(target) = renderer.target_info(alias) else {
-            return false;
-        };
-        if target.shape != shape
-            || self.render_shape(texture) != shape
+        if self.render_shape(texture) != target.shape
+            || self.render_shape(alias) != target.shape
             || self.texture_identity(alias) != Some(identity)
             || Some(target.format) != vk_format(identity.1 as u32)
         {
@@ -4151,10 +4148,16 @@ impl Nvn {
         let layout = |key| -> Option<_> {
             let props = &self.objects.get(&key)?.builder;
             let value = |name| props.get(name).map_or(0, |args| args.x[0]);
-            let dims = [target.width, target.height, 1];
-            let layers =
-                super::texture_layout_layers(props, info, dims, 1, self.texture_levels(key));
-            let block = crate::nvn_format::base_block_shape(info, target.height, 1, layers);
+            let depth = target.shape.depth();
+            let dims = [target.width, target.height, depth];
+            let layers = super::texture_layout_layers(
+                props,
+                info,
+                dims,
+                target.shape.layers(),
+                self.texture_levels(key),
+            );
+            let block = crate::nvn_format::base_block_shape(info, target.height, depth, layers);
             Some((value("Stride"), value("Samples").max(1), block))
         };
         layout(texture)
@@ -5760,28 +5763,30 @@ impl Nvn {
         // attachment. A new image initialized from guest RAM would lose
         // those GPU writes, including any texels this dispatch leaves alone.
         let renderer = &self.gpu.as_ref().unwrap().renderer;
-        let target = if shape == (ImageShape::D2 { layers: 1 })
-            && renderer
-                .target_info(texture)
-                .is_none_or(|info| !info.initialized)
+        let target = if renderer
+            .target_info(texture)
+            .is_none_or(|info| !info.initialized)
         {
             self.refresh_target_index();
-            self.resolve_target_with_levels(texture, levels, true)
-                .filter(|&(alias, level)| {
-                    level == 0
-                        && self
-                            .gpu
-                            .as_ref()
-                            .unwrap()
-                            .renderer
-                            .target_info(alias)
-                            .is_some_and(|info| info.levels == levels && info.scale.is_one())
-                        && self.flat_alias_layout_matches(texture, alias)
-                        && self.texture_object_backing(texture).is_some_and(|backing| {
-                            self.texture_object_backing(alias).as_ref() == Some(&backing)
-                        })
+            let backend = self.gpu.as_ref().unwrap();
+            self.texture_storage(texture)
+                .and_then(|base| backend.target_index.storage.get(&base))
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&alias| {
+                    backend.renderer.target_info(alias).is_some_and(|info| {
+                        info.initialized
+                            && (info.width, info.height) == (width, height)
+                            && info.shape == shape
+                            && info.levels == levels
+                            && info.scale.is_one()
+                            && self.texture_alias_layout_matches(texture, alias, info)
+                    }) && self.texture_object_backing(texture).is_some_and(|backing| {
+                        self.texture_object_backing(alias).as_ref() == Some(&backing)
+                    })
                 })
-                .map_or(texture, |(alias, _)| alias)
+                .unwrap_or(texture)
         } else {
             texture
         };
@@ -12660,6 +12665,91 @@ mod target_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn layered_storage_images_find_the_compatible_rendered_alias() {
+        let Some((mut nvn, mut memory, _, template)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let (incompatible, rendered, storage) = (template + 1, template + 2, template + 3);
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut props = nvn.objects[&template].builder.clone();
+        props.remove("Stride");
+        for (key, value) in [
+            ("Width", 4),
+            ("Height", 4),
+            ("Format", 10),
+            ("Target", 4),
+            ("Depth", 2),
+            ("Levels", 2),
+        ] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        nvn.initialize(incompatible, "Texture", props.clone())
+            .unwrap();
+        props.get_mut("Depth").unwrap().x[0] = 3;
+        nvn.initialize(rendered, "Texture", props.clone()).unwrap();
+        nvn.initialize(storage, "Texture", props).unwrap();
+        nvn.ensure_render_target(incompatible).unwrap();
+        nvn.ensure_render_target(rendered).unwrap();
+        nvn.gpu_clear_color(
+            &guest,
+            (incompatible, 0, 0),
+            [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits),
+            None,
+            0xf,
+            0,
+        )
+        .unwrap();
+        for level in 0..2 {
+            for layer in 0..3 {
+                let value = ((level * 3 + layer) + 1) as f32 / 8.0;
+                nvn.gpu_clear_color(
+                    &guest,
+                    (rendered, level, layer),
+                    [value, 0.0, 0.0, 1.0].map(f32::to_bits),
+                    None,
+                    0xf,
+                    0,
+                )
+                .unwrap();
+            }
+        }
+
+        nvn.ensure_render_target(storage).unwrap();
+        assert!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .target_is_undefined(storage)
+        );
+        let (target, _) = nvn.prepare_compute_image(storage).unwrap();
+        nvn.initialize_new_targets(&guest);
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        for level in 0..2 {
+            let side = 4 >> level;
+            for layer in 0..3 {
+                let value = ((level * 3 + layer) + 1) as f32 / 8.0;
+                let bytes = renderer
+                    .read_target_plane_bytes(target, level, layer, 4, [0, 0, side, side])
+                    .unwrap();
+                assert_eq!(bytes, value.to_le_bytes().repeat((side * side) as usize));
+            }
+        }
+        assert_eq!(target, rendered);
     }
 
     #[test]
