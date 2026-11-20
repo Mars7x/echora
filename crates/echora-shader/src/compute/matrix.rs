@@ -909,9 +909,9 @@ impl Emitter {
             }
         }
         let zero = c(self, 0);
-        let counter = self
-            .function
-            .variable(&mut self.module, self.u32_ptr, Some(zero));
+        let counter = self.function.variable(&mut self.module, self.u32_ptr, None);
+        // One guest instruction can enter this loop again on a back edge.
+        self.function.emit(op::STORE, &[counter, zero]);
         let before = self.function.block();
         let (header, check, body, continuing, merge) = (
             self.module.id(),

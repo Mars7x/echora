@@ -7359,6 +7359,64 @@ mod tests {
     }
 
     #[test]
+    fn exact_matrix_accumulates_each_time_its_instruction_runs() {
+        use crate::compute::MatrixPath;
+
+        // Every A and B element is 1 and 2, respectively. Each HMMA adds
+        // 32 to all outputs. The guest loop runs the same instruction three times.
+        let inputs = [
+            0x3c00_3c00,
+            0x3c00_3c00,
+            0x3c00_3c00,
+            0x3c00_3c00,
+            0x4000_4000,
+            0x4000_4000,
+            0,
+            0,
+            0,
+            3,
+        ];
+        let mut program: Vec<_> = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(register, value)| mov(register as u128, value))
+            .collect();
+        let multiply = word(&[
+            (0, 12, 0x23c),
+            (16, 8, 6),
+            (24, 8, 0),
+            (32, 8, 4),
+            (64, 8, 6),
+            (75, 1, 1),
+            (76, 1, 0),
+        ]);
+        let repeat = program.len();
+        program.extend([
+            multiply,
+            add(8, 8, 1),
+            less(0, 8, 9),
+            bra(repeat + 3, repeat, 0),
+            EXIT,
+        ]);
+        let code: Vec<_> = program.into_iter().map(decode).collect();
+        let layout = Layout {
+            matrices: MatrixPath::Exact,
+            ..Layout::workgroup([32, 1, 1])
+        };
+        let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        let report = Machine::new(&translated.spirv).run_workgroup(32, 32, |n| {
+            HashMap::from([(27, vec![n as u64, 0, 0]), (41, vec![n as u64])])
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let result = u64::from(f64_to_f16(96.0));
+        for values in &report.invocations {
+            assert_eq!(values[&registers[&8]][0], 3);
+            assert_eq!(values[&registers[&6]][0], result | result << 16);
+            assert_eq!(values[&registers[&7]][0], result | result << 16);
+        }
+    }
+
+    #[test]
     fn exact_matrix_multiplies_match_the_tensor_core_model() {
         use crate::compute::MatrixPath;
         use crate::compute::matrix::tests::block_sum;
