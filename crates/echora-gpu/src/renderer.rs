@@ -5325,6 +5325,11 @@ impl Renderer {
         std::mem::take(&mut self.changed_targets)
     }
 
+    /// Target changes that have not been consumed by binding invalidation.
+    pub fn changed_targets(&self) -> &[u64] {
+        &self.changed_targets
+    }
+
     /// Targets created since the last call.
     pub fn take_fresh_targets(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.fresh_targets)

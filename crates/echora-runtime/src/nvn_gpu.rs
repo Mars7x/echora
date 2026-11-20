@@ -43,6 +43,60 @@ pub struct PageBuild {
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
 }
 
+#[derive(Default)]
+struct TargetIndex {
+    stamp: Option<u64>,
+    storage: HashMap<u64, Vec<u64>>,
+    mips: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
+    by_target: HashMap<u64, (u64, Vec<u64>)>,
+    changed: super::FastSet<u64>,
+}
+
+impl TargetIndex {
+    fn insert(
+        &mut self,
+        key: u64,
+        base: u64,
+        levels: impl Iterator<Item = (u32, u64, (u32, u32))>,
+    ) {
+        // Alias searches choose the first key in renderer order, even if
+        // that target was inserted after the other candidates.
+        let targets = self.storage.entry(base).or_default();
+        targets.insert(targets.partition_point(|&target| target < key), key);
+        let mut mip_storage = Vec::new();
+        for (level, offset, extent) in levels {
+            let address = base + offset;
+            let mips = self.mips.entry(address).or_default();
+            let at = mips.partition_point(|&(target, mip, _)| (target, mip) < (key, level));
+            mips.insert(at, (key, level, extent));
+            mip_storage.push(address);
+        }
+        self.by_target.insert(key, (base, mip_storage));
+    }
+
+    fn remove(&mut self, key: u64) {
+        use std::collections::hash_map::Entry;
+
+        let Some((base, mip_storage)) = self.by_target.remove(&key) else {
+            return;
+        };
+        if let Entry::Occupied(mut entry) = self.storage.entry(base) {
+            entry.get_mut().retain(|&target| target != key);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        for address in mip_storage {
+            if let Entry::Occupied(mut entry) = self.mips.entry(address) {
+                entry.get_mut().retain(|&(target, ..)| target != key);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
+
 /// One GPU address range backed by a physical allocation. Virtual pools
 /// can name a subrange of the same allocation at a different GPU address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -219,16 +273,8 @@ pub struct Backend {
     /// Bumped whenever a pool is shared (or shared again): the page table
     /// is rebuilt after it changes.
     share_generation: usize,
-    /// Render targets by their texture's storage address, and the
-    /// (renderer target changes, texture epoch) it was built at: texture
-    /// lookups scanned every target twice per binding.
-    target_index: HashMap<u64, Vec<u64>>,
-    /// The levels above 0 of render targets with more than one level, by
-    /// the storage address each level starts at: (target, level, extent),
-    /// targets in `target_keys` order and levels ascending (a texture over one of
-    /// their levels resolves to them). Built with `target_index`.
-    target_levels: HashMap<u64, Vec<(u64, u32, (u32, u32))>>,
-    target_index_stamp: Option<u64>,
+    /// Render targets and mip levels by their guest storage address.
+    target_index: TargetIndex,
     retired_since: HashMap<u64, u64>,
 }
 
@@ -439,9 +485,7 @@ impl Backend {
             shared_pieces: HashMap::default(),
             shared_guest_index: Default::default(),
             share_generation: 0,
-            target_index: HashMap::default(),
-            target_levels: HashMap::default(),
-            target_index_stamp: None,
+            target_index: TargetIndex::default(),
             retired_since: HashMap::default(),
         }))
     }
@@ -1556,7 +1600,7 @@ impl Nvn {
                 backend.texture_checked.len(),
                 backend.notes.len(),
                 backend.pending_storage.len(),
-                backend.target_index.len(),
+                backend.target_index.storage.len(),
             );
             for (name, size) in backend.renderer.cache_sizes() {
                 line += &format!(" {name} {size}");
@@ -3117,6 +3161,7 @@ impl Nvn {
         if self.target_index_current() {
             return backend
                 .target_index
+                .storage
                 .get(&base)?
                 .iter()
                 .copied()
@@ -3132,20 +3177,26 @@ impl Nvn {
     /// Whether `target_index` describes the current targets and storage.
     fn target_index_current(&self) -> bool {
         self.gpu.as_ref().is_some_and(|backend| {
-            backend.target_index_stamp == Some(backend.renderer.target_changes)
+            backend.target_index.stamp == Some(backend.renderer.target_changes)
+                && backend.target_index.changed.is_empty()
         })
     }
 
     /// A texture changed, or a pool changed where textures map.
     pub(super) fn invalidate_target_index(&mut self, texture: Option<u64>) {
-        if let Some(backend) = self.gpu.as_mut()
-            && texture.is_none_or(|key| backend.renderer.target_info(key).is_some())
-        {
-            backend.target_index_stamp = None;
+        if let Some(backend) = self.gpu.as_mut() {
+            if let Some(key) = texture {
+                if backend.renderer.target_info(key).is_some() {
+                    backend.target_index.changed.insert(key);
+                }
+            } else {
+                backend.target_index.stamp = None;
+            }
         }
     }
 
-    /// Rebuild `target_index` if targets or texture storage changed.
+    /// Update changed targets. A pool change can move many textures at
+    /// once, so it still rebuilds the entire index.
     fn refresh_target_index(&mut self) {
         if self.target_index_current() {
             return;
@@ -3155,39 +3206,62 @@ impl Nvn {
         };
         let started = std::time::Instant::now();
         let mut index = std::mem::take(&mut backend.target_index);
-        let mut levels = std::mem::take(&mut backend.target_levels);
-        index.values_mut().for_each(Vec::clear);
-        levels.values_mut().for_each(Vec::clear);
         let backend = self.gpu.as_ref().unwrap();
-        for &key in backend.renderer.target_keys_in_order() {
-            let base = self.texture_storage(key);
-            if let Some(base) = base {
-                index.entry(base).or_default().push(key);
+        let renderer = &backend.renderer;
+        let generation = renderer.target_changes;
+        let add_target = |index: &mut TargetIndex, key| {
+            if let Some(target) = renderer.target_info(key)
+                && let Some(base) = self.texture_storage(key)
+            {
+                let levels = (target.levels > 1)
+                    .then(|| self.target_level_offsets(key, target))
+                    .into_iter()
+                    .flatten();
+                index.insert(key, base, levels);
             }
-            let (Some(target), Some(base)) = (backend.renderer.target_info(key), base) else {
-                continue;
-            };
-            if target.levels == 1 {
-                continue;
+        };
+        let rebuild = index.stamp.is_none();
+        if rebuild {
+            index.storage.values_mut().for_each(Vec::clear);
+            index.mips.values_mut().for_each(Vec::clear);
+            index.by_target.clear();
+            index.changed.clear();
+            for &key in renderer.target_keys_in_order() {
+                add_target(&mut index, key);
             }
-            for (level, offset, extent) in self.target_level_offsets(key, target) {
-                levels
-                    .entry(base + offset)
-                    .or_default()
-                    .push((key, level, extent));
+            index.storage.retain(|_, targets| !targets.is_empty());
+            index.mips.retain(|_, mips| !mips.is_empty());
+        } else {
+            if index.stamp != Some(generation) {
+                index
+                    .changed
+                    .extend(renderer.changed_targets().iter().copied());
             }
+            let mut changed = std::mem::take(&mut index.changed);
+            for key in changed.drain() {
+                index.remove(key);
+                if renderer.target_keys_in_order().binary_search(&key).is_ok() {
+                    add_target(&mut index, key);
+                }
+            }
+            index.changed = changed;
         }
+        index.stamp = Some(generation);
         let backend = self.gpu.as_mut().unwrap();
-        index.retain(|_, targets| !targets.is_empty());
-        levels.retain(|_, targets| !targets.is_empty());
         backend.target_index = index;
-        backend.target_levels = levels;
-        backend.target_index_stamp = Some(backend.renderer.target_changes);
-        backend.stat("stat: target index rebuilds", 1);
-        backend.stat(
-            "stat: target index rebuild us",
-            started.elapsed().as_micros() as u64,
-        );
+        let (count, time) = if rebuild {
+            (
+                "stat: target index rebuilds",
+                "stat: target index rebuild us",
+            )
+        } else {
+            (
+                "stat: target index incremental updates",
+                "stat: target index incremental update us",
+            )
+        };
+        backend.stat(count, 1);
+        backend.stat(time, started.elapsed().as_micros() as u64);
     }
 
     /// The render target (and its mip level) a texture object's storage
@@ -3236,7 +3310,13 @@ impl Nvn {
         // then the target levels that start there.
         if self.target_index_current() {
             let backend = self.gpu.as_ref()?;
-            for &key in backend.target_index.get(&base).into_iter().flatten() {
+            for &key in backend
+                .target_index
+                .storage
+                .get(&base)
+                .into_iter()
+                .flatten()
+            {
                 if renderer.target_info(key).is_some_and(|target| {
                     (target.width, target.height) == extent
                         && same_format(target.format)
@@ -3246,7 +3326,8 @@ impl Nvn {
                 }
             }
             return backend
-                .target_levels
+                .target_index
+                .mips
                 .get(&base)?
                 .iter()
                 .find(|(key, level, level_extent)| {
@@ -5971,7 +6052,17 @@ impl Nvn {
         let targets = self
             .gpu
             .as_mut()
-            .map(|backend| backend.renderer.take_changed_targets())
+            .map(|backend| {
+                let targets = backend.renderer.take_changed_targets();
+                if backend
+                    .target_index
+                    .stamp
+                    .is_some_and(|stamp| stamp != backend.renderer.target_changes)
+                {
+                    backend.target_index.changed.extend(targets.iter().copied());
+                }
+                targets
+            })
             .unwrap_or_default();
         if targets.is_empty() && self.binding_evictions.is_empty() {
             return;
@@ -12289,15 +12380,42 @@ mod pool_tests {
         nvn.initialize(0x2000, "Texture", props.clone()).unwrap();
         nvn.ensure_render_target(0x2000).unwrap();
         nvn.refresh_target_index();
-        assert_eq!(nvn.gpu.as_ref().unwrap().target_index[&0x10_2000], [0x2000]);
-        nvn.initialize(0x3000, "Texture", props).unwrap();
+        assert_eq!(
+            nvn.gpu.as_ref().unwrap().target_index.storage[&0x10_2000],
+            [0x2000]
+        );
+        nvn.initialize(0x3000, "Texture", props.clone()).unwrap();
         assert!(nvn.target_index_current());
+
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .move_target(0x2000, 0x3000)
+            .unwrap();
+        nvn.evict_bindings();
+        assert!(!nvn.target_index_current());
+        nvn.refresh_target_index();
+        assert_eq!(
+            nvn.gpu.as_ref().unwrap().target_index.storage[&0x10_2000],
+            [0x3000]
+        );
+
+        let mut props = props;
+        props.get_mut("Storage").unwrap().x[1] = 0x3000;
+        nvn.objects.get_mut(&0x3000).unwrap().builder = props;
+        nvn.object_changed(0x3000, "Texture");
+        assert!(!nvn.target_index_current());
+        nvn.refresh_target_index();
+        let index = &nvn.gpu.as_ref().unwrap().target_index;
+        assert!(!index.storage.contains_key(&0x10_2000));
+        assert_eq!(index.storage[&0x10_3000], [0x3000]);
 
         nvn.objects.remove(&0x1000);
         nvn.object_changed(0x1000, "MemoryPool");
         assert!(!nvn.target_index_current());
         nvn.refresh_target_index();
-        assert!(nvn.gpu.as_ref().unwrap().target_index.is_empty());
+        assert!(nvn.gpu.as_ref().unwrap().target_index.storage.is_empty());
         nvn.initialize(
             0x1000,
             "MemoryPool",
@@ -12305,7 +12423,10 @@ mod pool_tests {
         )
         .unwrap();
         nvn.refresh_target_index();
-        assert_eq!(nvn.gpu.as_ref().unwrap().target_index[&0x20_2000], [0x2000]);
+        assert_eq!(
+            nvn.gpu.as_ref().unwrap().target_index.storage[&0x20_3000],
+            [0x3000]
+        );
     }
 
     #[test]
