@@ -1033,6 +1033,7 @@ type TranslationKey = (
     bool,
     Option<Arc<shader::JumpTargets>>,
     Vec<shader::SampledTexture>,
+    Vec<shader::BoundStorageImage>,
 );
 
 struct ComputeJumps {
@@ -2316,6 +2317,7 @@ impl Nvn {
         mesh: Option<MeshParameters>,
         compute_constants: Option<&[u8]>,
         sampled_textures: &[shader::SampledTexture],
+        storage_images: &[shader::BoundStorageImage],
     ) -> Result<(Arc<Translated>, u64), String> {
         let (code, key) = self
             .stage_code(core, gpu)
@@ -2357,6 +2359,7 @@ impl Nvn {
             native_pointers,
             jump_targets,
             sampled_textures.to_vec(),
+            storage_images.to_vec(),
         );
         if let Some(found) = backend.translations.get(&cache_key) {
             return found.clone().map(|stage| (stage, key));
@@ -2459,11 +2462,12 @@ impl Nvn {
             // that holds it; elsewhere such programs stay with the plugin.
             let rust = (translator != shader::Translator::Plugin)
                 .then(|| {
-                    shader::translate_rust_with_sampled_textures(
+                    shader::translate_rust_with_bound_images(
                         &code,
                         &parameters,
                         constants_for_translation,
                         sampled_textures,
+                        storage_images,
                     )
                 })
                 .map(|result| {
@@ -2733,6 +2737,7 @@ impl Nvn {
             None,
             None,
             &[],
+            &[],
         )?;
         let binding_base = vertex
             .descriptors
@@ -2763,6 +2768,7 @@ impl Nvn {
             [0; 5],
             None,
             None,
+            &[],
             &[],
         )?;
         if vertex.stage != Stage::Vertex || fragment.stage != Stage::Fragment {
@@ -2961,6 +2967,7 @@ impl Nvn {
                 Some(parameters),
                 None,
                 &[],
+                &[],
             )?;
             if stage.stage != Stage::Task {
                 return Err(format!("the task program translated as {:?}", stage.stage));
@@ -2985,6 +2992,7 @@ impl Nvn {
             Some(parameters),
             None,
             &[],
+            &[],
         )?;
         if stage.stage != Stage::Mesh {
             return Err(format!("the mesh program translated as {:?}", stage.stage));
@@ -3003,6 +3011,7 @@ impl Nvn {
             [0; 5],
             None,
             None,
+            &[],
             &[],
         )?;
         if stage.stage != Stage::Fragment {
@@ -5872,6 +5881,7 @@ impl Nvn {
             None,
             constants.as_deref(),
             &[],
+            &[],
         )?;
         // Storage pointers the NVN tracking found outside c0 were constants,
         // not addresses (floats 1.0 and 10.0 in c1): such a program reads
@@ -5892,6 +5902,7 @@ impl Nvn {
                 compute,
                 None,
                 constants.as_deref(),
+                &[],
                 &[],
             )?;
         }
@@ -6588,7 +6599,36 @@ impl Nvn {
                 })
             })
             .collect();
-        if !sampled_textures.is_empty() {
+        let mut storage_images = Vec::new();
+        if !images.is_empty() {
+            let renderer = &self.gpu.as_ref().unwrap().renderer;
+            for constant in &stage.spec_constants {
+                let echora_shader_abi::SpecMeaning::IntegerFormat(binding) = constant.meaning
+                else {
+                    continue;
+                };
+                let Some(image) = images.get(&binding) else {
+                    continue;
+                };
+                let descriptor = stage
+                    .descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.binding == binding)
+                    .ok_or("image specialization has no descriptor")?;
+                let view = renderer.storage_image_binding_format(
+                    *image,
+                    descriptor.flags,
+                    image_formats.get(&binding).copied(),
+                )?;
+                storage_images.push(shader::BoundStorageImage {
+                    bank: descriptor.cbuf_index,
+                    offset: descriptor.cbuf_offset,
+                    view: descriptor.texture_type,
+                    sample_type: echora_gpu::renderer::sampled_texture_type(view),
+                });
+            }
+        }
+        if !sampled_textures.is_empty() || !storage_images.is_empty() {
             let (typed, _) = self.translate_stage(
                 core,
                 address,
@@ -6599,15 +6639,15 @@ impl Nvn {
                 None,
                 constants.as_deref(),
                 &sampled_textures,
+                &storage_images,
             )?;
             if typed.descriptors != stage.descriptors {
-                return Err("integer texture formats changed the compute descriptor layout".into());
+                return Err("numeric image types changed the compute descriptor layout".into());
             }
             stage = typed;
         }
-        // The program, specialized for what is bound: an IntegerFormat
-        // constant is 1 when its binding's image or texture is integer. Each
-        // combination has its own program for this exact translation.
+        // Resolve the remaining specializations for this exact translation.
+        // An IntegerFormat constant is 1 for an integer image or texture.
         let backend = self.gpu.as_mut().unwrap();
         let mut specialization = Vec::new();
         for constant in &stage.spec_constants {

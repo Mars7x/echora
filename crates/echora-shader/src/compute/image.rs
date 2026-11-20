@@ -9,7 +9,7 @@
 
 use echora_shader_abi::{Descriptor, Unsupported};
 
-use super::{Emitter, unsupported};
+use super::{Emitter, SampleType, unsupported};
 use crate::spirv::{Type, capability, op, storage};
 
 /// SPIR-V decorations.
@@ -29,15 +29,27 @@ const FLAG_FORMAT_R32_UINT: u32 = 5 << 8;
 /// SPIR-V's device scope.
 const SCOPE_DEVICE: u32 = 1;
 
-/// An image's views and the constant that picks between them.
+/// A storage image's shader variable and the type of a texel read through it.
+#[derive(Clone, Copy, Debug)]
+struct ImageView {
+    variable: u32,
+    image_type: u32,
+    texel_type: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ImageBinding {
+    Known(ImageView),
+    Specialized {
+        id: u32,
+        float: ImageView,
+        unsigned: ImageView,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ImageViews {
-    float: u32,
-    unsigned: u32,
-    float_type: u32,
-    unsigned_type: u32,
-    integer: u32,
-    /// The descriptor's index (before bindings are assigned).
+    binding: ImageBinding,
     descriptor: usize,
 }
 
@@ -78,8 +90,16 @@ impl Emitter {
             .capability(capability::STORAGE_IMAGE_READ_WITHOUT_FORMAT);
         self.module
             .capability(capability::STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
-        let view = |e: &mut Self, sampled_type: u32| {
-            let ty = e.module.ty(Type::Image {
+        let view = |e: &mut Self, sample_type: SampleType| {
+            let sampled_type = match sample_type {
+                SampleType::Float => e.f32,
+                SampleType::Unsigned => e.u32,
+                SampleType::Signed => e.module.ty(Type::Int {
+                    width: 32,
+                    signed: true,
+                }),
+            };
+            let image_type = e.module.ty(Type::Image {
                 sampled_type,
                 dim,
                 depth: 0,
@@ -88,17 +108,30 @@ impl Emitter {
                 sampled: 2,
                 format: 0,
             });
-            let pointer = e.module.pointer(storage::UNIFORM_CONSTANT, ty);
-            (
-                e.module.global_variable(pointer, storage::UNIFORM_CONSTANT),
-                ty,
-            )
+            let pointer = e.module.pointer(storage::UNIFORM_CONSTANT, image_type);
+            let variable = e.module.global_variable(pointer, storage::UNIFORM_CONSTANT);
+            let texel_type = e.module.ty(Type::Vector {
+                component: sampled_type,
+                count: 4,
+            });
+            ImageView {
+                variable,
+                image_type,
+                texel_type,
+            }
         };
-        let (float, float_type) = view(self, self.f32);
-        let (unsigned, unsigned_type) = view(self, self.u32);
         let descriptor = self.descriptors.len();
+        let known = self
+            .storage_images
+            .iter()
+            .find(|image| {
+                (image.bank, image.offset, image.view)
+                    == (u32::from(bank), u32::from(offset), texture_type)
+            })
+            .map(|image| image.sample_type);
+        let primary = view(self, known.unwrap_or_default());
         self.add_descriptor(
-            float,
+            primary.variable,
             Descriptor {
                 kind,
                 count: 1,
@@ -109,18 +142,25 @@ impl Emitter {
                 ..Descriptor::default()
             },
         );
-        self.descriptor_aliases.push((descriptor, unsigned));
-        self.interface.push(unsigned);
-        let integer = self.module.bool_spec_constant();
-        let id = self.image_spec_ids.len() as u32 + echora_shader_abi::INTEGER_FORMAT_SPEC_BASE;
-        self.module.decorate(integer, DECORATION_SPEC_ID, &[id]);
-        self.image_spec_ids.push((descriptor, id));
+        let binding = if known.is_some() {
+            ImageBinding::Known(primary)
+        } else {
+            let unsigned = view(self, SampleType::Unsigned);
+            self.descriptor_aliases
+                .push((descriptor, unsigned.variable));
+            self.interface.push(unsigned.variable);
+            let integer = self.module.bool_spec_constant();
+            let id = self.image_spec_ids.len() as u32 + echora_shader_abi::INTEGER_FORMAT_SPEC_BASE;
+            self.module.decorate(integer, DECORATION_SPEC_ID, &[id]);
+            self.image_spec_ids.push((descriptor, id));
+            ImageBinding::Specialized {
+                id: integer,
+                float: primary,
+                unsigned,
+            }
+        };
         let views = ImageViews {
-            float,
-            unsigned,
-            float_type,
-            unsigned_type,
-            integer,
+            binding,
             descriptor,
         };
         self.images.insert(key, views);
@@ -160,10 +200,6 @@ impl Emitter {
             .collect();
         let coordinate = self.vector(self.u32, &coordinates);
         let components: Vec<usize> = (0..4).filter(|n| mask >> n & 1 != 0).collect();
-        let vec4 = self.module.ty(Type::Vector {
-            component: self.f32,
-            count: 4,
-        });
         let uvec4 = self.module.ty(Type::Vector {
             component: self.u32,
             count: 4,
@@ -180,14 +216,13 @@ impl Emitter {
                 };
             }
             let unsigned_texel = self.vector(self.u32, &words);
-            let float_texel = self.value(op::BITCAST, vec4, &[unsigned_texel]);
-            self.choose(views.integer, |e, integer| {
-                let (variable, ty, texel) = if integer {
-                    (views.unsigned, views.unsigned_type, unsigned_texel)
+            self.bind_surface(views.binding, |e, view| {
+                let texel = if view.texel_type == uvec4 {
+                    unsigned_texel
                 } else {
-                    (views.float, views.float_type, float_texel)
+                    e.value(op::BITCAST, view.texel_type, &[unsigned_texel])
                 };
-                let image = e.value(op::LOAD, ty, &[variable]);
+                let image = e.value(op::LOAD, view.image_type, &[view.variable]);
                 e.module.note_store();
                 e.function
                     .emit(op::IMAGE_WRITE, &[image, coordinate, texel]);
@@ -195,17 +230,12 @@ impl Emitter {
         } else {
             let pointer = self.module.pointer(storage::FUNCTION, uvec4);
             let result = self.function.variable(&mut self.module, pointer, None);
-            self.choose(views.integer, |e, integer| {
-                let (variable, ty) = if integer {
-                    (views.unsigned, views.unsigned_type)
+            self.bind_surface(views.binding, |e, view| {
+                let image = e.value(op::LOAD, view.image_type, &[view.variable]);
+                let value = e.value(op::IMAGE_READ, view.texel_type, &[image, coordinate]);
+                let texel = if view.texel_type == uvec4 {
+                    value
                 } else {
-                    (views.float, views.float_type)
-                };
-                let image = e.value(op::LOAD, ty, &[variable]);
-                let texel = if integer {
-                    e.value(op::IMAGE_READ, uvec4, &[image, coordinate])
-                } else {
-                    let value = e.value(op::IMAGE_READ, vec4, &[image, coordinate]);
                     e.value(op::BITCAST, uvec4, &[value])
                 };
                 e.function.emit(op::STORE, &[result, texel]);
@@ -311,6 +341,21 @@ impl Emitter {
         let relaxed = self.constant(0);
         self.value(opcode, self.u32, &[pointer, scope, relaxed, value]);
         Ok(())
+    }
+
+    fn bind_surface(&mut self, binding: ImageBinding, mut emit: impl FnMut(&mut Self, ImageView)) {
+        match binding {
+            ImageBinding::Known(view) => emit(self, view),
+            ImageBinding::Specialized {
+                id,
+                float,
+                unsigned,
+            } => {
+                self.choose(id, |e, integer| {
+                    emit(e, if integer { unsigned } else { float })
+                });
+            }
+        }
     }
 
     /// Runs `body(true)` where `condition` holds, else `body(false)`.

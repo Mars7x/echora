@@ -52,6 +52,24 @@ pub struct Dispatch<'a> {
 }
 
 impl Renderer {
+    /// The Vulkan format a storage descriptor will use for the requested
+    /// image. A typed shader translation uses this format as well.
+    pub fn storage_image_binding_format(
+        &self,
+        image: StorageImage,
+        declaration: u32,
+        view: Option<vk::Format>,
+    ) -> Result<vk::Format, String> {
+        let format = self
+            .existing_target(image.target)
+            .ok_or("compute image is not a target")?
+            .format;
+        let declared = crate::renderer::declared_image_format(declaration).or(view);
+        self.storage_view_format(format, declared).ok_or_else(|| {
+            format!("storage image format {format:?} (declared {declared:?}) is not supported")
+        })
+    }
+
     /// Record `dispatch` without waiting: returns, for each storage
     /// buffer it writes, the token of its contents after the next flush
     /// (`take_reads`).
@@ -132,17 +150,11 @@ impl Renderer {
                     .get(&binding)
                     .ok_or_else(|| format!("no image for compute binding {binding}"))?;
                 let key = image.target;
-                let format = self
-                    .existing_target(key)
-                    .ok_or("compute image is not a target")?
-                    .format;
-                let declared = crate::renderer::declared_image_format(descriptor.flags)
-                    .or_else(|| dispatch.image_formats.get(&binding).copied());
-                let view_format = self.storage_view_format(format, declared).ok_or_else(|| {
-                    format!(
-                        "storage image format {format:?} (declared {declared:?}) is not supported"
-                    )
-                })?;
+                let view_format = self.storage_image_binding_format(
+                    *image,
+                    descriptor.flags,
+                    dispatch.image_formats.get(&binding).copied(),
+                )?;
                 self.transition(key, vk::ImageLayout::GENERAL)?;
                 // Storage image views name one mip level.
                 let image_view =
@@ -898,6 +910,152 @@ mod tests {
         let array_view = renderer.storage_image_view(image, 1, format).unwrap();
         let single_view = renderer.storage_image_view(image, 0, format).unwrap();
         assert_ne!(array_view, single_view);
+    }
+
+    #[test]
+    fn typed_guest_storage_instructions_address_one_dimensional_array_views() {
+        use crate::draw::ImageShape;
+        use echora_shader::compute::{BoundStorageImage, Layout, SampleType, translate};
+        use std::sync::Arc;
+
+        let word = |fields: &[(u32, u128)]| {
+            echora_shader::decode(
+                fields
+                    .iter()
+                    .fold(7 << 12, |word, &(shift, value)| word | value << shift),
+            )
+        };
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let surface = |store| {
+            word(&[
+                (0, if store { 0xb9b } else { 0xb97 }),
+                (16, if store { 0 } else { 4 }),
+                (24, 0),
+                (32, if store { 4 } else { 0 }),
+                (40, 0x18),
+                (61, 2),
+                (72, 1),
+                (81, if store { 0 } else { 7 }),
+            ])
+        };
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        for (index, (format, sample_type, texels)) in [
+            (
+                vk::Format::R32_SFLOAT,
+                SampleType::Float,
+                [0.25f32, 0.5, 0.75].map(f32::to_bits),
+            ),
+            (
+                vk::Format::R32_UINT,
+                SampleType::Unsigned,
+                [5, 2_000_000_000, u32::MAX - 1],
+            ),
+            (
+                vk::Format::R32_SINT,
+                SampleType::Signed,
+                [-5i32, -10, 7].map(|value| value as u32),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = index as u64;
+            // Read logical texel (0, layer 0) and store it at (1, layer 0).
+            let stage = Arc::new(
+                translate(
+                    &[
+                        mov(0, 0),
+                        mov(1, 0),
+                        surface(false),
+                        mov(0, 1),
+                        surface(true),
+                        word(&[(0, 0x94d), (87, 7)]),
+                    ],
+                    &Layout {
+                        storage_images: &[BoundStorageImage {
+                            bank: 0,
+                            offset: 0x60,
+                            view: 1,
+                            sample_type,
+                        }],
+                        ..Layout::workgroup([1; 3])
+                    },
+                )
+                .unwrap(),
+            );
+            let binding = stage.descriptors[0].binding;
+            assert_eq!(stage.descriptors[0].texture_type, 1);
+            assert!(stage.spec_constants.is_empty());
+            let program = renderer.create_program(vec![stage]).unwrap();
+            for (target, layers, base_layer) in [(index * 2 + 1, 1, 0), (index * 2 + 2, 3, 1)] {
+                renderer
+                    .shaped_target(target, 4, 1, ImageShape::D1 { layers }, format, 2)
+                    .unwrap();
+                for layer in 0..layers {
+                    let value = texels[layer as usize];
+                    renderer
+                        .clear_color_level(
+                            target,
+                            1,
+                            layer,
+                            None,
+                            vk::ClearColorValue {
+                                uint32: [value, 0, 0, 0],
+                            },
+                        )
+                        .unwrap();
+                    renderer
+                        .clear_color_level(
+                            target,
+                            1,
+                            layer,
+                            Some([1, 0, 1, 1]),
+                            vk::ClearColorValue { uint32: [0; 4] },
+                        )
+                        .unwrap();
+                }
+                let dispatch = Dispatch {
+                    program: &program,
+                    groups: [1; 3],
+                    uniforms: HashMap::new(),
+                    storage: HashMap::new(),
+                    storage_in_place: HashMap::new(),
+                    textures: HashMap::new(),
+                    images: [(
+                        binding,
+                        StorageImage {
+                            target,
+                            level: 1,
+                            base_layer,
+                            layer_count: 1,
+                        },
+                    )]
+                    .into(),
+                    image_formats: HashMap::new(),
+                    indirect: None,
+                    page_table: Default::default(),
+                    pool: Default::default(),
+                };
+                renderer.dispatch(&dispatch).unwrap();
+                for layer in 0..layers {
+                    let value = texels[layer as usize];
+                    let expected = [value, if layer == base_layer { value } else { 0 }];
+                    assert_eq!(
+                        renderer
+                            .read_target_plane_bytes(target, 1, layer, 4, [0, 0, 2, 1])
+                            .unwrap(),
+                        expected.map(u32::to_le_bytes).as_flattened(),
+                    );
+                }
+            }
+            renderer.destroy_program(program).unwrap();
+        }
     }
 
     #[test]

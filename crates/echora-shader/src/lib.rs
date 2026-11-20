@@ -63,7 +63,7 @@ pub fn translate_with_needs(
     parameters: &Parameters,
     options: &Options,
 ) -> Result<(Translated, compute::Needs), Unsupported> {
-    translate_with_constants(program, parameters, options, None, &[])
+    translate_with_constants(program, parameters, options, None, &[], &[])
 }
 
 /// Translate computed jumps against the same constant bank the caller will
@@ -74,7 +74,7 @@ pub fn translate_with_compute_constants(
     options: &Options,
     constants: &[u8],
 ) -> Result<Translated, Unsupported> {
-    translate_with_constants(program, parameters, options, Some(constants), &[])
+    translate_with_constants(program, parameters, options, Some(constants), &[], &[])
         .map(|(translated, _)| translated)
 }
 
@@ -86,8 +86,34 @@ pub fn translate_with_sampled_textures(
     constants: Option<&[u8]>,
     sampled_textures: &[compute::SampledTexture],
 ) -> Result<Translated, Unsupported> {
-    translate_with_constants(program, parameters, options, constants, sampled_textures)
-        .map(|(translated, _)| translated)
+    translate_with_bound_images(
+        program,
+        parameters,
+        options,
+        constants,
+        sampled_textures,
+        &[],
+    )
+}
+
+/// Translate compute instructions with the known numeric types of their image views.
+pub fn translate_with_bound_images(
+    program: &[u8],
+    parameters: &Parameters,
+    options: &Options,
+    constants: Option<&[u8]>,
+    sampled_textures: &[compute::SampledTexture],
+    storage_images: &[compute::BoundStorageImage],
+) -> Result<Translated, Unsupported> {
+    translate_with_constants(
+        program,
+        parameters,
+        options,
+        constants,
+        sampled_textures,
+        storage_images,
+    )
+    .map(|(translated, _)| translated)
 }
 
 fn translate_with_constants(
@@ -96,6 +122,7 @@ fn translate_with_constants(
     options: &Options,
     constants: Option<&[u8]>,
     sampled_textures: &[compute::SampledTexture],
+    storage_images: &[compute::BoundStorageImage],
 ) -> Result<(Translated, compute::Needs), Unsupported> {
     let mesh = match parameters.stage_slot {
         None => None,
@@ -125,6 +152,7 @@ fn translate_with_constants(
         let code = program_code(&program[GRAPHICS_HEADER_SIZE.min(program.len())..])?;
         let layout = compute::Layout {
             sampled_textures: &[],
+            storage_images: &[],
             stage: header.stage,
             header: Some(header),
             workgroup: [1, 1, 1],
@@ -171,6 +199,7 @@ fn translate_with_constants(
     let code = program_code(program)?;
     let layout = compute::Layout {
         sampled_textures,
+        storage_images,
         stage: Stage::Compute,
         header: None,
         workgroup,

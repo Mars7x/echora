@@ -475,10 +475,20 @@ pub struct SampledTexture {
     pub sample_type: SampleType,
 }
 
+/// Numeric type of a view bound to a formatted storage image instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BoundStorageImage {
+    pub bank: u32,
+    pub offset: u32,
+    pub view: u32,
+    pub sample_type: SampleType,
+}
+
 /// What a program needs beyond its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout<'a> {
     pub sampled_textures: &'a [SampledTexture],
+    pub storage_images: &'a [BoundStorageImage],
     pub stage: Stage,
     /// A graphics program's header.
     pub header: Option<crate::header::Header>,
@@ -568,6 +578,7 @@ impl Layout<'_> {
     pub fn workgroup(workgroup: [u32; 3]) -> Self {
         Self {
             sampled_textures: &[],
+            storage_images: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -687,6 +698,8 @@ struct Emitter {
     /// depth comparison.
     textures: BTreeMap<(u8, u16, u32, bool), u32>,
     sampled_textures: Vec<SampledTexture>,
+
+    storage_images: Vec<BoundStorageImage>,
     /// Cooperative-matrix scratch by component type, and whether any
     /// cooperative matrix is used.
     matrix_scratch: BTreeMap<u32, u32>,
@@ -789,6 +802,7 @@ impl Emitter {
             u64: None,
             layout: Layout {
                 sampled_textures: &[],
+                storage_images: &[],
                 ..*layout
             },
             stage: layout.stage,
@@ -814,6 +828,7 @@ impl Emitter {
             descriptor_variables: Vec::new(),
             textures: BTreeMap::new(),
             sampled_textures: layout.sampled_textures.to_vec(),
+            storage_images: layout.storage_images.to_vec(),
             images: BTreeMap::new(),
             atomic_images: BTreeMap::new(),
             mesh: None,
@@ -4156,6 +4171,7 @@ mod tests {
         ];
         let layout = Layout {
             sampled_textures: &[],
+            storage_images: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -4416,6 +4432,7 @@ mod tests {
         ];
         let layout = Layout {
             sampled_textures: &[],
+            storage_images: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
@@ -5317,6 +5334,7 @@ mod tests {
         ];
         let layout = Layout {
             sampled_textures: &[],
+            storage_images: &[],
             stage: Stage::Compute,
             header: None,
             previous_stores: None,

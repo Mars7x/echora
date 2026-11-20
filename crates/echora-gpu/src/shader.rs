@@ -5,7 +5,7 @@
 
 use std::ffi::c_void;
 
-pub use echora_shader::compute::{SampleType, SampledTexture};
+pub use echora_shader::compute::{BoundStorageImage, SampleType, SampledTexture};
 pub use echora_shader::handle_reads;
 pub use echora_shader::jump_tables::{JumpTables, JumpTargets};
 pub use echora_shader_abi::{
@@ -129,6 +129,16 @@ pub fn translate_rust_with_sampled_textures(
     constants: Option<&[u8]>,
     sampled_textures: &[SampledTexture],
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
+    translate_rust_with_bound_images(program, parameters, constants, sampled_textures, &[])
+}
+
+pub fn translate_rust_with_bound_images(
+    program: &[u8],
+    parameters: &Parameters,
+    constants: Option<&[u8]>,
+    sampled_textures: &[SampledTexture],
+    storage_images: &[BoundStorageImage],
+) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
         previous_stores: parameters.previous_stores,
         fragment_output_types: parameters.fragment_output_types,
@@ -137,12 +147,13 @@ pub fn translate_rust_with_sampled_textures(
         ..Default::default()
     };
     let parameters = abi_parameters(parameters);
-    let translated = echora_shader::translate_with_sampled_textures(
+    let translated = echora_shader::translate_with_bound_images(
         program,
         &parameters,
         &options,
         constants,
         sampled_textures,
+        storage_images,
     )?;
     if translated.abi_version != ABI_VERSION {
         return Err(echora_shader_abi::Unsupported {

@@ -205,12 +205,13 @@ where the hardware gives 1 or n). A bindless TXQ.B is queried as 2D (its
 pool entry's view type is not known). The survey example counts the two
 kinds over a dump.
 
-**Storage images.** A formatted image access (SULD.P, SUST.P) is typeless
-(the bound image's format, no format in the SPIR-V). Whether the image is
-integer is run-time state, so each image has a float and an unsigned view
-at one binding, and a boolean specialization constant
-(`SpecMeaning::IntegerFormat(binding)`, ids from 32) picks the view the
-access uses; the runtime precompiles both values. SURED reduces into a texel
+**Storage images.** A formatted image access (SULD.P, SUST.P) leaves the
+SPIR-V image format unspecified. When the runtime resolves a storage image
+view, the compute translation declares one image with the view's numeric
+type (float, signed integer, or unsigned integer). Without a resolved view,
+the translation declares float and unsigned views at one binding and a
+boolean specialization constant (`SpecMeaning::IntegerFormat(binding)`, IDs
+from 32) selects the view. SURED reduces into a texel
 through a descriptor and binding of its own (even for a handle SULD or
 SUST also uses), an R32ui image declared R32_UINT in the descriptor's
 format bits (flags 8-11 = 5): Vulkan's image atomics require a format,
