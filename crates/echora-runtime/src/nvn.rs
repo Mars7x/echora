@@ -720,9 +720,8 @@ pub struct Nvn {
     /// render targets is current while this holds.
     #[serde(skip)]
     texture_epoch: u64,
-    /// Render-target shapes by texture (width, height, format, levels,
-    /// shape), valid for the texture epoch they were derived in: draws
-    /// look them up for every color and depth target.
+    /// Render-target shapes by texture. Each lasts until its texture
+    /// changes or a replay can override mip handling.
     #[serde(skip)]
     target_shapes: (u64, HashMap<u64, TargetShape>),
     /// Each queue submission, compute dispatch, texture or sampler pool
@@ -3638,8 +3637,6 @@ impl Nvn {
                 if self.objects.contains_key(&this) {
                     self.texture_epoch += 1;
                     self.binding_epoch += 1;
-                } else {
-                    self.target_shapes.1.remove(&this);
                 }
                 let builder = self.bag(x[1], "TextureBuilder").map_err(invalid)?;
                 self.require_device(&builder).map_err(invalid)?;
@@ -7324,6 +7321,7 @@ impl Nvn {
                 self.invalidate_target_index(None);
             }
             "Texture" => {
+                self.target_shapes.1.remove(&address);
                 self.storage_memo.get_mut().remove(&address);
                 self.size_memo.get_mut().remove(&address);
                 self.invalidate_target_index(Some(address));

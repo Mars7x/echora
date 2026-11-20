@@ -1414,7 +1414,7 @@ impl Nvn {
 
     /// Size and Vulkan format of a texture used as a render target.
     fn target_shape(&self, texture: u64) -> Result<(u32, u32, vk::Format), String> {
-        if self.target_shapes.0 == self.texture_epoch
+        if self.target_shapes.0 == super::debug_generation()
             && let Some(&(width, height, format, ..)) = self.target_shapes.1.get(&texture)
         {
             return Ok((width, height, format));
@@ -5159,8 +5159,9 @@ impl Nvn {
                 std::panic::Location::caller()
             );
         }
-        if self.target_shapes.0 != self.texture_epoch {
-            self.target_shapes = (self.texture_epoch, HashMap::default());
+        let generation = super::debug_generation();
+        if self.target_shapes.0 != generation {
+            self.target_shapes = (generation, HashMap::default());
         }
         let (width, height, format, levels, shape, storage) =
             match self.target_shapes.1.get(&texture) {
@@ -12691,6 +12692,7 @@ mod target_tests {
             },
         );
         nvn.gpu_clear_depth(2, Some(0.5), None).unwrap();
+        assert_eq!(nvn.target_shape(2).unwrap().0, 8);
 
         let mut cpu = Cpu::default();
         let mut memory = Memory::new(1 << 39);
@@ -12701,6 +12703,7 @@ mod target_tests {
             counter: None,
         };
         assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        assert!(nvn.target_shape(2).is_err());
 
         let TextureSource::Target(key) = nvn.texture_source(&core, 3).unwrap() else {
             panic!("the alias must sample the retained target");
