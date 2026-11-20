@@ -3053,12 +3053,22 @@ impl Renderer {
             -self.gpu.max_sampler_lod_bias,
             self.gpu.max_sampler_lod_bias,
         );
+        let address = if self.gpu.sampler_mirror_clamp_to_edge {
+            sampler.address
+        } else {
+            sampler.address.map(|mode| match mode {
+                vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE => {
+                    vk::SamplerAddressMode::MIRRORED_REPEAT
+                }
+                mode => mode,
+            })
+        };
         let key: SamplerKey = (
             sampler.min_filter.as_raw(),
             sampler.mag_filter.as_raw(),
             sampler.mipmap.as_raw(),
             sampler.base_level_only,
-            sampler.address.map(|mode| mode.as_raw()),
+            address.map(|mode| mode.as_raw()),
             [sampler.lod[0], sampler.lod[1], lod_bias].map(f32::to_bits),
             anisotropy.to_bits(),
             sampler.compare.map(|op| op.as_raw()),
@@ -3071,9 +3081,9 @@ impl Renderer {
             .min_filter(sampler.min_filter)
             .mag_filter(sampler.mag_filter)
             .mipmap_mode(sampler.mipmap)
-            .address_mode_u(sampler.address[0])
-            .address_mode_v(sampler.address[1])
-            .address_mode_w(sampler.address[2])
+            .address_mode_u(address[0])
+            .address_mode_v(address[1])
+            .address_mode_w(address[2])
             .min_lod(sampler.lod[0])
             .max_lod(if sampler.base_level_only {
                 0.25

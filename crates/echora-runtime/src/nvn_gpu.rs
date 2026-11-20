@@ -5079,9 +5079,9 @@ impl Nvn {
         };
         let wrap = |value: u64| match value {
             1 => vk::SamplerAddressMode::REPEAT,
-            // Mirror-once modes approximate as mirrored repeat (the device
-            // feature for mirror clamp is not enabled).
-            2..=4 | 6 => vk::SamplerAddressMode::MIRRORED_REPEAT,
+            3 => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+            // Vulkan has no mirror-clamp modes for a border or a half border.
+            2 | 4 | 6 => vk::SamplerAddressMode::MIRRORED_REPEAT,
             5 => vk::SamplerAddressMode::CLAMP_TO_BORDER,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
@@ -14832,6 +14832,12 @@ mod pool_tests {
         );
         call(
             &mut nvn,
+            "nvnSamplerBuilderSetWrapMode",
+            [builder, 3, 1, 7],
+            0.0,
+        );
+        call(
+            &mut nvn,
             "nvnSamplerInitialize",
             [sampler, builder, 0, 0],
             0.0,
@@ -14844,6 +14850,14 @@ mod pool_tests {
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
         assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 2.5);
+        assert_eq!(
+            nvn.handle_sampler(2 << 20).address,
+            [
+                vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+                vk::SamplerAddressMode::REPEAT,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            ],
+        );
         call(
             &mut nvn,
             "nvnSamplerBuilderSetMinMagFilter",

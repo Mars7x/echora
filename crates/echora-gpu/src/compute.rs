@@ -530,6 +530,145 @@ mod tests {
     }
 
     #[test]
+    fn mirror_clamp_samples_the_edge_after_reflecting_once() {
+        use crate::draw::{ImageShape, UploadRegion};
+        use echora_shader::compute::{Layout, translate};
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        use std::sync::Arc;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() || !gpu.buffer_device_address {
+            return;
+        }
+        let supported = gpu.sampler_mirror_clamp_to_edge;
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let word = |fields: &[(u32, u128)]| {
+            echora_shader::decode(
+                fields
+                    .iter()
+                    .fold(7 << 12, |word, &(shift, value)| word | value << shift),
+            )
+        };
+        let mov = |register, value: u32| {
+            word(&[
+                (0, 0x802),
+                (16, register),
+                (32, u128::from(value)),
+                (72, 15),
+            ])
+        };
+        let guest_address = 0x1_0000u32;
+        // TEX.LL through c[0][0x40], reading (x, y, level) from R0..R2.
+        let sample = word(&[
+            (0, 0xb60),
+            (16, 10),
+            (32, 2),
+            (40, 0x10),
+            (61, 1),
+            (64, 255),
+            (72, 1),
+            (81, 7),
+            (87, 3),
+        ]);
+        let store = word(&[(0, 0x386), (24, 4), (32, 10), (72, 1), (73, 4)]);
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let stage = Arc::new(
+            translate(
+                &[
+                    mov(0, 1.75f32.to_bits()),
+                    mov(1, 0.5f32.to_bits()),
+                    mov(2, 0),
+                    mov(4, guest_address),
+                    mov(5, 0),
+                    sample,
+                    store,
+                    exit,
+                ],
+                &Layout::workgroup([1, 1, 1]),
+            )
+            .unwrap(),
+        );
+        let binding = stage
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.kind() == DescriptorKind::Texture)
+            .unwrap()
+            .binding;
+        let program = renderer.create_program(vec![stage]).unwrap();
+        let output = 1;
+        let (buffer, _) = renderer.resident_buffer(output, PAGE_SIZE).unwrap();
+        let address = renderer.buffer_address(buffer).unwrap();
+        let (table, _) = renderer
+            .set_page_table(guest_address >> PAGE_SHIFT, &[address])
+            .unwrap();
+        let source = TextureSource::Upload {
+            key: 2,
+            generation: 1,
+            width: 2,
+            height: 1,
+            shape: ImageShape::D2 { layers: 1 },
+            format: vk::Format::R32_SFLOAT,
+            texels: Arc::new(
+                [0.25f32, 0.75]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+            levels: vec![UploadRegion {
+                level: 0,
+                layer: 0,
+                width: 2,
+                height: 1,
+                depth: 1,
+                offset: 0,
+            }]
+            .into(),
+        };
+        for (mode, expected) in [
+            (vk::SamplerAddressMode::MIRRORED_REPEAT, 0.25f32),
+            (
+                vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+                if supported { 0.75 } else { 0.25 },
+            ),
+        ] {
+            let sampler = Sampler {
+                min_filter: vk::Filter::NEAREST,
+                mag_filter: vk::Filter::NEAREST,
+                address: [
+                    mode,
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                ],
+                ..Sampler::default()
+            };
+            let dispatch = Dispatch {
+                program: &program,
+                groups: [1, 1, 1],
+                uniforms: HashMap::new(),
+                storage: HashMap::new(),
+                storage_in_place: HashMap::new(),
+                textures: [(binding, (source.clone(), sampler))].into(),
+                images: HashMap::new(),
+                image_formats: HashMap::new(),
+                indirect: None,
+                page_table: table,
+                pool: Default::default(),
+            };
+            renderer.dispatch(&dispatch).unwrap();
+            let token = renderer.read_resident(output, 0, 4).unwrap();
+            renderer.flush().unwrap();
+            assert_eq!(
+                renderer.take_reads(&[token])[&token],
+                expected.to_le_bytes(),
+                "{mode:?}"
+            );
+        }
+        renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
     fn image_reductions_can_use_device_scope() {
         use echora_shader::compute::{Layout, translate};
         use std::sync::Arc;
