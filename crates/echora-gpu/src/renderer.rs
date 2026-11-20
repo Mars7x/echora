@@ -6461,14 +6461,51 @@ impl Renderer {
         to: u64,
         destination: [i32; 4],
     ) -> Result<(), String> {
-        if from == to {
-            return Err("copy within one target".into());
+        self.copy_target_level((from, 0, 0), source, (to, 0, 0), destination)
+    }
+
+    /// Copy between selected mip levels and layers, with rectangles in
+    /// their guest texel grids.
+    pub fn copy_target_level(
+        &mut self,
+        (from, source_level, source_layer): (u64, u32, u32),
+        source: [i32; 4],
+        (to, destination_level, destination_layer): (u64, u32, u32),
+        destination: [i32; 4],
+    ) -> Result<(), String> {
+        if (from, source_level, source_layer) == (to, destination_level, destination_layer) {
+            return Err("copy within one render target subresource".into());
+        }
+        let bounds = |key, level, layer| -> Result<[i32; 4], String> {
+            let target = self.targets.get(&key).ok_or("no such copy target")?;
+            if level >= target.levels || layer >= target.shape.layers() {
+                return Err("texture copy layer or mip level is outside the render target".into());
+            }
+            let (width, height) = target.extent(level);
+            Ok([0, 0, width as i32, height as i32])
+        };
+        let source_bounds = bounds(from, source_level, source_layer)?;
+        let destination_bounds = bounds(to, destination_level, destination_layer)?;
+        let source = clip(self.targets[&from].scaled(source), source_bounds);
+        let destination = clip(self.targets[&to].scaled(destination), destination_bounds);
+        if source[2] <= 0 || source[3] <= 0 || destination[2] <= 0 || destination[3] <= 0 {
+            return Ok(());
         }
         self.transition(from, vk::ImageLayout::GENERAL)?;
         self.transition(to, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
         let (source_target, destination_target) = (&self.targets[&from], &self.targets[&to]);
-        let bounds = |target: &Target| [0, 0, target.width as i32, target.height as i32];
+        if (matches!(source_target.shape, ImageShape::D3 { .. })
+            || matches!(destination_target.shape, ImageShape::D3 { .. }))
+            && (source_layer != 0 || destination_layer != 0)
+        {
+            return Err("texture copy between an array layer and volume".into());
+        }
+        if aspect(source_target.format) != aspect(destination_target.format)
+            || (is_depth(source_target.format) && source_target.format != destination_target.format)
+        {
+            return Err("texture copy between incompatible depth or stencil formats".into());
+        }
         let corners = |[x, y, width, height]: [i32; 4]| {
             [
                 vk::Offset3D { x, y, z: 0 },
@@ -6479,25 +6516,25 @@ impl Renderer {
                 },
             ]
         };
-        let source = source_target.scaled(clip(source, bounds(source_target)));
-        let destination = destination_target.scaled(clip(destination, bounds(destination_target)));
-        if source[2] <= 0 || source[3] <= 0 || destination[2] <= 0 || destination[3] <= 0 {
-            return Ok(());
-        }
-        let layers = |format| {
-            let range = range(format);
-            vk::ImageSubresourceLayers {
-                aspect_mask: range.aspect_mask,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            }
+        let subresource = |aspect_mask, mip_level, base_array_layer| vk::ImageSubresourceLayers {
+            aspect_mask,
+            mip_level,
+            base_array_layer,
+            layer_count: 1,
         };
-        let region = vk::ImageBlit::default()
-            .src_subresource(layers(source_target.format))
-            .src_offsets(corners(source))
-            .dst_subresource(layers(destination_target.format))
-            .dst_offsets(corners(destination));
+        let regions: Vec<_> = transfer_aspects(source_target.format)
+            .map(|aspect_mask| {
+                vk::ImageBlit::default()
+                    .src_subresource(subresource(aspect_mask, source_level, source_layer))
+                    .src_offsets(corners(source))
+                    .dst_subresource(subresource(
+                        aspect_mask,
+                        destination_level,
+                        destination_layer,
+                    ))
+                    .dst_offsets(corners(destination))
+            })
+            .collect();
         let filter = if is_depth(source_target.format)
             || integer_format(source_target.format)
             || source[2..] == destination[2..]
@@ -6506,7 +6543,7 @@ impl Renderer {
         } else {
             vk::Filter::LINEAR
         };
-        let barrier = |target: &Target, src, dst| {
+        let barrier = |target: &Target, mip_level, layer, src, dst| {
             vk::ImageMemoryBarrier::default()
                 .src_access_mask(src)
                 .dst_access_mask(dst)
@@ -6515,23 +6552,33 @@ impl Renderer {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(target.image)
-                .subresource_range(range(target.format))
+                .subresource_range(vk::ImageSubresourceRange {
+                    base_mip_level: mip_level,
+                    base_array_layer: layer,
+                    ..range(target.format)
+                })
         };
         let read_write = vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
         let before = [
             barrier(
                 source_target,
+                source_level,
+                source_layer,
                 vk::AccessFlags::MEMORY_WRITE,
                 vk::AccessFlags::TRANSFER_READ,
             ),
             barrier(
                 destination_target,
+                destination_level,
+                destination_layer,
                 read_write,
                 vk::AccessFlags::TRANSFER_WRITE,
             ),
         ];
         let after = barrier(
             destination_target,
+            destination_level,
+            destination_layer,
             vk::AccessFlags::TRANSFER_WRITE,
             read_write,
         );
@@ -6553,7 +6600,7 @@ impl Renderer {
                 vk::ImageLayout::GENERAL,
                 destination_target.image,
                 vk::ImageLayout::GENERAL,
-                &[region],
+                &regions,
                 filter,
             );
             device.cmd_pipeline_barrier(

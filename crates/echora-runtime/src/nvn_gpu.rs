@@ -5320,32 +5320,58 @@ impl Nvn {
                 self.texture_storage(command.x[4])
             );
         }
-        // Views of level 0 and layer 0 are the whole texture.
-        if command
-            .captured
-            .get(12..16)
-            .is_none_or(|bases| bases.iter().any(|base| *base != 0))
-        {
-            return Err("texture views of other levels or layers".into());
+        if command.captured.len() < 16 {
+            return Err("texture copy has no recorded regions".into());
         }
+        let recorded = |key, region: usize, view: usize| -> Result<_, String> {
+            let transfer = super::TexelTransfer {
+                region: std::array::from_fn(|index| command.captured[region + index] as u32),
+                bases: [command.captured[view], command.captured[view + 1]],
+                strides: [0; 2],
+            };
+            let target = self
+                .object(key, "Texture")?
+                .builder
+                .get("Target")
+                .map_or(1, |args| args.x[0] as u32);
+            let [x, y, z, width, height, planes] = transfer.region_for(target);
+            let level =
+                u32::try_from(transfer.bases[0]).map_err(|_| "texture copy mip level overflows")?;
+            let layer = u32::try_from(transfer.bases[1])
+                .ok()
+                .and_then(|layer| layer.checked_add(z))
+                .ok_or("texture copy layer overflows")?;
+            Ok((
+                level,
+                layer,
+                [x as i32, y as i32, width as i32, height as i32],
+                planes,
+            ))
+        };
         let (from, to) = (command.x[1], command.x[4]);
-        let rect = |base: usize| -> [i32; 4] {
-            std::array::from_fn(|index| command.captured[base + [0, 1, 3, 4][index]] as u32 as i32)
+        let (source_level, source_layer, source, source_planes) = recorded(from, 0, 12)?;
+        let (destination_level, destination_layer, destination, destination_planes) =
+            recorded(to, 6, 14)?;
+        if source_planes == 0 || destination_planes == 0 {
+            return Ok(());
+        }
+        if source_planes != 1 || destination_planes != 1 {
+            return Err("texture copy of multiple planes".into());
+        }
+        // A view or another texture object may name a region of an existing
+        // target. Rendered mips keep their own level in that target.
+        let target = |texture| {
+            self.resolve_target(texture)
+                .or_else(|| self.target_sharing_storage(texture).map(|key| (key, 0)))
         };
-        let (source, destination) = (rect(0), rect(6));
-        // Either end may be another texture object over a render target's
-        // storage (a depth buffer copied for a later pass to test against):
-        // that target.
-        let target = |this: &Self, texture: u64| {
-            let renderer = &this.gpu.as_ref().unwrap().renderer;
-            if renderer.target_info(texture).is_some() {
-                Some(texture)
-            } else {
-                this.target_sharing_storage(texture)
-            }
-        };
-        let from = target(self, from).ok_or("source is not a render target")?;
-        let to = target(self, to).unwrap_or(to);
+        let (from, source_base) = target(from).ok_or("source is not a render target")?;
+        let (to, destination_base) = target(to).unwrap_or((to, 0));
+        let source_level = source_base
+            .checked_add(source_level)
+            .ok_or("source copy level overflows")?;
+        let destination_level = destination_base
+            .checked_add(destination_level)
+            .ok_or("destination copy level overflows")?;
         if self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]) {
             eprintln!(
                 "depth trace present {} copy resolved {from:x} -> {to:x} source {source:?} destination {destination:?}",
@@ -5358,15 +5384,27 @@ impl Nvn {
             .as_ref()
             .unwrap()
             .renderer
-            .partial_write_needs_initialization(to, 0, 0, Some(destination))
+            .partial_write_needs_initialization(
+                to,
+                destination_level,
+                destination_layer,
+                Some(destination),
+            )
         {
             self.initialize_new_targets(core);
         }
-        let traced = self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]);
+        let traced = (self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]))
+            && source_layer == 0
+            && destination_layer == 0;
         let present = self.presented_frames;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.restore_archived_target(from)?;
-        renderer.copy_target(from, source, to, destination)?;
+        renderer.copy_target_level(
+            (from, source_level, source_layer),
+            source,
+            (to, destination_level, destination_layer),
+            destination,
+        )?;
         // A traced copy: both ends read back after it, and how many texels
         // differ (a depth copy a later EQUAL test relies on must be exact).
         if traced {
@@ -5376,8 +5414,8 @@ impl Nvn {
                 renderer.existing_target(to).map(|target| target.format),
             );
             let (a, b) = (
-                renderer.read_target_level(from, 0),
-                renderer.read_target_level(to, 0),
+                renderer.read_target_level(from, source_level),
+                renderer.read_target_level(to, destination_level),
             );
             match (a, b) {
                 (Ok(a), Ok(b)) => {
@@ -13152,6 +13190,68 @@ mod target_tests {
             .unwrap();
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
         assert_eq!(renderer.read_target_bytes(4, 4).unwrap(), expected);
+    }
+
+    #[test]
+    fn texture_copies_use_the_view_level_and_layer_offsets() {
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        let key = 2;
+        nvn.initialize(
+            key,
+            "Texture",
+            BTreeMap::from([
+                ("Target".into(), scalar(4)),
+                ("Width".into(), scalar(4)),
+                ("Height".into(), scalar(4)),
+                ("Depth".into(), scalar(4)),
+                ("Levels".into(), scalar(2)),
+                ("Format".into(), scalar(10)),
+            ]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        for (level, layer, red) in [(0, 3, 0.5_f32), (1, 2, 0.75), (1, 3, 0.125)] {
+            let color = [red, 0.0, 0.0, 1.0].map(f32::to_bits);
+            nvn.gpu_clear_color(&core, (key, level, layer), color, None)
+                .unwrap();
+        }
+        let command = Command {
+            name: "nvnCommandBufferCopyTextureToTexture",
+            x: [0, key, 0, 0, key, 0, 0, 0],
+            v: [0; 8],
+            captured: vec![0, 0, 1, 2, 2, 1, 0, 0, 1, 1, 2, 1, 1, 1, 1, 2],
+            states: Default::default(),
+        };
+        nvn.gpu_copy_texture(&mut core, &command).unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        for (level, layer, width, values) in [
+            (0, 3, 4, vec![0.5_f32; 16]),
+            (1, 2, 2, vec![0.75; 4]),
+            (1, 3, 2, vec![0.75, 0.125, 0.75, 0.125]),
+        ] {
+            let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+            assert_eq!(
+                renderer
+                    .read_target_plane_bytes(key, level, layer, 4, [0, 0, width, width])
+                    .unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]
