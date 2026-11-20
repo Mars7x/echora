@@ -497,6 +497,11 @@ impl PackedSpans {
     }
 }
 
+struct GeneratedTextureUpload<'a> {
+    size: usize,
+    fill: &'a mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+}
+
 pub struct Renderer {
     /// The submission slot being recorded: its command buffer, fence,
     /// ring, descriptor pool and what they hold until it completes (the
@@ -2571,6 +2576,40 @@ impl Renderer {
 
     /// Upload a guest texture when it is new or its generation changed.
     fn upload(&mut self, source: &crate::draw::TextureSource) -> Result<(), String> {
+        self.upload_contents(source, None)
+    }
+
+    /// Whether a first upload is larger than the ring and can split into
+    /// whole subresources that each fit into the ring.
+    pub fn can_generate_upload(&self, key: u64, size: usize, largest_region: usize) -> bool {
+        size as u64 > RING_SIZE
+            && size as u64 <= MAX_UPLOAD_BYTES
+            && largest_region as u64 <= RING_SIZE
+            && !self.uploads.contains_key(&key)
+    }
+
+    /// A first upload, with source bytes generated into successive ring
+    /// chunks. A chunk always holds complete subresources at their offsets.
+    pub fn upload_generated(
+        &mut self,
+        source: &crate::draw::TextureSource,
+        size: usize,
+        mut fill: impl FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.upload_contents(
+            source,
+            Some(GeneratedTextureUpload {
+                size,
+                fill: &mut fill,
+            }),
+        )
+    }
+
+    fn upload_contents(
+        &mut self,
+        source: &crate::draw::TextureSource,
+        mut generated: Option<GeneratedTextureUpload<'_>>,
+    ) -> Result<(), String> {
         let crate::draw::TextureSource::Upload {
             key,
             generation,
@@ -2595,11 +2634,17 @@ impl Renderer {
         if has_stencil(*format) {
             return Err("a depth-stencil upload needs separate depth and stencil planes".into());
         }
-        if texels.is_empty() && !levels.is_empty() {
+        if generated.is_some() && (self.uploads.contains_key(key) || levels.is_empty()) {
+            return Err("a generated upload needs an unused key and subresource layout".into());
+        }
+        if generated.is_none() && texels.is_empty() && !levels.is_empty() {
             return Err(format!(
                 "upload {key:#x}: texels released without a current image"
             ));
         }
+        let size = generated
+            .as_ref()
+            .map_or(texels.len(), |generated| generated.size);
         let level_count = levels
             .iter()
             .map(|region| region.level + 1)
@@ -2623,10 +2668,10 @@ impl Renderer {
         // A guest texture's upload never needs more than this: a larger one
         // means a misread size, shape or format, which stops the run with
         // the texture's description instead of exhausting memory.
-        if texels.len() as u64 > MAX_UPLOAD_BYTES {
+        if size as u64 > MAX_UPLOAD_BYTES {
             let message = format!(
                 "upload {key:#x}: {width}x{height} {shape:?} {format:?}, {level_count} levels, is {} MiB, over the {} MiB limit",
-                texels.len() >> 20,
+                size >> 20,
                 MAX_UPLOAD_BYTES >> 20
             );
             self.fatal = Some(message.clone());
@@ -2636,23 +2681,37 @@ impl Renderer {
         // the end.
         let mut by_offset: Vec<&crate::draw::UploadRegion> = levels.iter().collect();
         by_offset.sort_by_key(|region| region.offset);
+        if generated.is_some()
+            && (by_offset.first().is_none_or(|region| region.offset != 0)
+                || by_offset
+                    .last()
+                    .is_none_or(|region| region.offset >= size as u64)
+                || by_offset
+                    .windows(2)
+                    .any(|pair| pair[0].offset == pair[1].offset))
+        {
+            return Err("invalid offsets for generated texture upload".into());
+        }
         let region_bytes = |index: usize| {
             by_offset
                 .get(index + 1)
-                .map_or(texels.len() as u64, |next| next.offset)
+                .map_or(size as u64, |next| next.offset)
                 - by_offset[index].offset
         };
         // An upload larger than the ring (a big ASTC array decoded to
         // RGBA8) whose regions each fit goes through the ring a batch of
         // regions at a time, with no staging buffer of its own (two of
         // 852 MiB pushed host memory past its limit).
-        let chunked = texels.len() as u64 > RING_SIZE
+        let chunked = (generated.is_some() || size as u64 > RING_SIZE)
             && (0..by_offset.len()).all(|index| region_bytes(index) <= RING_SIZE);
-        let big = texels.len() as u64 > RING_SIZE;
+        if generated.is_some() && !chunked {
+            return Err("a generated upload region exceeds the ring".into());
+        }
+        let big = size as u64 > RING_SIZE;
         if big || Self::labelling() {
             let text = format!(
                 "present - upload {key:#x} {width}x{height} {shape:?} {format:?} levels {level_count} bytes {} chunked {chunked} reused {}",
-                texels.len(),
+                size,
                 reused.is_some()
             );
             if big {
@@ -2773,68 +2832,78 @@ impl Renderer {
                 );
             }
         }
-        if chunked {
-            // Batches of consecutive regions that fill the ring; a batch
-            // may flush first (the barrier above is then submitted before
-            // its copies).
-            let mut start = 0;
-            while start < by_offset.len() {
-                let mut end = start;
-                let mut bytes = 0;
-                while end < by_offset.len() && bytes + region_bytes(end) <= RING_SIZE {
-                    bytes += region_bytes(end);
-                    end += 1;
+        let result = (|| {
+            if chunked {
+                // Batches of consecutive regions that fill the ring; a batch
+                // may flush first (the barrier above is then submitted before
+                // its copies).
+                let mut start = 0;
+                while start < by_offset.len() {
+                    let mut end = start;
+                    let mut bytes = 0;
+                    while end < by_offset.len() && bytes + region_bytes(end) <= RING_SIZE {
+                        bytes += region_bytes(end);
+                        end += 1;
+                    }
+                    let first = by_offset[start].offset;
+                    let (ring, at) = if let Some(generated) = generated.as_mut() {
+                        self.ring_upload_with(bytes, 16, |output| (generated.fill)(first, output))?
+                    } else {
+                        self.ring_upload(&texels[first as usize..(first + bytes) as usize], 16)?
+                    };
+                    let batch: Vec<vk::BufferImageCopy> = copies
+                        .iter()
+                        .filter(|copy| {
+                            let source = copy.buffer_offset - offset;
+                            source >= first && source < first + bytes
+                        })
+                        .map(|copy| vk::BufferImageCopy {
+                            buffer_offset: at + (copy.buffer_offset - offset - first),
+                            ..*copy
+                        })
+                        .collect();
+                    let commands = self.commands()?;
+                    // SAFETY: recording; the image and ring are live.
+                    unsafe {
+                        self.gpu.device.cmd_copy_buffer_to_image(
+                            commands,
+                            ring,
+                            target.image,
+                            vk::ImageLayout::GENERAL,
+                            &batch,
+                        );
+                    }
+                    start = end;
                 }
-                let first = by_offset[start].offset;
-                let slice = &texels[first as usize..(first + bytes) as usize];
-                let (ring, at) = self.ring_upload(slice, 16)?;
-                let batch: Vec<vk::BufferImageCopy> = copies
-                    .iter()
-                    .filter(|copy| {
-                        let source = copy.buffer_offset - offset;
-                        source >= first && source < first + bytes
-                    })
-                    .map(|copy| vk::BufferImageCopy {
-                        buffer_offset: at + (copy.buffer_offset - offset - first),
-                        ..*copy
-                    })
-                    .collect();
-                let commands = self.commands()?;
-                // SAFETY: recording; the image and ring are live.
-                unsafe {
-                    self.gpu.device.cmd_copy_buffer_to_image(
-                        commands,
-                        ring,
-                        target.image,
-                        vk::ImageLayout::GENERAL,
-                        &batch,
-                    );
-                }
-                start = end;
             }
-        }
-        let commands = self.commands()?;
-        // SAFETY: recording; the image is live.
-        unsafe {
-            *self.stats.entry("stat: barriers in upload").or_default() += 1;
-            self.gpu.device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_GRAPHICS
-                    | vk::PipelineStageFlags::COMPUTE_SHADER
-                    | vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[after],
-            );
+            let commands = self.commands()?;
+            // SAFETY: recording; the image is live.
+            unsafe {
+                *self.stats.entry("stat: barriers in upload").or_default() += 1;
+                self.gpu.device.cmd_pipeline_barrier(
+                    commands,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_GRAPHICS
+                        | vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[after],
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.slot.retired_uploads.push(target);
+            return Err(error);
         }
         target.layout = vk::ImageLayout::GENERAL;
         if !reusing {
             self.register_views(&target);
         }
         self.uploads.insert(*key, (*generation, target));
-        self.upload_lengths.insert(*key, texels.len() as u64);
+        self.upload_lengths.insert(*key, size as u64);
         Ok(())
     }
 
@@ -8417,6 +8486,85 @@ mod tests {
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (1, 1));
             assert_eq!((range.base_array_layer, range.layer_count), selected);
+        }
+    }
+
+    #[test]
+    fn generated_upload_retries_after_a_partial_failure() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 19;
+        // Padding forces several ring batches with only a few actual
+        // pixels to read back from the GPU.
+        let stride = super::RING_SIZE / 2;
+        let levels: Vec<_> = (0..4)
+            .map(|index| {
+                let level = index / 2;
+                let extent = 2 >> level;
+                UploadRegion {
+                    level,
+                    layer: index % 2,
+                    width: extent,
+                    height: extent,
+                    depth: 1,
+                    offset: u64::from(index) * stride,
+                }
+            })
+            .collect();
+        let source = TextureSource::Upload {
+            key,
+            generation: 1,
+            width: 2,
+            height: 2,
+            shape: ImageShape::D2 { layers: 2 },
+            format: vk::Format::R8G8B8A8_UNORM,
+            texels: Default::default(),
+            levels: levels.clone().into(),
+        };
+        let size = (3 * stride + 4) as usize;
+        let fill = |offset, bytes: &mut [u8]| {
+            let end = offset + bytes.len() as u64;
+            for region in levels
+                .iter()
+                .filter(|region| (offset..end).contains(&region.offset))
+            {
+                let start = (region.offset - offset) as usize;
+                let length = (region.width * region.height * 4) as usize;
+                bytes[start..start + length].fill(10 + (region.offset / stride) as u8);
+            }
+        };
+        let failure = renderer.upload_generated(&source, size, |offset, bytes| {
+            if offset != 0 {
+                return Err("generated texels unavailable".into());
+            }
+            fill(offset, bytes);
+            Ok(())
+        });
+        assert_eq!(failure, Err("generated texels unavailable".into()));
+        assert!(!renderer.has_upload(key, 1));
+
+        renderer
+            .upload_generated(&source, size, |offset, bytes| {
+                fill(offset, bytes);
+                Ok(())
+            })
+            .unwrap();
+        renderer.texture_view_for(&source).unwrap();
+        for region in levels {
+            let pixels = renderer
+                .read_upload_slice(key, region.level, region.layer)
+                .unwrap();
+            let value = (10 + region.offset / stride) as f32 / 255.0;
+            assert_eq!(pixels.len(), (region.width * region.height) as usize);
+            assert!(
+                pixels
+                    .iter()
+                    .flatten()
+                    .all(|pixel| (pixel - value).abs() < 1e-6)
+            );
         }
     }
 
