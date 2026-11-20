@@ -5059,22 +5059,19 @@ impl Nvn {
     /// that were never rendered to, and views of other levels or layers,
     /// are not modeled.
     /// The image a texture renders into: 2D arrays keep their layers and
-    /// cubes their faces (in Depth, as for sampling; NVN targets inferred,
-    /// GL order), so a view's layer selects one of them. Others, and arrays
-    /// of more than 64 layers, are one 2D layer.
+    /// cubes their faces (in Depth, as for sampling), so a view's layer
+    /// selects the same subresource when rendering and sampling.
     fn render_shape(&self, texture: u64) -> ImageShape {
         let Ok(object) = self.object(texture, "Texture") else {
             return ImageShape::D2 { layers: 1 };
         };
         let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
-        let depth = get("Depth").unwrap_or(1).clamp(1, 64);
+        let depth = get("Depth").unwrap_or(1).max(1);
         match get("Target").unwrap_or(1) {
             // TARGET_3D: a volume of all its slices (the fog's froxel
             // volumes are 96 deep), as the dispatch image binding makes it;
             // one 2D layer would drop every store past slice 0.
-            2 => ImageShape::D3 {
-                depth: get("Depth").unwrap_or(1).max(1),
-            },
+            2 => ImageShape::D3 { depth },
             4 => ImageShape::D2 { layers: depth },
             // TARGET_CUBEMAP (and arrays): six faces even when Depth is
             // left at 1, as the upload path makes cubes; one 2D layer
@@ -12136,6 +12133,59 @@ mod target_tests {
                 for channel in pixels.iter().flatten() {
                     assert!((channel - expected).abs() < 1e-6);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn array_render_targets_keep_layers_above_sixty_four() {
+        let Some((mut nvn, mut memory, _, array)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let builder = nvn.objects[&array].builder.clone();
+        let red = [1.0_f32, 0.0, 0.0, 1.0];
+        let green = [0.0_f32, 1.0, 0.0, 1.0];
+        for (texture, target, last_layer) in [(array + 1, 4, 65), (array + 2, 9, 71)] {
+            let mut props = builder.clone();
+            props.remove("Stride");
+            props.get_mut("Storage").unwrap().x[1] = (texture - array) << 16;
+            for (key, value) in [
+                ("Width", 4),
+                ("Height", 4),
+                ("Depth", last_layer + 1),
+                ("Target", target),
+            ] {
+                props.insert(
+                    key.into(),
+                    Args {
+                        x: [value, 0, 0, 0],
+                        ..Default::default()
+                    },
+                );
+            }
+            nvn.initialize(texture, "Texture", props).unwrap();
+            let clears = [(0, green), (last_layer - 1, green), (last_layer, red)];
+            for (layer, color) in clears {
+                nvn.gpu_clear_color(
+                    &guest,
+                    (texture, 0, layer as u32),
+                    color.map(f32::to_bits),
+                    None,
+                )
+                .unwrap();
+            }
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            for (layer, color) in clears {
+                let pixels = renderer
+                    .read_target_slice(texture, 0, layer as u32)
+                    .unwrap();
+                assert_eq!(pixels, vec![color; 16]);
             }
         }
     }

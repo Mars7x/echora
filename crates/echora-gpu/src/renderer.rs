@@ -5856,12 +5856,48 @@ impl Renderer {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        let mut uncompressed =
+            vk::ImageCompressionControlEXT::default().flags(vk::ImageCompressionFlagsEXT::DISABLED);
+        let uncompressed_depth = self.gpu.uncompressed_depth && is_depth(format);
+        if info.array_layers > 1 {
+            let mut query_formats = format_list;
+            let mut query_compression = uncompressed;
+            let mut query = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(format)
+                .ty(image_type)
+                .tiling(info.tiling)
+                .usage(usage)
+                .flags(flags);
+            if twin.is_some() {
+                query = query.push_next(&mut query_formats);
+            }
+            if uncompressed_depth {
+                query = query.push_next(&mut query_compression);
+            }
+            let mut properties = vk::ImageFormatProperties2::default();
+            // SAFETY: the instance and physical device are live.
+            unsafe {
+                self.gpu
+                    .instance
+                    .get_physical_device_image_format_properties2(
+                        self.gpu.physical,
+                        &query,
+                        &mut properties,
+                    )
+            }
+            .map_err(vk_error("vkGetPhysicalDeviceImageFormatProperties2"))?;
+            let max_layers = properties.image_format_properties.max_array_layers;
+            if info.array_layers > max_layers {
+                return Err(format!(
+                    "image has {} layers, but {format:?} supports at most {max_layers}",
+                    info.array_layers
+                ));
+            }
+        }
         if twin.is_some() {
             info = info.push_next(&mut format_list);
         }
-        let mut uncompressed =
-            vk::ImageCompressionControlEXT::default().flags(vk::ImageCompressionFlagsEXT::DISABLED);
-        if self.gpu.uncompressed_depth && is_depth(format) {
+        if uncompressed_depth {
             info = info.push_next(&mut uncompressed);
         }
         let device = self.device();
