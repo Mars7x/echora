@@ -265,16 +265,23 @@ impl Renderer {
         // compute too.
         let commands = self.commands()?;
         self.apply_condition()?;
+        // Compute can overwrite images and buffers that earlier work wrote.
+        // Publish those writes to shader writes as well as shader reads.
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
             .dst_access_mask(
                 vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
                     | vk::AccessFlags::UNIFORM_READ
                     | vk::AccessFlags::INDIRECT_COMMAND_READ,
             );
         let after = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ);
+            .dst_access_mask(
+                vk::AccessFlags::HOST_READ
+                    | vk::AccessFlags::MEMORY_READ
+                    | vk::AccessFlags::MEMORY_WRITE,
+            );
         let rescaling = (!program.push_stages.is_empty()).then(|| {
             let scaled: Vec<bool> = program
                 .texture_bits
@@ -762,6 +769,73 @@ mod tests {
         assert_eq!(
             renderer.read_target_bytes(output, 4).unwrap(),
             0x32u32.to_le_bytes()
+        );
+        renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
+    fn dispatches_and_clears_can_overwrite_the_same_image() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let code = spirv(
+            "@group(0) @binding(0) var<uniform> value: vec4<u32>;
+            @group(0) @binding(1) var image: texture_storage_2d<r32uint, write>;
+            @compute @workgroup_size(1) fn main() { textureStore(image, vec2<i32>(0), value); }",
+            naga::ShaderStage::Compute,
+        );
+        let program = renderer
+            .create_program(vec![translated(
+                Stage::Compute,
+                code,
+                vec![
+                    Descriptor {
+                        kind: DescriptorKind::UniformBuffer as u32,
+                        binding: 0,
+                        count: 1,
+                        index: 3,
+                        ..Default::default()
+                    },
+                    Descriptor {
+                        kind: DescriptorKind::Image as u32,
+                        binding: 1,
+                        count: 1,
+                        ..Default::default()
+                    },
+                ],
+            )])
+            .unwrap();
+        let target = 1;
+        renderer.target(target, 1, 1, vk::Format::R32_UINT).unwrap();
+        let mut dispatch = Dispatch {
+            program: &program,
+            groups: [1; 3],
+            uniforms: HashMap::from([(0, vec![7; 16])]),
+            storage: HashMap::new(),
+            storage_in_place: HashMap::new(),
+            textures: HashMap::new(),
+            images: HashMap::from([(1, (target, 0))]),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: Default::default(),
+        };
+        renderer.dispatch_deferred(&dispatch).unwrap();
+        dispatch.uniforms.get_mut(&0).unwrap().fill(9);
+        renderer.dispatch_deferred(&dispatch).unwrap();
+        assert_eq!(renderer.read_target_bytes(target, 4).unwrap(), [9; 4]);
+
+        renderer.dispatch_deferred(&dispatch).unwrap();
+        renderer
+            .clear_color(target, None, vk::ClearColorValue { uint32: [15; 4] })
+            .unwrap();
+        assert_eq!(
+            renderer.read_target_bytes(target, 4).unwrap(),
+            15_u32.to_le_bytes()
         );
         renderer.destroy_program(program).unwrap();
     }
