@@ -6001,7 +6001,6 @@ impl Nvn {
         // atomics advanced, are there in order).
         let indirect = if command.name.ends_with("DispatchComputeIndirect") {
             let guest = self.gpu_to_guest(command.x[1], 12)?;
-            self.resolve_copies(core, Some(guest..guest + 12))?;
             Some(
                 self.indirect_arguments(core, guest, 12)?
                     .ok_or("indirect dispatch arguments are in no memory pool")?,
@@ -8599,6 +8598,10 @@ impl Nvn {
         length: u64,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
         let range = guest..guest + length;
+        // A storage binding may have written to a temporary GPU buffer.
+        // Its results must reach guest memory before choosing an argument
+        // source, for draws and dispatches alike.
+        self.resolve_copies(core, Some(range.clone()))?;
         let copy_newer = self.gpu.as_ref().unwrap().resident.values().any(|pool| {
             pool.contains(guest)
                 && pool
@@ -13157,6 +13160,28 @@ mod pool_tests {
         command.x[1] = address + size - 4;
         let groups = nvn.mesh_groups(&mut guest, &command).unwrap();
         assert!(matches!(groups, super::MeshGroups::Indirect { .. }));
+
+        // An earlier dispatch wrote a temporary storage binding at the
+        // same guest address. The next draw must pick up its new count.
+        let temporary = 0x30_0000;
+        let count = 31u32.to_le_bytes();
+        let backend = nvn.gpu.as_mut().unwrap();
+        backend.renderer.resident_buffer(temporary, 16).unwrap();
+        backend
+            .renderer
+            .upload_resident(temporary, 0, &count)
+            .unwrap();
+        let token = backend.renderer.read_resident(temporary, 0, 4).unwrap();
+        backend
+            .pending_storage
+            .push((token, base + size - 4..base + size, 0, 0, command.x[1]));
+        let groups = nvn.mesh_groups(&mut guest, &command).unwrap();
+        assert!(matches!(groups, super::MeshGroups::Indirect { .. }));
+        assert_eq!(guest.memory.read_u32(base + size - 4).unwrap(), 31);
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let token = renderer.read_resident(base, size - 4, 4).unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(renderer.take_reads(&[token])[&token], count);
     }
 
     #[test]
