@@ -4733,11 +4733,6 @@ impl Nvn {
             );
         }
         let storage_hashes: Vec<u64> = raw.chunks(STORAGE_CHUNK as usize).map(hash_bytes).collect();
-        let raw_copy = if uncached && storage_size <= SHADOW_LIMIT {
-            raw.clone()
-        } else {
-            Vec::new()
-        };
         let upload_start = std::time::Instant::now();
         // ECHORA_IDENTITY_LUT=1 (debugging) replaces RGBA8 3D textures
         // (colour lookup tables) with an identity table: neutral grading.
@@ -5104,7 +5099,7 @@ impl Nvn {
             if backend.shadows.contains_key(&texture) {
                 backend.stat("stat: uncached uploads changed", 1);
             }
-            backend.shadows.insert(texture, raw_copy);
+            backend.shadows.insert(texture, raw);
         } else {
             backend.shadows.remove(&texture);
         }
