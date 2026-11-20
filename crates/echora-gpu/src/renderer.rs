@@ -712,17 +712,7 @@ enum ExtraView {
     },
 }
 
-type SamplerKey = (
-    i32,
-    i32,
-    i32,
-    bool,
-    [i32; 3],
-    [u32; 3],
-    u32,
-    Option<i32>,
-    [u32; 4],
-);
+type SamplerKey = (i32, i32, i32, [i32; 3], [u32; 3], u32, Option<i32>, i32);
 
 /// What one submission owns until the GPU finishes it: its command
 /// buffer and fence, the ring its uploads went to, its descriptor pool,
@@ -3053,6 +3043,17 @@ impl Renderer {
             -self.gpu.max_sampler_lod_bias,
             self.gpu.max_sampler_lod_bias,
         );
+        let (mipmap, min_lod, max_lod) = if sampler.base_level_only {
+            // A positive maximum preserves the minification filter while
+            // nearest mip selection keeps the sample in level zero.
+            (vk::SamplerMipmapMode::NEAREST, 0.0, 0.25)
+        } else {
+            (
+                sampler.mipmap,
+                sampler.lod[0],
+                sampler.lod[1].max(sampler.lod[0]),
+            )
+        };
         let address = if self.gpu.sampler_mirror_clamp_to_edge {
             sampler.address
         } else {
@@ -3063,16 +3064,20 @@ impl Renderer {
                 mode => mode,
             })
         };
+        let border = if address.contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER) {
+            border_color(sampler.border)
+        } else {
+            vk::BorderColor::FLOAT_TRANSPARENT_BLACK
+        };
         let key: SamplerKey = (
             sampler.min_filter.as_raw(),
             sampler.mag_filter.as_raw(),
-            sampler.mipmap.as_raw(),
-            sampler.base_level_only,
+            mipmap.as_raw(),
             address.map(|mode| mode.as_raw()),
-            [sampler.lod[0], sampler.lod[1], lod_bias].map(f32::to_bits),
+            [min_lod, max_lod, lod_bias].map(f32::to_bits),
             anisotropy.to_bits(),
             sampler.compare.map(|op| op.as_raw()),
-            sampler.border,
+            border.as_raw(),
         );
         if let Some(existing) = self.samplers.get(&key) {
             return Ok(*existing);
@@ -3080,22 +3085,18 @@ impl Renderer {
         let info = vk::SamplerCreateInfo::default()
             .min_filter(sampler.min_filter)
             .mag_filter(sampler.mag_filter)
-            .mipmap_mode(sampler.mipmap)
+            .mipmap_mode(mipmap)
             .address_mode_u(address[0])
             .address_mode_v(address[1])
             .address_mode_w(address[2])
-            .min_lod(sampler.lod[0])
-            .max_lod(if sampler.base_level_only {
-                0.25
-            } else {
-                sampler.lod[1].max(sampler.lod[0])
-            })
+            .min_lod(min_lod)
+            .max_lod(max_lod)
             .mip_lod_bias(lod_bias)
             .anisotropy_enable(anisotropy > 1.0)
             .max_anisotropy(anisotropy)
             .compare_enable(sampler.compare.is_some())
             .compare_op(sampler.compare.unwrap_or(vk::CompareOp::ALWAYS))
-            .border_color(border_color(sampler.border));
+            .border_color(border);
         // SAFETY: valid create info; destroyed in Drop.
         let created = unsafe { self.gpu.device.create_sampler(&info, None) }
             .map_err(vk_error("vkCreateSampler"))?;
@@ -8130,6 +8131,22 @@ mod tests {
             assert_eq!(renderer.sampler(&requested).unwrap(), first);
             assert_eq!(renderer.samplers.len(), count);
         }
+
+        let base_level = Sampler {
+            base_level_only: true,
+            lod: [8.0, 12.0, 0.0],
+            mipmap: vk::SamplerMipmapMode::LINEAR,
+            border: [1.0f32.to_bits(); 4],
+            ..Sampler::default()
+        };
+        let first = renderer.sampler(&base_level).unwrap();
+        let equivalent = Sampler {
+            lod: [0.0, 0.25, 0.0],
+            mipmap: vk::SamplerMipmapMode::NEAREST,
+            border: [0; 4],
+            ..base_level
+        };
+        assert_eq!(renderer.sampler(&equivalent).unwrap(), first);
     }
 
     fn renderer() -> Option<Renderer> {

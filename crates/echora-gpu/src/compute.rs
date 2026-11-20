@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_clamp_samples_the_edge_after_reflecting_once() {
+    fn sampling_respects_mirror_clamp_and_base_level_filtering() {
         use crate::draw::{ImageShape, UploadRegion};
         use echora_shader::compute::{Layout, translate};
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
@@ -579,7 +579,7 @@ mod tests {
                 &[
                     mov(0, 1.75f32.to_bits()),
                     mov(1, 0.5f32.to_bits()),
-                    mov(2, 0),
+                    mov(2, 1.0f32.to_bits()),
                     mov(4, guest_address),
                     mov(5, 0),
                     sample,
@@ -611,38 +611,66 @@ mod tests {
             shape: ImageShape::D2 { layers: 1 },
             format: vk::Format::R32_SFLOAT,
             texels: Arc::new(
-                [0.25f32, 0.75]
+                [0.25f32, 0.75, 0.125]
                     .into_iter()
                     .flat_map(f32::to_le_bytes)
                     .collect(),
             ),
-            levels: vec![UploadRegion {
-                level: 0,
-                layer: 0,
-                width: 2,
-                height: 1,
-                depth: 1,
-                offset: 0,
-            }]
+            levels: vec![
+                UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 2,
+                    height: 1,
+                    depth: 1,
+                    offset: 0,
+                },
+                UploadRegion {
+                    level: 1,
+                    layer: 0,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    offset: 8,
+                },
+            ]
             .into(),
         };
-        for (mode, expected) in [
-            (vk::SamplerAddressMode::MIRRORED_REPEAT, 0.25f32),
-            (
+        let mirror = Sampler {
+            min_filter: vk::Filter::NEAREST,
+            mag_filter: vk::Filter::NEAREST,
+            base_level_only: false,
+            address: [
                 vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
-                if supported { 0.75 } else { 0.25 },
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            ],
+            lod: [0.0; 3],
+            ..Sampler::default()
+        };
+        let mut repeated = mirror;
+        repeated.address[0] = vk::SamplerAddressMode::MIRRORED_REPEAT;
+        let edge = if supported { 0.75 } else { 0.25 };
+        for (sampler, expected) in [
+            (repeated, 0.25f32),
+            (mirror, edge),
+            (
+                Sampler {
+                    lod: [1.0, 1.0, 0.0],
+                    ..mirror
+                },
+                0.125,
+            ),
+            (
+                Sampler {
+                    base_level_only: true,
+                    mipmap: vk::SamplerMipmapMode::LINEAR,
+                    lod: [8.0, 12.0, 0.0],
+                    ..mirror
+                },
+                edge,
             ),
         ] {
-            let sampler = Sampler {
-                min_filter: vk::Filter::NEAREST,
-                mag_filter: vk::Filter::NEAREST,
-                address: [
-                    mode,
-                    vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                    vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                ],
-                ..Sampler::default()
-            };
             let dispatch = Dispatch {
                 program: &program,
                 groups: [1, 1, 1],
@@ -662,7 +690,7 @@ mod tests {
             assert_eq!(
                 renderer.take_reads(&[token])[&token],
                 expected.to_le_bytes(),
-                "{mode:?}"
+                "{sampler:?}"
             );
         }
         renderer.destroy_program(program).unwrap();
