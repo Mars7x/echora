@@ -1440,6 +1440,7 @@ impl Renderer {
                 .or_default() += 1;
         }
         let sinks_at = mixes_at + mixes;
+        let mut device = None;
         for index in 0..sink_count {
             let entry = &input[sinks_at + index * SINK_IN..][..SINK_IN];
             if entry[1] == 0 {
@@ -1449,7 +1450,7 @@ impl Renderer {
                 // Device: its name and input count.
                 1 => {
                     let inputs = (crate::bytes::le_u32(&entry[0x120..0x124]) as usize).min(6);
-                    self.device = Some(
+                    device = Some(
                         entry[0x124..0x124 + inputs]
                             .iter()
                             .map(|&input| input as usize)
@@ -1478,6 +1479,7 @@ impl Renderer {
             };
             *self.survey.entry(format!("sink {detail}")).or_default() += 1;
         }
+        self.device = device;
         if splitter_size != 0 {
             *self
                 .survey
@@ -1860,6 +1862,24 @@ mod tests {
         renderer.voices.clear();
         renderer.render_frame(Some(&Wave(Vec::new())));
         assert_eq!(renderer.drain_output().as_slice(), &[0; 480]);
+    }
+
+    #[test]
+    fn disabling_the_device_sink_stops_mixing_to_it() {
+        let (mut renderer, output) = play(false);
+        assert!(!output.is_empty());
+        let mut input = scene(false);
+        let sink = input.len() - SINK_IN;
+        input[sink + 1] = 0;
+        let size = HEADER_SIZE + 0x10 + SINK_OUT + PERFORMANCE_OUT + BEHAVIOR_OUT + RENDER_INFO_OUT;
+        renderer.update(&input, size).unwrap();
+        renderer.render_frame(Some(&Wave(Vec::new())));
+        assert!(renderer.drain_output().as_slice().is_empty());
+
+        input[sink + 1] = 1;
+        renderer.update(&input, size).unwrap();
+        renderer.render_frame(Some(&Wave(Vec::new())));
+        assert_eq!(renderer.drain_output().as_slice().len(), 480);
     }
 
     #[test]
