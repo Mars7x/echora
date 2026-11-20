@@ -12435,6 +12435,71 @@ mod pool_tests {
                 assert_eq!(texels.as_slice(), &[(offset / PAGE_SIZE) as u8, 0, 0, 255]);
             }
         }
+
+        let update = |nvn: &mut Nvn, guest: &mut Guest, requests: &[[u64; 4]]| {
+            for (index, words) in requests.iter().enumerate() {
+                for (field, value) in words.iter().enumerate() {
+                    guest
+                        .memory
+                        .write(
+                            request + (index * 0x28 + field * 8) as u64,
+                            &value.to_le_bytes(),
+                        )
+                        .unwrap();
+                }
+            }
+            guest.cpu.regs[..3].copy_from_slice(&[virtual_pool, requests.len() as u64, request]);
+            nvn.call("nvnMemoryPoolMapVirtual", guest)
+        };
+        // The adjacent pages keep their backing when the middle page unmaps
+        // or is replaced, with the original offset retained on the right.
+        update(
+            &mut nvn,
+            &mut guest,
+            &[[physical, 0, 2 * PAGE_SIZE, 3 * PAGE_SIZE]],
+        )
+        .unwrap();
+        let neighbor = |nvn: &mut Nvn, guest: &mut Guest| {
+            [
+                page(nvn, guest, address - PAGE_SIZE),
+                page(nvn, guest, address + PAGE_SIZE),
+            ]
+        };
+        let sides = neighbor(&mut nvn, &mut guest);
+        assert_ne!(sides[0], 0);
+        assert_eq!(sides[1], sides[0] + 2 * PAGE_SIZE);
+        update(&mut nvn, &mut guest, &[[0, 0, 3 * PAGE_SIZE, PAGE_SIZE]]).unwrap();
+        assert_eq!(page(&mut nvn, &mut guest, address), 0);
+        assert_eq!(neighbor(&mut nvn, &mut guest), sides);
+        update(
+            &mut nvn,
+            &mut guest,
+            &[[physical, 3 * PAGE_SIZE, 3 * PAGE_SIZE, PAGE_SIZE]],
+        )
+        .unwrap();
+        assert_eq!(
+            page(&mut nvn, &mut guest, address),
+            sides[0] + 3 * PAGE_SIZE
+        );
+        assert_eq!(neighbor(&mut nvn, &mut guest), sides);
+
+        // A request list with an invalid range leaves every mapping intact.
+        assert!(
+            update(
+                &mut nvn,
+                &mut guest,
+                &[
+                    [0, 0, 3 * PAGE_SIZE, PAGE_SIZE],
+                    [0, 0, 8 * PAGE_SIZE, PAGE_SIZE]
+                ],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            page(&mut nvn, &mut guest, address),
+            sides[0] + 3 * PAGE_SIZE
+        );
+        assert_eq!(neighbor(&mut nvn, &mut guest), sides);
     }
 
     #[test]

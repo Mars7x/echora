@@ -2743,20 +2743,15 @@ impl Nvn {
                 if !(0..=4096).contains(&count) {
                     return Err(invalid(format!("{count} mapping requests")));
                 }
-                let mut mappings = Vec::new();
+                if x[2].checked_add(count as u64 * 0x28).is_none() {
+                    return Err(invalid("mapping requests exceed the address space".into()));
+                }
+                let mut mappings = Vec::with_capacity(count as usize);
                 for index in 0..count as u64 {
                     let at = x[2] + index * 0x28;
                     let word = |offset: u64| core.memory.read_u64(at + offset);
                     let request = [word(0)?, word(8)?, word(0x10)?, word(0x18)?];
-                    mappings.push(request);
-                }
-                // Each request changes GPU and CPU translations immediately.
-                self.invalidate_virtual_texture_uploads(this, &mappings);
-                self.pool_epoch += 1;
-                self.pool_ranges.get_mut().epoch = None;
-                self.storage_memo.get_mut().clear();
-                self.invalidate_target_index(None);
-                for [physical, physical_offset, offset, size] in mappings {
+                    let [physical, physical_offset, offset, size] = request;
                     if size == 0 || offset.checked_add(size).is_none_or(|end| end > pool_size) {
                         return Err(invalid(format!(
                             "virtual mapping {offset:#x}+{size:#x} outside the pool"
@@ -2775,28 +2770,50 @@ impl Nvn {
                             )));
                         }
                     }
-                    let pool = self.objects.get_mut(&this).unwrap();
-                    let overlapping: Vec<(String, u64, u64)> = pool
-                        .state
+                    mappings.push(request);
+                }
+                if mappings.is_empty() {
+                    core.cpu.regs[0] = 1;
+                    return Ok(true);
+                }
+                // Invalidate the GPU and CPU translations after validating
+                // the entire request list.
+                self.invalidate_virtual_texture_uploads(this, &mappings);
+                self.pool_epoch += 1;
+                self.pool_ranges.get_mut().epoch = None;
+                self.storage_memo.get_mut().clear();
+                self.invalidate_target_index(None);
+                let state = &mut self.objects.get_mut(&this).unwrap().state;
+                for [physical, physical_offset, offset, size] in mappings {
+                    let end = offset + size;
+                    let overlapping: Vec<_> = state
                         .iter()
-                        .filter_map(|(name, mapping)| {
+                        .filter_map(|(name, &mapping)| {
                             let start = u64::from_str_radix(name.strip_prefix(VIRTUAL_MAPPING)?, 16)
                                 .ok()?;
-                            let end = start + mapping.x[2];
-                            (start < offset + size && offset < end)
-                                .then(|| (name.clone(), start, end))
+                            (start < end && offset < start + mapping.x[2])
+                                .then(|| (name.clone(), start, mapping))
                         })
                         .collect();
-                    for (name, start, end) in overlapping {
-                        if start < offset || end > offset + size {
-                            return Err(stop(format!(
-                                "virtual mapping {offset:#x}+{size:#x} splits {start:#x}..{end:#x}"
-                            )));
+                    for (name, start, mapping) in overlapping {
+                        let mapped_end = start + mapping.x[2];
+                        // Preserve the portions outside the requested range.
+                        if start < offset {
+                            let mut left = mapping;
+                            left.x[2] = offset - start;
+                            state.insert(name, left);
+                        } else {
+                            state.remove(&name);
                         }
-                        pool.state.remove(&name);
+                        if end < mapped_end {
+                            let mut right = mapping;
+                            right.x[1] += end - start;
+                            right.x[2] = mapped_end - end;
+                            state.insert(format!("{VIRTUAL_MAPPING}{end:016x}"), right);
+                        }
                     }
                     if physical != 0 {
-                        pool.state.insert(
+                        state.insert(
                             format!("{VIRTUAL_MAPPING}{offset:016x}"),
                             Args {
                                 x: [physical, physical_offset, size, 0],
