@@ -212,6 +212,8 @@ const SPIN_DENSITY_INSTRUCTIONS: u64 = 64;
 pub struct Machine {
     /// CPU, memory and per-instruction accounting used by generated code.
     pub core: Core,
+    /// NVN owns GPU imports and releases them before guest memory is dropped.
+    pub nvn: crate::nvn::Nvn,
     /// Mappings, permissions and checked host-side access to guest memory;
     /// `core.memory` is the generated code's view of the same bytes.
     pub memory: Memory,
@@ -269,8 +271,6 @@ pub struct Machine {
     thread_exits: u64,
     last_context_switch: Option<ContextSwitch>,
     random_entropy: Option<[u64; 4]>,
-    /// High-level NVN entry points (host functions).
-    pub nvn: crate::nvn::Nvn,
     /// Where the hid shared memory is mapped, and controller samples
     /// published to it (ECHORA_WINDOW).
     hid_mapping: Option<u64>,
@@ -389,6 +389,7 @@ impl Machine {
         core.current_thread_id = current_thread_id;
         Self {
             core,
+            nvn: Default::default(),
             memory,
             layout,
             heap_size: 0,
@@ -436,7 +437,6 @@ impl Machine {
             thread_exits: 0,
             last_context_switch: None,
             random_entropy: None,
-            nvn: Default::default(),
             hid_mapping: None,
             hid_samples: 0,
             pc_samples: Default::default(),

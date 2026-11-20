@@ -46,6 +46,7 @@ pub struct Gpu {
     /// VK_EXT_external_memory_host: guest memory can be imported as device
     /// memory, so buffers in it are shared with the GPU without copies.
     pub host_import: Option<ash::ext::external_memory_host::Device>,
+    pub(crate) host_import_alignment: u64,
     /// VK_KHR_external_memory_fd with VK_EXT_external_memory_dma_buf (Linux):
     /// a dma-buf over guest memory's file (a udmabuf) can be imported as
     /// device memory, so guest buffers are shared with the GPU in place.
@@ -314,8 +315,13 @@ impl Gpu {
         }
         let host_import = has(ash::ext::external_memory_host::NAME)
             && std::env::var_os("ECHORA_NO_HOST_IMPORT").is_none();
+        let mut host_properties = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         if host_import {
             enabled_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
+            let mut properties =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut host_properties);
+            // SAFETY: the physical device supports external host memory.
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
         }
         // ECHORA_NO_DMA_BUF (diagnostic): guest buffers are copied instead.
         let dma_buf_import = cfg!(target_os = "linux")
@@ -615,6 +621,7 @@ impl Gpu {
                     + 1),
             cooperative_matrix,
             host_import,
+            host_import_alignment: host_properties.min_imported_host_pointer_alignment,
             dma_buf_import,
             buffer_marker,
             uncompressed_depth,

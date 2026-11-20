@@ -4236,7 +4236,21 @@ impl Renderer {
         const PAGE: usize = 4096;
         let start = pointer as usize & !(PAGE - 1);
         let offset = (pointer as usize - start) as u64;
-        let span = (offset + length.max(1)).next_multiple_of(PAGE as u64);
+        let Some(span) = offset
+            .checked_add(length.max(1))
+            .and_then(|bytes| bytes.checked_next_multiple_of(PAGE as u64))
+        else {
+            return Ok(None);
+        };
+        let alignment = self.gpu.host_import_alignment;
+        // The caller only guarantees the guest pages in this span. Do
+        // not round outward to the device's larger import alignment.
+        if pointer.is_null()
+            || !alignment.is_power_of_two()
+            || ((start as u64 | span) & (alignment - 1)) != 0
+        {
+            return Ok(None);
+        }
         if let Some((buffer, _)) = self.imported.get(&(start, span)) {
             return Ok(Some((*buffer, offset)));
         }
@@ -4247,7 +4261,7 @@ impl Renderer {
         let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
         // SAFETY: `start` is a page-aligned host address the caller keeps
         // mapped (guest memory).
-        unsafe {
+        let queried = unsafe {
             (host.fp().get_memory_host_pointer_properties_ext)(
                 host.device(),
                 handle,
@@ -4255,8 +4269,12 @@ impl Renderer {
                 &mut properties,
             )
         }
-        .result()
-        .map_err(vk_error("vkGetMemoryHostPointerPropertiesEXT"))?;
+        .result();
+        if queried == Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE) {
+            self.import_refused.insert((start, span));
+            return Ok(None);
+        }
+        queried.map_err(vk_error("vkGetMemoryHostPointerPropertiesEXT"))?;
         let device = self.gpu.device.clone();
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
         let info = vk::BufferCreateInfo::default()
@@ -4274,12 +4292,19 @@ impl Renderer {
         // SAFETY: the buffer is live.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
         let bits = properties.memory_type_bits & requirements.memory_type_bits;
-        let Some(index) =
-            (0..self.memory_types.memory_type_count).find(|index| bits & (1 << index) != 0)
-        else {
+        let coherent =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(index) = (0..self.memory_types.memory_type_count).find(|index| {
+            requirements.size <= span
+                && bits & (1 << index) != 0
+                && self.memory_types.memory_types[*index as usize]
+                    .property_flags
+                    .contains(coherent)
+        }) else {
             // SAFETY: unused buffer.
             unsafe { device.destroy_buffer(buffer, None) };
-            return Err("no memory type can import host memory".into());
+            self.import_refused.insert((start, span));
+            return Ok(None);
         };
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle)
@@ -4303,8 +4328,14 @@ impl Renderer {
             }
         };
         // SAFETY: fresh buffer and memory of the required size.
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-            .map_err(vk_error("vkBindBufferMemory"))?;
+        if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: no work has referenced the buffer or its allocation.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(vk_error("vkBindBufferMemory")(error));
+        }
         self.imported.insert((start, span), (buffer, memory));
         Ok(Some((buffer, offset)))
     }
@@ -7652,6 +7683,27 @@ fn block_compressed(format: vk::Format) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_import_falls_back_when_the_guest_span_is_too_small() {
+        #[repr(align(4096))]
+        struct HostPage([u8; 4096]);
+
+        let mut page = Box::new(HostPage([0; 4096]));
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if renderer.gpu.host_import.is_none() {
+            return;
+        }
+        renderer.gpu.host_import_alignment = 64 << 10;
+        assert!(
+            renderer
+                .import_host(page.0.as_mut_ptr(), page.0.len() as u64)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn failed_submission_releases_waiters_for_queued_batches() {
