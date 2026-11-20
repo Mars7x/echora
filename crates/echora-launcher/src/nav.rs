@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Div, Element, ElementId, FocusHandle, KeyDownEvent, Pixels, Stateful, Window,
-    actions, canvas, deferred,
+    App, Bounds, Div, Element, ElementId, FocusHandle, KeyDownEvent, MouseButton, Pixels, Stateful,
+    Window, actions, canvas, deferred,
 };
 
 use crate::ui;
@@ -37,21 +37,44 @@ actions!(
 /// presses.
 pub trait Press {
     fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self;
+
+    /// Show a reversible surface as soon as its button is pressed.
+    fn on_press_down(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self;
 }
 
 impl Press for Stateful<Div> {
     fn on_press(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self {
         let listener = Rc::new(listener);
-        let activate = listener.clone();
-        let key = listener.clone();
-        // GPUI clicks a focused control when Enter or Space is released;
-        // pressing on the key going down instead feels immediate. Held keys
-        // don't repeat the press.
-        self.on_click(move |event, window, cx| {
+        let click = listener.clone();
+        let control = self.on_click(move |event, window, cx| {
             if !event.is_keyboard() {
-                listener(&(), window, cx);
+                click(&(), window, cx);
             }
-        })
+        });
+        keyboard_and_controller(control, listener)
+    }
+
+    fn on_press_down(self, listener: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self {
+        let listener = Rc::new(listener);
+        let press = listener.clone();
+        let control = self.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            // Keep GPUI's default mouse focus handler from pulling focus
+            // back to the opener after the press has moved it into a sheet.
+            window.prevent_default();
+            cx.stop_propagation();
+            press(&(), window, cx);
+        });
+        keyboard_and_controller(control, listener)
+    }
+}
+
+fn keyboard_and_controller(
+    control: Stateful<Div>,
+    listener: Rc<impl Fn(&(), &mut Window, &mut App) + 'static>,
+) -> Stateful<Div> {
+    let key = listener.clone();
+    // GPUI normally clicks on key release. Use key down and ignore repeats.
+    control
         .on_key_down(move |event: &KeyDownEvent, window, cx| {
             let stroke = &event.keystroke;
             if matches!(stroke.key.as_str(), "enter" | "space") && !stroke.modifiers.modified() {
@@ -63,8 +86,7 @@ impl Press for Stateful<Div> {
         })
         // Actions go to the focused element first, so only the focused
         // control answers Activate.
-        .on_action(move |_: &Activate, window, cx| activate(&(), window, cx))
-    }
+        .on_action(move |_: &Activate, window, cx| listener(&(), window, cx))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

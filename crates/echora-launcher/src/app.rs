@@ -11,10 +11,10 @@ use echora_config::{InternalResolutionSetting, Settings, WindowMode, Workers};
 use echora_content::ContentSource;
 use echora_input::button;
 use gpui::{
-    Action, AnyElement, App, Application, Bounds, BoxShadow, Context, CursorStyle, Decorations,
-    Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image, ImageFormat, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions,
-    Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
+    Action, Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
+    CursorStyle, Decorations, Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
+    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    PathPromptOptions, Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, actions, anchored,
     canvas, deferred, div, img, point, prelude::*, px, size,
 };
@@ -480,17 +480,28 @@ impl Launcher {
     }
 
     fn choose_game(&mut self, _: &ChooseGame, _: &mut Window, cx: &mut Context<Self>) {
-        // A NUP package is a file and a dump is a folder; the platform picker
-        // offers both.
+        self.choose_source(false, cx);
+    }
+
+    fn choose_source(&mut self, directory: bool, cx: &mut Context<Self>) {
+        // The Linux portal can select files or folders in one request.
+        // Use distinct requests so a NUP remains selectable.
         let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: true,
+            files: !directory,
+            directories: directory,
             multiple: false,
             prompt: Some("Choose".into()),
         });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
+            let paths = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.notify(format!("Couldn't open the file picker: {error}"), cx);
+                    });
+                    return;
+                }
+                _ => return,
             };
             let Some(path) = paths.into_iter().next() else {
                 return;
@@ -498,6 +509,21 @@ impl Launcher {
             let _ = this.update(cx, |this, cx| this.install_game(path, cx));
         })
         .detach();
+    }
+
+    fn source_buttons(&self, size: Size, live: bool, cx: &mut Context<Self>) -> Div {
+        div().flex().flex_wrap().gap(u(space::S)).children(
+            [
+                ("choose", "Choose NUP…", Kind::Primary, false),
+                ("choose-folder", "Choose folder…", Kind::Secondary, true),
+            ]
+            .map(|(id, label, kind, directory)| {
+                self.stop(ui::button(id, label, kind, size), live, cx)
+                    .on_press(cx.listener(move |this, _, _, cx| {
+                        this.choose_source(directory, cx);
+                    }))
+            }),
+        )
     }
 
     /// Copies the chosen NUP or dump into Echora's data folder on another
@@ -1077,14 +1103,27 @@ const CREDITS: [(&str, &str); 5] = [
 const WINDOW_INSET: f32 = 16.0;
 /// Margin between a sheet and the window's edges.
 const SHEET_MARGIN: f32 = 24.0;
+const SHEET_OPEN: Duration = Duration::from_millis(150);
 
 /// Dims the launcher behind a sheet; clicking outside the sheet closes it.
 fn scrim(
     sheet: gpui::Stateful<gpui::Div>,
     corner: Pixels,
+    animation_id: &'static str,
+    motion: bool,
     cx: &mut Context<Launcher>,
 ) -> AnyElement {
     let sheet = sheet.on_click(|_, _, cx| cx.stop_propagation());
+    let sheet = if motion {
+        sheet
+            .with_animation(animation_id, Animation::new(SHEET_OPEN), |sheet, t| {
+                // Keep the panel legible as soon as its first frame arrives.
+                sheet.opacity(0.9 + 0.1 * ui::ease_out(t))
+            })
+            .into_any_element()
+    } else {
+        sheet.into_any_element()
+    };
     div()
         .id("scrim")
         .absolute()
@@ -1215,15 +1254,6 @@ impl Launcher {
                 ui::progress_details(stage, percent).into_any_element(),
             )
         } else {
-            let choose = self
-                .stop(
-                    ui::button("choose", "Choose game…", Kind::Primary, Size::Large),
-                    self.sheet.is_none(),
-                    cx,
-                )
-                .on_press(
-                    cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
-                );
             let content = div()
                 .flex()
                 .flex_col()
@@ -1233,9 +1263,9 @@ impl Launcher {
                     div()
                         .text_size(u(text::BODY))
                         .text_color(color(palette::SECONDARY_LABEL))
-                        .child("Choose a NUP package or a game dump folder."),
+                        .child("Use a game package or an extracted dump."),
                 )
-                .child(choose);
+                .child(self.source_buttons(Size::Large, self.sheet.is_none(), cx));
             ("Add a game", content.into_any_element())
         };
         div()
@@ -1278,18 +1308,24 @@ impl Launcher {
                 active,
                 cx,
             )
-            .on_press(
-                cx.listener(|this, _, window, cx| {
+            .when(active, |button| {
+                button.on_press_down(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.stops.handle("settings", cx));
                     this.toggle_settings(&ToggleSettings, window, cx)
-                }),
-            );
+                }))
+            });
         let about = self
             .stop(
                 ui::button("about", "About", Kind::Secondary, Size::Large).w(u(DOCK_BUTTON)),
                 active,
                 cx,
             )
-            .on_press(cx.listener(|this, _, window, cx| this.open_sheet(Sheet::About, window, cx)));
+            .when(active, |button| {
+                button.on_press_down(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.stops.handle("about", cx));
+                    this.open_sheet(Sheet::About, window, cx)
+                }))
+            });
         [settings, about]
     }
 
@@ -1573,7 +1609,7 @@ impl Launcher {
             .track_focus(&self.sheet_focus)
             .child(tabs)
             .child(content);
-        scrim(sheet, self.corner, cx)
+        scrim(sheet, self.corner, "settings-open", self.motion, cx)
     }
 
     fn settings_page(
@@ -1882,15 +1918,6 @@ impl Launcher {
 
     /// The installed game, and installing or reinstalling it.
     fn game_page(&self, live: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let choose = |label: &'static str, cx: &mut Context<Self>| {
-            self.stop(
-                ui::button("install", label, Kind::Secondary, Size::Regular),
-                live,
-                cx,
-            )
-            .on_press(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)))
-            .into_any_element()
-        };
         let Some(game) = &self.game else {
             return vec![
                 ui::group(
@@ -1898,11 +1925,11 @@ impl Launcher {
                     vec![
                         ui::row(
                             None,
-                            ui::titles(
-                                "No game",
-                                Some("Choose your NUP package or dump folder.".into()),
+                            ui::titles("No game", None),
+                            Some(
+                                self.source_buttons(Size::Regular, live, cx)
+                                    .into_any_element(),
                             ),
-                            Some(choose("Choose game…", cx)),
                         )
                         .into_any_element(),
                     ],
@@ -1934,7 +1961,10 @@ impl Launcher {
                     "Installed",
                     Some("Your original NUP or dump is no longer needed.".into()),
                 ),
-                Some(choose("Reinstall…", cx)),
+                Some(
+                    self.source_buttons(Size::Regular, live, cx)
+                        .into_any_element(),
+                ),
             )
         } else {
             let path = game.path.clone();
@@ -2113,7 +2143,7 @@ impl Launcher {
                     )
                     .child(source),
             );
-        scrim(sheet, self.corner, cx)
+        scrim(sheet, self.corner, "about-open", self.motion, cx)
     }
 }
 

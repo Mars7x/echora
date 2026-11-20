@@ -71,6 +71,25 @@ dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
 
+# Font parsing and rasterization run on the launcher's first panel frame.
+[profile.dev.package.ttf-parser]
+opt-level = 3
+
+[profile.dev.package.unicode-ccc]
+opt-level = 3
+
+[profile.dev.package.read-fonts]
+opt-level = 3
+
+[profile.dev.package.font-types]
+opt-level = 3
+
+[profile.dev.package.skrifa]
+opt-level = 3
+
+[profile.dev.package.swash]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
