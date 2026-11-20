@@ -1189,8 +1189,8 @@ mod tests {
     }
 }
 
-/// All bytes a compute program can write through pointers initialized by
-/// complete uniform constant-bank loads, independent of control flow.
+/// All bytes a compute program can write through pointers derived from
+/// uniform constant-bank loads, independent of control flow.
 #[derive(Debug)]
 pub struct UniformWriteRanges(Vec<UniformPointer>);
 
@@ -1198,6 +1198,248 @@ pub struct UniformWriteRanges(Vec<UniformPointer>);
 struct UniformPointer {
     offsets: std::ops::RangeInclusive<i64>,
     constant: (u8, u16),
+    low_unknown: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UniformAddress {
+    constant: (u8, u16),
+    /// Inclusive upper bound for the unsigned additions to the base.
+    max_offset: i64,
+}
+
+/// A carry from adding an unsigned word to the low word of a pointer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PointerCarry {
+    base: UniformAddress,
+    high_input: u8,
+    low_result: u8,
+}
+
+#[derive(Clone, Copy)]
+struct UniformDefinitions {
+    pointers: [Option<UniformAddress>; 64],
+    /// Pointer high words can survive an unrelated change to the low word
+    /// or be copied into a register pair with a different low word.
+    high_words: [Option<UniformAddress>; 64],
+    carries: [Option<PointerCarry>; 7],
+}
+
+impl UniformDefinitions {
+    const UNKNOWN: Self = Self {
+        pointers: [None; 64],
+        high_words: [None; 64],
+        carries: [None; 7],
+    };
+
+    fn overwrite(&mut self, first: u8, last: u8) {
+        let last = last.min(62);
+        if first <= last {
+            self.pointers[usize::from(first.saturating_sub(1))..=usize::from(last)].fill(None);
+            self.high_words[usize::from(first)..=usize::from(last)].fill(None);
+            let words = first..=last;
+            for carry in &mut self.carries {
+                if carry.is_some_and(|carry| {
+                    words.contains(&carry.low_result) || words.contains(&carry.high_input)
+                }) {
+                    *carry = None;
+                }
+            }
+        }
+    }
+
+    fn set_carry(&mut self, predicate: u8, carry: Option<PointerCarry>) {
+        if let Some(output) = self.carries.get_mut(usize::from(predicate)) {
+            *output = carry;
+        }
+    }
+
+    fn pointer_word(operand: Operand) -> Option<u8> {
+        match operand {
+            Operand {
+                src: Src::Reg(Reg(reg)),
+                abs: false,
+                neg: false,
+            } if reg < 63 => Some(reg),
+            _ => None,
+        }
+    }
+
+    fn zero(operand: Operand) -> bool {
+        !operand.neg && matches!(operand.src, Src::Reg(Reg(63)) | Src::Imm(0))
+    }
+
+    fn low_sum(&self, d: Reg, base: Operand) -> Option<PointerCarry> {
+        if d.0 >= 62 {
+            return None;
+        }
+        let pointer = Self::pointer_word(base)?;
+        let base = self.pointers[usize::from(pointer)]?;
+        Some(PointerCarry {
+            base,
+            high_input: pointer + 1,
+            low_result: d.0,
+        })
+    }
+
+    fn high_sum(
+        &self,
+        d: Reg,
+        a: Operand,
+        b: Operand,
+        c: Operand,
+        carry_in: [Pred; 2],
+    ) -> Option<(usize, UniformAddress)> {
+        if carry_in[0].negated
+            || carry_in[1]
+                != (Pred {
+                    index: 7,
+                    negated: true,
+                })
+            || !Self::zero(c)
+        {
+            return None;
+        }
+        let carry = self
+            .carries
+            .get(usize::from(carry_in[0].index))
+            .copied()
+            .flatten()?;
+        if d.0 != carry.low_result + 1
+            || ![(a, b), (b, a)].into_iter().any(|(high, zero)| {
+                Self::pointer_word(high) == Some(carry.high_input) && Self::zero(zero)
+            })
+        {
+            return None;
+        }
+        let mut address = carry.base;
+        address.max_offset = address.max_offset.checked_add(i64::from(u32::MAX))?;
+        Some((usize::from(carry.low_result), address))
+    }
+
+    fn advance(&mut self, instruction: &Instruction) {
+        if instruction.guard.index == 7 && instruction.guard.negated {
+            return;
+        }
+        let unconditional = instruction.guard.is_true();
+        match instruction.op {
+            Op::Uldc { d, src, size } => {
+                self.overwrite(d.0, d.0 + u8::from(size == 5));
+                if unconditional
+                    && size == 5
+                    && d.0 < 62
+                    && let Src::Const { bank, offset } = src
+                {
+                    let address = UniformAddress {
+                        constant: (bank, offset & !3),
+                        max_offset: 0,
+                    };
+                    self.pointers[usize::from(d.0)] = Some(address);
+                    self.high_words[usize::from(d.0 + 1)] = Some(address);
+                }
+            }
+            Op::Iadd3 {
+                d,
+                a,
+                b,
+                c,
+                carry_out,
+                carry_in,
+                extended,
+            } if instruction.uniform => {
+                let completed = (unconditional && extended)
+                    .then(|| self.high_sum(d, a, b, c, carry_in))
+                    .flatten();
+                let carry = (unconditional
+                    && !extended
+                    && !a.neg
+                    && !b.neg
+                    && !carry_out[0].negated
+                    && Self::zero(c))
+                .then(|| self.low_sum(d, a).or_else(|| self.low_sum(d, b)))
+                .flatten();
+                self.overwrite(d.0, d.0);
+                self.set_carry(carry_out[0].index, carry);
+                self.set_carry(carry_out[1].index, None);
+                if let Some((low, address)) = completed {
+                    self.pointers[low] = Some(address);
+                    self.high_words[low + 1] = Some(address);
+                }
+            }
+            Op::Lea {
+                d,
+                b,
+                high,
+                negate_shifted,
+                extended,
+                overflow,
+                ..
+            } if instruction.uniform => {
+                // LEA's shifted term is a u32, so its addition has the
+                // same carry and bound as an unsigned low-word sum.
+                let carry = (unconditional && !high && !negate_shifted && !extended)
+                    .then(|| self.low_sum(d, b))
+                    .flatten();
+                self.overwrite(d.0, d.0);
+                self.set_carry(overflow, carry);
+            }
+            Op::Isetp { p, q, .. } if instruction.uniform => {
+                self.set_carry(p, None);
+                self.set_carry(q, None);
+            }
+            Op::Mov { d, src, lanes } if instruction.uniform => {
+                let source = match src {
+                    Src::Uniform(UniformReg(word)) | Src::Reg(Reg(word)) if word < 63 => {
+                        self.high_words[usize::from(word)]
+                    }
+                    _ => None,
+                };
+                self.overwrite(d.0, d.0);
+                if unconditional && lanes == 15 && d.0 < 63 {
+                    self.high_words[usize::from(d.0)] = source;
+                }
+            }
+            Op::Imad { d, .. } | Op::Shf { d, .. } if instruction.uniform => {
+                self.overwrite(d.0, d.0);
+            }
+            Op::ImadWide { d, carry_out, .. } if instruction.uniform => {
+                self.overwrite(d.0, d.0.saturating_add(1));
+                self.set_carry(carry_out, None);
+            }
+            Op::Bra { .. } | Op::Call { .. } | Op::Exit { .. } => {}
+            Op::R2ur { d, .. } | Op::Redux { d, .. } => self.overwrite(d.0, d.0),
+            Op::Vote {
+                d,
+                p,
+                uniform_out: true,
+                ..
+            } => {
+                self.overwrite(d.0, d.0);
+                self.set_carry(p, None);
+            }
+            _ if instruction.uniform => *self = Self::UNKNOWN,
+            _ => {}
+        }
+    }
+
+    fn intersect(&mut self, other: Self) -> bool {
+        fn keep_matching<T: PartialEq>(
+            current: &mut [Option<T>],
+            other: impl IntoIterator<Item = Option<T>>,
+        ) -> bool {
+            let mut changed = false;
+            for (old, new) in current.iter_mut().zip(other) {
+                if old.is_some() && *old != new {
+                    *old = None;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        keep_matching(&mut self.pointers, other.pointers)
+            | keep_matching(&mut self.high_words, other.high_words)
+            | keep_matching(&mut self.carries, other.carries)
+    }
 }
 
 impl UniformWriteRanges {
@@ -1211,11 +1453,8 @@ impl UniformWriteRanges {
 
     /// Constant-bank pointer definitions that reach every path to a write.
     /// Any incoming path with a different or unknown definition invalidates
-    /// the pair until a later unconditional full-width load defines it.
+    /// the pair until a later instruction establishes a new definition.
     fn compile_reaching(code: &[Instruction]) -> Option<Self> {
-        type Input = (u8, u16);
-        type State = [Option<Input>; 64];
-
         let mut successors = Vec::with_capacity(code.len());
         let mut writes = Vec::new();
         for (index, instruction) in code.iter().enumerate() {
@@ -1237,11 +1476,20 @@ impl UniformWriteRanges {
                 Op::Exit { condition } if condition.is_true() && instruction.guard.is_true() => {
                     [None, None]
                 }
-                Op::Bra { .. }
-                | Op::Brx { .. }
-                | Op::Call { .. }
-                | Op::Ret { .. }
-                | Op::Unknown { .. } => return None,
+                Op::Call { offset } => {
+                    let target = crate::compute::relative_target(index, offset, code.len())?;
+                    [
+                        Some(target),
+                        if instruction.guard.is_true() {
+                            None
+                        } else {
+                            next
+                        },
+                    ]
+                }
+                Op::Bra { .. } | Op::Brx { .. } | Op::Ret { .. } | Op::Unknown { .. } => {
+                    return None;
+                }
                 Op::Store {
                     space: Space::Global,
                     address,
@@ -1262,54 +1510,17 @@ impl UniformWriteRanges {
             return None;
         }
 
-        let mut inputs: Vec<Option<State>> = vec![None; code.len()];
-        inputs[0] = Some([None; 64]);
+        let mut inputs = vec![None; code.len()];
+        inputs[0] = Some(UniformDefinitions::UNKNOWN);
         let mut pending = std::collections::VecDeque::from([0]);
         let mut queued = vec![false; code.len()];
         while let Some(at) = pending.pop_front() {
             queued[at] = false;
             let mut output = inputs[at]?;
-            let instruction = &code[at];
-            match instruction.op {
-                Op::Uldc { d, src, size } => {
-                    let at = usize::from(d.0);
-                    if at != 63 {
-                        output[at.saturating_sub(1)..=at + usize::from(size == 5)].fill(None);
-                        if instruction.guard.is_true()
-                            && size == 5
-                            && at < 62
-                            && let Src::Const { bank, offset } = src
-                        {
-                            output[at] = Some((bank, offset & !3));
-                        }
-                    }
-                }
-                Op::Bra { .. } | Op::Exit { .. } => {}
-                // An arithmetic result overwrites only that uniform word.
-                Op::Iadd3 { d, .. } if instruction.uniform => {
-                    let at = usize::from(d.0);
-                    if at < 63 {
-                        output[at.saturating_sub(1)..=at].fill(None);
-                    }
-                }
-                Op::R2ur { .. }
-                | Op::Redux { .. }
-                | Op::Vote {
-                    uniform_out: true, ..
-                } => output.fill(None),
-                _ if instruction.uniform => output.fill(None),
-                _ => {}
-            }
+            output.advance(&code[at]);
             for next in successors[at].into_iter().flatten() {
                 let changed = if let Some(input) = &mut inputs[next] {
-                    let mut changed = false;
-                    for (old, new) in input.iter_mut().zip(output) {
-                        if old.is_some() && *old != new {
-                            *old = None;
-                            changed = true;
-                        }
-                    }
-                    changed
+                    input.intersect(output)
                 } else {
                     inputs[next] = Some(output);
                     true
@@ -1333,11 +1544,17 @@ impl UniformWriteRanges {
             if address.wide && dynamic {
                 return None;
             }
-            let source = state[usize::from(pointer.0)]?;
+            let word = usize::from(pointer.0);
+            let (source, low_unknown) = match state.pointers[word] {
+                Some(source) => (source, false),
+                None => (state.high_words.get(word + 1).copied().flatten()?, true),
+            };
             let first = i64::from(address.offset);
-            let last = first + if dynamic { i64::from(u32::MAX) } else { 0 };
+            let last = first
+                .checked_add(source.max_offset)?
+                .checked_add(i64::from(u32::MAX) * (i64::from(dynamic) + i64::from(low_unknown)))?;
             ranges
-                .entry(source)
+                .entry((source.constant, low_unknown))
                 .and_modify(|(lo, hi): &mut (i64, i64)| {
                     *lo = (*lo).min(first);
                     *hi = (*hi).max(last);
@@ -1348,9 +1565,10 @@ impl UniformWriteRanges {
             Self(
                 ranges
                     .into_iter()
-                    .map(|(source, (lo, hi))| UniformPointer {
+                    .map(|((source, low_unknown), (lo, hi))| UniformPointer {
                         offsets: lo..=hi,
                         constant: source,
+                        low_unknown,
                     })
                     .collect(),
             )
@@ -1368,7 +1586,13 @@ impl UniformWriteRanges {
                 | u64::from(constant(bank, offset.wrapping_add(4))?) << 32;
             // Subword stores can update a whole aligned word. One translated
             // instruction writes at most sixteen bytes.
-            let first = base.checked_add_signed(*pointer.offsets.start())? & !3;
+            // With only the high word known, any low word can appear.
+            let first_base = if pointer.low_unknown {
+                base & !u64::from(u32::MAX)
+            } else {
+                base
+            };
+            let first = first_base.checked_add_signed(*pointer.offsets.start())? & !3;
             let end = base
                 .checked_add_signed(*pointer.offsets.end())?
                 .checked_add(16)?;
@@ -1438,6 +1662,127 @@ mod uniform_range_tests {
             0x8_0000_0100..0x9_0000_010f
         );
         assert!(UniformWriteRanges::compile_reaching(&[pair, partial, write]).is_none());
+    }
+
+    #[test]
+    fn uniform_pointer_additions_follow_their_carry_through_control_flow() {
+        let reg = |n| Operand {
+            src: Src::Reg(Reg(n)),
+            abs: false,
+            neg: false,
+        };
+        let uniform = |op| Instruction {
+            uniform: true,
+            ..ins(op)
+        };
+        let never = Pred {
+            index: 7,
+            negated: true,
+        };
+        let carry = Pred {
+            index: 2,
+            negated: false,
+        };
+        let call = |offset| Instruction {
+            guard: carry,
+            ..ins(Op::Call { offset })
+        };
+        let exit = ins(Op::Exit {
+            condition: Pred::TRUE,
+        });
+        let write = store(Reg(2), false, 0);
+        for base_register in [4, 8] {
+            let mut base = load(base_register, 32, 5);
+            base.guard = Pred::TRUE;
+            let low = uniform(Op::Iadd3 {
+                d: Reg(4),
+                a: reg(7),
+                b: reg(base_register),
+                c: reg(63),
+                carry_out: [carry, Pred::TRUE],
+                carry_in: [never; 2],
+                extended: false,
+            });
+            let shifted_low = uniform(Op::Lea {
+                d: Reg(4),
+                a: Reg(7),
+                b: reg(base_register),
+                c: reg(63),
+                shift: 1,
+                high: false,
+                negate_shifted: false,
+                extended: false,
+                overflow: 2,
+                carry_in: never,
+            });
+            let high = uniform(Op::Iadd3 {
+                d: Reg(5),
+                a: reg(63),
+                b: reg(base_register + 1),
+                c: reg(63),
+                carry_out: [Pred::TRUE; 2],
+                carry_in: [carry, never],
+                extended: true,
+            });
+            for low in [low, shifted_low] {
+                // The call goes straight to the exit on lanes that take it.
+                let plan =
+                    UniformWriteRanges::compile_reaching(&[base, low, call(32), high, write, exit])
+                        .unwrap();
+                let ranges = plan
+                    .intervals(|_, word| match word {
+                        32 => Some(0x100),
+                        36 => Some(8),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(ranges[0], 0x8_0000_0100..0xa_0000_010e);
+                // A path entering the store without its high word has no bound.
+                assert!(
+                    UniformWriteRanges::compile_reaching(&[base, low, call(16), high, write, exit])
+                        .is_none()
+                );
+                // Even a conditional overwrite of the base invalidates the carry.
+                assert!(
+                    UniformWriteRanges::compile_reaching(&[
+                        base,
+                        low,
+                        load(base_register + 1, 64, 4),
+                        high,
+                        write
+                    ])
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forwarded_high_word_bounds_unknown_low_words() {
+        let mut base = load(8, 32, 5);
+        base.guard = Pred::TRUE;
+        let copy_high = Instruction {
+            uniform: true,
+            ..ins(Op::Mov {
+                d: Reg(5),
+                src: Src::Uniform(UniformReg(9)),
+                lanes: 15,
+            })
+        };
+        let write = store(Reg::ZERO, false, -4);
+        let plan = UniformWriteRanges::compile_reaching(&[base, copy_high, write]).unwrap();
+        let ranges = plan
+            .intervals(|_, word| match word {
+                32 => Some(0x100),
+                36 => Some(8),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ranges[0], 0x7_ffff_fffc..0x9_0000_010b);
+        assert!(
+            UniformWriteRanges::compile_reaching(&[base, load(9, 64, 4), copy_high, write])
+                .is_none()
+        );
     }
 
     fn branch(offset: i64, unconditional: bool) -> Instruction {
@@ -1526,7 +1871,7 @@ mod uniform_range_tests {
     }
 
     #[test]
-    fn uniform_add_only_invalidates_the_pair_it_overwrites() {
+    fn uniform_add_only_invalidates_the_word_it_overwrites() {
         let mut pair = load(4, 32, 5);
         pair.guard = Pred::TRUE;
         let value = Operand {
@@ -1549,11 +1894,12 @@ mod uniform_range_tests {
         };
         let write = store(Reg(2), false, 0);
         for d in [0, 3, 6, 62, 63] {
-            assert!(UniformWriteRanges::compile_reaching(&[pair, add(d), write]).is_some());
+            let plan = UniformWriteRanges::compile_reaching(&[pair, add(d), write]).unwrap();
+            assert!(!plan.0[0].low_unknown);
         }
-        for d in [4, 5] {
-            assert!(UniformWriteRanges::compile_reaching(&[pair, add(d), write]).is_none());
-        }
+        let plan = UniformWriteRanges::compile_reaching(&[pair, add(4), write]).unwrap();
+        assert!(plan.0[0].low_unknown);
+        assert!(UniformWriteRanges::compile_reaching(&[pair, add(5), write]).is_none());
     }
 
     #[test]

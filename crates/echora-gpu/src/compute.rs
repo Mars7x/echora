@@ -443,7 +443,7 @@ mod tests {
         let output = 1;
         let (buffer, _) = renderer.resident_buffer(output, PAGE_SIZE).unwrap();
         let address = renderer.buffer_address(buffer).unwrap();
-        let table = renderer
+        let (table, _) = renderer
             .set_page_table(guest_address >> PAGE_SHIFT, &[address])
             .unwrap();
         for (index, (view, texel, expected)) in [
