@@ -1484,7 +1484,51 @@ impl Nvn {
         backend.shadows.remove(&texture);
         backend.storage_hashes.remove(&texture);
         backend.dirty.remove(&texture);
+        backend.copied_levels.remove(&texture);
         backend.renderer.forget_upload(texture);
+    }
+
+    /// Discard guest texture uploads whose virtual storage may change.
+    pub(super) fn invalidate_virtual_texture_uploads(&mut self, pool: u64, mappings: &[[u64; 4]]) {
+        let Some(backend) = self.gpu.as_ref() else {
+            return;
+        };
+        if mappings.is_empty() {
+            return;
+        }
+        let mut affected: Vec<_> = backend
+            .textures
+            .keys()
+            .chain(backend.copied_levels.keys())
+            .copied()
+            .filter(|&texture| {
+                let Some(storage) = self
+                    .objects
+                    .get(&texture)
+                    .and_then(|o| o.builder.get("Storage"))
+                else {
+                    return false;
+                };
+                if storage.x[0] != pool {
+                    return false;
+                }
+                let start = storage.x[1];
+                let end = self
+                    .texture_storage_size(texture)
+                    .map_or(u64::MAX, |length| start.saturating_add(length));
+                mappings.iter().any(|&[_, _, offset, length]| {
+                    length != 0 && start < offset.saturating_add(length) && offset < end
+                })
+            })
+            .collect();
+        if !affected.is_empty() {
+            affected.sort_unstable();
+            affected.dedup();
+            self.bump_binding_serial("stat: binding serial by virtual texture remapping");
+            for texture in affected {
+                self.gpu_forget_texture(texture);
+            }
+        }
     }
 
     /// Forget the host target and cached upload kept for texture object
@@ -12289,6 +12333,35 @@ mod pool_tests {
                 .unwrap_or(0)
         };
         let address = gpu + 3 * PAGE_SIZE;
+        let texture = builder + 0x800;
+        let scalar = |value| Args {
+            x: [value, 0, 0, 0],
+            ..Default::default()
+        };
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                (
+                    "Storage".into(),
+                    Args {
+                        x: [virtual_pool, 3 * PAGE_SIZE, 0, 0],
+                        ..Default::default()
+                    },
+                ),
+                ("Width".into(), scalar(1)),
+                ("Height".into(), scalar(1)),
+                ("Stride".into(), scalar(4)),
+                ("Format".into(), scalar(37)),
+            ]),
+        )
+        .unwrap();
+        for offset in [PAGE_SIZE, 2 * PAGE_SIZE] {
+            guest
+                .memory
+                .write(storage + offset, &[(offset / PAGE_SIZE) as u8, 0, 0, 255])
+                .unwrap();
+        }
         for (backing, offset) in [(physical, 2 * PAGE_SIZE), (physical, PAGE_SIZE), (0, 0)] {
             for (index, word) in [backing, offset, 3 * PAGE_SIZE, PAGE_SIZE]
                 .into_iter()
@@ -12322,6 +12395,16 @@ mod pool_tests {
             };
             assert_eq!(actual, expected);
             assert_eq!(page(&mut nvn, &mut guest, address - PAGE_SIZE), 0);
+            if backing == 0 {
+                assert!(nvn.guest_texture(&guest, texture).is_err());
+            } else {
+                let TextureSource::Upload { texels, .. } =
+                    nvn.guest_texture(&guest, texture).unwrap()
+                else {
+                    panic!("expected a texture uploaded from the mapped backing");
+                };
+                assert_eq!(texels.as_slice(), &[(offset / PAGE_SIZE) as u8, 0, 0, 255]);
+            }
         }
     }
 
