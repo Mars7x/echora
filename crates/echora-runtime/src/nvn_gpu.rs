@@ -427,6 +427,10 @@ impl From<Vec<SharedRange>> for BoundedWrites {
 
 fn merge_shared_writes(ranges: &mut Vec<SharedRange>) {
     ranges.sort_unstable_by_key(|range| (range.file, range.start));
+    coalesce_shared_writes(ranges);
+}
+
+fn coalesce_shared_writes(ranges: &mut Vec<SharedRange>) {
     ranges.dedup_by(|next, previous| {
         if next.file == previous.file && next.start <= previous.end {
             previous.end = previous.end.max(next.end);
@@ -435,6 +439,43 @@ fn merge_shared_writes(ranges: &mut Vec<SharedRange>) {
             false
         }
     });
+}
+
+/// Extend a submission's sorted, coalesced ranges with another set of writes.
+fn extend_shared_writes(ranges: &mut Vec<SharedRange>, mut added: Vec<SharedRange>) {
+    merge_shared_writes(&mut added);
+    // Both lists are sorted and disjoint within each file. Walk the
+    // existing ranges once to discard writes they already cover.
+    let mut remaining = ranges.iter();
+    let mut known = remaining.next();
+    added.retain(|range| {
+        while known.is_some_and(|known| (known.file, known.end) < (range.file, range.start)) {
+            known = remaining.next();
+        }
+        !known.is_some_and(|known| {
+            known.file == range.file && known.start <= range.start && known.end >= range.end
+        })
+    });
+    let Some(&first) = added.first() else {
+        return;
+    };
+
+    // Merge backwards so unread entries in `ranges` stay in place.
+    let mut left = ranges.len();
+    let mut destination = left + added.len();
+    ranges.resize(destination, first);
+    for right in added.into_iter().rev() {
+        while left > 0
+            && (ranges[left - 1].file, ranges[left - 1].start) > (right.file, right.start)
+        {
+            left -= 1;
+            destination -= 1;
+            ranges[destination] = ranges[left];
+        }
+        destination -= 1;
+        ranges[destination] = right;
+    }
+    coalesce_shared_writes(ranges);
 }
 
 impl SharedRange {
@@ -644,8 +685,7 @@ impl Backend {
                     && *previous_serial == serial
                 {
                     if !writes.shared.is_empty() && previous.shared != writes.shared {
-                        previous.shared.append(&mut writes.shared);
-                        merge_shared_writes(&mut previous.shared);
+                        extend_shared_writes(&mut previous.shared, writes.shared);
                     }
                     for range in writes.virtual_ranges {
                         add_range(&mut previous.virtual_ranges, range);
@@ -13775,7 +13815,8 @@ mod target_tests {
 #[cfg(test)]
 mod pool_tests {
     use super::{
-        Backend, GuestFileIndex, Nvn, Sampler, SharedRange, TextureBacking, TextureSource, vk,
+        Backend, GuestFileIndex, Nvn, Sampler, SharedRange, TextureBacking, TextureSource,
+        extend_shared_writes, vk,
     };
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
@@ -14433,6 +14474,34 @@ mod pool_tests {
         backend.wait_for_table_writes(None).unwrap();
         assert!(backend.renderer.completed_serial() >= serial);
         assert!(!backend.page_table_writes);
+    }
+
+    #[test]
+    fn shared_write_extension_keeps_ranges_sorted_and_coalesced() {
+        let range = |file, start, end| SharedRange { file, start, end };
+        let mut ranges = vec![range(1, 1, 8), range(1, 12, 20), range(3, 3, 7)];
+        extend_shared_writes(&mut ranges, vec![range(3, 4, 6), range(1, 2, 8)]);
+        assert_eq!(ranges, [range(1, 1, 8), range(1, 12, 20), range(3, 3, 7)]);
+
+        extend_shared_writes(
+            &mut ranges,
+            vec![
+                range(3, 7, 8),
+                range(1, 9, 12),
+                range(2, 2, 10),
+                range(1, 8, 9),
+                range(0, 0, 1),
+            ],
+        );
+        assert_eq!(
+            ranges,
+            [
+                range(0, 0, 1),
+                range(1, 1, 20),
+                range(2, 2, 10),
+                range(3, 3, 8)
+            ]
+        );
     }
 
     #[test]
