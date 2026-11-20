@@ -6740,9 +6740,9 @@ impl Nvn {
             && *cached_guest == guest
             && code.len() as u64 == length
         {
-            let mut prefix = [0; 512];
-            let readable = read_prefix_into(core, guest, &mut prefix[..length.min(512) as usize]);
-            if code.starts_with(&prefix[..readable]) {
+            let mut buffer = [0; 512];
+            let prefix = &mut buffer[..length.min(512) as usize];
+            if core.memory.read(guest, prefix).is_ok() && code.starts_with(prefix) {
                 return Some((code.clone(), *key));
             }
         }
@@ -7549,9 +7549,22 @@ fn read_prefix(core: &Guest, address: u64, length: u64) -> Vec<u8> {
 }
 
 fn read_prefix_into(core: &Guest, address: u64, bytes: &mut [u8]) -> usize {
-    let mut readable = bytes.len();
-    while readable > 0 && core.memory.read(address, &mut bytes[..readable]).is_err() {
-        readable /= 2;
+    let mut readable = 0;
+    let mut chunk = bytes.len();
+    while chunk != 0 {
+        let end = readable + chunk;
+        if core
+            .memory
+            .read(address + readable as u64, &mut bytes[readable..end])
+            .is_ok()
+        {
+            readable = end;
+            chunk = chunk.min(bytes.len() - readable);
+        } else {
+            // Keep bytes already read while locating the boundary of the
+            // readable range with progressively smaller requests.
+            chunk /= 2;
+        }
     }
     readable
 }
@@ -10006,6 +10019,33 @@ mod tests {
         let (registered, registered_key) = nvn.stage_code(&guest, gpu).unwrap();
         assert_eq!(registered[0x214], 12);
         assert_ne!(flushed_key, registered_key);
+
+        let GuestMemory::Checked(memory) = &mut guest.memory else {
+            unreachable!("the fixture uses checked guest memory");
+        };
+        memory.set_permissions(base, 0x1000, 0).unwrap();
+        let (unreadable, unreadable_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(unreadable.is_empty());
+        assert_ne!(unreadable_key, registered_key);
+    }
+
+    #[test]
+    fn shader_prefix_keeps_every_readable_byte_before_a_gap() {
+        let base = 0x10_000;
+        let offset = 0x0e88;
+        let expected = [0x71; 0x178];
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x1000, READ | WRITE, STATE_NORMAL, "shader prefix")
+            .unwrap();
+        memory.write(base + offset, &expected).unwrap();
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert_eq!(read_prefix(&guest, base + offset, 0x400), expected);
     }
 
     #[test]
