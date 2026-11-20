@@ -32,6 +32,7 @@ use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, StateSnapsh
 #[derive(Debug, Default)]
 pub(super) struct DrawBindings {
     uniforms: echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    spare_uniforms: Vec<Vec<u8>>,
     guest_uniforms: echora_gpu::FastMap<(usize, u32), (u64, usize)>,
     textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
 }
@@ -2649,6 +2650,17 @@ impl Nvn {
 
     /// The constants a stage's control section places beside its code.
     fn stage_constants_of(&self, core: &Guest, stage: super::Args) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_stage_constants(core, stage, &mut bytes)?;
+        Some(bytes)
+    }
+
+    fn read_stage_constants(
+        &self,
+        core: &Guest,
+        stage: super::Args,
+        bytes: &mut Vec<u8>,
+    ) -> Option<()> {
         let (code, control) = (stage.x[0], stage.x[1]);
         let size = core.memory.read_u32(control + 0x3c).ok()?;
         let offset = core.memory.read_u32(control + 0x40).ok()?;
@@ -2658,9 +2670,8 @@ impl Nvn {
         let guest = self
             .gpu_to_guest(code + u64::from(offset), u64::from(size))
             .ok()?;
-        let mut bytes = vec![0u8; size as usize];
-        core.memory.read(guest, &mut bytes).ok()?;
-        Some(bytes)
+        bytes.resize(size as usize, 0);
+        core.memory.read(guest, bytes).ok()
     }
 
     /// The stage of `program` bound for stage bit `bit` (0 vertex, 1
@@ -9516,7 +9527,12 @@ impl Nvn {
         }
         let mut bindings = std::mem::take(&mut self.draw_bindings);
         let result = self.gpu_draw_with_bindings(core, command, &mut bindings);
-        bindings.uniforms.clear();
+        bindings
+            .spare_uniforms
+            .extend(bindings.uniforms.drain().map(|(_, mut bytes)| {
+                bytes.clear();
+                bytes
+            }));
         bindings.guest_uniforms.clear();
         bindings.textures.clear();
         self.draw_bindings = bindings;
@@ -9895,6 +9911,7 @@ impl Nvn {
         }
         let DrawBindings {
             uniforms,
+            spare_uniforms,
             guest_uniforms,
             textures,
         } = bindings;
@@ -9939,8 +9956,8 @@ impl Nvn {
                     // pipeline (PushGraphicsConstants).
                     DescriptorKind::UniformBuffer if descriptor.index == 24 => {
                         let words = self.render.roots[0].first().copied().unwrap_or([0; 64]);
-                        let bytes: Vec<u8> =
-                            words.iter().flat_map(|word| word.to_le_bytes()).collect();
+                        let mut bytes = spare_uniforms.pop().unwrap_or_default();
+                        bytes.extend(words.iter().flat_map(|word| word.to_le_bytes()));
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
                     DescriptorKind::UniformBuffer if descriptor.index >= 3 => {
@@ -9981,9 +9998,13 @@ impl Nvn {
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
-                        let mut bytes = self
-                            .stage_constants_of(core, program.entries[index])
-                            .unwrap_or_default();
+                        let mut bytes = spare_uniforms.pop().unwrap_or_default();
+                        if self
+                            .read_stage_constants(core, program.entries[index], &mut bytes)
+                            .is_none()
+                        {
+                            bytes.clear();
+                        }
                         bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
@@ -9997,7 +10018,9 @@ impl Nvn {
                                 descriptor.index, stage.stage, keys_for_note.get(index).copied().unwrap_or(0)
                             ));
                         }
-                        uniforms.insert((index, descriptor.binding), vec![0; used as usize]);
+                        let mut bytes = spare_uniforms.pop().unwrap_or_default();
+                        bytes.resize(used as usize, 0);
+                        uniforms.insert((index, descriptor.binding), bytes);
                     }
                     // Storage buffer i of graphics stage s (NVN numbering):
                     // its address and size at c0+0x110+0x100*s+16*i, 16 per
