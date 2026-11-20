@@ -803,40 +803,38 @@ mod tests {
             return;
         }
         let mut renderer = Renderer::new(gpu).unwrap();
-        let target = 1;
-        renderer
-            .shaped_target(
-                target,
-                2,
-                2,
-                ImageShape::D2 { layers: 3 },
-                vk::Format::R32_UINT,
-                2,
-            )
-            .unwrap();
-        for layer in 0..3 {
+        for (target, height, shape) in [
+            (1, 2, ImageShape::D2 { layers: 3 }),
+            (2, 1, ImageShape::D1 { layers: 3 }),
+        ] {
             renderer
-                .clear_color_level(
-                    target,
-                    1,
-                    layer,
-                    None,
-                    vk::ClearColorValue {
-                        uint32: [10 + layer; 4],
-                    },
-                )
+                .shaped_target(target, 2, height, shape, vk::Format::R32_UINT, 2)
                 .unwrap();
+            for layer in 0..3 {
+                renderer
+                    .clear_color_level(
+                        target,
+                        1,
+                        layer,
+                        None,
+                        vk::ClearColorValue {
+                            uint32: [10 + layer; 4],
+                        },
+                    )
+                    .unwrap();
+            }
         }
         let cases = [
-            ("2d_array", "0, ", 3, 1, 2, [10_u32, 77, 12]),
-            ("2d", "", 2, 2, 1, [10, 77, 77]),
+            (1, "2d_array", "vec2<i32>(0), 0", 3, 1, 2, [10_u32, 77, 12]),
+            (1, "2d", "vec2<i32>(0)", 2, 2, 1, [10, 77, 77]),
+            (2, "1d", "0", 0, 1, 1, [10, 77, 12]),
         ];
-        for (shape, relative_layer, texture_type, base_layer, layer_count, expected) in cases {
+        for (target, shape, coords, texture_type, base_layer, layer_count, expected) in cases {
             let code = spirv(
                 &format!(
                     "@group(0) @binding(0) var image: texture_storage_{shape}<r32uint, write>;
                     @compute @workgroup_size(1) fn main() {{
-                        textureStore(image, vec2<i32>(0), {relative_layer}vec4<u32>(77u));
+                        textureStore(image, {coords}, vec4<u32>(77u));
                     }}"
                 ),
                 naga::ShaderStage::Compute,

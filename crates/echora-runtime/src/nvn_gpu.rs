@@ -188,10 +188,10 @@ fn texture_row_pitch(
 
 fn texture_height_and_depth(target: u32, height: u32, depth: u32) -> (u32, u32) {
     // For a 1D array, SetSize2D supplies the number of layers in Height.
-    if target == 3 {
-        (1, height.max(1))
-    } else {
-        (height, depth.max(1))
+    match target {
+        0 => (1, 1),
+        3 => (1, height.max(1)),
+        _ => (height, depth.max(1)),
     }
 }
 
@@ -1471,6 +1471,11 @@ impl Nvn {
         }
         let (width, height) = self.texture_extent(texture)?;
         let object = self.object(texture, "Texture")?;
+        let target = object
+            .builder
+            .get("Target")
+            .map_or(1, |value| value.x[0] as u32);
+        let (height, _) = texture_height_and_depth(target, height, 1);
         let format = object
             .builder
             .get("Format")
@@ -3842,7 +3847,11 @@ impl Nvn {
     /// size, if any.
     fn target_sharing_storage(&self, texture: u64, initialized_only: bool) -> Option<u64> {
         let base = self.texture_storage(texture)?;
-        let extent = self.texture_extent(texture).ok()?;
+        let extent = self
+            .target_shape(texture)
+            .map(|(width, height, _)| (width, height))
+            .or_else(|_| self.texture_extent(texture))
+            .ok()?;
         let backend = self.gpu.as_ref()?;
         let renderer = &backend.renderer;
         let matches = |key: &u64| {
@@ -5504,16 +5513,21 @@ impl Nvn {
     /// source region into the destination region. Copies from textures
     /// that were never rendered to, and views of other levels or layers,
     /// are not modeled.
-    /// The image a texture renders into: 2D arrays keep their layers and
-    /// cubes their faces (in Depth, as for sampling), so a view's layer
-    /// selects the same subresource when rendering and sampling.
+    /// The image a texture renders into, with the array layers used by
+    /// uploads and sampling.
     fn render_shape(&self, texture: u64) -> ImageShape {
         let Ok(object) = self.object(texture, "Texture") else {
             return ImageShape::D2 { layers: 1 };
         };
         let get = |name: &str| object.builder.get(name).map(|value| value.x[0] as u32);
-        let depth = get("Depth").unwrap_or(1).max(1);
-        match get("Target").unwrap_or(1) {
+        let target = get("Target").unwrap_or(1);
+        let (_, depth) = texture_height_and_depth(
+            target,
+            get("Height").unwrap_or(1),
+            get("Depth").unwrap_or(1),
+        );
+        match target {
+            0 | 3 => ImageShape::D1 { layers: depth },
             // TARGET_3D: a volume of all its slices (the fog's froxel
             // volumes are 96 deep), as the dispatch image binding makes it;
             // one 2D layer would drop every store past slice 0.
@@ -12535,7 +12549,7 @@ mod target_tests {
     }
 
     #[test]
-    fn one_dimensional_array_upload_uses_height_for_layers() {
+    fn one_dimensional_storage_image_keeps_array_layers() {
         use echora_gpu::draw::ImageShape;
         let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
             return;
@@ -12626,6 +12640,24 @@ mod target_tests {
                 for channel in pixels.iter().flatten() {
                     assert!((channel - expected).abs() < 1e-6);
                 }
+            }
+        }
+        let (target, _) = nvn.prepare_compute_image(texture).unwrap();
+        nvn.initialize_new_targets(&guest);
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let info = renderer.target_info(target).unwrap();
+        assert_eq!((info.width, info.height), (8, 1));
+        assert_eq!(info.shape, ImageShape::D1 { layers: 3 });
+        for level in 0..2 {
+            for layer in 0..3 {
+                let width = 8 >> level;
+                let expected = ((level + 1) * 0x40 + layer) as u8;
+                assert_eq!(
+                    renderer
+                        .read_target_plane_bytes(target, level, layer, 4, [0, 0, width, 1])
+                        .unwrap(),
+                    vec![expected; width as usize * 4]
+                );
             }
         }
     }

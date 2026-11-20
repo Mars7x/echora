@@ -2418,9 +2418,12 @@ impl Renderer {
                 ImageShape::D2 { .. } | ImageShape::Cube { .. }
             );
             let cube = matches!(target.shape, ImageShape::Cube { .. });
+            let one_dimensional = matches!(target.shape, ImageShape::D1 { .. });
             // The binding's view type over the selected range, when the
             // range can hold it.
             let view = match texture_type {
+                0 if one_dimensional => Some((vk::ImageViewType::TYPE_1D, 1)),
+                1 if one_dimensional => Some((vk::ImageViewType::TYPE_1D_ARRAY, layer_count)),
                 2 | 8 if layered => Some((vk::ImageViewType::TYPE_2D, 1)),
                 3 if layered => Some((vk::ImageViewType::TYPE_2D_ARRAY, layer_count)),
                 4 if matches!(target.shape, ImageShape::D3 { .. }) => {
@@ -5849,6 +5852,7 @@ impl Renderer {
         let total = target.shape.layers();
         let own_type = own_view_type(target.shape);
         let view_type = match (texture_type, target.shape) {
+            (0, ImageShape::D1 { .. }) => vk::ImageViewType::TYPE_1D,
             (2, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => vk::ImageViewType::TYPE_2D,
             (3, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => {
                 vk::ImageViewType::TYPE_2D_ARRAY
@@ -8873,6 +8877,40 @@ mod tests {
             assert_eq!(
                 (range.base_mip_level, range.level_count),
                 (relative_base, 4 - relative_base)
+            );
+        }
+        renderer
+            .shaped_target(
+                9,
+                8,
+                1,
+                ImageShape::D1 { layers: 3 },
+                vk::Format::R8G8B8A8_UNORM,
+                4,
+            )
+            .unwrap();
+        let source = TextureSource::TargetView {
+            key: 9,
+            base_level: 1,
+            level_count: 2,
+            base_layer: 1,
+            layer_count: 2,
+        };
+        for (texture_type, view_type, layer_count) in [
+            (0, vk::ImageViewType::TYPE_1D, 1),
+            (1, vk::ImageViewType::TYPE_1D_ARRAY, 2),
+        ] {
+            let view = renderer.texture_view(&source, texture_type).unwrap();
+            let info = &renderer.view_infos[&view];
+            assert_eq!(info.view_type, view_type);
+            assert_eq!(
+                (
+                    info.range.base_mip_level,
+                    info.range.level_count,
+                    info.range.base_array_layer,
+                    info.range.layer_count,
+                ),
+                (1, 2, 1, layer_count),
             );
         }
         renderer
