@@ -449,14 +449,12 @@ impl FastHasher {
 pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
 pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FastHasher>>;
 
-/// A texture handle resolved for a draw: what it samples and how.
-/// A texture handle's resolved binding: its source, its sampler and the
-/// guest range of the texture's storage (checked for GPU writes on reuse)
-/// and the GPU write generation it was last checked at.
-pub(crate) type ResolvedBinding = (
+/// A texture handle's resolved binding: its source, sampler, physical
+/// backing (checked for GPU writes on reuse) and last checked generation.
+type ResolvedBinding = (
     echora_gpu::draw::TextureSource,
     echora_gpu::draw::Sampler,
-    Option<std::ops::Range<u64>>,
+    Option<gpu::TextureBacking>,
     u64,
     // The present it was resolved or last revalidated in.
     u64,

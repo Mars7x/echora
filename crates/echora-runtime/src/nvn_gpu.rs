@@ -53,8 +53,8 @@ struct TargetIndex {
 }
 
 /// Guest storage as seen at successive byte offsets in a texture.
-#[derive(PartialEq, Eq)]
-enum TextureBacking {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TextureBacking {
     Linear((u64, std::ops::Range<u64>)),
     Virtual {
         size: u64,
@@ -143,6 +143,19 @@ impl TextureBacking {
             self.read_into(core, offset, &mut bytes[..length]);
             true
         })
+    }
+}
+
+fn texture_row_pitch(
+    props: &BTreeMap<String, super::Args>,
+    info: crate::nvn_format::FormatInfo,
+    width: u32,
+) -> u64 {
+    // Buffer textures are linear arrays of texels.
+    if props.get("Target").is_some_and(|target| target.x[0] == 10) {
+        u64::from(width.div_ceil(info.block_width)) * u64::from(info.bytes_per_block)
+    } else {
+        props.get("Stride").map_or(0, |value| value.x[0])
     }
 }
 
@@ -827,6 +840,29 @@ impl Backend {
         ranges_overlap(ranges, range)
     }
 
+    /// A physical write can cover parts of several textures, including
+    /// more than one virtual offset in the same texture.
+    fn mark_texture_bytes_changed(&mut self, range: &std::ops::Range<u64>) -> bool {
+        let mut count = 0;
+        if self.cached_textures_overlap(range) {
+            for (&key, (_, _, backing)) in &self.textures {
+                for (offset, storage) in backing.pieces() {
+                    let start = range.start.max(storage.start);
+                    let end = range.end.min(storage.end);
+                    if start < end {
+                        let start = offset + (start - storage.start);
+                        let end = offset + (end - storage.start);
+                        self.texture_checked.remove(&key);
+                        self.dirty.entry(key).or_default().push(start..end);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        self.stat("stat: textures invalidated", count);
+        count != 0
+    }
+
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
     /// the run report; nothing is logged.
     pub(super) fn stat(&mut self, name: &'static str, amount: u64) {
@@ -1453,34 +1489,8 @@ impl Nvn {
             if let Some(texture) = texture {
                 backend.remove_texture_upload(texture);
             }
-            let mut touched = Vec::new();
-            if backend.cached_textures_overlap(&range) {
-                touched.extend(backend.textures.iter().flat_map(|(&key, (_, _, backing))| {
-                    let range = &range;
-                    backing
-                        .pieces()
-                        .iter()
-                        .filter_map(move |(offset, storage)| {
-                            let start = range.start.max(storage.start);
-                            let end = range.end.min(storage.end);
-                            (start < end).then(|| {
-                                (
-                                    key,
-                                    offset + (start - storage.start)
-                                        ..offset + (end - storage.start),
-                                )
-                            })
-                        })
-                }));
-            }
-            backend.stat("stat: textures invalidated", touched.len() as u64);
-            if !touched.is_empty() {
+            if backend.mark_texture_bytes_changed(&range) {
                 self.bump_binding_serial("stat: binding serial by touched textures");
-            }
-            let backend = self.gpu.as_mut().unwrap();
-            for (key, overlap) in touched {
-                backend.texture_checked.remove(&key);
-                backend.dirty.entry(key).or_default().push(overlap);
             }
         }
     }
@@ -2980,6 +2990,12 @@ impl Nvn {
         let object = self.objects.get(&texture).filter(|o| o.kind == "Texture")?;
         let get = |key: &str| object.builder.get(key).map(|value| value.x[0] as u32);
         let info = crate::nvn_format::info(get("Format")?)?;
+        let width = get("Width").unwrap_or(1);
+        let height = get("Height").unwrap_or(1);
+        let stride = texture_row_pitch(&object.builder, info, width);
+        if stride != 0 {
+            return stride.checked_mul(u64::from(height.div_ceil(info.block_height)));
+        }
         let depth = get("Depth").unwrap_or(1).max(1);
         let (depth, layers) = if get("Target") == Some(2) {
             (depth, 1)
@@ -2989,13 +3005,13 @@ impl Nvn {
         Some(
             crate::nvn_format::block_linear_size(
                 info,
-                get("Width").unwrap_or(1),
-                get("Height").unwrap_or(1),
+                width,
+                height,
                 depth,
                 super::texture_layout_layers(
                     &object.builder,
                     info,
-                    [get("Width").unwrap_or(1), get("Height").unwrap_or(1), depth],
+                    [width, height, depth],
                     layers,
                     get("Levels").unwrap_or(1),
                 ),
@@ -3209,19 +3225,7 @@ impl Nvn {
                     .stat("stat: texture pool handles unresolved", 1);
                 continue;
             };
-            // As the draw path does before it memoizes: GPU-written
-            // bytes under the texture come back first.
-            let storage = match (
-                self.texture_storage(texture),
-                self.texture_storage_size(texture),
-            ) {
-                (Some(base), Some(size)) => Some(base..base + size),
-                _ => None,
-            };
-            if let Some(storage) = &storage {
-                self.resolve_storage(core, Some(storage.clone()))?;
-            }
-            let source = self.texture_source(core, texture)?;
+            let (source, storage) = self.resolve_sampled_texture(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, &source);
             self.binding_memo.1.insert(
@@ -3446,7 +3450,11 @@ impl Nvn {
 
     fn texture_backing(&self, storage: &super::Args, size: u64) -> Result<TextureBacking, String> {
         let pool = self.object(storage.x[0], "MemoryPool")?;
-        let [base, pool_size, ..] = pool.builder["Storage"].x;
+        let [base, pool_size, ..] = pool
+            .builder
+            .get("Storage")
+            .ok_or("texture pool has no storage")?
+            .x;
         let start = storage.x[1];
         let end = start
             .checked_add(size)
@@ -3874,6 +3882,24 @@ impl Nvn {
         Ok(Some((alias, size)))
     }
 
+    fn resolve_sampled_texture(
+        &mut self,
+        core: &mut Guest,
+        texture: u64,
+    ) -> Result<(TextureSource, Option<TextureBacking>), String> {
+        let storage = self.objects.get(&texture).and_then(|object| {
+            let size = self.texture_storage_size(texture)?;
+            self.texture_backing(object.builder.get("Storage")?, size)
+                .ok()
+        });
+        if let Some(backing) = &storage {
+            for (_, range) in backing.pieces() {
+                self.resolve_storage(core, Some(range.clone()))?;
+            }
+        }
+        Ok((self.texture_source(core, texture)?, storage))
+    }
+
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         let source = self.texture_source_resolved(core, texture)?;
         // Blocks drawn since it was last sampled come in first.
@@ -4070,13 +4096,7 @@ impl Nvn {
         // CPU_CACHED 4; the builder default 0x21 gives the CPU no access.
         let pool_flags = pool.builder.get("Flags").map_or(0x21, |value| value.x[0]);
         let uncached = pool_flags & 2 != 0 && pool_flags & 4 == 0;
-        // Buffer textures (target 10) are linear arrays of texels.
-        let buffer_texture = get("Target") == Some(10);
-        let stride = if buffer_texture {
-            u64::from(width.div_ceil(info.block_width)) * u64::from(info.bytes_per_block)
-        } else {
-            object.builder.get("Stride").map_or(0, |value| value.x[0])
-        };
+        let stride = texture_row_pitch(&object.builder, info, width);
         let block = info.bytes_per_block as usize;
         // Untiling and hashing whole textures on every draw costs more than
         // the draw: a sample of 256 evenly spaced 64-byte chunks of the raw
@@ -5647,13 +5667,7 @@ impl Nvn {
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
                     let texture = self.handle_texture(handle)?;
                     let started = std::time::Instant::now();
-                    if let (Some(base), Some(size)) = (
-                        self.texture_storage(texture),
-                        self.texture_storage_size(texture),
-                    ) {
-                        self.resolve_storage(core, Some(base..base + size))?;
-                    }
-                    let source = self.texture_source(core, texture)?;
+                    let (source, _) = self.resolve_sampled_texture(core, texture)?;
                     let source = self.through_view(source, handle);
                     if let Some(swizzle) = self.handle_swizzle(handle) {
                         if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -6334,10 +6348,12 @@ impl Nvn {
             }
         }
         if entry.3 != now
-            && entry
-                .2
-                .as_ref()
-                .is_some_and(|storage| self.gpu_writes_pending(storage))
+            && entry.2.as_ref().is_some_and(|backing| {
+                backing
+                    .pieces()
+                    .iter()
+                    .any(|(_, range)| self.gpu_writes_pending(range))
+            })
         {
             return None;
         }
@@ -6390,10 +6406,12 @@ impl Nvn {
             };
             source_key.is_some_and(|key| keys.contains(&key))
                 || keys.contains(&entry.5)
-                || entry
-                    .2
-                    .as_ref()
-                    .is_some_and(|storage| bases.iter().any(|base| storage.contains(base)))
+                || entry.2.as_ref().is_some_and(|backing| {
+                    backing
+                        .pieces()
+                        .iter()
+                        .any(|(_, range)| bases.iter().any(|base| range.contains(base)))
+                })
         };
         let before = self.binding_memo.1.len();
         self.binding_memo.1.retain(|_, entry| !stale(entry));
@@ -6508,7 +6526,13 @@ impl Nvn {
             if waits {
                 backend.stat("stat: GPU waits for in-place writes", 1);
                 backend.renderer.flush()?;
-                backend.in_place_writes.clear();
+                let mut textures_changed = false;
+                for written in std::mem::take(&mut backend.in_place_writes) {
+                    textures_changed |= backend.mark_texture_bytes_changed(&written);
+                }
+                if textures_changed {
+                    self.bump_binding_serial("stat: binding serial by in-place texture writes");
+                }
             }
         }
         self.resolve_copies(core, range.clone())?;
@@ -6673,28 +6697,38 @@ impl Nvn {
         // Which call site asked (`#[track_caller]` up the resolve chain).
         backend.stat(caller_stat(std::panic::Location::caller()), 1);
         let mut ids = ids.into_iter();
-        for (base, ranges) in batches {
-            for (offset, _) in ranges {
-                let token = ids.next().ok_or("resident read token missing")?;
-                let bytes = completed
-                    .remove(&token)
-                    .ok_or_else(|| format!("resident read {token} never completed"))?;
-                core.memory
-                    .write(base + offset, &bytes)
-                    .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-            }
-            // Keep this pool's ranges pending until every selected write
-            // has reached guest memory.
-            if let Some(pool) = backend.resident.get_mut(&base) {
-                if let Some(range) = &range {
-                    remove_range(&mut pool.gpu_dirty, range.clone());
-                } else {
-                    pool.gpu_dirty.clear();
+        let mut textures_changed = false;
+        let result = (|| {
+            for (base, ranges) in batches {
+                for (offset, _) in ranges {
+                    let token = ids.next().ok_or("resident read token missing")?;
+                    let bytes = completed
+                        .remove(&token)
+                        .ok_or_else(|| format!("resident read {token} never completed"))?;
+                    let start = base + offset;
+                    core.memory
+                        .write(start, &bytes)
+                        .map_err(|trap| format!("resident write-back: {trap:?}"))?;
+                    textures_changed |=
+                        backend.mark_texture_bytes_changed(&(start..start + bytes.len() as u64));
                 }
-                backend.dirty_removals += 1;
+                // Keep this pool's ranges pending until every selected write
+                // has reached guest memory.
+                if let Some(pool) = backend.resident.get_mut(&base) {
+                    if let Some(range) = &range {
+                        remove_range(&mut pool.gpu_dirty, range.clone());
+                    } else {
+                        pool.gpu_dirty.clear();
+                    }
+                    backend.dirty_removals += 1;
+                }
             }
+            Ok(())
+        })();
+        if textures_changed {
+            self.bump_binding_serial("stat: binding serial by resident texture writes");
         }
-        Ok(())
+        result
     }
 
     /// A memory pool at guest `base` is finalized: its mirror is dropped
@@ -9468,17 +9502,7 @@ impl Nvn {
                                 descriptor.binding
                             )
                         })?;
-                        let storage = match (
-                            self.texture_storage(texture),
-                            self.texture_storage_size(texture),
-                        ) {
-                            (Some(base), Some(size)) => Some(base..base + size),
-                            _ => None,
-                        };
-                        if let Some(storage) = &storage {
-                            self.resolve_storage(core, Some(storage.clone()))?;
-                        }
-                        let source = self.texture_source(core, texture)?;
+                        let (source, storage) = self.resolve_sampled_texture(core, texture)?;
                         if let Some(started) = started {
                             texture_time += started.elapsed();
                         }
@@ -12049,7 +12073,7 @@ mod target_tests {
             assert!(nvn.call("nvnMemoryPoolMapVirtual", guest).unwrap());
             assert_eq!(guest.cpu.regs[0], 1);
         };
-        map(&mut nvn, &mut guest, [physical_pool, 0, 0, 0x1000]);
+        map(&mut nvn, &mut guest, [physical_pool, 0x60_000, 0, 0x1000]);
         map(
             &mut nvn,
             &mut guest,
@@ -12058,28 +12082,73 @@ mod target_tests {
         let red = [255, 0, 0, 255];
         let green = [0, 255, 0, 255];
         let blue = [0, 0, 255, 255];
-        guest.memory.write(base, &red).unwrap();
+        guest.memory.write(base + 0x60_000, &red).unwrap();
         // These bytes follow the first allocation physically but are not
         // mapped into the corresponding virtual offsets.
-        guest.memory.write(base + 0x1000, &blue).unwrap();
+        guest.memory.write(base + 0x61_000, &blue).unwrap();
+        guest.memory.write(base + 0x62_100, &blue).unwrap();
         guest.memory.write(base + 0x2100, &blue).unwrap();
         let physical = base + 0x40_100;
         guest.memory.write(physical, &green).unwrap();
-        let upload = |nvn: &mut Nvn, guest: &Guest| {
-            let super::TextureSource::Upload { texels, .. } =
-                nvn.guest_texture(guest, texture).unwrap()
-            else {
+        let (descriptor_pool, index) = (4, 256);
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, descriptor_pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        nvn.texture_descriptors
+            .entry(descriptor_pool)
+            .or_default()
+            .insert(index, args([texture, 0, 0, 0]));
+        let upload = |nvn: &mut Nvn, guest: &mut Guest| {
+            let entries = nvn.pool_entries(guest, 0, &[u64::from(index)]).unwrap();
+            let super::TextureSource::Upload { texels, .. } = &entries[0].source else {
                 panic!("expected a texture upload");
             };
-            texels
+            texels.clone()
         };
-        let texels = upload(&mut nvn, &guest);
+        let texels = upload(&mut nvn, &mut guest);
         assert_eq!(texels[..4], red);
         assert_eq!(texels[0x1000..0x1004], [0; 4]);
         assert_eq!(texels[0x2100..0x2104], green);
+
+        // A newer GPU mirror is outside the range starting at the first
+        // physical allocation. Refresh the memoized upload in this present.
+        let backend = nvn.gpu.as_mut().unwrap();
+        let resident = base + 0x40_000;
+        let gpu_write = physical..physical + 4;
+        backend.renderer.resident_buffer(resident, 0x3000).unwrap();
+        backend
+            .renderer
+            .upload_resident(resident, 0x100, &blue)
+            .unwrap();
+        backend.resident.insert(
+            resident,
+            super::ResidentPool {
+                base: resident,
+                size: 0x3000,
+                uncached: true,
+                host_visible: true,
+                guest_dirty: Vec::new(),
+                gpu_dirty: vec![gpu_write.clone()],
+            },
+        );
+        super::add_range(&mut backend.dirty_index.get_mut().1, gpu_write);
+        backend.gpu_writes += 1;
+        assert_eq!(upload(&mut nvn, &mut guest)[0x2100..0x2104], blue);
+        assert_eq!(
+            guest.memory.read_u32(physical).unwrap(),
+            u32::from_le_bytes(blue)
+        );
+
         guest.memory.write(physical, &red).unwrap();
         nvn.gpu_invalidate(physical..physical + 4, None);
-        assert_eq!(upload(&mut nvn, &guest)[0x2100..0x2104], red);
+        assert_eq!(upload(&mut nvn, &mut guest)[0x2100..0x2104], red);
 
         map(&mut nvn, &mut guest, [0, 0, 0, 0x1000]);
         map(
@@ -12087,7 +12156,7 @@ mod target_tests {
             &mut guest,
             [physical_pool, 0x2000, 0x2000, 0x1000],
         );
-        let texels = upload(&mut nvn, &guest);
+        let texels = upload(&mut nvn, &mut guest);
         assert_eq!(texels[..4], [0; 4]);
         assert_eq!(texels[0x2100..0x2104], blue);
     }
@@ -14088,7 +14157,7 @@ mod pool_tests {
             (
                 TextureSource::Target(7),
                 Sampler::default(),
-                Some(4096..8192),
+                Some(TextureBacking::linear(4096, 4096)),
                 0,
                 0,
                 7,
