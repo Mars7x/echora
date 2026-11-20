@@ -12039,6 +12039,7 @@ fn sample_chunks(
     const CHUNK_BYTES: usize = 64;
     let mut data = [0u8; CHUNK_COUNT * CHUNK_BYTES + CHUNK_COUNT / 8];
     let (chunks, read_mask) = data.split_at_mut(CHUNK_COUNT * CHUNK_BYTES);
+    read_mask.fill(u8::MAX);
     let span = storage_size.saturating_sub(CHUNK_BYTES as u64);
     for (index, chunk) in chunks
         .as_chunks_mut::<CHUNK_BYTES>()
@@ -12047,9 +12048,8 @@ fn sample_chunks(
         .enumerate()
     {
         let offset = span * index as u64 / (CHUNK_COUNT - 1) as u64;
-        if read_chunk(base + offset, chunk) {
-            read_mask[index / 8] |= 1 << (index % 8);
-        } else {
+        if !read_chunk(base + offset, chunk) {
+            read_mask[index / 8] &= !(1 << (index % 8));
             chunk.fill(0);
         }
     }
