@@ -186,19 +186,26 @@ fn write(
     binary_version: ([u8; 16], u32),
     binaries: &[ShaderBinary],
 ) -> std::io::Result<()> {
-    let mut bytes = header(binary_version);
-    bytes.extend_from_slice(&(binaries.len() as u32).to_le_bytes());
+    use std::io::Write;
+
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory)?;
+    // Each writer owns its staging file. Rename publishes the complete
+    // entry even when two renderers compile the same program at once.
+    let mut partial = tempfile::NamedTempFile::new_in(directory)?;
+    partial.write_all(&header(binary_version))?;
+    partial.write_all(&(binaries.len() as u32).to_le_bytes())?;
     for binary in binaries {
-        bytes.extend_from_slice(&(binary.length as u64).to_le_bytes());
-        bytes.extend_from_slice(binary.bytes());
+        partial.write_all(&(binary.length as u64).to_le_bytes())?;
+        partial.write_all(binary.bytes())?;
     }
-    if let Some(directory) = path.parent() {
-        std::fs::create_dir_all(directory)?;
-    }
-    // Written beside and renamed over, so a reader never sees half a file.
-    let partial = path.with_extension(format!("{}.part", std::process::id()));
-    std::fs::write(&partial, &bytes)?;
-    std::fs::rename(&partial, path)
+    partial
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 fn header(binary_version: ([u8; 16], u32)) -> Vec<u8> {
@@ -273,6 +280,39 @@ mod tests {
         // storage and layout information remain live for the call.
         let shaders = unsafe { objects.create_shaders(&[info], None) }.unwrap();
         destroy(objects, &shaders);
+    }
+
+    #[test]
+    fn concurrent_shader_cache_writers_publish_complete_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("program.bin");
+        let version = ([11; 16], 7);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for fill in 1..=8 {
+                let path = &path;
+                let barrier = &barrier;
+                writers.push(scope.spawn(move || {
+                    let mut binary = ShaderBinary::zeroed(256 * 1024).unwrap();
+                    binary.bytes_mut().fill(fill);
+                    barrier.wait();
+                    for _ in 0..16 {
+                        write(path, version, std::slice::from_ref(&binary)).unwrap();
+                    }
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+        });
+        let binaries = read(&path, version).unwrap();
+        assert_eq!(binaries.len(), 1);
+        let bytes = binaries[0].bytes();
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert!((1..=8).contains(&bytes[0]));
+        assert!(bytes.iter().all(|&byte| byte == bytes[0]));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 zstd.workspace = true
+tempfile.workspace = true
 ash = "0.38"
 echora-av1.workspace = true
 echora-shader.workspace = true
