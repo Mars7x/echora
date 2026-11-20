@@ -772,7 +772,7 @@ pub struct Nvn {
     #[serde(skip)]
     mesh_program_memo: (
         (u64, u64),
-        HashMap<[Option<u64>; 8], std::sync::Arc<gpu::BoundProgram>>,
+        HashMap<([Option<u64>; 8], [u8; MAX_COLOR_TARGETS]), std::sync::Arc<gpu::BoundProgram>>,
     ),
     /// SHADER_CODE pools' guest storage (start, size).
     #[serde(skip)]
@@ -817,7 +817,10 @@ pub struct Nvn {
     #[serde(skip)]
     program_memo: (
         (u64, u64),
-        HashMap<(u64, u64), (StateSnapshots, std::sync::Arc<gpu::BoundProgram>)>,
+        HashMap<
+            (u64, u64, [u8; MAX_COLOR_TARGETS]),
+            (StateSnapshots, std::sync::Arc<gpu::BoundProgram>),
+        >,
     ),
     /// nvnSyncWait calls that timed out (never fenced), by sync address.
     pub sync_timeouts: BTreeMap<u64, u64>,

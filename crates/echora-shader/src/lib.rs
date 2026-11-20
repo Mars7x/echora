@@ -139,6 +139,7 @@ fn translate_with_constants(
             loop_trace: loop_trace(),
             vertex_trace: options.vertex_trace.unwrap_or_else(vertex_trace),
             previous_stores: options.previous_stores,
+            fragment_output_types: options.fragment_output_types,
             float64: options.float64,
             denorm_flush_32: options.denorm_flush_32,
             dual_source_blend: options.dual_source_blend,
@@ -180,6 +181,7 @@ fn translate_with_constants(
         loop_trace: loop_trace(),
         vertex_trace: false,
         previous_stores: None,
+        fragment_output_types: [0; 8],
         float64: options.float64,
         denorm_flush_32: options.denorm_flush_32,
         dual_source_blend: false,
@@ -739,6 +741,66 @@ mod tests {
             (texture.binding, texture.cbuf_index, texture.cbuf_offset),
             (4 * compute::MAX_DESCRIPTORS, 2, 0x20)
         );
+    }
+
+    #[test]
+    fn fragment_integer_outputs_preserve_register_bits() {
+        use spirv::op;
+
+        const LOCATION: u32 = 30;
+
+        let mut program = header(2, 5, &[576, 580]);
+        let mov = |register, bits| {
+            word(&[
+                (0, 12, 0x802),
+                (72, 4, 0xf),
+                (16, 8, register),
+                (32, 32, bits),
+            ])
+        };
+        program.extend(bytes(&[mov(0, 123), mov(4, 0xffff_fffb), EXIT]));
+        let options = Options {
+            fragment_output_types: [2, 1, 0, 0, 0, 0, 0, 0],
+            ..Options::default()
+        };
+        let translated =
+            translate_with_options(&program, &Parameters::default(), &options).unwrap();
+        assert_eq!(spirv::tests::validate(&translated.spirv), None);
+
+        let mut remaining = &translated.spirv[5..];
+        let instructions: Vec<_> = std::iter::from_fn(|| {
+            let first = *remaining.first()?;
+            let (instruction, rest) = remaining.split_at((first >> 16) as usize);
+            remaining = rest;
+            Some((first as u16, &instruction[1..]))
+        })
+        .collect();
+        for (location, signed) in [(0, 0), (1, 1)] {
+            let operands = |kind, index, id| {
+                instructions
+                    .iter()
+                    .find(|(opcode, operands)| *opcode == kind && operands[index] == id)
+                    .unwrap()
+                    .1
+            };
+            let output = instructions
+                .iter()
+                .find(|(opcode, args)| {
+                    *opcode == op::DECORATE && args.get(1..) == Some(&[LOCATION, location])
+                })
+                .unwrap()
+                .1[0];
+            let pointer = operands(op::VARIABLE, 1, output)[0];
+            let vector = operands(op::TYPE_POINTER, 0, pointer)[2];
+            let component = operands(op::TYPE_VECTOR, 0, vector)[1];
+            assert_eq!(operands(op::TYPE_INT, 0, component)[1..], [32, signed]);
+        }
+
+        let machine = sim::Machine::new(&translated.spirv);
+        let report = machine.simulate(&sim::Inputs::default());
+        let colors = machine.located_outputs(&report.invocations[0]);
+        assert_eq!(colors[&(0, 0)][0], 123);
+        assert_eq!(colors[&(1, 0)][0], 0xffff_fffb);
     }
 
     #[test]

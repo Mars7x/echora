@@ -131,6 +131,7 @@ pub fn translate_rust_with_sampled_textures(
 ) -> Result<Translated, echora_shader_abi::Unsupported> {
     let options = echora_shader_abi::Options {
         previous_stores: parameters.previous_stores,
+        fragment_output_types: parameters.fragment_output_types,
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
         vertex_trace: parameters.vertex_trace,
         ..Default::default()
@@ -223,6 +224,8 @@ pub struct Parameters {
     /// Vertex stages: Shader::AttributeType of each generic input (0 float,
     /// 1 signed integer, 2 unsigned integer).
     pub generic_input_types: [u8; 32],
+    /// Numeric type of each color attachment for fragment translation.
+    pub fragment_output_types: [u8; 8],
     /// Render target resolution scale the program is translated for, as
     /// (numerator, denominator); (0, 0) or equal terms: none. See
     /// `Renderer::resolution_scale`.

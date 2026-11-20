@@ -76,7 +76,15 @@ impl Emitter {
         if let Some(&variable) = existing {
             return variable;
         }
-        let vec4 = self.vec4();
+        let component = if output && self.stage == Stage::Fragment {
+            self.fragment_output_component(location)
+        } else {
+            self.f32
+        };
+        let vec4 = self.module.ty(Type::Vector {
+            component,
+            count: 4,
+        });
         let class = if output {
             storage::OUTPUT
         } else {
@@ -507,6 +515,17 @@ impl Emitter {
         })
     }
 
+    fn fragment_output_component(&mut self, location: u32) -> u32 {
+        match self.layout.fragment_output_types.get(location as usize) {
+            Some(1) => self.module.ty(Type::Int {
+                width: 32,
+                signed: true,
+            }),
+            Some(2) => self.u32,
+            _ => self.f32,
+        }
+    }
+
     /// A fragment program's outputs, from its registers at exit: four
     /// registers per render target the header enables, then the sample
     /// mask's place and the depth.
@@ -525,18 +544,25 @@ impl Emitter {
             }
             // With dual-source blending colour 1 is target 0's second
             // source.
-            let variable = if dual && target == 1 {
-                self.second_source()
+            let (variable, component) = if dual && target == 1 {
+                (self.second_source(), self.f32)
             } else {
-                self.generic(target, true)
+                (
+                    self.generic(target, true),
+                    self.fragment_output_component(target),
+                )
             };
             let components: Vec<u32> = (0..4)
                 .map(|n| {
                     let bits = self.read_register(register + n);
-                    self.value(op::BITCAST, self.f32, &[bits])
+                    if component == self.u32 {
+                        bits
+                    } else {
+                        self.value(op::BITCAST, component, &[bits])
+                    }
                 })
                 .collect();
-            let vector = self.vector(self.f32, &components);
+            let vector = self.vector(component, &components);
             self.function.emit(op::STORE, &[variable, vector]);
             if !(dual && target == 1) {
                 self.frag_colors |= 1 << target;

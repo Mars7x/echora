@@ -123,6 +123,9 @@ pub struct Options {
     /// Attributes supplied by the stage before a fragment shader.
     /// None leaves the fragment interface unlinked.
     pub previous_stores: Option<[u64; 8]>,
+    /// Fragment output type at each attachment location: 0 float, 1
+    /// signed integer, 2 unsigned integer.
+    pub fragment_output_types: [u8; 8],
     /// Fragment programs, for a pipeline whose render target 0 blends with
     /// a second source (SRC1_COLOR, ONE_MINUS_SRC1_COLOR, SRC1_ALPHA,
     /// ONE_MINUS_SRC1_ALPHA): the program's colour output 1 (the registers

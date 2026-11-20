@@ -484,6 +484,8 @@ pub struct Layout<'a> {
     pub header: Option<crate::header::Header>,
     /// Attribute components the preceding stage writes.
     pub previous_stores: Option<[u64; 8]>,
+    /// Attachment numeric types for a fragment shader's color outputs.
+    pub fragment_output_types: [u8; 8],
     pub workgroup: [u32; 3],
     /// Bytes of shared memory, when known.
     pub shared_bytes: Option<u32>,
@@ -569,6 +571,7 @@ impl Layout<'_> {
             stage: Stage::Compute,
             header: None,
             previous_stores: None,
+            fragment_output_types: [0; 8],
             workgroup,
             shared_bytes: None,
             local_bytes: None,
@@ -4137,6 +4140,7 @@ mod tests {
             float64: false,
             denorm_flush_32: false,
             dual_source_blend: false,
+            fragment_output_types: [0; 8],
         };
         let translated = valid_with(&words, &layout);
         assert_eq!(translated.push_fields, 0);
@@ -4396,6 +4400,7 @@ mod tests {
             float64: false,
             denorm_flush_32: false,
             dual_source_blend: false,
+            fragment_output_types: [0; 8],
         };
         valid_with(&words, &layout);
         let code: Vec<Instruction> = words.iter().map(|&raw| decode(raw)).collect();
@@ -5296,6 +5301,7 @@ mod tests {
             float64: false,
             denorm_flush_32: false,
             dual_source_blend: false,
+            fragment_output_types: [0; 8],
         };
         valid_with(&words, &layout);
     }

@@ -639,6 +639,7 @@ type TranslationKey = (
     [u32; 3],
     Option<[u64; 8]>,
     [u8; 32],
+    [u8; MAX_COLOR_TARGETS],
     [u32; 5],
     Option<MeshParameters>,
     bool,
@@ -1089,6 +1090,37 @@ impl Nvn {
         let vk_format =
             vk_format(format).ok_or_else(|| format!("render target format {format}"))?;
         Ok((width, height, vk_format))
+    }
+
+    fn color_view_format(&self, location: usize) -> Option<vk::Format> {
+        self.render
+            .color_formats
+            .get(location)
+            .copied()
+            .filter(|format| *format != 0)
+            .and_then(vk_format)
+    }
+
+    fn fragment_output_types(&self) -> [u8; MAX_COLOR_TARGETS] {
+        std::array::from_fn(|location| {
+            let Some(texture) = self
+                .render
+                .colors
+                .get(location)
+                .copied()
+                .filter(|key| *key != 0)
+            else {
+                return 0;
+            };
+            let format = self
+                .color_view_format(location)
+                .or_else(|| self.target_shape(texture).ok().map(|(_, _, format)| format));
+            match format.map(echora_gpu::renderer::sampled_texture_type) {
+                Some(shader::SampleType::Signed) => 1,
+                Some(shader::SampleType::Unsigned) => 2,
+                _ => 0,
+            }
+        })
     }
 
     /// Draws recorded so far (the statistics' count).
@@ -1720,6 +1752,12 @@ impl Nvn {
                 let _ = std::fs::write(path, code.as_slice());
             }
         }
+        let fragment_output_types = if previous_stores.is_some() {
+            self.fragment_output_types()
+        } else {
+            [0; MAX_COLOR_TARGETS]
+        };
+        let typed_outputs = fragment_output_types != [0; MAX_COLOR_TARGETS];
         let backend = self.gpu.as_mut().unwrap();
         let native_pointers = backend.native_programs.contains(&key);
         let jump_targets = compute_constants.and_then(|constants| {
@@ -1736,6 +1774,7 @@ impl Nvn {
             base,
             previous_stores,
             generic_input_types,
+            fragment_output_types,
             compute,
             mesh,
             native_pointers,
@@ -1771,6 +1810,7 @@ impl Nvn {
                 mesh,
                 previous_stores,
                 generic_input_types,
+                fragment_output_types,
                 workgroup_size: [compute[0], compute[1], compute[2]],
                 // Compute shared memory from the control section; zero
                 // (graphics) is raised to 48 KiB, as zero aborts the
@@ -1827,7 +1867,10 @@ impl Nvn {
             // ECHORA_PLUGIN_PROGRAMS=<stage key>[,...] (debugging): those
             // stages from the plugin whatever the translator, to tell a Rust
             // translation's fault from its neighbours'.
-            let translator = if super::debug_var("ECHORA_PLUGIN_PROGRAMS").is_ok_and(|keys| {
+            // The plugin ABI has no attachment numeric types.
+            let translator = if typed_outputs {
+                shader::Translator::Rust
+            } else if super::debug_var("ECHORA_PLUGIN_PROGRAMS").is_ok_and(|keys| {
                 keys.split(',')
                     .any(|item| item.trim() == format!("{key:016x}"))
             }) {
@@ -1866,7 +1909,7 @@ impl Nvn {
                 }
                 (_, Some(Err(unsupported))) => {
                     notes.push(format!("rust translator: {}", unsupported.reason));
-                    if shader::available() {
+                    if shader::available() && !typed_outputs {
                         plugin(self)
                     } else {
                         Err(match unsupported.offset {
@@ -1899,7 +1942,7 @@ impl Nvn {
         // not handle stops the run with its report: nothing is drawn wrong
         // in silence.
         if let Err(error) = &translated
-            && !shader::available()
+            && (typed_outputs || !shader::available())
         {
             backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
         }
@@ -2071,7 +2114,9 @@ impl Nvn {
         if self.program_memo.0 != stamp {
             self.program_memo = (stamp, HashMap::default());
         }
-        let key = bind(0).zip(bind(1));
+        let key = bind(0)
+            .zip(bind(1))
+            .map(|(vertex, fragment)| (vertex, fragment, self.fragment_output_types()));
         if let Some(key) = key
             && let Some((memo_attributes, bound)) = self.program_memo.1.get(&key)
             && attributes.ptr_eq(memo_attributes)
@@ -2182,11 +2227,12 @@ impl Nvn {
         if self.mesh_program_memo.0 != stamp {
             self.mesh_program_memo = (stamp, HashMap::default());
         }
-        if let Some(found) = self.mesh_program_memo.1.get(&binds) {
+        let key = (binds, self.fragment_output_types());
+        if let Some(found) = self.mesh_program_memo.1.get(&key) {
             return Ok(found.clone());
         }
         let found = Arc::new(self.resolve_bound_mesh_program(core)?);
-        self.mesh_program_memo.1.insert(binds, found.clone());
+        self.mesh_program_memo.1.insert(key, found.clone());
         Ok(found)
     }
 
@@ -8787,13 +8833,7 @@ impl Nvn {
             color_levels[index] = attachment_level;
             // An sRGB view encodes writes to a UNORM target. An integer
             // view one block wide per texel renders into compressed blocks.
-            color_formats[index] = self
-                .render
-                .color_formats
-                .get(index)
-                .copied()
-                .filter(|format| *format != 0)
-                .and_then(vk_format);
+            color_formats[index] = self.color_view_format(index);
         }
         let DrawBindings {
             uniforms,
