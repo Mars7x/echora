@@ -160,6 +160,28 @@ impl TextureBacking {
         expected[end..].iter().all(|&byte| byte == 0)
     }
 
+    fn matches_chunk_hashes(
+        &self,
+        core: &Guest,
+        hashes: &[u64],
+        mut chunks: impl Iterator<Item = u64>,
+    ) -> bool {
+        let size = self.size();
+        let mut buffer = vec![0; STORAGE_CHUNK as usize];
+        chunks.all(|chunk| {
+            let Some(expected) = hashes.get(chunk as usize) else {
+                return false;
+            };
+            let offset = chunk * STORAGE_CHUNK;
+            let Some(remaining) = size.checked_sub(offset) else {
+                return false;
+            };
+            let bytes = &mut buffer[..remaining.min(STORAGE_CHUNK) as usize];
+            self.read_into(core, offset, bytes);
+            *expected == hash_bytes(bytes)
+        })
+    }
+
     fn sample(&self, core: &Guest, format: u32, dimensions: [u32; 3]) -> u64 {
         if let Self::Linear((_, range)) = self {
             return texture_sample(core, range.start, self.size(), format, dimensions);
@@ -4469,14 +4491,7 @@ impl Nvn {
                         .map(|range| range.start / STORAGE_CHUNK..range.end.div_ceil(STORAGE_CHUNK))
                         .collect();
                     merge_ranges(&mut chunks);
-                    let mut bytes = vec![0; STORAGE_CHUNK as usize];
-                    chunks.into_iter().flatten().all(|chunk| {
-                        let start = chunk * STORAGE_CHUNK;
-                        let length = STORAGE_CHUNK.min(backing.size() - start);
-                        let bytes = &mut bytes[..length as usize];
-                        backing.read_into(core, start, bytes);
-                        hashes.get(chunk as usize) == Some(&hash_bytes(bytes))
-                    })
+                    backing.matches_chunk_hashes(core, hashes, chunks.into_iter().flatten())
                 }
                 _ => false,
             };
@@ -4589,18 +4604,25 @@ impl Nvn {
         let base = backing.pieces().first().map_or(0, |(_, range)| range.start);
         let check_started = std::time::Instant::now();
         let backend = self.gpu.as_ref().unwrap();
-        let mapping_changed = backend
-            .textures
-            .get(&texture)
-            .is_some_and(|(_, _, previous)| *previous != backing);
+        let cached = backend.textures.get(&texture);
+        let mapping_changed = cached.is_some_and(|(_, _, previous)| *previous != backing);
         let shadow = backend.shadows.get(&texture);
         let shadowed = shadow.is_some();
-        // Uncached memory can change in any frame without a flush.
-        let shadow_changed = shadow.is_some_and(|shadow| !backing.equals(core, shadow));
-        // An unchanged copy proves the cached upload current: its sample
-        // stands for the storage.
-        let kept_sample = (shadowed && !shadow_changed)
-            .then(|| backend.textures.get(&texture).map(|entry| entry.0))
+        // Uncached memory can change without a flush, including between the
+        // sample positions. Large textures use the existing chunk hashes
+        // so they do not need another persistent copy of the raw storage.
+        let content_matches = if let Some(shadow) = shadow {
+            Some(backing.equals(core, shadow))
+        } else if uncached && storage_size > SHADOW_LIMIT && cached.is_some() && !mapping_changed {
+            let count = storage_size.div_ceil(STORAGE_CHUNK);
+            Some(backend.storage_hashes.get(&texture).is_some_and(|hashes| {
+                hashes.len() as u64 == count && backing.matches_chunk_hashes(core, hashes, 0..count)
+            }))
+        } else {
+            None
+        };
+        let kept_sample = (content_matches == Some(true))
+            .then(|| cached.map(|entry| entry.0))
             .flatten();
         let sample = kept_sample
             .unwrap_or_else(|| backing.sample(core, format, [width, height, depth_or_layers]));
@@ -4626,7 +4648,7 @@ impl Nvn {
             );
         }
         if let Some((sampled, _, _)) = self.gpu.as_ref().unwrap().textures.get(&texture) {
-            if *sampled == sample && !stale && !shadow_changed && !mapping_changed {
+            if *sampled == sample && !stale && content_matches != Some(false) && !mapping_changed {
                 self.release_upload_texels(texture);
                 let backend = self.gpu.as_mut().unwrap();
                 let source = backend.textures[&texture].1.clone();
@@ -12559,6 +12581,14 @@ mod target_tests {
     }
 
     fn texture_cache_fixture(flags: u64) -> Option<(Nvn, Memory, u64, u64)> {
+        texture_cache_fixture_of_size(flags, 1024, 512)
+    }
+
+    fn texture_cache_fixture_of_size(
+        flags: u64,
+        width: u64,
+        height: u64,
+    ) -> Option<(Nvn, Memory, u64, u64)> {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
         let backend = Backend::create(None).ok()??;
@@ -12569,7 +12599,8 @@ mod target_tests {
         };
         let (pool, texture) = (1, 2);
         let base = 0x10_0000;
-        let size = 2 << 20;
+        let stride = width * 4;
+        let size = stride * height;
         let args = |x| Args {
             x,
             ..Default::default()
@@ -12589,9 +12620,9 @@ mod target_tests {
             "Texture",
             BTreeMap::from([
                 ("Storage".into(), args([pool, 0, 0, 0])),
-                ("Width".into(), scalar(1024)),
-                ("Height".into(), scalar(512)),
-                ("Stride".into(), scalar(4096)),
+                ("Width".into(), scalar(width)),
+                ("Height".into(), scalar(height)),
+                ("Stride".into(), scalar(stride)),
                 ("Format".into(), scalar(37)),
             ]),
         )
@@ -13247,6 +13278,46 @@ mod target_tests {
             panic!("expected the initial texture upload");
         };
         for _ in 0..128 {
+            nvn.presented_frames += 1;
+            nvn.guest_texture(&guest, texture).unwrap();
+        }
+        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        nvn.presented_frames += 1;
+        let rgba = [32, 64, 128, 255];
+        let offset = 256;
+        guest.memory.write(base + offset, &rgba).unwrap();
+        let TextureSource::Upload {
+            generation: updated,
+            texels,
+            ..
+        } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the refreshed texture upload");
+        };
+        assert_ne!(updated, generation);
+        assert_eq!(texels[offset as usize..][..4], rgba);
+    }
+
+    #[test]
+    fn large_uncached_upload_refreshes_bytes_between_samples() {
+        use echora_gpu::draw::TextureSource;
+
+        let Some((mut nvn, mut memory, base, texture)) =
+            texture_cache_fixture_of_size(0x22, 2048, 2050)
+        else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let TextureSource::Upload { generation, .. } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the initial texture upload");
+        };
+        for _ in 0..2 {
             nvn.presented_frames += 1;
             nvn.guest_texture(&guest, texture).unwrap();
         }
