@@ -254,6 +254,7 @@ fn write_aux(
     input: &[i32],
     offset: u32,
     update: u32,
+    scratch: &mut [[u8; 4]],
 ) {
     let info = base + AUX_INFO_SIZE;
     let mut position = [0u8; 4];
@@ -268,11 +269,14 @@ fn write_aux(
     let mut done = 0;
     while done < input.len() {
         let run = ((count_max - target) as usize).min(input.len() - done);
-        let bytes: Vec<u8> = input[done..done + run]
-            .iter()
-            .flat_map(|sample| sample.to_le_bytes())
-            .collect();
-        memory.write(base + AUX_BUFFER_AT + u64::from(target) * 4, &bytes);
+        let words = &mut scratch[..run];
+        for (word, sample) in words.iter_mut().zip(&input[done..done + run]) {
+            *word = sample.to_le_bytes();
+        }
+        memory.write(
+            base + AUX_BUFFER_AT + u64::from(target) * 4,
+            words.as_flattened(),
+        );
         target = (target + run as u32) % count_max;
         done += run;
     }
@@ -291,6 +295,7 @@ fn read_aux(
     output: &mut [i32],
     offset: u32,
     update: u32,
+    scratch: &mut [[u8; 4]],
 ) -> bool {
     let info = base + AUX_INFO_SIZE;
     let mut position = [0u8; 4];
@@ -305,15 +310,15 @@ fn read_aux(
     let mut done = 0;
     while done < output.len() {
         let run = ((count_max - target) as usize).min(output.len() - done);
-        let mut bytes = vec![0u8; run * 4];
-        if !memory.read(base + AUX_BUFFER_AT + u64::from(target) * 4, &mut bytes) {
-            bytes.fill(0);
-        }
-        for (sample, bytes) in output[done..done + run]
-            .iter_mut()
-            .zip(bytes.chunks_exact(4))
-        {
-            *sample = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let address = base + AUX_BUFFER_AT + u64::from(target) * 4;
+        let samples = &mut output[done..done + run];
+        let words = &mut scratch[..run];
+        if memory.read(address, words.as_flattened_mut()) {
+            for (sample, &word) in samples.iter_mut().zip(words.iter()) {
+                *sample = i32::from_le_bytes(word);
+            }
+        } else {
+            samples.fill(0);
         }
         target = (target + run as u32) % count_max;
         done += run;
@@ -333,6 +338,7 @@ impl Effect {
         count: usize,
         memory: &dyn Source,
         long_pre_delay: bool,
+        aux_scratch: &mut Vec<[u8; 4]>,
     ) {
         match &mut self.processor {
             Processor::Reverb {
@@ -405,6 +411,7 @@ impl Effect {
                 }
                 // Channel after channel in the rings; the last one moves
                 // their positions past the whole frame.
+                aux_scratch.resize(count, [0; 4]);
                 let total = (pairs.len() * count) as u32;
                 for (channel, &(input, output)) in pairs.iter().enumerate() {
                     if input >= buffers.len() || output >= buffers.len() {
@@ -419,6 +426,7 @@ impl Effect {
                         &buffers[input][..count],
                         offset,
                         update,
+                        aux_scratch,
                     );
                     if !read_aux(
                         memory,
@@ -427,6 +435,7 @@ impl Effect {
                         &mut buffers[output][..count],
                         offset,
                         update,
+                        aux_scratch,
                     ) {
                         buffers[output][..count].fill(0);
                     }
@@ -708,6 +717,8 @@ pub struct Renderer {
     mixers: BTreeMap<usize, BufferMixer>,
     /// The effect slots with signal processing of their own.
     processors: BTreeMap<usize, Effect>,
+    /// Little-endian sample bytes shared by all aux send and return rings.
+    aux_scratch: Vec<[u8; 4]>,
     /// Effect placements in mix, processing order, and slot order.
     effect_order: Vec<(i32, u32, usize)>,
     /// Each splitter's destination ids, in order.
@@ -743,6 +754,7 @@ impl Renderer {
             voice_input: Vec::new(),
             mixers: BTreeMap::new(),
             processors: BTreeMap::new(),
+            aux_scratch: Vec::new(),
             effect_order: Vec::new(),
             splitters: BTreeMap::new(),
             destinations: BTreeMap::new(),
@@ -993,7 +1005,7 @@ impl Renderer {
                             }
                         }
                     } else if let Some(effect) = self.processors.get_mut(&slot) {
-                        effect.process(own, count, memory, long_pre_delay);
+                        effect.process(own, count, memory, long_pre_delay, &mut self.aux_scratch);
                     }
                 }
             }
@@ -2000,7 +2012,8 @@ mod tests {
             },
         };
         let mut buffers = vec![vec![1, 2], vec![3, 4]];
-        effect.process(&mut buffers, 2, &ram, true);
+        let mut scratch = Vec::new();
+        effect.process(&mut buffers, 2, &ram, true, &mut scratch);
         // Both channels went out one after the other and came back so.
         assert_eq!(
             [word(0x180), word(0x184), word(0x188), word(0x18c)],
@@ -2011,7 +2024,7 @@ mod tests {
         assert_eq!((word(0x144), word(0x240)), (4, 4));
         // The next frame wraps around both rings.
         let mut buffers = vec![vec![5, 6], vec![7, 8]];
-        effect.process(&mut buffers, 2, &ram, true);
+        effect.process(&mut buffers, 2, &ram, true, &mut scratch);
         assert_eq!(
             [word(0x190), word(0x194), word(0x180), word(0x184)],
             [5, 6, 7, 8]
@@ -2021,8 +2034,30 @@ mod tests {
         // Disabled, it passes through and rewinds the rings.
         effect.enabled = false;
         let mut buffers = vec![vec![9, 9], vec![8, 8]];
-        effect.process(&mut buffers, 2, &ram, true);
+        effect.process(&mut buffers, 2, &ram, true, &mut scratch);
         assert_eq!(buffers, vec![vec![9, 9], vec![8, 8]]);
         assert_eq!((word(0x144), word(0x240)), (0, 0));
+    }
+
+    #[test]
+    fn aux_wraps_to_readable_samples_after_an_unmapped_segment() {
+        let ram = Ram(std::cell::RefCell::new(vec![0u8; 0x194]));
+        let sample = -0x1067_4321_i32;
+        assert!(ram.write(0x140, &5_u32.to_le_bytes()));
+        assert!(ram.write(0x180, &sample.to_le_bytes()));
+        let mut output = [1, 2];
+        assert!(read_aux(
+            &ram,
+            0x100,
+            6,
+            &mut output,
+            0,
+            2,
+            &mut [[255; 4]; 2]
+        ));
+        assert_eq!(output, [0, sample]);
+        let mut position = [0; 4];
+        assert!(ram.read(0x140, &mut position));
+        assert_eq!(u32::from_le_bytes(position), 1);
     }
 }
