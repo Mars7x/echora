@@ -2790,6 +2790,7 @@ impl Nvn {
                 }
                 // Invalidate the GPU and CPU translations after validating
                 // the entire request list.
+                let old_targets = self.contiguous_targets_before_remap(this, &mappings);
                 self.invalidate_virtual_texture_uploads(this, &mappings);
                 self.pool_epoch += 1;
                 self.pool_ranges.get_mut().epoch = None;
@@ -2834,6 +2835,7 @@ impl Nvn {
                         );
                     }
                 }
+                self.move_remapped_targets(old_targets);
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -3468,6 +3470,9 @@ impl Nvn {
                 // half, for ECHORA_HANDLE_LOG).
                 entry.x[2] = storage;
                 entry.x[3] = format & 0xffff_ffff | self.presented_frames << 32;
+                if sampler.is_none() {
+                    entry.v[0] = self.virtual_texture_address(x[2]).unwrap_or(0);
+                }
                 let registration = Registration {
                     pool: this,
                     id,
@@ -4568,6 +4573,7 @@ impl Nvn {
             || entry.x[1] != u64::from(image)
             || entry.x[2] != storage
             || entry.x[3] & 0xffff_ffff != format & 0xffff_ffff
+            || entry.v[0] != self.virtual_texture_address(texture).unwrap_or(0)
         {
             return false;
         }
@@ -4625,6 +4631,7 @@ impl Nvn {
         let current_view = self.views.get(&(pool, id));
         if previous.x[..3] == entry.x[..3]
             && previous.x[3] as u32 == entry.x[3] as u32
+            && previous.v[0] == entry.v[0]
             && view.is_none_or(|view| view.as_ref() == current_view)
         {
             return;

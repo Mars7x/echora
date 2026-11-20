@@ -1646,6 +1646,86 @@ impl Nvn {
         backend.renderer.forget_upload(texture);
     }
 
+    fn overlaps_virtual_remap(&self, texture: u64, pool: u64, mappings: &[[u64; 4]]) -> bool {
+        let Some(storage) = self
+            .objects
+            .get(&texture)
+            .and_then(|object| object.builder.get("Storage"))
+        else {
+            return false;
+        };
+        if storage.x[0] != pool {
+            return false;
+        }
+        let start = storage.x[1];
+        let end = self
+            .texture_storage_size(texture)
+            .map_or(u64::MAX, |length| start.saturating_add(length));
+        mappings.iter().any(|&[_, _, offset, length]| {
+            length != 0 && start < offset.saturating_add(length) && offset < end
+        })
+    }
+
+    /// Live render targets with linear backing that a virtual remap can change.
+    pub(super) fn contiguous_targets_before_remap(
+        &self,
+        pool: u64,
+        mappings: &[[u64; 4]],
+    ) -> Vec<(u64, std::ops::Range<u64>)> {
+        let Some(backend) = self.gpu.as_ref() else {
+            return Vec::new();
+        };
+        backend
+            .renderer
+            .target_keys_in_order()
+            .iter()
+            .copied()
+            .filter(|&texture| {
+                texture >> 63 == 0 && self.overlaps_virtual_remap(texture, pool, mappings)
+            })
+            .filter_map(|texture| {
+                let TextureBacking::Linear((_, range)) = self.texture_object_backing(texture)?
+                else {
+                    return None;
+                };
+                Some((texture, range))
+            })
+            .collect()
+    }
+
+    /// A whole remap leaves rendered texels with the previous physical
+    /// allocation, available to other textures over that allocation.
+    pub(super) fn move_remapped_targets(&mut self, targets: Vec<(u64, std::ops::Range<u64>)>) {
+        for (texture, previous) in targets {
+            let new = match self.texture_object_backing(texture) {
+                None => None,
+                Some(TextureBacking::Linear((_, range)))
+                    if range.end <= previous.start || range.start >= previous.end =>
+                {
+                    Some(range.start)
+                }
+                // Partial/overlapping remaps need per-subresource merging.
+                _ => continue,
+            };
+            let mut old = self.objects[&texture].clone();
+            let Some(format) = old.builder.get("Format").map(|value| value.x[0]) else {
+                continue;
+            };
+            let previous_identity = (previous.start, format);
+            let retired = super::retired_texture(previous_identity);
+            old.state.insert(
+                "RetiredBacking".into(),
+                super::Args {
+                    x: [previous.start, previous.end - previous.start, 0, 0],
+                    ..Default::default()
+                },
+            );
+            self.objects.insert(retired, old);
+            self.object_changed(retired, "Texture");
+            self.gpu_move_texture(texture, previous_identity, new.map(|base| (base, format)));
+        }
+    }
+
     /// Discard guest texture uploads whose virtual storage may change.
     pub(super) fn invalidate_virtual_texture_uploads(&mut self, pool: u64, mappings: &[[u64; 4]]) {
         let Some(backend) = self.gpu.as_ref() else {
@@ -1659,25 +1739,7 @@ impl Nvn {
             .keys()
             .chain(backend.copied_levels.keys())
             .copied()
-            .filter(|&texture| {
-                let Some(storage) = self
-                    .objects
-                    .get(&texture)
-                    .and_then(|o| o.builder.get("Storage"))
-                else {
-                    return false;
-                };
-                if storage.x[0] != pool {
-                    return false;
-                }
-                let start = storage.x[1];
-                let end = self
-                    .texture_storage_size(texture)
-                    .map_or(u64::MAX, |length| start.saturating_add(length));
-                mappings.iter().any(|&[_, _, offset, length]| {
-                    length != 0 && start < offset.saturating_add(length) && offset < end
-                })
-            })
+            .filter(|&texture| self.overlaps_virtual_remap(texture, pool, mappings))
             .collect();
         if !affected.is_empty() {
             affected.sort_unstable();
@@ -3522,8 +3584,23 @@ impl Nvn {
         address
     }
 
+    /// A descriptor holds a virtual address, which stays the same while
+    /// the memory at that address is remapped.
+    pub(super) fn virtual_texture_address(&self, texture: u64) -> Option<u64> {
+        let texture = self.object(texture, "Texture").ok()?;
+        let storage = texture.builder.get("Storage")?;
+        let pool = self.object(storage.x[0], "MemoryPool").ok()?;
+        if pool.builder.get("Storage")?.x[0] != 0 {
+            return None;
+        }
+        pool.state.get("GpuAddress")?.x[0].checked_add(storage.x[1])
+    }
+
     fn texture_storage_uncached(&self, texture: u64) -> Option<u64> {
         let texture = self.objects.get(&texture).filter(|o| o.kind == "Texture")?;
+        if let Some(backing) = texture.state.get("RetiredBacking") {
+            return Some(backing.x[0]);
+        }
         let storage = texture.builder.get("Storage")?;
         let pool = self
             .objects
@@ -3535,6 +3612,26 @@ impl Nvn {
         }
         let gpu = pool.state.get("GpuAddress")?.x[0] + storage.x[1];
         self.pool_for(gpu).map(|(guest, _)| guest)
+    }
+
+    fn texture_backing_of(
+        &self,
+        object: &super::Object,
+        size: u64,
+    ) -> Result<TextureBacking, String> {
+        if let Some(backing) = object.state.get("RetiredBacking") {
+            if size > backing.x[1] {
+                return Err("texture exceeds its retired physical backing".into());
+            }
+            return Ok(TextureBacking::linear(backing.x[0], size));
+        }
+        self.texture_backing(
+            object
+                .builder
+                .get("Storage")
+                .ok_or("texture has no storage")?,
+            size,
+        )
     }
 
     pub(super) fn texture_backing(
@@ -3992,8 +4089,7 @@ impl Nvn {
     fn texture_object_backing(&self, texture: u64) -> Option<TextureBacking> {
         let object = self.objects.get(&texture)?;
         let size = self.texture_storage_size(texture)?;
-        self.texture_backing(object.builder.get("Storage")?, size)
-            .ok()
+        self.texture_backing_of(object, size).ok()
     }
 
     pub(super) fn resolve_texture_copy_read(
@@ -4256,7 +4352,7 @@ impl Nvn {
         } else {
             crate::nvn_format::block_linear_size(info, width, height, depth, layout, levels_set).0
         };
-        let backing = self.texture_backing(storage, storage_size)?;
+        let backing = self.texture_backing_of(object, storage_size)?;
         let base = backing.pieces().first().map_or(0, |(_, range)| range.start);
         let check_started = std::time::Instant::now();
         let backend = self.gpu.as_ref().unwrap();
@@ -4833,9 +4929,18 @@ impl Nvn {
         let current = self.texture_identity(entry.x[0]);
         let mut resolved = entry.x[0];
         if registered.0 != 0 && current != Some(registered) {
-            let retired = super::retired_texture(registered);
-            if self.objects.contains_key(&retired) {
-                resolved = retired;
+            let same_virtual_texture = entry.v[0] != 0
+                && self.virtual_texture_address(entry.x[0]) == Some(entry.v[0])
+                && self
+                    .objects
+                    .get(&entry.x[0])
+                    .and_then(|object| object.builder.get("Format"))
+                    .is_some_and(|format| format.x[0] == registered.1);
+            if !same_virtual_texture {
+                let retired = super::retired_texture(registered);
+                if self.objects.contains_key(&retired) {
+                    resolved = retired;
+                }
             }
         }
         // ECHORA_HANDLE_LOG=<storage hex>[,...] (debugging): each lookup of
@@ -13439,6 +13544,146 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn a_remapped_render_target_keeps_pixels_with_its_physical_storage() {
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x20_0000;
+        let old = 1;
+        let new = 2;
+        let pool = 3;
+        let gpu = 0x10_0000;
+        let args = |x| Args { x, v: [0; 2] };
+        for (key, address) in [(old, base), (new, base + 0x1000), (pool, 0)] {
+            nvn.initialize(
+                key,
+                "MemoryPool",
+                BTreeMap::from([("Storage".into(), args([address, 0x1000, 0, 0]))]),
+            )
+            .unwrap();
+        }
+        nvn.objects
+            .get_mut(&pool)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
+        let texture = 4;
+        let physical_alias = 5;
+        let scalar = |value| args([value, 0, 0, 0]);
+        for (key, pool) in [(texture, pool), (physical_alias, old)] {
+            nvn.initialize(
+                key,
+                "Texture",
+                BTreeMap::from([
+                    ("Target".into(), scalar(1)),
+                    ("Width".into(), scalar(2)),
+                    ("Height".into(), scalar(1)),
+                    ("Levels".into(), scalar(1)),
+                    ("Format".into(), scalar(10)),
+                    ("Storage".into(), args([pool, 0, 0, 0])),
+                ]),
+            )
+            .unwrap();
+        }
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                base,
+                0x3000,
+                READ | WRITE,
+                STATE_NORMAL,
+                "remapped render surfaces",
+            )
+            .unwrap();
+        let colors = [0.125_f32, 0.5].map(f32::to_le_bytes).concat();
+        memory.write(base + 0x1000, &colors).unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let map = |nvn: &mut Nvn, core: &mut Guest<'_>, backing| {
+            let request = base + 0x2000;
+            for (index, word) in [backing, 0, 0, 0x1000_u64].into_iter().enumerate() {
+                core.memory
+                    .write(request + index as u64 * 8, &word.to_le_bytes())
+                    .unwrap();
+            }
+            core.cpu.regs[..3].copy_from_slice(&[pool, 1, request]);
+            assert!(nvn.call("nvnMemoryPoolMapVirtual", core).unwrap());
+        };
+
+        map(&mut nvn, &mut core, old);
+        let descriptors = 6;
+        nvn.initialize(
+            descriptors,
+            "TexturePool",
+            BTreeMap::from([("Storage".into(), args([old, 0, 3, 0]))]),
+        )
+        .unwrap();
+        core.cpu.regs[..4].copy_from_slice(&[descriptors, 1, texture, 0]);
+        assert!(
+            nvn.call("nvnTexturePoolRegisterTexture", &mut core)
+                .unwrap()
+        );
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, descriptors, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+
+        let drawn = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (texture, 0, 0), drawn, None)
+            .unwrap();
+        map(&mut nvn, &mut core, new);
+        assert_eq!(nvn.handle_texture(1), Ok(texture));
+
+        let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, texture).unwrap()
+        else {
+            panic!("the new physical range must not reuse the previous render target");
+        };
+        assert_eq!(texels.as_slice(), colors);
+        let TextureSource::Target(key) = nvn.texture_source(&core, physical_alias).unwrap() else {
+            panic!("the alias of the old storage must keep the rendered texels");
+        };
+        let rendered = [0.75_f32; 2].map(f32::to_le_bytes).concat();
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(key, 4)
+                .unwrap(),
+            rendered
+        );
+        map(&mut nvn, &mut core, old);
+        let (restored, level) = nvn.resolve_target(texture).unwrap();
+        assert_eq!(level, 0);
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(restored, 4)
+                .unwrap(),
+            rendered
+        );
+    }
 
     #[test]
     fn virtual_gpu_pages_use_the_physical_pool_and_follow_remapping() {
