@@ -12,10 +12,12 @@
 
 use ash::vk;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"ECSB";
 const FORMAT: u32 = 1;
+const HEADER_SIZE: usize = 28;
 
 /// Vulkan requires 16-byte alignment when exporting or loading a binary.
 /// A byte vector alone only guarantees alignment of one.
@@ -162,23 +164,28 @@ fn key(binary_version: ([u8; 16], u32), infos: &[vk::ShaderCreateInfoEXT], layou
 }
 
 fn read(path: &Path, binary_version: ([u8; 16], u32)) -> Option<Vec<ShaderBinary>> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut rest = bytes.strip_prefix(header(binary_version).as_slice())?;
-    let mut take = |count: usize| {
-        let (taken, after) = rest.split_at_checked(count)?;
-        rest = after;
-        Some(taken)
-    };
-    let stages = u32::from_le_bytes(take(4)?.try_into().ok()?);
+    let file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut reader = BufReader::new(file);
+    let mut prefix = [0; HEADER_SIZE + 4];
+    let mut remaining = length.checked_sub(prefix.len() as u64)?;
+    reader.read_exact(&mut prefix).ok()?;
+    let (encoded_header, count) = prefix.split_at(HEADER_SIZE);
+    if encoded_header != header(binary_version) {
+        return None;
+    }
+    let stages = u32::from_le_bytes(count.try_into().ok()?);
     let mut binaries = Vec::new();
     for _ in 0..stages {
-        let size = usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()?;
-        let encoded = take(size)?;
-        let mut binary = ShaderBinary::zeroed(size)?;
-        binary.bytes_mut().copy_from_slice(encoded);
+        let mut size = [0; 8];
+        reader.read_exact(&mut size).ok()?;
+        let size = u64::from_le_bytes(size);
+        remaining = remaining.checked_sub(8)?.checked_sub(size)?;
+        let mut binary = ShaderBinary::zeroed(usize::try_from(size).ok()?)?;
+        reader.read_exact(binary.bytes_mut()).ok()?;
         binaries.push(binary);
     }
-    rest.is_empty().then_some(binaries)
+    (remaining == 0 && reader.fill_buf().ok()?.is_empty()).then_some(binaries)
 }
 
 fn write(
@@ -208,11 +215,12 @@ fn write(
         .map_err(|error| error.error)
 }
 
-fn header(binary_version: ([u8; 16], u32)) -> Vec<u8> {
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&FORMAT.to_le_bytes());
-    bytes.extend_from_slice(&binary_version.0);
-    bytes.extend_from_slice(&binary_version.1.to_le_bytes());
+fn header(binary_version: ([u8; 16], u32)) -> [u8; HEADER_SIZE] {
+    let mut bytes = [0; HEADER_SIZE];
+    bytes[..4].copy_from_slice(MAGIC);
+    bytes[4..8].copy_from_slice(&FORMAT.to_le_bytes());
+    bytes[8..24].copy_from_slice(&binary_version.0);
+    bytes[24..].copy_from_slice(&binary_version.1.to_le_bytes());
     bytes
 }
 
@@ -243,6 +251,16 @@ mod tests {
             assert!(binary.bytes().as_ptr().addr().is_multiple_of(16));
         }
         assert!(read(&path, ([7; 16], 4)).is_none());
+        let mut encoded = std::fs::read(&path).unwrap();
+        encoded.push(0);
+        std::fs::write(&path, &encoded).unwrap();
+        assert!(read(&path, version).is_none());
+        encoded.truncate(encoded.len() - 2);
+        std::fs::write(&path, &encoded).unwrap();
+        assert!(read(&path, version).is_none());
+        encoded[HEADER_SIZE + 4..HEADER_SIZE + 12].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &encoded).unwrap();
+        assert!(read(&path, version).is_none());
         assert!(read(&path, ([8; 16], 3)).is_none());
         // A truncated file is not a cache entry.
         let bytes = std::fs::read(&path).unwrap();
