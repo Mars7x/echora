@@ -124,6 +124,7 @@ fn available_memory() -> Option<u64> {
         ..Default::default()
     };
     // SAFETY: the structure is writable and declares its required size.
+    #[allow(unsafe_code)]
     let success = unsafe { GlobalMemoryStatusEx(&mut status) };
     (success != 0).then_some(status.ullAvailPhys)
 }
@@ -236,5 +237,11 @@ mod tests {
         assert_eq!(jobs_for_memory(16, Some(24 * GIB)), 4);
         assert_eq!(jobs_for_memory(2, Some(64 * GIB)), 2);
         assert_eq!(jobs_for_memory(16, None), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_available_physical_memory() {
+        assert!(available_memory().is_some_and(|bytes| bytes > 0));
     }
 }
