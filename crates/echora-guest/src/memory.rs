@@ -1515,14 +1515,24 @@ impl Memory {
         self.clear_reservation_for_write(backing, bytes.len());
         let start = address & !(PAGE_SIZE - 1);
         let backing_start = backing & !(PAGE_SIZE - 1);
-        let mut page = start;
         let end = address + bytes.len() as u64;
-        while page < end {
-            if self.pages.resident.insert(backing_start + (page - start)) {
-                // Cached read-only while never written (see `fill_tlb`).
-                self.tlb[(page / PAGE_SIZE) as usize % TLB_ENTRIES].set(EMPTY_TLB_ENTRY);
+        let pages = (end - start).div_ceil(PAGE_SIZE);
+        // A large rewrite can check the resident range in one ordered
+        // walk. Small writes do less work with the individual inserts.
+        let all_resident = pages >= 32
+            && self
+                .pages
+                .resident
+                .range(backing_start..backing_start + pages * PAGE_SIZE)
+                .count() as u64
+                == pages;
+        if !all_resident {
+            for page in (start..end).step_by(PAGE_SIZE as usize) {
+                if self.pages.resident.insert(backing_start + (page - start)) {
+                    // Cached read-only while never written (see `fill_tlb`).
+                    self.tlb[(page / PAGE_SIZE) as usize % TLB_ENTRIES].set(EMPTY_TLB_ENTRY);
+                }
             }
-            page += PAGE_SIZE;
         }
         self.pages.host.write_physical(backing, bytes);
     }
@@ -1965,6 +1975,27 @@ mod tests {
         assert!(memory.read(start, &mut bytes).is_err());
         assert!(memory.equals(start, &expected).is_err());
         assert_eq!(bytes[PAGE_SIZE as usize], 0x11);
+    }
+
+    #[test]
+    fn rewriting_resident_backing_through_an_alias_clears_the_reservation() {
+        let mut memory = Memory::new(1 << 39);
+        let (source, alias, size) = (0x10_0000, 0x20_0000, 32 * PAGE_SIZE);
+        memory
+            .map(source, size, READ | WRITE, STATE_NORMAL, "data")
+            .unwrap();
+        memory.write(source, &vec![0x11; size as usize]).unwrap();
+        memory.map_stack_alias(alias, source, size).unwrap();
+        memory
+            .load_exclusive_single_thread(alias + PAGE_SIZE, 4, false)
+            .unwrap();
+        let data = vec![0x22; size as usize];
+        memory.write(alias, &data).unwrap();
+        assert_eq!(memory.exclusive_reservation(), None);
+        assert!(memory.equals(alias, &data).unwrap());
+        assert_eq!(memory.pages.len(), 32);
+        memory.unmap_stack_alias(alias, source, size).unwrap();
+        assert!(memory.equals(source, &data).unwrap());
     }
 
     #[test]
