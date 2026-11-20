@@ -3114,16 +3114,20 @@ impl Machine {
         let profile = crate::nvn::debug_var_os("ECHORA_NVN_PROFILE")
             .is_some()
             .then(std::time::Instant::now);
-        // Calls under the machine lock (present, lookups) see all work
-        // replayed, before and after them; a queued present leaves the
-        // frame's work to the replay thread.
+        // A queued present leaves this frame's work to the replay thread.
+        // A fresh pool only needs the machine lock to see guest mappings.
         let queued_present =
             name == "nvnQueuePresentTexture" && crate::nvn::Nvn::present_queued_mode();
-        while self.nvn.replay_paused() && !queued_present {
+        let fresh_pool = name == "nvnMemoryPoolInitialize"
+            && self.parallel
+            && crate::nvn::Nvn::replay_thread()
+            && self.nvn.share_pools_at_init()
+            && !self.nvn.holds_object(guest.cpu.regs[0]);
+        while self.nvn.replay_paused() && !queued_present && !fresh_pool {
             self.nvn.resume_replay(&mut guest)?;
         }
         let handled = self.nvn.call(&name, &mut guest)?;
-        while self.nvn.replay_paused() && !queued_present {
+        while self.nvn.replay_paused() && !queued_present && !fresh_pool {
             self.nvn.resume_replay(&mut guest)?;
         }
         if let Some(started) = profile {
@@ -5820,8 +5824,10 @@ impl Worker {
                 std::time::Instant::now(),
             );
         }
+        let checked_pool =
+            thread && name == Some("nvnMemoryPoolInitialize") && nvn.share_pools_at_init();
         let mut made = name
-            .filter(|name| !locked_nvn_call(name))
+            .filter(|name| !checked_pool && !locked_nvn_call(name))
             .is_some_and(|name| self.held_nvn_call_locked(&mut nvn, name));
         if thread && nvn.replay_paused() {
             shared.wake_replay();

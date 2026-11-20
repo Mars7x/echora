@@ -8073,6 +8073,14 @@ impl Nvn {
         Ok(())
     }
 
+    /// Pool sharing at creation needs the machine's checked memory mappings.
+    pub(crate) fn share_pools_at_init(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|backend| backend.renderer.gpu.dma_buf_import.is_some())
+            && super::debug_var_os("ECHORA_SHARE_AT_INIT").is_none_or(|value| value != "0")
+    }
+
     pub(super) fn share_new_pools(&mut self, core: &Guest) {
         // ECHORA_POOL_LOG (debugging): every 300th present, the memory
         // pools a GPU page table would cover: count, bytes by CPU access

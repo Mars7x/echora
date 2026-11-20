@@ -2699,13 +2699,10 @@ impl Nvn {
                 // of it read zero for the pool (an unmapped page), and the
                 // forest's task programs, given zeros, loop in every
                 // workgroup until the loop budget: their first frame ran
-                // the GPU past the kernel's job limit. A call reaching
-                // memory through a worker's view cannot share (the next
-                // present does).
+                // the GPU past the kernel's job limit. The threaded runtime
+                // uses checked memory here when the backend can import it.
                 // ECHORA_SHARE_AT_INIT=0 (debugging): only at presents, as before.
-                if core.memory.can_share()
-                    && !debug_var_os("ECHORA_SHARE_AT_INIT").is_some_and(|value| value == "0")
-                {
+                if core.memory.can_share() && self.share_pools_at_init() {
                     self.share_new_pools(core);
                 }
                 core.cpu.regs[0] = 1;
