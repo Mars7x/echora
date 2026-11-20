@@ -209,9 +209,11 @@ fn write(
         partial.write_all(&(binary.length as u64).to_le_bytes())?;
         partial.write_all(binary.bytes())?;
     }
+    // Close the handle before publication so a subsequent Windows rename
+    // can replace the entry as soon as it becomes visible.
     partial
+        .into_temp_path()
         .persist(path)
-        .map(|_| ())
         .map_err(|error| error.error)
 }
 
