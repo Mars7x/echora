@@ -427,6 +427,8 @@ pub struct Sampler {
     /// A texture view's mip levels (base, count; zero count means the
     /// remaining levels) of an upload; not part of the Vulkan sampler.
     pub view_levels: Option<(u32, u32)>,
+    /// An upload's view of array layers (base, count; zero means the rest).
+    pub view_layers: Option<(u32, u32)>,
 }
 
 impl PartialEq for Sampler {
@@ -459,7 +461,7 @@ impl PartialEq for Sampler {
             components(other.components),
             other.format,
             other.view_levels,
-        )
+        ) && self.view_layers == other.view_layers
     }
 }
 
@@ -478,6 +480,7 @@ impl Default for Sampler {
             components: vk::ComponentMapping::default(),
             format: None,
             view_levels: None,
+            view_layers: None,
         }
     }
 }

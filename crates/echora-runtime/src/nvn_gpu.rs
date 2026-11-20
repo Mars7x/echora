@@ -3305,12 +3305,13 @@ impl Nvn {
                 sampler.base_level_only = true;
             }
         }
-        if let (TextureSource::Upload { .. }, Some((base, count))) =
-            (source, self.handle_view_levels(handle))
-        {
-            if base != 0 || count != 0 {
-                sampler.view_levels = Some((base, count));
-            }
+        if matches!(source, TextureSource::Upload { .. }) {
+            sampler.view_levels = self
+                .handle_view_levels(handle)
+                .filter(|&range| range != (0, 0));
+            sampler.view_layers = self
+                .handle_view_layers(handle)
+                .filter(|&range| range != (0, 0));
         }
         sampler
     }
@@ -12155,6 +12156,7 @@ mod target_tests {
                     props: BTreeMap::from([
                         ("Format".into(), args([view, 0, 0, 0])),
                         ("Levels".into(), args([1, 0, 0, 0])),
+                        ("Layers".into(), args([1, 2, 0, 0])),
                     ]),
                     ..Default::default()
                 },
@@ -12164,7 +12166,7 @@ mod target_tests {
                 generation: 1,
                 width: 4,
                 height: 4,
-                shape: ImageShape::D2 { layers: 1 },
+                shape: ImageShape::D2 { layers: 4 },
                 format: upload,
                 texels: Default::default(),
                 levels: Default::default(),
@@ -12172,6 +12174,7 @@ mod target_tests {
             let sampler = nvn.binding_sampler(u64::from(index), &source);
             assert_eq!(sampler.format, Some(expected));
             assert_eq!(sampler.view_levels, Some((1, 0)));
+            assert_eq!(sampler.view_layers, Some((1, 2)));
         }
     }
 

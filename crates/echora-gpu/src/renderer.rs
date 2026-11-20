@@ -677,7 +677,6 @@ pub struct Renderer {
 
 #[derive(PartialEq, Eq, Hash)]
 enum ExtraView {
-    Sampled(vk::ImageViewType),
     SampledRange {
         view_type: vk::ImageViewType,
         base_level: u32,
@@ -2085,7 +2084,7 @@ impl Renderer {
         sampler: &crate::draw::Sampler,
     ) -> Result<vk::ImageView, String> {
         let (components, format) = (sampler.components, sampler.format);
-        let plain = self.texture_view(source, texture_type)?;
+        let plain = self.texture_view_with_layers(source, texture_type, sampler.view_layers)?;
         let plain = match sampler.view_levels {
             Some((base, count)) => self.level_view_of(plain, base, count)?,
             None => plain,
@@ -2213,6 +2212,15 @@ impl Renderer {
         source: &crate::draw::TextureSource,
         texture_type: u32,
     ) -> Result<vk::ImageView, String> {
+        self.texture_view_with_layers(source, texture_type, None)
+    }
+
+    fn texture_view_with_layers(
+        &mut self,
+        source: &crate::draw::TextureSource,
+        texture_type: u32,
+        layer_range: Option<(u32, u32)>,
+    ) -> Result<vk::ImageView, String> {
         use crate::draw::{ImageShape, TextureSource};
         if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = source {
             self.cancel_target_archive(*key);
@@ -2309,7 +2317,7 @@ impl Renderer {
                         _ => {}
                     }
                 }
-                return self.texture_view(&source, texture_type);
+                return self.texture_view_with_layers(&source, texture_type, layer_range);
             }
         }
         // A view of some mip levels and/or array layers (cube faces) of a
@@ -2365,43 +2373,18 @@ impl Renderer {
             }
             self.transition(key, vk::ImageLayout::GENERAL)?;
             let target = &self.targets[&key];
-            let cache = (
-                target.image,
-                ExtraView::SampledRange {
-                    view_type,
-                    base_level,
-                    level_count,
-                    base_layer,
-                    layer_count,
-                },
-            );
-            if let Some(view) = self.extra_views.get(&cache) {
-                return Ok(*view);
-            }
-            let mut subresource = range(target.format);
-            if has_stencil(target.format) {
-                subresource.aspect_mask = vk::ImageAspectFlags::DEPTH;
-            }
-            let mut usage =
-                vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
-            let info = vk::ImageViewCreateInfo::default()
-                .image(target.image)
-                .view_type(view_type)
-                .format(target.format)
-                .subresource_range(vk::ImageSubresourceRange {
+            return self.sampled_range_view(ViewInfo {
+                image: target.image,
+                view_type,
+                format: target.format,
+                range: vk::ImageSubresourceRange {
                     base_mip_level: base_level,
                     level_count,
                     base_array_layer: base_layer,
                     layer_count,
-                    ..subresource
-                })
-                .push_next(&mut usage);
-            // SAFETY: the image is live; the view is destroyed with it.
-            let view = unsafe { self.gpu.device.create_image_view(&info, None) }
-                .map_err(vk_error("vkCreateImageView"))?;
-            self.extra_views.insert(cache, view);
-            self.view_infos.insert(view, ViewInfo::of(&info));
-            return Ok(view);
+                    ..range(target.format)
+                },
+            });
         }
         // A 3D binding of a 2D render target: the application renders a 3D
         // colour lookup table slice by slice, which 2D targets do not hold
@@ -2498,23 +2481,34 @@ impl Renderer {
             6 => vk::ImageViewType::CUBE_ARRAY,
             _ => vk::ImageViewType::TYPE_2D,
         };
-        if wanted == own_view_type(target.shape) {
+        if wanted == own_view_type(target.shape) && layer_range.is_none() {
             return Ok(target.sampled_view);
         }
-        let cache = (target.image, ExtraView::Sampled(wanted));
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
-        }
         let layers = target.shape.layers();
+        let (base_layer, count) = layer_range.unwrap_or_default();
+        let remaining = layers
+            .checked_sub(base_layer)
+            .filter(|&remaining| remaining != 0)
+            .ok_or_else(|| format!("texture {key:x} has no layer {base_layer}"))?;
+        let selected = if count == 0 {
+            remaining
+        } else {
+            count.min(remaining)
+        };
         let layer_count = match (wanted, target.shape) {
             (vk::ImageViewType::TYPE_1D, ImageShape::D1 { .. })
-            | (vk::ImageViewType::TYPE_2D, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => 1,
+            | (vk::ImageViewType::TYPE_2D, ImageShape::D2 { .. } | ImageShape::Cube { .. })
+            | (vk::ImageViewType::TYPE_3D, ImageShape::D3 { .. }) => 1,
             (vk::ImageViewType::TYPE_1D_ARRAY, ImageShape::D1 { .. })
             | (vk::ImageViewType::TYPE_2D_ARRAY, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => {
-                layers
+                selected
             }
-            (vk::ImageViewType::CUBE, ImageShape::Cube { .. }) => 6,
-            (vk::ImageViewType::CUBE_ARRAY, ImageShape::Cube { .. }) => layers,
+            (vk::ImageViewType::CUBE, ImageShape::Cube { .. }) if selected >= 6 => 6,
+            (vk::ImageViewType::CUBE_ARRAY, ImageShape::Cube { .. })
+                if selected.is_multiple_of(6) =>
+            {
+                selected
+            }
             _ => {
                 let what = match source {
                     TextureSource::Target(_) | TextureSource::TargetView { .. } => "render target",
@@ -2526,20 +2520,46 @@ impl Renderer {
                 ));
             }
         };
-        let mut subresource = range(target.format);
-        if has_stencil(target.format) {
-            subresource.aspect_mask = vk::ImageAspectFlags::DEPTH;
+        if wanted == own_view_type(target.shape) && (base_layer, layer_count) == (0, layers) {
+            return Ok(target.sampled_view);
+        }
+        self.sampled_range_view(ViewInfo {
+            image: target.image,
+            view_type: wanted,
+            format: target.format,
+            range: vk::ImageSubresourceRange {
+                level_count: target.levels,
+                base_array_layer: base_layer,
+                layer_count,
+                ..range(target.format)
+            },
+        })
+    }
+
+    /// Read-only view of the selected mips and layers of a live image.
+    fn sampled_range_view(&mut self, mut view: ViewInfo) -> Result<vk::ImageView, String> {
+        let cache = (
+            view.image,
+            ExtraView::SampledRange {
+                view_type: view.view_type,
+                base_level: view.range.base_mip_level,
+                level_count: view.range.level_count,
+                base_layer: view.range.base_array_layer,
+                layer_count: view.range.layer_count,
+            },
+        );
+        if let Some(existing) = self.extra_views.get(&cache) {
+            return Ok(*existing);
+        }
+        if has_stencil(view.format) {
+            view.range.aspect_mask = vk::ImageAspectFlags::DEPTH;
         }
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
         let info = vk::ImageViewCreateInfo::default()
-            .image(target.image)
-            .view_type(wanted)
-            .format(target.format)
-            .subresource_range(vk::ImageSubresourceRange {
-                level_count: target.levels,
-                layer_count,
-                ..subresource
-            })
+            .image(view.image)
+            .view_type(view.view_type)
+            .format(view.format)
+            .subresource_range(view.range)
             .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
@@ -8305,6 +8325,59 @@ mod tests {
                 (range.base_mip_level, range.level_count),
                 (relative_base, 4 - relative_base)
             );
+        }
+    }
+
+    #[test]
+    fn upload_views_select_layers_and_mips_together() {
+        use crate::draw::{ImageShape, Sampler, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let mut texels = Vec::new();
+        let mut levels = Vec::new();
+        for level in 0..2 {
+            let size = 2 >> level;
+            for layer in 0..4 {
+                levels.push(UploadRegion {
+                    level,
+                    layer,
+                    width: size,
+                    height: size,
+                    depth: 1,
+                    offset: texels.len() as u64,
+                });
+                texels.extend(std::iter::repeat_n(layer as u8, (size * size * 4) as usize));
+            }
+        }
+        let source = TextureSource::Upload {
+            key: 19,
+            generation: 1,
+            width: 2,
+            height: 2,
+            shape: ImageShape::D2 { layers: 4 },
+            format: vk::Format::R8G8B8A8_UNORM,
+            texels: std::sync::Arc::new(texels),
+            levels: levels.into(),
+        };
+        for (texture_type, layers, selected) in [
+            (2, (2, 0), (2, 1)),
+            (3, (2, 0), (2, 2)),
+            (3, (1, 1), (1, 1)),
+            (3, (2, 0), (2, 2)),
+        ] {
+            let sampler = Sampler {
+                view_levels: Some((1, 0)),
+                view_layers: Some(layers),
+                ..Default::default()
+            };
+            let view = renderer
+                .texture_view_swizzled(&source, texture_type, &sampler)
+                .unwrap();
+            let range = renderer.view_infos[&view].range;
+            assert_eq!((range.base_mip_level, range.level_count), (1, 1));
+            assert_eq!((range.base_array_layer, range.layer_count), selected);
         }
     }
 
