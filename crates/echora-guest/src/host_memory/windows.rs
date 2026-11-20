@@ -469,6 +469,20 @@ impl HostMemory {
         unsafe { &mut *self.physical.base.as_ptr().add(page as usize).cast() }
     }
 
+    /// Readable bytes in the physical view, up to `length` and the
+    /// current section boundary.
+    pub(crate) fn physical_read_span(&self, address: u64, length: usize) -> &[u8] {
+        debug_assert!(address + length as u64 <= self.size);
+        let length = length.min((CHUNK - address % CHUNK) as usize);
+        if self.chunks[(address / CHUNK) as usize].is_none() {
+            return &ZERO_PAGE[..length.min(PAGE_SIZE as usize)];
+        }
+        // SAFETY: the mapped chunk contains the whole span.
+        unsafe {
+            std::slice::from_raw_parts(self.physical.base.as_ptr().add(address as usize), length)
+        }
+    }
+
     /// Copy bytes into the canonical memory file's physical view, mapping
     /// each backing section before copying bytes into its view.
     pub(crate) fn write_physical(&mut self, mut address: u64, mut bytes: &[u8]) {

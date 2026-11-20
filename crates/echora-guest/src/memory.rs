@@ -119,7 +119,7 @@ impl Pages {
     /// The host-written page at backing address `page` (its "slot" is that
     /// address): the TLB serves only those, so host writes to new pages take
     /// the slow path that records them as resident. Every other page still
-    /// reads correctly through `get`.
+    /// reads through the physical view.
     fn slot_of(&self, page: u64) -> Option<usize> {
         self.resident.contains(&page).then_some(page as usize)
     }
@@ -127,10 +127,6 @@ impl Pages {
     /// Host address of a slot's page storage (stable for the file's life).
     fn slot_address(&self, slot: usize) -> usize {
         self.host.page_address(slot as u64)
-    }
-
-    fn get(&self, page: &u64) -> Option<&[u8; PAGE_SIZE as usize]> {
-        Some(self.host.page(*page))
     }
 
     #[cfg(test)]
@@ -998,44 +994,46 @@ impl Memory {
 
     /// Whether the readable bytes at `address` equal `expected`, compared
     /// in place (host-side change checks of large guest buffers).
-    pub fn equals(&self, address: u64, expected: &[u8]) -> Result<bool, Trap> {
+    pub fn equals(&self, address: u64, mut expected: &[u8]) -> Result<bool, Trap> {
         self.validate_access(address, expected.len(), READ)?;
-        let mut done = 0;
-        while done < expected.len() {
-            let current = address + done as u64;
-            let page = current & !(PAGE_SIZE - 1);
-            let offset = (current - page) as usize;
-            let count = (PAGE_SIZE as usize - offset).min(expected.len() - done);
-            let same = match self.pages.get(&self.backing_page(page)) {
-                Some(bytes) => bytes[offset..offset + count] == expected[done..done + count],
-                None => expected[done..done + count].iter().all(|byte| *byte == 0),
-            };
-            if !same {
+        for bytes in self.readable_spans(address, expected.len()) {
+            let (prefix, rest) = expected.split_at(bytes.len());
+            if bytes != prefix {
                 return Ok(false);
             }
-            done += count;
+            expected = rest;
         }
         Ok(true)
     }
 
     #[cold]
     #[inline(never)]
-    fn read_slow(&self, address: u64, out: &mut [u8]) -> Result<(), Trap> {
+    fn read_slow(&self, address: u64, mut out: &mut [u8]) -> Result<(), Trap> {
         self.validate_access(address, out.len(), READ)?;
-        let mut done = 0;
-        while done < out.len() {
-            let current = address + done as u64;
-            let page = current & !(PAGE_SIZE - 1);
-            let offset = (current - page) as usize;
-            let count = (PAGE_SIZE as usize - offset).min(out.len() - done);
-            if let Some(bytes) = self.pages.get(&self.backing_page(page)) {
-                out[done..done + count].copy_from_slice(&bytes[offset..offset + count]);
-            } else {
-                out[done..done + count].fill(0);
-            }
-            done += count;
+        for bytes in self.readable_spans(address, out.len()) {
+            let (prefix, rest) = out.split_at_mut(bytes.len());
+            prefix.copy_from_slice(bytes);
+            out = rest;
         }
         Ok(())
+    }
+
+    /// Visit a validated range in contiguous physical spans. Backing
+    /// changes at alias boundaries and may be split by the host mapping.
+    fn readable_spans(&self, mut address: u64, length: usize) -> impl Iterator<Item = &[u8]> {
+        let end = address + length as u64;
+        std::iter::from_fn(move || {
+            if address == end {
+                return None;
+            }
+            let (backing, stop) = self.backing_span(address, end);
+            let bytes = self
+                .pages
+                .host
+                .physical_read_span(backing, (stop - address) as usize);
+            address += bytes.len() as u64;
+            Some(bytes)
+        })
     }
 
     #[inline]
@@ -1926,6 +1924,47 @@ mod tests {
             .map(0x10000, 0x4000, READ | WRITE, STATE_NORMAL, "heap")
             .unwrap();
         assert_eq!(memory.load_u64(0x10008), 0);
+    }
+
+    #[test]
+    fn bulk_reads_and_comparisons_follow_backing_across_aliases() {
+        let mut memory = Memory::new(1 << 39);
+        let source = 0x20_0000 - PAGE_SIZE;
+        let alias = 0x50_0000;
+        let tail = alias + 2 * PAGE_SIZE;
+        for (base, size) in [
+            (source, 2 * PAGE_SIZE),
+            (alias - PAGE_SIZE, PAGE_SIZE),
+            (tail, PAGE_SIZE),
+        ] {
+            memory
+                .map(base, size, READ | WRITE, STATE_NORMAL, "data")
+                .unwrap();
+        }
+        memory.store_u32(source + PAGE_SIZE - 2, 0x4433_2211);
+        memory.store_u8(alias - 1, 0xff);
+        memory.store_u8(tail, 0x55);
+        memory
+            .map_stack_alias(alias, source, 2 * PAGE_SIZE)
+            .unwrap();
+
+        let start = alias - 2;
+        let mut expected = vec![0; 4 + 2 * PAGE_SIZE as usize];
+        expected[1] = 0xff;
+        expected[PAGE_SIZE as usize..PAGE_SIZE as usize + 4]
+            .copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        expected[2 + 2 * PAGE_SIZE as usize] = 0x55;
+        let mut bytes = vec![0x77; expected.len()];
+        memory.read(start, &mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(memory.equals(start, &expected).unwrap());
+        expected[PAGE_SIZE as usize] = 0;
+        assert!(!memory.equals(start, &expected).unwrap());
+
+        memory.set_permissions(tail, PAGE_SIZE, 0).unwrap();
+        assert!(memory.read(start, &mut bytes).is_err());
+        assert!(memory.equals(start, &expected).is_err());
+        assert_eq!(bytes[PAGE_SIZE as usize], 0x11);
     }
 
     #[test]

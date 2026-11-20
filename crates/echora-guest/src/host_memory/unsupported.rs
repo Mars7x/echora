@@ -36,6 +36,10 @@ impl HostMemory {
         match self.never {}
     }
 
+    pub(crate) fn physical_read_span(&self, _address: u64, _length: usize) -> &[u8] {
+        match self.never {}
+    }
+
     pub(crate) fn write_physical(&mut self, _address: u64, _bytes: &[u8]) {
         match self.never {}
     }

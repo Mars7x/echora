@@ -167,6 +167,13 @@ impl HostMemory {
         unsafe { &mut *self.physical.as_ptr().add(page as usize).cast() }
     }
 
+    /// Readable bytes in the physical view, up to `length`.
+    pub(crate) fn physical_read_span(&self, address: u64, length: usize) -> &[u8] {
+        debug_assert!(address + length as u64 <= self.size);
+        // SAFETY: the canonical file is mapped and readable over this span.
+        unsafe { std::slice::from_raw_parts(self.physical.as_ptr().add(address as usize), length) }
+    }
+
     /// Copy bytes into the canonical memory file's physical view.
     pub(crate) fn write_physical(&mut self, address: u64, bytes: &[u8]) {
         debug_assert!(address + bytes.len() as u64 <= self.size);
