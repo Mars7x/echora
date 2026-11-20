@@ -991,12 +991,43 @@ impl Emitter {
         let byte = self.value(op::I_ADD, self.u32, &[at, offset]);
         let two = self.constant(2);
         let word = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[byte, two]);
-        let last = self.constant(bytes / 4 - 1);
+        let (clamped, inside) = self.clamp_array_index(word, bytes / 4 - 1);
+        (self.array_element(variable, storage_class, clamped), inside)
+    }
+
+    fn clamp_array_index(&mut self, word: u32, last: u32) -> (u32, u32) {
+        let last = self.constant(last);
         let inside = self.value(op::U_LESS_THAN_EQUAL, self.bool, &[word, last]);
         let clamped = self.glsl(self.u32, glsl::U_MIN, &[word, last]);
-        let pointer = self.module.pointer(storage_class, self.u32);
-        let element = self.value(op::ACCESS_CHAIN, pointer, &[variable, clamped]);
-        (element, inside)
+        (clamped, inside)
+    }
+
+    fn array_element(&mut self, variable: u32, class: u32, word: u32) -> u32 {
+        let pointer = self.module.pointer(class, self.u32);
+        self.value(op::ACCESS_CHAIN, pointer, &[variable, word])
+    }
+
+    /// An aligned access into an array sized in whole groups is either
+    /// wholly inside or wholly outside. Its later words cannot wrap.
+    fn array_group(
+        &mut self,
+        bytes: u32,
+        address: Address,
+        at: u32,
+        count: u32,
+    ) -> Option<(u32, u32)> {
+        let width = count * 4;
+        if count <= 1
+            || !bytes.is_multiple_of(width)
+            || !(address.offset as u32).is_multiple_of(width)
+            || (address.reg != Reg::ZERO && !u32::from(address.scale).is_multiple_of(width))
+            || address.uniform.is_some()
+        {
+            return None;
+        }
+        let two = self.constant(2);
+        let word = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[at, two]);
+        Some(self.clamp_array_index(word, bytes / 4 - count))
     }
 
     fn array_load(
@@ -1009,10 +1040,16 @@ impl Emitter {
         let (variable, bytes) = self.array(index, space)?;
         let class = storage_class(space);
         let at = self.array_address(address);
+        let group = self.array_group(bytes, address, at, count);
         let zero = self.constant(0);
         let mut values = Vec::new();
         for n in 0..count {
-            let (element, inside) = self.array_word(variable, class, bytes, at, n);
+            let (element, inside) = if let Some((first, inside)) = group {
+                let word = self.offset_array_index(first, n);
+                (self.array_element(variable, class, word), inside)
+            } else {
+                self.array_word(variable, class, bytes, at, n)
+            };
             let value = self.value(op::LOAD, self.u32, &[element]);
             values.push(self.value(op::SELECT, self.u32, &[inside, value, zero]));
         }
@@ -1031,6 +1068,16 @@ impl Emitter {
         let (variable, bytes) = self.array(index, space)?;
         let class = storage_class(space);
         let at = self.array_address(address);
+        if let Some((first, inside)) = self.array_group(bytes, address, at, values.len() as u32) {
+            return self.when(inside, |e| {
+                for (n, &value) in values.iter().enumerate() {
+                    let word = e.offset_array_index(first, n as u32);
+                    let element = e.array_element(variable, class, word);
+                    e.function.emit(op::STORE, &[element, value]);
+                }
+                Ok(())
+            });
+        }
         for (n, &value) in values.iter().enumerate() {
             let (element, inside) = self.array_word(variable, class, bytes, at, n as u32);
             self.when(inside, |e| {
@@ -1039,6 +1086,15 @@ impl Emitter {
             })?;
         }
         Ok(())
+    }
+
+    fn offset_array_index(&mut self, first: u32, n: u32) -> u32 {
+        if n == 0 {
+            first
+        } else {
+            let offset = self.constant(n);
+            self.value(op::I_ADD, self.u32, &[first, offset])
+        }
     }
 }
 
@@ -1051,5 +1107,99 @@ fn storage_class(space: Space) -> u32 {
         storage::WORKGROUP
     } else {
         storage::FUNCTION
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute::{Layout, translate_with_registers};
+    use crate::decode::Src;
+    use crate::sim::{Inputs, Machine};
+
+    #[test]
+    fn aligned_shared_groups_preserve_word_boundaries() {
+        let instruction = |op| Instruction {
+            raw: 0,
+            guard: Pred::TRUE,
+            op,
+            uniform: false,
+        };
+        let address = |reg, offset| Address {
+            reg,
+            offset,
+            scale: 8,
+            wide: false,
+            uniform: None,
+        };
+        let initial = address(Reg::ZERO, 0);
+        let store = |data, address| {
+            instruction(Op::Store {
+                data: Reg(data),
+                space: Space::Shared,
+                address,
+                size: 5,
+                strong: false,
+            })
+        };
+        let load = |d, address| {
+            instruction(Op::Load {
+                d: Reg(d),
+                space: Space::Shared,
+                address,
+                size: 5,
+                condition: Pred::TRUE,
+                strong: false,
+            })
+        };
+        let mov = |d, value| {
+            instruction(Op::Mov {
+                d: Reg(d),
+                src: Src::Imm(value),
+                lanes: 0xf,
+            })
+        };
+        let a = 0x1234_5678;
+        let b = 0x8765_4321;
+        let c = 0xabcd_ef01;
+        let d = 0xfedc_ba98;
+        for (bytes, index, offset, touched, first) in [
+            (8, 0, 0, [c, d], [c, d]),
+            (8, 1, 0, [0, 0], [a, b]),
+            (8, u32::MAX, 0, [0, 0], [a, b]),
+            (8, u32::MAX, 4, [0, d], [d, b]),
+            (8, 0, 4, [c, 0], [a, c]),
+            (12, 1, 0, [c, 0], [a, b]),
+        ] {
+            let target = address(Reg(0), offset);
+            let code = [
+                mov(0, index),
+                mov(1, a),
+                mov(2, b),
+                mov(3, c),
+                mov(4, d),
+                store(1, initial),
+                store(3, target),
+                load(5, target),
+                load(7, initial),
+                instruction(Op::Exit {
+                    condition: Pred::TRUE,
+                }),
+            ];
+            let layout = Layout {
+                shared_bytes: Some(bytes),
+                ..Layout::workgroup([1, 1, 1])
+            };
+            let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1, 1, 1],
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let read = |reg| report.invocations[0][&registers[&reg]][0] as u32;
+            assert_eq!([read(5), read(6)], touched);
+            assert_eq!([read(7), read(8)], first);
+        }
     }
 }
