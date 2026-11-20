@@ -133,12 +133,9 @@ pub struct Backend {
     handle_reads: HashMap<usize, Arc<shader::handle_reads::HandleReads>>,
     global_writes: HashMap<usize, (shader::handle_reads::GlobalWrites, [u32; 3])>,
     uniform_writes: HashMap<usize, shader::handle_reads::UniformWriteRanges>,
-    /// Most recent writer bounded using the page table's shared mappings.
-    projected_write_serial: u64,
-    /// Last unbounded store and bounded writes in submission order, each
-    /// with disjoint file ranges ordered by file and offset.
+    /// Last unbounded store and bounded writes in submission order.
     unbounded_write_serial: u64,
-    shared_writes: VecDeque<(u64, Vec<SharedRange>)>,
+    shared_writes: VecDeque<(u64, BoundedWrites)>,
     /// Compute stage keys translated with raw storage pointers
     /// (`Parameters::native_pointers`).
     native_programs: std::collections::HashSet<u64>,
@@ -297,6 +294,34 @@ struct SharedRange {
     end: u64,
 }
 
+/// Files a submission can change and the virtual ranges that need to be
+/// projected again if its page table receives new entries.
+struct BoundedWrites {
+    shared: Vec<SharedRange>,
+    virtual_ranges: Vec<std::ops::Range<u64>>,
+}
+
+impl From<Vec<SharedRange>> for BoundedWrites {
+    fn from(shared: Vec<SharedRange>) -> Self {
+        Self {
+            shared,
+            virtual_ranges: Vec::new(),
+        }
+    }
+}
+
+fn merge_shared_writes(ranges: &mut Vec<SharedRange>) {
+    ranges.sort_unstable_by_key(|range| (range.file, range.start));
+    ranges.dedup_by(|next, previous| {
+        if next.file == previous.file && next.start <= previous.end {
+            previous.end = previous.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+}
+
 impl SharedRange {
     fn overlaps(self, other: Self) -> bool {
         self.file == other.file && self.start < other.end && other.start < self.end
@@ -443,7 +468,6 @@ impl Backend {
             handle_reads: HashMap::default(),
             global_writes: HashMap::default(),
             uniform_writes: HashMap::default(),
-            projected_write_serial: 0,
             unbounded_write_serial: 0,
             shared_writes: VecDeque::new(),
             native_programs: Default::default(),
@@ -491,30 +515,36 @@ impl Backend {
         }))
     }
 
-    fn record_page_table_write(&mut self, serial: u64, bounded: Option<Vec<SharedRange>>) {
+    fn record_page_table_write(&mut self, serial: u64, bounded: Option<BoundedWrites>) {
         self.page_table_writes = true;
         self.page_table_wrote = true;
         self.page_table_wrote_after_signal = true;
         self.page_table_write_serial = serial;
-        if let Some(mut ranges) = bounded {
+        if let Some(mut writes) = bounded {
             let done = self.renderer.completed_serial();
             self.discard_shared_writes_through(done);
-            debug_assert!(
-                self.shared_writes
-                    .back()
-                    .is_none_or(|&(previous, _)| previous <= serial)
-            );
-            if !ranges.is_empty() {
-                ranges.sort_unstable_by_key(|range| (range.file, range.start));
-                ranges.dedup_by(|next, previous| {
-                    if next.file == previous.file && next.start <= previous.end {
-                        previous.end = previous.end.max(next.end);
-                        true
-                    } else {
-                        false
+            if serial > self.unbounded_write_serial
+                && (!writes.shared.is_empty() || !writes.virtual_ranges.is_empty())
+            {
+                if let Some((previous_serial, previous)) = self.shared_writes.back_mut()
+                    && *previous_serial == serial
+                {
+                    if !writes.shared.is_empty() && previous.shared != writes.shared {
+                        previous.shared.append(&mut writes.shared);
+                        merge_shared_writes(&mut previous.shared);
                     }
-                });
-                self.shared_writes.push_back((serial, ranges));
+                    for range in writes.virtual_ranges {
+                        add_range(&mut previous.virtual_ranges, range);
+                    }
+                } else {
+                    debug_assert!(
+                        self.shared_writes
+                            .back()
+                            .is_none_or(|&(previous, _)| previous < serial)
+                    );
+                    merge_shared_writes(&mut writes.shared);
+                    self.shared_writes.push_back((serial, writes));
+                }
             }
         } else {
             self.unbounded_write_serial = serial;
@@ -525,24 +555,96 @@ impl Backend {
     fn set_page_table(
         &mut self,
         key: (usize, u64),
-        first: u32,
-        entries: &[u64],
+        built: PageBuild,
     ) -> Result<echora_shader_abi::PageTable, String> {
         let previous_address = self.page_table.map(|(_, table)| table.address);
-        let (table, extended) = self.renderer.set_page_table(first, entries)?;
-        if extended {
-            // Programs queued against this buffer can reach its new pages.
-            let projected = std::mem::take(&mut self.projected_write_serial);
-            if projected > self.unbounded_write_serial {
-                self.unbounded_write_serial = projected;
-                self.discard_shared_writes_through(projected);
-            }
-        } else if previous_address != Some(table.address) {
-            // Outstanding programs still address the old table's buffer.
-            self.projected_write_serial = 0;
-        }
+        let (table, extended) = self
+            .renderer
+            .set_page_table(built.first as u32, &built.entries)?;
         self.page_table = Some((key, table));
+        self.page_build = Some(built);
+        if extended {
+            self.extend_pending_writes();
+        } else if previous_address != Some(table.address) {
+            // Outstanding programs still read the retired table. Its
+            // existing file ranges remain valid until their submissions finish.
+            for (_, writes) in &mut self.shared_writes {
+                writes.virtual_ranges.clear();
+            }
+        }
         Ok(table)
+    }
+
+    fn extend_pending_writes(&mut self) {
+        self.discard_shared_writes_through(self.renderer.completed_serial());
+        let Some(latest) = self
+            .shared_writes
+            .iter()
+            .rev()
+            .find(|(_, writes)| !writes.virtual_ranges.is_empty())
+            .map(|&(serial, _)| serial)
+        else {
+            return;
+        };
+        let projected = self
+            .shared_writes
+            .iter()
+            .map(|(_, writes)| {
+                if writes.virtual_ranges.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    self.project_shared_writes(&writes.virtual_ranges)
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(projected) = projected {
+            // Keep the original file ranges too: queued programs can have
+            // observed the table before the new entries became visible.
+            for ((_, writes), mut additional) in self.shared_writes.iter_mut().zip(projected) {
+                if !additional.is_empty() {
+                    writes.shared.append(&mut additional);
+                    merge_shared_writes(&mut writes.shared);
+                }
+            }
+        } else {
+            self.unbounded_write_serial = self.unbounded_write_serial.max(latest);
+            self.discard_shared_writes_through(latest);
+        }
+    }
+
+    fn project_shared_writes(&self, ranges: &[std::ops::Range<u64>]) -> Option<Vec<SharedRange>> {
+        let built = self.page_build.as_ref()?;
+        let mapping = built
+            .shared_mapping
+            .get_or_init(|| {
+                use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+                let (file, imports) = self.renderer.shared_device_file_mappings()?;
+                let imports = imports
+                    .into_iter()
+                    .map(|(device, offset)| writer_ranges::ImportedSpan {
+                        file,
+                        device,
+                        offset,
+                    })
+                    .collect();
+                writer_ranges::project_table(
+                    built.first << PAGE_SHIFT,
+                    PAGE_SIZE,
+                    &built.entries,
+                    imports,
+                )
+            })
+            .as_ref()?;
+        Some(
+            writer_ranges::project_writes(mapping, ranges)?
+                .into_iter()
+                .map(|range| SharedRange {
+                    file: range.file,
+                    start: range.bytes.start,
+                    end: range.bytes.end,
+                })
+                .collect(),
+        )
     }
 
     fn discard_shared_writes_through(&mut self, serial: u64) {
@@ -566,8 +668,12 @@ impl Backend {
             .take_while(|&&(serial, _)| serial > minimum)
             .find(|(_, written)| {
                 let first = written
+                    .shared
                     .partition_point(|span| (span.file, span.end) <= (range.file, range.start));
-                written.get(first).is_some_and(|span| range.overlaps(*span))
+                written
+                    .shared
+                    .get(first)
+                    .is_some_and(|span| range.overlaps(*span))
             })
             .map_or(minimum, |(serial, _)| *serial)
     }
@@ -5974,14 +6080,13 @@ impl Nvn {
             .collect();
         if writes_page_table {
             let serial = backend.renderer.recorded_serial();
-            let (ranges, projected) = bounded.map_or((None, false), |(ranges, projected)| {
-                (Some(ranges), projected)
-            });
-            if projected {
-                backend.projected_write_serial = serial;
+            if bounded
+                .as_ref()
+                .is_some_and(|writes| !writes.virtual_ranges.is_empty())
+            {
                 backend.stat("stat: bounded uniform writes", 1);
             }
-            backend.record_page_table_write(serial, ranges);
+            backend.record_page_table_write(serial, bounded);
         }
         backend.stat(
             "stat: dispatch renderer microseconds",
@@ -6838,16 +6943,18 @@ impl Nvn {
             "stat: page table map microseconds",
             started.elapsed().as_micros() as u64,
         );
-        let table = backend.set_page_table(key, first as u32, &entries)?;
+        let table = backend.set_page_table(
+            key,
+            PageBuild {
+                first,
+                entries,
+                pools: built_pools,
+                shared_mapping: std::cell::OnceCell::new(),
+            },
+        )?;
         if whole.is_some() {
             backend.renderer.take_superseded(superseded);
         }
-        backend.page_build = Some(PageBuild {
-            first,
-            entries,
-            pools: built_pools,
-            shared_mapping: std::cell::OnceCell::new(),
-        });
         backend.stat(
             "stat: page table pinned MiB",
             backend.renderer.addressed_bytes() >> 20,
@@ -8167,7 +8274,7 @@ impl Nvn {
         stage: &Arc<Translated>,
         groups: Option<[u32; 3]>,
         mut constant: impl FnMut(u8, u16) -> Option<u32>,
-    ) -> Option<(Vec<SharedRange>, bool)> {
+    ) -> Option<BoundedWrites> {
         let backend = self.gpu.as_ref()?;
         let key = Arc::as_ptr(stage) as usize;
         if let Some(groups) = groups
@@ -8182,49 +8289,19 @@ impl Nvn {
                 })
                 .collect::<Option<Vec<_>>>()
         {
-            return Some((shared, false));
+            return Some(shared.into());
         }
 
-        let mut ranges = backend.uniform_writes.get(&key)?.intervals(constant)?;
+        let mut virtual_ranges = backend.uniform_writes.get(&key)?.intervals(constant)?;
         let (stamp, _) = backend.page_table?;
         if stamp != (backend.share_generation, self.pool_epoch) {
             return None;
         }
-        let built = backend.page_build.as_ref()?;
-        let mapping = built
-            .shared_mapping
-            .get_or_init(|| {
-                use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
-                let (file, imports) = backend.renderer.shared_device_file_mappings()?;
-                let imports = imports
-                    .into_iter()
-                    .map(|(device, offset)| writer_ranges::ImportedSpan {
-                        file,
-                        device,
-                        offset,
-                    })
-                    .collect();
-                writer_ranges::project_table(
-                    built.first << PAGE_SHIFT,
-                    PAGE_SIZE,
-                    &built.entries,
-                    imports,
-                )
-            })
-            .as_ref()?;
-        merge_ranges(&mut ranges);
-        let shared = writer_ranges::project_writes(mapping, &ranges)?;
-        Some((
-            shared
-                .into_iter()
-                .map(|range| SharedRange {
-                    file: range.file,
-                    start: range.bytes.start,
-                    end: range.bytes.end,
-                })
-                .collect(),
-            true,
-        ))
+        merge_ranges(&mut virtual_ranges);
+        Some(BoundedWrites {
+            shared: backend.project_shared_writes(&virtual_ranges)?,
+            virtual_ranges,
+        })
     }
 
     /// The buffer and offset that share `length` guest bytes at `guest` with
@@ -12332,16 +12409,19 @@ mod pool_tests {
         };
         let range = |file, start, end| SharedRange { file, start, end };
         backend.record_page_table_write(1, None);
-        backend.record_page_table_write(2, Some(vec![range(1, 0, 16)]));
-        backend.record_page_table_write(3, Some(vec![range(2, 0, 16)]));
+        backend.record_page_table_write(2, Some(vec![range(1, 0, 16)].into()));
+        backend.record_page_table_write(3, Some(vec![range(2, 0, 16)].into()));
         backend.record_page_table_write(
             4,
-            Some(vec![
-                range(1, 16, 32),
-                range(2, 24, 32),
-                range(1, 8, 16),
-                range(1, 12, 24),
-            ]),
+            Some(
+                vec![
+                    range(1, 16, 32),
+                    range(2, 24, 32),
+                    range(1, 8, 16),
+                    range(1, 12, 24),
+                ]
+                .into(),
+            ),
         );
 
         assert_eq!(backend.shared_write_serial(range(1, 0, 8)), 2);
@@ -12360,7 +12440,7 @@ mod pool_tests {
     }
 
     #[test]
-    fn projected_write_bounds_survive_replacement_but_not_extension() {
+    fn projected_writes_follow_only_additions_to_their_own_table() {
         let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
@@ -12368,38 +12448,65 @@ mod pool_tests {
         let Some(address) = backend.renderer.buffer_address(buffer) else {
             return;
         };
-        let writes = SharedRange {
+        let page = echora_shader_abi::PAGE_SIZE;
+        let initial = 10 * page;
+        let entries = |addresses: &[u64]| {
+            let mapping = super::writer_ranges::project_table(
+                initial,
+                page,
+                addresses,
+                vec![super::writer_ranges::ImportedSpan {
+                    file: 1,
+                    device: address..address + 2 * page,
+                    offset: 0,
+                }],
+            );
+            super::PageBuild {
+                first: 10,
+                entries: addresses.to_vec(),
+                pools: Default::default(),
+                shared_mapping: std::cell::OnceCell::from(mapping),
+            }
+        };
+        let first = backend
+            .set_page_table((0, 0), entries(&[address, 0, 0]))
+            .unwrap();
+        let touches = |start| SharedRange {
             file: 1,
-            start: 0,
-            end: 16,
+            start,
+            end: start + 8,
         };
-        let unrelated = SharedRange {
-            start: 16,
-            end: 32,
-            ..writes
-        };
-        let initial = backend.set_page_table((0, 0), 10, &[address, 0]).unwrap();
-        backend.record_page_table_write(1, Some(vec![writes]));
-        backend.projected_write_serial = 1;
-
-        let same = backend.set_page_table((0, 1), 10, &[address, 0]).unwrap();
-        assert_eq!(same, initial);
-        assert_eq!(backend.projected_write_serial, 1);
-        let replacement = backend
-            .set_page_table((0, 2), 10, &[address + 4096, 0])
+        backend.record_page_table_write(
+            1,
+            Some(super::BoundedWrites {
+                shared: vec![touches(0)],
+                virtual_ranges: std::iter::once(initial..initial + page + 8).collect(),
+            }),
+        );
+        let unchanged = backend
+            .set_page_table((0, 1), entries(&[address, 0, 0]))
             .unwrap();
-        assert_ne!(replacement.address, initial.address);
-        assert_eq!(backend.projected_write_serial, 0);
-        assert_eq!(backend.shared_write_serial(writes), 1);
-        assert_eq!(backend.shared_write_serial(unrelated), 0);
-
-        backend.record_page_table_write(2, Some(vec![writes]));
-        backend.projected_write_serial = 2;
+        assert_eq!(first, unchanged);
         let extended = backend
-            .set_page_table((0, 3), 10, &[address + 4096, address])
+            .set_page_table((0, 2), entries(&[address, address + page, 0]))
             .unwrap();
-        assert_eq!(extended.address, replacement.address);
-        assert_eq!(backend.shared_write_serial(unrelated), 2);
+        assert_eq!(extended, first);
+        assert_eq!(backend.shared_write_serial(touches(0)), 1);
+        assert_eq!(backend.shared_write_serial(touches(page)), 1);
+        assert_eq!(backend.shared_write_serial(touches(page + 8)), 0);
+        assert_eq!(backend.unbounded_write_serial, 0);
+
+        // A replacement gives newer work a different buffer. The previous
+        // serial's virtual ranges must not be projected through it.
+        let replaced = backend
+            .set_page_table((0, 3), entries(&[address + page, 0, 0]))
+            .unwrap();
+        assert_ne!(replaced.address, first.address);
+        backend
+            .set_page_table((0, 4), entries(&[address + page, address, 0]))
+            .unwrap();
+        assert_eq!(backend.shared_write_serial(touches(page + 8)), 0);
+        assert_eq!(backend.shared_write_serial(touches(page)), 1);
     }
 
     #[test]
@@ -12892,11 +12999,14 @@ mod pool_tests {
         let serial = backend.renderer.recorded_serial();
         backend.record_page_table_write(
             serial,
-            Some(vec![super::SharedRange {
-                file: 2,
-                start: 49,
-                end: 50,
-            }]),
+            Some(
+                vec![super::SharedRange {
+                    file: 2,
+                    start: 49,
+                    end: 50,
+                }]
+                .into(),
+            ),
         );
 
         let mut nvn = Nvn {
@@ -12936,11 +13046,14 @@ mod pool_tests {
         let serial = backend.renderer.recorded_serial();
         backend.record_page_table_write(
             serial,
-            Some(vec![super::SharedRange {
-                file: 1,
-                start: 16,
-                end: 24,
-            }]),
+            Some(
+                vec![super::SharedRange {
+                    file: 1,
+                    start: 16,
+                    end: 24,
+                }]
+                .into(),
+            ),
         );
 
         let mut nvn = Nvn {
