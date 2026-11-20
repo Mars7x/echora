@@ -8330,6 +8330,25 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_counter_reports_follow_command_order() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let (buffer, _) = renderer.resident_buffer(1, 24).unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.samples_report(buffer, 0, 0x1234).unwrap();
+        renderer.samples_report(buffer, 8, 0x2345).unwrap();
+        renderer.samples_report(buffer, 8, 0x3456).unwrap();
+        renderer.mark().unwrap();
+        let token = renderer.read_resident(1, 0, 24).unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            [0_u64, 0, 0x3456].map(u64::to_le_bytes).concat()
+        );
+    }
+
+    #[test]
     fn color_and_depth_clears_follow_a_gpu_condition() {
         let Some(mut renderer) = renderer() else {
             return;

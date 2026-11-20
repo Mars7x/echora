@@ -406,13 +406,47 @@ impl Occlusion {
                 &[],
                 &[],
             );
+            // Keep each count and timestamp together when later reports
+            // overwrite part or all of the same destination.
+            let mut written_words = std::collections::HashSet::new();
             for (index, report) in self.pending.iter().enumerate() {
+                let words = || {
+                    (0..16)
+                        .step_by(4)
+                        .map(|word| (report.buffer, report.offset + word))
+                };
+                if words().any(|word| written_words.contains(&word)) {
+                    let overlap = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(report.buffer)
+                        .offset(report.offset)
+                        .size(16);
+                    device.cmd_pipeline_barrier(
+                        commands,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[overlap],
+                        &[],
+                    );
+                }
+                written_words.extend(words());
                 let copy = vk::BufferCopy {
                     src_offset: sum_at(index as u32),
                     dst_offset: report.offset,
                     size: 8,
                 };
                 device.cmd_copy_buffer(commands, self.sums.buffer, report.buffer, &[copy]);
+                device.cmd_update_buffer(
+                    commands,
+                    report.buffer,
+                    report.offset + 8,
+                    &report.timestamp.to_le_bytes(),
+                );
             }
             let total = vk::BufferCopy {
                 src_offset: sum_at(plan.len() as u32 - 1),
@@ -425,14 +459,6 @@ impl Occlusion {
                 self.accumulator.buffer,
                 &[total],
             );
-            for report in &self.pending {
-                device.cmd_update_buffer(
-                    commands,
-                    report.buffer,
-                    report.offset + 8,
-                    &report.timestamp.to_le_bytes(),
-                );
-            }
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -605,6 +631,9 @@ impl Renderer {
         offset: u64,
         timestamp: u64,
     ) -> Result<(), String> {
+        if !offset.is_multiple_of(4) {
+            return Err("a samples-passed report must be four-byte aligned".into());
+        }
         let counting = self.occlusion()?.active.is_some();
         let resume = self.occlusion()?.resume;
         self.next_segment(false)?;

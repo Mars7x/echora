@@ -52,6 +52,10 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(2);
     });
+    if full && !gpu.compute_full_subgroups {
+        eprintln!("the Vulkan device lacks computeFullSubgroups");
+        std::process::exit(2);
+    }
     println!(
         "device: {}; variant {variant}, accumulator f{accumulator}",
         gpu.name

@@ -38,6 +38,8 @@ pub struct Gpu {
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
     pub compute_subgroup_32: bool,
+    /// Compute shader objects can request fully active subgroups.
+    pub compute_full_subgroups: bool,
     /// Buffers can be given device addresses (bufferDeviceAddress, core in
     /// 1.2): the GPU page table points into them.
     pub buffer_device_address: bool,
@@ -451,12 +453,14 @@ impl Gpu {
             .vulkan_memory_model_device_scope(vulkan_device_scope)
             .timeline_semaphore(s12.timeline_semaphore != 0)
             .buffer_device_address(s12.buffer_device_address != 0);
+        let compute_full_subgroups = s13.compute_full_subgroups != 0;
         let mut enable13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(s13.dynamic_rendering != 0)
             .synchronization2(s13.synchronization2 != 0)
             .shader_demote_to_helper_invocation(s13.shader_demote_to_helper_invocation != 0)
             .maintenance4(s13.maintenance4 != 0)
-            .subgroup_size_control(s13.subgroup_size_control != 0);
+            .subgroup_size_control(s13.subgroup_size_control != 0)
+            .compute_full_subgroups(compute_full_subgroups);
         let mut enable_objects =
             vk::PhysicalDeviceShaderObjectFeaturesEXT::default().shader_object(use_objects);
         let priorities = [1.0f32];
@@ -601,6 +605,7 @@ impl Gpu {
             max_sampler_lod_bias: properties.limits.max_sampler_lod_bias,
             texture_compression_astc_ldr: core.texture_compression_astc_ldr != 0,
             compute_subgroup_32,
+            compute_full_subgroups,
             buffer_device_address,
             texture_pool_layout,
             dynamic_uniform_limit: properties.limits.max_descriptor_set_uniform_buffers_dynamic,
@@ -731,9 +736,12 @@ impl Gpu {
             .code(code)
             .name(c"main")
             .set_layouts(&layouts);
+        if translated.stage == Stage::Mesh {
+            info = info.flags(vk::ShaderCreateFlagsEXT::NO_TASK_SHADER);
+        }
         if self.compute_subgroup_32 && translated.stage == Stage::Compute {
             info = info.push_next(&mut subgroup_32);
-            if whole_subgroups(&translated.spirv) {
+            if self.compute_full_subgroups && whole_subgroups(&translated.spirv) {
                 info = info.flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
             }
         }

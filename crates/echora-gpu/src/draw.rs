@@ -723,6 +723,9 @@ impl Renderer {
         let compute_32 = self.gpu.compute_subgroup_32
             && stages.len() == 1
             && stages[0].stage == crate::shader::Stage::Compute;
+        let has_task = stages
+            .iter()
+            .any(|stage| stage.stage == crate::shader::Stage::Task);
         let mut infos: Vec<_> = stages
             .iter()
             .enumerate()
@@ -732,12 +735,15 @@ impl Renderer {
                     .map_or(vk::ShaderStageFlags::empty(), |next| {
                         stage_flags(next.stage)
                     });
+                let mut flags = vk::ShaderCreateFlagsEXT::empty();
+                if stages.len() > 1 {
+                    flags |= vk::ShaderCreateFlagsEXT::LINK_STAGE;
+                }
+                if stage.stage == crate::shader::Stage::Mesh && !has_task {
+                    flags |= vk::ShaderCreateFlagsEXT::NO_TASK_SHADER;
+                }
                 vk::ShaderCreateInfoEXT::default()
-                    .flags(if stages.len() > 1 {
-                        vk::ShaderCreateFlagsEXT::LINK_STAGE
-                    } else {
-                        vk::ShaderCreateFlagsEXT::empty()
-                    })
+                    .flags(flags)
                     .stage(stage_flags(stage.stage))
                     .next_stage(next)
                     .code_type(vk::ShaderCodeTypeEXT::SPIRV)
@@ -750,7 +756,7 @@ impl Renderer {
             .collect();
         if compute_32 {
             infos[0] = infos[0].push_next(&mut subgroup_32);
-            if crate::vulkan::whole_subgroups(&stages[0].spirv) {
+            if self.gpu.compute_full_subgroups && crate::vulkan::whole_subgroups(&stages[0].spirv) {
                 infos[0] = infos[0].flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
             }
         }
