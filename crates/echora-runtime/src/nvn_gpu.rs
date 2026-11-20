@@ -1879,6 +1879,21 @@ impl Nvn {
                 self.presented_frames
             );
         }
+        let restore = identity.and_then(|identity| {
+            let renderer = &self.gpu.as_ref()?.renderer;
+            let key = super::retired_texture(identity);
+            let target = if previous == identity {
+                renderer
+                    .target_info(texture)
+                    .or_else(|| renderer.target_info(key))
+            } else {
+                renderer.target_info(key)
+            }?;
+            let (width, _) = self.texture_extent(texture).ok()?;
+            // A different width changes the row layout. Keep the retained
+            // image available to texture objects describing that layout.
+            (target.width == width).then_some(key)
+        });
         if let Some(backend) = self.gpu.as_mut() {
             backend.remove_texture_upload(texture);
             backend.texture_checked.remove(&texture);
@@ -1887,17 +1902,13 @@ impl Nvn {
             if renderer.target_info(texture).is_some() {
                 backend.retired_since.insert(retired, self.presented_frames);
             }
-            if let Some(identity) = identity {
-                backend
-                    .retired_since
-                    .remove(&super::retired_texture(identity));
+            if let Some(key) = restore {
+                backend.retired_since.remove(&key);
             }
             let result = renderer
                 .move_target(texture, retired)
-                .and_then(|_| match identity {
-                    Some(identity) => {
-                        renderer.move_target(super::retired_texture(identity), texture)
-                    }
+                .and_then(|_| match restore {
+                    Some(key) => renderer.move_target(key, texture),
                     None => Ok(()),
                 });
             if let Err(error) = result {
@@ -13091,6 +13102,83 @@ mod target_tests {
         assert_eq!(
             renderer.read_target_bytes(2, 4).unwrap(),
             0.5_f32.to_le_bytes().repeat(32)
+        );
+    }
+
+    #[test]
+    fn a_different_width_texture_does_not_consume_a_retained_target() {
+        use crate::nvn::{Bag, Guest, GuestMemory, retired_texture, write_shared};
+        use echora_gpu::draw::TextureSource;
+        use echora_guest::{cpu::Cpu, memory::Memory};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x20_0000;
+        let (pool, device, texture, alias, builder) = (1, 2, 3, 4, 5);
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        let properties = |width| {
+            BTreeMap::from([
+                ("Device".into(), scalar(device)),
+                ("Width".into(), scalar(width)),
+                ("Height".into(), scalar(4)),
+                ("Format".into(), scalar(10)),
+                ("Storage".into(), args([pool, 0, 0, 0])),
+            ])
+        };
+        nvn.initialize(texture, "Texture", properties(16)).unwrap();
+        nvn.initialize(alias, "Texture", properties(16)).unwrap();
+        write_shared(nvn.bags.at(builder)).insert(
+            builder,
+            Bag {
+                kind: "TextureBuilder".into(),
+                props: properties(4),
+                ..Bag::default()
+            },
+        );
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let clear = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (texture, 0, 0), clear, None, 0xf, 0)
+            .unwrap();
+        core.cpu.regs[0] = texture;
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        core.cpu.regs[..2].copy_from_slice(&[texture, builder]);
+        assert!(nvn.call("nvnTextureInitialize", &mut core).unwrap());
+
+        // The smaller object may have its own attachment, whose allocation
+        // has not written any of the larger target's bytes.
+        nvn.ensure_render_target(texture).unwrap();
+        let TextureSource::Target(key) = nvn.texture_source(&core, alias).unwrap() else {
+            panic!("the wider texture lost its GPU texels when creating a different view");
+        };
+        assert_eq!(key, retired_texture((base, 10)));
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(key, 4)
+                .unwrap(),
+            0.75_f32.to_le_bytes().repeat(64)
         );
     }
 
