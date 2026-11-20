@@ -7900,17 +7900,6 @@ mod tests {
             for form in 0..32u32 {
                 let kind = form & 3; // 0 I64, 1 U64, 2 I32, 3 U32
                 let (right, wrap, high_word) = (form & 4 != 0, form & 8 != 0, form & 16 != 0);
-                let shf = word(&[
-                    (0, 12, 0x219),
-                    (16, 8, 3),
-                    (24, 8, 0),
-                    (32, 8, 2),
-                    (64, 8, 1),
-                    (73, 2, u128::from(kind)),
-                    (75, 1, u128::from(wrap)),
-                    (76, 1, u128::from(right)),
-                    (80, 1, u128::from(high_word)),
-                ]);
                 let bits = if kind < 2 { 64 } else { 32 };
                 let amount = if wrap {
                     shift & (bits - 1)
@@ -7933,12 +7922,25 @@ mod tests {
                 } else {
                     shifted as u32
                 };
-                let (r, _) = run(&[low, high, shift], &[shf]);
-                assert_eq!(
-                    r[&3], expected,
-                    "SHF kind {kind} right {right} wrap {wrap} high {high_word}: \
-                     {low:#x} {high:#x} by {shift}"
-                );
+                for (opcode, operand) in [(0x219, 2), (0x819, u128::from(shift))] {
+                    let shf = word(&[
+                        (0, 12, opcode),
+                        (16, 8, 3),
+                        (24, 8, 0),
+                        (32, 32, operand),
+                        (64, 8, 1),
+                        (73, 2, u128::from(kind)),
+                        (75, 1, u128::from(wrap)),
+                        (76, 1, u128::from(right)),
+                        (80, 1, u128::from(high_word)),
+                    ]);
+                    let (r, _) = run(&[low, high, shift], &[shf]);
+                    assert_eq!(
+                        r[&3], expected,
+                        "SHF {opcode:#x} kind {kind} right {right} wrap {wrap} high {high_word}: \
+                         {low:#x} {high:#x} by {shift}"
+                    );
+                }
             }
             // PRMT (index mode): byte n from nibble n of the selector (a's
             // bytes 0-3, c's 4-7; bit 3 replicates the byte's sign).

@@ -2265,11 +2265,18 @@ impl Emitter {
                 let amount = self.constant(u32::from(shift));
                 let shifted = if high {
                     let c = self.integer(index, c)?;
-                    let ty = self.u64();
-                    let joined = self.join(a, c);
-                    let amount = self.constant(32 - u32::from(shift).min(32));
-                    let wide = self.value(op::SHIFT_RIGHT_LOGICAL, ty, &[joined, amount]);
-                    self.value(op::U_CONVERT, self.u32, &[wide])
+                    // Keep the high word of the shifted register pair.
+                    match shift {
+                        0 => c,
+                        1..=31 => {
+                            let remainder = self.constant(32 - u32::from(shift));
+                            let bottom =
+                                self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[a, remainder]);
+                            let top = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[c, amount]);
+                            self.value(op::BITWISE_OR, self.u32, &[top, bottom])
+                        }
+                        _ => a,
+                    }
                 } else {
                     self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[a, amount])
                 };
@@ -2298,9 +2305,36 @@ impl Emitter {
                 right,
                 high_word,
             } => {
-                let ty = self.u64();
                 let width = if kind < 2 { 64 } else { 32 };
                 let signed = kind & 1 == 0;
+                let opcode = match (right, signed) {
+                    (true, true) => op::SHIFT_RIGHT_ARITHMETIC,
+                    (true, false) => op::SHIFT_RIGHT_LOGICAL,
+                    (false, _) => op::SHIFT_LEFT_LOGICAL,
+                };
+                if right == high_word
+                    && let Src::Imm(amount) = shift.src
+                {
+                    let amount = if wrap {
+                        amount & (width - 1)
+                    } else {
+                        amount.min(width)
+                    };
+                    // Fewer than 32 bits shifted outward leave this word
+                    // independent of the other word in the pair.
+                    if amount < 32 {
+                        let input = if right {
+                            self.integer(index, high)?
+                        } else {
+                            self.read_register(low.0)
+                        };
+                        let amount = self.constant(amount);
+                        let word = self.value(opcode, self.u32, &[input, amount]);
+                        self.write_register(d.0, word);
+                        return Ok(());
+                    }
+                }
+                let ty = self.u64();
                 let low = self.read_register(low.0);
                 let high = self.integer(index, high)?;
                 let amount = self.integer(index, shift)?;
@@ -2317,11 +2351,6 @@ impl Emitter {
                 let sixty_three = self.constant(63);
                 let safe = self.glsl(self.u32, glsl::U_MIN, &[amount, sixty_three]);
                 let value = self.join(low, high);
-                let opcode = match (right, signed) {
-                    (true, true) => op::SHIFT_RIGHT_ARITHMETIC,
-                    (true, false) => op::SHIFT_RIGHT_LOGICAL,
-                    (false, _) => op::SHIFT_LEFT_LOGICAL,
-                };
                 let mut shifted = self.value(opcode, ty, &[value, safe]);
                 if width == 64 && !wrap && !(right && signed) {
                     let sixty_four = self.constant(64);
