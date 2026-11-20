@@ -812,21 +812,35 @@ impl Renderer {
     }
 
     pub fn destroy_program(&mut self, program: Program) -> Result<(), String> {
+        self.destroy_programs(std::iter::once(program))
+    }
+
+    /// Release several programs after their last queued use completes.
+    pub fn destroy_programs(
+        &mut self,
+        programs: impl IntoIterator<Item = Program>,
+    ) -> Result<(), String> {
+        let mut programs = programs.into_iter().peekable();
+        if programs.peek().is_none() {
+            return Ok(());
+        }
         self.flush()?;
         let objects = self.gpu.shader_objects()?;
-        // SAFETY: flushed, so nothing uses the program.
-        unsafe {
-            for shader in program.shaders {
-                if shader != vk::ShaderEXT::null() {
-                    objects.destroy_shader(shader, None);
+        for program in programs {
+            // SAFETY: flushed, so nothing uses this program.
+            unsafe {
+                for shader in program.shaders {
+                    if shader != vk::ShaderEXT::null() {
+                        objects.destroy_shader(shader, None);
+                    }
                 }
+                self.gpu
+                    .device
+                    .destroy_pipeline_layout(program.pipeline_layout, None);
+                self.gpu
+                    .device
+                    .destroy_descriptor_set_layout(program.layout, None);
             }
-            self.gpu
-                .device
-                .destroy_pipeline_layout(program.pipeline_layout, None);
-            self.gpu
-                .device
-                .destroy_descriptor_set_layout(program.layout, None);
         }
         Ok(())
     }

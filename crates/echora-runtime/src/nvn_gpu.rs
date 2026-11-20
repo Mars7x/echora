@@ -340,6 +340,12 @@ impl Drop for Backend {
         if let Some(Ok(presenter)) = self.presenter.take() {
             self.renderer.destroy_presenter(presenter);
         }
+        let programs = std::mem::take(&mut self.programs)
+            .into_values()
+            .chain(std::mem::take(&mut self.compute_programs).into_values());
+        if let Err(error) = self.renderer.destroy_programs(programs) {
+            eprintln!("GPU program cleanup: {error}");
+        }
     }
 }
 
