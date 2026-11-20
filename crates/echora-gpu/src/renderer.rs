@@ -3095,6 +3095,7 @@ impl Renderer {
     pub(crate) fn sampler(
         &mut self,
         sampler: &crate::draw::Sampler,
+        integer: bool,
     ) -> Result<vk::Sampler, String> {
         let anisotropy = sampler
             .max_anisotropy
@@ -3126,7 +3127,9 @@ impl Renderer {
             })
         };
         let border = if address.contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER) {
-            border_color(sampler.border)
+            border_color(sampler.border, integer)
+        } else if integer {
+            vk::BorderColor::INT_TRANSPARENT_BLACK
         } else {
             vk::BorderColor::FLOAT_TRANSPARENT_BLACK
         };
@@ -8267,23 +8270,23 @@ mod tests {
             max_anisotropy: limit + 1.0,
             ..Sampler::default()
         };
-        let first = renderer.sampler(&requested).unwrap();
+        let first = renderer.sampler(&requested, false).unwrap();
         let clamped = Sampler {
             max_anisotropy: limit,
             ..requested
         };
         let count = renderer.samplers.len();
-        assert_eq!(renderer.sampler(&clamped).unwrap(), first);
+        assert_eq!(renderer.sampler(&clamped, false).unwrap(), first);
         assert_eq!(renderer.samplers.len(), count);
 
         for sign in [-1.0, 1.0] {
             let limit = renderer.gpu.max_sampler_lod_bias;
             let mut requested = Sampler::default();
             requested.lod[2] = sign * (limit + 1.0);
-            let first = renderer.sampler(&requested).unwrap();
+            let first = renderer.sampler(&requested, false).unwrap();
             requested.lod[2] = sign * limit;
             let count = renderer.samplers.len();
-            assert_eq!(renderer.sampler(&requested).unwrap(), first);
+            assert_eq!(renderer.sampler(&requested, false).unwrap(), first);
             assert_eq!(renderer.samplers.len(), count);
         }
 
@@ -8294,14 +8297,14 @@ mod tests {
             border: [1.0f32.to_bits(); 4],
             ..Sampler::default()
         };
-        let first = renderer.sampler(&base_level).unwrap();
+        let first = renderer.sampler(&base_level, false).unwrap();
         let equivalent = Sampler {
             lod: [0.0, 0.25, 0.0],
             mipmap: vk::SamplerMipmapMode::NEAREST,
             border: [0; 4],
             ..base_level
         };
-        assert_eq!(renderer.sampler(&equivalent).unwrap(), first);
+        assert_eq!(renderer.sampler(&equivalent, false).unwrap(), first);
     }
 
     fn renderer() -> Option<Renderer> {
@@ -9907,14 +9910,28 @@ impl ViewInfo {
 /// black, opaque black or opaque white. Other colours (custom border
 /// colours are not enabled) take the nearest of these by alpha and
 /// brightness.
-fn border_color(rgba: [u32; 4]) -> vk::BorderColor {
+fn border_color(rgba: [u32; 4], integer: bool) -> vk::BorderColor {
+    use vk::BorderColor as Color;
+    let [transparent_black, opaque_black, opaque_white] = if integer {
+        [
+            Color::INT_TRANSPARENT_BLACK,
+            Color::INT_OPAQUE_BLACK,
+            Color::INT_OPAQUE_WHITE,
+        ]
+    } else {
+        [
+            Color::FLOAT_TRANSPARENT_BLACK,
+            Color::FLOAT_OPAQUE_BLACK,
+            Color::FLOAT_OPAQUE_WHITE,
+        ]
+    };
     let [r, g, b, a] = rgba.map(f32::from_bits);
     if a < 0.5 {
-        vk::BorderColor::FLOAT_TRANSPARENT_BLACK
+        transparent_black
     } else if (r + g + b) / 3.0 < 0.5 {
-        vk::BorderColor::FLOAT_OPAQUE_BLACK
+        opaque_black
     } else {
-        vk::BorderColor::FLOAT_OPAQUE_WHITE
+        opaque_white
     }
 }
 

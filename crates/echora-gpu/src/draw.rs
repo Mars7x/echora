@@ -1323,7 +1323,8 @@ impl Renderer {
                         };
                         let view =
                             self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
-                        let sampler = self.sampler(sampler)?;
+                        let sampler =
+                            self.sampler(sampler, descriptor.flags & Descriptor::INTEGER != 0)?;
                         DescriptorSource::Image(vk::DescriptorImageInfo {
                             sampler,
                             image_view: view,

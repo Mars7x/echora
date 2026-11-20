@@ -154,7 +154,14 @@ impl Emitter {
                 cbuf_index: u32::from(texture.bank),
                 cbuf_offset: u32::from(texture.handle_offset),
                 texture_type: view.texture_type,
-                flags: FLAG_READ | if depth { FLAG_DEPTH } else { 0 },
+                flags: FLAG_READ
+                    | if depth {
+                        FLAG_DEPTH
+                    } else if sample_type != SampleType::Float {
+                        Descriptor::INTEGER
+                    } else {
+                        0
+                    },
                 ..Descriptor::default()
             },
         );

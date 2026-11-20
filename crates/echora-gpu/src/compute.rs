@@ -176,7 +176,10 @@ impl Renderer {
                     .ok_or_else(|| format!("no texture for compute binding {binding}"))?;
                 let image_view =
                     self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
-                let sampler = self.sampler(sampler)?;
+                let sampler = self.sampler(
+                    sampler,
+                    descriptor.flags & crate::shader::Descriptor::INTEGER != 0,
+                )?;
                 images.push((
                     binding,
                     [vk::DescriptorImageInfo {
@@ -431,7 +434,7 @@ mod tests {
     use crate::vulkan::Gpu;
 
     #[test]
-    fn compute_fetch_matches_the_texture_view_numeric_type() {
+    fn compute_texture_reads_match_the_view_numeric_type() {
         use crate::draw::{ImageShape, UploadRegion};
         use echora_shader::compute::{Layout, SampledTexture, translate};
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
@@ -467,10 +470,31 @@ mod tests {
         ]);
         let store = word(&[(0, 0x386), (24, 4), (32, 10), (72, 1), (73, 4)]);
         let exit = word(&[(0, 0x94d), (87, 7)]);
-        let code = [
+        let fetch_code = [
             mov(4, u128::from(guest_address)),
             mov(5, 0),
             fetch,
+            store,
+            exit,
+        ];
+        let sample = word(&[
+            (0, 0xb60),
+            (16, 10),
+            (32, 2),
+            (40, 0x10),
+            (61, 1),
+            (64, 255),
+            (72, 1),
+            (81, 7),
+            (87, 3),
+        ]);
+        let border_code = [
+            mov(0, u128::from(1.75f32.to_bits())),
+            mov(1, u128::from(0.5f32.to_bits())),
+            mov(2, 0),
+            mov(4, u128::from(guest_address)),
+            mov(5, 0),
+            sample,
             store,
             exit,
         ];
@@ -488,30 +512,12 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            renderer.fill_resident(output, 0, 4, 0).unwrap();
             let formats = [SampledTexture {
                 bank: 0,
                 offset: 0x40,
                 view: 2,
                 sample_type: crate::renderer::sampled_texture_type(view),
             }];
-            let stage = Arc::new(
-                translate(
-                    &code,
-                    &Layout {
-                        sampled_textures: &formats,
-                        ..Layout::workgroup([1, 1, 1])
-                    },
-                )
-                .unwrap(),
-            );
-            let binding = stage
-                .descriptors
-                .iter()
-                .find(|d| d.kind() == DescriptorKind::Texture)
-                .unwrap()
-                .binding;
-            let program = renderer.create_program(vec![stage]).unwrap();
             let source = TextureSource::Upload {
                 key: 2 + index as u64,
                 generation: 1,
@@ -535,28 +541,63 @@ mod tests {
                 mag_filter: vk::Filter::NEAREST,
                 ..Sampler::default()
             };
-            let dispatch = Dispatch {
-                program: &program,
-                groups: [1, 1, 1],
-                uniforms: HashMap::new(),
-                storage: HashMap::new(),
-                storage_in_place: HashMap::new(),
-                textures: [(binding, (source, sampler))].into(),
-                images: HashMap::new(),
-                image_formats: HashMap::new(),
-                indirect: None,
-                page_table: table,
-                pool: Default::default(),
+            let border = Sampler {
+                address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
+                border: [1.0f32.to_bits(); 4],
+                ..sampler
             };
-            renderer.dispatch(&dispatch).unwrap();
-            let token = renderer.read_resident(output, 0, 4).unwrap();
-            renderer.flush().unwrap();
-            assert_eq!(
-                renderer.take_reads(&[token])[&token],
-                expected.to_le_bytes(),
-                "{view:?}"
-            );
-            renderer.destroy_program(program).unwrap();
+            let expected_border = if crate::renderer::integer_format(view) {
+                1
+            } else {
+                1.0f32.to_bits()
+            };
+            for (code, sampler, expected) in [
+                (fetch_code.as_slice(), sampler, expected),
+                (border_code.as_slice(), border, expected_border),
+            ] {
+                renderer.fill_resident(output, 0, 4, 0).unwrap();
+                let stage = Arc::new(
+                    translate(
+                        code,
+                        &Layout {
+                            sampled_textures: &formats,
+                            ..Layout::workgroup([1, 1, 1])
+                        },
+                    )
+                    .unwrap(),
+                );
+                let binding = stage
+                    .descriptors
+                    .iter()
+                    .find(|d| d.kind() == DescriptorKind::Texture)
+                    .unwrap()
+                    .binding;
+                let program = renderer.create_program(vec![stage]).unwrap();
+                let dispatch = Dispatch {
+                    program: &program,
+                    groups: [1, 1, 1],
+                    uniforms: HashMap::new(),
+                    storage: HashMap::new(),
+                    storage_in_place: HashMap::new(),
+                    textures: [(binding, (source.clone(), sampler))].into(),
+                    images: HashMap::new(),
+                    image_formats: HashMap::new(),
+                    indirect: None,
+                    page_table: table,
+                    pool: Default::default(),
+                };
+                renderer.dispatch(&dispatch).unwrap();
+                let token = renderer.read_resident(output, 0, 4).unwrap();
+                renderer.flush().unwrap();
+                let actual = renderer.take_reads(&[token]).remove(&token).unwrap();
+                renderer.destroy_program(program).unwrap();
+                assert_eq!(
+                    actual,
+                    expected.to_le_bytes(),
+                    "{view:?}, {:?}",
+                    sampler.address,
+                );
+            }
         }
     }
 

@@ -82,6 +82,8 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
+    pub const INTEGER: u32 = 1 << 2;
+
     pub fn kind(&self) -> DescriptorKind {
         match self.kind {
             0 => DescriptorKind::UniformBuffer,

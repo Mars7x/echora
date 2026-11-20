@@ -166,7 +166,7 @@ impl Renderer {
             .gpu
             .texture_pool_layout
             .ok_or("the device cannot hold the texture pool")?;
-        let sampler = self.sampler(&Sampler::default())?;
+        let sampler = self.sampler(&Sampler::default(), false)?;
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
@@ -372,7 +372,7 @@ impl Renderer {
                 continue;
             }
             let first = wanted.len();
-            let sampler = self.sampler(&entry.sampler_state)?;
+            let sampler = self.sampler(&entry.sampler_state, false)?;
             wanted.push((binding::SAMPLERS, entry.sampler, sampler.as_raw()));
             let (shape, format) = self.source_shape(&entry.source)?;
             let integer = integer_format(format);
