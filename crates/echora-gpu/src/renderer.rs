@@ -6001,8 +6001,7 @@ impl Renderer {
         let sampled_view = if has_stencil(format) {
             let depth_only = view_info.subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::DEPTH,
-                level_count: levels,
-                ..range(format)
+                ..view_info.subresource_range
             });
             // SAFETY: as above.
             unsafe { device.create_image_view(&depth_only, None) }

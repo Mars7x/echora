@@ -666,6 +666,86 @@ mod tests {
     }
 
     #[test]
+    fn combined_depth_stencil_arrays_sample_every_depth_layer() {
+        use crate::draw::ImageShape;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() || gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let key = 1;
+        renderer
+            .shaped_target(
+                key,
+                4,
+                4,
+                ImageShape::D2 { layers: 2 },
+                vk::Format::D32_SFLOAT_S8_UINT,
+                1,
+            )
+            .unwrap();
+        for (layer, depth) in [(0, 0.25), (1, 0.75)] {
+            renderer
+                .clear_depth_stencil(key, layer, None, Some(depth), Some(0))
+                .unwrap();
+        }
+        let code = spirv(
+            "enable wgpu_binding_array;
+             @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+             @group(1) @binding(4) var textures: binding_array<texture_depth_2d_array, 8>;
+             @compute @workgroup_size(1) fn main() {
+                 output[0] = bitcast<u32>(textureLoad(textures[1], vec2<i32>(1, 1), 0, 0));
+                 output[1] = bitcast<u32>(textureLoad(textures[1], vec2<i32>(1, 1), 1, 0));
+             }",
+            naga::ShaderStage::Compute,
+        );
+        let mut stage = translated(
+            Stage::Compute,
+            code,
+            vec![Descriptor {
+                kind: 1,
+                binding: 0,
+                count: 1,
+                flags: 1,
+                ..Default::default()
+            }],
+        );
+        std::sync::Arc::get_mut(&mut stage)
+            .unwrap()
+            .texture_pool_bindings = 1 << echora_shader_abi::texture_pool::SAMPLED_2D_ARRAY;
+        let program = renderer.create_program(vec![stage]).unwrap();
+        let dispatch = Dispatch {
+            program: &program,
+            groups: [1, 1, 1],
+            uniforms: HashMap::new(),
+            storage: HashMap::from([(0, vec![0; 16])]),
+            storage_in_place: HashMap::new(),
+            textures: HashMap::new(),
+            images: HashMap::new(),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: vec![crate::pool::PoolEntry {
+                texture: 1,
+                sampler: 1,
+                source: TextureSource::Target(key),
+                sampler_state: Sampler::default(),
+            }]
+            .into(),
+        };
+        let results = renderer.dispatch(&dispatch).unwrap();
+        renderer.destroy_program(program).unwrap();
+        let expected: Vec<_> = [0.25_f32, 0.75]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(results[&0][..8], expected);
+    }
+
+    #[test]
     fn texture_pool_rewrite_preserves_bindings_for_pending_work() {
         for use_spare in [false, true] {
             check_texture_pool_rewrite(use_spare);
