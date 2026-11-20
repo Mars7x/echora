@@ -4838,6 +4838,24 @@ impl Renderer {
             .or_else(|| self.archived_targets.get(&key).map(|target| target.info))
     }
 
+    /// Whether a live allocation still has its initial undefined layout.
+    pub fn target_is_undefined(&self, key: u64) -> bool {
+        self.targets
+            .get(&key)
+            .is_some_and(|target| target.layout == vk::ImageLayout::UNDEFINED)
+    }
+
+    /// Retire an allocation that has no texels to keep under another key.
+    pub fn discard_undefined_target(&mut self, key: u64) {
+        if self.target_is_undefined(key) {
+            let target = self.remove_target(key).unwrap();
+            self.slot.retired_uploads.push(target);
+            self.fresh_targets.retain(|fresh| *fresh != key);
+            self.target_changes += 1;
+            self.changed_targets.push(key);
+        }
+    }
+
     /// Schedule one lossless snapshot while the target is inactive. Leave
     /// the image resident until the copy completes and only use ring space
     /// available in this submission.

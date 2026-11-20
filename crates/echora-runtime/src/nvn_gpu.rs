@@ -1794,7 +1794,9 @@ impl Nvn {
     ) {
         let retired = super::retired_texture(identity);
         let renderer = self.gpu.as_ref().map(|backend| &backend.renderer);
-        let has_target = renderer.is_some_and(|renderer| renderer.target_info(texture).is_some());
+        let has_target = renderer.is_some_and(|renderer| {
+            renderer.target_info(texture).is_some() && !renderer.target_is_undefined(texture)
+        });
         // An alias with no image of its own leaves the existing image and its
         // description together.
         if !has_target
@@ -1882,7 +1884,7 @@ impl Nvn {
         let restore = identity.and_then(|identity| {
             let renderer = &self.gpu.as_ref()?.renderer;
             let key = super::retired_texture(identity);
-            let target = if previous == identity {
+            let target = if previous == identity && !renderer.target_is_undefined(texture) {
                 renderer
                     .target_info(texture)
                     .or_else(|| renderer.target_info(key))
@@ -1898,6 +1900,7 @@ impl Nvn {
             backend.remove_texture_upload(texture);
             backend.texture_checked.remove(&texture);
             let renderer = &mut backend.renderer;
+            renderer.discard_undefined_target(texture);
             let retired = super::retired_texture(previous);
             if renderer.target_info(texture).is_some() {
                 backend.retired_since.insert(retired, self.presented_frames);
@@ -13169,6 +13172,22 @@ mod target_tests {
         nvn.ensure_render_target(texture).unwrap();
         let TextureSource::Target(key) = nvn.texture_source(&core, alias).unwrap() else {
             panic!("the wider texture lost its GPU texels when creating a different view");
+        };
+        assert_eq!(key, retired_texture((base, 10)));
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(key, 4)
+                .unwrap(),
+            0.75_f32.to_le_bytes().repeat(64)
+        );
+
+        core.cpu.regs[0] = texture;
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        let TextureSource::Target(key) = nvn.texture_source(&core, alias).unwrap() else {
+            panic!("retiring an untouched image discarded previously rendered texels");
         };
         assert_eq!(key, retired_texture((base, 10)));
         assert_eq!(
