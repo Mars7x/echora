@@ -11,10 +11,10 @@ use echora_config::{InternalResolutionSetting, Settings, WindowMode, Workers};
 use echora_content::ContentSource;
 use echora_input::button;
 use gpui::{
-    Action, Animation, AnimationExt as _, AnyElement, App, Application, Bounds, BoxShadow, Context,
-    CursorStyle, Decorations, Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image,
-    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
-    PathPromptOptions, Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
+    Action, AnyElement, App, Application, Bounds, BoxShadow, Context, CursorStyle, Decorations,
+    Div, ElementId, FocusHandle, FontWeight, HitboxBehavior, Hsla, Image, ImageFormat, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions,
+    Pixels, ResizeEdge, SharedString, Stateful, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, actions, anchored,
     canvas, deferred, div, img, point, prelude::*, px, size,
 };
@@ -23,6 +23,7 @@ use crate::chrome::{self, ButtonLayout, WindowButton};
 use crate::install;
 use crate::nav::{Activate, Direction, Press as _, Stops};
 use crate::prepare;
+use crate::save_preview::{self, SavePreview};
 use crate::ui::{self, Kind, Size, color, palette, radius, space, text, u};
 
 const APP_ID: &str = "io.github.mars7x.Echora";
@@ -114,6 +115,7 @@ struct Game {
     title: SharedString,
     version: SharedString,
     icon: Option<Arc<Image>>,
+    preview: Option<SavePreview>,
 }
 
 struct Launcher {
@@ -141,8 +143,6 @@ struct Launcher {
     /// Holds focus while a sheet is open and none of its controls does, so
     /// Escape always reaches it.
     sheet_focus: FocusHandle,
-    /// A sheet fading out after being closed.
-    closing: Option<Sheet>,
     /// The settings pop-up menu that is open, by id.
     open_menu: Option<&'static str>,
     /// A menu folding away after being closed, and which closing it is.
@@ -172,7 +172,7 @@ struct Launcher {
     notice_generation: u64,
     running: bool,
     /// The game being installed and how far the copy has got.
-    installing: Option<(SharedString, Arc<install::Progress>)>,
+    installing: Option<Arc<install::Progress>>,
     /// The game being prepared to run (translated and built), before its
     /// first start.
     preparing: Option<Arc<prepare::Preparation>>,
@@ -359,7 +359,6 @@ impl Launcher {
             settings_path,
             sheet: None,
             sheet_focus: cx.focus_handle(),
-            closing: None,
             open_menu: None,
             closing_menu: None,
             menu_closes: 0,
@@ -394,6 +393,7 @@ impl Launcher {
                         Ok(game) => {
                             this.game = Some(game);
                             this.check_prepared(cx);
+                            this.refresh_save_preview(cx);
                         }
                         Err(message) => this.notify(message, cx),
                     }
@@ -464,22 +464,18 @@ impl Launcher {
         cx.notify();
     }
 
-    fn select_game(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        match read_game(&path) {
-            Ok(game) => {
-                if let Some(file) = last_game_file() {
-                    let _ = file
-                        .parent()
-                        .map(std::fs::create_dir_all)
-                        .transpose()
-                        .and_then(|_| std::fs::write(&file, path.display().to_string()));
-                }
-                self.game = Some(game);
-                self.refocus = self.sheet.is_none();
-                self.check_prepared(cx);
-            }
-            Err(message) => self.notify(message, cx),
+    fn select_game(&mut self, game: Game, cx: &mut Context<Self>) {
+        if let Some(file) = last_game_file() {
+            let _ = file
+                .parent()
+                .map(std::fs::create_dir_all)
+                .transpose()
+                .and_then(|_| std::fs::write(&file, game.path.display().to_string()));
         }
+        self.game = Some(game);
+        self.refocus = self.sheet.is_none();
+        self.check_prepared(cx);
+        self.refresh_save_preview(cx);
         cx.notify();
     }
 
@@ -510,17 +506,18 @@ impl Launcher {
         if self.running || self.installing.is_some() || self.preparing.is_some() {
             return;
         }
-        let title = match read_game(&source).and_then(supported_build) {
-            Ok(game) => game.title,
-            Err(message) => return self.notify(message, cx),
-        };
         let Some(games) = install::data_dir().map(|dir| dir.join("game")) else {
             return self.notify("There's no data folder to install the game into", cx);
         };
         let progress = Arc::new(install::Progress::default());
         let worker = progress.clone();
-        std::thread::spawn(move || install::install(&source, &games, &worker));
-        self.installing = Some((title, progress.clone()));
+        let task = cx.background_executor().spawn(async move {
+            let mut game = read_game(&source).and_then(supported_build)?;
+            game.path = install::install(&source, &games, &worker)
+                .map_err(|error| format!("Couldn't install the game: {error}"))?;
+            Ok::<_, String>(game)
+        });
+        self.installing = Some(progress.clone());
         // The sheet's controls go with it, so focus moves to the launcher.
         self.sheet = None;
         self.open_menu = None;
@@ -528,49 +525,58 @@ impl Launcher {
         self.refocus = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.installing = None;
+                this.refocus = this.sheet.is_none();
+                match result {
+                    Ok(game) => this.select_game(game, cx),
+                    Err(message) => this.notify(message, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let mut last = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
-                let result = progress.take_result();
-                let done = result.is_some();
+                let status = progress.status();
                 let updated = this.update(cx, |this, cx| {
-                    if let Some(result) = result {
-                        this.installing = None;
-                        this.refocus = this.sheet.is_none();
-                        match result {
-                            Ok(installed) => this.select_game(installed, cx),
-                            Err(error) => {
-                                this.notify(format!("Couldn't install the game: {error}"), cx)
-                            }
-                        }
+                    let current = this
+                        .installing
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &progress));
+                    if current && last != Some(status) {
+                        cx.notify();
                     }
-                    cx.notify();
+                    current
                 });
-                if done || updated.is_err() {
+                if !matches!(updated, Ok(true)) {
                     break;
                 }
+                last = Some(status);
             }
         })
         .detach();
     }
 
     fn play(&mut self, _: &Play, _: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.sheet.is_some() || self.preparing.is_some() {
+        if self.running
+            || self.sheet.is_some()
+            || self.preparing.is_some()
+            || self.installing.is_some()
+            || self.game.is_none()
+        {
             return;
         }
-        let Some(game) = &self.game else {
-            return;
-        };
         let Some(echora) = echora_binary() else {
             self.notify("The echora command wasn't found next to the launcher", cx);
             return;
         };
-        if !prepare::is_prepared(prepare::command(&echora, &game.path, true)) {
-            self.prepare_game(&echora, cx);
-        } else {
-            self.start_game(cx);
-        }
+        self.prepare_game(&echora, cx);
     }
 
     /// Asks in the background whether the selected game starts right away,
@@ -598,6 +604,35 @@ impl Launcher {
         .detach();
     }
 
+    fn refresh_save_preview(&self, cx: &mut Context<Self>) {
+        let Some(Game {
+            path,
+            build: Some((title, _)),
+            ..
+        }) = &self.game
+        else {
+            return;
+        };
+        let path = path.clone();
+        let title = title.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { save_preview::load(&title) });
+        cx.spawn(async move |this, cx| {
+            let preview = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(game) = &mut this.game
+                    && game.path == path
+                    && !this.running
+                {
+                    game.preview = preview;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Translates and builds the selected game with `echora prepare`,
     /// showing its progress, then starts it.
     fn prepare_game(&mut self, echora: &Path, cx: &mut Context<Self>) {
@@ -615,11 +650,13 @@ impl Launcher {
         self.refocus = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
+            let mut last = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
                 let result = preparation.take_result();
+                let status = preparation.step().status();
                 let done = result.is_some();
                 let updated = this.update(cx, |this, cx| {
                     if let Some(result) = result {
@@ -636,11 +673,14 @@ impl Launcher {
                             }
                         }
                     }
-                    cx.notify();
+                    if done || last != Some(status) {
+                        cx.notify();
+                    }
                 });
                 if done || updated.is_err() {
                     break;
                 }
+                last = Some(status);
             }
         })
         .detach();
@@ -662,11 +702,12 @@ impl Launcher {
             }
         };
         self.running = true;
-        self.notify("Starting…", cx);
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let code = wait_for(child, cx).await;
             let _ = this.update(cx, |this, cx| {
                 this.running = false;
+                this.refresh_save_preview(cx);
                 if let Some(message) = stop_message(code) {
                     this.notify(message, cx);
                 }
@@ -689,7 +730,6 @@ impl Launcher {
             self.return_focus = window.focused(cx);
         }
         self.sheet = Some(sheet);
-        self.closing = None;
         self.open_menu = None;
         self.toggled = None;
         // Focus goes straight to the sheet's first control: the open
@@ -725,28 +765,15 @@ impl Launcher {
     }
 
     /// Escape, B and the close buttons: closes an open menu first, then the
-    /// sheet, which fades out. Focus goes back to what opened it.
+    /// sheet. Focus goes back to what opened it.
     fn close_sheet(&mut self, _: &CloseSheet, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(menu) = self.close_menu(cx) {
             window.focus(&self.stops.handle((menu, 0usize), cx));
             cx.notify();
             return;
         }
-        let Some(sheet) = self.sheet.take() else {
+        if self.sheet.take().is_none() {
             return;
-        };
-        if self.motion {
-            self.closing = Some(sheet);
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(SHEET_OUT).await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.closing == Some(sheet) {
-                        this.closing = None;
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
         }
         let target = self
             .return_focus
@@ -1013,6 +1040,7 @@ fn read_game(path: &Path) -> Result<Game, String> {
             .into(),
         version: version.into(),
         icon,
+        preview: None,
     })
 }
 
@@ -1050,21 +1078,15 @@ const WINDOW_INSET: f32 = 16.0;
 /// Margin between a sheet and the window's edges.
 const SHEET_MARGIN: f32 = 24.0;
 
-/// How long a closing sheet takes to fade out.
-const SHEET_OUT: Duration = Duration::from_millis(180);
-
 /// Dims the launcher behind a sheet; clicking outside the sheet closes it.
-/// A closing sheet fades out instead of in and takes no input.
 fn scrim(
     sheet: gpui::Stateful<gpui::Div>,
     corner: Pixels,
-    motion: bool,
-    closing: bool,
     cx: &mut Context<Launcher>,
 ) -> AnyElement {
     let sheet = sheet.on_click(|_, _, cx| cx.stop_propagation());
-    let backdrop = div()
-        .id(if closing { "scrim-closing" } else { "scrim" })
+    div()
+        .id("scrim")
         .absolute()
         .inset_0()
         .rounded(corner)
@@ -1072,60 +1094,8 @@ fn scrim(
         .items_center()
         .justify_center()
         .bg(color(palette::SCRIM))
-        .when(!closing, |el| {
-            el.on_click(
-                cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)),
-            )
-        })
-        // Clicks inside the sheet must not reach the scrim behind it.
-        .child(if motion {
-            fade(sheet, closing)
-        } else {
-            sheet.into_any_element()
-        });
-    if !motion {
-        return backdrop.into_any_element();
-    }
-    if closing {
-        return backdrop
-            .with_animation(
-                "scrim-out",
-                Animation::new(SHEET_OUT),
-                // Leaving needs no bounce: a quick fade.
-                |el, t| el.opacity(1.0 - ui::ease_out(t)),
-            )
-            .into_any_element();
-    }
-    backdrop
-        .with_animation(
-            "scrim-in",
-            Animation::new(Duration::from_millis(220)),
-            |el, t| el.opacity(ui::ease_out(t)),
-        )
-        .into_any_element()
-}
-
-/// Opening fades the sheet in with the dim behind it; closing fades it out
-/// a little faster. Neither scales: GPUI can't scale an element without its
-/// text and images snapping to the pixel grid frame by frame.
-fn fade(sheet: gpui::Stateful<gpui::Div>, closing: bool) -> AnyElement {
-    let duration = if closing {
-        SHEET_OUT
-    } else {
-        Duration::from_millis(200)
-    };
-    sheet
-        .with_animation(
-            if closing { "sheet-out" } else { "sheet-in" },
-            Animation::new(duration),
-            move |sheet, t| {
-                sheet.opacity(if closing {
-                    1.0 - ui::ease_out(t)
-                } else {
-                    ui::ease_out(t)
-                })
-            },
-        )
+        .on_click(cx.listener(|this, _, window, cx| this.close_sheet(&CloseSheet, window, cx)))
+        .child(sheet)
         .into_any_element()
 }
 
@@ -1225,9 +1195,8 @@ impl Launcher {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .font_family(ui::TITLE_FONT)
                             .text_size(u(text::HEADLINE))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(palette::LABEL))
                             .child("Echora"),
                     )
@@ -1238,15 +1207,37 @@ impl Launcher {
         )
     }
 
-    /// No game yet: a status page with the one thing to do.
-    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choose = self
-            .stop(
-                ui::button("choose", "Choose game…", Kind::Primary, Size::Large),
-                self.sheet.is_none(),
-                cx,
+    fn render_setup(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (title, content) = if let Some(installation) = &self.installing {
+            let (stage, percent) = installation.status();
+            (
+                "Installing game",
+                ui::progress_details(stage, percent).into_any_element(),
             )
-            .on_press(cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)));
+        } else {
+            let choose = self
+                .stop(
+                    ui::button("choose", "Choose game…", Kind::Primary, Size::Large),
+                    self.sheet.is_none(),
+                    cx,
+                )
+                .on_press(
+                    cx.listener(|this, _, window, cx| this.choose_game(&ChooseGame, window, cx)),
+                );
+            let content = div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(u(space::XL))
+                .child(
+                    div()
+                        .text_size(u(text::BODY))
+                        .text_color(color(palette::SECONDARY_LABEL))
+                        .child("Choose a NUP package or a game dump folder."),
+                )
+                .child(choose);
+            ("Add a game", content.into_any_element())
+        };
         div()
             .absolute()
             .inset_0()
@@ -1254,22 +1245,27 @@ impl Launcher {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(u(space::S))
             .pb(u(72.0))
             .child(
                 div()
-                    .text_size(u(text::LARGE_TITLE))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(color(palette::LABEL))
-                    .child("Echora"),
+                    .w(u(400.0))
+                    .p(u(space::XL))
+                    .rounded(u(radius::SHEET))
+                    .border_1()
+                    .border_color(color(palette::BORDER))
+                    .bg(color(palette::SURFACE))
+                    .flex()
+                    .flex_col()
+                    .gap(u(space::L))
+                    .child(
+                        div()
+                            .text_size(u(text::LARGE_TITLE))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color(palette::LABEL))
+                            .child(title),
+                    )
+                    .child(content),
             )
-            .child(
-                div()
-                    .text_size(u(text::HEADLINE))
-                    .text_color(color(palette::SECONDARY_LABEL))
-                    .child("Choose your NUP package or dump folder to install the game."),
-            )
-            .child(div().pt(u(space::L)).child(choose))
     }
 
     /// Settings and About; the whole bottom bar on the empty screen, and
@@ -1313,40 +1309,20 @@ impl Launcher {
     }
 
     /// The game screen: the title large in the bottom left, with Play,
-    /// Settings and About under it (or the install's progress).
+    /// Settings and About under it, with preparation progress on first launch.
     fn render_hero(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (title, detail) = match (&self.installing, &self.game) {
-            (Some((title, progress)), _) => (
-                title.clone(),
-                format!(
-                    "Installing, {}%",
-                    (progress.fraction().clamp(0.0, 1.0) * 100.0) as u32
-                ),
-            ),
-            (None, Some(game)) => match (&self.preparing, self.prepared) {
-                (Some(preparation), _) => (game.title.clone(), preparation.step().describe()),
-                (None, Some(false)) => (
-                    game.title.clone(),
-                    format!(
-                        "{} · Builds before its first start, about an hour",
-                        game.version
-                    ),
-                ),
-                _ => (game.title.clone(), game.version.to_string()),
-            },
-            (None, None) => return div().into_any_element(),
+        let Some(game) = &self.game else {
+            return div().into_any_element();
         };
-        let (series, name) = split_title(&title);
-        let progress = match (&self.installing, &self.preparing) {
-            (Some((_, progress)), _) => Some(progress.fraction()),
-            (None, Some(preparation)) => Some(preparation.step().fraction()),
-            (None, None) => None,
+        let detail = if self.preparing.is_none() && self.prepared == Some(false) {
+            "First launch requires preparation".into()
+        } else {
+            game.version.clone()
         };
-        let actions = if let Some(fraction) = progress {
-            div()
-                .w(u(320.0))
-                .child(ui::progress(fraction))
-                .into_any_element()
+        let (series, name) = split_title(&game.title);
+        let actions = if let Some(preparation) = &self.preparing {
+            let (stage, percent) = preparation.step().status();
+            ui::progress_panel(stage, percent).into_any_element()
         } else {
             let active = self.sheet.is_none();
             let play = self
@@ -1402,6 +1378,48 @@ impl Launcher {
             .into_any_element()
     }
 
+    fn render_save_preview(&self, preview: &SavePreview, width: f32) -> impl IntoElement {
+        div()
+            .flex_none()
+            .w(u(width))
+            .p(u(space::S))
+            .rounded(u(radius::CARD))
+            .border_1()
+            .border_color(color(palette::BORDER))
+            .bg(color(palette::SURFACE))
+            .flex()
+            .flex_col()
+            .child(
+                img(preview.image.clone())
+                    .w_full()
+                    .h(u((width - 2.0 * space::S - 2.0) * 9.0 / 16.0))
+                    .rounded(u(radius::INNER))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .child(
+                div()
+                    .px(u(space::XS))
+                    .pt(u(space::M))
+                    .pb(u(space::XS))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(u(space::S))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(u(text::CALLOUT))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(palette::LABEL))
+                            .child("Last save"),
+                    )
+                    .when_some(preview.health, |footer, health| {
+                        let per_row = if width >= 290.0 { 10 } else { 7 };
+                        footer.child(ui::hearts(health, per_row))
+                    }),
+            )
+    }
+
     /// Makes `el` behave as a header bar does: dragging it moves the
     /// window, a double-click maximizes or restores it, and a right-click
     /// opens the window menu.
@@ -1437,19 +1455,13 @@ impl Launcher {
         }))
     }
 
-    /// The settings sheet. A `closing` sheet is drawn for its fade-out only.
-    fn render_settings(
-        &self,
-        window: &Window,
-        closing: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let (room_w, room_h) = self.sheet_room(window);
         let scale = window.rem_size() / px(16.0);
         let width = room_w.min(px(760.0) * scale);
         let height = room_h.min(px(460.0) * scale);
         // An open menu keeps focus to itself.
-        let live = !closing && self.open_menu.is_none();
+        let live = self.open_menu.is_none();
         let title = self.drag_window(
             div()
                 .flex_none()
@@ -1538,7 +1550,7 @@ impl Launcher {
             .flex()
             .flex_col()
             .gap(u(space::XL))
-            .children(self.settings_page(window, !closing, cx));
+            .children(self.settings_page(window, true, cx));
         let content = div()
             .flex_1()
             .min_w_0()
@@ -1558,10 +1570,10 @@ impl Launcher {
             );
         let surface = palette::VIEW;
         let sheet = sheet("settings", width, Some(height), surface, window.rem_size())
-            .when(!closing, |el| el.track_focus(&self.sheet_focus))
+            .track_focus(&self.sheet_focus)
             .child(tabs)
             .child(content);
-        scrim(sheet, self.corner, self.motion, closing, cx)
+        scrim(sheet, self.corner, cx)
     }
 
     fn settings_page(
@@ -1969,13 +1981,13 @@ impl Launcher {
 
     /// About: name, version and description, the credits in two columns,
     /// and the licence with a link to the source, all without scrolling.
-    fn render_about(&self, window: &Window, closing: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_about(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let (room_w, _) = self.sheet_room(window);
         let width = room_w.min(px(560.0) * (window.rem_size() / px(16.0)));
         let source = self
             .stop(
                 ui::button("source", "Source code", Kind::Secondary, Size::Regular),
-                !closing,
+                true,
                 cx,
             )
             .on_press(cx.listener(|_, _, _, cx| cx.open_url("https://github.com/Mars7x/echora")));
@@ -2027,7 +2039,7 @@ impl Launcher {
         let surface = palette::SURFACE;
         let sheet = sheet("about", width, None, surface, window.rem_size())
             .flex_col()
-            .when(!closing, |el| el.track_focus(&self.sheet_focus))
+            .track_focus(&self.sheet_focus)
             .child(top)
             .child(
                 div()
@@ -2101,7 +2113,7 @@ impl Launcher {
                     )
                     .child(source),
             );
-        scrim(sheet, self.corner, self.motion, closing, cx)
+        scrim(sheet, self.corner, cx)
     }
 }
 
@@ -2112,10 +2124,8 @@ const DRAG_THRESHOLD: f32 = 4.0;
 /// The width Play, Settings and About share, so the row reads as one set.
 const DOCK_BUTTON: f32 = 112.0;
 
-/// The artwork tile beside the title, and the narrowest window (in design
-/// pixels) that shows it.
+/// The cover-art tile beside the title when there's no save preview.
 const ART_SIZE: f32 = 220.0;
-const ART_MIN_WIDTH: f32 = 860.0;
 
 /// The window size the design is drawn for; larger windows scale it up.
 const DESIGN_SIZE: (f32, f32) = (960.0, 600.0);
@@ -2302,7 +2312,9 @@ impl Launcher {
             .font_family(self.font.clone())
             .text_size(u(text::BODY))
             .child(self.render_background())
-            .when(welcome, |el| el.child(self.render_welcome(cx)))
+            .when(welcome || self.installing.is_some(), |el| {
+                el.child(self.render_setup(cx))
+            })
             .child(self.render_title_bar(window, cx))
             .map(|el| {
                 let toast = self.notice.clone().map(|notice| {
@@ -2313,29 +2325,39 @@ impl Launcher {
                         self.motion,
                     )
                 });
-                if self.loading {
+                if self.loading || self.installing.is_some() {
                     return el;
                 }
-                // The game's artwork balances the title on the right, where
-                // the window is wide enough for both.
-                let wide = f32::from(window.viewport_size().width)
-                    / (f32::from(window.rem_size()) / 16.0)
-                    >= ART_MIN_WIDTH;
-                let art = self
-                    .game
-                    .as_ref()
-                    .and_then(|game| game.icon.clone())
-                    .filter(|_| wide)
-                    .map(|icon| {
+                // Reserve room for the title and its three action buttons.
+                let content_width =
+                    window.viewport_size().width - window.client_inset().unwrap_or(px(0.0)) * 2.0;
+                let design_width = f32::from(content_width) / (f32::from(window.rem_size()) / 16.0);
+                let preview_width = (design_width
+                    - 2.0 * (space::XL + space::L)
+                    - 3.0 * DOCK_BUTTON
+                    - 2.0 * space::S
+                    - space::XL)
+                    .clamp(216.0, 380.0);
+                let art = self.game.as_ref().and_then(|game| {
+                    if let Some(preview) = &game.preview {
+                        return Some(
+                            self.render_save_preview(preview, preview_width)
+                                .into_any_element(),
+                        );
+                    }
+                    let icon = game.icon.clone()?;
+                    Some(
                         img(icon)
                             .flex_none()
-                            .size(u(ART_SIZE))
+                            .size(u(ART_SIZE.min(preview_width)))
                             .rounded(u(radius::DOCK))
                             .border_1()
                             .border_color(color(palette::WINDOW_EDGE))
                             .object_fit(ObjectFit::Cover)
-                    });
-                if self.game.is_some() || self.installing.is_some() {
+                            .into_any_element(),
+                    )
+                });
+                if self.game.is_some() {
                     // The title hero sits in the bottom left; messages
                     // appear above it.
                     el.child(
@@ -2357,13 +2379,18 @@ impl Launcher {
                                     .justify_between()
                                     .gap(u(space::XL))
                                     .child(ui::appear(
-                                        div().child(self.render_hero(cx)),
+                                        div().flex_1().min_w_0().child(self.render_hero(cx)),
                                         "hero-in",
                                         space::L,
                                         self.motion,
                                     ))
                                     .children(art.map(|art| {
-                                        ui::appear(art, "art-in", space::L, self.motion)
+                                        ui::appear(
+                                            div().flex_none().child(art),
+                                            "art-in",
+                                            space::L,
+                                            self.motion,
+                                        )
                                     })),
                             ),
                     )
@@ -2388,16 +2415,10 @@ impl Launcher {
                     )
                 }
             })
-            .when_some(self.closing, |el, sheet| {
-                el.child(match sheet {
-                    Sheet::Settings => self.render_settings(window, true, cx),
-                    Sheet::About => self.render_about(window, true, cx),
-                })
-            })
             .when_some(self.sheet, |el, sheet| {
                 el.child(match sheet {
-                    Sheet::Settings => self.render_settings(window, false, cx),
-                    Sheet::About => self.render_about(window, false, cx),
+                    Sheet::Settings => self.render_settings(window, cx),
+                    Sheet::About => self.render_about(window, cx),
                 })
             })
             .child(self.stops.ring(self.keyboard, self.motion))
@@ -2429,6 +2450,7 @@ mod tests {
             title: "The Legend of Zelda: Ocarina of Time".into(),
             version: version.to_owned().into(),
             icon: None,
+            preview: None,
         }
     }
 

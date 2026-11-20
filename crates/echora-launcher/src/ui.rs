@@ -23,10 +23,12 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, BorderStyle, Bounds, BoxShadow, Div, ElementId,
-    FontWeight, Hsla, Pixels, Rems, SharedString, Stateful, Window, div, prelude::*, px, rems,
-    rgba,
+    Animation, AnimationExt as _, AnyElement, BorderStyle, Bounds, BoxShadow, ContentMask, Div,
+    ElementId, FontWeight, Hsla, PathBuilder, Pixels, Rems, SharedString, Stateful, Window, canvas,
+    div, point, prelude::*, px, rems, rgba, size,
 };
+
+use crate::save_preview::Health;
 
 /// Spacing on a 4 px grid.
 pub mod space {
@@ -97,6 +99,9 @@ pub mod palette {
     /// Pop-up menus, as the theme's popovers.
     pub const MENU: u32 = 0x191919ff;
     pub const SWITCH_OFF: u32 = 0x3a3a3aff;
+    pub const HEART: u32 = 0xe67766ff;
+    pub const HEART_EMPTY: u32 = 0x533c3aff;
+    pub const HEART_EDGE: u32 = 0xeea294ff;
 }
 
 /// A length in the design system's pixels, as rems (1 rem = 16 px).
@@ -601,8 +606,102 @@ pub fn switch_row(id: &'static str, titles: Div, on: bool, animate: bool) -> Sta
     .active(|style| style.bg(color(palette::FILL_HOVER)))
 }
 
-/// A thin progress bar; `fraction` runs from 0 to 1.
-pub fn progress(fraction: f32) -> Div {
+/// Health as full, partial, and empty heart containers.
+pub fn hearts(health: Health, per_row: u8) -> Div {
+    div().flex().flex_col().items_end().gap(u(3.0)).children(
+        (0..health.containers)
+            .step_by(usize::from(per_row))
+            .map(|start| {
+                let end = (start + per_row).min(health.containers);
+                div().flex().gap(u(3.0)).children(
+                    (start..end)
+                        .map(|index| heart(health.quarters.saturating_sub(index * 4).min(4))),
+                )
+            }),
+    )
+}
+
+fn heart(quarters: u8) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let at = |x, y| bounds.origin + point(bounds.size.width * x, bounds.size.height * y);
+            let path = |mut builder: PathBuilder| {
+                builder.move_to(at(0.5, 0.26));
+                builder.cubic_bezier_to(at(0.08, 0.42), at(0.34, -0.04), at(0.04, 0.12));
+                builder.cubic_bezier_to(at(0.5, 0.91), at(0.11, 0.61), at(0.35, 0.81));
+                builder.cubic_bezier_to(at(0.92, 0.42), at(0.65, 0.81), at(0.89, 0.61));
+                builder.cubic_bezier_to(at(0.5, 0.26), at(0.96, 0.12), at(0.66, -0.04));
+                builder.close();
+                builder.build().ok()
+            };
+            if let Some(fill) = path(PathBuilder::fill()) {
+                window.paint_path(fill.clone(), color(palette::HEART_EMPTY));
+                if quarters != 0 {
+                    let mask = ContentMask {
+                        bounds: Bounds::new(
+                            bounds.origin,
+                            size(
+                                bounds.size.width * (f32::from(quarters) / 4.0),
+                                bounds.size.height,
+                            ),
+                        ),
+                    };
+                    window.with_content_mask(Some(mask), |window| {
+                        window.paint_path(fill, color(palette::HEART));
+                    });
+                }
+            }
+            if let Some(outline) = path(PathBuilder::stroke(bounds.size.width / 16.0)) {
+                window.paint_path(outline, color(palette::HEART_EDGE));
+            }
+        },
+    )
+    .size(u(15.0))
+}
+
+/// The current installation or preparation step, with its measured progress.
+pub fn progress_panel(stage: &'static str, percent: Option<u8>) -> Div {
+    div()
+        .w_full()
+        .max_w(u(320.0))
+        .p(u(space::M))
+        .rounded(u(radius::CARD))
+        .bg(color(palette::CARD))
+        .border_1()
+        .border_color(color(palette::BORDER))
+        .child(progress_details(stage, percent))
+}
+
+pub fn progress_details(stage: &'static str, percent: Option<u8>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(u(space::M))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(u(space::M))
+                .text_size(u(text::BODY))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color(palette::LABEL))
+                .child(stage)
+                .when_some(percent, |row, percent| {
+                    row.child(
+                        div()
+                            .text_color(color(palette::SECONDARY_LABEL))
+                            .child(format!("{percent}%")),
+                    )
+                }),
+        )
+        .when_some(percent, |card, percent| {
+            card.child(progress(f32::from(percent) / 100.0))
+        })
+}
+
+fn progress(fraction: f32) -> Div {
     div()
         .h(u(4.0))
         .w_full()

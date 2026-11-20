@@ -2214,7 +2214,7 @@ fn call_code(out: &mut String) {
             ..options()
         },
         &listed,
-        &mut |region, source| {
+        &mut |region, source, _| {
             regions.push((region, source));
             Ok::<(), std::convert::Infallible>(())
         },

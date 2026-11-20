@@ -315,7 +315,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit,
             region_bits,
         } => {
-            lift(input, cache, limit, region_bits)?;
+            lift(input, cache, limit, region_bits, false)?;
         }
         Command::Prepare {
             input,
@@ -344,7 +344,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if !ready || force {
                 prepare::step("lift");
-                let lifted = lift(input, Some(cache), 20_000_000, 16)?;
+                let lifted = lift(input, Some(cache), 20_000_000, 16, true)?;
                 prepare::step("build");
                 prepare::build(&lifted, jobs.unwrap_or_else(prepare::default_jobs))?;
                 prepare::mark_ready(&lifted)?;
@@ -414,11 +414,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             // Saves go under the per-user data directory unless the
             // environment chooses a save or work directory.
-            if std::env::var_os("ECHORA_SAVE_DIR").is_none()
-                && std::env::var_os("ECHORA_WORK").is_none()
-            {
-                command.env("ECHORA_SAVE_DIR", host_paths::data_dir()?.join("save"));
-            }
+            command.env(
+                "ECHORA_SAVE_DIR",
+                echora_config::save_dir().context("no save directory could be determined")?,
+            );
             let status = command
                 .status()
                 .with_context(|| format!("start {}", runner.display()))?;
@@ -692,7 +691,13 @@ fn translation_dir(input: &std::path::Path, cache: &std::path::Path) -> Result<(
     Ok((exefs, cache.join("translations").join(key)))
 }
 
-fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) -> Result<PathBuf> {
+fn lift(
+    input: PathBuf,
+    cache: Option<PathBuf>,
+    limit: usize,
+    region_bits: u32,
+    report_progress: bool,
+) -> Result<PathBuf> {
     use echora_lift::codegen::{EmitOptions, emit_rust_split_to_regions};
     use std::collections::BTreeSet;
 
@@ -855,7 +860,7 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
         options,
         listed_options,
         &listed_regions,
-        &mut |region, source| {
+        &mut |region, source, total| {
             let dir = out.join("regions").join(format!("{region:x}"));
             let manifest = format!(
                 "[package]\nname = \"gen-r-{region:x}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
@@ -865,6 +870,9 @@ fn lift(input: PathBuf, cache: Option<PathBuf>, limit: usize, region_bits: u32) 
             source_bytes += source.len() as u64;
             written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
             regions.push(region);
+            if report_progress {
+                println!("{}lifted {} of {total}", prepare::PREFIX, regions.len());
+            }
             Ok::<(), std::io::Error>(())
         },
     )?;

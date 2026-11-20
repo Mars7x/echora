@@ -1398,15 +1398,13 @@ struct LocalUser {
 }
 
 impl LocalUser {
-    const UID: [u8; 16] = *b"echora-runtime\x00\x01";
-
     fn from_environment() -> Self {
         let nickname = std::env::var("ECHORA_USER_NAME")
             .ok()
             .filter(|name| !name.is_empty() && name.len() <= 32 && !name.contains('\0'))
             .unwrap_or_else(|| "Player".into());
         Self {
-            uid: Self::UID,
+            uid: echora_config::LOCAL_USER_ID,
             nickname,
         }
     }
@@ -14812,16 +14810,16 @@ mod tests {
     #[test]
     fn local_user_profile_base_follows_the_documented_layout() {
         let user = LocalUser {
-            uid: LocalUser::UID,
+            uid: echora_config::LOCAL_USER_ID,
             nickname: "Ash".into(),
         };
         let base = user.profile_base(&user.uid);
         assert_eq!(base.len(), 0x38);
-        assert_eq!(&base[..16], &LocalUser::UID);
+        assert_eq!(&base[..16], &echora_config::LOCAL_USER_ID);
         assert_eq!(&base[0x10..0x18], &[0; 8]);
         assert_eq!(&base[0x18..0x1b], b"Ash");
         assert!(base[0x1b..].iter().all(|byte| *byte == 0));
-        assert_ne!(LocalUser::UID, [0; 16]);
+        assert_ne!(echora_config::LOCAL_USER_ID, [0; 16]);
         assert_eq!(user.user_data().len(), 0x80);
     }
 

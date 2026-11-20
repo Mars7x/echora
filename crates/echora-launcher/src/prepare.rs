@@ -14,58 +14,37 @@ const PREFIX: &str = "echora-prepare: ";
 pub enum Step {
     #[default]
     Starting,
-    Lift,
+    Analyzing,
+    Lift(u32, u32),
     /// Region crates built of the total.
     Build(u32, u32),
     Ready,
 }
 
 impl Step {
-    /// What the player reads under the title.
-    pub fn describe(self) -> String {
+    pub fn status(self) -> (&'static str, Option<u8>) {
         match self {
-            Self::Starting | Self::Lift => "Translating the game".into(),
-            Self::Build(built, total) => {
-                format!(
-                    "Building the game, {} of {}",
-                    grouped(built),
-                    grouped(total)
-                )
-            }
-            Self::Ready => "Ready".into(),
-        }
-    }
-
-    /// Overall progress from 0 to 1. Building takes nearly all the time.
-    pub fn fraction(self) -> f32 {
-        match self {
-            Self::Starting => 0.0,
-            Self::Lift => 0.03,
-            Self::Build(_, 0) => 0.1,
-            Self::Build(built, total) => 0.1 + 0.9 * (built as f32 / total as f32).min(1.0),
-            Self::Ready => 1.0,
+            Self::Starting => ("Checking game files", None),
+            Self::Analyzing => ("Analyzing game code", None),
+            Self::Lift(done, total) => ("Translating game", percent(done, total)),
+            Self::Build(done, total) if total != 0 && done >= total => ("Finishing build", None),
+            Self::Build(done, total) => ("Building game", percent(done, total)),
+            Self::Ready => ("Ready to launch", None),
         }
     }
 }
 
-/// `n` with thousands separated: 1,111.
-fn grouped(n: u32) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
+fn percent(done: u32, total: u32) -> Option<u8> {
+    let completed = u64::from(done.min(total)) * 100;
+    Some(completed.checked_div(u64::from(total))? as u8)
 }
 
 /// The step a line of `echora prepare`'s output announces, if any.
 pub fn parse(line: &str) -> Option<Step> {
     let event = line.strip_prefix(PREFIX)?;
     match event.split_whitespace().collect::<Vec<_>>()[..] {
-        ["step", "lift"] => Some(Step::Lift),
+        ["step", "lift"] => Some(Step::Analyzing),
+        ["lifted", done, "of", total] => Some(Step::Lift(done.parse().ok()?, total.parse().ok()?)),
         ["step", "build"] => Some(Step::Build(0, 0)),
         ["built", built, "of", total] => {
             Some(Step::Build(built.parse().ok()?, total.parse().ok()?))
@@ -160,10 +139,15 @@ impl Preparation {
     }
 
     fn finish(&self) {
+        let child = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.child.take());
+        let status = child.map(|mut child| child.wait());
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let status = state.child.take().map(|mut child| child.wait());
         state.result = Some(match status {
             Some(Ok(status)) if status.success() => Ok(()),
             _ => Err(state
@@ -207,7 +191,11 @@ mod tests {
 
     #[test]
     fn progress_lines_become_steps() {
-        assert_eq!(parse("echora-prepare: step lift"), Some(Step::Lift));
+        assert_eq!(parse("echora-prepare: step lift"), Some(Step::Analyzing));
+        assert_eq!(
+            parse("echora-prepare: lifted 340 of 1111"),
+            Some(Step::Lift(340, 1111))
+        );
         assert_eq!(
             parse("echora-prepare: built 340 of 1111"),
             Some(Step::Build(340, 1111))
@@ -218,19 +206,14 @@ mod tests {
     }
 
     #[test]
-    fn counts_are_grouped() {
+    fn progress_measures_current_stage_and_names_the_remaining_work() {
+        assert_eq!(Step::Analyzing.status().1, None);
         assert_eq!(
-            Step::Build(340, 1111).describe(),
-            "Building the game, 340 of 1,111"
+            Step::Lift(555, 1110).status(),
+            ("Translating game", Some(50))
         );
-        assert_eq!(grouped(0), "0");
-        assert_eq!(grouped(1_234_567), "1,234,567");
-    }
-
-    #[test]
-    fn building_takes_most_of_the_bar() {
-        assert!(Step::Lift.fraction() < Step::Build(0, 1111).fraction());
-        assert_eq!(Step::Build(1111, 1111).fraction(), 1.0);
-        assert!((Step::Build(555, 1110).fraction() - 0.55).abs() < 1e-6);
+        assert_eq!(Step::Lift(1110, 1110).status().1, Some(100));
+        assert_eq!(Step::Build(0, 1110).status(), ("Building game", Some(0)));
+        assert_eq!(Step::Build(1110, 1110).status(), ("Finishing build", None));
     }
 }

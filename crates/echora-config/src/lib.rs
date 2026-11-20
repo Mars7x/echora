@@ -706,6 +706,29 @@ pub fn default_path() -> Option<std::path::PathBuf> {
     dir.map(|d| d.join("settings.toml"))
 }
 
+/// The local account the runtime exposes to a game.
+pub const LOCAL_USER_ID: [u8; 16] = *b"echora-runtime\0\x01";
+
+/// The save root used by the game runner and the launcher preview.
+pub fn save_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let env = |key| std::env::var_os(key).map(PathBuf::from);
+    env("ECHORA_SAVE_DIR")
+        .or_else(|| env("ECHORA_WORK").map(|path| path.join("save")))
+        .or_else(|| {
+            let data = env("ECHORA_DATA_DIR").or_else(|| {
+                if cfg!(target_os = "windows") {
+                    env("APPDATA").map(|path| path.join("Echora"))
+                } else {
+                    env("XDG_DATA_HOME")
+                        .or_else(|| env("HOME").map(|path| path.join(".local/share")))
+                        .map(|path| path.join("echora"))
+                }
+            });
+            data.map(|path| path.join("save"))
+        })
+}
+
 /// Upgrades an older settings table in place to [`SCHEMA_VERSION`].
 fn migrate(value: &mut toml::Table, from: u32) -> Result<(), ConfigError> {
     if from == 0 {

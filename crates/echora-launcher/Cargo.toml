@@ -17,9 +17,13 @@ echora-config.workspace = true
 echora-content.workspace = true
 echora-input.workspace = true
 gpui = "0.2.2"
+image = { version = "0.25.1", default-features = false, features = ["jpeg"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

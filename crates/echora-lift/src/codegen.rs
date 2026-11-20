@@ -5794,7 +5794,7 @@ pub fn emit_rust_split_to_with<E>(
         options,
         options,
         &BTreeSet::new(),
-        sink,
+        &mut |region, source, _| sink(region, source),
     )
 }
 
@@ -5929,14 +5929,15 @@ impl Drop for WorkerAnalyses {
 /// (so a BL elsewhere, or to a function of such a region from elsewhere,
 /// keeps `Core::call`, and the function table holds only emitted
 /// functions), and a function has a transitive summary only when its own
-/// region's options have `transitive_summaries`.
+/// region's options have `transitive_summaries`. The sink receives the
+/// region id, its emitted source, and the total number of regions.
 pub fn emit_rust_split_to_regions<E>(
     translation: &Translation,
     region_bits: u32,
     base: EmitOptions,
     listed: EmitOptions,
     regions: &BTreeSet<u64>,
-    sink: &mut dyn FnMut(u64, String) -> Result<(), E>,
+    sink: &mut dyn FnMut(u64, String, usize) -> Result<(), E>,
 ) -> Result<String, E> {
     assert!(region_bits >= SPLIT_WINDOW_BITS);
     let options_of = |region: u64| {
@@ -6271,7 +6272,7 @@ pub fn emit_rust_split_to_regions<E>(
     for batch in groups.chunks(workers) {
         if let [one] = batch {
             let (region, source) = emit(one);
-            sink(region, source)?;
+            sink(region, source, groups.len())?;
         } else {
             std::thread::scope(|scope| {
                 let pending: Vec<_> = batch
@@ -6284,7 +6285,7 @@ pub fn emit_rust_split_to_regions<E>(
                     let (region, source) = worker
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    sink(region, source)?;
+                    sink(region, source, groups.len())?;
                 }
                 Ok(())
             })?;

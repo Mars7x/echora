@@ -15,7 +15,6 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where installed games live: `ECHORA_DATA_DIR`, else the platform's
@@ -39,39 +38,26 @@ pub fn data_dir() -> Option<PathBuf> {
 pub struct Progress {
     copied: AtomicU64,
     total: AtomicU64,
-    result: Mutex<Option<Result<PathBuf, String>>>,
 }
 
 impl Progress {
-    /// Fraction copied, from 0 to 1.
-    pub fn fraction(&self) -> f32 {
+    pub fn status(&self) -> (&'static str, Option<u8>) {
         let total = self.total.load(Ordering::Relaxed);
         if total == 0 {
-            return 0.0;
+            return ("Checking game files", None);
         }
-        self.copied.load(Ordering::Relaxed) as f32 / total as f32
-    }
-
-    /// The installed path or the error, once the install has finished.
-    pub fn take_result(&self) -> Option<Result<PathBuf, String>> {
-        self.result.lock().ok()?.take()
-    }
-
-    fn finish(&self, result: Result<PathBuf, String>) {
-        if let Ok(mut slot) = self.result.lock() {
-            *slot = Some(result);
+        let copied = self.copied.load(Ordering::Relaxed);
+        if copied >= total {
+            return ("Finishing installation", None);
         }
+        let percent = (100 * u128::from(copied) / u128::from(total)) as u8;
+        ("Installing game files", Some(percent))
     }
 }
 
 /// Copies `source` (a NUP file or a dump folder) into `games`, replacing any
-/// earlier install, and reports the installed path through `progress`.
-pub fn install(source: &Path, games: &Path, progress: &Progress) {
-    let result = install_inner(source, games, progress).map_err(|error| error.to_string());
-    progress.finish(result);
-}
-
-fn install_inner(source: &Path, games: &Path, progress: &Progress) -> io::Result<PathBuf> {
+/// earlier install. Returns the installed path.
+pub fn install(source: &Path, games: &Path, progress: &Progress) -> io::Result<PathBuf> {
     let name = if source.is_dir() { "dump" } else { "game.nup" };
     let target = games.join(name);
     if source.canonicalize().ok() == target.canonicalize().ok() {
@@ -247,13 +233,12 @@ mod tests {
         fs::create_dir_all(games.join("dump")).unwrap();
         fs::write(dir.join("source.nup"), vec![7u8; 20 << 20]).unwrap();
         let progress = Progress::default();
-        install(&dir.join("source.nup"), &games, &progress);
-        let installed = progress.take_result().unwrap().unwrap();
+        let installed = install(&dir.join("source.nup"), &games, &progress).unwrap();
         assert_eq!(installed, games.join("game.nup"));
         assert_eq!(fs::read(&installed).unwrap().len(), 20 << 20);
         assert!(!games.join("dump").exists());
         assert!(!games.join(".installing").exists());
-        assert_eq!(progress.fraction(), 1.0);
+        assert_eq!(progress.status(), ("Finishing installation", None));
         remove(&dir).unwrap();
     }
 
@@ -264,8 +249,7 @@ mod tests {
         fs::write(dir.join("source/exefs/main"), b"code").unwrap();
         fs::write(dir.join("source/romfs.bin"), b"assets").unwrap();
         let progress = Progress::default();
-        install(&dir.join("source"), &dir.join("games"), &progress);
-        let installed = progress.take_result().unwrap().unwrap();
+        let installed = install(&dir.join("source"), &dir.join("games"), &progress).unwrap();
         assert_eq!(fs::read(installed.join("exefs/main")).unwrap(), b"code");
         assert_eq!(fs::read(installed.join("romfs.bin")).unwrap(), b"assets");
         remove(&dir).unwrap();
@@ -276,8 +260,7 @@ mod tests {
         let dir = scratch("outlives");
         fs::write(dir.join("source.nup"), b"game data").unwrap();
         let progress = Progress::default();
-        install(&dir.join("source.nup"), &dir.join("games"), &progress);
-        let installed = progress.take_result().unwrap().unwrap();
+        let installed = install(&dir.join("source.nup"), &dir.join("games"), &progress).unwrap();
         // Renamed, then deleted: the install keeps its own copy of the data.
         fs::rename(dir.join("source.nup"), dir.join("renamed.nup")).unwrap();
         assert_eq!(fs::read(&installed).unwrap(), b"game data");
@@ -313,8 +296,7 @@ mod tests {
         let games = nup.with_file_name(format!("echora-install-test-{}", std::process::id()));
         let progress = Progress::default();
         let start = std::time::Instant::now();
-        install(&nup, &games, &progress);
-        let installed = progress.take_result().unwrap().unwrap();
+        let installed = install(&nup, &games, &progress).unwrap();
         let elapsed = start.elapsed();
         #[cfg(unix)]
         {
@@ -338,11 +320,8 @@ mod tests {
         fs::create_dir_all(&games).unwrap();
         fs::write(games.join("game.nup"), b"installed").unwrap();
         let progress = Progress::default();
-        install(&games.join("game.nup"), &games, &progress);
-        assert_eq!(
-            progress.take_result().unwrap().unwrap(),
-            games.join("game.nup")
-        );
+        let installed = install(&games.join("game.nup"), &games, &progress).unwrap();
+        assert_eq!(installed, games.join("game.nup"));
         assert_eq!(fs::read(games.join("game.nup")).unwrap(), b"installed");
         remove(&dir).unwrap();
     }

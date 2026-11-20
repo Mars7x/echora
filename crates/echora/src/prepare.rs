@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! echora-prepare: step lift
+//! echora-prepare: lifted 340 of 1111
 //! echora-prepare: step build
 //! echora-prepare: built 340 of 1111
 //! echora-prepare: ready

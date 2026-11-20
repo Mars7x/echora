@@ -10,6 +10,7 @@ mod chrome;
 mod install;
 mod nav;
 mod prepare;
+mod save_preview;
 mod ui;
 
 fn main() -> std::process::ExitCode {
