@@ -183,21 +183,14 @@ pub struct Backend {
     texture_checked: HashMap<u64, u64>,
     /// The largest image extent the host GPU supports.
     max_extent: u32,
-    /// Uploads an application flush overlapped, with a hash of all their
-    /// raw storage: if a later use finds the storage unchanged, the upload
-    /// is kept instead of untiled again.
     /// Byte ranges (from the storage start) of cached uploads that
     /// application flushes overlapped: re-checked before the next use.
     dirty: HashMap<u64, Vec<std::ops::Range<u64>>>,
-    /// Hash of the whole raw storage of each upload.
     /// Hashes of each upload's raw storage in STORAGE_CHUNK pieces, so a
     /// flush re-checks only the pieces it overlapped.
     storage_hashes: HashMap<u64, Vec<u64>>,
     /// Merged storage of the cached uploads, rebuilt when the set changes.
     cached_texture_ranges: Option<Vec<std::ops::Range<u64>>>,
-    /// For uploads over DENSE_SAMPLE_ABOVE bytes: a hash of 4096 pieces
-    /// spread over the storage, checked instead of every flushed byte.
-    dense_samples: HashMap<u64, u64>,
     /// The linear rows a whole-level copy last wrote into a texture
     /// (`copy_texels`), with the texture's storage sample after it: while
     /// the storage samples the same they are its untiled level 0.
@@ -489,7 +482,6 @@ impl Backend {
             dirty: HashMap::default(),
             storage_hashes: HashMap::default(),
             cached_texture_ranges: None,
-            dense_samples: HashMap::default(),
             copied_levels: HashMap::default(),
             shadows: HashMap::default(),
             shadow_quiet: HashMap::default(),
@@ -1498,7 +1490,6 @@ impl Nvn {
         backend.texture_checked.remove(&texture);
         backend.shadows.remove(&texture);
         backend.storage_hashes.remove(&texture);
-        backend.dense_samples.remove(&texture);
         backend.dirty.remove(&texture);
         backend.renderer.forget_upload(texture);
     }
@@ -3774,28 +3765,21 @@ impl Nvn {
                 backend.textures.get(&texture),
                 backend.storage_hashes.get(&texture),
             ) {
-                (Some((_, _, storage)), _) if backend.dense_samples.contains_key(&texture) => {
-                    backend.dense_samples.get(&texture)
-                        == Some(&dense_sample(
-                            core,
-                            storage.start,
-                            storage.end - storage.start,
-                        ))
-                }
                 (Some((_, _, storage)), Some(hashes)) => {
-                    let mut chunks: Vec<u64> = ranges
-                        .iter()
-                        .flat_map(|range| {
-                            range.start / STORAGE_CHUNK..range.end.div_ceil(STORAGE_CHUNK)
-                        })
+                    // A flush can change bytes missed by the periodic texture
+                    // sample. Check every chunk the flush touches.
+                    let mut chunks: Vec<_> = ranges
+                        .into_iter()
+                        .map(|range| range.start / STORAGE_CHUNK..range.end.div_ceil(STORAGE_CHUNK))
                         .collect();
-                    chunks.sort_unstable();
-                    chunks.dedup();
-                    chunks.iter().all(|chunk| {
+                    merge_ranges(&mut chunks);
+                    let mut bytes = vec![0; STORAGE_CHUNK as usize];
+                    chunks.into_iter().flatten().all(|chunk| {
                         let start = chunk * STORAGE_CHUNK;
                         let length = STORAGE_CHUNK.min(storage.end - storage.start - start);
-                        let bytes = read_storage(core, storage.start + start, length);
-                        hashes.get(*chunk as usize) == Some(&hash_bytes(&bytes))
+                        let bytes = &mut bytes[..length as usize];
+                        read_storage_into(core, storage.start + start, bytes);
+                        hashes.get(chunk as usize) == Some(&hash_bytes(bytes))
                     })
                 }
                 _ => false,
@@ -4375,15 +4359,6 @@ impl Nvn {
         } else {
             backend.shadows.remove(&texture);
         }
-        if storage_size > DENSE_SAMPLE_ABOVE {
-            let sample = dense_sample(core, base, storage_size);
-            self.gpu
-                .as_mut()
-                .unwrap()
-                .dense_samples
-                .insert(texture, sample);
-        }
-        let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: texture uploads", 1);
         if let Some(note) = layout_note {
             backend.note(note);
@@ -11013,25 +10988,6 @@ impl Nvn {
     }
 }
 
-/// Uploads larger than this are re-checked after a flush by a dense sample
-/// (see `Backend::dense_samples`), not by hashing every flushed byte.
-const DENSE_SAMPLE_ABOVE: u64 = 1 << 20;
-
-/// A hash of 4096 64-byte pieces spread evenly over `length` bytes at
-/// `base` (a whole-storage hash costs more than the work it saves).
-fn dense_sample(core: &Guest, base: u64, length: u64) -> u64 {
-    let mut piece = [0u8; 64];
-    let mut sample = length;
-    for index in 0..4096u64 {
-        let offset = length.saturating_sub(64) * index / 4095;
-        if core.memory.read(base + offset, &mut piece).is_err() {
-            piece.fill(0);
-        }
-        sample = sample.rotate_left(7) ^ hash_bytes(&piece);
-    }
-    sample
-}
-
 /// A memory pool mirrored in a device-local buffer while compute shaders
 /// use storage in it (`Renderer::resident_buffer`, keyed by `base`). The
 /// pools the game puts storage in are CPU-cached: the CPU flushes ranges it
@@ -11762,6 +11718,81 @@ mod target_tests {
             assert_eq!(image.len(), 1);
             assert!((image[0][0] - f32::from(value) / 65535.0).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn a_small_flush_refreshes_a_large_cached_texture() {
+        use echora_gpu::draw::TextureSource;
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let (pool, texture) = (1, 2);
+        let base = 0x10_0000;
+        let size = 2 << 20;
+        let args = |x| Args {
+            x,
+            ..Default::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([
+                ("Storage".into(), args([base, size, 0, 0])),
+                ("Flags".into(), scalar(0x24)),
+            ]),
+        )
+        .unwrap();
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Storage".into(), args([pool, 0, 0, 0])),
+                ("Width".into(), scalar(1024)),
+                ("Height".into(), scalar(512)),
+                ("Stride".into(), scalar(4096)),
+                ("Format".into(), scalar(37)),
+            ]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "cached texture")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let rgba = [255, 128, 64, 255];
+        let offset = 256;
+        let TextureSource::Upload { generation, .. } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the initial texture upload");
+        };
+        nvn.gpu_invalidate(base + offset..base + offset + 4, None);
+        nvn.guest_texture(&guest, texture).unwrap();
+        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        guest.memory.write(base + offset, &rgba).unwrap();
+        nvn.gpu_invalidate(base + offset..base + offset + 4, None);
+        let TextureSource::Upload {
+            generation: updated,
+            texels,
+            ..
+        } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the refreshed texture upload");
+        };
+        assert_ne!(updated, generation);
+        assert_eq!(texels[offset as usize..][..4], rgba);
     }
 
     #[test]
