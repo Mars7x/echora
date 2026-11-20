@@ -541,11 +541,25 @@ impl Backend {
         &mut self,
         key: (usize, u64),
         built: PageBuild,
+        modified: Option<&[std::ops::Range<u64>]>,
     ) -> Result<echora_shader_abi::PageTable, String> {
         let previous_address = self.page_table.map(|(_, table)| table.address);
-        let (table, extended) = self
-            .renderer
-            .set_page_table(built.first as u32, &built.entries)?;
+        let (table, extended) = if let Some(modified) = modified {
+            self.stat("stat: page table uses patches", 1);
+            let patches: Vec<_> = modified
+                .iter()
+                .map(|range| {
+                    let start = range.start as usize;
+                    (start, &built.entries[start..range.end as usize])
+                })
+                .collect();
+            self.renderer
+                .patch_page_table(built.first as u32, built.entries.len(), &patches)?
+        } else {
+            self.renderer
+                .set_page_table(built.first as u32, &built.entries)?
+        };
+        debug_assert!(table.address == 0 || self.renderer.page_table_entries() == built.entries);
         self.page_table = Some((key, table));
         self.page_build = Some(built);
         if extended {
@@ -6836,6 +6850,10 @@ impl Nvn {
             superseded = backend.renderer.superseded_spans().0;
         }
         let previous = previous.filter(|_| whole.is_none());
+        let mut modified = previous
+            .as_ref()
+            .filter(|built| built.entries.len() == count)
+            .map(|_| Vec::new());
         let mut built_pools = HashMap::default();
         let mut entries = match previous {
             Some(built) => {
@@ -6854,8 +6872,12 @@ impl Nvn {
             .collect();
         for pool in gone {
             built_pools.remove(&pool);
-            if let Some(range) = entries.get_mut(pool.pages(first, count)) {
+            let pages = pool.pages(first, count);
+            if let Some(range) = entries.get_mut(pages.clone()) {
                 range.fill(0);
+                if let Some(modified) = &mut modified {
+                    modified.push(pages.start as u64..pages.end as u64);
+                }
             }
             self.gpu
                 .as_mut()
@@ -6894,15 +6916,18 @@ impl Nvn {
                 backend.stat("stat: page table bytes mapped again", pool.size);
             }
             let pages = pool.pages(first, count);
-            if let Some(range) = entries.get_mut(pages.clone()) {
+            let complete = if let Some(range) = entries.get_mut(pages.clone()) {
                 range.fill(0);
-            }
-            self.map_pool_pages(core, pool, first, &mut entries)?;
+                self.map_pool_pages(core, pool, first + pages.start as u64, range)?;
+                if let Some(modified) = &mut modified {
+                    modified.push(pages.start as u64..pages.end as u64);
+                }
+                range.iter().all(|&entry| entry != 0)
+            } else {
+                false
+            };
             // A pool with unmapped pages, mapped without the guest's page
             // table, is mapped again by a build that has it.
-            let complete = entries
-                .get(pages)
-                .is_some_and(|range| range.iter().all(|&entry| entry != 0));
             // Its signature after mapping (a GPU-only pool's resident
             // buffer exists from its first mapping on).
             let mapped = self.pool_share_signature(pool.base, pool.flags);
@@ -6917,6 +6942,9 @@ impl Nvn {
             "stat: page table map microseconds",
             started.elapsed().as_micros() as u64,
         );
+        if let Some(modified) = &mut modified {
+            merge_ranges(modified);
+        }
         let table = backend.set_page_table(
             key,
             PageBuild {
@@ -6925,6 +6953,7 @@ impl Nvn {
                 pools: built_pools,
                 shared_mapping: std::cell::OnceCell::new(),
             },
+            modified.as_deref(),
         )?;
         if whole.is_some() {
             backend.renderer.take_superseded(superseded);
@@ -12582,7 +12611,7 @@ mod pool_tests {
             }
         };
         let first = backend
-            .set_page_table((0, 0), entries(&[address, 0, 0]))
+            .set_page_table((0, 0), entries(&[address, 0, 0]), None)
             .unwrap();
         let touches = |start| SharedRange {
             file: 1,
@@ -12597,11 +12626,11 @@ mod pool_tests {
             }),
         );
         let unchanged = backend
-            .set_page_table((0, 1), entries(&[address, 0, 0]))
+            .set_page_table((0, 1), entries(&[address, 0, 0]), None)
             .unwrap();
         assert_eq!(first, unchanged);
         let extended = backend
-            .set_page_table((0, 2), entries(&[address, address + page, 0]))
+            .set_page_table((0, 2), entries(&[address, address + page, 0]), None)
             .unwrap();
         assert_eq!(extended, first);
         assert_eq!(backend.shared_write_serial(touches(0)), 1);
@@ -12612,11 +12641,11 @@ mod pool_tests {
         // A replacement gives newer work a different buffer. The previous
         // serial's virtual ranges must not be projected through it.
         let replaced = backend
-            .set_page_table((0, 3), entries(&[address + page, 0, 0]))
+            .set_page_table((0, 3), entries(&[address + page, 0, 0]), None)
             .unwrap();
         assert_ne!(replaced.address, first.address);
         backend
-            .set_page_table((0, 4), entries(&[address + page, address, 0]))
+            .set_page_table((0, 4), entries(&[address + page, address, 0]), None)
             .unwrap();
         assert_eq!(backend.shared_write_serial(touches(page + 8)), 0);
         assert_eq!(backend.shared_write_serial(touches(page)), 1);

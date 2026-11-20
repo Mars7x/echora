@@ -1455,21 +1455,52 @@ impl Renderer {
         if !self.gpu.buffer_device_address {
             return Ok((echora_shader_abi::PageTable::default(), false));
         }
-        let bytes = (entries.len().max(1) * 8) as u64;
-        // Preserve the table in place when its only changes fill unmapped
-        // pages. Keep the changed chunks so this comparison only runs once.
-        const CHUNK: usize = 512;
-        let mut additions = self.page_table.as_ref().and_then(|table| {
-            if table.first_page != first_page || table.entries.len() != entries.len() {
-                return None;
+        if self.page_table.as_ref().is_some_and(|table| {
+            table.first_page == first_page && table.entries.len() == entries.len()
+        }) {
+            return self.patch_page_table(first_page, entries.len(), &[(0, entries)]);
+        }
+        self.replace_page_table(first_page, entries.len(), |current| {
+            current.clear();
+            current.extend_from_slice(entries);
+        })?;
+        Ok((self.page_table_binding(), false))
+    }
+
+    /// Change sorted, non-overlapping ranges of an existing page table.
+    /// The existing mappings outside the patch, and the table's extent,
+    /// carry over. All addresses are kept stable for submitted commands.
+    pub fn patch_page_table(
+        &mut self,
+        first_page: u32,
+        count: usize,
+        patches: &[(usize, &[u64])],
+    ) -> Result<(echora_shader_abi::PageTable, bool), String> {
+        if !self.gpu.buffer_device_address {
+            return Ok((echora_shader_abi::PageTable::default(), false));
+        }
+        let table = self
+            .page_table
+            .as_ref()
+            .filter(|table| table.first_page == first_page && table.entries.len() == count)
+            .ok_or("page table patch does not match the current extent")?;
+        let mut last = 0;
+        for &(start, patch) in patches {
+            if start < last {
+                return Err("page table patches overlap or are unordered".into());
             }
-            let mut changed = Vec::new();
-            for (index, (old, new)) in table
-                .entries
-                .chunks(CHUNK)
-                .zip(entries.chunks(CHUNK))
-                .enumerate()
-            {
+            last = start
+                .checked_add(patch.len())
+                .filter(|&end| end <= count)
+                .ok_or("page table patch runs past the end of the table")?;
+        }
+
+        let mut added = Vec::new();
+        let mut replace = false;
+        const CHUNK: usize = 512;
+        'compare: for &(start, patch) in patches {
+            let old = &table.entries[start..start + patch.len()];
+            for (index, (old, new)) in old.chunks(CHUNK).zip(patch.chunks(CHUNK)).enumerate() {
                 if old == new {
                     continue;
                 }
@@ -1478,95 +1509,93 @@ impl Renderer {
                     .zip(new)
                     .any(|(old, new)| old != new && *old != 0)
                 {
-                    return None;
+                    replace = true;
+                    break 'compare;
                 }
-                changed.push(index);
+                added.push((start + index * CHUNK, new));
             }
-            Some(changed)
-        });
-        if additions
-            .as_ref()
-            .is_some_and(|changed| !changed.is_empty())
-            && self
-                .page_table
-                .as_ref()
-                .is_some_and(|table| table.submitted_read > self.completed_serial)
-        {
+        }
+        if !replace && !added.is_empty() && table.submitted_read > self.completed_serial {
             self.poll_completed()?;
-            if self
-                .page_table
-                .as_ref()
-                .is_some_and(|table| table.submitted_read > self.completed_serial)
-            {
-                // Submitted shaders still read this mapping buffer. Keep
-                // those entries stable and give later commands a new one.
-                additions = None;
+            if self.page_table.as_ref().unwrap().submitted_read > self.completed_serial {
+                // Submitted shaders keep the table entries they can still read.
+                replace = true;
                 self.stat("stat: page tables replaced with submitted readers", 1);
             }
         }
-        let extended = additions
-            .as_ref()
-            .is_some_and(|changed| !changed.is_empty());
-        if let Some(changed) = additions {
-            if extended {
-                let table = self.page_table.as_mut().unwrap();
-                for index in changed {
-                    let start = index * CHUNK;
-                    let end = (start + CHUNK).min(entries.len());
-                    table
-                        .buffer
-                        .write_page_addresses(start * 8, &entries[start..end]);
-                    table.entries[start..end].copy_from_slice(&entries[start..end]);
+        if replace {
+            self.replace_page_table(first_page, count, |entries| {
+                for &(start, patch) in patches {
+                    entries[start..start + patch.len()].copy_from_slice(patch);
                 }
-                self.stat("stat: page tables extended in place", 1);
-            }
-        } else {
-            // Finish allocating before retiring the currently published table.
-            let buffer = if self
-                .free_page_tables
-                .last()
-                .is_some_and(|table| table.size == bytes)
-            {
-                self.stat("stat: page table buffers reused", 1);
-                self.free_page_tables.pop().unwrap()
-            } else {
-                let buffer =
-                    self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-                self.stat("stat: page table buffers allocated", 1);
-                for old in self.free_page_tables.drain(..) {
-                    old.destroy(&self.gpu.device);
-                }
-                buffer
-            };
-            buffer.write_page_addresses(0, entries);
-            let mut written = if let Some(old) = self.page_table.take() {
-                // Work already recorded or submitted can still read the
-                // old buffer. The end of this slot orders all those uses.
-                self.slot.retired_page_tables.push(old.buffer);
-                old.entries
-            } else {
-                Vec::new()
-            };
-            written.clear();
-            written.extend_from_slice(entries);
-            self.page_table = Some(PageTableBuffer {
-                address: self.buffer_address(buffer.buffer).unwrap_or(0),
-                buffer,
-                entries: written,
-                first_page,
-                recorded_read: false,
-                submitted_read: 0,
-            });
+            })?;
+            return Ok((self.page_table_binding(), false));
         }
+        let extended = !added.is_empty();
+        if extended {
+            let table = self.page_table.as_mut().unwrap();
+            for (start, entries) in added {
+                table.buffer.write_page_addresses(start * 8, entries);
+                table.entries[start..start + entries.len()].copy_from_slice(entries);
+            }
+            self.stat("stat: page tables extended in place", 1);
+        }
+        Ok((self.page_table_binding(), extended))
+    }
+
+    fn replace_page_table(
+        &mut self,
+        first_page: u32,
+        count: usize,
+        update: impl FnOnce(&mut Vec<u64>),
+    ) -> Result<(), String> {
+        let bytes = (count.max(1) * 8) as u64;
+        // Acquire the new buffer before retiring the current one.
+        let buffer = if self
+            .free_page_tables
+            .last()
+            .is_some_and(|table| table.size == bytes)
+        {
+            self.stat("stat: page table buffers reused", 1);
+            self.free_page_tables.pop().unwrap()
+        } else {
+            let buffer =
+                self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            self.stat("stat: page table buffers allocated", 1);
+            for old in self.free_page_tables.drain(..) {
+                old.destroy(&self.gpu.device);
+            }
+            buffer
+        };
+        let mut entries = if let Some(old) = self.page_table.take() {
+            // Work already recorded or submitted can still read the old
+            // buffer. The end of this slot orders all those uses.
+            self.slot.retired_page_tables.push(old.buffer);
+            old.entries
+        } else {
+            Vec::new()
+        };
+        update(&mut entries);
+        debug_assert_eq!(entries.len(), count);
+        buffer.write_page_addresses(0, &entries);
+        self.page_table = Some(PageTableBuffer {
+            address: self.buffer_address(buffer.buffer).unwrap_or(0),
+            buffer,
+            entries,
+            first_page,
+            recorded_read: false,
+            submitted_read: 0,
+        });
+        Ok(())
+    }
+
+    fn page_table_binding(&self) -> echora_shader_abi::PageTable {
         let table = self.page_table.as_ref().unwrap();
-        Ok((
-            echora_shader_abi::PageTable {
-                address: table.address,
-                first_page,
-                page_count: entries.len() as u32,
-            },
-            extended,
-        ))
+        echora_shader_abi::PageTable {
+            address: table.address,
+            first_page: table.first_page,
+            page_count: table.entries.len() as u32,
+        }
     }
 
     /// Remember a command recorded with the current page-table buffer.
@@ -8090,7 +8119,33 @@ mod tests {
 
         entries[1] = resident + 4096;
         entries[1024] = resident;
-        let (same, extended) = renderer.set_page_table(0x100, &entries).unwrap();
+        let before = renderer.page_table_entries().to_vec();
+        assert!(
+            renderer
+                .patch_page_table(
+                    0x100,
+                    entries.len(),
+                    &[(1, &entries[1..3]), (2, &entries[2..3])]
+                )
+                .is_err()
+        );
+        assert!(
+            renderer
+                .patch_page_table(
+                    0x100,
+                    entries.len(),
+                    &[(1, &entries[1..2]), (1025, &entries[1024..])]
+                )
+                .is_err()
+        );
+        assert_eq!(renderer.page_table_entries(), before);
+        let (same, extended) = renderer
+            .patch_page_table(
+                0x100,
+                entries.len(),
+                &[(1, &entries[1..2]), (1024, &entries[1024..])],
+            )
+            .unwrap();
         assert_eq!(same, table);
         assert!(extended);
         assert_eq!(renderer.page_table_entries(), entries);
@@ -8111,7 +8166,10 @@ mod tests {
         renderer.commands().unwrap();
         entries[0] = 0;
         entries[1] = resident;
-        let (replaced, extended) = renderer.set_page_table(0x100, &entries).unwrap();
+        let (replaced, extended) = renderer
+            .patch_page_table(0x100, entries.len(), &[(0, &entries[..2])])
+            .unwrap();
+        assert_eq!(renderer.page_table_entries(), entries);
         assert!(!extended);
         assert_ne!(replaced.address, table.address);
         assert!(renderer.free_page_tables.is_empty());
