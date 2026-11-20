@@ -2362,6 +2362,9 @@ impl Renderer {
             let view = match texture_type {
                 2 | 8 if layered => Some((vk::ImageViewType::TYPE_2D, 1)),
                 3 if layered => Some((vk::ImageViewType::TYPE_2D_ARRAY, layer_count)),
+                4 if matches!(target.shape, ImageShape::D3 { .. }) => {
+                    Some((vk::ImageViewType::TYPE_3D, 1))
+                }
                 5 if cube && layer_count >= 6 => Some((vk::ImageViewType::CUBE, 6)),
                 6 if cube && layer_count >= 6 => {
                     Some((vk::ImageViewType::CUBE_ARRAY, layer_count / 6 * 6))
@@ -8467,7 +8470,7 @@ mod tests {
 
     #[test]
     fn relative_mip_views_keep_their_source_ranges() {
-        use crate::draw::{Sampler, TextureSource};
+        use crate::draw::{ImageShape, Sampler, TextureSource};
 
         let Some(mut renderer) = renderer() else {
             return;
@@ -8507,6 +8510,26 @@ mod tests {
                 (relative_base, 4 - relative_base)
             );
         }
+        renderer
+            .shaped_target(
+                8,
+                8,
+                8,
+                ImageShape::D3 { depth: 8 },
+                vk::Format::R8G8B8A8_UNORM,
+                4,
+            )
+            .unwrap();
+        let volume = TextureSource::TargetView {
+            key: 8,
+            base_level: 1,
+            level_count: 2,
+            base_layer: 0,
+            layer_count: 1,
+        };
+        let view = renderer.texture_view(&volume, 4).unwrap();
+        let range = renderer.view_infos[&view].range;
+        assert_eq!((range.base_mip_level, range.level_count), (1, 2));
     }
 
     #[test]

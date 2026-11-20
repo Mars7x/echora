@@ -3424,10 +3424,17 @@ impl Nvn {
     /// layers (or cube faces) samples only those, and a view's mip levels
     /// only those (`mip_targets`).
     fn through_view(&self, source: TextureSource, handle: u64) -> TextureSource {
-        let TextureSource::Target(key) = source else {
-            return source;
+        let (key, source_level, source_levels) = match source {
+            TextureSource::Target(key) => (key, 0, 0),
+            TextureSource::TargetView {
+                key,
+                base_level,
+                level_count,
+                ..
+            } => (key, base_level, level_count),
+            TextureSource::Upload { .. } => return source,
         };
-        let (base_level, level_count) = if super::mip_targets() {
+        let (mut base_level, mut level_count) = if super::mip_targets() {
             self.handle_view_levels(handle).unwrap_or((0, 0))
         } else {
             (0, 0)
@@ -3436,9 +3443,20 @@ impl Nvn {
         if (base_level, level_count, base_layer, layer_count) == (0, 0, 0, 0) {
             return source;
         }
+        // The view's levels are relative to the texture object, including
+        // when it names just part of the render target's mip chain.
+        if source_levels != 0 {
+            base_level = base_level.min(source_levels - 1);
+            let remaining = source_levels - base_level;
+            level_count = if level_count == 0 {
+                remaining
+            } else {
+                level_count.min(remaining)
+            };
+        }
         TextureSource::TargetView {
             key,
-            base_level,
+            base_level: source_level + base_level,
             level_count,
             base_layer,
             layer_count,
@@ -4001,12 +4019,22 @@ impl Nvn {
         // for textures of other formats within a frame (an RGB9E5 image
         // over the HDR scene's R11G11B10 memory once the scene is used):
         // the target in the texture's own format is the one it reads.
-        if let Some((key, level)) = self.resolve_target(texture) {
-            if level > 0 {
+        let levels = self.texture_levels(texture);
+        if let Some((key, level)) = self.resolve_target_with_levels(texture, levels) {
+            if level > 0
+                || (key != texture
+                    && self
+                        .gpu
+                        .as_ref()
+                        .unwrap()
+                        .renderer
+                        .target_info(key)
+                        .is_some_and(|target| target.levels > levels))
+            {
                 return Ok(TextureSource::TargetView {
                     key,
                     base_level: level,
-                    level_count: 1,
+                    level_count: levels,
                     base_layer: 0,
                     layer_count: 0,
                 });
@@ -13009,6 +13037,8 @@ mod target_tests {
 
     #[test]
     fn mip_storage_aliases_require_compatible_formats() {
+        use super::TextureSource;
+
         let Ok(Some(backend)) = Backend::create(None) else {
             return;
         };
@@ -13036,7 +13066,7 @@ mod target_tests {
             ])
         };
         let parent = 2;
-        nvn.initialize(parent, "Texture", texture(16, 2, 0, 37))
+        nvn.initialize(parent, "Texture", texture(16, 4, 0, 37))
             .unwrap();
         nvn.ensure_render_target(parent).unwrap();
         let target = nvn
@@ -13050,7 +13080,7 @@ mod target_tests {
             .target_level_offsets(parent, target.into())
             .next()
             .unwrap();
-        nvn.initialize(3, "Texture", texture(8, 1, offset, 37))
+        nvn.initialize(3, "Texture", texture(8, 2, offset, 37))
             .unwrap();
         nvn.initialize(4, "Texture", texture(8, 1, offset, 56))
             .unwrap();
@@ -13065,6 +13095,50 @@ mod target_tests {
             assert_eq!(nvn.resolve_target(4), Some((parent, 1)));
             assert_eq!(nvn.resolve_target(5), None);
         }
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let source = nvn.texture_source_resolved(&core, 3).unwrap();
+        assert!(matches!(
+            source,
+            TextureSource::TargetView {
+                key: 2,
+                base_level: 1,
+                level_count: 2,
+                ..
+            }
+        ));
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        nvn.views.insert(
+            (pool, 3),
+            crate::nvn::Bag {
+                kind: "TextureView".into(),
+                props: BTreeMap::from([("Levels".into(), args([1, 0, 0, 0]))]),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            nvn.through_view(source, 3),
+            TextureSource::TargetView {
+                key: 2,
+                base_level: 2,
+                level_count: 1,
+                ..
+            }
+        ));
         nvn.ensure_render_target(3).unwrap();
         assert_eq!(nvn.resolve_target(4), Some((3, 0)));
         nvn.refresh_target_index();
@@ -13093,13 +13167,6 @@ mod target_tests {
             .unwrap();
         let red = [1.0f32, 0.0, 0.0, 1.0];
         let blue = [0.0f32, 0.0, 1.0, 1.0];
-        let mut cpu = Cpu::default();
-        let mut memory = Memory::new(1 << 39);
-        let core = Guest {
-            cpu: &mut cpu,
-            memory: GuestMemory::Checked(&mut memory),
-            counter: None,
-        };
         nvn.gpu_clear_color(&core, (9, 0, 0), red.map(f32::to_bits), None)
             .unwrap();
         nvn.refresh_target_index();
