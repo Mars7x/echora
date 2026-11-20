@@ -509,7 +509,7 @@ pub struct Renderer {
     slot: Slot,
     /// Graphics state remains valid across render passes in one batch.
     pub(crate) graphics: crate::draw::GraphicsState,
-    pub(crate) stencil_clear_program: Option<crate::draw::Program>,
+    pub(crate) shader_clear_programs: [Option<crate::draw::Program>; 4],
     pub gpu: Gpu,
     /// Held while the queue is used (submissions, presents).
     pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
@@ -705,13 +705,10 @@ enum ExtraView {
         format: vk::Format,
         level: u32,
     },
-    Layer {
-        level: u32,
-        layer: u32,
-    },
-    AttachmentLevel {
+    Attachment {
         format: vk::Format,
         level: u32,
+        layer: u32,
     },
 }
 
@@ -1122,7 +1119,7 @@ impl Renderer {
             recording: false,
             full_barrier_recorded: false,
             graphics: Default::default(),
-            stencil_clear_program: None,
+            shader_clear_programs: Default::default(),
             memory_types,
             targets: FastMap::default(),
             archived_targets: FastMap::default(),
@@ -5839,14 +5836,14 @@ impl Renderer {
         Ok(view)
     }
 
-    /// A 2D view of mip level `level` of array layer (or cube face)
-    /// `layer` of target `key`, for attachments: `level_view` for targets
-    /// of one layer.
+    /// A view of a single mip and layer, cube face, or volume slice.
+    /// An sRGB or UNORM view selects how the attachment encodes writes.
     pub(crate) fn attachment_view(
         &mut self,
         key: u64,
         level: u32,
         layer: u32,
+        view_format: Option<vk::Format>,
     ) -> Result<vk::ImageView, String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
         if level >= target.levels {
@@ -5867,14 +5864,23 @@ impl Renderer {
                 target.levels
             ));
         }
-        if layers == 1 && !matches!(target.shape, ImageShape::D3 { .. }) {
+        let format = attachment_format(target.format, view_format);
+        if format == target.format && layers == 1 && !matches!(target.shape, ImageShape::D3 { .. })
+        {
             return self.level_view(key, level);
         }
-        let cache = (target.image, ExtraView::Layer { level, layer });
+        let cache = (
+            target.image,
+            ExtraView::Attachment {
+                format,
+                level,
+                layer,
+            },
+        );
         if let Some(view) = self.extra_views.get(&cache) {
             return Ok(*view);
         }
-        let attachment = if is_depth(target.format) {
+        let attachment = if is_depth(format) {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
         } else {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -5882,57 +5888,16 @@ impl Renderer {
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(attachment);
         let info = vk::ImageViewCreateInfo::default()
             .image(target.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(target.format)
-            .subresource_range(vk::ImageSubresourceRange {
-                base_mip_level: level,
-                base_array_layer: layer,
-                ..range(target.format)
+            .view_type(if matches!(target.shape, ImageShape::D1 { .. }) {
+                vk::ImageViewType::TYPE_1D
+            } else {
+                vk::ImageViewType::TYPE_2D
             })
-            .push_next(&mut usage);
-        // SAFETY: the image is live; the view is destroyed with it.
-        let view = unsafe { self.gpu.device.create_image_view(&info, None) }
-            .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
-        Ok(view)
-    }
-
-    /// `attachment_view` in `format`, the target's sRGB (or UNORM) twin
-    /// its image was created to allow: an sRGB attachment encodes what
-    /// draws write, as rendering through an NVN RGBA8_SRGB view of an
-    /// RGBA8 texture does. Other formats keep the target's own view.
-    pub(crate) fn attachment_view_as(
-        &mut self,
-        key: u64,
-        level: u32,
-        layer: u32,
-        format: vk::Format,
-    ) -> Result<vk::ImageView, String> {
-        let target = self.targets.get(&key).ok_or("no such target")?;
-        if format == target.format
-            || srgb_twin(target.format) != Some(format)
-            || target.shape.layers() != 1
-            || level >= target.levels
-            || layer != 0
-        {
-            return self.attachment_view(key, level, layer);
-        }
-        let cache = (target.image, ExtraView::AttachmentLevel { format, level });
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
-        }
-        // Used as an attachment only (an sRGB format has no storage use
-        // its image may have).
-        let mut usage =
-            vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
-        let info = vk::ImageViewCreateInfo::default()
-            .image(target.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
                 base_mip_level: level,
-                level_count: 1,
-                ..range(target.format)
+                base_array_layer: layer,
+                ..range(format)
             })
             .push_next(&mut usage);
         // SAFETY: the image is live; the view is destroyed with it.
@@ -6641,8 +6606,7 @@ impl Renderer {
     }
 
     /// Clear `rect` (x, y, width, height; the whole target when None) of a
-    /// color target to `color`, written only where `mask` (bit per channel)
-    /// is set. Masked clears are not modeled.
+    /// color target to `color`.
     pub fn clear_color(
         &mut self,
         key: u64,
@@ -6662,6 +6626,27 @@ impl Renderer {
         rect: Option<[i32; 4]>,
         color: vk::ClearColorValue,
     ) -> Result<(), String> {
+        self.clear_color_view(
+            (key, level, layer),
+            None,
+            rect,
+            color,
+            vk::ColorComponentFlags::RGBA,
+        )
+    }
+
+    /// Clear selected channels of a color attachment, using its view format.
+    pub fn clear_color_view(
+        &mut self,
+        (key, level, layer): (u64, u32, u32),
+        view_format: Option<vk::Format>,
+        rect: Option<[i32; 4]>,
+        color: vk::ClearColorValue,
+        mask: vk::ColorComponentFlags,
+    ) -> Result<(), String> {
+        if mask.is_empty() {
+            return Ok(());
+        }
         let target = self.targets.get(&key).ok_or("no such target")?;
         if level >= target.levels || layer >= target.shape.layers() {
             return Err(format!(
@@ -6671,6 +6656,8 @@ impl Renderer {
             ));
         }
         let (whole_width, whole_height) = target.extent(level);
+        let format = attachment_format(target.format, view_format);
+        let reinterpret = format != target.format;
         let whole = [0, 0, whole_width as i32, whole_height as i32];
         let rect = rect.map(|rect| target.scaled(rect));
         let [x, y, width, height] = clip(rect.unwrap_or(whole), whole);
@@ -6680,7 +6667,22 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
-        if [x, y, width, height] == whole && self.condition.is_none() {
+        if mask != vk::ColorComponentFlags::RGBA {
+            self.stat("stat: masked color clears", 1);
+            // SAFETY: the union contains four initialized 32-bit words.
+            let words = unsafe { color.uint32 };
+            return self.clear_with_shader(
+                (key, level, layer),
+                (whole_width, whole_height),
+                [x, y, width, height],
+                crate::draw::ShaderClear::Color {
+                    format,
+                    words,
+                    mask,
+                },
+            );
+        }
+        if [x, y, width, height] == whole && self.condition.is_none() && !reinterpret {
             self.transition(key, vk::ImageLayout::GENERAL)?;
             self.order_target(key)?;
             let commands = self.commands()?;
@@ -6704,7 +6706,7 @@ impl Renderer {
         }
         // Attachment clears support scissoring and conditional rendering.
         self.prepare_condition()?;
-        self.begin_rendering(&[key], &[level], &[layer], &[], None, [0; 4])?;
+        self.begin_rendering(&[key], &[level], &[layer], &[view_format], None, [0; 4])?;
         self.apply_condition()?;
         let commands = self.recording_commands()?;
         let attachment = vk::ClearAttachment {
@@ -6863,14 +6865,11 @@ impl Renderer {
                 views.push(vk::ImageView::null());
                 continue;
             };
-            let view = match format {
-                Some(format) => self.attachment_view_as(target, level, layer, format)?,
-                None => self.attachment_view(target, level, layer)?,
-            };
+            let view = self.attachment_view(target, level, layer, format)?;
             views.push(view);
         }
         let depth_view = match depth {
-            Some((key, level, layer)) => Some(self.attachment_view(key, level, layer)?),
+            Some((key, level, layer)) => Some(self.attachment_view(key, level, layer, None)?),
             None => None,
         };
         // The render area is the attachments' common extent (the
@@ -7930,9 +7929,8 @@ impl Drop for Renderer {
         if let Some(occlusion) = self.occlusion.take() {
             occlusion.destroy(&self.gpu.device);
         }
-        if let Some(program) = self.stencil_clear_program.take() {
-            let _ = self.destroy_idle_programs([program]);
-        }
+        let clear_programs = std::mem::take(&mut self.shader_clear_programs);
+        let _ = self.destroy_idle_programs(clear_programs.into_iter().flatten());
         if let Some(mesh_count) = self.mesh_count.take() {
             mesh_count.destroy(&self.gpu.device);
         }
@@ -8936,7 +8934,7 @@ mod tests {
         assert!(!target.view_usage.contains(vk::ImageUsageFlags::STORAGE));
         assert!(target.view_usage.contains(vk::ImageUsageFlags::SAMPLED));
         let mip = renderer.level_view(7, 2).unwrap();
-        let layer = renderer.attachment_view(7, 2, 1).unwrap();
+        let layer = renderer.attachment_view(7, 2, 1, None).unwrap();
         let writable = renderer.level_view_as(7, 2, storage).unwrap();
         assert_ne!(mip, writable);
         assert_ne!(layer, writable);
@@ -9421,6 +9419,109 @@ mod tests {
     }
 
     #[test]
+    fn masked_color_clears_preserve_channels_and_use_the_view_format() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.supports_conditions() {
+            return;
+        }
+        let (predicate, _) = renderer.resident_buffer(1, 32).unwrap();
+        renderer.fill_resident(1, 0, 32, 0).unwrap();
+        renderer
+            .target(2, 4, 2, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let initial = vk::ClearColorValue {
+            float32: [0.0, 1.0, 1.0, 1.0],
+        };
+        let color = vk::ClearColorValue {
+            float32: [0.25, 0.0, 0.0, 0.5],
+        };
+        let srgb = Some(vk::Format::R8G8B8A8_SRGB);
+        let mask = vk::ColorComponentFlags::R | vk::ColorComponentFlags::A;
+        renderer.clear_color(2, None, initial).unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.set_condition(Some((predicate, 0, false)));
+        renderer
+            .clear_color_view((2, 0, 0), srgb, None, color, mask)
+            .unwrap();
+        renderer.set_condition(Some((predicate, 0, true)));
+        renderer
+            .clear_color_view((2, 0, 0), srgb, Some([2, 0, 2, 2]), color, mask)
+            .unwrap();
+        renderer.set_condition(None);
+        renderer
+            .clear_color_view(
+                (2, 0, 0),
+                srgb,
+                None,
+                color,
+                vk::ColorComponentFlags::empty(),
+            )
+            .unwrap();
+        renderer.samples_report(predicate, 16, 0x1234).unwrap();
+        let token = renderer.read_resident(1, 16, 16).unwrap();
+        let bytes = renderer.read_target_bytes(2, 4).unwrap();
+        for row in bytes.chunks_exact(16) {
+            assert_eq!(&row[..8], &[0, 255, 255, 255].repeat(2));
+            for pixel in row[8..].chunks_exact(4) {
+                assert!(pixel[0].abs_diff(137) <= 1, "{pixel:?}");
+                assert_eq!(&pixel[1..3], &[255, 255]);
+                assert!(pixel[3].abs_diff(128) <= 1, "{pixel:?}");
+            }
+        }
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            [0_u64, 0x1234].map(u64::to_le_bytes).concat()
+        );
+
+        renderer
+            .clear_color_view((2, 0, 0), srgb, None, color, vk::ColorComponentFlags::RGBA)
+            .unwrap();
+        for pixel in renderer.read_target_bytes(2, 4).unwrap().chunks_exact(4) {
+            assert!(pixel[0].abs_diff(137) <= 1, "{pixel:?}");
+            assert_eq!(&pixel[1..3], &[0, 0]);
+            assert!(pixel[3].abs_diff(128) <= 1, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    fn masked_integer_color_clears_keep_exact_words() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let initial = [0x8123_4567_u32, 45, 0x0100_0001, 111];
+        let update = [0xFEDC_BA98_u32, 1, 2, 0x8ABD_EFFF];
+        let mask = vk::ColorComponentFlags::R | vk::ColorComponentFlags::A;
+        for (key, format) in [vk::Format::R32G32B32A32_UINT, vk::Format::R32G32B32A32_SINT]
+            .into_iter()
+            .enumerate()
+        {
+            let key = key as u64 + 1;
+            renderer.target(key, 2, 2, format).unwrap();
+            renderer
+                .clear_color(key, None, vk::ClearColorValue { uint32: initial })
+                .unwrap();
+            renderer
+                .clear_color_view(
+                    (key, 0, 0),
+                    None,
+                    None,
+                    vk::ClearColorValue { uint32: update },
+                    mask,
+                )
+                .unwrap();
+            let texel = [update[0], initial[1], initial[2], update[3]]
+                .map(u32::to_le_bytes)
+                .concat();
+            assert_eq!(
+                renderer.read_target_bytes(key, 16).unwrap(),
+                texel.repeat(4)
+            );
+        }
+    }
+
+    #[test]
     fn masked_stencil_clears_follow_conditions_without_counting_samples() {
         let Some(mut renderer) = renderer() else {
             return;
@@ -9582,6 +9683,11 @@ pub fn srgb_twin(format: vk::Format) -> Option<vk::Format> {
             None
         }
     })
+}
+
+fn attachment_format(format: vk::Format, view: Option<vk::Format>) -> vk::Format {
+    view.filter(|&view| srgb_twin(format) == Some(view))
+        .unwrap_or(format)
 }
 
 fn astc_srgb_twin(format: vk::Format) -> Option<vk::Format> {

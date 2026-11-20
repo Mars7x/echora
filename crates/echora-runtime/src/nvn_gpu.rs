@@ -1556,14 +1556,20 @@ impl Nvn {
         Ok(())
     }
 
-    /// ClearColor on the GPU: `color` as the four captured 32-bit words.
+    /// Clear selected color channels on the GPU using the captured view.
     pub(super) fn gpu_clear_color(
         &mut self,
         core: &Guest,
         (texture, level, layer): (u64, u32, u32),
         color: [u32; 4],
         rect: Option<[i32; 4]>,
+        mask: u32,
+        view_format: u32,
     ) -> Result<(), String> {
+        let mask = vk::ColorComponentFlags::from_raw(mask & 0xf);
+        if mask.is_empty() {
+            return Ok(());
+        }
         // A texture object over one level of another target clears that
         // target's level, as draws into it render there.
         let (texture, level) = self.resolve_color_target(texture, level)?;
@@ -1571,23 +1577,22 @@ impl Nvn {
         self.ensure_render_target(texture)?;
         let ensured = std::time::Instant::now();
         crate::timeline::span(u64::MAX - 2, "clear: ensure target", started, ensured);
-        if self
-            .gpu
-            .as_ref()
-            .unwrap()
-            .renderer
-            .partial_write_needs_initialization(texture, level, layer, rect)
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        if (mask != vk::ColorComponentFlags::RGBA && renderer.target_needs_initialization(texture))
+            || renderer.partial_write_needs_initialization(texture, level, layer, rect)
         {
             self.initialize_new_targets(core);
         }
         let backend = self.gpu.as_mut().unwrap();
         backend.renderer.defined(texture);
-        let value = vk::ClearColorValue {
-            float32: color.map(f32::from_bits),
-        };
-        let cleared = backend
-            .renderer
-            .clear_color_level(texture, level, layer, rect, value);
+        let value = vk::ClearColorValue { uint32: color };
+        let cleared = backend.renderer.clear_color_view(
+            (texture, level, layer),
+            vk_format(view_format),
+            rect,
+            value,
+            mask,
+        );
         crate::timeline::span(
             u64::MAX - 2,
             "clear: clear",
@@ -12451,6 +12456,8 @@ mod target_tests {
                     (texture, 0, layer as u32),
                     color.map(f32::to_bits),
                     None,
+                    0xf,
+                    0,
                 )
                 .unwrap();
             }
@@ -12515,7 +12522,7 @@ mod target_tests {
             );
         }
         let red = [1.0_f32, 0.0, 0.0, 1.0];
-        nvn.gpu_clear_color(&guest, (texture, 0, 0), red.map(f32::to_bits), None)
+        nvn.gpu_clear_color(&guest, (texture, 0, 0), red.map(f32::to_bits), None, 0xf, 0)
             .unwrap();
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
         assert_eq!(
@@ -13069,6 +13076,41 @@ mod target_tests {
     }
 
     #[test]
+    fn first_masked_color_clear_preserves_guest_channels() {
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let props = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+        for (key, value) in [("Width", 8), ("Height", 4), ("Stride", 32), ("Format", 37)] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        memory.write(base, &[17, 77, 100, 190].repeat(32)).unwrap();
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let green = [0.0_f32, 1.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&guest, (texture, 0, 0), green, None, 2, 0)
+            .unwrap();
+        let pixels = nvn
+            .gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .read_target_bytes(texture, 4)
+            .unwrap();
+        assert_eq!(pixels, [17, 255, 100, 190].repeat(32));
+    }
+
+    #[test]
     fn a_first_masked_stencil_clear_preserves_depth_and_unselected_bits() {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
@@ -13310,7 +13352,8 @@ mod target_tests {
             counter: None,
         };
         let color = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
-        nvn.gpu_clear_color(&core, (2, 0, 0), color, None).unwrap();
+        nvn.gpu_clear_color(&core, (2, 0, 0), color, None, 0xf, 0)
+            .unwrap();
         let mut command = Command {
             name: "nvnCommandBufferCopyTextureToTexture",
             x: [0, 2, 0, 0, 3, 0, 0, 0],
@@ -13328,7 +13371,7 @@ mod target_tests {
         command.captured[6] = 0;
         command.captured[9] = 3;
         nvn.gpu_copy_texture(&mut core, &command).unwrap();
-        nvn.gpu_clear_color(&core, (4, 0, 0), color, Some([1, 0, 1, 1]))
+        nvn.gpu_clear_color(&core, (4, 0, 0), color, Some([1, 0, 1, 1]), 0xf, 0)
             .unwrap();
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
         assert_eq!(renderer.read_target_bytes(4, 4).unwrap(), expected);
@@ -13369,7 +13412,7 @@ mod target_tests {
         };
         for (level, layer, red) in [(0, 3, 0.5_f32), (1, 2, 0.75), (1, 3, 0.125)] {
             let color = [red, 0.0, 0.0, 1.0].map(f32::to_bits);
-            nvn.gpu_clear_color(&core, (key, level, layer), color, None)
+            nvn.gpu_clear_color(&core, (key, level, layer), color, None, 0xf, 0)
                 .unwrap();
         }
         let command = Command {
@@ -13531,10 +13574,10 @@ mod target_tests {
             .unwrap();
         let red = [1.0f32, 0.0, 0.0, 1.0];
         let blue = [0.0f32, 0.0, 1.0, 1.0];
-        nvn.gpu_clear_color(&core, (9, 0, 0), red.map(f32::to_bits), None)
+        nvn.gpu_clear_color(&core, (9, 0, 0), red.map(f32::to_bits), None, 0xf, 0)
             .unwrap();
         nvn.refresh_target_index();
-        nvn.gpu_clear_color(&core, (10, 2, 0), blue.map(f32::to_bits), None)
+        nvn.gpu_clear_color(&core, (10, 2, 0), blue.map(f32::to_bits), None, 0xf, 0)
             .unwrap();
         assert_eq!(nvn.resolve_target(9), Some((10, 0)));
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
@@ -13655,7 +13698,7 @@ mod pool_tests {
         );
 
         let drawn = [0.75_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
-        nvn.gpu_clear_color(&core, (texture, 0, 0), drawn, None)
+        nvn.gpu_clear_color(&core, (texture, 0, 0), drawn, None, 0xf, 0)
             .unwrap();
         map(&mut nvn, &mut core, new);
         assert_eq!(nvn.handle_texture(1), Ok(texture));
@@ -15203,9 +15246,9 @@ mod pool_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: Some(0),
         };
-        nvn.gpu_clear_color(&core, (texture, 1, 0), blue, None)
+        nvn.gpu_clear_color(&core, (texture, 1, 0), blue, None, 0xf, 0)
             .unwrap();
-        nvn.gpu_clear_color(&core, (texture, 1, 1), red, None)
+        nvn.gpu_clear_color(&core, (texture, 1, 1), red, None, 0xf, 0)
             .unwrap();
         nvn.execute_command(
             &Command {

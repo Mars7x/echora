@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::renderer::{Renderer, Scale, descriptor_buffer_range, has_stencil};
-use crate::shader::{Descriptor, DescriptorKind, Translated};
+use crate::shader::{Descriptor, DescriptorKind, SampleType, Translated};
 use crate::vulkan::stage_flags;
 
 /// A vertex/fragment pair, translated so its bindings share set 0.
@@ -568,9 +568,8 @@ fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
     move |error| format!("{context}: {error}")
 }
 
-/// A fullscreen triangle and a fragment stage with no color outputs.
-/// The stencil stage updates each of the covered samples.
-fn stencil_clear_stage(stage: crate::shader::Stage) -> Arc<Translated> {
+/// Stages for a fullscreen clear. A stencil clear has no color output.
+fn clear_stage(stage: crate::shader::Stage, output: Option<SampleType>) -> Arc<Translated> {
     use echora_shader::spirv::{
         Function, Module, Type, capability, decoration, execution, op, storage,
     };
@@ -584,6 +583,7 @@ fn stencil_clear_stage(stage: crate::shader::Stage) -> Arc<Translated> {
         parameters: Vec::new(),
     });
     let mut main = Function::new(&mut module, void, signature);
+    let mut descriptors = Vec::new();
     if stage == crate::shader::Stage::Vertex {
         let index_type = module.u32();
         let index_pointer = module.pointer(storage::INPUT, index_type);
@@ -619,7 +619,45 @@ fn stencil_clear_stage(stage: crate::shader::Stage) -> Arc<Translated> {
         );
         main.emit(op::STORE, &[position, vertex]);
     } else {
-        module.entry_point(execution::FRAGMENT, main.id, "main", &[]);
+        let mut interface = Vec::new();
+        if let Some(output) = output {
+            let component = match output {
+                SampleType::Float => module.f32(),
+                SampleType::Signed => module.ty(Type::Int {
+                    width: 32,
+                    signed: true,
+                }),
+                SampleType::Unsigned => module.u32(),
+            };
+            let vector = module.ty(Type::Vector {
+                component,
+                count: 4,
+            });
+            let block = module.ty(Type::Struct {
+                members: vec![vector],
+            });
+            module.decorate(block, decoration::BLOCK, &[]);
+            module.member_decorate(block, 0, decoration::OFFSET, &[0]);
+            let uniform = module.pointer(storage::UNIFORM, block);
+            let color = module.global_variable(uniform, storage::UNIFORM);
+            module.decorate(color, decoration::DESCRIPTOR_SET, &[0]);
+            module.decorate(color, decoration::BINDING, &[0]);
+            let output = module.pointer(storage::OUTPUT, vector);
+            let attachment = module.global_variable(output, storage::OUTPUT);
+            const LOCATION: u32 = 30;
+            module.decorate(attachment, LOCATION, &[0]);
+            let pointer = module.pointer(storage::UNIFORM, vector);
+            let zero = module.u32_constant(0);
+            let color_value = main.value(&mut module, op::ACCESS_CHAIN, pointer, &[color, zero]);
+            let color_value = main.value(&mut module, op::LOAD, vector, &[color_value]);
+            main.emit(op::STORE, &[attachment, color_value]);
+            interface.extend([color, attachment]);
+            descriptors.push(Descriptor {
+                count: 1,
+                ..Descriptor::default()
+            });
+        }
+        module.entry_point(execution::FRAGMENT, main.id, "main", &interface);
         module.execution_mode(main.id, execution::ORIGIN_UPPER_LEFT, &[]);
     }
     main.emit(op::RETURN, &[]);
@@ -628,16 +666,25 @@ fn stencil_clear_stage(stage: crate::shader::Stage) -> Arc<Translated> {
         abi_version: crate::shader::ABI_VERSION,
         stage,
         spirv: module.finish(),
-        descriptors: Vec::new(),
+        frag_colors: u32::from(!descriptors.is_empty()),
+        descriptors,
         loaded_generics: 0,
         stored_generics: 0,
         stores: [0; 8],
-        frag_colors: 0,
         cbuf_used_sizes: [0; 18],
         spec_constants: Vec::new(),
         push_fields: 0,
         texture_pool_bindings: 0,
     })
+}
+
+pub(crate) enum ShaderClear {
+    Color {
+        format: vk::Format,
+        words: [u32; 4],
+        mask: vk::ColorComponentFlags,
+    },
+    Stencil(StencilFace),
 }
 
 impl Renderer {
@@ -970,13 +1017,6 @@ impl Renderer {
         if scissor[2] <= 0 || scissor[3] <= 0 {
             return Ok(());
         }
-        let program = match self.stencil_clear_program.take() {
-            Some(program) => program,
-            None => self.create_program(vec![
-                stencil_clear_stage(crate::shader::Stage::Vertex),
-                stencil_clear_stage(crate::shader::Stage::Fragment),
-            ])?,
-        };
         let face = StencilFace {
             fail: vk::StencilOp::KEEP,
             pass: vk::StencilOp::REPLACE,
@@ -986,13 +1026,69 @@ impl Renderer {
             write_mask: u32::from(mask),
             reference: value & 0xff,
         };
+        self.stat("stat: masked stencil clears", 1);
+        self.clear_with_shader(
+            (key, level, layer),
+            (width, height),
+            scissor,
+            ShaderClear::Stencil(face),
+        )
+    }
+
+    pub(crate) fn clear_with_shader(
+        &mut self,
+        (key, level, layer): (u64, u32, u32),
+        (width, height): (u32, u32),
+        scissor: [i32; 4],
+        clear: ShaderClear,
+    ) -> Result<(), String> {
+        let mut uniforms = crate::FastMap::default();
+        let (format, stencil, blend) = match clear {
+            ShaderClear::Color {
+                format,
+                words,
+                mask,
+            } => {
+                uniforms.insert(
+                    (1, 0),
+                    words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+                );
+                (
+                    Some(format),
+                    None,
+                    Some(Blend {
+                        write_mask: mask,
+                        ..Default::default()
+                    }),
+                )
+            }
+            ShaderClear::Stencil(face) => (None, Some([face; 2]), None),
+        };
+        let output = format.map(crate::renderer::sampled_texture_type);
+        let slot = match output {
+            None => 0,
+            Some(SampleType::Float) => 1,
+            Some(SampleType::Signed) => 2,
+            Some(SampleType::Unsigned) => 3,
+        };
+        let program = match self.shader_clear_programs[slot].take() {
+            Some(program) => program,
+            None => self.create_program(vec![
+                clear_stage(crate::shader::Stage::Vertex, None),
+                clear_stage(crate::shader::Stage::Fragment, output),
+            ])?,
+        };
+        let color_target = format.map(|_| key);
+        let color_level = format.map(|_| level);
+        let color_layer = format.map(|_| layer);
+        let color_format = format.map(Some);
         let draw = Draw {
             program: &program,
-            colors: &[],
-            color_levels: &[],
-            color_layers: &[],
-            color_formats: &[],
-            depth: Some(key),
+            colors: color_target.as_slice(),
+            color_levels: color_level.as_slice(),
+            color_layers: color_layer.as_slice(),
+            color_formats: color_format.as_slice(),
+            depth: stencil.map(|_| key),
             depth_level: level,
             depth_layer: layer,
             attributes: Vec::new(),
@@ -1003,7 +1099,7 @@ impl Renderer {
             base_vertex: 0,
             instances: 1,
             first_instance: 0,
-            uniforms: &crate::FastMap::default(),
+            uniforms: &uniforms,
             guest_uniforms: &crate::FastMap::default(),
             read_guest: None,
             textures: &crate::FastMap::default(),
@@ -1020,14 +1116,14 @@ impl Renderer {
                 depth_compare: vk::CompareOp::ALWAYS,
                 viewport: [0.0, 0.0, width as f32, height as f32, 0.0, 1.0],
                 scissor,
-                stencil: Some([face; 2]),
+                stencil,
                 depth_minus_one_to_one: false,
                 depth_bias: None,
                 depth_bias_d24: false,
                 alpha_to_coverage: false,
                 blend_constants: [0.0; 4],
             },
-            blends: &[],
+            blends: blend.as_slice(),
             mesh: None,
             page_table: Default::default(),
             vertex_fetch: Vec::new(),
@@ -1037,8 +1133,7 @@ impl Renderer {
             renderer.draw_with_raster_scale(&draw, Some(Scale::ONE))?;
             Ok(())
         });
-        self.stencil_clear_program = Some(program);
-        self.stat("stat: masked stencil clears", 1);
+        self.shader_clear_programs[slot] = Some(program);
         result
     }
 

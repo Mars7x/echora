@@ -5504,21 +5504,22 @@ impl Nvn {
             // ClearTexture(cmd, view, region, color, mask): the view's level,
             // the region's rectangle (not the scissor, which limits draws)
             // and, in an array or cube, its layers z..z+depth after the
-            // view's base layer; partial masks are noted, not modeled.
+            // view's base layer.
             "nvnCommandBufferClearTexture" => {
                 let texture = command.x[1];
                 self.object(texture, "Texture").map_err(stop)?;
                 let captured = &command.captured;
-                let (level, layer) = (
-                    captured[captured.len() - 2] as u32,
-                    captured[captured.len() - 1] as u32,
-                );
+                let has_region = captured.len() >= 12;
+                let view = if has_region { 10 } else { 4 };
+                let (level, layer) = (captured[view] as u32, captured[view + 1] as u32);
+                let format = captured.get(view + 2).copied().unwrap_or(0) as u32;
                 let color: [u32; 4] = std::array::from_fn(|channel| captured[channel] as u32);
-                if command.x[5] as u32 & 0xf != 0xf {
-                    self.gpu_note("masked texture clears are not modeled");
+                let mask = command.x[5] as u32 & 0xf;
+                if mask == 0 {
+                    return Ok(());
                 }
                 // CopyRegion { x, y, z, width, height, depth }.
-                let (rect, layers) = if captured.len() == 12 {
+                let (rect, layers) = if has_region {
                     let region = &captured[4..10];
                     let target = self
                         .object(texture, "Texture")
@@ -5547,8 +5548,15 @@ impl Nvn {
                 }
                 if self.gpu().is_some() {
                     for layer in layers {
-                        self.gpu_clear_color(core, (texture, level, layer), color, rect)
-                            .map_err(stop)?;
+                        self.gpu_clear_color(
+                            core,
+                            (texture, level, layer),
+                            color,
+                            rect,
+                            mask,
+                            format,
+                        )
+                        .map_err(stop)?;
                     }
                     return Ok(());
                 }
@@ -5585,16 +5593,24 @@ impl Nvn {
                     // Without mip-level targets, only level 0 exists.
                     return Ok(());
                 }
-                let mask = command.x[3] as u32;
+                let mask = command.x[3] as u32 & 0xf;
+                if mask == 0 {
+                    return Ok(());
+                }
                 if self.gpu().is_some() {
-                    if mask & 0xf != 0xf {
-                        self.gpu_note("masked color clears are not modeled on the GPU");
-                    }
                     let color = std::array::from_fn(|channel| command.captured[channel] as u32);
                     // The scissor rectangle limits the clear.
                     let scissor = self.render.scissor;
+                    let format = self.render.color_formats.get(index).copied().unwrap_or(0);
                     return self
-                        .gpu_clear_color(core, (texture, level as u32, layer), color, scissor)
+                        .gpu_clear_color(
+                            core,
+                            (texture, level as u32, layer),
+                            color,
+                            scissor,
+                            mask,
+                            format,
+                        )
                         .map_err(stop);
                 }
                 let (width, height) = self.texture_extent(texture).map_err(stop)?;
@@ -8256,14 +8272,14 @@ fn record_command(
         }
     }
     if command.name == "nvnCommandBufferClearTexture" {
-        let bases = if command.x[2] == 0 {
-            [0, 0]
+        let view = if command.x[2] == 0 {
+            [0, 0, 0]
         } else {
             let view_bags = read_shared(bags.at(command.x[2]));
             let view = bag_in(&view_bags, command.x[2], "TextureView").map_err(invalid)?;
-            ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
+            ["Levels", "Layers", "Format"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
         };
-        command.captured.extend(bases);
+        command.captured.extend(view);
     }
     if command.name == "nvnCommandBufferCopyTextureToTexture" {
         // After both regions: each view's level and layer base
@@ -8499,7 +8515,7 @@ fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
         // ClearTexture(cmd, const NVNtexture*, const NVNtextureView*, const
         // NVNcopyRegion*, const float color[4], int mask): the four color
         // words, then the region's six words (none for a null region); the
-        // view's level and layer bases follow at record time.
+        // view's level and layer bases and format follow at record time.
         "nvnCommandBufferClearTexture" => {
             let mut captured: Vec<u64> = (0..4)
                 .map(|channel| {
@@ -9279,6 +9295,156 @@ mod tests {
             };
             assert_eq!(&pixels[..16], depth.to_le_bytes().repeat(4));
             assert_eq!(&pixels[16..], &[stencil; 4]);
+        }
+    }
+
+    #[test]
+    fn color_clears_preserve_unselected_channels_in_the_recorded_view() {
+        use echora_gpu::{ash::vk, draw::ImageShape, renderer::Scale};
+
+        let mut nvn = Nvn::default();
+        if nvn.gpu().is_none() {
+            return;
+        }
+        let (buffer, texture, view) = (0x1100, 0x1200, 0x1300);
+        let scalar = |value| Args {
+            x: [value, 0, 0, 0],
+            ..Args::default()
+        };
+        nvn.initialize(buffer, "CommandBuffer", BTreeMap::new())
+            .unwrap();
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Width".into(), scalar(4)),
+                ("Height".into(), scalar(4)),
+                ("Depth".into(), scalar(2)),
+                ("Levels".into(), scalar(2)),
+                ("Target".into(), scalar(4)),
+                ("Format".into(), scalar(37)),
+            ]),
+        )
+        .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.set_resolution_scale(Scale::ONE);
+        renderer
+            .shaped_target(
+                texture,
+                4,
+                4,
+                ImageShape::D2 { layers: 2 },
+                vk::Format::R8G8B8A8_UNORM,
+                2,
+            )
+            .unwrap();
+        let original = vk::ClearColorValue {
+            float32: [0.0, 1.0, 1.0, 1.0],
+        };
+        for (level, layer) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            renderer
+                .clear_color_level(texture, level, layer, None, original)
+                .unwrap();
+        }
+        renderer.defined(texture);
+
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                0x10_0000,
+                0x1000,
+                READ | WRITE,
+                STATE_NORMAL,
+                "clear parameters",
+            )
+            .unwrap();
+        let color = 0x10_0000;
+        let region = 0x10_0010;
+        let targets = 0x10_0030;
+        let views = 0x10_0038;
+        for (index, value) in [0.25f32, 0.0, 0.25, 0.0].into_iter().enumerate() {
+            memory
+                .write_u32(color + index as u64 * 4, value.to_bits())
+                .unwrap();
+        }
+        for (index, value) in [1, 0, 0, 1, 1, 1].into_iter().enumerate() {
+            memory.write_u32(region + index as u64 * 4, value).unwrap();
+        }
+        memory.write_u64(targets, texture).unwrap();
+        memory.write_u64(views, view).unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        call(&mut nvn, &mut core, "nvnTextureViewSetDefaults", &[view]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLevels",
+            &[view, 1, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureViewSetLayers",
+            &[view, 1, 1],
+        );
+        call(&mut nvn, &mut core, "nvnTextureViewSetFormat", &[view, 56]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferSetRenderTargets",
+            &[buffer, 1, targets, views, 0, 0],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferClearColor",
+            &[buffer, 0, color, 0x1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferClearTexture",
+            &[buffer, texture, view, region, color, 0x4],
+        );
+        call(&mut nvn, &mut core, "nvnTextureViewSetFormat", &[view, 37]);
+        core.memory.write_u32(color, 0).unwrap();
+        let handle = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        for command in nvn.use_command_list(handle).unwrap().iter() {
+            nvn.execute_command(command, &mut core).unwrap();
+        }
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        for (level, layer) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let pixels = renderer
+                .read_target_plane_bytes(texture, level, layer, 4, [0, 0, 2, 2])
+                .unwrap();
+            for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                if (level, layer) == (1, 1) {
+                    assert!(pixel[0].abs_diff(137) <= 1, "{pixel:?}");
+                    assert_eq!(pixel[1], 255);
+                    assert_eq!(pixel[3], 255);
+                    assert!(
+                        pixel[2].abs_diff(if index == 1 { 137 } else { 255 }) <= 1,
+                        "{pixel:?}"
+                    );
+                } else {
+                    assert_eq!(pixel, &[0, 255, 255, 255]);
+                }
+            }
         }
     }
 
