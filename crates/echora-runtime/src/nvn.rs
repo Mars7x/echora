@@ -2401,6 +2401,14 @@ impl Nvn {
 
     fn call_inner(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
         call_watch(name, core);
+        let x = core.cpu.regs;
+        if name == "nvnSyncWait" && x[0] != 0 && x[1] == 0 && !self.poll_sync(x[0])? {
+            // A poll of unfinished work cannot resolve deferred GPU
+            // results: doing so would submit and wait for that work.
+            *self.sync_timeouts.entry(x[0]).or_default() += 1;
+            core.cpu.regs[0] = 2;
+            return Ok(true);
+        }
         // Where the CPU may look at what the GPU wrote (after waiting for
         // it, or invalidating its view of a mapped range), deferred
         // dispatch results are stored first; between those points they
@@ -2430,7 +2438,6 @@ impl Nvn {
                 });
             }
         }
-        let x = core.cpu.regs;
         let args = Args {
             x: [x[1], x[2], x[3], x[4]],
             v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
@@ -2603,11 +2610,9 @@ impl Nvn {
             // nvnSyncWait(const NVNsync*, u64 timeout_ns) -> NVNsyncWaitResult.
             // The application treats 0 as "already signaled" and anything else
             // as not yet (inferred from its polling loop with timeout 0, which
-            // flushes the queue and retries). Host work completes at
-            // submission, so a fenced sync is always signaled; an unfenced one
-            // can only time out: 2 (inferred "timeout expired") for a zero
-            // timeout, and an explicit stop for a blocking wait that would
-            // never finish.
+            // flushes the queue and retries). A poll of an unfinished fence
+            // returns timeout expired (2) above. A blocking wait may finish
+            // replay before waiting for its recorded GPU work.
             "nvnSyncWait" => {
                 self.object(this, "Sync").map_err(invalid)?;
                 // A blocking wait on a sync a blocked queue will signal: the
@@ -4445,6 +4450,26 @@ impl Nvn {
         self.gpu_poll_completed()
             .map_err(|message| Trap::InvalidState { message })?;
         Ok(self.gpu_completed_serial() >= serial)
+    }
+
+    /// Check the fence's current state without submitting more work.
+    fn poll_sync(&mut self, sync: u64) -> Result<bool, Trap> {
+        let sync = self
+            .object(sync, "Sync")
+            .map_err(|message| Trap::InvalidState {
+                message: format!("nvnSyncWait: {message}"),
+            })?;
+        if !sync.state.contains_key("Signaled") {
+            return Ok(false);
+        }
+        let (serial, marker) = sync.state.get("GpuSerial").map_or_else(
+            || (self.gpu_recorded_serial(), 0),
+            |recorded| (recorded.x[0], recorded.x[1]),
+        );
+        if self.gpu_completed_serial() >= serial {
+            return Ok(true);
+        }
+        self.submission_done(serial, marker)
     }
 
     /// Whether an NVN object lives at `address`.
@@ -8794,6 +8819,39 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn zero_timeout_sync_poll_does_not_submit_unfinished_gpu_work() {
+        let Ok(Some(mut backend)) = gpu::Backend::create(None) else {
+            return;
+        };
+        let base = 0x10_0000;
+        backend.renderer.resident_buffer(base, 4096).unwrap();
+        backend.renderer.upload_resident(base, 0, &[1; 16]).unwrap();
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let sync = 0x1000;
+        nvn.initialize(sync, "Sync", BTreeMap::new()).unwrap();
+        nvn.signal_sync(sync, Args::default());
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        assert_eq!(call(&mut nvn, &mut core, "nvnSyncWait", &[sync, 0]), 2);
+        assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 0);
+        assert_eq!(nvn.sync_timeouts[&sync], 1);
+
+        nvn.gpu.as_mut().unwrap().renderer.flush().unwrap();
+        assert_eq!(call(&mut nvn, &mut core, "nvnSyncWait", &[sync, 0]), 0);
+        assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 1);
+        assert_eq!(nvn.sync_timeouts[&sync], 1);
     }
 
     #[test]

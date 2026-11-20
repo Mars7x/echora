@@ -5773,7 +5773,7 @@ impl Worker {
         // state held, so the replay goes on meanwhile.
         let gpu_wait = match name.filter(|_| thread) {
             Some("nvnMemoryPoolInvalidateMappedRange") => Some(None),
-            Some("nvnSyncWait") => Some(Some(self.core.cpu.regs[0])),
+            Some("nvnSyncWait") if self.core.cpu.regs[1] != 0 => Some(Some(self.core.cpu.regs[0])),
             _ => None,
         };
         if let Some(sync) = gpu_wait {
