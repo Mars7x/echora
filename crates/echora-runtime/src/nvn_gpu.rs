@@ -3266,6 +3266,23 @@ impl Nvn {
         let mut sampler = self.handle_sampler(handle);
         sampler.components = self.handle_components(handle);
         sampler.format = self.handle_view_format(handle);
+        // A decoded ASTC upload is an RGBA image. Its alternate ASTC view
+        // still selects the other color space through the RGBA format.
+        if let TextureSource::Upload { key, format, .. } = source
+            && matches!(
+                *format,
+                vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+            )
+            && let Some(view) = sampler.format
+            && let Some(encoded) = self
+                .objects
+                .get(key)
+                .and_then(|object| object.builder.get("Format"))
+                .and_then(|value| astc_vk_format(value.x[0] as u32))
+            && echora_gpu::renderer::srgb_twin(encoded) == Some(view)
+        {
+            sampler.format = echora_gpu::renderer::srgb_twin(*format);
+        }
         if sampler.format.is_some() && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
             let texture = self.handle_texture(handle).unwrap_or(0);
             let own = self
@@ -3291,7 +3308,7 @@ impl Nvn {
         if let (TextureSource::Upload { .. }, Some((base, count))) =
             (source, self.handle_view_levels(handle))
         {
-            if count > 0 {
+            if base != 0 || count != 0 {
                 sampler.view_levels = Some((base, count));
             }
         }
@@ -12072,6 +12089,90 @@ mod target_tests {
         let texels = upload(&mut nvn, &guest);
         assert_eq!(texels[..4], [0; 4]);
         assert_eq!(texels[0x2100..0x2104], blue);
+    }
+
+    #[test]
+    fn decoded_astc_views_keep_their_color_space_and_mip_range() {
+        use super::{TextureSource, vk};
+        use echora_gpu::draw::ImageShape;
+
+        let mut nvn = Nvn::default();
+        let (pool, index) = (1, 3);
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        for (case, (encoded, view, upload, expected)) in [
+            (
+                121,
+                135,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::Format::R8G8B8A8_SRGB,
+            ),
+            (
+                135,
+                121,
+                vk::Format::R8G8B8A8_SRGB,
+                vk::Format::R8G8B8A8_UNORM,
+            ),
+            (
+                121,
+                135,
+                vk::Format::ASTC_4X4_UNORM_BLOCK,
+                vk::Format::ASTC_4X4_SRGB_BLOCK,
+            ),
+            (
+                121,
+                136,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::Format::ASTC_5X4_SRGB_BLOCK,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let texture = 2 + case as u64;
+            nvn.initialize(
+                texture,
+                "Texture",
+                BTreeMap::from([("Format".into(), args([encoded, 0, 0, 0]))]),
+            )
+            .unwrap();
+            nvn.views.insert(
+                (pool, index),
+                crate::nvn::Bag {
+                    kind: "TextureView".into(),
+                    props: BTreeMap::from([
+                        ("Format".into(), args([view, 0, 0, 0])),
+                        ("Levels".into(), args([1, 0, 0, 0])),
+                    ]),
+                    ..Default::default()
+                },
+            );
+            let source = TextureSource::Upload {
+                key: texture,
+                generation: 1,
+                width: 4,
+                height: 4,
+                shape: ImageShape::D2 { layers: 1 },
+                format: upload,
+                texels: Default::default(),
+                levels: Default::default(),
+            };
+            let sampler = nvn.binding_sampler(u64::from(index), &source);
+            assert_eq!(sampler.format, Some(expected));
+            assert_eq!(sampler.view_levels, Some((1, 0)));
+        }
     }
 
     #[test]

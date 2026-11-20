@@ -424,8 +424,8 @@ pub struct Sampler {
     /// A texture view's format, when it differs from the texture's (its
     /// sRGB twin); not part of the Vulkan sampler.
     pub format: Option<vk::Format>,
-    /// A texture view's mip levels (base, count) of an upload; not part of
-    /// the Vulkan sampler (one guest sampler serves textures of any size).
+    /// A texture view's mip levels (base, count; zero count means the
+    /// remaining levels) of an upload; not part of the Vulkan sampler.
     pub view_levels: Option<(u32, u32)>,
 }
 

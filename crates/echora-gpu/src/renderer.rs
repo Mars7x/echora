@@ -2087,8 +2087,8 @@ impl Renderer {
         let (components, format) = (sampler.components, sampler.format);
         let plain = self.texture_view(source, texture_type)?;
         let plain = match sampler.view_levels {
-            Some((base, count)) if count > 0 => self.level_view_of(plain, base, count)?,
-            _ => plain,
+            Some((base, count)) => self.level_view_of(plain, base, count)?,
+            None => plain,
         };
         let swizzle = [components.r, components.g, components.b, components.a];
         let identity = swizzle
@@ -2149,7 +2149,11 @@ impl Renderer {
         };
         let levels = info.range.level_count.max(1);
         let base = base.min(levels - 1);
-        let count = count.min(levels - base);
+        let count = if count == 0 {
+            levels - base
+        } else {
+            count.min(levels - base)
+        };
         if base == 0 && count == levels {
             return Ok(view);
         }
@@ -8287,6 +8291,20 @@ mod tests {
                 .unwrap();
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (base_level, 1));
+        }
+        for relative_base in [1, 2, 3] {
+            let sampler = Sampler {
+                view_levels: Some((relative_base, 0)),
+                ..Default::default()
+            };
+            let view = renderer
+                .texture_view_swizzled(&TextureSource::Target(7), 2, &sampler)
+                .unwrap();
+            let range = renderer.view_infos[&view].range;
+            assert_eq!(
+                (range.base_mip_level, range.level_count),
+                (relative_base, 4 - relative_base)
+            );
         }
     }
 
