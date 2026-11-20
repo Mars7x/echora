@@ -5853,6 +5853,7 @@ impl Renderer {
         let own_type = own_view_type(target.shape);
         let view_type = match (texture_type, target.shape) {
             (0, ImageShape::D1 { .. }) => vk::ImageViewType::TYPE_1D,
+            (1, ImageShape::D1 { .. }) => vk::ImageViewType::TYPE_1D_ARRAY,
             (2, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => vk::ImageViewType::TYPE_2D,
             (3, ImageShape::D2 { .. } | ImageShape::Cube { .. }) => {
                 vk::ImageViewType::TYPE_2D_ARRAY

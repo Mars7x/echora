@@ -47,6 +47,7 @@ fn surface(dimension: u8) -> Option<(u32, bool, u32, u32, u32)> {
     Some(match dimension {
         0 => (0, false, 0, KIND_IMAGE, 1),
         1 => (5, false, 7, KIND_IMAGE_BUFFER, 1),
+        2 => (0, true, 1, KIND_IMAGE, 2),
         3 => (1, false, 2, KIND_IMAGE, 2),
         4 => (1, true, 3, KIND_IMAGE, 3),
         5 => (2, false, 4, KIND_IMAGE, 3),

@@ -5346,51 +5346,55 @@ mod tests {
 
     #[test]
     fn storage_images_read_and_write_the_dumped_texels() {
-        // SULD.P.2D R4, [R0] (x = 1, y = 2), 0xf; MOV R0, 3;
-        // SUST.P.2D [R0], R4, 0xf: texel (1, 2) copied to (3, 2).
-        let surface = |store: bool, data: u128| {
-            word(&[
-                (0, 12, if store { 0xb9b } else { 0xb97 }),
-                (16, 8, if store { 0 } else { data }),
-                (24, 8, 0),
-                (32, 8, if store { data } else { 0 }),
-                (40, 14, 0x18),
-                (54, 5, 0),
-                (61, 3, 3),
-                (72, 4, 0xf),
-                (81, 3, if store { 0 } else { 7 }),
-            ])
-        };
-        let program = [
-            mov(0, 1),
-            mov(1, 2),
-            surface(false, 4),
-            mov(0, 3),
-            surface(true, 4),
-            EXIT,
-        ];
-        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
-        let translated = crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
-        let image = translated.descriptors.iter().find(|d| d.kind == 5).unwrap();
-        let texels = (0..16u32).map(|n| [n, n + 100, n + 200, n + 300]).collect();
-        let inputs = Inputs {
-            workgroup_count: [1, 1, 1],
-            images: HashMap::from([(
-                (0, image.binding),
-                Image {
-                    width: 4,
-                    height: 4,
-                    depth: 1,
-                    layers: 1,
-                    texels,
-                },
-            )]),
-            ..Inputs::default()
-        };
-        let report = Machine::new(&translated.spirv).simulate(&inputs);
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
-        let result = &report.images[&(0, image.binding)];
-        assert_eq!(result.texels.get(2 * 4 + 3), Some([9, 109, 209, 309]));
+        // Copy x=1 to x=3 on row or layer 2, using the same coordinate
+        // registers for a 2D image and a one-dimensional array.
+        for (dimension, texture_type, height, layers) in [(3, 2, 4, 1), (2, 1, 1, 4)] {
+            let surface = |store: bool, data: u128| {
+                word(&[
+                    (0, 12, if store { 0xb9b } else { 0xb97 }),
+                    (16, 8, if store { 0 } else { data }),
+                    (24, 8, 0),
+                    (32, 8, if store { data } else { 0 }),
+                    (40, 14, 0x18),
+                    (54, 5, 0),
+                    (61, 3, dimension),
+                    (72, 4, 0xf),
+                    (81, 3, if store { 0 } else { 7 }),
+                ])
+            };
+            let program = [
+                mov(0, 1),
+                mov(1, 2),
+                surface(false, 4),
+                mov(0, 3),
+                surface(true, 4),
+                EXIT,
+            ];
+            let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+            let translated =
+                crate::compute::translate(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let image = translated.descriptors.iter().find(|d| d.kind == 5).unwrap();
+            assert_eq!(image.texture_type, texture_type);
+            let texels = (0..16u32).map(|n| [n, n + 100, n + 200, n + 300]).collect();
+            let inputs = Inputs {
+                workgroup_count: [1, 1, 1],
+                images: HashMap::from([(
+                    (0, image.binding),
+                    Image {
+                        width: 4,
+                        height,
+                        depth: 1,
+                        layers,
+                        texels,
+                    },
+                )]),
+                ..Inputs::default()
+            };
+            let report = Machine::new(&translated.spirv).simulate(&inputs);
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let result = &report.images[&(0, image.binding)];
+            assert_eq!(result.texels.get(2 * 4 + 3), Some([9, 109, 209, 309]));
+        }
     }
 
     #[test]

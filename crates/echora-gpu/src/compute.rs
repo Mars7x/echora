@@ -883,6 +883,21 @@ mod tests {
                 );
             }
         }
+
+        let target = 3;
+        let format = vk::Format::R32_UINT;
+        renderer
+            .shaped_target(target, 2, 1, ImageShape::D1 { layers: 1 }, format, 2)
+            .unwrap();
+        let image = StorageImage {
+            target,
+            level: 1,
+            base_layer: 0,
+            layer_count: 1,
+        };
+        let array_view = renderer.storage_image_view(image, 1, format).unwrap();
+        let single_view = renderer.storage_image_view(image, 0, format).unwrap();
+        assert_ne!(array_view, single_view);
     }
 
     #[test]
