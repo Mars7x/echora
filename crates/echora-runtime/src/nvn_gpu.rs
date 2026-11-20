@@ -25,7 +25,7 @@ use echora_gpu::present::Presenter;
 use echora_gpu::renderer::{Renderer, Scale};
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
-use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, StateSnapshots};
+use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, StateSnapshots};
 
 /// Reuse the allocation of the binding tables filled for each draw.
 #[derive(Debug, Default)]
@@ -230,18 +230,6 @@ impl TargetIndex {
             }
         }
     }
-}
-
-/// One GPU address range backed by a physical allocation. Virtual pools
-/// can name a subrange of the same allocation at a different GPU address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PagePool {
-    base: u64,
-    backing_size: u64,
-    offset: u64,
-    gpu: u64,
-    size: u64,
-    flags: u64,
 }
 
 impl PagePool {
@@ -7026,86 +7014,6 @@ impl Nvn {
         })
     }
 
-    fn page_pools(&self) -> Vec<PagePool> {
-        let mut ranges = Vec::new();
-        for object in &self.memory_pools {
-            let Some(pool) = self.objects.get(object) else {
-                continue;
-            };
-            let (Some(storage), Some(address)) =
-                (pool.builder.get("Storage"), pool.state.get("GpuAddress"))
-            else {
-                continue;
-            };
-            let [base, size, ..] = storage.x;
-            let gpu = address.x[0];
-            let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
-            if gpu == 0 || size == 0 {
-                continue;
-            }
-            if base != 0 {
-                // GPU_NO_ACCESS exposes the allocation only through aliases.
-                if flags & 8 == 0 {
-                    ranges.push(PagePool {
-                        base,
-                        backing_size: size,
-                        offset: 0,
-                        gpu,
-                        size,
-                        flags,
-                    });
-                }
-                continue;
-            }
-            for (name, mapping) in &pool.state {
-                let Some(virtual_offset) = name
-                    .strip_prefix(super::VIRTUAL_MAPPING)
-                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                else {
-                    continue;
-                };
-                let [physical, offset, size, _] = mapping.x;
-                let Some(backing) = self
-                    .objects
-                    .get(&physical)
-                    .filter(|obj| obj.kind == "MemoryPool")
-                else {
-                    continue;
-                };
-                let Some(storage) = backing.builder.get("Storage") else {
-                    continue;
-                };
-                let [base, backing_size, ..] = storage.x;
-                if base == 0
-                    || offset
-                        .checked_add(size)
-                        .is_none_or(|end| end > backing_size)
-                {
-                    continue;
-                }
-                let address = gpu + virtual_offset;
-                // NVN virtual mappings have page-granular offsets and sizes.
-                use echora_shader_abi::PAGE_SIZE;
-                if !offset.is_multiple_of(PAGE_SIZE) || !address.is_multiple_of(PAGE_SIZE) {
-                    continue;
-                }
-                let flags = backing
-                    .builder
-                    .get("Flags")
-                    .map_or(0x21, |flags| flags.x[0]);
-                ranges.push(PagePool {
-                    base,
-                    backing_size,
-                    offset,
-                    gpu: address,
-                    size,
-                    flags,
-                });
-            }
-        }
-        ranges
-    }
-
     /// The GPU page table programs reach global memory through
     /// (`echora_shader_abi::PageTable`; ECHORA_PAGE_TABLE=0, debugging,
     /// leaves it empty), rebuilt when the
@@ -7177,7 +7085,7 @@ impl Nvn {
             );
             self.new_pools.extend(unshared);
         }
-        let pools = self.page_pools();
+        let pools = self.indexed_pool_ranges().page_pools.clone();
         let first = pools
             .iter()
             .map(|pool| pool.gpu >> PAGE_SHIFT)
@@ -13311,6 +13219,16 @@ mod pool_tests {
                 .copied()
                 .unwrap_or(0)
         };
+        let physical_gpu = call(
+            &mut nvn,
+            &mut guest,
+            "nvnMemoryPoolGetBufferAddress",
+            &[physical],
+        );
+        // The CPU can address the physical pool, while the GPU can only
+        // access it through a virtual alias.
+        assert_eq!(nvn.gpu_to_guest(physical_gpu, 4), Ok(storage));
+        assert_eq!(page(&mut nvn, &mut guest, physical_gpu), 0);
         let address = gpu + 3 * PAGE_SIZE;
         let texture = builder + 0x800;
         let scalar = |value| Args {

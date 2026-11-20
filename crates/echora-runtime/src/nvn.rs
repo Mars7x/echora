@@ -566,8 +566,8 @@ pub struct Nvn {
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<StageCodeCache>,
-    /// The CPU-visible ranges of live memory pools, rebuilt when a pool or
-    /// virtual mapping changes.
+    /// Ranges for CPU address lookup and GPU page-table construction,
+    /// rebuilt when a memory pool or virtual mapping changes.
     #[serde(skip)]
     pool_ranges: std::cell::RefCell<PoolRanges>,
     /// The tiled level `copy_texels` builds a whole-level copy in, kept
@@ -900,6 +900,19 @@ impl WindowTiming {
 struct PoolRanges {
     epoch: Option<u64>,
     entries: Vec<PoolRange>,
+    page_pools: Vec<PagePool>,
+}
+
+/// One GPU address range backed by a physical allocation. Virtual pools
+/// can name a subrange of the same allocation at a different GPU address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PagePool {
+    base: u64,
+    backing_size: u64,
+    offset: u64,
+    gpu: u64,
+    size: u64,
+    flags: u64,
 }
 
 #[derive(Debug)]
@@ -7082,11 +7095,7 @@ impl Nvn {
     /// memory pool. Sorted ranges and their running maximum end allow a
     /// binary search even when ranges overlap.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let mut index = self.pool_ranges.borrow_mut();
-        if index.epoch != Some(self.pool_epoch) {
-            self.index_pool_ranges(&mut index.entries);
-            index.epoch = Some(self.pool_epoch);
-        }
+        let index = self.indexed_pool_ranges();
         let ranges = &index.entries;
         let after = ranges.partition_point(|range| range.gpu <= address);
         ranges[..after]
@@ -7099,8 +7108,21 @@ impl Nvn {
             })
     }
 
-    fn index_pool_ranges(&self, ranges: &mut Vec<PoolRange>) {
+    fn indexed_pool_ranges(&self) -> std::cell::RefMut<'_, PoolRanges> {
+        let mut index = self.pool_ranges.borrow_mut();
+        if index.epoch != Some(self.pool_epoch) {
+            self.index_pool_ranges(&mut index);
+            index.epoch = Some(self.pool_epoch);
+        }
+        index
+    }
+
+    fn index_pool_ranges(&self, index: &mut PoolRanges) {
+        use echora_shader_abi::PAGE_SIZE;
+
+        let ranges = &mut index.entries;
         ranges.clear();
+        index.page_pools.clear();
         let mut add = |gpu, size, guest| {
             ranges.push(PoolRange {
                 gpu,
@@ -7110,13 +7132,31 @@ impl Nvn {
             });
         };
         for address in &self.memory_pools {
-            let pool = &self.objects[address];
-            let Some(gpu) = pool.state.get("GpuAddress").map(|args| args.x[0]) else {
+            let Some(pool) = self.objects.get(address) else {
                 continue;
             };
-            let storage = &pool.builder["Storage"];
-            if storage.x[0] != 0 {
-                add(gpu, storage.x[1], storage.x[0]);
+            let (Some(storage), Some(gpu)) = (
+                pool.builder.get("Storage"),
+                pool.state.get("GpuAddress").map(|args| args.x[0]),
+            ) else {
+                continue;
+            };
+            let [base, size, ..] = storage.x;
+            let gpu_visible = gpu != 0 && size != 0;
+            if base != 0 {
+                add(gpu, size, base);
+                let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
+                // GPU_NO_ACCESS exposes the allocation only through aliases.
+                if gpu_visible && flags & 8 == 0 {
+                    index.page_pools.push(PagePool {
+                        base,
+                        backing_size: size,
+                        offset: 0,
+                        gpu,
+                        size,
+                        flags,
+                    });
+                }
                 continue;
             }
             for (name, mapping) in &pool.state {
@@ -7126,10 +7166,29 @@ impl Nvn {
                 else {
                     continue;
                 };
-                let Some(range) = self.virtual_mapping_storage(mapping) else {
+                let Some((backing, range)) = self.virtual_mapping_backing(mapping) else {
                     continue;
                 };
-                add(gpu + offset, range.end - range.start, range.start);
+                let gpu = gpu + offset;
+                let size = range.end - range.start;
+                add(gpu, size, range.start);
+                let physical_offset = mapping.x[1];
+                if gpu_visible
+                    && physical_offset.is_multiple_of(PAGE_SIZE)
+                    && gpu.is_multiple_of(PAGE_SIZE)
+                {
+                    index.page_pools.push(PagePool {
+                        base: range.start - physical_offset,
+                        backing_size: backing.builder["Storage"].x[1],
+                        offset: physical_offset,
+                        gpu,
+                        size,
+                        flags: backing
+                            .builder
+                            .get("Flags")
+                            .map_or(0x21, |flags| flags.x[0]),
+                    });
+                }
             }
         }
         ranges.sort_by_key(|range| range.gpu);
@@ -7141,18 +7200,20 @@ impl Nvn {
     }
 
     fn virtual_mapping_storage(&self, mapping: &Args) -> Option<std::ops::Range<u64>> {
+        self.virtual_mapping_backing(mapping)
+            .map(|(_, range)| range)
+    }
+
+    fn virtual_mapping_backing(&self, mapping: &Args) -> Option<(&Object, std::ops::Range<u64>)> {
         let [physical, offset, size, _] = mapping.x;
-        let storage = self
-            .object(physical, "MemoryPool")
-            .ok()?
-            .builder
-            .get("Storage")?;
+        let backing = self.object(physical, "MemoryPool").ok()?;
+        let storage = backing.builder.get("Storage")?;
         let end = offset.checked_add(size)?;
         let base = storage.x[0];
         if base == 0 || end > storage.x[1] {
             return None;
         }
-        Some(base.checked_add(offset)?..base.checked_add(end)?)
+        Some((backing, base.checked_add(offset)?..base.checked_add(end)?))
     }
 
     fn texture_extent(&self, texture: u64) -> Result<(u32, u32), String> {
