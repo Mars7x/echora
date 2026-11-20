@@ -610,6 +610,26 @@ impl Renderer {
         self.next_segment_outside(commands, true);
     }
 
+    /// Internal raster operations implementing attachment clears are
+    /// excluded from the guest's samples-passed count.
+    pub(crate) fn without_occlusion_count(
+        &mut self,
+        record: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let counting = self
+            .occlusion
+            .as_ref()
+            .is_some_and(|queries| queries.active.is_some() || queries.resume);
+        if !counting {
+            return record(self);
+        }
+        self.next_segment(false)?;
+        self.occlusion.as_mut().expect("counting").resume = false;
+        let result = record(self);
+        let resumed = self.next_segment(true);
+        result.and(resumed)
+    }
+
     /// ResetCounter(SAMPLES_PASSED): the count restarts from 0 here.
     pub fn samples_reset(&mut self) -> Result<(), String> {
         self.next_segment(false)?;

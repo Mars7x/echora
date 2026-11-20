@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::renderer::{Renderer, descriptor_buffer_range, has_stencil};
+use crate::renderer::{Renderer, Scale, descriptor_buffer_range, has_stencil};
 use crate::shader::{Descriptor, DescriptorKind, Translated};
 use crate::vulkan::stage_flags;
 
@@ -567,6 +567,78 @@ fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
     move |error| format!("{context}: {error}")
 }
 
+/// A fullscreen triangle and a fragment stage with no color outputs.
+/// The stencil stage updates each of the covered samples.
+fn stencil_clear_stage(stage: crate::shader::Stage) -> Arc<Translated> {
+    use echora_shader::spirv::{
+        Function, Module, Type, capability, decoration, execution, op, storage,
+    };
+
+    let mut module = Module::new();
+    module.capability(capability::SHADER);
+    module.memory_model(0, 1);
+    let void = module.void();
+    let signature = module.ty(Type::Function {
+        result: void,
+        parameters: Vec::new(),
+    });
+    let mut main = Function::new(&mut module, void, signature);
+    if stage == crate::shader::Stage::Vertex {
+        let index_type = module.u32();
+        let index_pointer = module.pointer(storage::INPUT, index_type);
+        let index = module.global_variable(index_pointer, storage::INPUT);
+        const VERTEX_INDEX: u32 = 42;
+        module.decorate(index, decoration::BUILT_IN, &[VERTEX_INDEX]);
+        let float = module.f32();
+        let vector = module.ty(Type::Vector {
+            component: float,
+            count: 4,
+        });
+        let position_pointer = module.pointer(storage::OUTPUT, vector);
+        let position = module.global_variable(position_pointer, storage::OUTPUT);
+        const POSITION: u32 = 0;
+        module.decorate(position, decoration::BUILT_IN, &[POSITION]);
+        module.entry_point(execution::VERTEX, main.id, "main", &[index, position]);
+        let index = main.value(&mut module, op::LOAD, index_type, &[index]);
+        let bool_type = module.bool();
+        let neg = module.constant(float, (-1.0f32).to_bits());
+        let edge = module.constant(float, 3.0f32.to_bits());
+        let zero = module.constant(float, 0);
+        let one = module.constant(float, 1.0f32.to_bits());
+        let [x, y] = [1, 2].map(|corner| {
+            let corner = module.u32_constant(corner);
+            let outer = main.value(&mut module, op::I_EQUAL, bool_type, &[index, corner]);
+            main.value(&mut module, op::SELECT, float, &[outer, edge, neg])
+        });
+        let vertex = main.value(
+            &mut module,
+            op::COMPOSITE_CONSTRUCT,
+            vector,
+            &[x, y, zero, one],
+        );
+        main.emit(op::STORE, &[position, vertex]);
+    } else {
+        module.entry_point(execution::FRAGMENT, main.id, "main", &[]);
+        module.execution_mode(main.id, execution::ORIGIN_UPPER_LEFT, &[]);
+    }
+    main.emit(op::RETURN, &[]);
+    main.finish(&mut module);
+    Arc::new(Translated {
+        abi_version: crate::shader::ABI_VERSION,
+        stage,
+        spirv: module.finish(),
+        descriptors: Vec::new(),
+        loaded_generics: 0,
+        stored_generics: 0,
+        stores: [0; 8],
+        frag_colors: 0,
+        cbuf_used_sizes: [0; 18],
+        spec_constants: Vec::new(),
+        push_fields: 0,
+        texture_pool_bindings: 0,
+    })
+}
+
 impl Renderer {
     /// Link translated stages (vertex first) into shader objects sharing one
     /// set-0 layout. Each stage must have been translated with its binding
@@ -830,6 +902,14 @@ impl Renderer {
             return Ok(());
         }
         self.flush()?;
+        self.destroy_idle_programs(programs)
+    }
+
+    /// Release programs whose last queued use has already completed.
+    pub(crate) fn destroy_idle_programs(
+        &self,
+        programs: impl IntoIterator<Item = Program>,
+    ) -> Result<(), String> {
         let objects = self.gpu.shader_objects()?;
         for program in programs {
             // SAFETY: flushed, so nothing uses this program.
@@ -850,11 +930,111 @@ impl Renderer {
         Ok(())
     }
 
+    /// Replace only the requested stencil bits inside a depth attachment.
+    pub fn clear_stencil_masked(
+        &mut self,
+        key: u64,
+        layer: u32,
+        rect: Option<[i32; 4]>,
+        value: u32,
+        mask: u8,
+    ) -> Result<(), String> {
+        let target = self.target_info(key).ok_or("no such stencil target")?;
+        if mask == 0 || !has_stencil(target.format) {
+            return Ok(());
+        }
+        let width = target.scale.apply(target.width);
+        let height = target.scale.apply(target.height);
+        let whole = [0, 0, width as i32, height as i32];
+        let rect = rect.map(|rect| target.scale.rect(rect));
+        let scissor = crate::renderer::clip(rect.unwrap_or(whole), whole);
+        if scissor[2] <= 0 || scissor[3] <= 0 {
+            return Ok(());
+        }
+        let program = match self.stencil_clear_program.take() {
+            Some(program) => program,
+            None => self.create_program(vec![
+                stencil_clear_stage(crate::shader::Stage::Vertex),
+                stencil_clear_stage(crate::shader::Stage::Fragment),
+            ])?,
+        };
+        let face = StencilFace {
+            fail: vk::StencilOp::KEEP,
+            pass: vk::StencilOp::REPLACE,
+            depth_fail: vk::StencilOp::KEEP,
+            compare: vk::CompareOp::ALWAYS,
+            compare_mask: u32::MAX,
+            write_mask: u32::from(mask),
+            reference: value & 0xff,
+        };
+        let draw = Draw {
+            program: &program,
+            colors: &[],
+            color_levels: &[],
+            color_layers: &[],
+            color_formats: &[],
+            depth: Some(key),
+            depth_layer: layer,
+            attributes: Vec::new(),
+            streams: Vec::new(),
+            indices: Indices::None,
+            count: 3,
+            first: 0,
+            base_vertex: 0,
+            instances: 1,
+            first_instance: 0,
+            uniforms: &crate::FastMap::default(),
+            guest_uniforms: &crate::FastMap::default(),
+            read_guest: None,
+            textures: &crate::FastMap::default(),
+            storage: crate::FastMap::default(),
+            storage_in_place: crate::FastMap::default(),
+            fixed: Fixed {
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                primitive_restart: false,
+                cull: vk::CullModeFlags::NONE,
+                front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+                polygon_mode: vk::PolygonMode::FILL,
+                depth_test: false,
+                depth_write: false,
+                depth_compare: vk::CompareOp::ALWAYS,
+                viewport: [0.0, 0.0, width as f32, height as f32, 0.0, 1.0],
+                scissor,
+                stencil: Some([face; 2]),
+                depth_minus_one_to_one: false,
+                depth_bias: None,
+                depth_bias_d24: false,
+                alpha_to_coverage: false,
+                blend_constants: [0.0; 4],
+            },
+            blends: &[],
+            mesh: None,
+            page_table: Default::default(),
+            vertex_fetch: Vec::new(),
+            pool: Default::default(),
+        };
+        let result = self.without_occlusion_count(|renderer| {
+            renderer.draw_with_raster_scale(&draw, Some(Scale::ONE))?;
+            Ok(())
+        });
+        self.stencil_clear_program = Some(program);
+        self.stat("stat: masked stencil clears", 1);
+        result
+    }
+
     /// Record one draw.
     /// Record `draw`. Returns, for each copied storage buffer a stage
     /// writes, its (stage index, binding) and the token of its contents
     /// after the next flush (`take_reads`).
     pub fn draw(&mut self, draw: &Draw) -> Result<Vec<((usize, u32), u64)>, String> {
+        self.draw_with_raster_scale(draw, None)
+    }
+
+    fn draw_with_raster_scale(
+        &mut self,
+        draw: &Draw,
+        raster_scale: Option<Scale>,
+    ) -> Result<Vec<((usize, u32), u64)>, String> {
         let empty = match draw.mesh {
             Some(MeshGroups::Direct(groups)) => groups.contains(&0),
             Some(MeshGroups::Indirect { .. }) => false,
@@ -1164,18 +1344,20 @@ impl Renderer {
         }
         let [x, y, width, height, near, far] = fixed.viewport;
         // A negative height (Vulkan 1.1) flips Y; the caller decides.
-        // Viewport and scissor are in guest texels; scaled targets have
-        // `scale` image texels per guest texel.
+        // Guest draws scale their viewport and scissor to image texels.
+        // Attachment clear draws specify them directly in image texels.
         let factor = scale.factor();
+        let raster_factor = raster_scale.map_or(factor, Scale::factor);
+        let raster_scale = raster_scale.unwrap_or(scale);
         let viewport = vk::Viewport {
-            x: x * factor,
-            y: y * factor,
-            width: width * factor,
-            height: height * factor,
+            x: x * raster_factor,
+            y: y * raster_factor,
+            width: width * raster_factor,
+            height: height * raster_factor,
             min_depth: near,
             max_depth: far,
         };
-        let area = scale.rect(area.map(|value| value.max(0)));
+        let area = raster_scale.rect(area.map(|value| value.max(0)));
         let scissor = vk::Rect2D {
             offset: vk::Offset2D {
                 x: area[0],

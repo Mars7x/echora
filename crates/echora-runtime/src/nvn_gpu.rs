@@ -1597,18 +1597,17 @@ impl Nvn {
         cleared
     }
 
-    /// ClearDepthStencil on the GPU: the masked-off aspects keep their
-    /// contents (partial stencil masks clear all bits; not modeled).
+    /// ClearDepthStencil on the GPU, preserving masked-off depth and stencil.
     pub(super) fn gpu_clear_depth(
         &mut self,
         core: &Guest,
         texture: u64,
         depth: Option<f32>,
-        stencil: Option<u32>,
+        stencil: Option<(u32, u8)>,
     ) -> Result<(), String> {
         let (_, _, format) = self.target_shape(texture)?;
         let has_stencil = echora_gpu::renderer::has_stencil(format);
-        let stencil = stencil.filter(|_| has_stencil);
+        let stencil = stencil.filter(|&(_, mask)| has_stencil && mask != 0);
         if depth.is_none() && stencil.is_none() {
             return Ok(());
         }
@@ -1616,17 +1615,22 @@ impl Nvn {
         let scissor = self.render.scissor;
         let layer = self.render.depth_layer;
         let renderer = &self.gpu.as_ref().unwrap().renderer;
-        let untouched_aspect = has_stencil && (depth.is_none() || stencil.is_none());
+        let full_stencil = stencil
+            .filter(|&(_, mask)| mask == u8::MAX)
+            .map(|(value, _)| value & 0xff);
+        let untouched_aspect = has_stencil && (depth.is_none() || full_stencil.is_none());
         if (untouched_aspect && renderer.target_needs_initialization(texture))
             || renderer.partial_write_needs_initialization(texture, 0, layer, scissor)
         {
             self.initialize_new_targets(core);
         }
-        let backend = self.gpu.as_mut().unwrap();
-        backend.renderer.defined(texture);
-        backend
-            .renderer
-            .clear_depth_stencil(texture, layer, scissor, depth, stencil)
+        let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        renderer.clear_depth_stencil(texture, layer, scissor, depth, full_stencil)?;
+        if let Some((value, mask)) = stencil.filter(|&(_, mask)| mask != u8::MAX) {
+            renderer.clear_stencil_masked(texture, layer, scissor, value, mask)?;
+        }
+        renderer.defined(texture);
+        Ok(())
     }
 
     /// Release what was cached for texture object `texture`, finalized:
@@ -13066,7 +13070,7 @@ mod target_tests {
     }
 
     #[test]
-    fn a_first_stencil_clear_preserves_both_depth_encodings() {
+    fn a_first_masked_stencil_clear_preserves_depth_and_unselected_bits() {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
         let Ok(Some(backend)) = Backend::create(None) else {
@@ -13141,14 +13145,18 @@ mod target_tests {
         };
         let expected24: Vec<_> = depths24
             .into_iter()
-            .flat_map(|depth| (depth << 8 | 1).to_le_bytes())
+            .zip([0x21, 0x2a])
+            .flat_map(|(depth, stencil)| (depth << 8 | stencil).to_le_bytes())
             .collect();
         let expected32: Vec<_> = depths32
             .into_iter()
-            .flat_map(|depth| depth.to_le_bytes().into_iter().chain([1, 0, 0, 0]))
+            .zip([0x31, 0x3f])
+            .flat_map(|(depth, stencil)| depth.to_le_bytes().into_iter().chain([stencil, 0, 0, 0]))
             .collect();
+        nvn.render.scissor = Some([0, 0, 1, 1]);
         for (key, expected) in [(2, expected24), (3, expected32)] {
-            nvn.gpu_clear_depth(&core, key, None, Some(1)).unwrap();
+            nvn.gpu_clear_depth(&core, key, None, Some((0x81, 0x0f)))
+                .unwrap();
             let output = base + 0x2000;
             assert!(
                 nvn.gpu_read_texels(&mut core, key, transfer, output)

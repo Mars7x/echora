@@ -509,6 +509,7 @@ pub struct Renderer {
     slot: Slot,
     /// Graphics state remains valid across render passes in one batch.
     pub(crate) graphics: crate::draw::GraphicsState,
+    pub(crate) stencil_clear_program: Option<crate::draw::Program>,
     pub gpu: Gpu,
     /// Held while the queue is used (submissions, presents).
     pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
@@ -1121,6 +1122,7 @@ impl Renderer {
             recording: false,
             full_barrier_recorded: false,
             graphics: Default::default(),
+            stencil_clear_program: None,
             memory_types,
             targets: FastMap::default(),
             archived_targets: FastMap::default(),
@@ -7871,12 +7873,16 @@ fn range(format: vk::Format) -> vk::ImageSubresourceRange {
 }
 
 /// `rect` limited to `bounds`, both (x, y, width, height).
-fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
+pub(crate) fn clip(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
     let x0 = rect[0].max(bounds[0]);
     let y0 = rect[1].max(bounds[1]);
-    let x1 = (rect[0] + rect[2]).min(bounds[0] + bounds[2]);
-    let y1 = (rect[1] + rect[3]).min(bounds[1] + bounds[3]);
-    [x0, y0, x1 - x0, y1 - y0]
+    let x1 = rect[0]
+        .saturating_add(rect[2])
+        .min(bounds[0].saturating_add(bounds[2]));
+    let y1 = rect[1]
+        .saturating_add(rect[3])
+        .min(bounds[1].saturating_add(bounds[3]));
+    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
 }
 
 impl Drop for Renderer {
@@ -7899,6 +7905,9 @@ impl Drop for Renderer {
         }
         if let Some(occlusion) = self.occlusion.take() {
             occlusion.destroy(&self.gpu.device);
+        }
+        if let Some(program) = self.stencil_clear_program.take() {
+            let _ = self.destroy_idle_programs([program]);
         }
         if let Some(mesh_count) = self.mesh_count.take() {
             mesh_count.destroy(&self.gpu.device);
@@ -8594,6 +8603,7 @@ mod tests {
     fn clip_limits_to_bounds() {
         assert_eq!(clip([-5, 2, 20, 4], [0, 0, 10, 10]), [0, 2, 10, 4]);
         assert_eq!(clip([12, 0, 4, 4], [0, 0, 10, 10])[2], -2);
+        assert!(clip([i32::MAX, 0, 4, 4], [0, 0, 10, 10])[2] < 0);
     }
 
     #[test]
@@ -9384,6 +9394,60 @@ mod tests {
             assert_eq!(&row[..16], 0.25_f32.to_le_bytes().repeat(4));
             assert_eq!(&row[16..], 0.75_f32.to_le_bytes().repeat(4));
         }
+    }
+
+    #[test]
+    fn masked_stencil_clears_follow_conditions_without_counting_samples() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.supports_conditions() {
+            return;
+        }
+        let (buffer, _) = renderer.resident_buffer(1, 32).unwrap();
+        renderer.fill_resident(1, 0, 32, 0).unwrap();
+        renderer
+            .target(2, 4, 2, vk::Format::D32_SFLOAT_S8_UINT)
+            .unwrap();
+        renderer
+            .clear_depth_stencil(2, 0, None, Some(0.25), Some(0x49))
+            .unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.set_condition(Some((buffer, 0, false)));
+        renderer
+            .clear_stencil_masked(2, 0, None, 0x88, 0xff)
+            .unwrap();
+        renderer.set_condition(Some((buffer, 0, true)));
+        renderer
+            .clear_stencil_masked(2, 0, Some([2, 0, 2, 2]), 0x36, 0x0f)
+            .unwrap();
+        renderer.set_condition(None);
+        renderer.samples_report(buffer, 16, 0x1234).unwrap();
+        let token = renderer.read_resident(1, 16, 16).unwrap();
+        let pixels = renderer
+            .read_target_depth_stencil_plane_bytes(2, 0, 0, [0, 0, 4, 2])
+            .unwrap();
+        assert_eq!(&pixels[..32], 0.25_f32.to_le_bytes().repeat(8));
+        assert_eq!(&pixels[32..], [0x49, 0x49, 0x46, 0x46].repeat(2));
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            [0_u64, 0x1234].map(u64::to_le_bytes).concat()
+        );
+
+        renderer.set_resolution_scale(Scale::new(1, 2).unwrap());
+        renderer
+            .target(3, 1, 1, vk::Format::D32_SFLOAT_S8_UINT)
+            .unwrap();
+        renderer
+            .clear_depth_stencil(3, 0, None, Some(0.5), Some(0x84))
+            .unwrap();
+        renderer
+            .clear_stencil_masked(3, 0, None, 0x21, 0x0f)
+            .unwrap();
+        let pixel = renderer
+            .read_target_depth_stencil_plane_bytes(3, 0, 0, [0, 0, 1, 1])
+            .unwrap();
+        assert_eq!(pixel, [0.5_f32.to_le_bytes().as_slice(), &[0x81]].concat());
     }
 }
 

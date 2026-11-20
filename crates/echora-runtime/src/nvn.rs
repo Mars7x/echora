@@ -5666,7 +5666,7 @@ impl Nvn {
                     // The depth value is the first float argument (V0).
                     let depth = f32::from_bits(command.v[0] as u32);
                     let (depth_mask, stencil, stencil_mask) =
-                        (command.x[1] != 0, command.x[2] as u32, command.x[3] as u32);
+                        (command.x[1] != 0, command.x[2] as u32, command.x[3] as u8);
                     let texture = self.render.depth;
                     if self.depth_traced(texture) {
                         eprintln!(
@@ -5688,7 +5688,7 @@ impl Nvn {
                             core,
                             texture,
                             depth_mask.then_some(depth),
-                            (stencil_mask != 0).then_some(stencil),
+                            (stencil_mask != 0).then_some((stencil, stencil_mask)),
                         )
                         .map_err(stop);
                 }
