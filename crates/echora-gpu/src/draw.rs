@@ -159,6 +159,7 @@ pub(crate) struct GraphicsState {
     // Valid for the current command buffer and program. Submitting resets it.
     dynamic_set: Option<DynamicSet>,
     pool_set: Option<vk::DescriptorSet>,
+    // Dynamic vertex input remains set across shader object bindings.
     vertex_input: Option<VertexInput>,
 }
 
@@ -167,13 +168,13 @@ impl GraphicsState {
         self.program = None;
         self.raster = None;
         self.blends.clear();
+        self.vertex_input = None;
         self.reset_program_bindings();
     }
 
     fn reset_program_bindings(&mut self) {
         self.dynamic_set = None;
         self.pool_set = None;
-        self.vertex_input = None;
     }
 }
 
@@ -2202,6 +2203,13 @@ pub(crate) mod tests {
         let stats = renderer.take_stats();
         assert!(!stats.contains_key("stat: graphics vertex input sets"));
 
+        let alternate = renderer.create_program(program.stages.clone()).unwrap();
+        draw.program = &alternate;
+        renderer.draw(&draw).unwrap();
+        let stats = renderer.take_stats();
+        assert!(!stats.contains_key("stat: graphics vertex input sets"));
+        draw.program = &program;
+
         let texels = renderer.read_target(7).unwrap();
         assert_eq!(texels[0], [1.0, 1.0, 1.0, 1.0]);
 
@@ -2255,6 +2263,7 @@ pub(crate) mod tests {
             assert_eq!(texels[3], [0.0; 4]);
         }
 
+        renderer.destroy_program(alternate).unwrap();
         renderer.destroy_program(program).unwrap();
     }
 }
