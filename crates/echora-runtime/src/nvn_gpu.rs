@@ -159,6 +159,15 @@ fn texture_row_pitch(
     }
 }
 
+fn texture_height_and_depth(target: u32, height: u32, depth: u32) -> (u32, u32) {
+    // For a 1D array, SetSize2D supplies the number of layers in Height.
+    if target == 3 {
+        (1, height.max(1))
+    } else {
+        (height, depth.max(1))
+    }
+}
+
 impl TargetIndex {
     fn insert(
         &mut self,
@@ -2974,8 +2983,7 @@ impl Nvn {
         format!("[{}]", described.join(" "))
     }
 
-    /// Bytes of a texture object's block-linear storage (all levels and
-    /// layers).
+    /// Bytes of a texture object's storage (all levels and layers).
     pub(super) fn texture_storage_size(&self, texture: u64) -> Option<u64> {
         let mut memo = self.size_memo.borrow_mut();
         if let Some(&size) = memo.get(&texture) {
@@ -2991,17 +2999,17 @@ impl Nvn {
         let get = |key: &str| object.builder.get(key).map(|value| value.x[0] as u32);
         let info = crate::nvn_format::info(get("Format")?)?;
         let width = get("Width").unwrap_or(1);
-        let height = get("Height").unwrap_or(1);
+        let target = get("Target").unwrap_or(1);
+        let (height, depth) = texture_height_and_depth(
+            target,
+            get("Height").unwrap_or(1),
+            get("Depth").unwrap_or(1),
+        );
         let stride = texture_row_pitch(&object.builder, info, width);
         if stride != 0 {
             return stride.checked_mul(u64::from(height.div_ceil(info.block_height)));
         }
-        let depth = get("Depth").unwrap_or(1).max(1);
-        let (depth, layers) = if get("Target") == Some(2) {
-            (depth, 1)
-        } else {
-            (1, depth)
-        };
+        let (depth, layers) = if target == 2 { (depth, 1) } else { (1, depth) };
         Some(
             crate::nvn_format::block_linear_size(
                 info,
@@ -4055,7 +4063,13 @@ impl Nvn {
         let format = get("Format").unwrap_or(0);
         let info =
             crate::nvn_format::info(format).ok_or_else(|| format!("texture format {format}"))?;
-        let (width, height) = (get("Width").unwrap_or(1), get("Height").unwrap_or(1));
+        let width = get("Width").unwrap_or(1);
+        let target = get("Target").unwrap_or(1);
+        let (height, depth_or_layers) = texture_height_and_depth(
+            target,
+            get("Height").unwrap_or(1),
+            get("Depth").unwrap_or(1),
+        );
         let astc = info.name.starts_with("ASTC");
         let mut vk_format = match vk_format(format) {
             Some(vk_format) => vk_format,
@@ -4106,10 +4120,8 @@ impl Nvn {
         // small updates such as new glyphs in a font atlas are not missed.
         // NVN targets (inferred, GL order): 0 1D, 1 2D, 2 3D, 3 1D array,
         // 4 2D array, 7 rectangle, 8 cube, 9 cube array, 10 buffer (read as
-        // a 1D image here); arrays and cubes
-        // keep their layers (faces) in Depth.
-        let depth_or_layers = get("Depth").unwrap_or(1).max(1);
-        let shape = match get("Target").unwrap_or(1) {
+        // a 1D image here); 2D arrays and cubes keep their layers in Depth.
+        let shape = match target {
             0 | 10 => ImageShape::D1 { layers: 1 },
             3 => ImageShape::D1 {
                 layers: depth_or_layers,
@@ -11995,6 +12007,102 @@ mod target_tests {
             .map(base, size, READ | WRITE, STATE_NORMAL, "texture storage")
             .unwrap();
         Some((nvn, memory, base, texture))
+    }
+
+    #[test]
+    fn one_dimensional_array_upload_uses_height_for_layers() {
+        use echora_gpu::draw::ImageShape;
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let props = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+        for (key, value) in [("Width", 8), ("Height", 3), ("Target", 3), ("Levels", 2)] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        props.remove("Stride");
+        let (size, _) = crate::nvn::texture_storage(props).unwrap();
+        assert_eq!(nvn.texture_storage_size(texture), Some(size));
+
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let linear = base + (1 << 20);
+        for layer in 0..3 {
+            guest
+                .memory
+                .write(linear + layer * 32, &[0x40 + layer as u8; 32])
+                .unwrap();
+            guest
+                .memory
+                .write(linear + 96 + layer * 16, &[0x80 + layer as u8; 16])
+                .unwrap();
+        }
+        for (level, width, address) in [(0, 8, linear), (1, 4, linear + 96)] {
+            assert!(
+                nvn.copy_texels(
+                    &mut guest,
+                    texture,
+                    crate::nvn::TexelTransfer {
+                        region: [0, 0, 0, width, 3, 1],
+                        bases: [level, 0],
+                        strides: [0; 2],
+                    },
+                    address,
+                    true,
+                )
+                .is_ok()
+            );
+        }
+        let source = nvn.guest_texture(&guest, texture).unwrap();
+        let super::TextureSource::Upload {
+            height,
+            shape,
+            texels,
+            levels,
+            ..
+        } = &source
+        else {
+            panic!("expected a texture upload");
+        };
+        assert_eq!(*height, 1);
+        assert_eq!(*shape, ImageShape::D1 { layers: 3 });
+        assert_eq!(levels.len(), 6);
+        for (index, region) in levels.iter().enumerate() {
+            let (level, layer) = (index / 3, index % 3);
+            assert_eq!(
+                (region.level as usize, region.layer as usize),
+                (level, layer)
+            );
+            assert_eq!(region.height, 1);
+            let start = region.offset as usize;
+            let end = start + region.width as usize * 4;
+            assert!(
+                texels[start..end]
+                    .iter()
+                    .all(|&byte| byte == ((level + 1) * 0x40 + layer) as u8)
+            );
+        }
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.texture_view_for(&source).unwrap();
+        for level in 0..2 {
+            for layer in 0..3 {
+                let pixels = renderer.read_upload_slice(texture, level, layer).unwrap();
+                assert_eq!(pixels.len(), 8 >> level);
+                let expected = ((level + 1) * 0x40 + layer) as f32 / 255.0;
+                for channel in pixels.iter().flatten() {
+                    assert!((channel - expected).abs() < 1e-6);
+                }
+            }
+        }
     }
 
     #[test]

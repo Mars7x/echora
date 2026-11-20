@@ -6895,7 +6895,10 @@ impl Renderer {
 
     /// Make sure a guest texture is uploaded (debugging reads).
     pub fn texture_view_for(&mut self, source: &crate::draw::TextureSource) -> Result<(), String> {
-        self.texture_view(source, 2).map(|_| ())
+        match source {
+            crate::draw::TextureSource::Upload { .. } => self.upload(source),
+            _ => self.texture_view(source, 2).map(|_| ()),
+        }
     }
 
     /// Debugging: read mip level `level` of upload `key` back as RGBA f32
