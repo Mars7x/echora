@@ -1498,10 +1498,15 @@ impl Renderer {
         }) {
             return self.patch_page_table(first_page, entries.len(), &[(0, entries)]);
         }
-        self.replace_page_table(first_page, entries.len(), 0..entries.len(), |current| {
-            current.clear();
-            current.extend_from_slice(entries);
-        })?;
+        self.replace_page_table(
+            first_page,
+            entries.len(),
+            std::iter::once(0..entries.len()),
+            |current| {
+                current.clear();
+                current.extend_from_slice(entries);
+            },
+        )?;
         Ok((self.page_table_binding(), false))
     }
 
@@ -1562,9 +1567,10 @@ impl Renderer {
             }
         }
         if replace {
-            let (first, _) = patches.first().unwrap();
-            let (last, patch) = patches.last().unwrap();
-            self.replace_page_table(first_page, count, *first..*last + patch.len(), |entries| {
+            let changed = patches
+                .iter()
+                .map(|&(start, patch)| start..start + patch.len());
+            self.replace_page_table(first_page, count, changed, |entries| {
                 for &(start, patch) in patches {
                     entries[start..start + patch.len()].copy_from_slice(patch);
                 }
@@ -1573,9 +1579,11 @@ impl Renderer {
         }
         let extended = !added.is_empty();
         if extended {
-            let (first, _) = added.first().unwrap();
-            let (last, entries) = added.last().unwrap();
-            self.mark_recycled_page_tables_dirty(*first..*last + entries.len());
+            self.mark_recycled_page_tables_dirty(
+                added
+                    .iter()
+                    .map(|&(start, entries)| start..start + entries.len()),
+            );
             let table = self.page_table.as_mut().unwrap();
             for (start, entries) in added {
                 table.buffer.write_page_addresses(start * 8, entries);
@@ -1587,12 +1595,17 @@ impl Renderer {
     }
 
     /// Remember changes without touching buffers that the GPU can still read.
-    fn mark_recycled_page_tables_dirty(&mut self, changed: std::ops::Range<usize>) {
+    fn mark_recycled_page_tables_dirty(
+        &mut self,
+        changed: impl Iterator<Item = std::ops::Range<usize>> + Clone,
+    ) {
         let retired = std::iter::once(&mut self.slot)
             .chain(&mut self.spares)
             .flat_map(|slot| &mut slot.retired_page_tables);
         for table in self.free_page_tables.iter_mut().chain(retired) {
-            table.mark_dirty(changed.clone());
+            for range in changed.clone() {
+                table.mark_dirty(range);
+            }
         }
     }
 
@@ -1600,7 +1613,7 @@ impl Renderer {
         &mut self,
         first_page: u32,
         count: usize,
-        changed: std::ops::Range<usize>,
+        changed: impl Iterator<Item = std::ops::Range<usize>> + Clone,
         update: impl FnOnce(&mut Vec<u64>),
     ) -> Result<(), String> {
         let bytes = (count.max(1) * 8) as u64;
@@ -1621,28 +1634,39 @@ impl Renderer {
             }
             RecycledPageTable {
                 buffer,
-                dirty: 0..count,
+                dirty: std::iter::once(0..count).collect(),
             }
         };
         self.mark_recycled_page_tables_dirty(changed.clone());
-        storage.mark_dirty(changed.clone());
-        let mut entries = if let Some(old) = self.page_table.take() {
-            // Work already recorded or submitted can still read the old
-            // buffer. The end of this slot orders all those uses.
-            self.slot.retired_page_tables.push(RecycledPageTable {
-                buffer: old.buffer,
-                dirty: changed,
-            });
-            old.entries
-        } else {
-            Vec::new()
-        };
+        for range in changed.clone() {
+            storage.mark_dirty(range);
+        }
+        let (mut entries, retired) = self
+            .page_table
+            .take()
+            .map_or_else(|| (Vec::new(), None), |old| (old.entries, Some(old.buffer)));
         update(&mut entries);
         debug_assert_eq!(entries.len(), count);
-        // A recycled buffer holds every entry outside its dirty span.
-        let range = storage.dirty.start.min(count)..storage.dirty.end.min(count);
+        // A recycled buffer holds every entry outside its dirty ranges.
+        for range in storage.dirty.drain(..) {
+            let range = range.start.min(count)..range.end.min(count);
+            storage
+                .buffer
+                .write_page_addresses(range.start * 8, &entries[range]);
+        }
         let buffer = storage.buffer;
-        buffer.write_page_addresses(range.start * 8, &entries[range]);
+        if let Some(retired) = retired {
+            // Work already recorded or submitted can still read the old
+            // buffer. The end of this slot orders all those uses.
+            let mut storage = RecycledPageTable {
+                buffer: retired,
+                dirty: storage.dirty,
+            };
+            for range in changed {
+                storage.mark_dirty(range);
+            }
+            self.slot.retired_page_tables.push(storage);
+        }
         self.page_table = Some(PageTableBuffer {
             address: self.buffer_address(buffer.buffer).unwrap_or(0),
             buffer,
@@ -7911,20 +7935,25 @@ struct RecycledPageTable {
     buffer: HostBuffer,
     // Covers changes since this memory was the current table. The buffer
     // itself stays immutable until its last submitted references finish.
-    dirty: std::ops::Range<usize>,
+    dirty: Vec<std::ops::Range<usize>>,
 }
 
 impl RecycledPageTable {
-    fn mark_dirty(&mut self, changed: std::ops::Range<usize>) {
+    fn mark_dirty(&mut self, mut changed: std::ops::Range<usize>) {
         if changed.is_empty() {
             return;
         }
-        if self.dirty.is_empty() {
-            self.dirty = changed;
-        } else {
-            self.dirty.start = self.dirty.start.min(changed.start);
-            self.dirty.end = self.dirty.end.max(changed.end);
+        let first = self
+            .dirty
+            .partition_point(|range| range.end < changed.start);
+        let end = self
+            .dirty
+            .partition_point(|range| range.start <= changed.end);
+        if first < end {
+            changed.start = changed.start.min(self.dirty[first].start);
+            changed.end = changed.end.max(self.dirty[end - 1].end);
         }
+        self.dirty.splice(first..end, [changed]);
     }
 }
 
@@ -8690,15 +8719,25 @@ mod tests {
         assert_ne!(original.address, replacement.address);
 
         entries[130] = address + 4096;
+        entries[900] = address + 4096;
         let (extended_in_place, extended) = renderer
-            .patch_page_table(0x100, entries.len(), &[(130, &entries[130..131])])
+            .patch_page_table(
+                0x100,
+                entries.len(),
+                &[(130, &entries[130..131]), (900, &entries[900..901])],
+            )
             .unwrap();
         assert!(extended);
         assert_eq!(replacement.address, extended_in_place.address);
+        assert_eq!(
+            renderer.slot.retired_page_tables[0].dirty,
+            [128..129, 130..131, 900..901]
+        );
         let old = &renderer.slot.retired_page_tables[0].buffer;
-        let prefix = old.read_bytes(132 * 8);
+        let prefix = old.read_bytes(901 * 8);
         assert_eq!(&prefix[128 * 8..129 * 8], &address.to_le_bytes());
         assert_eq!(&prefix[130 * 8..131 * 8], &[0; 8]);
+        assert_eq!(&prefix[900 * 8..901 * 8], &[0; 8]);
         renderer.flush().unwrap();
 
         entries[131] = address;
