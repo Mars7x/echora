@@ -4020,24 +4020,44 @@ impl Nvn {
         }
         let base = self.texture_storage(texture)?;
         let extent = extent?;
+        // Prefer the same array or volume shape when the backing has
+        // several views. A lone alias can still be reinterpreted by the
+        // sampler as before.
+        let base_alias = |keys: &[u64], indexed: bool| {
+            let mut matching = keys
+                .iter()
+                .copied()
+                .filter(|&key| indexed || self.texture_storage(key) == Some(base))
+                .filter_map(|key| {
+                    let target = renderer.target_info(key)?;
+                    ((target.width, target.height) == extent
+                        && same_format(target.format)
+                        && covers_levels(target, 0))
+                    .then_some((key, target.shape))
+                })
+                .peekable();
+            let (first, first_shape) = matching.next()?;
+            if matching.peek().is_none() {
+                return Some((first, 0));
+            }
+            let shape = self.render_shape(texture);
+            let key = if first_shape == shape {
+                first
+            } else {
+                matching
+                    .find_map(|(key, candidate)| (candidate == shape).then_some(key))
+                    .unwrap_or(first)
+            };
+            Some((key, 0))
+        };
         // From the index when it is current: the targets at this storage,
         // then the target levels that start there.
         if self.target_index_current() {
             let backend = self.gpu.as_ref()?;
-            for &key in backend
-                .target_index
-                .storage
-                .get(&base)
-                .into_iter()
-                .flatten()
+            if let Some(keys) = backend.target_index.storage.get(&base)
+                && let Some(target) = base_alias(keys, true)
             {
-                if renderer.target_info(key).is_some_and(|target| {
-                    (target.width, target.height) == extent
-                        && same_format(target.format)
-                        && covers_levels(target, 0)
-                }) {
-                    return Some((key, 0));
-                }
+                return Some(target);
             }
             return backend
                 .target_index
@@ -4053,8 +4073,11 @@ impl Nvn {
                 })
                 .map(|mip| (mip.key, mip.level));
         }
-        let mut mip_match = None;
-        for &key in renderer.target_keys_in_order() {
+        let keys = renderer.target_keys_in_order();
+        if let Some(target) = base_alias(keys, false) {
+            return Some(target);
+        }
+        for &key in keys {
             let Some(target) = renderer
                 .target_info(key)
                 .filter(|target| same_format(target.format))
@@ -4064,14 +4087,7 @@ impl Nvn {
             let Some(target_base) = self.texture_storage(key) else {
                 continue;
             };
-            if target_base == base
-                && (target.width, target.height) == extent
-                && covers_levels(target, 0)
-            {
-                return Some((key, 0));
-            }
-            if mip_match.is_some()
-                || target.levels == 1
+            if target.levels == 1
                 || (base <= target_base && self.virtual_texture_address(key).is_none())
             {
                 continue;
@@ -4082,12 +4098,11 @@ impl Nvn {
                     && covers_levels(target, mip.level)
                     && self.mip_matches_backing(&mip, texture)
                 {
-                    mip_match = Some((key, mip.level));
-                    break;
+                    return Some((key, mip.level));
                 }
             }
         }
-        mip_match
+        None
     }
 
     /// A texture alias of a virtually mapped mip must fit its physical span.
@@ -12669,6 +12684,8 @@ mod target_tests {
 
     #[test]
     fn layered_storage_images_find_the_compatible_rendered_alias() {
+        use echora_gpu::draw::TextureSource;
+
         let Some((mut nvn, mut memory, _, template)) = texture_cache_fixture(0x24) else {
             return;
         };
@@ -12750,6 +12767,14 @@ mod target_tests {
             }
         }
         assert_eq!(target, rendered);
+        assert_eq!(
+            nvn.resolve_target_with_levels(storage, 2, true),
+            Some((rendered, 0))
+        );
+        match nvn.texture_source(&guest, storage).unwrap() {
+            TextureSource::Target(key) => assert_eq!(key, rendered),
+            source => panic!("expected the rendered alias, got {source:?}"),
+        }
     }
 
     #[test]
