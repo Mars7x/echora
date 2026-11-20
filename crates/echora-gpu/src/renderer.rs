@@ -5545,22 +5545,29 @@ impl Renderer {
     }
 
     /// The clear leaves some of the image's original texels untouched.
-    pub fn color_clear_needs_initialization(
+    pub fn clear_needs_initialization(
         &self,
         key: u64,
         level: u32,
         layer: u32,
         rect: Option<[i32; 4]>,
     ) -> bool {
-        self.fresh_targets.contains(&key)
-            && (self.condition.is_some()
-                || level != 0
-                || layer != 0
-                || rect.is_some()
-                || self
-                    .targets
-                    .get(&key)
-                    .is_some_and(|target| target.levels > 1 || target.shape.layers() > 1))
+        if !self.fresh_targets.contains(&key) {
+            return false;
+        }
+        let Some(target) = self.targets.get(&key) else {
+            return false;
+        };
+        self.condition.is_some()
+            || level != 0
+            || layer != 0
+            || target.levels > 1
+            || target.shape.layers() > 1
+            || rect.is_some_and(|rect| {
+                let (width, height) = target.extent(level);
+                let whole = [0, 0, width as i32, height as i32];
+                clip(target.scaled(rect), whole) != whole
+            })
     }
 
     /// Target `key` gets its contents otherwise (a clear or a copy): it

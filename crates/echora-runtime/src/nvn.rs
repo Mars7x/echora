@@ -5634,9 +5634,7 @@ impl Nvn {
                 Ok(())
             }
             // ClearDepthStencil(cmd, float depth, NVNboolean depthMask, int
-            // stencil, int stencilMask) on the bound depth target. No depth
-            // buffer is read until draws are rendered, so the cleared values
-            // are recorded as the depth target's contents.
+            // stencil, int stencilMask) on the bound depth attachment.
             "nvnCommandBufferClearDepthStencil" => {
                 if self.render.depth == 0 {
                     return Err(stop("no depth-stencil target is bound".into()));
@@ -5667,6 +5665,7 @@ impl Nvn {
                     }
                     return self
                         .gpu_clear_depth(
+                            core,
                             texture,
                             depth_mask.then_some(depth),
                             (stencil_mask != 0).then_some(stencil),

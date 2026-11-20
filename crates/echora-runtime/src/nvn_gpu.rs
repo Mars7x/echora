@@ -1572,7 +1572,7 @@ impl Nvn {
             .as_ref()
             .unwrap()
             .renderer
-            .color_clear_needs_initialization(texture, level, layer, rect)
+            .clear_needs_initialization(texture, level, layer, rect)
         {
             self.initialize_new_targets(core);
         }
@@ -1597,13 +1597,30 @@ impl Nvn {
     /// contents (partial stencil masks clear all bits; not modeled).
     pub(super) fn gpu_clear_depth(
         &mut self,
+        core: &Guest,
         texture: u64,
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), String> {
+        let (_, _, format) = self.target_shape(texture)?;
+        let has_stencil = echora_gpu::renderer::has_stencil(format);
+        let stencil = stencil.filter(|_| has_stencil);
+        if depth.is_none() && stencil.is_none() {
+            return Ok(());
+        }
         self.ensure_render_target(texture)?;
         let scissor = self.render.scissor;
         let layer = self.render.depth_layer;
+        if !has_stencil
+            && self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .clear_needs_initialization(texture, 0, layer, scissor)
+        {
+            self.initialize_new_targets(core);
+        }
         let backend = self.gpu.as_mut().unwrap();
         backend.renderer.defined(texture);
         backend
@@ -12691,9 +12708,6 @@ mod target_tests {
                 ..Bag::default()
             },
         );
-        nvn.gpu_clear_depth(2, Some(0.5), None).unwrap();
-        assert_eq!(nvn.target_shape(2).unwrap().0, 8);
-
         let mut cpu = Cpu::default();
         let mut memory = Memory::new(1 << 39);
         cpu.regs[0] = 2;
@@ -12702,6 +12716,8 @@ mod target_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: None,
         };
+        nvn.gpu_clear_depth(&core, 2, Some(0.5), None).unwrap();
+        assert_eq!(nvn.target_shape(2).unwrap().0, 8);
         assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
         assert!(nvn.target_shape(2).is_err());
 
@@ -12770,8 +12786,6 @@ mod target_tests {
                 ..Bag::default()
             },
         );
-        nvn.gpu_clear_depth(2, Some(0.5), None).unwrap();
-
         let mut cpu = Cpu::default();
         let mut memory = Memory::new(1 << 39);
         cpu.regs[0] = 2;
@@ -12780,6 +12794,7 @@ mod target_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: None,
         };
+        nvn.gpu_clear_depth(&core, 2, Some(0.5), None).unwrap();
         assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
         let archive = retired_texture((0x10000, 52));
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
@@ -12818,6 +12833,43 @@ mod target_tests {
             renderer.read_target_bytes(2, 4).unwrap(),
             0.5_f32.to_le_bytes().repeat(512 * 512)
         );
+    }
+
+    #[test]
+    fn first_scissored_depth_clear_preserves_the_rest_of_guest_storage() {
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let props = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+        for (key, value) in [("Width", 8), ("Height", 4), ("Stride", 32), ("Format", 52)] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        memory
+            .write(base, &0.25_f32.to_le_bytes().repeat(32))
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        nvn.render.scissor = Some([0, 0, 4, 4]);
+        nvn.gpu_clear_depth(&guest, texture, Some(0.75), None)
+            .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        let pixels = renderer.read_target_bytes(texture, 4).unwrap();
+        let expected: Vec<_> = [0.75_f32; 4]
+            .into_iter()
+            .chain([0.25; 4])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(pixels, expected.repeat(4));
     }
 
     #[test]
