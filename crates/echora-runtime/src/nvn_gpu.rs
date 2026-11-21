@@ -16438,6 +16438,49 @@ mod pool_tests {
     }
 
     #[test]
+    fn texel_writes_evict_only_the_bindings_over_them() {
+        let mut nvn = Nvn::default();
+        let binding =
+            |texture: u64, backing: Option<TextureBacking>| super::super::ResolvedBinding {
+                source: TextureSource::Target(texture),
+                sampler: Sampler::default(),
+                sample_type: super::shader::SampleType::Float,
+                backing,
+                gpu_writes: 0,
+                present: 0,
+                texture,
+            };
+        let fill = |nvn: &mut Nvn| {
+            nvn.binding_memo.1.clear();
+            nvn.binding_memo
+                .1
+                .insert(1, binding(1, Some(TextureBacking::linear(0x1000, 0x100))));
+            nvn.binding_memo
+                .1
+                .insert(2, binding(2, Some(TextureBacking::linear(0x2000, 0x100))));
+            // Storage unknown: any write may change it.
+            nvn.binding_memo.1.insert(3, binding(3, None));
+        };
+        fill(&mut nvn);
+        let inputs = nvn.pool_inputs;
+        nvn.evict_bindings_over(&[0x10f0..0x1200]);
+        let mut kept: Vec<u64> = nvn.binding_memo.1.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [2]);
+        assert!(nvn.pool_inputs > inputs);
+
+        // A write elsewhere keeps both known bindings.
+        fill(&mut nvn);
+        let inputs = nvn.pool_inputs;
+        nvn.evict_bindings_over(&[0x3000..0x3010]);
+        let mut kept: Vec<u64> = nvn.binding_memo.1.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [1, 2]);
+        // Pool lists are made again all the same.
+        assert!(nvn.pool_inputs > inputs);
+    }
+
+    #[test]
     fn texture_storage_index_preserves_flushes_and_named_invalidations() {
         let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
