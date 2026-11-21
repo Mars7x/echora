@@ -366,5 +366,11 @@ mod tests {
         assert_ne!(base, key(version, &[info(&other)], "layout"));
         assert_ne!(base, key(version, &[info(&code)], "other layout"));
         assert_ne!(base, key(([1; 16], 2), &[info(&code)], "layout"));
+        let mut subgroup =
+            vk::ShaderRequiredSubgroupSizeCreateInfoEXT::default().required_subgroup_size(32);
+        assert_ne!(
+            base,
+            key(version, &[info(&code).push_next(&mut subgroup)], "layout")
+        );
     }
 }

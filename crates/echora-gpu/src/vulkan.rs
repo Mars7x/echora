@@ -41,6 +41,7 @@ pub struct Gpu {
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
     pub compute_subgroup_32: bool,
+    subgroup_32_stages: vk::ShaderStageFlags,
     /// Compute shader objects can request fully active subgroups.
     pub compute_full_subgroups: bool,
     /// This device can enforce reconvergence of individual subgroups.
@@ -273,11 +274,14 @@ impl Gpu {
             object_properties.shader_binary_version,
         );
         let buffer_device_address = supported12.buffer_device_address != 0;
-        let compute_subgroup_32 = supported13.subgroup_size_control != 0
+        let subgroup_32_stages = if supported13.subgroup_size_control != 0
             && (size_control.min_subgroup_size..=size_control.max_subgroup_size).contains(&32)
-            && size_control
-                .required_subgroup_size_stages
-                .contains(vk::ShaderStageFlags::COMPUTE);
+        {
+            size_control.required_subgroup_size_stages & subgroup_properties.supported_stages
+        } else {
+            vk::ShaderStageFlags::empty()
+        };
+        let compute_subgroup_32 = subgroup_32_stages.contains(vk::ShaderStageFlags::COMPUTE);
         let (s11, s12, s13, objects) = (
             supported11,
             supported12,
@@ -641,6 +645,7 @@ impl Gpu {
             sampler_mirror_clamp_to_edge,
             texture_compression_astc_ldr: core.texture_compression_astc_ldr != 0,
             compute_subgroup_32,
+            subgroup_32_stages,
             compute_full_subgroups,
             subgroup_uniform_control_flow,
             buffer_device_address,
@@ -738,6 +743,11 @@ impl Gpu {
             .map_err(vk_error("vkCreateDescriptorSetLayout"))
     }
 
+    /// Whether this translated stage should request the guest's warp width.
+    pub(crate) fn require_subgroup_32(&self, translated: &Translated) -> bool {
+        require_subgroup_32(self.subgroup_32_stages, translated.stage, &translated.spirv)
+    }
+
     /// Compile one translated stage on the driver (VK_EXT_shader_object) and
     /// discard it: a check that the SPIR-V is accepted.
     pub fn check_stage(&self, translated: &Translated) -> Result<(), String> {
@@ -764,7 +774,7 @@ impl Gpu {
             vk::ShaderStageFlags::empty()
         };
         let code: &[u8] = bytemuck_words(&translated.spirv);
-        // As the renderer creates them: compute in 32-lane subgroups.
+        // Use the same subgroup width as the renderer.
         let mut subgroup_32 =
             vk::ShaderRequiredSubgroupSizeCreateInfoEXT::default().required_subgroup_size(32);
         let mut info = vk::ShaderCreateInfoEXT::default()
@@ -777,9 +787,12 @@ impl Gpu {
         if translated.stage == Stage::Mesh {
             info = info.flags(vk::ShaderCreateFlagsEXT::NO_TASK_SHADER);
         }
-        if self.compute_subgroup_32 && translated.stage == Stage::Compute {
+        if self.require_subgroup_32(translated) {
             info = info.push_next(&mut subgroup_32);
-            if self.compute_full_subgroups && whole_subgroups(&translated.spirv) {
+            if translated.stage == Stage::Compute
+                && self.compute_full_subgroups
+                && whole_subgroups(&translated.spirv)
+            {
                 info = info.flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
             }
         }
@@ -807,6 +820,33 @@ impl Gpu {
             }
         }
     }
+}
+
+fn require_subgroup_32(stages: vk::ShaderStageFlags, stage: Stage, spirv: &[u32]) -> bool {
+    use echora_shader::spirv::{capability, op};
+
+    if !stages.contains(stage_flags(stage)) {
+        return false;
+    }
+    if stage == Stage::Compute {
+        return true;
+    }
+    // Capabilities precede the shader body. Graphics without subgroup
+    // operations can use whichever width the driver would normally choose.
+    const GROUP_NON_UNIFORM_QUAD: u32 = 68;
+    let mut at = 5;
+    while let Some(&head) = spirv.get(at) {
+        if head as u16 != op::CAPABILITY || head >> 16 != 2 {
+            break;
+        }
+        if spirv.get(at + 1).is_some_and(|cap| {
+            (capability::GROUP_NON_UNIFORM..=GROUP_NON_UNIFORM_QUAD).contains(cap)
+        }) {
+            return true;
+        }
+        at += 2;
+    }
+    false
 }
 
 /// Whether a compute program's workgroups split into whole 32-lane
@@ -944,8 +984,33 @@ fn radv_too_old(driver_info: &str) -> bool {
 }
 
 #[cfg(test)]
-mod driver_version_tests {
-    use super::radv_too_old;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_request_32_lanes_only_for_supported_subgroup_stages() {
+        use echora_shader::spirv::{capability, op};
+
+        let mut words = vec![0; 5];
+        let declare = (2 << 16) | u32::from(op::CAPABILITY);
+        words.extend([declare, capability::SHADER]);
+        let stages = vk::ShaderStageFlags::COMPUTE
+            | vk::ShaderStageFlags::FRAGMENT
+            | vk::ShaderStageFlags::MESH_EXT;
+        assert!(!require_subgroup_32(stages, Stage::Fragment, &words));
+        assert!(!require_subgroup_32(stages, Stage::Mesh, &words));
+        assert!(require_subgroup_32(stages, Stage::Compute, &words));
+
+        words.extend([declare, capability::GROUP_NON_UNIFORM_BALLOT]);
+        assert!(require_subgroup_32(stages, Stage::Fragment, &words));
+        assert!(require_subgroup_32(stages, Stage::Mesh, &words));
+        assert!(!require_subgroup_32(stages, Stage::Vertex, &words));
+        assert!(!require_subgroup_32(
+            vk::ShaderStageFlags::empty(),
+            Stage::Fragment,
+            &words
+        ));
+    }
 
     #[test]
     fn radv_before_the_taskmesh_flush_fix_is_too_old() {

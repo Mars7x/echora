@@ -842,20 +842,22 @@ impl Renderer {
                     .data(data)
             })
             .collect();
-        // Compute stages run in 32-lane subgroups, as guest warps, where the
-        // device can require it.
-        let mut subgroup_32 =
-            vk::ShaderRequiredSubgroupSizeCreateInfoEXT::default().required_subgroup_size(32);
+        let mut subgroup_sizes = vec![
+            vk::ShaderRequiredSubgroupSizeCreateInfoEXT::default()
+                .required_subgroup_size(32);
+            stages.len()
+        ];
         let compute_32 = self.gpu.compute_subgroup_32
             && stages.len() == 1
             && stages[0].stage == crate::shader::Stage::Compute;
         let has_task = stages
             .iter()
             .any(|stage| stage.stage == crate::shader::Stage::Task);
-        let mut infos: Vec<_> = stages
+        let infos: Vec<_> = stages
             .iter()
+            .zip(&mut subgroup_sizes)
             .enumerate()
-            .map(|(index, stage)| {
+            .map(|(index, (stage, subgroup))| {
                 let next = stages
                     .get(index + 1)
                     .map_or(vk::ShaderStageFlags::empty(), |next| {
@@ -868,7 +870,13 @@ impl Renderer {
                 if stage.stage == crate::shader::Stage::Mesh && !has_task {
                     flags |= vk::ShaderCreateFlagsEXT::NO_TASK_SHADER;
                 }
-                vk::ShaderCreateInfoEXT::default()
+                if compute_32
+                    && self.gpu.compute_full_subgroups
+                    && crate::vulkan::whole_subgroups(&stage.spirv)
+                {
+                    flags |= vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS;
+                }
+                let info = vk::ShaderCreateInfoEXT::default()
                     .flags(flags)
                     .stage(stage_flags(stage.stage))
                     .next_stage(next)
@@ -877,15 +885,14 @@ impl Renderer {
                     .name(c"main")
                     .set_layouts(&layouts)
                     .push_constant_ranges(push_ranges)
-                    .specialization_info(&specialization_infos[index])
+                    .specialization_info(&specialization_infos[index]);
+                if self.gpu.require_subgroup_32(stage) {
+                    info.push_next(subgroup)
+                } else {
+                    info
+                }
             })
             .collect();
-        if compute_32 {
-            infos[0] = infos[0].push_next(&mut subgroup_32);
-            if self.gpu.compute_full_subgroups && crate::vulkan::whole_subgroups(&stages[0].spirv) {
-                infos[0] = infos[0].flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
-            }
-        }
         let mut cache_layout = format!(
             "{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}{}",
             if dynamic_uniforms.is_empty() {
