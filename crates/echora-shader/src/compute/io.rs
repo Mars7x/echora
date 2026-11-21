@@ -269,13 +269,11 @@ impl Emitter {
         centroid: bool,
     ) -> Result<u32, Unsupported> {
         let address = u32::from(address);
-        // The guest reads zero for an unwritten component. Loading it from
-        // a host varying would use an undefined value, even if other
-        // components of the same vector were written.
-        if self.fragment_input_missing(address) {
-            return Ok(self.constant(0));
-        }
         let word = (address / 4) % 4;
+        // Unwritten varying components default to (0, 0, 0, 1).
+        if self.fragment_input_missing(address) {
+            return Ok(self.constant(if word == 3 { 1.0f32.to_bits() } else { 0 }));
+        }
         Ok(match (self.stage, address) {
             (Stage::Vertex, 0x80..=0x27f) => {
                 let location = (address - 0x80) / 16;
@@ -475,11 +473,17 @@ impl Emitter {
     /// it: IPA(attr) * rcp(IPA(w))). Vulkan hands over attr already
     /// corrected.
     fn as_interpolated(&mut self, address: u16, value: u32) -> u32 {
-        if !(0x80..0x280).contains(&address) || self.fragment_input_missing(u32::from(address)) {
+        if !(0x80..0x280).contains(&address) {
+            return value;
+        }
+        // Missing XYZ stay zero. For perspective IPA, a missing W is the
+        // vertex default 1.0 multiplied by the interpolated inverse W.
+        let component = u32::from((address - 0x80) / 4);
+        let missing = self.fragment_input_missing(u32::from(address));
+        if missing && component % 4 != 3 {
             return value;
         }
         // As the input is declared (what Vulkan delivered).
-        let component = u32::from((address - 0x80) / 4);
         let mode = self.declared_mode(component / 4, component % 4);
         if mode != Interpolation::Perspective {
             return value;
@@ -488,6 +492,9 @@ impl Emitter {
         let variable = self.builtin_variable(BUILTIN_FRAG_COORD, vec4);
         let pointer = self.component_pointer(variable, storage::INPUT, 3);
         let inverse_w = self.value(op::LOAD, self.f32, &[pointer]);
+        if missing {
+            return self.value(op::BITCAST, self.u32, &[inverse_w]);
+        }
         let float = self.value(op::BITCAST, self.f32, &[value]);
         let product = self.exact(op::F_MUL, &[float, inverse_w]);
         self.value(op::BITCAST, self.u32, &[product])

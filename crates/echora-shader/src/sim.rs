@@ -7778,6 +7778,67 @@ mod tests {
     }
 
     #[test]
+    fn missing_fragment_varyings_keep_the_guest_fourth_component_default() {
+        use crate::header::{Header, Interpolation};
+        use echora_shader_abi::Stage;
+
+        let ipa = |d: u128, address: u128| {
+            decode(word(&[
+                (0, 12, 0x326),
+                (16, 8, d),
+                (24, 8, 255),
+                (32, 8, 255),
+                (64, 8, address / 4),
+                (81, 3, 7),
+            ]))
+        };
+        let code = [ipa(1, 0x80), ipa(2, 0x8c), decode(EXIT)];
+        let bits =
+            |coordinates: [f32; 4]| coordinates.map(|value| u64::from(value.to_bits())).to_vec();
+        for (mode, default_w, written_w) in [
+            (Interpolation::Constant, 1.0, 0.5),
+            (Interpolation::ScreenLinear, 1.0, 0.5),
+            (Interpolation::Perspective, 0.25, 0.125),
+        ] {
+            let mut imap = [Interpolation::Unused; 128];
+            imap[0] = mode;
+            imap[3] = mode;
+            let header = Header {
+                stage: Stage::Fragment,
+                imap,
+                targets: 0,
+                writes_depth: false,
+                writes_sample_mask: false,
+                local_bytes: Some(0),
+                outputs: [0; 5],
+                outputs_beyond: false,
+            };
+            for (w_written, expected) in [(false, default_w), (true, written_w)] {
+                let mut stores = [0u64; 8];
+                stores[0] = u64::from(w_written) << (0x8c / 4);
+                let layout = Layout {
+                    stage: Stage::Fragment,
+                    header: Some(header),
+                    previous_stores: Some(stores),
+                    ..Layout::workgroup([1, 1, 1])
+                };
+                let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+                assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+                let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                    workgroup_count: [1, 1, 1],
+                    builtins: HashMap::from([(15, bits([10.5, 20.5, 0.5, 0.25]))]),
+                    locations: HashMap::from([(0, bits([2.0, 0.0, 0.0, 0.5]))]),
+                    ..Inputs::default()
+                });
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                let read =
+                    |reg: u8| f32::from_bits(report.invocations[0][&registers[&reg]][0] as u32);
+                assert_eq!((read(1), read(2)), (0.0, expected), "{mode:?}, {w_written}");
+            }
+        }
+    }
+
+    #[test]
     fn a_vector_mixing_interpolations_reads_each_component_as_its_own() {
         use crate::header::{Header, Interpolation};
         use echora_shader_abi::Stage;
