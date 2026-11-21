@@ -552,7 +552,7 @@ impl Submitter {
     }
 }
 
-/// Which backing file owns the offsets tracked by the page-table imports.
+/// Whether the page-table imports can be packed from one backing file.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum AddressedFile {
     #[default]
@@ -561,8 +561,36 @@ enum AddressedFile {
     Multiple,
 }
 
+#[derive(Clone, Copy)]
+struct AddressedSpan {
+    file: i32,
+    start: u64,
+    size: u64,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    address: u64,
+    #[cfg(target_os = "linux")]
+    imported: u64,
+}
+
+impl AddressedSpan {
+    fn offset(&self, file: i32, start: u64, size: u64) -> Option<u64> {
+        if self.file != file {
+            return None;
+        }
+        let inside = start.checked_sub(self.start)?;
+        size.checked_add(inside).filter(|&end| end <= self.size)?;
+        Some(inside)
+    }
+
+    fn overlaps(&self, file: i32, start: u64, end: u64) -> bool {
+        self.file == file && self.start < end && start < self.start + self.size
+    }
+}
+
 /// Discontiguous byte ranges packed back-to-back in the same imported buffer.
 struct PackedSpans {
+    file: i32,
     ranges: Vec<(u64, u64, u64)>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -570,7 +598,10 @@ struct PackedSpans {
 }
 
 impl PackedSpans {
-    fn offset(&self, start: u64, length: u64) -> Option<u64> {
+    fn offset(&self, file: i32, start: u64, length: u64) -> Option<u64> {
+        if self.file != file {
+            return None;
+        }
         let after = self.ranges.partition_point(|&(known, ..)| known <= start);
         self.ranges[..after]
             .iter()
@@ -669,16 +700,15 @@ pub struct Renderer {
     /// that only import anonymous memory): not tried again.
     import_refused: std::collections::HashSet<(usize, u64)>,
     /// Spans of guest memory's file shared as dma-bufs (see `import_file`),
-    /// by page-aligned file offset and length, oldest use first.
-    shared: Vec<((u64, u64), vk::Buffer, vk::DeviceMemory)>,
+    /// by backing descriptor, page-aligned file offset and length, oldest use first.
+    shared: Vec<((i32, u64, u64), vk::Buffer, vk::DeviceMemory)>,
     /// Shared spans the GPU page table points into (`address_span`): kept
     /// until their file range is released, never evicted while the table
-    /// may use them. Start, span, buffer, memory, device address and the
-    /// submission serial at import.
-    addressed: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64, u64)>,
+    /// may use them, sorted by file offset.
+    addressed: Vec<AddressedSpan>,
     /// Page-table spans another joined (`address_span`): the table may
     /// still point into them until it is built whole.
-    superseded: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory, u64, u64)>,
+    superseded: Vec<AddressedSpan>,
     #[cfg(target_os = "linux")]
     last_span_pack_serial: u64,
     packed: Vec<PackedSpans>,
@@ -692,7 +722,7 @@ pub struct Renderer {
     #[cfg(target_os = "linux")]
     udmabuf: Option<Option<std::fs::File>>,
     /// Spans that could not be shared: not tried again.
-    shared_refused: std::collections::HashSet<(u64, u64)>,
+    shared_refused: std::collections::HashSet<(i32, u64, u64)>,
     /// Storage buffers kept on the GPU between dispatches (see
     /// `resident_buffer`), by the caller's key: buffer, memory, size.
     resident: FastMap<u64, (vk::Buffer, vk::DeviceMemory, u64)>,
@@ -1802,7 +1832,7 @@ impl Renderer {
             .addressed
             .iter()
             .chain(&self.superseded)
-            .map(|&(offset, size, _, _, address, _)| (address..address + size, offset));
+            .map(|span| (span.address..span.address + span.size, span.start));
         let packed = self.packed.iter().flat_map(|group| {
             group
                 .ranges
@@ -1816,25 +1846,19 @@ impl Renderer {
     /// guest file. Previous imports remain valid until the table replaces
     /// their device addresses.
     pub fn shares_device_range(&self, file: i32, offset: u64, length: u64, device: u64) -> bool {
-        if self.addressed_file != AddressedFile::Single(file) {
-            return false;
-        }
-        let after = self
-            .addressed
-            .partition_point(|&(start, ..)| start <= offset);
+        let after = self.addressed.partition_point(|span| span.start <= offset);
         self.addressed[..after]
             .iter()
             .rev()
-            .take_while(|&&(start, ..)| start + MAX_SHARED_SPAN >= offset)
+            .take_while(|span| span.start + MAX_SHARED_SPAN >= offset)
             .chain(&self.superseded)
-            .any(|&(start, size, _, _, address, _)| {
-                offset
-                    .checked_sub(start)
-                    .is_some_and(|inside| inside + length <= size && address + inside == device)
+            .any(|span| {
+                span.offset(file, offset, length)
+                    .is_some_and(|inside| span.address + inside == device)
             })
             || self.packed.iter().any(|group| {
                 group
-                    .offset(offset, length)
+                    .offset(file, offset, length)
                     .is_some_and(|inside| group.address + inside == device)
             })
     }
@@ -3641,10 +3665,11 @@ impl Renderer {
             let gaps: Vec<u64> = self
                 .addressed
                 .windows(2)
-                .map(|pair| pair[1].0.saturating_sub(pair[0].0 + pair[0].1))
+                .filter(|pair| pair[0].file == pair[1].file)
+                .map(|pair| pair[1].start.saturating_sub(pair[0].start + pair[0].size))
                 .collect();
             let small = gaps.iter().filter(|gap| **gap <= 64 << 10).count();
-            let sizes: u64 = self.addressed.iter().map(|(_, span, ..)| span).sum();
+            let sizes: u64 = self.addressed.iter().map(|span| span.size).sum();
             eprintln!(
                 "spans: {} page-table ({} MiB, {} gaps of 64 KiB or less, first gaps {:x?}), {} for bindings",
                 self.addressed.len(),
@@ -3948,6 +3973,16 @@ impl Renderer {
         buffer.destroy(self.device());
     }
 
+    fn addressed_span(&self, file: i32, start: u64, size: u64) -> Option<&AddressedSpan> {
+        // Spans are sorted by start and each is at most MAX_SHARED_SPAN.
+        let after = self.addressed.partition_point(|entry| entry.start <= start);
+        self.addressed[..after]
+            .iter()
+            .rev()
+            .take_while(|entry| entry.start + MAX_SHARED_SPAN >= start)
+            .find(|entry| entry.offset(file, start, size).is_some())
+    }
+
     /// `length` bytes of guest memory's file `file` at `offset` as a storage
     /// buffer the GPU reads and writes in place: the buffer and the offset
     /// in it. The page-aligned span is shared as a dma-buf (a udmabuf of the
@@ -3957,6 +3992,7 @@ impl Renderer {
     /// udmabuf's 64 MiB limit, an import the driver refuses): the caller
     /// copies instead. Spans are kept for reuse, the least recently used
     /// dropped beyond MAX_SHARED_BYTES (udmabuf pins their pages).
+    /// Keep the backing descriptor open until its imports are released.
     pub fn import_file(
         &mut self,
         file: i32,
@@ -3971,33 +4007,26 @@ impl Renderer {
         const CHUNK: u64 = 16 << 20;
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
-        let key = (start, span);
-        if self.addressed_file == AddressedFile::Single(file)
-            && let Some((group, inside)) = self
-                .packed
-                .iter()
-                .find_map(|group| group.offset(start, span).map(|inside| (group, inside)))
-        {
+        let key = (file, start, span);
+        if let Some((group, inside)) = self.packed.iter().find_map(|group| {
+            group
+                .offset(file, start, span)
+                .map(|inside| (group, inside))
+        }) {
             return Ok(Some((group.buffer, inside + offset - start)));
         }
-        let after = self
-            .addressed
-            .partition_point(|(known, ..)| *known <= start);
-        if let Some(&(known, _, buffer, ..)) = self.addressed[..after]
-            .iter()
-            .rev()
-            .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
-            .find(|(known, held, ..)| start + span <= known + held)
-        {
-            return Ok(Some((buffer, offset - known)));
+        if let Some(entry) = self.addressed_span(file, start, span) {
+            return Ok(Some((entry.buffer, offset - entry.start)));
         }
         if let Some(index) = self
             .shared
             .iter()
-            .position(|((known, held), _, _)| *known <= start && start + span <= known + held)
+            .position(|&((backing, known, held), _, _)| {
+                backing == file && known <= start && start + span <= known + held
+            })
         {
             let entry = self.shared.remove(index);
-            let ((known, _), buffer, _) = entry;
+            let ((_, known, _), buffer, _) = entry;
             self.shared.push(entry);
             return Ok(Some((buffer, offset - known)));
         }
@@ -4008,9 +4037,10 @@ impl Renderer {
         // span alone.
         let chunk_start = start & !(CHUNK - 1);
         let chunk_span = (start + span - chunk_start).next_multiple_of(CHUNK);
-        let widened = if chunk_span <= MAX_SHARED_SPAN && (chunk_start, chunk_span) != key {
+        let chunk = (file, chunk_start, chunk_span);
+        let widened = if chunk_span <= MAX_SHARED_SPAN && chunk != key {
             self.share_span(file, chunk_start, chunk_span)?
-                .map(|imported| ((chunk_start, chunk_span), imported))
+                .map(|imported| (chunk, imported))
         } else {
             None
         };
@@ -4025,11 +4055,11 @@ impl Renderer {
             },
         };
         self.stat("stat: spans imported for bindings", 1);
-        let (start, span) = key;
+        let (_, start, span) = key;
         self.shared.push((key, imported.0, imported.1));
         self.shared_bytes += span;
         while self.shared_bytes > MAX_SHARED_BYTES && self.shared.len() > 1 {
-            let ((_, dropped), buffer, memory) = self.shared.remove(0);
+            let ((_, _, dropped), buffer, memory) = self.shared.remove(0);
             self.shared_bytes -= dropped;
             self.slot.retired_shared.push((buffer, memory));
         }
@@ -4040,7 +4070,8 @@ impl Renderer {
     /// at `offset`, shared in place (a udmabuf, as `import_file`) for the
     /// GPU page table, at most `MAX_SHARED_SPAN` bytes. The span stays until
     /// `release_file_range` covers it. None where sharing or device
-    /// addresses are unavailable.
+    /// addresses are unavailable. Keep the backing descriptor open until
+    /// its imports are released.
     pub fn address_span(
         &mut self,
         file: i32,
@@ -4050,13 +4081,11 @@ impl Renderer {
         const PAGE: u64 = 4096;
         let start = offset & !(PAGE - 1);
         let span = (offset - start + length.max(1)).next_multiple_of(PAGE);
-        if self.addressed_file == AddressedFile::Single(file)
-            && let Some(address) = self.packed.iter().find_map(|group| {
-                group
-                    .offset(start, span)
-                    .map(|inside| group.address + inside)
-            })
-        {
+        if let Some(address) = self.packed.iter().find_map(|group| {
+            group
+                .offset(file, start, span)
+                .map(|inside| group.address + inside)
+        }) {
             return Ok(Some(address + offset - start));
         }
         self.addressed_file = match self.addressed_file {
@@ -4066,16 +4095,8 @@ impl Renderer {
         };
         // Kept sorted by start; a span holding this one starts at most
         // MAX_SHARED_SPAN before it.
-        let after = self
-            .addressed
-            .partition_point(|(known, ..)| *known <= start);
-        if let Some(&(known, _, _, _, address, _)) = self.addressed[..after]
-            .iter()
-            .rev()
-            .take_while(|(known, ..)| known + MAX_SHARED_SPAN >= start)
-            .find(|(known, held, ..)| start + span <= known + held)
-        {
-            return Ok(Some(address + (offset - known)));
+        if let Some(entry) = self.addressed_span(file, start, span) {
+            return Ok(Some(entry.address + (offset - entry.start)));
         }
         if span > MAX_SHARED_SPAN || !self.gpu.buffer_device_address {
             self.stat("stat: spans too large to share", 1);
@@ -4094,9 +4115,13 @@ impl Renderer {
             let grown = self
                 .addressed
                 .iter()
-                .filter(|(known, held, ..)| *known <= high + GAP && low <= known + held + GAP)
-                .fold((low, high), |(low, high), (known, held, ..)| {
-                    (low.min(*known), high.max(known + held))
+                .filter(|entry| {
+                    entry.file == file
+                        && entry.start <= high + GAP
+                        && low <= entry.start + entry.size + GAP
+                })
+                .fold((low, high), |(low, high), entry| {
+                    (low.min(entry.start), high.max(entry.start + entry.size))
                 });
             if grown == (low, high) || grown.1 - grown.0 > MAX_SHARED_SPAN {
                 break;
@@ -4123,17 +4148,30 @@ impl Renderer {
         };
         let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
             .into_iter()
-            .partition(|(known, held, ..)| start <= *known && known + held <= start + span);
+            .partition(|entry| {
+                entry.file == file
+                    && start <= entry.start
+                    && entry.start + entry.size <= start + span
+            });
         self.addressed = kept;
         if !replaced.is_empty() {
             self.stat("stat: page-table spans joined", replaced.len() as u64);
         }
         self.superseded.extend(replaced);
-        let at = self
-            .addressed
-            .partition_point(|(known, ..)| *known <= start);
-        self.addressed
-            .insert(at, (start, span, buffer, memory, address, self.flushes));
+        let at = self.addressed.partition_point(|entry| entry.start <= start);
+        self.addressed.insert(
+            at,
+            AddressedSpan {
+                file,
+                start,
+                size: span,
+                buffer,
+                memory,
+                address,
+                #[cfg(target_os = "linux")]
+                imported: self.flushes,
+            },
+        );
         Ok(Some(address + (offset - start)))
     }
 
@@ -4154,7 +4192,10 @@ impl Renderer {
             return Ok(false);
         }
         let cutoff = self.flushes - SPAN_PACK_INTERVAL;
-        let stable = self.addressed.iter().filter(|entry| entry.5 <= cutoff);
+        let stable = self
+            .addressed
+            .iter()
+            .filter(|entry| entry.imported <= cutoff);
         if stable.take(SPAN_PACK_MIN_IMPORTS).count() < SPAN_PACK_MIN_IMPORTS {
             return Ok(false);
         }
@@ -4175,7 +4216,7 @@ impl Renderer {
                 select_stable_spans(
                     self.addressed
                         .iter()
-                        .map(|&(_, size, _, _, _, imported)| (imported <= cutoff).then_some(size)),
+                        .map(|entry| (entry.imported <= cutoff).then_some(entry.size)),
                 )
             })
             .into_iter()
@@ -4189,7 +4230,12 @@ impl Renderer {
             let mut length = 0;
             let mut end = start;
             let mut ranges = Vec::new();
-            for &(offset, size, ..) in old[start..].iter().take(128) {
+            for &AddressedSpan {
+                start: offset,
+                size,
+                ..
+            } in old[start..].iter().take(128)
+            {
                 if length + size > MAX_SHARED_SPAN {
                     break;
                 }
@@ -4207,6 +4253,7 @@ impl Renderer {
                 Ok(Some((buffer, memory))) => {
                     if let Some(address) = self.buffer_address(buffer) {
                         Some(PackedSpans {
+                            file,
                             ranges,
                             buffer,
                             memory,
@@ -4220,7 +4267,7 @@ impl Renderer {
                 Ok(None) => None,
                 Err(error) => {
                     kept.extend_from_slice(&old[start..]);
-                    kept.sort_unstable_by_key(|&(offset, ..)| offset);
+                    kept.sort_unstable_by_key(|entry| entry.start);
                     self.addressed = kept;
                     return Err(error);
                 }
@@ -4236,7 +4283,7 @@ impl Renderer {
             }
             start = end;
         }
-        kept.sort_unstable_by_key(|&(offset, ..)| offset);
+        kept.sort_unstable_by_key(|entry| entry.start);
         self.addressed = kept;
         Ok(changed)
     }
@@ -4255,7 +4302,7 @@ impl Renderer {
     /// bytes they pin, and whether a released range dropped a span holding
     /// other pools too.
     pub fn superseded_spans(&self) -> (usize, u64, bool) {
-        let bytes = self.superseded.iter().map(|(_, span, ..)| span).sum();
+        let bytes = self.superseded.iter().map(|entry| entry.size).sum();
         (self.superseded.len(), bytes, self.dropped_shared_span)
     }
 
@@ -4264,15 +4311,15 @@ impl Renderer {
     /// go once work recorded so far has finished.
     pub fn take_superseded(&mut self, count: usize) {
         let count = count.min(self.superseded.len());
-        for (_, _, buffer, memory, ..) in self.superseded.drain(..count) {
-            self.slot.retired_shared.push((buffer, memory));
+        for entry in self.superseded.drain(..count) {
+            self.slot.retired_shared.push((entry.buffer, entry.memory));
         }
         self.dropped_shared_span = false;
     }
 
     /// Bytes of guest memory the page table's spans pin.
     pub fn addressed_bytes(&self) -> u64 {
-        self.addressed.iter().map(|(_, span, ..)| span).sum::<u64>()
+        self.addressed.iter().map(|entry| entry.size).sum::<u64>()
             + self
                 .packed
                 .iter()
@@ -4281,11 +4328,14 @@ impl Renderer {
                 .sum::<u64>()
     }
 
-    /// Stop sharing file range `[offset, offset + length)`: its pages may be
-    /// released (a udmabuf would keep the old ones).
-    pub fn release_file_range(&mut self, offset: u64, length: u64) {
+    /// Stop sharing a backing file's range `[offset, offset + length)`:
+    /// its pages may be released (a udmabuf would keep the old ones).
+    pub fn release_file_range(&mut self, file: i32, offset: u64, length: u64) {
         let end = offset + length;
         self.packed.retain(|group| {
+            if group.file != file {
+                return true;
+            }
             let after = group.ranges.partition_point(|&(start, ..)| start < end);
             if group.ranges[..after]
                 .iter()
@@ -4302,34 +4352,37 @@ impl Renderer {
         });
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
             .into_iter()
-            .partition(|(start, span, ..)| *start < end && offset < start + span);
+            .partition(|entry| entry.overlaps(file, offset, end));
         self.addressed = kept;
-        for (start, span, buffer, memory, ..) in gone {
-            if start < offset || end < start + span {
+        for entry in gone {
+            if entry.start < offset || end < entry.start + entry.size {
                 self.dropped_shared_span = true;
             }
-            self.slot.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((entry.buffer, entry.memory));
         }
         // Joined-away spans of the range keep old pages too: the table is
         // built whole before more work is recorded.
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.superseded)
             .into_iter()
-            .partition(|(start, span, ..)| *start < end && offset < start + span);
+            .partition(|entry| entry.overlaps(file, offset, end));
         self.superseded = kept;
-        for (_, _, buffer, memory, ..) in gone {
+        for entry in gone {
             self.dropped_shared_span = true;
-            self.slot.retired_shared.push((buffer, memory));
+            self.slot.retired_shared.push((entry.buffer, entry.memory));
         }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
             .into_iter()
-            .partition(|((start, span), _, _)| *start < end && offset < start + span);
+            .partition(|&((backing, start, span), _, _)| {
+                backing == file && start < end && offset < start + span
+            });
         self.shared = kept;
-        for ((_, span), buffer, memory) in dropped {
+        for ((_, _, span), buffer, memory) in dropped {
             self.shared_bytes -= span;
             self.slot.retired_shared.push((buffer, memory));
         }
-        self.shared_refused
-            .retain(|(start, span)| !(*start < end && offset < start + span));
+        self.shared_refused.retain(|&(backing, start, span)| {
+            backing != file || start >= end || start + span <= offset
+        });
     }
 
     /// A udmabuf of `span` bytes of `file` at `start`, imported as a storage
@@ -8277,7 +8330,7 @@ impl Drop for Renderer {
                 std::mem::take(&mut self.addressed)
                     .into_iter()
                     .chain(std::mem::take(&mut self.superseded))
-                    .map(|(_, _, buffer, memory, ..)| (buffer, memory)),
+                    .map(|entry| (entry.buffer, entry.memory)),
             )
             .chain(
                 std::mem::take(&mut self.packed)
@@ -8791,9 +8844,84 @@ mod tests {
         assert!(!renderer.shares_device_range(file, gap + page - 32, 64, base + 2 * page - 32));
         renderer.take_superseded(64);
         assert!(!renderer.shares_device_range(file, 24, 64, original + 24));
-        renderer.release_file_range(gap, page);
+        renderer.release_file_range(file, gap, page);
         assert!(renderer.packed.is_empty());
         assert!(renderer.superseded_spans().2);
+    }
+
+    #[test]
+    fn equal_offsets_in_separate_files_keep_their_own_imports() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.gpu.buffer_device_address {
+            return;
+        }
+        let page = 4096;
+        let (first, second) = (21, 22);
+        let storage = |renderer: &mut Renderer, key| {
+            renderer.resident_buffer(key, page).unwrap();
+            let (buffer, memory, _) = renderer.resident.remove(&key).unwrap();
+            let address = renderer.buffer_address(buffer).unwrap();
+            (buffer, memory, address)
+        };
+        // Seed the completed Vulkan imports so lookup and retirement are
+        // exercised even on hosts without the Linux sharing device.
+        let (first_buffer, first_memory, first_address) = storage(&mut renderer, 0);
+        renderer.addressed.push(AddressedSpan {
+            file: first,
+            start: 0,
+            size: page,
+            buffer: first_buffer,
+            memory: first_memory,
+            address: first_address,
+            #[cfg(target_os = "linux")]
+            imported: 0,
+        });
+        let (second_buffer, second_memory, second_address) = storage(&mut renderer, 1);
+        renderer.addressed.push(AddressedSpan {
+            file: second,
+            start: 0,
+            size: page,
+            buffer: second_buffer,
+            memory: second_memory,
+            address: second_address,
+            #[cfg(target_os = "linux")]
+            imported: 0,
+        });
+        let (bound, bound_memory, _) = storage(&mut renderer, 2);
+        renderer
+            .shared
+            .push(((second, page, page), bound, bound_memory));
+        renderer.shared_bytes += page;
+        renderer
+            .shared_refused
+            .extend([(first, page * 2, page), (second, page * 2, page)]);
+        for (file, buffer, address) in [
+            (first, first_buffer, first_address),
+            (second, second_buffer, second_address),
+        ] {
+            assert_eq!(
+                renderer.address_span(file, 24, 8).unwrap(),
+                Some(address + 24)
+            );
+            assert_eq!(
+                renderer.import_file(file, 24, 8).unwrap(),
+                Some((buffer, 24))
+            );
+            assert!(renderer.shares_device_range(file, 24, 8, address + 24));
+        }
+        assert!(!renderer.shares_device_range(second, 24, 8, first_address + 24));
+        renderer.release_file_range(first, 0, page * 3);
+        assert!(!renderer.shares_device_range(first, 24, 8, first_address + 24));
+        assert!(renderer.shares_device_range(second, 24, 8, second_address + 24));
+        assert_eq!(
+            renderer.import_file(second, page + 24, 8).unwrap(),
+            Some((bound, 24))
+        );
+        assert!(renderer.shared_refused.contains(&(second, page * 2, page)));
+        assert!(!renderer.shared_refused.contains(&(first, page * 2, page)));
+        assert_eq!(renderer.slot.retired_shared, [(first_buffer, first_memory)]);
     }
 
     #[test]

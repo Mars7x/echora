@@ -7635,8 +7635,8 @@ impl Nvn {
                     .flatten()
                     .map(|&(_, size, file, offset)| (size, file, offset)),
             );
-            for (size, _, offset) in released.clone() {
-                backend.renderer.release_file_range(offset, size);
+            for (size, file, offset) in released.clone() {
+                backend.renderer.release_file_range(file, offset, size);
             }
             if backend.pool_share_versions.remove(&base).is_none() {
                 return;
