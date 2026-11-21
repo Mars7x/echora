@@ -3123,12 +3123,12 @@ impl Machine {
             && crate::nvn::Nvn::replay_thread()
             && self.nvn.share_pools_at_init()
             && !self.nvn.holds_object(guest.cpu.regs[0]);
-        while self.nvn.replay_paused() && !queued_present && !fresh_pool {
-            self.nvn.resume_replay(&mut guest)?;
+        if !queued_present && !fresh_pool {
+            settle_replay(&mut self.nvn, &mut guest)?;
         }
         let handled = self.nvn.call(&name, &mut guest)?;
-        while self.nvn.replay_paused() && !queued_present && !fresh_pool {
-            self.nvn.resume_replay(&mut guest)?;
+        if !queued_present && !fresh_pool {
+            settle_replay(&mut self.nvn, &mut guest)?;
         }
         if let Some(started) = profile {
             *self.nvn.call_microseconds.entry(name.clone()).or_default() +=
@@ -5224,6 +5224,20 @@ fn replay_thread(shared: &Shared, mut core: Core) {
     }
 }
 
+/// Run the paused replay to its end under the machine lock. A piece that
+/// stopped for an input the GPU still produces waits for that submission
+/// instead of resuming at once (which would only stop again, spinning).
+fn settle_replay(nvn: &mut crate::nvn::Nvn, guest: &mut crate::nvn::Guest) -> Result<(), Trap> {
+    while nvn.replay_paused() {
+        nvn.resume_replay(guest)?;
+        if let Some(wait) = nvn.replay_waiting_on_inputs() {
+            wait.wait(std::time::Duration::from_millis(1))
+                .map_err(|message| Trap::InvalidState { message })?;
+        }
+    }
+    Ok(())
+}
+
 /// Leave the NVN lock available while the GPU produces the command's input.
 fn wait_for_replay_inputs(
     wait: echora_gpu::renderer::SubmissionWait,
@@ -5872,7 +5886,14 @@ impl Worker {
         // threads' calls are not held up by the whole replay (with
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
         while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
+            let waiting_on_inputs = nvn.replay_waiting_on_inputs();
             drop(nvn);
+            if let Some(wait) = waiting_on_inputs
+                && let Err(message) = wait_for_replay_inputs(wait, self.core.current_thread_id)
+            {
+                self.held_failed = Some(Some(Trap::InvalidState { message }));
+                return false;
+            }
             let let_go = std::time::Instant::now();
             shared.hand_nvn_over();
             let asked_again = std::time::Instant::now();
