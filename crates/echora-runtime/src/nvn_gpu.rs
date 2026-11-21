@@ -1462,6 +1462,17 @@ fn c0_storage_table(nvn: u32) -> u32 {
     }
 }
 
+/// The binding of the uniform buffer a stage reads as constant bank `bank`.
+fn uniform_binding(stage: &Translated, bank: u32) -> Option<u32> {
+    stage
+        .descriptors
+        .iter()
+        .find(|descriptor| {
+            descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == bank
+        })
+        .map(|descriptor| descriptor.binding)
+}
+
 fn shader_word(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
@@ -2618,7 +2629,7 @@ impl Nvn {
                     .subgroup_uniform_control_flow,
                 // Instrument only these stage keys when a trace of every
                 // translated stage would be too expensive to reach the frame.
-                vertex_trace: std::env::var("ECHORA_VERTEX_TRACE_PROGRAMS")
+                vertex_trace: super::debug_var("ECHORA_VERTEX_TRACE_PROGRAMS")
                     .ok()
                     .map(|keys| {
                         keys.split(',').any(|item| {
@@ -6996,11 +7007,8 @@ impl Nvn {
                 core,
                 &stage,
                 |_, bank, offset| {
-                    let descriptor = stage.descriptors.iter().find(|descriptor| {
-                        descriptor.kind() == DescriptorKind::UniformBuffer
-                            && descriptor.index == u32::from(bank)
-                    })?;
-                    shader_word(uniforms.get(&descriptor.binding)?, offset)
+                    let binding = uniform_binding(&stage, u32::from(bank))?;
+                    shader_word(uniforms.get(&binding)?, offset)
                 },
                 |address, length| {
                     c0[storage_base as usize..texture_base as usize]
@@ -7073,11 +7081,8 @@ impl Nvn {
                 &stage,
                 indirect.is_none().then_some(groups),
                 |bank, offset| {
-                    let descriptor = stage.descriptors.iter().find(|descriptor| {
-                        descriptor.kind() == DescriptorKind::UniformBuffer
-                            && descriptor.index == u32::from(bank)
-                    })?;
-                    shader_word(uniforms.get(&descriptor.binding)?, usize::from(offset))
+                    let binding = uniform_binding(&stage, u32::from(bank))?;
+                    shader_word(uniforms.get(&binding)?, usize::from(offset))
                 },
             )
         } else {
@@ -10891,11 +10896,7 @@ impl Nvn {
                     core,
                     stage,
                     |core, bank, offset| {
-                        let descriptor = stage.descriptors.iter().find(|descriptor| {
-                            descriptor.kind() == DescriptorKind::UniformBuffer
-                                && descriptor.index == u32::from(bank)
-                        })?;
-                        let key = (index, descriptor.binding);
+                        let key = (index, uniform_binding(stage, u32::from(bank))?);
                         if let Some(bytes) = uniforms.get(&key) {
                             return shader_word(bytes, offset);
                         }
