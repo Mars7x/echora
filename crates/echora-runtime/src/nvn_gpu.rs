@@ -11044,21 +11044,6 @@ impl Nvn {
                 }
             }
         }
-        // Each stage's c0 holds its storage buffers' addresses and sizes,
-        // which translated code reads to find offsets in the buffer.
-        for &(index, offset, gpu, size) in &storage_entries {
-            let Some(c0) = stages[index].descriptors.iter().find(|descriptor| {
-                descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0
-            }) else {
-                continue;
-            };
-            if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
-                let entry = offset as usize;
-                set_shader_word(bytes, entry, gpu as u32);
-                set_shader_word(bytes, entry + 4, (gpu >> 32) as u32);
-                set_shader_word(bytes, entry + 8, size as u32);
-            }
-        }
         // The driver's other words in each stage's c0: the largest point
         // size (0x610, the hardware's 2047; GLSLC clamps gl_PointSize to
         // it) and the draw's base instance (0x644; DrawElementsInstanced's
@@ -11069,16 +11054,29 @@ impl Nvn {
             "nvnCommandBufferDrawElementsInstanced" => command.x[6] as u32,
             _ => 0,
         };
+        // Each stage's c0 (looked up once per stage) holds its storage
+        // buffers' addresses and sizes, which translated code reads to find
+        // offsets in the buffer, then those words.
         for (index, stage) in stages.iter().enumerate() {
             let Some(c0) = stage.descriptors.iter().find(|descriptor| {
                 descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0
             }) else {
                 continue;
             };
-            if let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) {
-                for (offset, word) in [(0x610, 2047.0f32.to_bits()), (0x644, base_instance)] {
-                    set_shader_word(bytes, offset, word);
+            let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) else {
+                continue;
+            };
+            for &(owner, offset, gpu, size) in &storage_entries {
+                if owner != index {
+                    continue;
                 }
+                let entry = offset as usize;
+                set_shader_word(bytes, entry, gpu as u32);
+                set_shader_word(bytes, entry + 4, (gpu >> 32) as u32);
+                set_shader_word(bytes, entry + 8, size as u32);
+            }
+            for (offset, word) in [(0x610, 2047.0f32.to_bits()), (0x644, base_instance)] {
+                set_shader_word(bytes, offset, word);
             }
         }
         let pool_started = timing.then(std::time::Instant::now);
