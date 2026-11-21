@@ -983,6 +983,20 @@ impl Backend {
     /// The notes with the stat counters added in.
     pub(super) fn notes_with_stats(&self) -> BTreeMap<String, u64> {
         let mut notes = self.notes.clone();
+        for (name, counter) in [
+            "stat: shared write projections",
+            "stat: shared write projection writes",
+            "stat: shared write projection file ranges",
+            "stat: shared write projection spans walked",
+        ]
+        .into_iter()
+        .zip(&writer_ranges::PROJECTION_COUNTS)
+        {
+            notes.insert(
+                name.into(),
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         for (&name, &amount) in &self.stats {
             *notes.entry(name.to_string()).or_default() += amount;
         }

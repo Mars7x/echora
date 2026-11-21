@@ -76,8 +76,15 @@ pub fn project_table(
     Some(mapped)
 }
 
+/// Calls of `project_writes`, the writes they projected, the file ranges
+/// before merging and the mapping spans they walked (the report's
+/// statistics: the sort was ~3% of the replay thread in the forest).
+pub static PROJECTION_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<Vec<FileRange>> {
     let mut physical: Vec<FileRange> = Vec::new();
+    let mut walked = 0u64;
     for write in writes {
         // Page-table runs and the imports within each run both start in
         // ascending order. The prefix maximum also accounts for nested
@@ -87,6 +94,7 @@ pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<
             .iter()
             .take_while(|span| span.gpu.start < write.end)
         {
+            walked += 1;
             let lo = span.gpu.start.max(write.start);
             let hi = span.gpu.end.min(write.end);
             if lo < hi {
@@ -109,6 +117,13 @@ pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<
                 }
             }
         }
+    }
+    for (counter, amount) in
+        PROJECTION_COUNTS
+            .iter()
+            .zip([1, writes.len() as u64, physical.len() as u64, walked])
+    {
+        counter.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
     }
     physical.sort_unstable_by_key(|range| (range.file, range.bytes.start));
     physical.dedup_by(|next, previous| {
