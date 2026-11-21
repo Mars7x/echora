@@ -5977,6 +5977,7 @@ impl Worker {
 /// A lower limit must take effect at once. An old, lower limit naturally
 /// takes the exact checks early and updates itself. The scheduler also
 /// clears the limit when a different worker requests a preemption.
+#[inline]
 fn rearm_lowered_dispatch_limit(core: &Core) {
     use std::sync::atomic::Ordering::Relaxed;
     if core.stop.load(Relaxed) > core.max_steps.min(core.host_check_at)
