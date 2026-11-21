@@ -44,7 +44,17 @@ pub struct PageBuild {
     entries: Vec<u64>,
     pools: HashMap<PagePool, (PoolShareVersion, bool)>,
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
+    /// Virtual write ranges projected through `shared_mapping`, kept with
+    /// it (the forest's culling passes project the same ranges, ~870 file
+    /// ranges each, every frame: their sorting was ~4% of the replay
+    /// thread).
+    projections: std::cell::RefCell<ProjectedWrites>,
 }
+
+type ProjectedWrites = echora_gpu::FastMap<Vec<std::ops::Range<u64>>, Option<Vec<SharedRange>>>;
+
+/// Projections kept per page table build (`PageBuild::projections`).
+const KEPT_PROJECTIONS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PoolShareVersion {
@@ -825,6 +835,23 @@ impl Backend {
 
     fn project_shared_writes(&self, ranges: &[std::ops::Range<u64>]) -> Option<Vec<SharedRange>> {
         let built = self.page_build.as_ref()?;
+        if let Some(known) = built.projections.borrow().get(ranges) {
+            return known.clone();
+        }
+        let projected = self.project_shared_writes_in(built, ranges);
+        let mut projections = built.projections.borrow_mut();
+        if projections.len() >= KEPT_PROJECTIONS {
+            projections.clear();
+        }
+        projections.insert(ranges.to_vec(), projected.clone());
+        projected
+    }
+
+    fn project_shared_writes_in(
+        &self,
+        built: &PageBuild,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Option<Vec<SharedRange>> {
         let mapping = built
             .shared_mapping
             .get_or_init(|| {
@@ -8338,6 +8365,7 @@ impl Nvn {
                 entries,
                 pools: built_pools,
                 shared_mapping: std::cell::OnceCell::new(),
+                projections: Default::default(),
             },
             modified.as_deref(),
         )?;
@@ -16112,6 +16140,7 @@ mod pool_tests {
                 entries: addresses.to_vec(),
                 pools: Default::default(),
                 shared_mapping: std::cell::OnceCell::from(mapping),
+                projections: Default::default(),
             }
         };
         let first = backend
