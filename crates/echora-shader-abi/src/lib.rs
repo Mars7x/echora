@@ -8,7 +8,7 @@
 /// Changes whenever anything a translated program relies on changes (the
 /// push-constant layout, the page-table format, descriptor numbering). It
 /// is stored in every `Translated` and is part of every shader cache key.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// A program's pipeline stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
