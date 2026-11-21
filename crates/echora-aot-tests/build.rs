@@ -3843,7 +3843,7 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     let mut others: Vec<Piece> = Vec::new();
     let body = |words: &mut Vec<u32>, count: u32, next: &mut dyn FnMut() -> u32| {
         for _ in 0..count {
-            if fp && next() % 4 == 0 {
+            if fp && next().is_multiple_of(4) {
                 words.push(fp_instruction(next));
             } else {
                 words.push(body_instruction(next, &reserved));
@@ -4124,7 +4124,7 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         addresses[piece] = BASE + 4 * words.len() as u64;
         words.extend(&pieces[piece].words);
     }
-    while (words.len() + 3) % 256 != 0 {
+    while !(words.len() + 3).is_multiple_of(256) {
         words.push(NOP);
     }
     addresses[straddle] = BASE + 4 * words.len() as u64;
@@ -4217,7 +4217,9 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     lift("window_call_base", 16, plain);
     lift("window_call_on", 16, calling);
     lift("window_call_table", 10, calling);
-    let variants: &[(&'static str, &'static str, fn(&mut EmitOptions))] = if fp {
+    // (the lift without, the lift with, the options' change)
+    type Variant = (&'static str, &'static str, fn(&mut EmitOptions));
+    let variants: &[Variant] = if fp {
         &[
             (
                 "window_call_deferred_base",
