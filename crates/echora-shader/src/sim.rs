@@ -6452,7 +6452,7 @@ mod tests {
                 assert!(report.problems.is_empty(), "{:?}", report.problems);
                 let d: Vec<Vec<u32>> = (0..32)
                     .map(|lane| {
-                        (16..24u8)
+                        (16..36u8)
                             .filter_map(|n| registers.get(&n))
                             .map(|v| report.invocations[lane][v][0] as u32)
                             .collect()
@@ -6466,6 +6466,33 @@ mod tests {
                 fewer < all,
                 "single {single}: {fewer} loads, {all} without reuse"
             );
+
+            // Overlapping destinations leave the second product's words in
+            // the shared registers. The following pair reads those words.
+            let overlapping = [
+                hmma(16, 4, 8),
+                hmma(17, 6, 12),
+                hmma(28, 24, 16),
+                hmma(32, 26, 17),
+            ];
+            let staged = [
+                overlapping[0],
+                overlapping[1],
+                copy(16),
+                overlapping[2],
+                overlapping[3],
+            ];
+            let (result, loads) = run(&overlapping);
+            let (reference, reference_loads) = run(&staged);
+            assert_eq!(result, reference, "overlapping outputs for single {single}");
+            assert_eq!(loads, reference_loads);
+
+            let partial = [hmma(254, 4, 8), hmma(16, 24, 254)];
+            let staged = [partial[0], copy(254), partial[1]];
+            let (result, loads) = run(&partial);
+            let (reference, reference_loads) = run(&staged);
+            assert_eq!(result, reference, "discarded outputs for single {single}");
+            assert_eq!(loads, reference_loads);
         }
     }
 

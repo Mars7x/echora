@@ -724,9 +724,19 @@ impl Emitter {
                 }
             }
         }
-        // D, for the next multiply whose C it is (registers written back
-        // above; none when a D is RZ).
-        self.matrix_reuse.d = halves_in.iter().all(|&(d, _, _)| d != 255).then(|| {
+        // Reuse D only if its registers hold every word of the product.
+        // A later fragment can overwrite an earlier one, and writes to RZ
+        // discard part or all of a fragment.
+        let disjoint = halves_in.len() == 1
+            || !overlap(
+                &registers(halves_in[0].0, c_count),
+                &registers(halves_in[1].0, c_count),
+            );
+        self.matrix_reuse.d = (disjoint
+            && halves_in
+                .iter()
+                .all(|&(d, _, _)| u16::from(d) + u16::from(c_count) <= 255))
+        .then(|| {
             let registers: Vec<u8> = halves_in.iter().map(|&(d, _, _)| d).collect();
             let versions = registers
                 .iter()
