@@ -1074,22 +1074,120 @@ impl BoundProgram {
 }
 
 /// Stage key, binding base, previous stage's stores, generic input types,
-/// compute and mesh state, native pointers, and proved jump targets.
-type TranslationKey = (
-    u64,
-    [u32; 3],
-    Option<[u64; 8]>,
-    [u8; 32],
-    [u8; MAX_COLOR_TARGETS],
-    [u32; 5],
-    Option<MeshParameters>,
-    bool,
-    Option<Arc<shader::JumpTargets>>,
-    Vec<shader::SampledTexture>,
-    Vec<shader::BoundStorageImage>,
-);
+/// compute and mesh state, native pointers, and proved jump targets; then
+/// the integer views of sampled textures and storage images.
+type TranslationKey = ListKey<
+    (
+        u64,
+        [u32; 3],
+        Option<[u64; 8]>,
+        [u8; 32],
+        [u8; MAX_COLOR_TARGETS],
+        [u32; 5],
+        Option<MeshParameters>,
+        bool,
+        JumpKey,
+    ),
+    shader::SampledTexture,
+    shader::BoundStorageImage,
+>;
 
-type FragmentVariantKey = (usize, Vec<shader::SampledTexture>);
+type FragmentVariantKey = ListKey<usize, shader::SampledTexture, ()>;
+
+/// A map key of a fixed part and two lists. Draws look keys up from
+/// borrowed lists (`ListKey::view`), so a hit allocates nothing.
+struct ListKey<H, T, U> {
+    head: H,
+    first: Box<[T]>,
+    second: Box<[U]>,
+}
+
+trait ListKeyView<H, T, U> {
+    fn parts(&self) -> (&H, &[T], &[U]);
+}
+
+impl<H, T, U> ListKey<H, T, U> {
+    fn new(head: H, first: &[T], second: &[U]) -> Self
+    where
+        T: Clone,
+        U: Clone,
+    {
+        Self {
+            head,
+            first: first.into(),
+            second: second.into(),
+        }
+    }
+
+    /// The key these parts make, to look up without building it.
+    fn view<'a>(parts: &'a (H, &'a [T], &'a [U])) -> &'a (dyn ListKeyView<H, T, U> + 'a) {
+        parts
+    }
+}
+
+impl<H, T, U> ListKeyView<H, T, U> for ListKey<H, T, U> {
+    fn parts(&self) -> (&H, &[T], &[U]) {
+        (&self.head, &self.first, &self.second)
+    }
+}
+
+impl<H, T, U> ListKeyView<H, T, U> for (H, &[T], &[U]) {
+    fn parts(&self) -> (&H, &[T], &[U]) {
+        (&self.0, self.1, self.2)
+    }
+}
+
+impl<'a, H: 'a, T: 'a, U: 'a> std::borrow::Borrow<dyn ListKeyView<H, T, U> + 'a>
+    for ListKey<H, T, U>
+{
+    fn borrow(&self) -> &(dyn ListKeyView<H, T, U> + 'a) {
+        self
+    }
+}
+
+impl<H: std::hash::Hash, T: std::hash::Hash, U: std::hash::Hash> std::hash::Hash
+    for dyn ListKeyView<H, T, U> + '_
+{
+    fn hash<S: std::hash::Hasher>(&self, state: &mut S) {
+        self.parts().hash(state);
+    }
+}
+
+impl<H: PartialEq, T: PartialEq, U: PartialEq> PartialEq for dyn ListKeyView<H, T, U> + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl<H: Eq, T: Eq, U: Eq> Eq for dyn ListKeyView<H, T, U> + '_ {}
+
+impl<H: std::hash::Hash, T: std::hash::Hash, U: std::hash::Hash> std::hash::Hash
+    for ListKey<H, T, U>
+{
+    fn hash<S: std::hash::Hasher>(&self, state: &mut S) {
+        (self as &dyn ListKeyView<H, T, U>).hash(state);
+    }
+}
+
+impl<H: PartialEq, T: PartialEq, U: PartialEq> PartialEq for ListKey<H, T, U> {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl<H: Eq, T: Eq, U: Eq> Eq for ListKey<H, T, U> {}
+
+/// Proved jump targets in a translation key: compared whole (the same
+/// `Arc` compares by pointer) but not hashed, as hashing their table on
+/// every lookup costs more than the keys that differ only in them.
+#[derive(Clone, PartialEq, Eq)]
+struct JumpKey(Option<Arc<shader::JumpTargets>>);
+
+impl std::hash::Hash for JumpKey {
+    fn hash<S: std::hash::Hasher>(&self, state: &mut S) {
+        self.0.is_some().hash(state);
+    }
+}
 
 struct FragmentJumpVariant {
     targets: Arc<shader::JumpTargets>,
@@ -2459,7 +2557,7 @@ impl Nvn {
                 .resolve(constants)
         });
         let constants_for_translation = jump_targets.as_ref().and(stage_constants);
-        let cache_key = (
+        let head = (
             key,
             base,
             previous_stores,
@@ -2468,13 +2566,13 @@ impl Nvn {
             compute,
             mesh,
             native_pointers,
-            jump_targets,
-            sampled_textures.to_vec(),
-            storage_images.to_vec(),
+            JumpKey(jump_targets),
         );
-        if let Some(found) = backend.translations.get(&cache_key) {
+        let parts = (head, sampled_textures, storage_images);
+        if let Some(found) = backend.translations.get(TranslationKey::view(&parts)) {
             return found.clone().map(|stage| (stage, key));
         }
+        let cache_key = TranslationKey::new(parts.0, sampled_textures, storage_images);
         let resolution_scale = self
             .gpu
             .as_ref()
@@ -9905,8 +10003,12 @@ impl Nvn {
             .get_mut(&key)?
             .as_mut()?
             .resolve(constants)?;
-        let variant_key = (Arc::as_ptr(original) as usize, numeric.to_vec());
-        if let Some(variant) = backend.fragment_jump_variants.get(&variant_key) {
+        let identity = Arc::as_ptr(original) as usize;
+        let parts = (identity, numeric, &[][..]);
+        if let Some(variant) = backend
+            .fragment_jump_variants
+            .get(FragmentVariantKey::view(&parts))
+        {
             // A changing jump table can keep drawing with the general
             // shader without compiling a new program on every change.
             return (variant.targets == targets)
@@ -9947,7 +10049,7 @@ impl Nvn {
             backend.stat("stat: fragment jump variants", 1);
         }
         backend.fragment_jump_variants.insert(
-            variant_key,
+            FragmentVariantKey::new(identity, numeric, &[]),
             FragmentJumpVariant {
                 targets,
                 stage: stage.clone(),
@@ -17277,3 +17379,72 @@ const ARCHIVE_AFTER_PRESENTS: u64 = 24;
 /// Archives queued per submission, largest first, so one submission does
 /// not hand the compressing thread a whole scene's targets at once.
 const ARCHIVES_PER_SUBMIT: usize = 6;
+
+#[cfg(test)]
+mod translation_key_tests {
+    use super::{FragmentVariantKey, HashMap, JumpKey, TranslationKey, shader};
+    use echora_shader_abi::{ABI_VERSION, Stage, Translated};
+    use std::sync::Arc;
+
+    #[test]
+    fn borrowed_lookups_find_the_stored_translation() {
+        let stage = Arc::new(Translated {
+            abi_version: ABI_VERSION,
+            stage: Stage::Fragment,
+            spirv: vec![7],
+            descriptors: Vec::new(),
+            loaded_generics: 0,
+            stored_generics: 0,
+            stores: [0; 8],
+            frag_colors: 0,
+            cbuf_used_sizes: [0; 18],
+            spec_constants: Vec::new(),
+            push_fields: 0,
+            texture_pool_bindings: 0,
+        });
+        let texture = |view| shader::SampledTexture {
+            bank: 1,
+            offset: 8,
+            view,
+            sample_type: shader::SampleType::Unsigned,
+        };
+        let head = |key| {
+            (
+                key,
+                [0; 3],
+                None,
+                [0; 32],
+                [0; super::MAX_COLOR_TARGETS],
+                [0; 5],
+                None,
+                false,
+                JumpKey(None),
+            )
+        };
+        let sampled = [texture(2), texture(3)];
+        let mut translations: HashMap<TranslationKey, Result<Arc<Translated>, String>> =
+            HashMap::default();
+        translations.insert(
+            TranslationKey::new(head(5), &sampled, &[]),
+            Ok(stage.clone()),
+        );
+
+        let parts = (head(5), &sampled[..], &[][..]);
+        let found = translations.get(TranslationKey::view(&parts));
+        assert!(matches!(found, Some(Ok(found)) if Arc::ptr_eq(found, &stage)));
+        for parts in [
+            (head(6), &sampled[..], &[][..]),
+            (head(5), &sampled[..1], &[][..]),
+            (head(5), &[texture(3), texture(2)][..], &[][..]),
+        ] {
+            assert!(translations.get(TranslationKey::view(&parts)).is_none());
+        }
+
+        let mut variants = HashMap::default();
+        variants.insert(FragmentVariantKey::new(9, &sampled, &[]), 1);
+        let parts = (9, &sampled[..], &[][..]);
+        assert_eq!(variants.get(FragmentVariantKey::view(&parts)), Some(&1));
+        let parts = (10, &sampled[..], &[][..]);
+        assert_eq!(variants.get(FragmentVariantKey::view(&parts)), None);
+    }
+}
