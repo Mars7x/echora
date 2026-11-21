@@ -72,6 +72,9 @@ pub struct Gpu {
     /// VK_EXT_conditional_rendering: draws and dispatches gated on a word
     /// the GPU wrote (the guest's occlusion-conditioned rendering).
     pub conditional_rendering: Option<ash::ext::conditional_rendering::Device>,
+    /// VK_KHR_index_type_uint8 (or the EXT): draws bind 8-bit index
+    /// buffers as they are.
+    pub index_type_uint8: bool,
     /// VK_EXT_depth_bias_control with the forced UNORM representation: a
     /// D24 depth target held as D32F takes polygon offset units in D24
     /// steps (2^-24), as the console's D24 does, not in the float format's
@@ -206,6 +209,7 @@ impl Gpu {
         let mut supported_conditional =
             vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut supported_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
+        let mut supported_uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut supported_compression =
             vk::PhysicalDeviceImageCompressionControlFeaturesEXT::default();
         let mut supported_maintenance =
@@ -225,7 +229,8 @@ impl Gpu {
             .push_next(&mut supported_atomic_float)
             .push_next(&mut supported_cooperative)
             .push_next(&mut supported_conditional)
-            .push_next(&mut supported_bias);
+            .push_next(&mut supported_bias)
+            .push_next(&mut supported_uint8);
         // SAFETY: the chain is well formed and outlives the call.
         unsafe { instance.get_physical_device_features2(physical, &mut supported) };
         let core = supported.features;
@@ -384,6 +389,19 @@ impl Gpu {
             && has(ash::ext::conditional_rendering::NAME);
         if conditional_rendering {
             enabled_extensions.push(ash::ext::conditional_rendering::NAME.as_ptr());
+        }
+        // 8-bit index buffers bound as they are (GPU-written ones read in
+        // place, without waiting to widen them on the CPU).
+        let uint8_extension = [
+            ash::khr::index_type_uint8::NAME,
+            ash::ext::index_type_uint8::NAME,
+        ]
+        .into_iter()
+        .find(|name| has(name))
+        .filter(|_| supported_uint8.index_type_uint8 != 0);
+        let index_type_uint8 = uint8_extension.is_some();
+        if let Some(name) = uint8_extension {
+            enabled_extensions.push(name.as_ptr());
         }
         let depth_bias_control = supported_bias.depth_bias_control != 0
             && supported_bias.least_representable_value_force_unorm_representation != 0
@@ -544,6 +562,11 @@ impl Gpu {
         if conditional_rendering {
             device_info = device_info.push_next(&mut enable_conditional);
         }
+        let mut enable_uint8 =
+            vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default().index_type_uint8(true);
+        if index_type_uint8 {
+            device_info = device_info.push_next(&mut enable_uint8);
+        }
         let mut enable_bias = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default()
             .depth_bias_control(true)
             .least_representable_value_force_unorm_representation(true)
@@ -672,6 +695,7 @@ impl Gpu {
             uncompressed_depth,
             mesh_shader,
             conditional_rendering,
+            index_type_uint8,
             depth_bias_control,
             shader_binary_version,
             name,

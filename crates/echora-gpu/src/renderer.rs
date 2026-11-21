@@ -5321,6 +5321,11 @@ impl Renderer {
         self.gpu.uniform_offset_alignment
     }
 
+    /// Draws can bind 8-bit index buffers (`vk::IndexType::UINT8_KHR`).
+    pub fn supports_uint8_indices(&self) -> bool {
+        self.gpu.index_type_uint8
+    }
+
     pub fn restore_archived_target(&mut self, key: u64) -> Result<(), String> {
         let Some(archived) = self.archived_targets.get(&key) else {
             return Ok(());

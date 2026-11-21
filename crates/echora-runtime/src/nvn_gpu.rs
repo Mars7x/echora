@@ -11342,9 +11342,20 @@ impl Nvn {
                 // A restart value that is already the type's all-ones
                 // value (Vulkan's) needs no rewriting.
                 let all_ones = if size == 2 { 0xffff } else { u32::MAX };
-                let rewrites_indices = size == 1
+                // 8-bit indices are widened on the CPU unless the device
+                // takes them as they are (and no restart value applies:
+                // that compares against the widened indices).
+                let native_bytes = size == 1
+                    && !(strip && restart.is_some())
+                    && self.gpu.as_ref().unwrap().renderer.supports_uint8_indices();
+                let rewrites_indices = size == 1 && !native_bytes
                     || quads
                     || strip && restart.is_some_and(|value| value & all_ones != all_ones);
+                let kind = match size {
+                    1 => vk::IndexType::UINT8_KHR,
+                    2 => vk::IndexType::UINT16,
+                    _ => vk::IndexType::UINT32,
+                };
                 // Indices GPU work is still writing (compute culling's
                 // output) are read in place, ordered after that work by its
                 // barrier, instead of waiting for it to finish to copy them
@@ -11358,7 +11369,7 @@ impl Nvn {
                     // Waits counted by why the CPU reads them.
                     let kind = if !pulling {
                         "indices for fetched vertices"
-                    } else if size == 1 {
+                    } else if size == 1 && rewrites_indices {
                         "8-bit indices"
                     } else if quads {
                         "quad indices"
@@ -11377,18 +11388,9 @@ impl Nvn {
                     Indices::Shared {
                         buffer,
                         offset,
-                        kind: if size == 2 {
-                            vk::IndexType::UINT16
-                        } else {
-                            vk::IndexType::UINT32
-                        },
+                        kind,
                     }
                 } else if pulling && !rewrites_indices && count > 0 {
-                    let kind = if size == 2 {
-                        vk::IndexType::UINT16
-                    } else {
-                        vk::IndexType::UINT32
-                    };
                     Indices::Guest {
                         address: guest,
                         bytes: length,
@@ -12294,13 +12296,19 @@ impl Nvn {
                     bytes,
                     kind,
                 } => {
-                    let width = if kind == vk::IndexType::UINT16 { 2 } else { 4 };
+                    let width = match kind {
+                        vk::IndexType::UINT8_KHR => 1,
+                        vk::IndexType::UINT16 => 2,
+                        _ => 4,
+                    };
                     let mut sample = [0u8; 64];
                     let sample = &mut sample[..(bytes as usize).min(16 * width)];
                     core.memory.read(address, sample).map_err(|trap| {
                         format!("reading guest indices at {address:#x}: {trap:?}")
                     })?;
-                    if width == 2 {
+                    if width == 1 {
+                        sample.iter().map(|&index| u32::from(index)).collect()
+                    } else if width == 2 {
                         sample
                             .as_chunks::<2>()
                             .0
