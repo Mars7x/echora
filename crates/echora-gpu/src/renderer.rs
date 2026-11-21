@@ -653,6 +653,11 @@ pub struct Renderer {
     /// Each uploaded pool entry's resolved descriptors, by (texture,
     /// sampler) index: reused while the entry is the same (`bind_pool`).
     pub(crate) pool_entry_memo: FastMap<(u32, u32), crate::pool::ResolvedEntry>,
+    /// Changes when an upload's image may no longer be the one its key
+    /// names (one removed or destroyed): programs' memoized upload
+    /// bindings (`Program::texture_memo`) from before are stale. Unique
+    /// to this renderer.
+    pub(crate) texture_epoch: u64,
     /// Counts for the runtime's statistics (`take_stats`).
     pub(crate) stats: FastMap<&'static str, u64>,
     /// Rendering passes ended, by the source line that ended them (for
@@ -1231,6 +1236,11 @@ impl Renderer {
             tried_spare_texture_pool: false,
             pool_cache: None,
             pool_entry_memo: FastMap::default(),
+            texture_epoch: {
+                static RENDERERS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                RENDERERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 40
+            },
             stats: FastMap::default(),
             pass_ends: FastMap::default(),
             debug_buffers: Vec::new(),
@@ -2902,6 +2912,7 @@ impl Renderer {
         // the work submitted so far has completed.
         let mut reused = None;
         if let Some((_, old)) = self.uploads.remove(key) {
+            self.texture_epoch += 1;
             if (old.width, old.height, old.format, old.shape) == (*width, *height, *format, *shape)
                 && old.levels == level_count
             {
@@ -6517,6 +6528,7 @@ impl Renderer {
     }
 
     fn destroy_target(&mut self, target: Target) {
+        self.texture_epoch += 1;
         for view in self.image_views.remove(&target.image).unwrap_or_default() {
             // (A view handle noted again for another image belongs to it.)
             if self
@@ -7540,6 +7552,7 @@ impl Renderer {
     pub fn forget_upload(&mut self, key: u64) {
         for key in [key, key ^ 1 << 63] {
             if let Some((_, target)) = self.uploads.remove(&key) {
+                self.texture_epoch += 1;
                 self.slot.retired_uploads.push(target);
             }
             self.upload_lengths.remove(&key);
@@ -7622,6 +7635,7 @@ impl Renderer {
         slice: u32,
     ) -> Result<Vec<[f32; 4]>, String> {
         let (generation, target) = self.uploads.remove(&key).ok_or("no such upload")?;
+        self.texture_epoch += 1;
         let temporary = u64::MAX - 1;
         self.insert_target(temporary, target);
         let texels = self

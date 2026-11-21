@@ -34,6 +34,38 @@ pub struct Program {
     /// (`Renderer::bind_pool`).
     pub(crate) pool: bool,
     dynamic_uniforms: Vec<u32>,
+    /// Each texture binding's (in descriptor order) last guest texture
+    /// upload and its resolved descriptor (`TextureMemo`).
+    texture_memo: std::sync::Mutex<Vec<Option<TextureMemo>>>,
+}
+
+/// A texture binding's upload, sampler state and the descriptor they
+/// resolved to: the same again resolves to it while the renderer's
+/// `texture_epoch` is unchanged (an upload's views and samplers live as
+/// long as its image, and an image holds one key's texels while its
+/// generation is unchanged).
+struct TextureMemo {
+    epoch: u64,
+    upload: (u64, u64, u32, u32, ImageShape, vk::Format),
+    sampler: Sampler,
+    info: vk::DescriptorImageInfo,
+}
+
+impl TextureMemo {
+    fn upload(source: &TextureSource) -> Option<(u64, u64, u32, u32, ImageShape, vk::Format)> {
+        match *source {
+            TextureSource::Upload {
+                key,
+                generation,
+                width,
+                height,
+                shape,
+                format,
+                ..
+            } => Some((key, generation, width, height, shape, format)),
+            _ => None,
+        }
+    }
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -978,6 +1010,7 @@ impl Renderer {
             abi_stages,
             pool,
             dynamic_uniforms,
+            texture_memo: Default::default(),
         })
     }
 
@@ -1242,17 +1275,51 @@ impl Renderer {
                                 descriptor.binding
                             ));
                         };
-                        let view =
-                            self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
-                        let sampler =
-                            self.sampler(sampler, descriptor.flags & Descriptor::INTEGER != 0)?;
-                        scratch
-                            .textures
-                            .push(DescriptorSource::Image(vk::DescriptorImageInfo {
-                                sampler,
-                                image_view: view,
-                                image_layout: vk::ImageLayout::GENERAL,
-                            }));
+                        let slot = scratch.textures.len();
+                        let upload = TextureMemo::upload(source);
+                        let memoized = upload.and_then(|upload| {
+                            let memo = program.texture_memo.lock().unwrap();
+                            memo.get(slot)?
+                                .as_ref()
+                                .filter(|memo| {
+                                    memo.epoch == self.texture_epoch
+                                        && memo.upload == upload
+                                        && memo.sampler == *sampler
+                                })
+                                .map(|memo| memo.info)
+                        });
+                        let info = match memoized {
+                            Some(info) => info,
+                            None => {
+                                let view = self.texture_view_swizzled(
+                                    source,
+                                    descriptor.texture_type,
+                                    sampler,
+                                )?;
+                                let info = vk::DescriptorImageInfo {
+                                    sampler: self.sampler(
+                                        sampler,
+                                        descriptor.flags & Descriptor::INTEGER != 0,
+                                    )?,
+                                    image_view: view,
+                                    image_layout: vk::ImageLayout::GENERAL,
+                                };
+                                if let Some(upload) = upload {
+                                    let mut memo = program.texture_memo.lock().unwrap();
+                                    if memo.len() <= slot {
+                                        memo.resize_with(slot + 1, || None);
+                                    }
+                                    memo[slot] = Some(TextureMemo {
+                                        epoch: self.texture_epoch,
+                                        upload,
+                                        sampler: *sampler,
+                                        info,
+                                    });
+                                }
+                                info
+                            }
+                        };
+                        scratch.textures.push(DescriptorSource::Image(info));
                         descriptors[1] += 1;
                     }
                     DescriptorKind::TextureBuffer => {
