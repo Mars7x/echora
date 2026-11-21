@@ -3186,10 +3186,20 @@ impl Renderer {
         sampler: &crate::draw::Sampler,
         integer: bool,
     ) -> Result<vk::Sampler, String> {
-        let anisotropy = sampler
-            .max_anisotropy
-            .max(1.0)
-            .min(self.gpu.max_sampler_anisotropy);
+        // Raw integer texels use point filtering, even when the guest
+        // sampler is also shared with a linearly filtered float view.
+        let (min_filter, mag_filter, anisotropy) = if integer {
+            (vk::Filter::NEAREST, vk::Filter::NEAREST, 1.0)
+        } else {
+            (
+                sampler.min_filter,
+                sampler.mag_filter,
+                sampler
+                    .max_anisotropy
+                    .max(1.0)
+                    .min(self.gpu.max_sampler_anisotropy),
+            )
+        };
         let lod_bias = sampler.lod[2].clamp(
             -self.gpu.max_sampler_lod_bias,
             self.gpu.max_sampler_lod_bias,
@@ -3200,7 +3210,11 @@ impl Renderer {
             (vk::SamplerMipmapMode::NEAREST, 0.0, 0.25)
         } else {
             (
-                sampler.mipmap,
+                if integer {
+                    vk::SamplerMipmapMode::NEAREST
+                } else {
+                    sampler.mipmap
+                },
                 sampler.lod[0],
                 sampler.lod[1].max(sampler.lod[0]),
             )
@@ -3223,8 +3237,8 @@ impl Renderer {
             vk::BorderColor::FLOAT_TRANSPARENT_BLACK
         };
         let key: SamplerKey = (
-            sampler.min_filter.as_raw(),
-            sampler.mag_filter.as_raw(),
+            min_filter.as_raw(),
+            mag_filter.as_raw(),
             mipmap.as_raw(),
             address.map(|mode| mode.as_raw()),
             [min_lod, max_lod, lod_bias].map(f32::to_bits),
@@ -3236,8 +3250,8 @@ impl Renderer {
             return Ok(*existing);
         }
         let info = vk::SamplerCreateInfo::default()
-            .min_filter(sampler.min_filter)
-            .mag_filter(sampler.mag_filter)
+            .min_filter(min_filter)
+            .mag_filter(mag_filter)
             .mipmap_mode(mipmap)
             .address_mode_u(address[0])
             .address_mode_v(address[1])
@@ -8431,6 +8445,28 @@ mod tests {
             ..base_level
         };
         assert_eq!(renderer.sampler(&equivalent, false).unwrap(), first);
+
+        let linear = Sampler {
+            min_filter: vk::Filter::LINEAR,
+            mag_filter: vk::Filter::LINEAR,
+            mipmap: vk::SamplerMipmapMode::LINEAR,
+            max_anisotropy: 4.0,
+            base_level_only: false,
+            ..Sampler::default()
+        };
+        let nearest = Sampler {
+            min_filter: vk::Filter::NEAREST,
+            mag_filter: vk::Filter::NEAREST,
+            mipmap: vk::SamplerMipmapMode::NEAREST,
+            max_anisotropy: 1.0,
+            ..linear
+        };
+        let integer = renderer.sampler(&linear, true).unwrap();
+        assert_eq!(renderer.sampler(&nearest, true).unwrap(), integer);
+        assert_ne!(
+            renderer.sampler(&linear, false).unwrap(),
+            renderer.sampler(&nearest, false).unwrap()
+        );
     }
 
     fn renderer() -> Option<Renderer> {

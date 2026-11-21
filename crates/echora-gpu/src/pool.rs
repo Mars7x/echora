@@ -655,8 +655,8 @@ mod tests {
             ..Default::default()
         };
         let sampler = Sampler {
-            min_filter: vk::Filter::NEAREST,
-            mag_filter: vk::Filter::NEAREST,
+            min_filter: vk::Filter::LINEAR,
+            mag_filter: vk::Filter::LINEAR,
             base_level_only: true,
             address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
             border: [1.0f32.to_bits(); 4],
@@ -689,6 +689,11 @@ mod tests {
         }
         for (name, position, expected) in [
             ("interior", 0.5f32, [24u32, (-11i32) as u32, 0]),
+            (
+                "interpolated border",
+                0.25f32,
+                [24, (-11i32) as u32, 0.25f32.to_bits()],
+            ),
             ("border", 1.75f32, [1, 1, 1.0f32.to_bits()]),
         ] {
             let sample: Vec<u8> = [
