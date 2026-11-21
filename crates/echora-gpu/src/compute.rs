@@ -269,7 +269,8 @@ impl Renderer {
                 .device
                 .update_descriptor_sets(&descriptor_writes, &[])
         };
-        let objects = self.gpu.shader_objects()?.clone();
+        let gpu = self.gpu.clone();
+        let objects = gpu.shader_objects()?;
         // The group counts an indirect dispatch reads, bounded by the
         // device's limit on the GPU (`mesh_count`), before the condition.
         let indirect = match dispatch.indirect {

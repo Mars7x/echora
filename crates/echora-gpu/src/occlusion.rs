@@ -507,7 +507,8 @@ impl Renderer {
         // the next can (no resolve, its query reset ahead).
         if self.pass_open() {
             let fence = self.current_fence();
-            let device = self.gpu.device.clone();
+            let gpu = self.gpu.clone();
+            let device = &gpu.device;
             let commands = self.recording_commands()?;
             let occlusion = self.occlusion()?;
             if (occlusion.active.is_none() || occlusion.active_inside)
@@ -530,7 +531,8 @@ impl Renderer {
     /// `next_segment` outside a rendering pass (the occlusion state made).
     fn next_segment_outside(&mut self, commands: vk::CommandBuffer, begin: bool) {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         let occlusion = self.occlusion.as_mut().expect("made by the caller");
         occlusion.end(&device, commands);
         if begin && !occlusion.has_room(fence) {
@@ -568,7 +570,8 @@ impl Renderer {
     /// next to begin inside (`occlusion_pass_begun`). True when one did.
     pub(crate) fn occlusion_pass_begins(&mut self, commands: vk::CommandBuffer) -> bool {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         let Some(occlusion) = self.occlusion.as_mut() else {
             return false;
         };
@@ -585,7 +588,8 @@ impl Renderer {
     /// After a rendering pass began: counting goes on inside it.
     pub(crate) fn occlusion_pass_begun(&mut self, commands: vk::CommandBuffer) {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         if let Some(occlusion) = self.occlusion.as_mut() {
             occlusion.begin(&device, commands, fence, true);
         }
@@ -594,7 +598,8 @@ impl Renderer {
     /// Before a rendering pass ends: a segment begun inside it ends there.
     /// True when one did (`occlusion_pass_ended` begins the next).
     pub(crate) fn occlusion_pass_ends(&mut self, commands: vk::CommandBuffer) -> bool {
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         match self.occlusion.as_mut() {
             Some(occlusion) if occlusion.active.is_some() && occlusion.active_inside => {
                 occlusion.end(&device, commands);
@@ -676,7 +681,8 @@ impl Renderer {
     /// condition begins): counting goes on in a new segment.
     pub(crate) fn occlusion_resolve(&mut self, commands: vk::CommandBuffer) {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         if let Some(occlusion) = self.occlusion.as_mut()
             && !occlusion.pending.is_empty()
         {
@@ -696,7 +702,8 @@ impl Renderer {
     /// batch is resolved.
     pub(crate) fn occlusion_before_submit(&mut self, commands: vk::CommandBuffer) {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         if let Some(occlusion) = self.occlusion.as_mut() {
             if occlusion.active.is_some() {
                 occlusion.end(&device, commands);
@@ -710,7 +717,8 @@ impl Renderer {
     /// are free, and a segment interrupted by the last submission resumes.
     pub(crate) fn occlusion_after_begin(&mut self, commands: vk::CommandBuffer) {
         let fence = self.current_fence();
-        let device = self.gpu.device.clone();
+        let gpu = self.gpu.clone();
+        let device = &gpu.device;
         if let Some(occlusion) = self.occlusion.as_mut() {
             occlusion.slot_reused(fence);
             if occlusion.resume {
