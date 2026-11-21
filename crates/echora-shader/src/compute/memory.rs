@@ -108,10 +108,11 @@ fn access(strong: bool) -> u32 {
 
 /// Scopes and memory semantics for barriers.
 const SCOPE_WORKGROUP: u32 = 2;
+const ACQUIRE_RELEASE_SHARED: u32 = 0x8 | 0x100;
 /// BAR orders every memory access in the workgroup (as PTX's bar.sync
 /// does): acquire-release over uniform (buffer and physical), workgroup
 /// and image memory.
-const ACQUIRE_RELEASE_ALL_MEMORY: u32 = 0x8 | 0x40 | 0x100 | 0x800;
+const ACQUIRE_RELEASE_ALL_MEMORY: u32 = ACQUIRE_RELEASE_SHARED | 0x40 | 0x800;
 
 /// Words a load or store of memory type `size` moves (a sub-word access
 /// moves the word that holds it).
@@ -484,6 +485,11 @@ impl Emitter {
         let quarter = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[lane, two]);
         let within = self.value(op::BITWISE_AND, self.u32, &[lane, three]);
         let subgroup = self.constant(super::SCOPE_SUBGROUP);
+        let shared_memory = self.constant(ACQUIRE_RELEASE_SHARED);
+        // LDSM consumes rows written by other lanes. Order the row loads
+        // after their producers and before any lane can reuse the storage.
+        self.function
+            .emit(op::CONTROL_BARRIER, &[subgroup, subgroup, shared_memory]);
         // The row address lane `source` supplies, plus the offset.
         let row = |e: &mut Self, source: u32| {
             let base = e.value(
@@ -532,6 +538,8 @@ impl Emitter {
             };
             values.push(value);
         }
+        self.function
+            .emit(op::CONTROL_BARRIER, &[subgroup, subgroup, shared_memory]);
         if d != 255 {
             for (n, value) in values.into_iter().enumerate() {
                 self.write_register(d.saturating_add(n as u8), value);

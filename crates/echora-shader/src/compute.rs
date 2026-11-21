@@ -5472,7 +5472,29 @@ mod tests {
             dual_source_blend: false,
             fragment_output_types: [0; 8],
         };
-        valid_with(&words, &layout);
+        let translated = valid_with(&words, &layout);
+        let mut constants = BTreeMap::new();
+        let mut barriers = 0;
+        let mut at = 5;
+        while let Some(&instruction) = translated.spirv.get(at) {
+            match instruction as u16 {
+                op::CONSTANT => {
+                    constants.insert(translated.spirv[at + 2], translated.spirv[at + 3]);
+                }
+                op::CONTROL_BARRIER => {
+                    let operands = &translated.spirv[at + 1..at + 4];
+                    assert_eq!(
+                        operands.iter().map(|id| constants[id]).collect::<Vec<_>>(),
+                        [SCOPE_SUBGROUP, SCOPE_SUBGROUP, 0x108]
+                    );
+                    barriers += 1;
+                }
+                op::GROUP_NON_UNIFORM_SHUFFLE => assert_eq!(barriers % 2, 1),
+                _ => {}
+            }
+            at += (instruction >> 16) as usize;
+        }
+        assert_eq!(barriers, 4);
     }
 
     #[test]
