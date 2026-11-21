@@ -4146,7 +4146,7 @@ mod tests {
             (64, 8, 255),
             (81, 3, 0),
         ]);
-        let imad = |opcode, target, a, b, c, carry| {
+        let imad_negated = |opcode, target, a, b, c, carry, negated| {
             word(&[
                 (0, 12, opcode),
                 (16, 8, target),
@@ -4154,10 +4154,12 @@ mod tests {
                 (32, 8, b),
                 (64, 8, c),
                 (74, 1, 1),
+                (75, 1, negated),
                 (81, 3, 7),
                 (87, 4, carry),
             ])
         };
+        let imad = |opcode, target, a, b, c, carry| imad_negated(opcode, target, a, b, c, carry, 0);
         for (low, high, offset, a, b) in [
             (0, 2, 8, 13, 17),
             (u32::MAX, 2, 8, 0, 17),
@@ -4172,6 +4174,9 @@ mod tests {
                     imad(0x224, 7, 255, 255, 1, 8),
                     imad(0x225, 8, 3, 4, 0, 0),
                     imad(0x227, 10, 3, 4, 0, 0),
+                    // IMAD.X R11, RZ, RZ, ~R1, P0: a negated addend of the
+                    // chain is inverted, not negated.
+                    imad_negated(0x224, 11, 255, 255, 1, 0, 1),
                 ],
             );
             let (low_sum, carry) = low.overflowing_add(offset);
@@ -4185,6 +4190,7 @@ mod tests {
             assert_eq!(r[&8], result as u32);
             assert_eq!(r[&9], (result >> 32) as u32);
             assert_eq!(r[&10], r[&9]);
+            assert_eq!(r[&11], (!high).wrapping_add(u32::from(carry)), "IMAD.X ~c");
         }
     }
 

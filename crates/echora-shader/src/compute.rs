@@ -1819,7 +1819,15 @@ impl Emitter {
                 carry_in,
             } => {
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
-                let c = self.signed_integer(index, c)?;
+                // In the carry-chain form (.X) a negated addend is its
+                // bitwise inverse, as for IADD3.X (`term`): the chain's low
+                // word supplied the +1.
+                let c = if carry_in.is_some() && c.neg && !matches!(c.src, Src::Imm(_)) {
+                    let value = self.integer(index, c)?;
+                    self.value(op::NOT, self.u32, &[value])
+                } else {
+                    self.signed_integer(index, c)?
+                };
                 let product = self.value(op::I_MUL, self.u32, &[a, b]);
                 let mut sum = self.value(op::I_ADD, self.u32, &[product, c]);
                 if let Some(carry_in) = carry_in {
@@ -2032,7 +2040,15 @@ impl Emitter {
                 }
                 let ty = self.u64();
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
+                let negated = c.neg && !matches!(c.src, Src::Imm(_));
                 let c = self.pair_operand(index, c)?;
+                // A negated 64-bit addend: its two's complement, or in the
+                // carry-chain form its bitwise inverse.
+                let c = match (negated, carry_in.is_some()) {
+                    (false, _) => c,
+                    (true, false) => self.value(op::S_NEGATE, ty, &[c]),
+                    (true, true) => self.value(op::NOT, ty, &[c]),
+                };
                 let (a, b) = (self.widen(a, signed), self.widen(b, signed));
                 let product = self.value(op::I_MUL, ty, &[a, b]);
                 let mut sum = self.value(op::I_ADD, ty, &[product, c]);
