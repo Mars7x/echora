@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use echora_shader_abi::{PUSH_RESOLUTION_SCALE, Stage, Unsupported};
 
 use super::{Emitter, unsupported};
-use crate::decode::Pred;
+use crate::decode::{Instruction, Op, Pred};
 use crate::header::Interpolation;
 use crate::spirv::{Type, capability, decoration, op, storage};
 
@@ -192,6 +192,35 @@ impl Emitter {
             .component_inputs
             .insert((location, component), variable);
         variable
+    }
+
+    /// Guest vertices can write only part of their homogeneous position.
+    /// Supply the missing defaults before any control flow or stores.
+    pub(super) fn initialize_vertex_position(&mut self, code: &[Instruction], entry_end: usize) {
+        let components = |instruction: &Instruction| {
+            let Op::Ast { address, count, .. } = instruction.op else {
+                return 0u8;
+            };
+            (0..u32::from(count))
+                .map(|word| u32::from(address) + 4 * word)
+                .filter(|address| (0x70..=0x7c).contains(address))
+                .fold(0, |mask, address| mask | (1 << ((address - 0x70) / 4)))
+        };
+        let entry_stores = code[..entry_end]
+            .iter()
+            .filter(|instruction| instruction.guard.is_true())
+            .fold(0, |mask, instruction| mask | components(instruction));
+        if entry_stores == 0xf || !code.iter().any(|instruction| components(instruction) != 0) {
+            return;
+        }
+        let vec4 = self.vec4();
+        let position = self.builtin_output(BUILTIN_POSITION, vec4);
+        let zero = self.float_constant(0.0);
+        let one = self.float_constant(1.0);
+        let default = self
+            .module
+            .composite_constant(vec4, &[zero, zero, zero, one]);
+        self.function.emit(op::STORE, &[position, default]);
     }
 
     /// A built-in output variable of type `ty`, declared once.

@@ -9040,6 +9040,76 @@ mod tests {
     }
 
     #[test]
+    fn vertex_positions_default_unwritten_components() {
+        use crate::decode::{Instruction, Op, Pred, Reg};
+        use echora_shader_abi::Stage;
+
+        let ast = |data, address, count, guard| Instruction {
+            raw: 0,
+            guard,
+            op: Op::Ast {
+                data: Reg(data),
+                offset: Reg::ZERO,
+                vertex: Reg::ZERO,
+                address,
+                count,
+                patch: false,
+            },
+            uniform: false,
+        };
+        let layout = Layout {
+            stage: Stage::Vertex,
+            ..Layout::workgroup([1, 1, 1])
+        };
+        let mut shader = vec![
+            decode(mov(0, (-0.75f32).to_bits())),
+            decode(mov(1, 0.25f32.to_bits())),
+            decode(mov(2, 0.5f32.to_bits())),
+            decode(mov(3, 2.0f32.to_bits())),
+        ];
+        for (stores, expected) in [
+            (vec![ast(0, 0x70, 2, Pred::TRUE)], [-0.75, 0.25, 0.0, 1.0]),
+            (
+                vec![
+                    ast(0, 0x70, 1, Pred::TRUE),
+                    ast(
+                        0,
+                        0x7c,
+                        1,
+                        Pred {
+                            index: 7,
+                            negated: true,
+                        },
+                    ),
+                ],
+                [-0.75, 0.0, 0.0, 1.0],
+            ),
+            (vec![ast(0, 0x70, 4, Pred::TRUE)], [-0.75, 0.25, 0.5, 2.0]),
+            (
+                vec![ast(0, 0x70, 2, Pred::TRUE), ast(3, 0x7c, 1, Pred::TRUE)],
+                [-0.75, 0.25, 0.0, 2.0],
+            ),
+        ] {
+            shader.truncate(4);
+            shader.extend(stores);
+            shader.push(decode(EXIT));
+            let translated = crate::compute::translate(&shader, &layout).unwrap();
+            assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+            let machine = Machine::new(&translated.spirv);
+            let report = machine.simulate(&Inputs::default());
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let actual = report.invocations[0]
+                .iter()
+                .find_map(|(&id, value)| (machine.builtin(id) == Some(0)).then_some(value))
+                .unwrap();
+            assert_eq!(
+                actual,
+                &expected.map(|value: f32| u64::from(value.to_bits()))
+            );
+        }
+    }
+
+    #[test]
     fn traced_vertex_programs_record_their_position_and_texture_results() {
         use echora_shader_abi::{Stage, VERTEX_TRACE_HIGH_SPEC_ID, VERTEX_TRACE_LOW_SPEC_ID};
         // TLD4.R (2D, handle c[0x0][0x40]) R4, R0; AST.128 a[0x70], R4;

@@ -318,7 +318,9 @@ fn emit_blocks(
     let mut emitter = Emitter::new(layout);
     emitter.hmma_pairs = matrix::pairs(code, blocks);
     if layout.stage == Stage::Vertex {
-        emitter.uniform_broadcasts = uniform_prefix::broadcasts(code, blocks[0].body_end);
+        let entry_end = blocks[0].body_end;
+        emitter.uniform_broadcasts = uniform_prefix::broadcasts(code, entry_end);
+        emitter.initialize_vertex_position(code, entry_end);
     }
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
