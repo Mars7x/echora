@@ -7661,13 +7661,19 @@ impl Nvn {
 
     /// Make a mapped rendering input current before comparing it on the
     /// CPU or copying it into the upload ring.
+    /// (Waits are also counted by the calling line.)
+    #[track_caller]
     pub(super) fn resolve_draw_input(
         &mut self,
         core: &mut Guest,
         guest: u64,
         size: u64,
     ) -> Result<(), String> {
-        self.resolve_draw_input_of(core, "other", guest, size)
+        let caller = std::panic::Location::caller();
+        if self.resolve_draw_input_waiting(core, "other", guest, size, None)? {
+            self.gpu.as_mut().unwrap().stat(wait_caller_stat(caller), 1);
+        }
+        Ok(())
     }
 
     /// `resolve_draw_input` for one `kind` of input ("indices",
@@ -7693,9 +7699,23 @@ impl Nvn {
         size: u64,
         serial: Option<Option<u64>>,
     ) -> Result<(), String> {
+        self.resolve_draw_input_waiting(core, kind, guest, size, serial)
+            .map(|_| ())
+    }
+
+    /// `resolve_draw_input_after`, telling whether it waited for GPU work.
+    fn resolve_draw_input_waiting(
+        &mut self,
+        core: &mut Guest,
+        kind: &'static str,
+        guest: u64,
+        size: u64,
+        serial: Option<Option<u64>>,
+    ) -> Result<bool, String> {
         if size == 0 {
-            return Ok(());
+            return Ok(false);
         }
+        let mut waited = false;
         let range = guest
             ..guest
                 .checked_add(size)
@@ -7704,6 +7724,7 @@ impl Nvn {
         if let Some(serial) = serial {
             let backend = self.gpu.as_mut().unwrap();
             if serial > backend.renderer.completed_serial() {
+                waited = true;
                 let started = std::time::Instant::now();
                 backend.renderer.wait_for(serial)?;
                 let (count, time) = match kind {
@@ -7719,9 +7740,17 @@ impl Nvn {
                         "stat: draw input waits for uniforms",
                         "stat: draw input wait us for uniforms",
                     ),
-                    "rewritten indices" => (
-                        "stat: draw input waits for rewritten indices",
-                        "stat: draw input wait us for rewritten indices",
+                    "8-bit indices" => (
+                        "stat: draw input waits for 8-bit indices",
+                        "stat: draw input wait us for 8-bit indices",
+                    ),
+                    "quad indices" => (
+                        "stat: draw input waits for quad indices",
+                        "stat: draw input wait us for quad indices",
+                    ),
+                    "restart indices" => (
+                        "stat: draw input waits for restart indices",
+                        "stat: draw input wait us for restart indices",
                     ),
                     "indices for fetched vertices" => (
                         "stat: draw input waits for indices of fetched vertices",
@@ -7739,7 +7768,8 @@ impl Nvn {
                 backend.page_table_writes = false;
             }
         }
-        self.resolve_storage(core, Some(range))
+        self.resolve_storage(core, Some(range))?;
+        Ok(waited)
     }
 
     /// A queued consumer sees preceding GPU writes whether or not a
@@ -11328,8 +11358,12 @@ impl Nvn {
                     // Waits counted by why the CPU reads them.
                     let kind = if !pulling {
                         "indices for fetched vertices"
+                    } else if size == 1 {
+                        "8-bit indices"
+                    } else if quads {
+                        "quad indices"
                     } else if rewrites_indices {
-                        "rewritten indices"
+                        "restart indices"
                     } else {
                         "indices"
                     };
@@ -12741,6 +12775,30 @@ impl ResidentPool {
 
 /// Add `range` to a sorted list of disjoint ranges, merging neighbours.
 /// A stat name for a copy-back's call site, made once per site.
+/// "stat: draw input waits from <file>:<line>" for a `resolve_draw_input`
+/// caller, made once each.
+fn wait_caller_stat(location: &'static std::panic::Location<'static>) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::RefCell<HashMap<(&'static str, u32), &'static str>> =
+            std::cell::RefCell::new(HashMap::default());
+    }
+    NAMES.with(|names| {
+        *names
+            .borrow_mut()
+            .entry((location.file(), location.line()))
+            .or_insert_with(|| {
+                Box::leak(
+                    format!(
+                        "stat: draw input waits from {}:{}",
+                        location.file(),
+                        location.line()
+                    )
+                    .into_boxed_str(),
+                )
+            })
+    })
+}
+
 fn caller_stat(location: &'static std::panic::Location<'static>) -> &'static str {
     thread_local! {
         static NAMES: std::cell::RefCell<HashMap<(&'static str, u32), &'static str>> =
