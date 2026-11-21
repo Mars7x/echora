@@ -419,6 +419,7 @@ impl Gpu {
             .shader_clip_distance(core.shader_clip_distance != 0)
             .multi_viewport(core.multi_viewport != 0)
             .depth_clamp(core.depth_clamp != 0)
+            .shader_resource_min_lod(core.shader_resource_min_lod != 0)
             .shader_image_gather_extended(core.shader_image_gather_extended != 0);
         let mut enable11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(s11.storage_buffer16_bit_access != 0)

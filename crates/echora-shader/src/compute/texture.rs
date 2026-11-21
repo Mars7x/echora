@@ -629,7 +629,7 @@ impl Emitter {
             && reference.is_none()
             && implicit
             && texture.op == TextureOp::Sample
-            && texture.lod == 0;
+            && matches!(texture.lod, 0 | 4);
         let mut gradients = None;
         let coordinate = if fetch {
             if let Some(offsets) = &offsets {
@@ -803,8 +803,8 @@ impl Emitter {
             let words: Vec<u32> = (0..4)
                 .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
                 .collect();
-            // A shader bias or minimum level still uses the explicit-level
-            // lowering. Grad samples use the selected view to compute LOD.
+            // Biased reads still use the explicit-level lowering.
+            // Grad samples use the selected view to compute LOD.
             let level =
                 (implicit && texture.op == TextureOp::Sample && gradients.is_none()).then(|| {
                     self.module.capability(capability::IMAGE_QUERY);

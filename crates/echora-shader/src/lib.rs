@@ -1054,57 +1054,60 @@ mod tests {
 
     #[test]
     fn fragment_pool_samples_take_gradients_before_the_numeric_branch() {
-        // TEX.B R4, R0 (x, y), R2 (handle), 2D, 0xf, implicit level
-        let mut program = header(2, 5, &[]);
-        program.extend(bytes(&[
-            word(&[
-                (0, 12, 0x361),
-                (16, 8, 4),
-                (24, 8, 0),
-                (32, 8, 2),
-                (59, 1, 1),
-                (61, 3, 1),
-                (64, 8, 255),
-                (72, 4, 0xf),
-                (81, 3, 7),
-            ]),
-            EXIT,
-        ]));
-        let translated = validated(&program);
         use crate::spirv::op;
-        let mut branches = false;
-        let mut derivatives = Vec::new();
-        let mut samples = 0;
-        let mut at = 5;
-        while at < translated.spirv.len() {
-            let word = translated.spirv[at];
-            match word as u16 {
-                op::BRANCH_CONDITIONAL => branches = true,
-                derivative @ (op::DPDX | op::DPDY) => {
-                    assert!(!branches, "derivatives must precede numeric dispatch");
-                    derivatives.push((derivative, translated.spirv[at + 2]));
+        for (lod_mode, operands) in [(0, 0x4), (4, 0x84)] {
+            // TEX.B, 2D, at an implicit level with or without a minimum clamp.
+            let mut program = header(2, 5, &[]);
+            program.extend(bytes(&[
+                word(&[
+                    (0, 12, 0x361),
+                    (16, 8, 4),
+                    (24, 8, 0),
+                    (32, 8, 2),
+                    (59, 1, 1),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 0xf),
+                    (81, 3, 7),
+                    (87, 3, lod_mode),
+                ]),
+                EXIT,
+            ]));
+            let translated = validated(&program);
+            let mut branches = false;
+            let mut derivatives = Vec::new();
+            let mut samples = 0;
+            let mut at = 5;
+            while at < translated.spirv.len() {
+                let word = translated.spirv[at];
+                match word as u16 {
+                    op::BRANCH_CONDITIONAL => branches = true,
+                    derivative @ (op::DPDX | op::DPDY) => {
+                        assert!(!branches, "derivatives must precede numeric dispatch");
+                        derivatives.push((derivative, translated.spirv[at + 2]));
+                    }
+                    op::IMAGE_SAMPLE_EXPLICIT_LOD => {
+                        assert_eq!(translated.spirv[at + 5], operands, "sample uses Grad");
+                        assert_eq!(translated.spirv[at + 6], derivatives[0].1);
+                        assert_eq!(translated.spirv[at + 7], derivatives[1].1);
+                        samples += 1;
+                    }
+                    op::IMAGE_QUERY_LOD | op::IMAGE_SAMPLE_IMPLICIT_LOD => {
+                        panic!("sample should use the typed view and shared derivatives");
+                    }
+                    _ => {}
                 }
-                op::IMAGE_SAMPLE_EXPLICIT_LOD => {
-                    assert_eq!(translated.spirv[at + 5], 4, "sample uses Grad");
-                    assert_eq!(translated.spirv[at + 6], derivatives[0].1);
-                    assert_eq!(translated.spirv[at + 7], derivatives[1].1);
-                    samples += 1;
-                }
-                op::IMAGE_QUERY_LOD | op::IMAGE_SAMPLE_IMPLICIT_LOD => {
-                    panic!("sample should use the typed view and shared derivatives");
-                }
-                _ => {}
+                at += (word >> 16) as usize;
             }
-            at += (word >> 16) as usize;
+            assert_eq!(
+                derivatives
+                    .iter()
+                    .map(|(opcode, _)| *opcode)
+                    .collect::<Vec<_>>(),
+                [op::DPDX, op::DPDY]
+            );
+            assert_eq!(samples, 3);
         }
-        assert_eq!(
-            derivatives
-                .iter()
-                .map(|(opcode, _)| *opcode)
-                .collect::<Vec<_>>(),
-            [op::DPDX, op::DPDY]
-        );
-        assert_eq!(samples, 3);
     }
 
     #[test]
