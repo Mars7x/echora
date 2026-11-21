@@ -10191,17 +10191,39 @@ impl Nvn {
             nvn.draw_input_write_serial(guest..guest + 8)
                 .is_some_and(|serial| serial > completed)
         };
-        if !pending(self, word)
-            || self.gpu_writes_pending(&(word..word + 8))
-            || pending(self, other)
-            || self.gpu_writes_pending(&(other..other + 8))
-        {
+        // Why the CPU compares them after all, counted.
+        let refused = [
+            (
+                !pending(self, word),
+                "stat: word conditions refused: no pending write",
+            ),
+            (
+                self.gpu_writes_pending(&(word..word + 8)),
+                "stat: word conditions refused: results to copy into the word",
+            ),
+            (
+                pending(self, other),
+                "stat: word conditions refused: other word written",
+            ),
+            (
+                self.gpu_writes_pending(&(other..other + 8)),
+                "stat: word conditions refused: results to copy into the other word",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(refused, why)| refused.then_some(why));
+        if let Some(why) = refused {
+            self.gpu.as_mut().unwrap().stat(why, 1);
             return Ok(None);
         }
         let Some(bound) = self
             .shared_binding(word, 8)?
             .filter(|&(_, offset)| offset.is_multiple_of(4))
         else {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: word conditions refused: word not shared", 1);
             return Ok(None);
         };
         // The other word as the CPU holds it (nothing is pending there).
