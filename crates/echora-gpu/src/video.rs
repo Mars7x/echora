@@ -1340,9 +1340,14 @@ impl Drop for Av1Decoder {
         let device = &video.device;
         let functions = video.video.fp();
         if self.sync.pending {
-            // SAFETY: this fence still belongs to a submission. Keep its
-            // resources live after a timed-out decode or copy.
-            let _ = unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) };
+            // SAFETY: this fence still belongs to a submission. A GPU that
+            // never finishes it (a hung or lost device) gets 5 s; then the
+            // decoder's objects are leaked, as destroying them while the
+            // submission may still use them is not allowed.
+            let waited = unsafe { device.wait_for_fences(&[self.sync.fence], true, 5_000_000_000) };
+            if waited.is_err() {
+                return;
+            }
         }
         self.bitstream.destroy(&video);
         self.readback.destroy(&video);
