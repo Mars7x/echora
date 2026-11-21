@@ -527,6 +527,9 @@ impl SharedRange {
 struct GuestFileIndex {
     generation: usize,
     spans: Vec<GuestFileSpan>,
+    /// `overlapping` lookups and the spans they walked since the index was
+    /// built (the report's statistics).
+    walks: std::cell::Cell<[u64; 2]>,
 }
 
 struct GuestFileSpan {
@@ -559,15 +562,25 @@ impl GuestFileIndex {
             furthest_end = furthest_end.max(span.end);
             span.furthest_end = furthest_end;
         }
-        Self { generation, spans }
+        Self {
+            generation,
+            spans,
+            walks: Default::default(),
+        }
     }
 
     fn overlapping(&self, guest: std::ops::Range<u64>) -> impl Iterator<Item = SharedRange> + '_ {
         let after = self.spans.partition_point(|span| span.guest < guest.end);
+        let [lookups, walked] = self.walks.get();
+        self.walks.set([lookups + 1, walked]);
         self.spans[..after]
             .iter()
             .rev()
             .take_while(move |span| span.furthest_end > guest.start)
+            .inspect(|_| {
+                let [lookups, walked] = self.walks.get();
+                self.walks.set([lookups, walked + 1]);
+            })
             .filter_map(move |span| {
                 let first = span.guest.max(guest.start);
                 let last = span.end.min(guest.end);
@@ -1022,6 +1035,15 @@ impl Backend {
             notes.insert(
                 name.into(),
                 counter.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+        if let Ok(index) = self.shared_guest_index.try_borrow() {
+            let [lookups, walked] = index.walks.get();
+            notes.insert("stat: shared span index lookups".into(), lookups);
+            notes.insert("stat: shared span index spans walked".into(), walked);
+            notes.insert(
+                "stat: shared span index spans".into(),
+                index.spans.len() as u64,
             );
         }
         for (&name, &amount) in &self.stats {
