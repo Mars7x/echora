@@ -42,10 +42,14 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("fpairs", 0x4000),
     ("fpscalar", 0x4400),
     ("misc", 0x4800),
+    ("gamecalls", 0x4c00),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x4c00;
+pub const KERNEL_SIZE: u64 = 0x5800;
+
+/// The windows of `gamecalls`' functions (after its own).
+pub const GAMECALLS_FUNCTIONS: [u64; 2] = [0x5000, 0x5400];
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -541,6 +545,83 @@ fn assemble() -> Assembler {
         ; svc 7
         ; udf 0
     );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Calls as game code makes them: an update loop over 64 objects of
+        // 64 bytes keeps its state in callee-saved registers and calls, per
+        // object, an update function (a frame, X19/X20 saved, loads and
+        // stores of the object, a clamp leaf and a flag getter in another
+        // window) and a hash leaf. x0 = iterations, x1 = the objects; SP a
+        // stack.
+        ; ->gamecalls:
+        ; stp x29, x30, [sp, -16]!
+        ; stp x19, x20, [sp, -16]!
+        ; stp x21, x22, [sp, -16]!
+        ; mov x19, x0
+        ; mov x20, x1
+        ; mov x21, 0
+        ; mov x22, 0
+        ; l1:
+        ; and x9, x21, 63
+        ; add x0, x20, x9, lsl 6
+        ; bl ->game_update
+        ; add x22, x22, x0
+        ; mov x0, x22
+        ; bl ->game_hash
+        ; eor x22, x22, x0
+        ; add x21, x21, 1
+        ; subs x19, x19, 1
+        ; b.ne <l1
+        ; ldp x21, x22, [sp], 16
+        ; ldp x19, x20, [sp], 16
+        ; ldp x29, x30, [sp], 16
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->game_update:
+        ; stp x29, x30, [sp, -32]!
+        ; stp x19, x20, [sp, 16]
+        ; mov x19, x0
+        ; ldr w0, [x19]
+        ; ldr w1, [x19, 4]
+        ; bl ->game_clamp
+        ; str w0, [x19]
+        ; ldr x0, [x19, 8]
+        ; bl ->game_flags
+        ; tst x0, 1
+        ; b.eq >skip
+        ; ldr w20, [x19, 16]
+        ; add w20, w20, 1
+        ; str w20, [x19, 16]
+        ; skip:
+        ; ldr w0, [x19]
+        ; ldp x19, x20, [sp, 16]
+        ; ldp x29, x30, [sp], 32
+        ; ret
+        ; ->game_hash:
+        ; eor x0, x0, x0, lsr 7
+        ; add x0, x0, x0, lsl 3
+        ; ror x0, x0, 11
+        ; ret
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->game_clamp:
+        ; add w0, w0, w1
+        ; sub w2, w0, 1000
+        ; cmp w0, 1000
+        ; csel w0, w2, w0, gt
+        ; ret
+        ; ->game_flags:
+        ; and x0, x0, 0xff
+        ; eor x0, x0, x0, lsr 3
+        ; ret
+    );
     ops
 }
 
@@ -550,6 +631,7 @@ pub fn image() -> Vec<u8> {
     let code = code();
     let mut starts: Vec<u64> = KERNEL_ENTRIES.iter().map(|&(_, offset)| offset).collect();
     starts.push(LEAVES);
+    starts.extend(GAMECALLS_FUNCTIONS);
     starts.sort_unstable();
     let mut bytes = vec![0; KERNEL_SIZE as usize];
     for (index, &start) in starts.iter().enumerate() {
@@ -576,7 +658,12 @@ mod tests {
     #[test]
     fn the_entry_table_matches_the_labels() {
         let ops = assemble();
-        for &(name, offset) in KERNEL_ENTRIES.iter().chain(&[("leaf_add", LEAVES)]) {
+        let functions = [
+            ("leaf_add", LEAVES),
+            ("game_update", GAMECALLS_FUNCTIONS[0]),
+            ("game_clamp", GAMECALLS_FUNCTIONS[1]),
+        ];
+        for &(name, offset) in KERNEL_ENTRIES.iter().chain(&functions) {
             let label = ops.labels().resolve_static(&StaticLabel::global(name)).unwrap();
             assert_eq!(label.0 as u64, offset, "{name}");
         }

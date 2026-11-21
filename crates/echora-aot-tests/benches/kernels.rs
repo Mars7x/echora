@@ -97,6 +97,11 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             regs[0] = 2_000_000 * scale;
             m.core.cpu.sp = DATA_BASE + DATA_SIZE;
         }
+        "gamecalls" => {
+            regs[0] = 1_000_000 * scale;
+            regs[1] = VECTOR_A;
+            m.core.cpu.sp = DATA_BASE + DATA_SIZE;
+        }
         "switch" => regs[0] = 5_000_000 * scale,
         "vector" => {
             regs[0] = 500 * scale;
