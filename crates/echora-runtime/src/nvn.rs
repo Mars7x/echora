@@ -727,9 +727,11 @@ pub struct Nvn {
     /// changes or a replay can override mip handling.
     #[serde(skip)]
     target_shapes: (u64, HashMap<u64, TargetShape>),
-    /// Each queue submission, compute dispatch, texture or sampler pool
-    /// change and CPU invalidation of texture memory: texture bindings
-    /// resolved before may differ after.
+    /// Moved when every texture binding resolved before may differ after:
+    /// a texture or sampler pool set or finalized, a replay or restored
+    /// capture, a virtual remap, a named texture of unknown storage
+    /// invalidated (`bump_binding_serial`). Texel writes evict only the
+    /// bindings over them (`evict_bindings_over`).
     #[serde(skip)]
     binding_serial: u64,
     /// Texture bindings resolved during the current stamp (texture epoch,

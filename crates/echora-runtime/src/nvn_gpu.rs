@@ -6168,8 +6168,8 @@ impl Nvn {
         // What later texture bindings resolve to is not changed by running
         // it: images it writes are targets (their bindings name them), and
         // results it stores back into a texture's memory invalidate it
-        // (`gpu_invalidate`, which moves `binding_serial`); guest textures
-        // are checked again each present.
+        // (`gpu_invalidate`, which evicts the bindings over those bytes);
+        // guest textures are checked again each present.
         let bind = self
             .render
             .state
