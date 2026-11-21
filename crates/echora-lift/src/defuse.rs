@@ -106,7 +106,7 @@ impl Regs {
         regs
     }
 
-    fn add_gpr(&mut self, n: u8) {
+    pub(crate) fn add_gpr(&mut self, n: u8) {
         if n < 31 {
             self.gpr |= 1 << n;
         }
