@@ -1758,8 +1758,8 @@ impl Nvn {
         {
             self.flush_epoch += 1;
         }
-        if texture.is_some() {
-            self.bump_binding_serial("stat: binding serial by an invalidated texture");
+        if let Some(texture) = texture {
+            self.evict_texture_bindings(texture);
         }
         if let Some(backend) = self.gpu.as_mut() {
             for pool in backend.resident.values_mut() {
@@ -1778,7 +1778,7 @@ impl Nvn {
                 backend.remove_texture_upload(texture);
             }
             if backend.mark_texture_bytes_changed(&range) {
-                self.bump_binding_serial("stat: binding serial by touched textures");
+                self.evict_bindings_over(std::slice::from_ref(&range));
             }
         }
     }
@@ -7325,6 +7325,12 @@ impl Nvn {
                         .any(|(_, range)| bases.iter().any(|base| range.contains(base)))
                 })
         };
+        self.evict_memoized_bindings(stale);
+    }
+
+    /// Drop the memoized bindings (every queue's) that `stale` selects;
+    /// pool entry lists made from them are made again.
+    fn evict_memoized_bindings(&mut self, stale: impl Fn(&super::ResolvedBinding) -> bool) {
         let before = self.binding_memo.1.len();
         self.binding_memo.1.retain(|_, entry| !stale(entry));
         let mut evicted = before != self.binding_memo.1.len();
@@ -7334,13 +7340,63 @@ impl Nvn {
             evicted |= before != memo.len();
         }
         if evicted {
-            // Pool entry lists made from them are made again.
             self.pool_inputs += 1;
-            self.gpu
-                .as_mut()
-                .unwrap()
-                .stat("stat: binding memo evictions", 1);
+            if let Some(backend) = self.gpu.as_mut() {
+                backend.stat("stat: binding memo evictions", 1);
+            }
         }
+    }
+
+    /// Guest bytes under `ranges` changed under cached textures: the
+    /// bindings that can see them (their texture's storage overlaps, or
+    /// their storage is unknown) resolve anew; the others stay. (Clearing
+    /// every binding instead cost the forest most of its texture binding
+    /// time.)
+    fn evict_bindings_over(&mut self, ranges: &[std::ops::Range<u64>]) {
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat("stat: binding evictions by texture writes", 1);
+        }
+        let overlaps = |range: &std::ops::Range<u64>| {
+            ranges
+                .iter()
+                .any(|written| written.start < range.end && range.start < written.end)
+        };
+        self.evict_memoized_bindings(|entry| {
+            entry
+                .backing
+                .as_ref()
+                .is_none_or(|backing| backing.pieces().iter().any(|(_, range)| overlaps(range)))
+        });
+    }
+
+    /// Texture object `texture`'s contents changed (WriteTexels, a copy
+    /// into it): its bindings, those sampling it as a render target, and
+    /// those over its storage resolve anew. With its storage unknown,
+    /// every binding does.
+    fn evict_texture_bindings(&mut self, texture: u64) {
+        let Some(backing) = self.texture_object_backing(texture) else {
+            self.bump_binding_serial("stat: binding serial by an invalidated texture");
+            return;
+        };
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat("stat: binding evictions by an invalidated texture", 1);
+        }
+        let ranges = backing.pieces();
+        self.evict_memoized_bindings(|entry| {
+            let source_key = match &entry.source {
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => Some(*key),
+                _ => None,
+            };
+            entry.texture == texture
+                || source_key == Some(texture)
+                || entry.backing.as_ref().is_none_or(|backing| {
+                    backing.pieces().iter().any(|(_, range)| {
+                        ranges.iter().any(|(_, written)| {
+                            written.start < range.end && range.start < written.end
+                        })
+                    })
+                })
+        });
     }
 
     /// Whether GPU writes not yet in guest memory overlap `range` (what
@@ -7627,12 +7683,14 @@ impl Nvn {
             if waits {
                 backend.stat("stat: GPU waits for in-place writes", 1);
                 backend.renderer.flush()?;
-                let mut textures_changed = false;
+                let mut changed = Vec::new();
                 for written in std::mem::take(&mut backend.in_place_writes) {
-                    textures_changed |= backend.mark_texture_bytes_changed(&written);
+                    if backend.mark_texture_bytes_changed(&written) {
+                        changed.push(written);
+                    }
                 }
-                if textures_changed {
-                    self.bump_binding_serial("stat: binding serial by in-place texture writes");
+                if !changed.is_empty() {
+                    self.evict_bindings_over(&changed);
                 }
             }
         }
@@ -7798,7 +7856,7 @@ impl Nvn {
         // Which call site asked (`#[track_caller]` up the resolve chain).
         backend.stat(caller_stat(std::panic::Location::caller()), 1);
         let mut ids = ids.into_iter();
-        let mut textures_changed = false;
+        let mut changed = Vec::new();
         let result = (|| {
             for (base, ranges) in batches {
                 for (offset, _) in ranges {
@@ -7810,8 +7868,10 @@ impl Nvn {
                     core.memory
                         .write(start, &bytes)
                         .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-                    textures_changed |=
-                        backend.mark_texture_bytes_changed(&(start..start + bytes.len() as u64));
+                    let written = start..start + bytes.len() as u64;
+                    if backend.mark_texture_bytes_changed(&written) {
+                        changed.push(written);
+                    }
                 }
                 // Keep this pool's ranges pending until every selected write
                 // has reached guest memory.
@@ -7826,8 +7886,8 @@ impl Nvn {
             }
             Ok(())
         })();
-        if textures_changed {
-            self.bump_binding_serial("stat: binding serial by resident texture writes");
+        if !changed.is_empty() {
+            self.evict_bindings_over(&changed);
         }
         result
     }
