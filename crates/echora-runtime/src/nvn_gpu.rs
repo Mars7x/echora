@@ -11399,8 +11399,9 @@ impl Nvn {
                 let guest = self.gpu_to_guest(address, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
-                // A restart value that is already the type's all-ones
-                // value (Vulkan's) needs no rewriting.
+                // A restart value that is exactly the type's all-ones
+                // value (Vulkan's) needs no rewriting (0x1ffff with 16-bit
+                // indices, say, still goes through the rewrite).
                 let all_ones = if size == 2 { 0xffff } else { u32::MAX };
                 // 8-bit indices are widened on the CPU unless the device
                 // takes them as they are (and no restart value applies:
@@ -11410,7 +11411,7 @@ impl Nvn {
                     && self.gpu.as_ref().unwrap().renderer.supports_uint8_indices();
                 let rewrites_indices = size == 1 && !native_bytes
                     || quads
-                    || strip && restart.is_some_and(|value| value & all_ones != all_ones);
+                    || strip && restart.is_some_and(|value| value != all_ones);
                 let kind = match size {
                     1 => vk::IndexType::UINT8_KHR,
                     2 => vk::IndexType::UINT16,
