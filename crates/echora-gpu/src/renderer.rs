@@ -242,6 +242,14 @@ struct TargetDescription {
     levels: u32,
 }
 
+/// Whether a target of `description` at `key` can be scaled at all (the
+/// rest of `Renderer::scale_for` aside).
+fn could_scale(key: u64, description: TargetDescription) -> bool {
+    matches!(description.shape, ImageShape::D2 { .. })
+        && description.width * description.height > 64
+        && key < STAGING_KEYS
+}
+
 impl From<&Target> for TargetDescription {
     fn from(target: &Target) -> Self {
         Self {
@@ -685,9 +693,9 @@ pub struct Renderer {
     /// Draws and dispatches recorded since the last submission.
     work_items: u32,
     samplers: FastMap<SamplerKey, vk::Sampler>,
-    /// Additional views retired with their image, with their range, format,
-    /// and usage used to identify them.
-    extra_views: FastMap<(vk::Image, ExtraView), vk::ImageView>,
+    /// Additional views retired with their image, by image and then by
+    /// their range, format, and usage used to identify them.
+    extra_views: FastMap<vk::Image, FastMap<ExtraView, vk::ImageView>>,
     /// Host memory imported as storage buffers (VK_EXT_external_memory_host),
     /// by page-aligned host address and length.
     imported: FastMap<(usize, u64), (vk::Buffer, vk::DeviceMemory)>,
@@ -729,6 +737,9 @@ pub struct Renderer {
     /// How each sampled view was made (image, type, format, range), so a
     /// swizzled copy of it can be made.
     view_infos: FastMap<vk::ImageView, ViewInfo>,
+    /// The `view_infos` entries of each image, so destroying a target
+    /// touches only its own.
+    image_views: FastMap<vk::Image, Vec<vk::ImageView>>,
     /// Targets created since the caller last took them (to initialize).
     fresh_targets: Vec<u64>,
     /// Submissions that waited for the GPU, and the microseconds waited.
@@ -1268,6 +1279,7 @@ impl Renderer {
             shared_refused: Default::default(),
             resident: FastMap::default(),
             view_infos: FastMap::default(),
+            image_views: FastMap::default(),
             fresh_targets: Vec::new(),
             flushes: 0,
             completed_reads: Vec::new(),
@@ -2316,8 +2328,8 @@ impl Renderer {
                 components: swizzle,
             },
         );
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
+        if let Some(view) = self.extra_view(&cache) {
+            return Ok(view);
         }
         // A twin-format view samples only (an sRGB format has no storage
         // use its image may have).
@@ -2334,7 +2346,7 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&create, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
+        self.add_extra_view(cache, view);
         Ok(view)
     }
 
@@ -2367,8 +2379,8 @@ impl Renderer {
                 count,
             },
         );
-        if let Some(existing) = self.extra_views.get(&cache) {
-            return Ok(*existing);
+        if let Some(existing) = self.extra_view(&cache) {
+            return Ok(existing);
         }
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::SAMPLED);
         let create = vk::ImageViewCreateInfo::default()
@@ -2384,8 +2396,8 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let selected = unsafe { self.gpu.device.create_image_view(&create, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, selected);
-        self.view_infos.insert(selected, ViewInfo::of(&create));
+        self.add_extra_view(cache, selected);
+        self.note_view(selected, ViewInfo::of(&create));
         Ok(selected)
     }
 
@@ -2402,12 +2414,30 @@ impl Renderer {
             format: target.format,
             range,
         };
-        self.view_infos.insert(target.view, info);
+        self.note_view(target.view, info);
         if has_stencil(target.format) {
             range.aspect_mask = vk::ImageAspectFlags::DEPTH;
         }
-        self.view_infos
-            .insert(target.sampled_view, ViewInfo { range, ..info });
+        self.note_view(target.sampled_view, ViewInfo { range, ..info });
+    }
+
+    fn note_view(&mut self, view: vk::ImageView, info: ViewInfo) {
+        self.view_infos.insert(view, info);
+        let views = self.image_views.entry(info.image).or_default();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+
+    fn extra_view(&self, (image, kind): &(vk::Image, ExtraView)) -> Option<vk::ImageView> {
+        self.extra_views.get(image)?.get(kind).copied()
+    }
+
+    fn add_extra_view(&mut self, (image, kind): (vk::Image, ExtraView), view: vk::ImageView) {
+        self.extra_views
+            .entry(image)
+            .or_default()
+            .insert(kind, view);
     }
 
     pub(crate) fn texture_view(
@@ -2757,8 +2787,8 @@ impl Renderer {
                 layer_count: view.range.layer_count,
             },
         );
-        if let Some(existing) = self.extra_views.get(&cache) {
-            return Ok(*existing);
+        if let Some(existing) = self.extra_view(&cache) {
+            return Ok(existing);
         }
         if has_stencil(view.format) {
             view.range.aspect_mask = vk::ImageAspectFlags::DEPTH;
@@ -2773,8 +2803,8 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
-        self.view_infos.insert(view, ViewInfo::of(&info));
+        self.add_extra_view(cache, view);
+        self.note_view(view, ViewInfo::of(&info));
         Ok(view)
     }
 
@@ -4917,7 +4947,7 @@ impl Renderer {
             let scale = self.scale_for(key, description);
             let target = self.create_target(width, height, shape, format, levels, scale)?;
             if self.pending_unscaled.remove(&key) {
-                self.unscaled.insert((key, description));
+                self.mark_unscaled(key, description);
             }
             // Tiny targets (exposure values adapting from their previous
             // frame) start from guest memory, as on the console; mip chains
@@ -5479,7 +5509,10 @@ impl Renderer {
             ("uploads", self.uploads.len()),
             ("retired uploads", self.slot.retired_uploads.len()),
             ("samplers", self.samplers.len()),
-            ("extra views", self.extra_views.len()),
+            (
+                "extra views",
+                self.extra_views.values().map(FastMap::len).sum(),
+            ),
             ("view infos", self.view_infos.len()),
             ("written", self.written.len()),
             ("pending reads", self.slot.pending_reads.len()),
@@ -5637,19 +5670,20 @@ impl Renderer {
     /// renderer's for 2D targets larger than a few texels (tiny ones hold
     /// values such as exposure, not images).
     fn scale_for(&self, key: u64, description: TargetDescription) -> Scale {
-        let TargetDescription {
-            width,
-            height,
-            shape,
-            ..
-        } = description;
-        let scalable = matches!(shape, ImageShape::D2 { .. })
-            && width * height > 64
-            && key < STAGING_KEYS
+        let TargetDescription { width, height, .. } = description;
+        let scalable = could_scale(key, description)
             && !self.pending_unscaled.contains(&key)
             && !self.unscaled.contains(&(key, description))
             && self.scale.apply(width.max(height)) <= self.max_image_extent();
         if scalable { self.scale } else { Scale::ONE }
+    }
+
+    /// Keep `description` at `key` at guest resolution. One that is never
+    /// scaled needs no entry: `unscaled` keeps only marks that matter.
+    fn mark_unscaled(&mut self, key: u64, description: TargetDescription) {
+        if could_scale(key, description) {
+            self.unscaled.insert((key, description));
+        }
     }
 
     /// The common scale of a pass's attachments: targets bound with ones
@@ -5724,7 +5758,7 @@ impl Renderer {
         };
         let description = TargetDescription::from(old);
         if old.scale.is_one() {
-            self.unscaled.insert((key, description));
+            self.mark_unscaled(key, description);
             return Ok(());
         }
         let (width, height, shape, format, levels) =
@@ -5764,7 +5798,7 @@ impl Renderer {
         let source = old.image;
         let destination = new.image;
         self.slot.retired_uploads.push(old);
-        self.unscaled.insert((key, description));
+        self.mark_unscaled(key, description);
         self.descaled += 1;
         self.target_changes += 1;
         self.changed_targets.push(key);
@@ -5859,7 +5893,7 @@ impl Renderer {
             self.guest_target_keys.remove(index);
         }
         if self.pending_unscaled.remove(&to) {
-            self.unscaled.insert((to, TargetDescription::from(&target)));
+            self.mark_unscaled(to, TargetDescription::from(&target));
         }
         self.insert_target(to, target);
         let needs_initialization = self.fresh_targets.contains(&from);
@@ -6141,8 +6175,8 @@ impl Renderer {
                 layer_count,
             },
         );
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
+        if let Some(view) = self.extra_view(&cache) {
+            return Ok(view);
         }
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::STORAGE);
         let info = vk::ImageViewCreateInfo::default()
@@ -6160,7 +6194,7 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
+        self.add_extra_view(cache, view);
         Ok(view)
     }
 
@@ -6173,8 +6207,8 @@ impl Renderer {
             return Err(format!("level {level} of a {}-level target", target.levels));
         }
         let cache = (target.image, ExtraView::Level(level));
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
+        if let Some(view) = self.extra_view(&cache) {
+            return Ok(view);
         }
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(target.view_usage);
         let info = vk::ImageViewCreateInfo::default()
@@ -6190,7 +6224,7 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
+        self.add_extra_view(cache, view);
         Ok(view)
     }
 
@@ -6235,8 +6269,8 @@ impl Renderer {
                 layer,
             },
         );
-        if let Some(view) = self.extra_views.get(&cache) {
-            return Ok(*view);
+        if let Some(view) = self.extra_view(&cache) {
+            return Ok(view);
         }
         let attachment = if is_depth(format) {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
@@ -6261,7 +6295,7 @@ impl Renderer {
         // SAFETY: the image is live; the view is destroyed with it.
         let view = unsafe { self.gpu.device.create_image_view(&info, None) }
             .map_err(vk_error("vkCreateImageView"))?;
-        self.extra_views.insert(cache, view);
+        self.add_extra_view(cache, view);
         Ok(view)
     }
 
@@ -6477,15 +6511,22 @@ impl Renderer {
     }
 
     fn destroy_target(&mut self, target: Target) {
-        self.view_infos.retain(|_, info| info.image != target.image);
-        let mut extra = Vec::new();
-        self.extra_views.retain(|(image, _), view| {
-            let other = *image != target.image;
-            if !other {
-                extra.push(*view);
+        for view in self.image_views.remove(&target.image).unwrap_or_default() {
+            // (A view handle noted again for another image belongs to it.)
+            if self
+                .view_infos
+                .get(&view)
+                .is_some_and(|info| info.image == target.image)
+            {
+                self.view_infos.remove(&view);
             }
-            other
-        });
+        }
+        let extra: Vec<_> = self
+            .extra_views
+            .remove(&target.image)
+            .unwrap_or_default()
+            .into_values()
+            .collect();
         let mut views = extra.clone();
         views.extend([target.view, target.sampled_view]);
         self.forget_pool_views(&views);
@@ -9575,6 +9616,64 @@ mod tests {
     }
 
     #[test]
+    fn destroying_a_target_drops_only_its_own_views() {
+        use crate::draw::{ImageShape, Sampler, TextureSource};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let shape = ImageShape::D2 { layers: 2 };
+        let mut images = Vec::new();
+        for key in [7, 8] {
+            images.push(
+                renderer
+                    .shaped_target(key, 8, 8, shape, format, 4)
+                    .unwrap()
+                    .image,
+            );
+            renderer.level_view(key, 2).unwrap();
+            renderer.attachment_view(key, 2, 1, None).unwrap();
+            let source = TextureSource::TargetView {
+                key,
+                base_level: 1,
+                level_count: 2,
+                base_layer: 1,
+                layer_count: 1,
+            };
+            let sampler = Sampler {
+                view_levels: Some((1, 1)),
+                ..Default::default()
+            };
+            renderer
+                .texture_view_swizzled(&source, 2, &sampler)
+                .unwrap();
+        }
+        let infos_of = |renderer: &Renderer, image| {
+            renderer
+                .view_infos
+                .values()
+                .filter(|info| info.image == image)
+                .count()
+        };
+        let (old, kept) = (images[0], images[1]);
+        let kept_infos = infos_of(&renderer, kept);
+        let kept_views = renderer.extra_views[&kept].len();
+        assert!(kept_infos > 2 && kept_views > 2);
+        assert_eq!(renderer.image_views[&kept].len(), kept_infos);
+
+        // A new shape replaces key 7's image, destroyed once its batch ran.
+        renderer.shaped_target(7, 16, 16, shape, format, 4).unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(infos_of(&renderer, old), 0);
+        assert!(!renderer.image_views.contains_key(&old));
+        assert!(!renderer.extra_views.contains_key(&old));
+        assert_eq!(infos_of(&renderer, kept), kept_infos);
+        assert_eq!(renderer.extra_views[&kept].len(), kept_views);
+        assert_eq!(renderer.image_views[&kept].len(), kept_infos);
+    }
+
+    #[test]
     fn repeated_identity_volume_binds_keep_the_uploaded_texels() {
         use crate::draw::{ImageShape, TextureSource, UploadRegion};
 
@@ -10575,6 +10674,11 @@ mod rescaling_tests {
             renderer.target(9, 32, 8, format).unwrap().extent(0),
             (64, 16)
         );
+
+        // A tiny target is never scaled: marking it keeps no entry.
+        assert_eq!(renderer.target(10, 8, 8, format).unwrap().extent(0), (8, 8));
+        renderer.keep_unscaled(10).unwrap();
+        assert!(!renderer.unscaled.iter().any(|(key, _)| *key == 10));
     }
 
     #[test]
